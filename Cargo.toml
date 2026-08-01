@@ -116,7 +116,11 @@ tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
 # not `futures` proper: the executor needs one combinator, not an ecosystem.
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 tracing     = "0.1"
-turso       = { version = "0.7", optional = true }
+# `default-features = false` on purpose: the defaults are `fts` (pulls in
+# tantivy, a search engine) and `mimalloc` (a C allocator, which would put back
+# the C toolchain this backend exists to avoid). A journal needs neither, and
+# with both on CI ran out of disk.
+turso       = { version = "0.7", default-features = false, optional = true }
 cedar-policy = { version = "4.12.0", default-features = false, optional = true }
 tokio-postgres = { version = "0.7.18", optional = true }
 deadpool-postgres = { version = "0.14.1", optional = true }
