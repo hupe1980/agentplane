@@ -10,7 +10,7 @@
 //! checked *everywhere it now applies*, and adding a feature silently widens
 //! where it applies.
 
-#![cfg(feature = "sqlite")]
+#![cfg(feature = "turso")]
 #![allow(clippy::disallowed_methods)]
 use agentplane::case::TimerStore;
 use agentplane::core::{
@@ -20,7 +20,7 @@ use agentplane::core::{
 use agentplane::journal::JournalStore;
 use agentplane::plan::{ReplanError, Replanner};
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -92,7 +92,7 @@ impl Skill for Boom {
 #[tokio::test]
 async fn a_compensation_may_sleep_before_it_reverses() {
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .owner("t")
         .timers(store.clone() as Arc<dyn TimerStore>)
@@ -194,7 +194,7 @@ impl Replanner for KeepsDone {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replan_requested_beside_a_succeeding_sibling_keeps_its_work() {
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .owner("t")
         .budget(Budget::default().replans(2))
@@ -288,7 +288,7 @@ impl Skill for Interleaves {
 async fn one_step_may_sleep_retry_and_sleep_again() {
     let l = log();
     let calls = Arc::new(Mutex::new(0usize));
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .owner("t")
         .timers(store.clone() as Arc<dyn TimerStore>)

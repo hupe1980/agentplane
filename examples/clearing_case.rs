@@ -34,7 +34,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 
 /// The domain's calendar: working days, skipping weekends.
@@ -204,7 +204,7 @@ impl Skill for SendRequest {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(SqliteStore::open_in_memory()?);
+    let store = Arc::new(TursoStore::open_in_memory().await?);
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .events(store.clone() as Arc<dyn EventStore>)
@@ -275,7 +275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// A rejection is not something to decide unilaterally.
 async fn handle_rejection(
     rt: &Runtime,
-    store: &Arc<SqliteStore>,
+    store: &Arc<TursoStore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let task = store
         .queue(&["mako-operator".to_owned()], 10)
@@ -317,7 +317,7 @@ async fn handle_rejection(
 /// Settle the remaining obligations and conclude the matter.
 async fn finish_and_close(
     _rt: &Runtime,
-    store: &Arc<SqliteStore>,
+    store: &Arc<TursoStore>,
     case_id: agentplane::core::CaseId,
     run_id: agentplane::core::RunId,
 ) -> Result<(), Box<dyn std::error::Error>> {

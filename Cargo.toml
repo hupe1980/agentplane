@@ -49,10 +49,13 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["sqlite"]
-# SQLite-backed journal + case store. Single-node deployments; Postgres backs
-# the active-active topology.
-sqlite  = ["dep:rusqlite"]
+default = ["turso"]
+# Embedded journal + case store, on Turso — a SQLite-compatible engine written
+# in Rust. Single-node deployments; Postgres backs the active-active topology.
+#
+# Turso rather than `rusqlite`/`libsqlite3-sys`: no C toolchain in the build, and
+# a natively async driver instead of blocking calls dispatched to a thread pool.
+turso = ["dep:turso"]
 # Fault injection and other harness pieces, for this crate's assurance layers
 # and for embedders testing their own stores and skills. Never in a production
 # build — nothing in `testkit` is reachable without it.
@@ -113,7 +116,7 @@ tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
 # not `futures` proper: the executor needs one combinator, not an ecosystem.
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 tracing     = "0.1"
-rusqlite    = { version = "0.40", features = ["bundled"], optional = true }
+turso       = { version = "0.7", optional = true }
 cedar-policy = { version = "4.12.0", default-features = false, optional = true }
 tokio-postgres = { version = "0.7.18", optional = true }
 deadpool-postgres = { version = "0.14.1", optional = true }

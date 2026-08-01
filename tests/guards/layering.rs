@@ -782,7 +782,7 @@ fn every_feature_a_test_gates_itself_on_exists() {
         .filter(|n| !n.is_empty() && !n.starts_with('#'))
         .collect();
     assert!(
-        declared.contains(&"sqlite".to_string()),
+        declared.contains(&"turso".to_string()),
         "the feature table was not parsed — this guard is inert: {declared:?}"
     );
 

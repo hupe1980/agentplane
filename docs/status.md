@@ -51,7 +51,7 @@ README.
 | ✅ | **Cedar** — the policy seam's first adapter, behind the `cedar` feature; a policy that *fails to evaluate* is reported as broken, not as a refusal |
 | ✅ | **Authorization** — a total, fail-closed policy seam; denials journaled, and replay never re-opens the gate |
 | ✅ | **Metrics** — a declared catalogue of counters and observed gauges, guarded against declared-but-unemitted |
-| ✅ | SQLite backend |
+| ✅ | **Turso** — the default embedded backend: SQLite semantics, pure Rust, no C toolchain, and a natively async driver |
 | ✅ | **PostgreSQL** — journal *and* case layer, for the shared-store topology |
 | ✅ | **Store conformance batteries** — one contract per store, run against every backend, including a racing check no sequential test can replace |
 | ✅ | **HTTP surface** — worklist, claim/release, decisions, run status, event delivery, behind the `http` feature; the wire types cannot express who is acting |

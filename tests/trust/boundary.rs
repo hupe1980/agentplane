@@ -26,7 +26,7 @@
 //! * The label is identical on replay, because a label that appeared only on
 //!   live runs would make an audit disagree with the run it audits.
 
-#![cfg(feature = "sqlite")]
+#![cfg(feature = "turso")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
@@ -37,7 +37,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -161,8 +161,8 @@ impl Effect for Transfer {
     }
 }
 
-fn db() -> Arc<SqliteStore> {
-    Arc::new(SqliteStore::open_in_memory().unwrap())
+async fn db() -> Arc<TursoStore> {
+    Arc::new(TursoStore::open_in_memory().await.unwrap())
 }
 
 /// Captures the label a step saw on its input.
@@ -203,7 +203,7 @@ impl Skill for Observe {
 #[tokio::test]
 async fn an_effect_output_is_untrusted_by_default() {
     let seen: Seen = Arc::default();
-    let store = db();
+    let store = db().await;
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .skill(Observe {
             name: "a",
@@ -247,7 +247,7 @@ async fn an_effect_output_is_untrusted_by_default() {
 #[tokio::test]
 async fn a_trusted_effect_does_not_taint_the_run() {
     let seen: Seen = Arc::default();
-    let store = db();
+    let store = db().await;
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .skill(Observe {
             name: "a",
@@ -282,7 +282,7 @@ async fn a_trusted_effect_does_not_taint_the_run() {
 #[tokio::test]
 async fn declared_sensitivity_raises_but_cannot_lower() {
     let seen: Seen = Arc::default();
-    let store = db();
+    let store = db().await;
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .skill(Observe {
             name: "a",
@@ -327,7 +327,7 @@ async fn declared_sensitivity_raises_but_cannot_lower() {
 #[tokio::test]
 async fn an_undeclared_effect_keeps_the_sensitivity_its_provenance_implies() {
     let seen: Seen = Arc::default();
-    let store = db();
+    let store = db().await;
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .skill(Observe {
             name: "a",
@@ -398,7 +398,7 @@ async fn tool_output_cannot_reach_a_mutating_sink() {
     }
 
     let world: World = Arc::default();
-    let store = db();
+    let store = db().await;
     let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .skill(Naive {
             world: Arc::clone(&world),
@@ -457,7 +457,7 @@ async fn declassifying_is_the_only_way_out_and_it_is_journaled() {
     }
 
     let world: World = Arc::default();
-    let store = db();
+    let store = db().await;
     let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .skill(Reviewed {
             world: Arc::clone(&world),
@@ -533,7 +533,7 @@ async fn a_run_holding_tool_output_may_not_replan() {
         }
     }
 
-    let store = db();
+    let store = db().await;
     let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .skill(Fetches)
         .skill(Reroutes)
@@ -572,7 +572,7 @@ async fn a_run_holding_tool_output_may_not_replan() {
 #[tokio::test]
 async fn a_replayed_effect_carries_the_same_label() {
     let seen: Seen = Arc::default();
-    let store = db();
+    let store = db().await;
 
     let build = |seen: &Seen| {
         Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)

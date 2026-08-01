@@ -1662,7 +1662,10 @@ async fn a_peer_call_carries_attested_provenance() {
         .as_object()
         .expect("provenance rides under the extension");
 
-    assert!(meta.contains_key("agentplane.io/attestation"), "{meta:?}");
+    assert!(
+        meta.contains_key("io.github.hupe1980.agentplane/attestation"),
+        "{meta:?}"
+    );
     let back = agentplane::core::Provenance::from_meta(meta).expect("parses peer-side");
     assert!(
         back.verify(&signer, "a2a.peer/call", &payload),

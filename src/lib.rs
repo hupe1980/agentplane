@@ -71,7 +71,7 @@
 //! }
 //!
 //! # async fn run(store: Arc<dyn JournalStore>) -> Result<(), Box<dyn std::error::Error>> {
-//! // With the default features, `agentplane::store::SqliteStore` is one.
+//! // With the default features, `agentplane::store::TursoStore` is one.
 //! let runtime = Runtime::builder(store).skill(Greet).build();
 //! let outcome = runtime.run("greet", serde_json::json!({"name": "world"})).await?;
 //!
@@ -97,7 +97,7 @@ pub mod policy;
 pub mod runtime;
 pub mod tools;
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "turso")]
 pub mod store;
 
 #[cfg(feature = "testkit")]

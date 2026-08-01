@@ -3,7 +3,7 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo run --example model_run --features sqlite,testkit
+//! cargo run --example model_run --features turso,testkit
 //! ```
 //!
 //! No API key, no network. `testkit::FakeProvider` stands in for the provider,
@@ -28,7 +28,7 @@ use agentplane::core::{Budget, Outcome, Skill, SkillDescriptor, SkillError, Tain
 use agentplane::journal::JournalStore;
 use agentplane::model::{ModelCall, ModelError, ModelId, ModelProvider, Usage};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use agentplane::testkit::FakeProvider;
 use serde_json::{Value, json};
 
@@ -97,7 +97,7 @@ impl Skill for Triage {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store: Arc<dyn JournalStore> = Arc::new(SqliteStore::open_in_memory()?);
+    let store: Arc<dyn JournalStore> = Arc::new(TursoStore::open_in_memory().await?);
 
     // ── 1. A live run ──────────────────────────────────────────────────────
     let provider = FakeProvider::new();

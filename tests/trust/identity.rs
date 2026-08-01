@@ -17,7 +17,7 @@
 //! * **An out-of-scope plan never starts.** The plan is the authorization graph,
 //!   so authority is checked against it before anything runs.
 
-#![cfg(feature = "sqlite")]
+#![cfg(feature = "turso")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
@@ -29,7 +29,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 
 // ── Scope containment ───────────────────────────────────────────────────────
@@ -279,11 +279,11 @@ impl Skill for Checker {
     }
 }
 
-fn db() -> Arc<SqliteStore> {
-    Arc::new(SqliteStore::open_in_memory().unwrap())
+async fn db() -> Arc<TursoStore> {
+    Arc::new(TursoStore::open_in_memory().await.unwrap())
 }
 
-fn runtime(store: &Arc<SqliteStore>, world: &World, chain: Option<Delegation>) -> Runtime {
+fn runtime(store: &Arc<TursoStore>, world: &World, chain: Option<Delegation>) -> Runtime {
     let mut b = Runtime::builder(Arc::clone(store) as Arc<dyn JournalStore>)
         .owner("identity")
         .skill(Checker {
@@ -312,7 +312,7 @@ fn plan(capability: &str) -> PlanIR {
 /// before anything runs.
 #[tokio::test]
 async fn a_plan_outside_the_chain_s_authority_never_starts() {
-    let store = db();
+    let store = db().await;
     let world: World = Arc::default();
     let chain = owner()
         .delegate(Principal::new("agent:auditor", Scope::of(["audit.*"])))
@@ -335,7 +335,7 @@ async fn a_plan_outside_the_chain_s_authority_never_starts() {
 
 #[tokio::test]
 async fn a_plan_within_authority_runs() {
-    let store = db();
+    let store = db().await;
     let world: World = Arc::default();
     let chain = owner()
         .delegate(Principal::new("agent:auditor", Scope::of(["audit.*"])))
@@ -353,7 +353,7 @@ async fn a_plan_within_authority_runs() {
 /// "On whose behalf" is answerable from the journal, not reconstructed.
 #[tokio::test]
 async fn the_chain_is_journaled_at_admission() {
-    let store = db();
+    let store = db().await;
     let world: World = Arc::default();
     let chain = owner()
         .delegate(Principal::new("agent:auditor", Scope::of(["audit.*"])))
@@ -384,7 +384,7 @@ async fn the_chain_is_journaled_at_admission() {
 /// A run with no delegation says so, rather than looking like an unbounded one.
 #[tokio::test]
 async fn a_run_with_no_chain_records_none() {
-    let store = db();
+    let store = db().await;
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, None)
@@ -409,7 +409,7 @@ async fn a_run_with_no_chain_records_none() {
 /// let a forged chain in through the audit path. Reading back is neither.
 #[tokio::test]
 async fn replay_uses_the_recorded_chain_not_the_configured_one() {
-    let store = db();
+    let store = db().await;
     let world: World = Arc::default();
     let chain = owner()
         .delegate(Principal::new("agent:auditor", Scope::of(["audit.*"])))
@@ -457,7 +457,7 @@ async fn the_policy_request_carries_the_owner_and_the_depth() {
         }
     }
 
-    let store = db();
+    let store = db().await;
     let world: World = Arc::default();
     let engine = Arc::new(Capturing::default());
     let chain = owner()

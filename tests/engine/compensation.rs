@@ -17,7 +17,7 @@
 //!   charge in place while reversing everything around it is exactly the outcome
 //!   the mechanism exists to prevent.
 
-#![cfg(feature = "sqlite")]
+#![cfg(feature = "turso")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 
 /// Everything the run did, in order, so a test can assert on the sequence
@@ -187,7 +187,7 @@ fn chain() -> PlanIR {
     ])
 }
 
-fn runtime(store: &Arc<SqliteStore>, steps: Vec<Step>) -> Runtime {
+fn runtime(store: &Arc<TursoStore>, steps: Vec<Step>) -> Runtime {
     let mut b = Runtime::builder(store.clone() as Arc<dyn JournalStore>).owner("test");
     for s in steps {
         b = b.skill(s);
@@ -203,7 +203,7 @@ fn runtime(store: &Arc<SqliteStore>, steps: Vec<Step>) -> Runtime {
 #[tokio::test]
 async fn a_failing_step_unwinds_the_completed_ones_in_reverse() {
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime(
         &store,
         vec![
@@ -231,7 +231,7 @@ async fn a_failing_step_unwinds_the_completed_ones_in_reverse() {
 #[tokio::test]
 async fn compensating_effects_are_journaled_in_their_own_phase() {
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime(
         &store,
         vec![
@@ -270,7 +270,7 @@ async fn compensating_effects_are_journaled_in_their_own_phase() {
 #[tokio::test]
 async fn compensation_effects_do_not_collide_with_forward_ones() {
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime(
         &store,
         vec![
@@ -300,7 +300,7 @@ async fn compensation_effects_do_not_collide_with_forward_ones() {
 #[tokio::test]
 async fn a_pivot_stops_the_unwind() {
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime(
         &store,
         vec![
@@ -324,7 +324,7 @@ async fn a_pivot_stops_the_unwind() {
 #[tokio::test]
 async fn an_unnecessary_declaration_is_skipped_without_stopping_the_unwind() {
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime(
         &store,
         vec![
@@ -346,7 +346,7 @@ async fn an_unnecessary_declaration_is_skipped_without_stopping_the_unwind() {
 #[tokio::test]
 async fn an_undeclared_step_that_changed_nothing_needs_no_compensation() {
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime(
         &store,
         vec![
@@ -373,7 +373,7 @@ async fn an_undeclared_step_that_changed_nothing_needs_no_compensation() {
 #[tokio::test]
 async fn an_undeclared_step_that_changed_something_escalates() {
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime(
         &store,
         vec![
@@ -405,7 +405,7 @@ async fn an_undeclared_step_that_changed_something_escalates() {
 #[tokio::test]
 async fn a_failed_compensation_quarantines_and_names_the_step() {
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime(
         &store,
         vec![
@@ -480,7 +480,7 @@ async fn a_quarantined_run_is_never_unwound() {
     }
 
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .owner("test")
         .skill(Step::new("a", &l))
@@ -511,7 +511,7 @@ async fn a_quarantined_run_is_never_unwound() {
 #[tokio::test]
 async fn an_exhausted_run_still_unwinds() {
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .owner("test")
         .budget(Budget::default().effects(2))
@@ -539,7 +539,7 @@ async fn an_exhausted_run_still_unwinds() {
 #[tokio::test]
 async fn replay_reproduces_an_unwind_without_repeating_it() {
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime(
         &store,
         vec![
@@ -635,7 +635,7 @@ async fn a_compensation_may_wait_for_a_human_and_the_unwind_resumes() {
     use agentplane::core::{CorrelationKey, Delivery, InboundEvent};
 
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .owner("test")
         .cases(store.clone() as Arc<dyn CaseStore>)
@@ -724,7 +724,7 @@ async fn a_succeeding_sibling_is_compensated_when_its_neighbour_fails() {
     use agentplane::core::PlanIR as Plan;
 
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .owner("test")
         .skill(Step::new("left", &l).failing())
@@ -804,7 +804,7 @@ async fn a_failure_beats_a_siblings_suspension() {
     }
 
     let l = log();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .owner("test")
         .cases(store.clone() as Arc<dyn CaseStore>)

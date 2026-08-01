@@ -48,7 +48,13 @@ jobs:
   # Each guarantee is broken on purpose and the test written to catch it must
   # fail. Without this a guarantee can be implemented, tested, and still
   # unfalsifiable — which this project shipped once, and found by accident.
+  #
+  # Pull requests only: the sweep costs ~25 minutes, and a push to `main` is a
+  # commit that already passed it on the way in. `just anchors` — which is in
+  # `just ci`, and so runs on every push — catches the cheap half, a mutation
+  # that no longer matches the code it names and therefore verifies nothing.
   mutants:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

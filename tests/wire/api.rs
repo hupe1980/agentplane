@@ -12,7 +12,7 @@
 //! influenced by the request, that authorization runs before anything else, and
 //! that neither can be skipped by a route somebody adds next year.
 
-#![cfg(all(feature = "http", feature = "sqlite"))]
+#![cfg(all(feature = "http", feature = "turso"))]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
@@ -25,7 +25,7 @@ use agentplane::core::{
 };
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
@@ -143,12 +143,12 @@ impl PolicyEngine for Recording {
 }
 
 struct Fixture {
-    store: Arc<SqliteStore>,
+    store: Arc<TursoStore>,
     rt: Arc<Runtime>,
 }
 
-fn fixture_with(policy: &Arc<Recording>) -> Fixture {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+async fn fixture_with(policy: &Arc<Recording>) -> Fixture {
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .events(store.clone() as Arc<dyn EventStore>)
@@ -162,8 +162,8 @@ fn fixture_with(policy: &Arc<Recording>) -> Fixture {
     }
 }
 
-fn fixture() -> Fixture {
-    fixture_with(&Arc::new(Recording::default()))
+async fn fixture() -> Fixture {
+    fixture_with(&Arc::new(Recording::default())).await
 }
 
 impl Fixture {
@@ -239,7 +239,7 @@ fn post(path: &str, actor: Option<&str>, body: &Value) -> Request<Body> {
 /// audit, months later, with nobody left who remembers.
 #[tokio::test]
 async fn a_body_that_names_an_actor_is_refused_rather_than_ignored() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let router = f.router();
 
@@ -276,7 +276,7 @@ async fn a_body_that_names_an_actor_is_refused_rather_than_ignored() {
 /// The decision is recorded under the authenticated caller.
 #[tokio::test]
 async fn the_decision_is_recorded_under_the_authenticated_caller() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let router = f.router();
 
@@ -324,7 +324,7 @@ async fn the_decision_is_recorded_under_the_authenticated_caller() {
 /// refusal rather than around it.
 #[tokio::test]
 async fn the_proposer_cannot_approve_their_own_proposal_over_http() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let router = f.router();
 
@@ -367,7 +367,7 @@ async fn the_proposer_cannot_approve_their_own_proposal_over_http() {
 /// Roles come from the authenticator, so a caller cannot widen their queue.
 #[tokio::test]
 async fn a_caller_sees_only_the_queue_their_roles_entitle_them_to() {
-    let f = fixture();
+    let f = fixture().await;
     f.pending_task().await;
     let router = f.router();
 
@@ -398,7 +398,7 @@ async fn a_caller_sees_only_the_queue_their_roles_entitle_them_to() {
 /// and the item itself says she may not decide it.
 #[tokio::test]
 async fn the_worklist_says_which_items_this_caller_may_decide() {
-    let f = fixture();
+    let f = fixture().await;
     f.pending_task().await;
     let router = f.router();
 
@@ -421,7 +421,7 @@ async fn the_worklist_says_which_items_this_caller_may_decide() {
 /// there was one.
 #[tokio::test]
 async fn a_truncated_worklist_says_it_was_truncated() {
-    let f = fixture();
+    let f = fixture().await;
     // Three tasks, one per run — see `two_runs_of_one_plan_do_not_share_one_task`
     // in tests/tasks.rs for why that is not a given.
     for doc in ["INV-1", "INV-2", "INV-3"] {
@@ -469,7 +469,7 @@ async fn a_truncated_worklist_says_it_was_truncated() {
 /// has already halted when it may not have.
 #[tokio::test]
 async fn a_run_can_be_stopped_and_the_stopper_is_named() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let run = (f.store.clone() as Arc<dyn TaskStore>)
         .task(agentplane::core::TaskId::parse(&task).unwrap())
@@ -514,7 +514,7 @@ async fn a_run_can_be_stopped_and_the_stopper_is_named() {
 /// A stop request body cannot name the actor either.
 #[tokio::test]
 async fn a_stop_body_that_names_an_actor_is_refused() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let run = (f.store.clone() as Arc<dyn TaskStore>)
         .task(agentplane::core::TaskId::parse(&task).unwrap())
@@ -543,7 +543,7 @@ async fn a_stop_body_that_names_an_actor_is_refused() {
 /// A pending stop is visible before the run has acted on it.
 #[tokio::test]
 async fn a_pending_stop_is_visible_on_the_run() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let run = (f.store.clone() as Arc<dyn TaskStore>)
         .task(agentplane::core::TaskId::parse(&task).unwrap())
@@ -582,7 +582,7 @@ async fn a_pending_stop_is_visible_on_the_run() {
 /// moment they submit, that the work was wasted.
 #[tokio::test]
 async fn a_claimed_task_is_reserved_against_other_reviewers() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let router = f.router();
 
@@ -624,7 +624,7 @@ async fn a_claimed_task_is_reserved_against_other_reviewers() {
 /// Collapsing them is how a reviewer retries something that cannot succeed.
 #[tokio::test]
 async fn contention_and_ineligibility_are_told_apart() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let router = f.router();
 
@@ -666,7 +666,7 @@ async fn contention_and_ineligibility_are_told_apart() {
 /// A reviewer can give a task back, and only the holder can.
 #[tokio::test]
 async fn only_the_holder_can_release_a_claim() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let router = f.router();
 
@@ -712,7 +712,7 @@ async fn only_the_holder_can_release_a_claim() {
 /// No credentials, no answer — on every route.
 #[tokio::test]
 async fn an_unauthenticated_request_is_refused_everywhere() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let router = f.router();
 
@@ -764,7 +764,7 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
         seen: Mutex::new(Vec::new()),
         deny: true,
     });
-    let f = fixture_with(&policy);
+    let f = fixture_with(&policy).await;
     let router = f.router();
 
     for req in [
@@ -828,9 +828,9 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
 }
 
 /// A surface with no authorization layer does not start.
-#[test]
-fn the_surface_refuses_to_build_without_a_policy_engine() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+#[tokio::test]
+async fn the_surface_refuses_to_build_without_a_policy_engine() {
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Arc::new(Runtime::builder(store as Arc<dyn JournalStore>).build());
 
     let err = Api::new(rt, Arc::new(HeaderAuth)).unwrap_err();
@@ -847,8 +847,8 @@ fn the_surface_refuses_to_build_without_a_policy_engine() {
 /// route added next year would be authenticated and authorized by construction —
 /// `gate` is the only way to get a `Caller` — but nothing would prove it, and
 /// "nothing proves it" is how the first ungated route gets written.
-#[test]
-fn every_route_is_walked_by_the_gate_tests() {
+#[tokio::test]
+async fn every_route_is_walked_by_the_gate_tests() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/api/mod.rs"))
         .expect("the api module");
     let here = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/wire/api.rs"))
@@ -877,7 +877,7 @@ fn every_route_is_walked_by_the_gate_tests() {
 /// A suspended run says what it is waiting for.
 #[tokio::test]
 async fn a_suspended_run_reports_what_it_is_waiting_for() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let run = (f.store.clone() as Arc<dyn TaskStore>)
         .task(agentplane::core::TaskId::parse(&task).unwrap())
@@ -909,7 +909,7 @@ async fn a_suspended_run_reports_what_it_is_waiting_for() {
 /// screen as permanently stuck, which is worse than showing nothing at all.
 #[tokio::test]
 async fn a_resumed_run_is_not_still_reported_as_suspended() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let run = (f.store.clone() as Arc<dyn TaskStore>)
         .task(agentplane::core::TaskId::parse(&task).unwrap())
@@ -945,7 +945,7 @@ async fn a_resumed_run_is_not_still_reported_as_suspended() {
 /// An unknown run is a 404, and a malformed one a 400 — after the gate.
 #[tokio::test]
 async fn an_unknown_run_is_not_confused_with_a_malformed_one() {
-    let f = fixture();
+    let f = fixture().await;
     let router = f.router();
 
     let (status, _) = send(&router, get("/runs/not-an-id", Some("bob"))).await;
@@ -963,7 +963,7 @@ async fn an_unknown_run_is_not_confused_with_a_malformed_one() {
 /// problem" is the question that follows "what is this".
 #[tokio::test]
 async fn the_case_view_carries_its_deadlines() {
-    let f = fixture();
+    let f = fixture().await;
     let task = f.pending_task().await;
     let case = (f.store.clone() as Arc<dyn TaskStore>)
         .task(agentplane::core::TaskId::parse(&task).unwrap())
@@ -990,7 +990,7 @@ async fn the_case_view_carries_its_deadlines() {
 /// Delivery reports what happened in a word a client can key on.
 #[tokio::test]
 async fn event_delivery_reports_the_outcome_by_name() {
-    let f = fixture();
+    let f = fixture().await;
     let router = f.router();
 
     let event = json!({
@@ -1013,7 +1013,7 @@ async fn event_delivery_reports_the_outcome_by_name() {
 /// A store failure does not describe the store.
 #[tokio::test]
 async fn a_missing_store_does_not_describe_the_plane() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Arc::new(
         Runtime::builder(store as Arc<dyn JournalStore>)
             .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)

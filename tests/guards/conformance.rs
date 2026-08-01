@@ -1,23 +1,24 @@
 //! The journal-store contract, checked against every backend this crate ships.
 //!
 //! One battery, in `testkit::conformance`, run here against each store. The
-//! point is not that `SQLite` passes — it has passed the whole suite for a long
-//! time — but that the battery is *real*, so that when a second backend is run
-//! against it a pass means something.
+//! point is not that Turso passes — it is the default backend, so the rest of
+//! the suite exercises it constantly — but that the battery is *real*, so that
+//! when a second backend is run against it a pass means something. The test
+//! below it breaks one guarantee on purpose and requires the battery to notice.
 //!
-//! Postgres is checked in `tests/postgres.rs`, which needs a container; keeping
-//! it separate means the `SQLite` run stays in the fast path.
+//! Postgres is checked separately, behind a container; keeping it apart means
+//! this run stays in the fast path.
 
-#![cfg(all(feature = "sqlite", feature = "testkit"))]
+#![cfg(all(feature = "turso", feature = "testkit"))]
 
 use std::sync::Arc;
 
 use agentplane::journal::JournalStore;
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use agentplane::testkit::conformance;
 
 #[tokio::test]
-async fn sqlite_satisfies_the_journal_store_contract() {
+async fn turso_satisfies_the_journal_store_contract() {
     // Signing is switched on for the whole battery, not only for the check that
     // is about it. Two reasons: the attestation round-trip check would otherwise
     // skip itself against an unsigned store and report success having asserted
@@ -26,7 +27,8 @@ async fn sqlite_satisfies_the_journal_store_contract() {
     let report = conformance::check(&|| {
         Box::pin(async {
             Arc::new(
-                SqliteStore::open_in_memory()
+                TursoStore::open_in_memory()
+                    .await
                     .expect("in-memory store")
                     .signing_as(Arc::new(agentplane::testkit::StubSigner::default())),
             ) as Arc<dyn JournalStore>
@@ -34,7 +36,7 @@ async fn sqlite_satisfies_the_journal_store_contract() {
     })
     .await;
 
-    report.assert_conforms("SqliteStore");
+    report.assert_conforms("TursoStore");
 }
 
 /// The battery must be able to fail.
@@ -49,7 +51,7 @@ async fn the_battery_rejects_a_store_that_drops_exactly_once() {
     let report = conformance::check(&|| {
         Box::pin(async {
             Arc::new(NoExactlyOnce {
-                inner: SqliteStore::open_in_memory().expect("in-memory store"),
+                inner: TursoStore::open_in_memory().await.expect("in-memory store"),
             }) as Arc<dyn JournalStore>
         })
     })
@@ -73,7 +75,7 @@ async fn the_battery_rejects_a_store_that_drops_exactly_once() {
 /// like idempotence and is in fact a second performance waiting to happen.
 #[derive(Debug)]
 struct NoExactlyOnce {
-    inner: SqliteStore,
+    inner: TursoStore,
 }
 
 #[async_trait::async_trait]
@@ -150,19 +152,19 @@ impl JournalStore for NoExactlyOnce {
     }
 }
 
-/// The case-layer stores, against `SQLite`.
+/// The case-layer stores, against Turso.
 ///
 /// Each battery covers one race: two messages for one matter, one event to one
 /// waiter, one wake-up fired once, one decision held by one reviewer, one item
 /// keeping its run id. These are the invariants a second backend reimplements
 /// *nearly* correctly.
 #[tokio::test]
-async fn sqlite_satisfies_the_case_layer_contracts() {
+async fn turso_satisfies_the_case_layer_contracts() {
     use agentplane::batch::BatchStore;
     use agentplane::case::{CaseStore, EventStore, TaskStore, TimerStore};
     use agentplane::testkit::conformance_case as cc;
 
-    let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+    let store = Arc::new(TursoStore::open_in_memory().await.expect("in-memory store"));
     let mut report = agentplane::testkit::conformance::Report::default();
 
     cc::check_cases(&(Arc::clone(&store) as Arc<dyn CaseStore>), &mut report).await;
@@ -171,5 +173,5 @@ async fn sqlite_satisfies_the_case_layer_contracts() {
     cc::check_tasks(&(Arc::clone(&store) as Arc<dyn TaskStore>), &mut report).await;
     cc::check_batches(&(Arc::clone(&store) as Arc<dyn BatchStore>), &mut report).await;
 
-    report.assert_conforms("SqliteStore (case layer)");
+    report.assert_conforms("TursoStore (case layer)");
 }

@@ -16,7 +16,7 @@
 //! behaviour, because a fault-injection test that injected nothing passes for
 //! the wrong reason and the assertions do not show it.
 
-#![cfg(all(feature = "sqlite", feature = "testkit"))]
+#![cfg(all(feature = "turso", feature = "testkit"))]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use agentplane::testkit::{Fault, Faulty, Schedule, assert_replay_was_not_backstopped};
 use serde_json::{Value, json};
 
@@ -107,8 +107,8 @@ fn plan() -> PlanIR {
     ])
 }
 
-fn store() -> Arc<SqliteStore> {
-    Arc::new(SqliteStore::open_in_memory().unwrap())
+async fn store() -> Arc<TursoStore> {
+    Arc::new(TursoStore::open_in_memory().await.unwrap())
 }
 
 fn runtime(store: Arc<dyn JournalStore>, world: &World) -> Runtime {
@@ -128,7 +128,7 @@ fn runtime(store: Arc<dyn JournalStore>, world: &World) -> Runtime {
 /// because the first one "didn't get recorded".
 #[tokio::test]
 async fn a_committed_but_lost_effect_record_is_not_performed_again() {
-    let db = store();
+    let db = store().await;
     let world: World = Arc::default();
 
     // Fail the append that records the effect's completion — after it commits.
@@ -195,7 +195,7 @@ async fn a_committed_but_lost_effect_record_is_not_performed_again() {
 /// rather than as done, and rather than as never attempted.
 #[tokio::test]
 async fn a_committed_but_lost_announcement_leaves_a_resolvable_orphan() {
-    let db = store();
+    let db = store().await;
     let world: World = Arc::default();
 
     let faulty = Arc::new(Faulty::new(
@@ -253,7 +253,7 @@ async fn a_committed_but_lost_announcement_leaves_a_resolvable_orphan() {
 /// Present so the suite can tell "survived a fault" from "the fault was a no-op".
 #[tokio::test]
 async fn a_clean_append_failure_leaves_no_trace() {
-    let db = store();
+    let db = store().await;
     let world: World = Arc::default();
 
     let faulty = Arc::new(Faulty::new(
@@ -300,7 +300,7 @@ async fn a_clean_append_failure_leaves_no_trace() {
 /// must not be "write anyway".
 #[tokio::test]
 async fn a_fenced_append_stops_the_run_rather_than_forcing_the_write() {
-    let db = store();
+    let db = store().await;
     let world: World = Arc::default();
 
     let faulty = Arc::new(Faulty::new(
@@ -332,7 +332,7 @@ async fn a_fenced_append_stops_the_run_rather_than_forcing_the_write() {
 async fn the_same_seed_injects_the_same_faults() {
     let mut runs = Vec::new();
     for _ in 0..2 {
-        let db = store();
+        let db = store().await;
         let world: World = Arc::default();
         let faulty = Arc::new(Faulty::new(
             db as Arc<dyn JournalStore>,

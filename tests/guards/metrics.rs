@@ -11,7 +11,7 @@
 //! *gauge* read from a `limit`-bounded query flattens exactly when the backlog
 //! becomes worth alerting on, and looks healthy while doing it.
 
-#![cfg(feature = "sqlite")]
+#![cfg(feature = "turso")]
 #![allow(clippy::disallowed_methods)]
 // Holding a `std::sync::Mutex` across an `.await` is normally a deadlock risk,
 // and here it is the point: the lock must span the whole run, because what it
@@ -30,7 +30,7 @@ use agentplane::core::{
 };
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{Runtime, StepCtx, metrics};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 use tracing::{Event, Metadata, Subscriber, span};
 
@@ -189,11 +189,11 @@ impl Skill for NeedsApproval {
     }
 }
 
-fn store() -> Arc<SqliteStore> {
-    Arc::new(SqliteStore::open_in_memory().unwrap())
+async fn store() -> Arc<TursoStore> {
+    Arc::new(TursoStore::open_in_memory().await.unwrap())
 }
 
-fn runtime(s: &Arc<SqliteStore>) -> Runtime {
+fn runtime(s: &Arc<TursoStore>) -> Runtime {
     Runtime::builder(Arc::clone(s) as Arc<dyn JournalStore>)
         .cases(Arc::clone(s) as Arc<dyn CaseStore>)
         .tasks(Arc::clone(s) as Arc<dyn TaskStore>)
@@ -211,7 +211,7 @@ fn t(secs: i64) -> Timestamp {
 #[tokio::test]
 async fn a_run_reports_its_outcome_and_its_effects() {
     let meter = Meter::default();
-    let db = store();
+    let db = store().await;
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(meter.clone());
     runtime(&db).run("ping", json!({})).await.unwrap();
@@ -238,7 +238,7 @@ async fn a_run_reports_its_outcome_and_its_effects() {
 /// attribution built on it is wrong in the safe-looking direction.
 #[tokio::test]
 async fn a_replayed_effect_is_counted_separately_from_a_performed_one() {
-    let db = store();
+    let db = store().await;
     let out = runtime(&db).run("ping", json!({})).await.unwrap();
 
     let meter = Meter::default();
@@ -270,7 +270,7 @@ async fn a_replayed_effect_is_counted_separately_from_a_performed_one() {
 /// a month, which is the difference between a healthy plane and a stuck one.
 #[tokio::test]
 async fn the_census_reports_open_cases_and_how_long_the_oldest_has_waited() {
-    let db = store();
+    let db = store().await;
     let rt = runtime(&db);
 
     let empty = rt.census(t(10_000)).await.unwrap();
@@ -300,7 +300,7 @@ async fn the_census_reports_open_cases_and_how_long_the_oldest_has_waited() {
 /// A closed case leaves the gauge, and the age follows the remaining oldest.
 #[tokio::test]
 async fn closing_a_case_moves_the_gauge_and_the_age_with_it() {
-    let db = store();
+    let db = store().await;
     let rt = runtime(&db);
 
     let old = db
@@ -330,7 +330,7 @@ async fn closing_a_case_moves_the_gauge_and_the_age_with_it() {
 /// a plateau rather than a backlog.
 #[tokio::test]
 async fn the_census_is_not_bounded_by_a_page_size() {
-    let db = store();
+    let db = store().await;
     let rt = runtime(&db);
     for i in 0..250 {
         db.correlate_or_open("bulk", &[CorrelationKey::new("n", i.to_string())], t(1_000))
@@ -342,7 +342,7 @@ async fn the_census_is_not_bounded_by_a_page_size() {
 
 #[tokio::test]
 async fn the_census_reports_humans_the_plane_is_waiting_on() {
-    let db = store();
+    let db = store().await;
     let rt = Runtime::builder(Arc::clone(&db) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&db) as Arc<dyn CaseStore>)
         .tasks(Arc::clone(&db) as Arc<dyn TaskStore>)
@@ -382,7 +382,7 @@ async fn the_census_reports_humans_the_plane_is_waiting_on() {
 /// stalled plane looks exactly like a quiet one on the dashboard.
 #[tokio::test]
 async fn a_sweep_emits_every_gauge() {
-    let db = store();
+    let db = store().await;
     db.correlate_or_open("k", &[CorrelationKey::new("k", "1")], t(1_000))
         .await
         .unwrap();
@@ -420,7 +420,7 @@ async fn a_sweep_emits_every_gauge() {
 #[tokio::test]
 async fn every_sample_matches_its_declaration() {
     let meter = Meter::default();
-    let db = store();
+    let db = store().await;
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(meter.clone());
     runtime(&db).run("ping", json!({})).await.unwrap();

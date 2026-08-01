@@ -14,7 +14,7 @@
 //!   tool ran, so the disposition must be `Landed` and the runtime must never
 //!   repeat it.
 
-#![cfg(all(feature = "mcp", feature = "sqlite"))]
+#![cfg(all(feature = "mcp", feature = "turso"))]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -351,11 +351,11 @@ async fn a_tool_call_carries_signed_provenance() {
         .clone()
         .expect("the server saw _meta");
     assert!(
-        meta.contains_key("agentplane.io/run_id"),
+        meta.contains_key("io.github.hupe1980.agentplane/run_id"),
         "the server received no provenance: {meta:?}"
     );
     assert!(
-        meta.contains_key("agentplane.io/attestation"),
+        meta.contains_key("io.github.hupe1980.agentplane/attestation"),
         "the block arrived unsigned, which is a claim rather than evidence: {meta:?}"
     );
 
@@ -406,9 +406,9 @@ async fn an_unsigned_block_still_correlates_but_does_not_attest() {
         .expect("call");
 
     let meta = seen.0.lock().unwrap().clone().expect("_meta");
-    assert!(meta.contains_key("agentplane.io/run_id"));
+    assert!(meta.contains_key("io.github.hupe1980.agentplane/run_id"));
     assert!(
-        !meta.contains_key("agentplane.io/attestation"),
+        !meta.contains_key("io.github.hupe1980.agentplane/attestation"),
         "a plane with no identity must not emit something that looks attested"
     );
 }
@@ -425,7 +425,7 @@ async fn no_provenance_means_no_meta() {
     let ours = meta
         .unwrap_or_default()
         .keys()
-        .filter(|k| k.starts_with("agentplane.io/"))
+        .filter(|k| k.starts_with("io.github.hupe1980.agentplane/"))
         .count();
     assert_eq!(ours, 0, "the client fabricated provenance nobody gave it");
 }

@@ -597,7 +597,7 @@ impl Append {
     ///
     /// Sealing a record is a store's job, so this has no callers in a build with
     /// no store compiled in.
-    #[cfg(any(feature = "sqlite", test))]
+    #[cfg(any(feature = "turso", test))]
     pub(crate) fn into_body(self, seq: Seq, epoch: Epoch) -> RecordBody {
         RecordBody {
             seq,

@@ -35,8 +35,8 @@ logic can be bypassed by the next caller, a constraint cannot.
 A second backend is where that stops being true, and the mechanism is worth being
 precise about. The new store is written from the same prose as the first. It
 encodes two guarantees exactly and something *nearly* like the third. Nothing
-catches it, because the suite that proves the runtime correct runs against
-SQLite, and the new store gets whatever tests its author wrote — which are the
+catches it, because the suite that proves the runtime correct runs against the
+embedded store, and the new one gets whatever tests its author wrote — which are the
 tests for the parts they were already thinking about. The invariant they misread
 is by construction the one with no test.
 
@@ -75,7 +75,7 @@ container tag is pinned in the test rather than inherited: the
 `testcontainers-modules` default is `postgres:11-alpine`, which has been end of
 life since November 2023, so the default would certify this backend against a
 release nobody should be running.
-Postgres settles several more cleanly than SQLite: `UPDATE … RETURNING` collapses
+Postgres settles several more cleanly than the embedded store: `UPDATE … RETURNING` collapses
 a read-then-write into one statement, so there is no window to reason about
 because there is no second statement.
 
@@ -95,8 +95,8 @@ found it; eight racers across four keys catches it on every run.
 * **A race check corroborates, it does not prove.** Passing means no interleaving
   found a violation; the constraint in the schema is what makes absence real.
 
-A store that serialises internally — SQLite behind one connection — passes
-trivially and correctly, having no race to lose.
+A store that serialises internally — the embedded store behind one connection —
+passes trivially and correctly, having no race to lose.
 
 ### Postgres
 

@@ -4,7 +4,7 @@
 //! is not the waiting — it is that the reply can arrive at *any* moment,
 //! including before the run reaches the wait at all.
 
-#![cfg(feature = "sqlite")]
+#![cfg(feature = "turso")]
 // Tests drive the runtime rather than run inside it, so establishing "now" here
 // is the harness doing its job, not a step smuggling non-determinism past the
 // journal.
@@ -20,7 +20,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -70,13 +70,13 @@ impl Skill for RequestAndWait {
 }
 
 struct Fixture {
-    store: Arc<SqliteStore>,
+    store: Arc<TursoStore>,
     rt: Runtime,
     sends: Arc<AtomicUsize>,
 }
 
-fn fixture(doc: &'static str) -> Fixture {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+async fn fixture(doc: &'static str) -> Fixture {
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let sends = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
@@ -98,7 +98,7 @@ fn reply(id: &str, doc: &str, body: Value) -> InboundEvent {
 /// A run that reaches a wait suspends, and delivery resumes it.
 #[tokio::test]
 async fn a_run_suspends_on_a_wait_and_resumes_on_delivery() {
-    let f = fixture("D-1");
+    let f = fixture("D-1").await;
 
     let out =
         f.rt.run_in_case("demo.request", json!({}), "matter", &[key("D-1")])
@@ -148,7 +148,7 @@ async fn a_run_suspends_on_a_wait_and_resumes_on_delivery() {
 /// would then wait forever for something that already happened.
 #[tokio::test]
 async fn an_event_arriving_before_the_wait_is_not_lost() {
-    let f = fixture("D-2");
+    let f = fixture("D-2").await;
 
     // Nothing is running yet.
     let delivery =
@@ -184,7 +184,7 @@ async fn an_event_arriving_before_the_wait_is_not_lost() {
 /// Retries are harmless: the same event id is delivered once.
 #[tokio::test]
 async fn duplicate_delivery_is_a_no_op() {
-    let f = fixture("D-3");
+    let f = fixture("D-3").await;
     f.rt.run_in_case("demo.request", json!({}), "matter", &[key("D-3")])
         .await
         .unwrap();
@@ -200,7 +200,7 @@ async fn duplicate_delivery_is_a_no_op() {
 /// An event for a different key does not satisfy someone else's wait.
 #[tokio::test]
 async fn events_are_matched_by_correlation_not_by_kind_alone() {
-    let f = fixture("D-4");
+    let f = fixture("D-4").await;
     let out =
         f.rt.run_in_case("demo.request", json!({}), "matter", &[key("D-4")])
             .await
@@ -224,7 +224,7 @@ async fn events_are_matched_by_correlation_not_by_kind_alone() {
 /// consume a single message.
 #[tokio::test]
 async fn an_event_is_delivered_to_exactly_one_waiter() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let sends = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
@@ -265,7 +265,7 @@ async fn an_event_is_delivered_to_exactly_one_waiter() {
 /// this" are different claims, and only the second is safe to act on.
 #[tokio::test]
 async fn unclaimed_events_are_dead_lettered_by_the_sweep_not_on_arrival() {
-    let f = fixture("D-6");
+    let f = fixture("D-6").await;
 
     let orphan = reply("EV-6", "NOBODY-WAITS-FOR-THIS", json!({}));
     assert_eq!(f.rt.deliver(&orphan).await.unwrap(), Delivery::Buffered);
@@ -290,7 +290,7 @@ async fn unclaimed_events_are_dead_lettered_by_the_sweep_not_on_arrival() {
 /// The sweep does not retire an event a run is actively waiting for.
 #[tokio::test]
 async fn the_sweep_leaves_claimed_events_alone() {
-    let f = fixture("D-7");
+    let f = fixture("D-7").await;
     f.rt.run_in_case("demo.request", json!({}), "matter", &[key("D-7")])
         .await
         .unwrap();
@@ -306,7 +306,7 @@ async fn the_sweep_leaves_claimed_events_alone() {
 /// A suspended run is not sealed: its chain is going to be extended.
 #[tokio::test]
 async fn a_suspended_run_is_not_sealed_and_records_why() {
-    let f = fixture("D-8");
+    let f = fixture("D-8").await;
     let out =
         f.rt.run_in_case("demo.request", json!({}), "matter", &[key("D-8")])
             .await
@@ -330,7 +330,7 @@ async fn a_suspended_run_is_not_sealed_and_records_why() {
 /// is read back from the journal like any other recorded effect.
 #[tokio::test]
 async fn a_resumed_run_replays_strictly() {
-    let f = fixture("D-9");
+    let f = fixture("D-9").await;
     let out =
         f.rt.run_in_case("demo.request", json!({}), "matter", &[key("D-9")])
             .await
@@ -379,7 +379,7 @@ async fn a_delivered_event_is_untrusted() {
         }
     }
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .events(store.clone() as Arc<dyn EventStore>)
@@ -421,7 +421,7 @@ async fn a_wait_without_a_registered_deadline_is_refused() {
         }
     }
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .events(store.clone() as Arc<dyn EventStore>)
@@ -442,7 +442,7 @@ async fn a_wait_without_a_registered_deadline_is_refused() {
 /// Delivery against a runtime with no event store is refused, not ignored.
 #[tokio::test]
 async fn delivery_without_an_event_store_is_refused() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>).build();
     let err = rt
         .deliver(&reply("EV-X", "D-X", json!({})))
@@ -455,7 +455,7 @@ async fn delivery_without_an_event_store_is_refused() {
 /// retired so the count can be alerted on.
 #[tokio::test]
 async fn the_sweep_reports_what_it_retired() {
-    let f = fixture("D-12");
+    let f = fixture("D-12").await;
     for i in 0..3 {
         f.rt.deliver(&reply(&format!("EV-{i}"), "ORPHAN", json!(i)))
             .await
@@ -471,7 +471,7 @@ async fn the_sweep_reports_what_it_retired() {
 /// A far-future grace window protects everything recently received.
 #[tokio::test]
 async fn the_grace_window_is_respected() {
-    let f = fixture("D-13");
+    let f = fixture("D-13").await;
     f.rt.deliver(&reply("EV-13", "ORPHAN", json!({})))
         .await
         .unwrap();
@@ -507,7 +507,7 @@ async fn waiting_without_an_event_store_is_refused() {
         }
     }
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     // Cases but no events: correlation and obligations work, waits do not.
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
@@ -548,7 +548,7 @@ async fn cases_do_not_require_an_event_store() {
         }
     }
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .skill(NoWait)
@@ -596,7 +596,7 @@ async fn a_wait_in_a_later_step_resumes_and_completes() {
         }
     }
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let sends = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)

@@ -1,4 +1,4 @@
-//! SQLite-backed inbound events.
+//! Inbound events.
 //!
 //! Claiming is the delicate part. Both directions — a wait looking for a
 //! buffered event, and an event looking for a waiter — run inside a transaction
@@ -7,7 +7,7 @@
 //! could resume two runs.
 
 use async_trait::async_trait;
-use rusqlite::{OptionalExtension, params};
+use turso::params;
 
 use crate::case::{BufferedEvent, EventStore};
 use crate::core::{
@@ -15,7 +15,7 @@ use crate::core::{
     Timestamp,
 };
 
-use super::sqlite::{SqliteStore, be};
+use super::turso::{TursoStore, be, first};
 
 pub(super) const EVENT_SCHEMA: &str = r"
 -- Every inbound event, stored on arrival whether or not anyone is waiting.
@@ -95,102 +95,100 @@ fn from_ts(v: i64) -> Result<Timestamp, StoreError> {
     })
 }
 
-fn load_correlation(
-    conn: &rusqlite::Connection,
+async fn load_correlation(
+    conn: &turso::Connection,
     event_id: &str,
 ) -> Result<Vec<CorrelationKey>, StoreError> {
-    let mut stmt = conn
-        .prepare(
+    let mut rows = conn
+        .query(
             "SELECT namespace, value FROM inbound_correlation
              WHERE event_id = ?1 ORDER BY namespace, value",
+            params![event_id.to_owned()],
         )
-        .map_err(|e| be(&e))?;
-    let rows = stmt
-        .query_map(params![event_id], |r| {
-            Ok(CorrelationKey::new(
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-            ))
-        })
+        .await
         .map_err(|e| be(&e))?;
     let mut out = Vec::new();
-    for r in rows {
-        out.push(r.map_err(|e| be(&e))?);
+    while let Some(r) = rows.next().await.map_err(|e| be(&e))? {
+        out.push(CorrelationKey::new(
+            r.get::<String>(0).map_err(|e| be(&e))?,
+            r.get::<String>(1).map_err(|e| be(&e))?,
+        ));
     }
     Ok(out)
 }
 
 #[async_trait]
-impl EventStore for SqliteStore {
+impl EventStore for TursoStore {
     async fn buffer(&self, event: &InboundEvent, at: Timestamp) -> Result<bool, StoreError> {
-        let e = event.clone();
-        self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|err| be(&err))?;
+        let mut conn = self.conn().await;
+        let tx = conn.transaction().await.map_err(|err| be(&err))?;
 
-            let seen: Option<i64> = tx
-                .query_row(
-                    "SELECT 1 FROM inbound_events WHERE event_id = ?1",
-                    params![e.id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|err| be(&err))?;
-            if seen.is_some() {
-                tx.commit().map_err(|err| be(&err))?;
-                return Ok(false);
-            }
-
-            tx.execute(
-                "INSERT INTO inbound_events (event_id, kind, payload, received_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![e.id, e.kind, serde_json::to_string(&e.payload)?, ts(at)],
+        let seen = tx
+            .query(
+                "SELECT 1 FROM inbound_events WHERE event_id = ?1",
+                params![event.id.clone()],
             )
+            .await
             .map_err(|err| be(&err))?;
+        if first(seen).await?.is_some() {
+            tx.commit().await.map_err(|err| be(&err))?;
+            return Ok(false);
+        }
 
-            for k in &e.correlation {
-                tx.execute(
-                    "INSERT INTO inbound_correlation (event_id, namespace, value)
-                     VALUES (?1, ?2, ?3)",
-                    params![e.id, k.namespace, k.value],
-                )
-                .map_err(|err| be(&err))?;
-            }
-
-            tx.commit().map_err(|err| be(&err))?;
-            Ok(true)
-        })
+        tx.execute(
+            "INSERT INTO inbound_events (event_id, kind, payload, received_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                event.id.clone(),
+                event.kind.clone(),
+                serde_json::to_string(&event.payload)?,
+                ts(at)
+            ],
+        )
         .await
+        .map_err(|err| be(&err))?;
+
+        for k in &event.correlation {
+            tx.execute(
+                "INSERT INTO inbound_correlation (event_id, namespace, value)
+                 VALUES (?1, ?2, ?3)",
+                params![event.id.clone(), k.namespace.clone(), k.value.clone()],
+            )
+            .await
+            .map_err(|err| be(&err))?;
+        }
+
+        tx.commit().await.map_err(|err| be(&err))?;
+        Ok(true)
     }
 
     async fn subscribe(&self, sub: &Subscription, at: Timestamp) -> Result<(), StoreError> {
-        let s = sub.clone();
-        self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|e| be(&e))?;
-            for k in &s.correlation {
-                tx.execute(
-                    "INSERT INTO subscriptions
-                       (run_id, effect_key, case_id, step, phase,
-                        event_kind, namespace, value, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT (run_id, effect_key, namespace, value) DO NOTHING",
-                    params![
-                        s.run.to_string(),
-                        s.effect.to_hex(),
-                        s.case.map(|c| c.to_string()),
-                        i64::from(s.step.0),
-                        phase_str(s.phase),
-                        s.kind,
-                        k.namespace,
-                        k.value,
-                        ts(at)
-                    ],
-                )
-                .map_err(|e| be(&e))?;
-            }
-            tx.commit().map_err(|e| be(&e))?;
-            Ok(())
-        })
-        .await
+        let mut conn = self.conn().await;
+        let tx = conn.transaction().await.map_err(|e| be(&e))?;
+        for k in &sub.correlation {
+            tx.execute(
+                "INSERT INTO subscriptions
+                   (run_id, effect_key, case_id, step, phase,
+                    event_kind, namespace, value, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT (run_id, effect_key, namespace, value) DO NOTHING",
+                params![
+                    sub.run.to_string(),
+                    sub.effect.to_hex(),
+                    sub.case.map(|c| c.to_string()),
+                    i64::from(sub.step.0),
+                    phase_str(sub.phase),
+                    sub.kind.clone(),
+                    k.namespace.clone(),
+                    k.value.clone(),
+                    ts(at)
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(())
     }
 
     async fn claim_for(
@@ -198,66 +196,77 @@ impl EventStore for SqliteStore {
         sub: &Subscription,
         at: Timestamp,
     ) -> Result<Option<BufferedEvent>, StoreError> {
-        let s = sub.clone();
-        self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|e| be(&e))?;
+        let mut conn = self.conn().await;
+        let tx = conn.transaction().await.map_err(|e| be(&e))?;
 
-            let mut found: Option<(String, String, i64)> = None;
-            for k in &s.correlation {
-                found = tx
-                    .query_row(
-                        "SELECT e.event_id, e.payload, e.received_at
-                         FROM inbound_events e
-                         JOIN inbound_correlation c ON c.event_id = e.event_id
-                         WHERE e.kind = ?1 AND c.namespace = ?2 AND c.value = ?3
-                           AND e.claimed_by IS NULL AND e.dead = 0
-                         ORDER BY e.received_at ASC LIMIT 1",
-                        params![s.kind, k.namespace, k.value],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                    )
-                    .optional()
-                    .map_err(|e| be(&e))?;
-                if found.is_some() {
-                    break;
-                }
-            }
-
-            let Some((event_id, payload, received)) = found else {
-                tx.commit().map_err(|e| be(&e))?;
-                return Ok(None);
-            };
-
-            // Claim in the same transaction that selected it: two runs waiting
-            // on one key must not both consume a single message.
-            tx.execute(
-                "UPDATE inbound_events SET claimed_by = ?2, claimed_at = ?3
-                 WHERE event_id = ?1 AND claimed_by IS NULL",
-                params![event_id, s.run.to_string(), ts(at)],
-            )
-            .map_err(|e| be(&e))?;
-
-            let correlation = load_correlation(&tx, &event_id)?;
-            let kind: String = tx
-                .query_row(
-                    "SELECT kind FROM inbound_events WHERE event_id = ?1",
-                    params![event_id],
-                    |r| r.get(0),
+        let mut found: Option<(String, String, i64)> = None;
+        for k in &sub.correlation {
+            let rows = tx
+                .query(
+                    "SELECT e.event_id, e.payload, e.received_at
+                     FROM inbound_events e
+                     JOIN inbound_correlation c ON c.event_id = e.event_id
+                     WHERE e.kind = ?1 AND c.namespace = ?2 AND c.value = ?3
+                       AND e.claimed_by IS NULL AND e.dead = 0
+                     ORDER BY e.received_at ASC LIMIT 1",
+                    params![sub.kind.clone(), k.namespace.clone(), k.value.clone()],
                 )
+                .await
                 .map_err(|e| be(&e))?;
+            if let Some(r) = first(rows).await? {
+                found = Some((
+                    r.get(0).map_err(|e| be(&e))?,
+                    r.get(1).map_err(|e| be(&e))?,
+                    r.get(2).map_err(|e| be(&e))?,
+                ));
+                break;
+            }
+        }
 
-            tx.commit().map_err(|e| be(&e))?;
+        let Some((event_id, payload, received)) = found else {
+            tx.commit().await.map_err(|e| be(&e))?;
+            return Ok(None);
+        };
 
-            Ok(Some(BufferedEvent {
-                event: InboundEvent {
-                    id: event_id,
-                    kind,
-                    correlation,
-                    payload: serde_json::from_str(&payload)?,
-                },
-                received_at: from_ts(received)?,
-            }))
-        })
+        // Claim in the same transaction that selected it: two runs waiting on
+        // one key must not both consume a single message.
+        tx.execute(
+            "UPDATE inbound_events SET claimed_by = ?2, claimed_at = ?3
+             WHERE event_id = ?1 AND claimed_by IS NULL",
+            params![event_id.clone(), sub.run.to_string(), ts(at)],
+        )
         .await
+        .map_err(|e| be(&e))?;
+
+        let correlation = load_correlation(&tx, &event_id).await?;
+        let rows = tx
+            .query(
+                "SELECT kind FROM inbound_events WHERE event_id = ?1",
+                params![event_id.clone()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let kind: String = match first(rows).await? {
+            Some(r) => r.get(0).map_err(|e| be(&e))?,
+            None => {
+                return Err(StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("event {event_id} vanished mid-claim"),
+                });
+            }
+        };
+
+        tx.commit().await.map_err(|e| be(&e))?;
+
+        Ok(Some(BufferedEvent {
+            event: InboundEvent {
+                id: event_id,
+                kind,
+                correlation,
+                payload: serde_json::from_str(&payload)?,
+            },
+            received_at: from_ts(received)?,
+        }))
     }
 
     async fn match_waiter(
@@ -265,103 +274,107 @@ impl EventStore for SqliteStore {
         event: &InboundEvent,
         at: Timestamp,
     ) -> Result<Option<Subscription>, StoreError> {
-        let e = event.clone();
-        self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|err| be(&err))?;
+        let mut conn = self.conn().await;
+        let tx = conn.transaction().await.map_err(|err| be(&err))?;
 
-            let mut found: Option<(String, String, Option<String>, i64, String)> = None;
-            for k in &e.correlation {
-                found = tx
-                    .query_row(
-                        "SELECT run_id, effect_key, case_id, step, phase FROM subscriptions
-                         WHERE event_kind = ?1 AND namespace = ?2 AND value = ?3
-                         ORDER BY created_at ASC LIMIT 1",
-                        params![e.kind, k.namespace, k.value],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                    )
-                    .optional()
-                    .map_err(|err| be(&err))?;
-                if found.is_some() {
-                    break;
-                }
-            }
-
-            let Some((run, effect, case, step, phase)) = found else {
-                tx.commit().map_err(|err| be(&err))?;
-                return Ok(None);
-            };
-
-            // Claim the event for this run in the same transaction, so one
-            // message cannot resume two runs.
-            let claimed = tx
-                .execute(
-                    "UPDATE inbound_events SET claimed_by = ?2, claimed_at = ?3
-                     WHERE event_id = ?1 AND claimed_by IS NULL AND dead = 0",
-                    params![e.id, run, ts(at)],
+        let mut found: Option<(String, String, Option<String>, i64, String)> = None;
+        for k in &event.correlation {
+            let rows = tx
+                .query(
+                    "SELECT run_id, effect_key, case_id, step, phase FROM subscriptions
+                     WHERE event_kind = ?1 AND namespace = ?2 AND value = ?3
+                     ORDER BY created_at ASC LIMIT 1",
+                    params![event.kind.clone(), k.namespace.clone(), k.value.clone()],
                 )
+                .await
                 .map_err(|err| be(&err))?;
-            if claimed == 0 {
-                // Someone else took it between the select and here.
-                tx.commit().map_err(|err| be(&err))?;
-                return Ok(None);
+            if let Some(r) = first(rows).await? {
+                found = Some((
+                    r.get(0).map_err(|e| be(&e))?,
+                    r.get(1).map_err(|e| be(&e))?,
+                    r.get(2).map_err(|e| be(&e))?,
+                    r.get(3).map_err(|e| be(&e))?,
+                    r.get(4).map_err(|e| be(&e))?,
+                ));
+                break;
             }
+        }
 
-            let correlation: Vec<CorrelationKey> = tx
-                .prepare(
-                    "SELECT namespace, value FROM subscriptions
-                     WHERE run_id = ?1 AND effect_key = ?2 ORDER BY namespace, value",
-                )
-                .and_then(|mut st| {
-                    st.query_map(params![run, effect], |r| {
-                        Ok(CorrelationKey::new(
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                        ))
-                    })
-                    .and_then(std::iter::Iterator::collect)
-                })
-                .map_err(|err| be(&err))?;
+        let Some((run, effect, case, step, phase)) = found else {
+            tx.commit().await.map_err(|err| be(&err))?;
+            return Ok(None);
+        };
 
-            tx.commit().map_err(|err| be(&err))?;
+        // Claim the event for this run in the same transaction, so one message
+        // cannot resume two runs.
+        let claimed = tx
+            .execute(
+                "UPDATE inbound_events SET claimed_by = ?2, claimed_at = ?3
+                 WHERE event_id = ?1 AND claimed_by IS NULL AND dead = 0",
+                params![event.id.clone(), run.clone(), ts(at)],
+            )
+            .await
+            .map_err(|err| be(&err))?;
+        if claimed == 0 {
+            // Someone else took it between the select and here.
+            tx.commit().await.map_err(|err| be(&err))?;
+            return Ok(None);
+        }
 
-            let case = case
-                .map(|c| {
-                    CaseId::parse(&c).map_err(|err| StoreError::Corrupt {
-                        seq: 0,
-                        detail: format!("bad case id '{c}': {err}"),
-                    })
-                })
-                .transpose()?;
+        let mut rows = tx
+            .query(
+                "SELECT namespace, value FROM subscriptions
+                 WHERE run_id = ?1 AND effect_key = ?2 ORDER BY namespace, value",
+                params![run.clone(), effect.clone()],
+            )
+            .await
+            .map_err(|err| be(&err))?;
+        let mut correlation: Vec<CorrelationKey> = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|err| be(&err))? {
+            correlation.push(CorrelationKey::new(
+                r.get::<String>(0).map_err(|e| be(&e))?,
+                r.get::<String>(1).map_err(|e| be(&e))?,
+            ));
+        }
+        drop(rows);
 
-            Ok(Some(Subscription {
-                run: RunId::parse(&run).map_err(|err| StoreError::Corrupt {
+        tx.commit().await.map_err(|err| be(&err))?;
+
+        let case = case
+            .map(|c| {
+                CaseId::parse(&c).map_err(|err| StoreError::Corrupt {
                     seq: 0,
-                    detail: format!("bad run id '{run}': {err}"),
-                })?,
-                case,
-                effect: EffectKey::from_hex(&effect).map_err(|err| StoreError::Corrupt {
-                    seq: 0,
-                    detail: format!("bad effect key '{effect}': {err}"),
-                })?,
-                step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
-                phase: phase_from(&phase),
-                kind: e.kind.clone(),
-                correlation,
-            }))
-        })
-        .await
+                    detail: format!("bad case id '{c}': {err}"),
+                })
+            })
+            .transpose()?;
+
+        Ok(Some(Subscription {
+            run: RunId::parse(&run).map_err(|err| StoreError::Corrupt {
+                seq: 0,
+                detail: format!("bad run id '{run}': {err}"),
+            })?,
+            case,
+            effect: EffectKey::from_hex(&effect).map_err(|err| StoreError::Corrupt {
+                seq: 0,
+                detail: format!("bad effect key '{effect}': {err}"),
+            })?,
+            step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
+            phase: phase_from(&phase),
+            kind: event.kind.clone(),
+            correlation,
+        }))
     }
 
     async fn unsubscribe(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError> {
-        self.with_conn(move |conn| {
-            conn.execute(
-                "DELETE FROM subscriptions WHERE run_id = ?1 AND effect_key = ?2",
-                params![run.to_string(), effect.to_hex()],
-            )
-            .map_err(|e| be(&e))?;
-            Ok(())
-        })
+        let conn = self.conn().await;
+        conn.execute(
+            "DELETE FROM subscriptions WHERE run_id = ?1 AND effect_key = ?2",
+            params![run.to_string(), effect.to_hex()],
+        )
         .await
+        .map_err(|e| be(&e))?;
+        Ok(())
     }
 
     async fn sweep_unclaimed(
@@ -369,117 +382,107 @@ impl EventStore for SqliteStore {
         older_than: Timestamp,
         reason: &str,
     ) -> Result<usize, StoreError> {
-        let reason = reason.to_owned();
-        self.with_conn(move |conn| {
-            let n = conn
-                .execute(
-                    // `<=`, not `<`: a zero grace window must retire everything
-                    // already buffered. With second-granularity timestamps, `<`
-                    // silently spares anything received in the current second.
-                    "UPDATE inbound_events SET dead = 1, dead_reason = ?2
-                     WHERE claimed_by IS NULL AND dead = 0 AND received_at <= ?1",
-                    params![ts(older_than), reason],
-                )
-                .map_err(|e| be(&e))?;
-            Ok(n)
-        })
-        .await
+        let conn = self.conn().await;
+        let n = conn
+            .execute(
+                // `<=`, not `<`: a zero grace window must retire everything
+                // already buffered. With second-granularity timestamps, `<`
+                // silently spares anything received in the current second.
+                "UPDATE inbound_events SET dead = 1, dead_reason = ?2
+                 WHERE claimed_by IS NULL AND dead = 0 AND received_at <= ?1",
+                params![ts(older_than), reason.to_owned()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(usize::try_from(n).unwrap_or(usize::MAX))
     }
 
     async fn dead_letters(&self, limit: usize) -> Result<Vec<DeadLetter>, StoreError> {
-        self.with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT event_id, kind, payload, received_at, dead_reason
-                     FROM inbound_events WHERE dead = 1
-                     ORDER BY received_at DESC LIMIT ?1",
-                )
-                .map_err(|e| be(&e))?;
-            let rows = stmt
-                .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, Option<String>>(4)?,
-                    ))
-                })
-                .map_err(|e| be(&e))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| be(&e))?;
+        let conn = self.conn().await;
+        let mut rows = conn
+            .query(
+                "SELECT event_id, kind, payload, received_at, dead_reason
+                 FROM inbound_events WHERE dead = 1
+                 ORDER BY received_at DESC LIMIT ?1",
+                params![i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await
+            .map_err(|e| be(&e))?;
 
-            let mut out = Vec::new();
-            for (id, kind, payload, received, reason) in rows {
-                let correlation = load_correlation(conn, &id)?;
-                out.push(DeadLetter {
-                    event: InboundEvent {
-                        id,
-                        kind,
-                        correlation,
-                        payload: serde_json::from_str(&payload)?,
-                    },
-                    received_at: from_ts(received)?,
-                    reason: reason.unwrap_or_else(|| "unclaimed".into()),
-                });
-            }
-            Ok(out)
-        })
-        .await
+        let mut raw = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|e| be(&e))? {
+            raw.push((
+                r.get::<String>(0).map_err(|e| be(&e))?,
+                r.get::<String>(1).map_err(|e| be(&e))?,
+                r.get::<String>(2).map_err(|e| be(&e))?,
+                r.get::<i64>(3).map_err(|e| be(&e))?,
+                r.get::<Option<String>>(4).map_err(|e| be(&e))?,
+            ));
+        }
+        drop(rows);
+
+        let mut out = Vec::new();
+        for (id, kind, payload, received, reason) in raw {
+            let correlation = load_correlation(&conn, &id).await?;
+            out.push(DeadLetter {
+                event: InboundEvent {
+                    id,
+                    kind,
+                    correlation,
+                    payload: serde_json::from_str(&payload)?,
+                },
+                received_at: from_ts(received)?,
+                reason: reason.unwrap_or_else(|| "unclaimed".into()),
+            });
+        }
+        Ok(out)
     }
 
     async fn waiting(&self, limit: usize) -> Result<Vec<Subscription>, StoreError> {
-        self.with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT run_id, effect_key, event_kind, namespace, value, case_id, step, phase
-                     FROM subscriptions ORDER BY created_at ASC LIMIT ?1",
-                )
-                .map_err(|e| be(&e))?;
-            let rows = stmt
-                .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                        r.get::<_, i64>(6)?,
-                        r.get::<_, String>(7)?,
-                    ))
-                })
-                .map_err(|e| be(&e))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| be(&e))?;
+        let conn = self.conn().await;
+        let mut rows = conn
+            .query(
+                "SELECT run_id, effect_key, event_kind, namespace, value, case_id, step, phase
+                 FROM subscriptions ORDER BY created_at ASC LIMIT ?1",
+                params![i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await
+            .map_err(|e| be(&e))?;
 
-            let mut out = Vec::new();
-            for (run, effect, kind, ns, v, case, step, phase) in rows {
-                out.push(Subscription {
-                    run: RunId::parse(&run).map_err(|e| StoreError::Corrupt {
-                        seq: 0,
-                        detail: format!("bad run id '{run}': {e}"),
-                    })?,
-                    case: case
-                        .map(|c| {
-                            CaseId::parse(&c).map_err(|e| StoreError::Corrupt {
-                                seq: 0,
-                                detail: format!("bad case id '{c}': {e}"),
-                            })
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|e| be(&e))? {
+            let run: String = r.get(0).map_err(|e| be(&e))?;
+            let effect: String = r.get(1).map_err(|e| be(&e))?;
+            let kind: String = r.get(2).map_err(|e| be(&e))?;
+            let ns: String = r.get(3).map_err(|e| be(&e))?;
+            let v: String = r.get(4).map_err(|e| be(&e))?;
+            let case: Option<String> = r.get(5).map_err(|e| be(&e))?;
+            let step: i64 = r.get(6).map_err(|e| be(&e))?;
+            let phase: String = r.get(7).map_err(|e| be(&e))?;
+
+            out.push(Subscription {
+                run: RunId::parse(&run).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("bad run id '{run}': {e}"),
+                })?,
+                case: case
+                    .map(|c| {
+                        CaseId::parse(&c).map_err(|e| StoreError::Corrupt {
+                            seq: 0,
+                            detail: format!("bad case id '{c}': {e}"),
                         })
-                        .transpose()?,
-                    effect: EffectKey::from_hex(&effect).map_err(|e| StoreError::Corrupt {
-                        seq: 0,
-                        detail: format!("bad effect key '{effect}': {e}"),
-                    })?,
-                    step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
-                    phase: phase_from(&phase),
-                    kind,
-                    correlation: vec![CorrelationKey::new(ns, v)],
-                });
-            }
-            Ok(out)
-        })
-        .await
+                    })
+                    .transpose()?,
+                effect: EffectKey::from_hex(&effect).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("bad effect key '{effect}': {e}"),
+                })?,
+                step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
+                phase: phase_from(&phase),
+                kind,
+                correlation: vec![CorrelationKey::new(ns, v)],
+            });
+        }
+        Ok(out)
     }
 }

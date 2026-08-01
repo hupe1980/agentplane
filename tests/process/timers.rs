@@ -10,7 +10,7 @@
 //! replayed next year, because the instant is a recorded fact rather than a
 //! formula re-evaluated on every replay.
 
-#![cfg(feature = "sqlite")]
+#![cfg(feature = "turso")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 
 /// Sleeps, then records that it woke. The counter is how many times the *work
@@ -54,13 +54,13 @@ impl Skill for Sleeps {
 }
 
 struct Fixture {
-    store: Arc<SqliteStore>,
+    store: Arc<TursoStore>,
     rt: Runtime,
     woke: Arc<AtomicUsize>,
 }
 
-fn fixture(how_long: Duration) -> Fixture {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+async fn fixture(how_long: Duration) -> Fixture {
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let woke = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .owner("test")
@@ -84,7 +84,7 @@ fn later(secs: i64) -> Timestamp {
 /// A sleeping run is a row, not a thread.
 #[tokio::test]
 async fn a_sleeping_run_suspends_and_holds_nothing() {
-    let f = fixture(Duration::from_hours(1));
+    let f = fixture(Duration::from_hours(1)).await;
 
     let out = f.rt.run("demo.sleep", json!({})).await.unwrap();
 
@@ -109,7 +109,7 @@ async fn a_sleeping_run_suspends_and_holds_nothing() {
 /// in-process wait that a restart would forget.
 #[tokio::test]
 async fn sleeping_without_a_timer_store_is_refused() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .skill(Sleeps {
             how_long: Duration::from_mins(1),
@@ -129,7 +129,7 @@ async fn sleeping_without_a_timer_store_is_refused() {
 /// **The loop.** The instant arrives, the sweep wakes the run, and it finishes.
 #[tokio::test]
 async fn a_sweep_wakes_a_run_whose_instant_arrived() {
-    let f = fixture(Duration::from_mins(1));
+    let f = fixture(Duration::from_mins(1)).await;
 
     let out = f.rt.run("demo.sleep", json!({})).await.unwrap();
     assert!(out.status.is_suspended());
@@ -168,7 +168,7 @@ async fn a_sweep_wakes_a_run_whose_instant_arrived() {
 /// same reason.
 #[tokio::test]
 async fn a_timer_fires_exactly_once_across_two_sweeps() {
-    let f = fixture(Duration::from_mins(1));
+    let f = fixture(Duration::from_mins(1)).await;
     let out = f.rt.run("demo.sleep", json!({})).await.unwrap();
     assert!(out.status.is_suspended());
 
@@ -188,7 +188,7 @@ async fn a_timer_fires_exactly_once_across_two_sweeps() {
 /// clock working.
 #[tokio::test]
 async fn a_fired_timer_is_reported_but_is_not_an_incident() {
-    let f = fixture(Duration::from_mins(1));
+    let f = fixture(Duration::from_mins(1)).await;
     f.rt.run("demo.sleep", json!({})).await.unwrap();
 
     let report =
@@ -210,7 +210,7 @@ async fn a_fired_timer_is_reported_but_is_not_an_incident() {
 /// recomputing `now + duration`, which would move the instant every time.
 #[tokio::test]
 async fn the_wake_instant_is_journaled_not_recomputed() {
-    let f = fixture(Duration::from_mins(1));
+    let f = fixture(Duration::from_mins(1)).await;
     let out = f.rt.run("demo.sleep", json!({})).await.unwrap();
 
     let armed = f.rt.timers().unwrap().pending(10).await.unwrap();
@@ -244,7 +244,7 @@ async fn the_wake_instant_is_journaled_not_recomputed() {
 /// the sweep noticed.
 #[tokio::test]
 async fn a_late_sweep_records_the_due_instant_not_its_own() {
-    let f = fixture(Duration::from_mins(1));
+    let f = fixture(Duration::from_mins(1)).await;
     let out = f.rt.run("demo.sleep", json!({})).await.unwrap();
     let due = f.rt.timers().unwrap().pending(10).await.unwrap()[0].fire_at;
 
@@ -266,7 +266,7 @@ async fn a_late_sweep_records_the_due_instant_not_its_own() {
 /// A completed sleep replays without sleeping again.
 #[tokio::test]
 async fn replay_reads_the_sleep_back_instead_of_sleeping_again() {
-    let f = fixture(Duration::from_mins(1));
+    let f = fixture(Duration::from_mins(1)).await;
     let first = f.rt.run("demo.sleep", json!({})).await.unwrap();
     f.rt.fire_timers(later(120)).await.unwrap();
     assert_eq!(f.woke.load(Ordering::SeqCst), 1);
@@ -284,7 +284,7 @@ async fn replay_reads_the_sleep_back_instead_of_sleeping_again() {
 /// — which would reset the clock on every replay and the run would never wake.
 #[tokio::test]
 async fn replaying_a_sleeping_run_does_not_reset_its_clock() {
-    let f = fixture(Duration::from_mins(1));
+    let f = fixture(Duration::from_mins(1)).await;
     let out = f.rt.run("demo.sleep", json!({})).await.unwrap();
     let armed = f.rt.timers().unwrap().pending(10).await.unwrap();
     let original = armed[0].fire_at;
@@ -313,7 +313,7 @@ async fn replaying_a_sleeping_run_does_not_reset_its_clock() {
 async fn claiming_a_due_timer_excludes_a_second_claimant() {
     use agentplane::core::{EffectKey, Phase, RunId, StepId, Timer};
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let run = RunId::generate();
     let descriptor =
         agentplane::core::EffectDescriptor::new("timer.sleep", json!({ "until": 1_000 }));
@@ -349,7 +349,7 @@ async fn claiming_a_due_timer_excludes_a_second_claimant() {
 async fn arming_the_same_timer_twice_leaves_one() {
     use agentplane::core::{EffectKey, Phase, RunId, StepId, Timer};
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let run = RunId::generate();
     let descriptor =
         agentplane::core::EffectDescriptor::new("timer.sleep", json!({ "until": 1_000 }));
@@ -379,7 +379,7 @@ async fn arming_the_same_timer_twice_leaves_one() {
 async fn an_abandoned_claim_is_reclaimed_rather_than_stranding_the_run() {
     use agentplane::core::{EffectKey, Phase, RunId, StepId, Timer};
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let run = RunId::generate();
     let descriptor =
         agentplane::core::EffectDescriptor::new("timer.sleep", json!({ "until": 1_000 }));
@@ -459,7 +459,7 @@ async fn two_concurrent_siblings_can_both_sleep() {
         }
     }
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .owner("test")
         .timers(store.clone() as Arc<dyn TimerStore>)

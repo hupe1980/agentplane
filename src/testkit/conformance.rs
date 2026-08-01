@@ -7,10 +7,11 @@
 //! logic — they are storage invariants, deliberately, because application logic
 //! can be bypassed by the next caller and a constraint cannot.
 //!
-//! A second backend is exactly where that stops being true. The `SQLite` store
+//! A second backend is exactly where that stops being true. The embedded store
 //! encodes all three; a Postgres store written from the same prose will encode
 //! two of them and something *nearly* the third, and nothing will notice,
-//! because the suite that proves the runtime correct runs against `SQLite`. The
+//! because the suite that proves the runtime correct runs against the embedded
+//! store. The
 //! new backend gets whatever tests its author remembered to write, and those
 //! will be the ones they were already thinking about.
 //!
@@ -89,7 +90,7 @@ pub type Factory<'a> =
 const LEASE: Duration = Duration::from_mins(5);
 /// The shortest lease a store is obliged to honour.
 ///
-/// A zero TTL is not usable: `SQLite` clamps it to a second, and any backend is
+/// A zero TTL is not usable: the embedded store clamps it to a second, and any backend is
 /// free to, because a lease that expires the instant it is granted is not a
 /// lease. So the fencing check takes the short one and *waits* — the only way to
 /// reach an expired lease through the public API, and therefore the only way a

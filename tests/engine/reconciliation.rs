@@ -15,7 +15,7 @@
 //! re-performing it, one that says "it never landed" permits an ordinary retry,
 //! and one that cannot tell leaves the run exactly where it was — escalated.
 
-#![cfg(feature = "sqlite")]
+#![cfg(feature = "turso")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{Append, JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 
 /// What the provider will say when asked.
@@ -133,15 +133,15 @@ impl Skill for Pay {
 }
 
 struct Fixture {
-    store: Arc<SqliteStore>,
+    store: Arc<TursoStore>,
     rt: Runtime,
     calls: Arc<AtomicUsize>,
     probes: Arc<AtomicUsize>,
 }
 
-fn fixture(probe: Probe) -> Fixture {
+async fn fixture(probe: Probe) -> Fixture {
     let (calls, probes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .owner("test")
         .skill(Pay(Payment::new(probe, &calls, &probes)))
@@ -174,7 +174,7 @@ fn reconciliations(records: &[agentplane::journal::Record]) -> Vec<Disposition> 
 /// recovered result and nothing is sent twice.
 #[tokio::test]
 async fn a_probe_that_finds_it_landed_completes_the_effect_without_repeating_it() {
-    let f = fixture(Probe::SaysItLanded);
+    let f = fixture(Probe::SaysItLanded).await;
 
     let out = f.rt.run("demo.pay", json!({})).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -193,7 +193,7 @@ async fn a_probe_that_finds_it_landed_completes_the_effect_without_repeating_it(
 #[tokio::test]
 async fn a_probe_that_finds_it_never_landed_permits_a_retry() {
     let (calls, probes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     // Attempt 1 times out; the probe says nothing landed; attempt 2 succeeds.
     let mut effect = Payment::new(Probe::SaysItDidNot, &calls, &probes);
     effect.succeeds = false;
@@ -225,7 +225,7 @@ async fn a_probe_that_finds_it_never_landed_permits_a_retry() {
 /// would have been without one — the doubt survived being asked about.
 #[tokio::test]
 async fn a_probe_that_cannot_tell_still_escalates() {
-    let f = fixture(Probe::CannotTell);
+    let f = fixture(Probe::CannotTell).await;
 
     let out = f.rt.run("demo.pay", json!({})).await.unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1, "never sent twice");
@@ -242,7 +242,7 @@ async fn a_probe_that_cannot_tell_still_escalates() {
 /// A probe that is itself unreachable is not an excuse to guess.
 #[tokio::test]
 async fn an_unreachable_probe_escalates_rather_than_assuming() {
-    let f = fixture(Probe::Unreachable);
+    let f = fixture(Probe::Unreachable).await;
 
     let out = f.rt.run("demo.pay", json!({})).await.unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
@@ -264,7 +264,7 @@ async fn the_verdict_is_journaled_even_when_it_resolves_nothing() {
         (Probe::CannotTell, Disposition::InDoubt),
         (Probe::Unreachable, Disposition::InDoubt),
     ] {
-        let f = fixture(probe);
+        let f = fixture(probe).await;
         let out = f.rt.run("demo.pay", json!({})).await.unwrap();
         let records = f.store.read(out.run_id, 1).await.unwrap();
         assert_eq!(
@@ -279,7 +279,7 @@ async fn the_verdict_is_journaled_even_when_it_resolves_nothing() {
 /// go and discover the endpoint was down.
 #[tokio::test]
 async fn a_failed_probe_records_why() {
-    let f = fixture(Probe::Unreachable);
+    let f = fixture(Probe::Unreachable).await;
     let out = f.rt.run("demo.pay", json!({})).await.unwrap();
     let records = f.store.read(out.run_id, 1).await.unwrap();
 
@@ -299,7 +299,7 @@ async fn a_failed_probe_records_why() {
 /// rather than asking again.
 #[tokio::test]
 async fn replay_reads_the_verdict_back_instead_of_probing_again() {
-    let f = fixture(Probe::SaysItLanded);
+    let f = fixture(Probe::SaysItLanded).await;
 
     let first = f.rt.run("demo.pay", json!({})).await.unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
@@ -322,7 +322,7 @@ async fn replay_reads_the_verdict_back_instead_of_probing_again() {
 /// and resolves the same way.
 #[tokio::test]
 async fn a_crash_orphan_is_resolved_by_the_probe_rather_than_escalated() {
-    let f = fixture(Probe::SaysItLanded);
+    let f = fixture(Probe::SaysItLanded).await;
 
     let run = RunId::generate();
     let plan = PlanIR::single("demo.pay");
@@ -398,7 +398,7 @@ async fn a_crash_orphan_is_resolved_by_the_probe_rather_than_escalated() {
 /// thing it checks is worse than no check.
 #[tokio::test]
 async fn strict_replay_of_an_orphan_neither_performs_nor_probes_nor_writes() {
-    let f = fixture(Probe::SaysItLanded);
+    let f = fixture(Probe::SaysItLanded).await;
 
     let run = RunId::generate();
     let plan = PlanIR::single("demo.pay");

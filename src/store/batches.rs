@@ -1,12 +1,12 @@
-//! SQLite-backed batch state.
+//! Batch state.
 
 use async_trait::async_trait;
-use rusqlite::{OptionalExtension, params};
+use turso::params;
 
 use crate::batch::{BatchCensus, BatchStore, ItemOutcome, ItemRecord};
 use crate::core::{BatchId, RunId, Spend, StoreError};
 
-use super::sqlite::{SqliteStore, be};
+use super::turso::{TursoStore, be, first};
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS batches (
@@ -58,46 +58,44 @@ fn outcome_from_row(s: Option<String>, detail: Option<String>) -> Option<ItemOut
 }
 
 #[async_trait]
-impl BatchStore for SqliteStore {
+impl BatchStore for TursoStore {
     async fn open(&self, id: BatchId, plan_digest: &str) -> Result<(), StoreError> {
-        let digest = plan_digest.to_owned();
-        self.with_conn(move |conn| {
-            conn.execute(
-                "INSERT INTO batches (batch_id, plan_digest) VALUES (?1, ?2)
-                 ON CONFLICT (batch_id) DO NOTHING",
-                params![id.to_string(), digest],
-            )
-            .map_err(|e| be(&e))?;
-            Ok(())
-        })
+        let conn = self.conn().await;
+        conn.execute(
+            "INSERT INTO batches (batch_id, plan_digest) VALUES (?1, ?2)
+             ON CONFLICT (batch_id) DO NOTHING",
+            params![id.to_string(), plan_digest.to_owned()],
+        )
         .await
+        .map_err(|e| be(&e))?;
+        Ok(())
     }
 
     async fn mark_exhausted(&self, id: BatchId) -> Result<(), StoreError> {
-        self.with_conn(move |conn| {
-            conn.execute(
-                "UPDATE batches SET exhausted = 1 WHERE batch_id = ?1",
-                params![id.to_string()],
-            )
-            .map_err(|e| be(&e))?;
-            Ok(())
-        })
+        let conn = self.conn().await;
+        conn.execute(
+            "UPDATE batches SET exhausted = 1 WHERE batch_id = ?1",
+            params![id.to_string()],
+        )
         .await
+        .map_err(|e| be(&e))?;
+        Ok(())
     }
 
     async fn is_exhausted(&self, id: BatchId) -> Result<bool, StoreError> {
-        self.with_conn(move |conn| {
-            let v: Option<i64> = conn
-                .query_row(
-                    "SELECT exhausted FROM batches WHERE batch_id = ?1",
-                    params![id.to_string()],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|e| be(&e))?;
-            Ok(v.unwrap_or(0) != 0)
-        })
-        .await
+        let conn = self.conn().await;
+        let rows = conn
+            .query(
+                "SELECT exhausted FROM batches WHERE batch_id = ?1",
+                params![id.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let v: Option<i64> = match first(rows).await? {
+            Some(r) => r.get(0).map_err(|e| be(&e))?,
+            None => None,
+        };
+        Ok(v.unwrap_or(0) != 0)
     }
 
     async fn reserve(
@@ -106,49 +104,49 @@ impl BatchStore for SqliteStore {
         key: &str,
         run: RunId,
     ) -> Result<ItemRecord, StoreError> {
-        let k = key.to_owned();
-        self.with_conn(move |conn| {
-            // `DO NOTHING` then read back, rather than an upsert: if this item
-            // was already reserved, the caller must get the *original* run id.
-            // Overwriting it would orphan the first run's journal and re-perform
-            // its effects, which is the one thing this row exists to prevent.
-            conn.execute(
-                "INSERT INTO batch_items (batch_id, item_key, run_id)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT (batch_id, item_key) DO NOTHING",
-                params![batch.to_string(), k, run.to_string()],
-            )
-            .map_err(|e| be(&e))?;
-
-            let (run_s, outcome, detail, tokens, minor): (
-                String,
-                Option<String>,
-                Option<String>,
-                i64,
-                i64,
-            ) = conn
-                .query_row(
-                    "SELECT run_id, outcome, detail, tokens, minor FROM batch_items
-                      WHERE batch_id = ?1 AND item_key = ?2",
-                    params![batch.to_string(), k],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                )
-                .map_err(|e| be(&e))?;
-
-            Ok(ItemRecord {
-                key: k,
-                run: RunId::parse(&run_s).map_err(|e| StoreError::Corrupt {
-                    seq: 0,
-                    detail: format!("bad run id '{run_s}': {e}"),
-                })?,
-                outcome: outcome_from_row(outcome, detail),
-                spend: Spend {
-                    tokens: u64::try_from(tokens).unwrap_or(0),
-                    minor_units: minor,
-                },
-            })
-        })
+        let conn = self.conn().await;
+        // `DO NOTHING` then read back, rather than an upsert: if this item was
+        // already reserved, the caller must get the *original* run id.
+        // Overwriting it would orphan the first run's journal and re-perform its
+        // effects, which is the one thing this row exists to prevent.
+        conn.execute(
+            "INSERT INTO batch_items (batch_id, item_key, run_id)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (batch_id, item_key) DO NOTHING",
+            params![batch.to_string(), key.to_owned(), run.to_string()],
+        )
         .await
+        .map_err(|e| be(&e))?;
+
+        let rows = conn
+            .query(
+                "SELECT run_id, outcome, detail, tokens, minor FROM batch_items
+                  WHERE batch_id = ?1 AND item_key = ?2",
+                params![batch.to_string(), key.to_owned()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let Some(r) = first(rows).await? else {
+            return Err(StoreError::NotFound(format!("{batch}/{key}")));
+        };
+        let run_s: String = r.get(0).map_err(|e| be(&e))?;
+        let outcome: Option<String> = r.get(1).map_err(|e| be(&e))?;
+        let detail: Option<String> = r.get(2).map_err(|e| be(&e))?;
+        let tokens: i64 = r.get(3).map_err(|e| be(&e))?;
+        let minor: i64 = r.get(4).map_err(|e| be(&e))?;
+
+        Ok(ItemRecord {
+            key: key.to_owned(),
+            run: RunId::parse(&run_s).map_err(|e| StoreError::Corrupt {
+                seq: 0,
+                detail: format!("bad run id '{run_s}': {e}"),
+            })?,
+            outcome: outcome_from_row(outcome, detail),
+            spend: Spend {
+                tokens: u64::try_from(tokens).unwrap_or(0),
+                minor_units: minor,
+            },
+        })
     }
 
     async fn record(
@@ -158,158 +156,141 @@ impl BatchStore for SqliteStore {
         outcome: &ItemOutcome,
         spend: Spend,
     ) -> Result<(), StoreError> {
-        let k = key.to_owned();
         let (state, detail) = outcome_to_row(outcome);
-        self.with_conn(move |conn| {
-            conn.execute(
-                "UPDATE batch_items
-                    SET outcome = ?3, detail = ?4, tokens = ?5, minor = ?6
-                  WHERE batch_id = ?1 AND item_key = ?2",
-                params![
-                    batch.to_string(),
-                    k,
-                    state,
-                    detail,
-                    i64::try_from(spend.tokens).unwrap_or(i64::MAX),
-                    spend.minor_units,
-                ],
-            )
-            .map_err(|e| be(&e))?;
-            Ok(())
-        })
+        let conn = self.conn().await;
+        conn.execute(
+            "UPDATE batch_items
+                SET outcome = ?3, detail = ?4, tokens = ?5, minor = ?6
+              WHERE batch_id = ?1 AND item_key = ?2",
+            params![
+                batch.to_string(),
+                key.to_owned(),
+                state,
+                detail,
+                i64::try_from(spend.tokens).unwrap_or(i64::MAX),
+                spend.minor_units,
+            ],
+        )
         .await
+        .map_err(|e| be(&e))?;
+        Ok(())
     }
 
     async fn cursor(&self, batch: BatchId) -> Result<Option<String>, StoreError> {
-        self.with_conn(move |conn| {
-            // The contiguous terminal prefix: the highest key such that every
-            // item up to and including it is terminal.
-            //
-            // Expressed as "the last key before the first non-terminal one",
-            // because taking MAX over terminal items would step over a suspended
-            // item sitting behind finished ones — and a resume that skips a
-            // waiting item reports the batch complete while it is not.
-            let first_open: Option<String> = conn
-                .query_row(
-                    "SELECT MIN(item_key) FROM batch_items
-                      WHERE batch_id = ?1
-                        AND (outcome IS NULL OR outcome = 'suspended')",
-                    params![batch.to_string()],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|e| be(&e))?
-                .flatten();
+        let conn = self.conn().await;
+        // The contiguous terminal prefix: the highest key such that every item
+        // up to and including it is terminal.
+        //
+        // Expressed as "the last key before the first non-terminal one", because
+        // taking MAX over terminal items would step over a suspended item
+        // sitting behind finished ones — and a resume that skips a waiting item
+        // reports the batch complete while it is not.
+        let rows = conn
+            .query(
+                "SELECT MIN(item_key) FROM batch_items
+                  WHERE batch_id = ?1
+                    AND (outcome IS NULL OR outcome = 'suspended')",
+                params![batch.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let first_open: Option<String> = match first(rows).await? {
+            Some(r) => r.get(0).map_err(|e| be(&e))?,
+            None => None,
+        };
 
-            let cursor: Option<String> = match first_open {
-                Some(open) => conn
-                    .query_row(
-                        "SELECT MAX(item_key) FROM batch_items
-                          WHERE batch_id = ?1 AND item_key < ?2",
-                        params![batch.to_string(), open],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .map_err(|e| be(&e))?
-                    .flatten(),
-                None => conn
-                    .query_row(
-                        "SELECT MAX(item_key) FROM batch_items WHERE batch_id = ?1",
-                        params![batch.to_string()],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .map_err(|e| be(&e))?
-                    .flatten(),
-            };
-            Ok(cursor)
-        })
-        .await
+        let rows = match first_open {
+            Some(open) => conn
+                .query(
+                    "SELECT MAX(item_key) FROM batch_items
+                      WHERE batch_id = ?1 AND item_key < ?2",
+                    params![batch.to_string(), open],
+                )
+                .await
+                .map_err(|e| be(&e))?,
+            None => conn
+                .query(
+                    "SELECT MAX(item_key) FROM batch_items WHERE batch_id = ?1",
+                    params![batch.to_string()],
+                )
+                .await
+                .map_err(|e| be(&e))?,
+        };
+        match first(rows).await? {
+            Some(r) => r.get(0).map_err(|e| be(&e)),
+            None => Ok(None),
+        }
     }
 
     async fn census(&self, batch: BatchId) -> Result<BatchCensus, StoreError> {
-        self.with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT outcome, COUNT(*), SUM(tokens), SUM(minor)
-                       FROM batch_items WHERE batch_id = ?1
-                      GROUP BY outcome",
-                )
-                .map_err(|e| be(&e))?;
-            let rows = stmt
-                .query_map(params![batch.to_string()], |r| {
-                    Ok((
-                        r.get::<_, Option<String>>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, Option<i64>>(2)?,
-                        r.get::<_, Option<i64>>(3)?,
-                    ))
-                })
-                .map_err(|e| be(&e))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| be(&e))?;
+        let conn = self.conn().await;
+        let mut rows = conn
+            .query(
+                "SELECT outcome, COUNT(*), SUM(tokens), SUM(minor)
+                   FROM batch_items WHERE batch_id = ?1
+                  GROUP BY outcome",
+                params![batch.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
 
-            let mut c = BatchCensus::default();
-            for (outcome, n, tokens, minor) in rows {
-                let n = u64::try_from(n).unwrap_or(0);
-                match outcome.as_deref() {
-                    Some("succeeded") => c.succeeded = n,
-                    Some("failed") => c.failed = n,
-                    Some("quarantined") => c.quarantined = n,
-                    Some("suspended") => c.suspended = n,
-                    // NULL: reserved, no outcome recorded.
-                    _ => c.in_flight = n,
-                }
-                c.spend.tokens += u64::try_from(tokens.unwrap_or(0)).unwrap_or(0);
-                c.spend.minor_units += minor.unwrap_or(0);
+        let mut c = BatchCensus::default();
+        while let Some(r) = rows.next().await.map_err(|e| be(&e))? {
+            let outcome: Option<String> = r.get(0).map_err(|e| be(&e))?;
+            let n: i64 = r.get(1).map_err(|e| be(&e))?;
+            let tokens: Option<i64> = r.get(2).map_err(|e| be(&e))?;
+            let minor: Option<i64> = r.get(3).map_err(|e| be(&e))?;
+
+            let n = u64::try_from(n).unwrap_or(0);
+            match outcome.as_deref() {
+                Some("succeeded") => c.succeeded = n,
+                Some("failed") => c.failed = n,
+                Some("quarantined") => c.quarantined = n,
+                Some("suspended") => c.suspended = n,
+                // NULL: reserved, no outcome recorded.
+                _ => c.in_flight = n,
             }
-            Ok(c)
-        })
-        .await
+            c.spend.tokens += u64::try_from(tokens.unwrap_or(0)).unwrap_or(0);
+            c.spend.minor_units += minor.unwrap_or(0);
+        }
+        Ok(c)
     }
 
     async fn items(&self, batch: BatchId, limit: usize) -> Result<Vec<ItemRecord>, StoreError> {
         let lim = i64::try_from(limit).unwrap_or(i64::MAX);
-        self.with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT item_key, run_id, outcome, detail, tokens, minor
-                       FROM batch_items WHERE batch_id = ?1
-                      ORDER BY item_key ASC LIMIT ?2",
-                )
-                .map_err(|e| be(&e))?;
-            let rows = stmt
-                .query_map(params![batch.to_string(), lim], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                        r.get::<_, i64>(4)?,
-                        r.get::<_, i64>(5)?,
-                    ))
-                })
-                .map_err(|e| be(&e))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| be(&e))?;
+        let conn = self.conn().await;
+        let mut rows = conn
+            .query(
+                "SELECT item_key, run_id, outcome, detail, tokens, minor
+                   FROM batch_items WHERE batch_id = ?1
+                  ORDER BY item_key ASC LIMIT ?2",
+                params![batch.to_string(), lim],
+            )
+            .await
+            .map_err(|e| be(&e))?;
 
-            let mut out = Vec::with_capacity(rows.len());
-            for (key, run_s, outcome, detail, tokens, minor) in rows {
-                out.push(ItemRecord {
-                    key,
-                    run: RunId::parse(&run_s).map_err(|e| StoreError::Corrupt {
-                        seq: 0,
-                        detail: format!("bad run id '{run_s}': {e}"),
-                    })?,
-                    outcome: outcome_from_row(outcome, detail),
-                    spend: Spend {
-                        tokens: u64::try_from(tokens).unwrap_or(0),
-                        minor_units: minor,
-                    },
-                });
-            }
-            Ok(out)
-        })
-        .await
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|e| be(&e))? {
+            let key: String = r.get(0).map_err(|e| be(&e))?;
+            let run_s: String = r.get(1).map_err(|e| be(&e))?;
+            let outcome: Option<String> = r.get(2).map_err(|e| be(&e))?;
+            let detail: Option<String> = r.get(3).map_err(|e| be(&e))?;
+            let tokens: i64 = r.get(4).map_err(|e| be(&e))?;
+            let minor: i64 = r.get(5).map_err(|e| be(&e))?;
+
+            out.push(ItemRecord {
+                key,
+                run: RunId::parse(&run_s).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("bad run id '{run_s}': {e}"),
+                })?,
+                outcome: outcome_from_row(outcome, detail),
+                spend: Spend {
+                    tokens: u64::try_from(tokens).unwrap_or(0),
+                    minor_units: minor,
+                },
+            });
+        }
+        Ok(out)
     }
 }

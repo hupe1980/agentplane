@@ -52,7 +52,9 @@ Read those five lines slowly, because they are the product:
 agentplane = "0.1"
 ```
 
-SQLite is the default backend. Everything else is opt-in:
+An embedded [Turso](https://github.com/tursodatabase/turso) store is the default
+backend — SQLite semantics in pure Rust, so there is no C toolchain in your
+build. Everything else is opt-in:
 
 ```toml
 agentplane = { version = "0.1", features = ["postgres", "http", "mcp", "providers", "cedar", "signing"] }
@@ -60,7 +62,7 @@ agentplane = { version = "0.1", features = ["postgres", "http", "mcp", "provider
 
 | feature | gives you |
 |---|---|
-| `sqlite` *(default)* | journal + case store, single node |
+| `turso` *(default)* | journal + case store, single node, embedded |
 | `postgres` | the same contract, for several plane instances sharing a store |
 | `http` | the operator surface: worklist, decisions, run status |
 | `mcp` | MCP tool transport |
@@ -123,10 +125,10 @@ is exactly what makes replay possible.
 ```rust
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{Mode, Runtime};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use std::sync::Arc;
 
-let store: Arc<dyn JournalStore> = Arc::new(SqliteStore::open_in_memory()?);
+let store: Arc<dyn JournalStore> = Arc::new(TursoStore::open_in_memory().await?);
 
 let runtime = Runtime::builder(Arc::clone(&store))
     .owner("my-service")

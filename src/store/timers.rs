@@ -1,12 +1,12 @@
-//! SQLite-backed durable timers.
+//! Durable timers.
 
 use async_trait::async_trait;
-use rusqlite::{OptionalExtension, params};
+use turso::params;
 
 use crate::case::TimerStore;
 use crate::core::{CaseId, EffectKey, Phase, RunId, StoreError, Timer, Timestamp};
 
-use super::sqlite::SqliteStore;
+use super::turso::{TursoStore, be, first};
 
 pub(super) const SCHEMA: &str = "
 -- Durable wake-ups. One row per (run, effect).
@@ -92,157 +92,151 @@ fn row_to_timer(
 }
 
 #[async_trait]
-impl TimerStore for SqliteStore {
+impl TimerStore for TursoStore {
     async fn arm(&self, timer: &Timer) -> Result<(), StoreError> {
-        let t = timer.clone();
-        self.with_conn(move |conn| {
-            conn.execute(
-                "INSERT INTO timers
-                   (run_id, effect_key, case_id, step, phase, fire_at, claimed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
-                 ON CONFLICT (run_id, effect_key) DO NOTHING",
-                params![
-                    t.run.to_string(),
-                    t.effect.to_hex(),
-                    t.case.map(|c| c.to_string()),
-                    i64::from(t.step.0),
-                    phase_str(t.phase),
-                    t.fire_at.unix_timestamp(),
-                ],
-            )
-            .map_err(|e| super::sqlite::be(&e))?;
-            Ok(())
-        })
+        let conn = self.conn().await;
+        conn.execute(
+            "INSERT INTO timers
+               (run_id, effect_key, case_id, step, phase, fire_at, claimed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+             ON CONFLICT (run_id, effect_key) DO NOTHING",
+            params![
+                timer.run.to_string(),
+                timer.effect.to_hex(),
+                timer.case.map(|c| c.to_string()),
+                i64::from(timer.step.0),
+                phase_str(timer.phase),
+                timer.fire_at.unix_timestamp(),
+            ],
+        )
         .await
+        .map_err(|e| be(&e))?;
+        Ok(())
     }
 
     async fn claim_due(&self, now: Timestamp, limit: usize) -> Result<Vec<Timer>, StoreError> {
         let cutoff = now.unix_timestamp();
         let lim = i64::try_from(limit).unwrap_or(i64::MAX);
-        self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|e| super::sqlite::be(&e))?;
+        let mut conn = self.conn().await;
+        let tx = conn.transaction().await.map_err(|e| be(&e))?;
 
-            // Selected and claimed in one transaction: a second sweeper reading
-            // concurrently finds nothing rather than a second copy of the same
-            // wake-up.
-            let rows: Vec<(String, String, Option<String>, i64, String, i64)> = {
-                let mut stmt = tx
-                    .prepare(
-                        "SELECT run_id, effect_key, case_id, step, phase, fire_at
-                           FROM timers
-                          WHERE fire_at <= ?1
-                            AND (claimed_at IS NULL OR claimed_at <= ?3)
-                       ORDER BY fire_at ASC
-                          LIMIT ?2",
-                    )
-                    .map_err(|e| super::sqlite::be(&e))?;
-                stmt.query_map(params![cutoff, lim, cutoff - CLAIM_LEASE], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                })
-                .map_err(|e| super::sqlite::be(&e))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| super::sqlite::be(&e))?
-            };
+        // Selected and claimed in one transaction: a second sweeper reading
+        // concurrently finds nothing rather than a second copy of the same
+        // wake-up.
+        let mut rows = tx
+            .query(
+                "SELECT run_id, effect_key, case_id, step, phase, fire_at
+                   FROM timers
+                  WHERE fire_at <= ?1
+                    AND (claimed_at IS NULL OR claimed_at <= ?3)
+               ORDER BY fire_at ASC
+                  LIMIT ?2",
+                params![cutoff, lim, cutoff - CLAIM_LEASE],
+            )
+            .await
+            .map_err(|e| be(&e))?;
 
-            let mut out = Vec::with_capacity(rows.len());
-            for (run, effect, case, step, phase, fire_at) in rows {
-                tx.execute(
-                    "UPDATE timers SET claimed_at = ?3
-                      WHERE run_id = ?1 AND effect_key = ?2",
-                    params![run, effect, cutoff],
-                )
-                .map_err(|e| super::sqlite::be(&e))?;
-                out.push(row_to_timer(&run, &effect, case, step, &phase, fire_at)?);
-            }
+        let mut raw = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|e| be(&e))? {
+            raw.push((
+                r.get::<String>(0).map_err(|e| be(&e))?,
+                r.get::<String>(1).map_err(|e| be(&e))?,
+                r.get::<Option<String>>(2).map_err(|e| be(&e))?,
+                r.get::<i64>(3).map_err(|e| be(&e))?,
+                r.get::<String>(4).map_err(|e| be(&e))?,
+                r.get::<i64>(5).map_err(|e| be(&e))?,
+            ));
+        }
+        drop(rows);
 
-            tx.commit().map_err(|e| super::sqlite::be(&e))?;
-            Ok(out)
-        })
-        .await
+        let mut out = Vec::with_capacity(raw.len());
+        for (run, effect, case, step, phase, fire_at) in raw {
+            tx.execute(
+                "UPDATE timers SET claimed_at = ?3
+                  WHERE run_id = ?1 AND effect_key = ?2",
+                params![run.clone(), effect.clone(), cutoff],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+            out.push(row_to_timer(&run, &effect, case, step, &phase, fire_at)?);
+        }
+
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(out)
     }
 
     async fn pending_count(&self) -> Result<u64, StoreError> {
-        self.with_conn(move |conn| {
-            let n: i64 = conn
-                .query_row("SELECT COUNT(*) FROM timers", [], |r| r.get(0))
-                .map_err(|e| super::sqlite::be(&e))?;
-            Ok(u64::try_from(n).unwrap_or(0))
-        })
-        .await
+        let conn = self.conn().await;
+        let rows = conn
+            .query("SELECT COUNT(*) FROM timers", ())
+            .await
+            .map_err(|e| be(&e))?;
+        let n: i64 = match first(rows).await? {
+            Some(r) => r.get(0).map_err(|e| be(&e))?,
+            None => 0,
+        };
+        Ok(u64::try_from(n).unwrap_or(0))
     }
 
     async fn disarm(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError> {
-        self.with_conn(move |conn| {
-            conn.execute(
-                "DELETE FROM timers WHERE run_id = ?1 AND effect_key = ?2",
-                params![run.to_string(), effect.to_hex()],
-            )
-            .map_err(|e| super::sqlite::be(&e))?;
-            Ok(())
-        })
+        let conn = self.conn().await;
+        conn.execute(
+            "DELETE FROM timers WHERE run_id = ?1 AND effect_key = ?2",
+            params![run.to_string(), effect.to_hex()],
+        )
         .await
+        .map_err(|e| be(&e))?;
+        Ok(())
     }
 
     async fn pending(&self, limit: usize) -> Result<Vec<Timer>, StoreError> {
         let lim = i64::try_from(limit).unwrap_or(i64::MAX);
-        self.with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT run_id, effect_key, case_id, step, phase, fire_at
-                       FROM timers
-                   ORDER BY fire_at ASC
-                      LIMIT ?1",
-                )
-                .map_err(|e| super::sqlite::be(&e))?;
-            let rows = stmt
-                .query_map(params![lim], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, i64>(5)?,
-                    ))
-                })
-                .map_err(|e| super::sqlite::be(&e))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| super::sqlite::be(&e))?;
+        let conn = self.conn().await;
+        let mut rows = conn
+            .query(
+                "SELECT run_id, effect_key, case_id, step, phase, fire_at
+                   FROM timers
+               ORDER BY fire_at ASC
+                  LIMIT ?1",
+                params![lim],
+            )
+            .await
+            .map_err(|e| be(&e))?;
 
-            let mut out = Vec::with_capacity(rows.len());
-            for (run, effect, case, step, phase, fire_at) in rows {
-                out.push(row_to_timer(&run, &effect, case, step, &phase, fire_at)?);
-            }
-            Ok(out)
-        })
-        .await
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|e| be(&e))? {
+            let run: String = r.get(0).map_err(|e| be(&e))?;
+            let effect: String = r.get(1).map_err(|e| be(&e))?;
+            let case: Option<String> = r.get(2).map_err(|e| be(&e))?;
+            let step: i64 = r.get(3).map_err(|e| be(&e))?;
+            let phase: String = r.get(4).map_err(|e| be(&e))?;
+            let fire_at: i64 = r.get(5).map_err(|e| be(&e))?;
+            out.push(row_to_timer(&run, &effect, case, step, &phase, fire_at)?);
+        }
+        Ok(out)
     }
 }
 
 /// Whether a run still has an armed timer.
 ///
 /// Used by tests and by operator tooling; the sweep uses `claim_due`.
-impl SqliteStore {
+impl TursoStore {
+    /// # Errors
+    ///
+    /// If the count cannot be read.
     pub async fn armed_timers(&self, run: RunId) -> Result<usize, StoreError> {
-        self.with_conn(move |conn| {
-            let n: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM timers WHERE run_id = ?1",
-                    params![run.to_string()],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|e| super::sqlite::be(&e))?
-                .unwrap_or(0);
-            Ok(usize::try_from(n).unwrap_or(0))
-        })
-        .await
+        let conn = self.conn().await;
+        let rows = conn
+            .query(
+                "SELECT COUNT(*) FROM timers WHERE run_id = ?1",
+                params![run.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let n: i64 = match first(rows).await? {
+            Some(r) => r.get(0).map_err(|e| be(&e))?,
+            None => 0,
+        };
+        Ok(usize::try_from(n).unwrap_or(0))
     }
 }

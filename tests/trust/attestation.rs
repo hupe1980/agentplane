@@ -11,7 +11,7 @@
 //! `verify_chain` and must fail `verify_attested`, and if it does not, the
 //! signatures are decoration.
 
-#![cfg(all(feature = "sqlite", feature = "signing"))]
+#![cfg(all(feature = "turso", feature = "signing"))]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use agentplane::core::{Digest, Outcome, Skill, SkillDescriptor, SkillError, Tain
 use agentplane::journal::{JournalStore, Record};
 use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
 use agentplane::runtime::{Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 
 #[derive(Debug)]
@@ -48,9 +48,10 @@ fn signer(id: &str, seed: [u8; 32]) -> Arc<Ed25519Signer> {
     Arc::new(Ed25519Signer::new(id, &seed))
 }
 
-async fn signed_run(signer: Arc<Ed25519Signer>) -> (Arc<SqliteStore>, Vec<Record>) {
+async fn signed_run(signer: Arc<Ed25519Signer>) -> (Arc<TursoStore>, Vec<Record>) {
     let store = Arc::new(
-        SqliteStore::open_in_memory()
+        TursoStore::open_in_memory()
+            .await
             .unwrap()
             .signing_as(signer as Arc<dyn agentplane::core::Signer>),
     );
@@ -235,7 +236,7 @@ async fn a_signature_commits_to_everything_before_it() {
 /// turns signing on for.
 #[tokio::test]
 async fn an_unsigned_plane_is_ordinary_not_broken() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .skill(Trivial)
         .build();
@@ -305,7 +306,7 @@ async fn an_unknown_signer_is_not_trusted() {
 
 // ── Binding runs to each other ──────────────────────────────────────────────
 
-async fn sealed_runs(store: &Arc<SqliteStore>, n: usize) -> Vec<agentplane::core::RunId> {
+async fn sealed_runs(store: &Arc<TursoStore>, n: usize) -> Vec<agentplane::core::RunId> {
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .skill(Trivial)
         .build();
@@ -323,7 +324,12 @@ async fn sealed_runs(store: &Arc<SqliteStore>, n: usize) -> Vec<agentplane::core
 /// Every sealed run enters the log, and can prove it.
 #[tokio::test]
 async fn a_sealed_run_is_committed_to() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap().origin("test-plane"));
+    let store = Arc::new(
+        TursoStore::open_in_memory()
+            .await
+            .unwrap()
+            .origin("test-plane"),
+    );
     let runs = sealed_runs(&store, 5).await;
 
     let cp = (store.clone() as Arc<dyn JournalStore>)
@@ -361,7 +367,7 @@ async fn a_sealed_run_is_committed_to() {
 /// *set*, and only if a root was published before the deletion.
 #[tokio::test]
 async fn deleting_a_run_breaks_the_published_root() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let runs = sealed_runs(&store, 6).await;
 
     // What an auditor was given, before.
@@ -411,7 +417,7 @@ async fn deleting_a_run_breaks_the_published_root() {
 /// A run that has not concluded is not in the log, and says so plainly.
 #[tokio::test]
 async fn an_unsealed_run_is_not_in_the_log() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let cp = (store.clone() as Arc<dyn JournalStore>)
         .checkpoint()
         .await
@@ -444,7 +450,7 @@ async fn an_unsealed_run_is_not_in_the_log() {
 /// consistency proof reports.
 #[tokio::test]
 async fn a_new_run_is_appended_after_the_survivors() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let runs = sealed_runs(&store, 3).await;
     store.delete_run_for_test(runs[1]).await.unwrap();
 
@@ -478,7 +484,7 @@ async fn a_new_run_is_appended_after_the_survivors() {
 /// A clean plane audits clean, and says what it could not check.
 #[tokio::test]
 async fn an_audit_reports_what_it_could_not_look_at() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let runs = sealed_runs(&store, 3).await;
     let s = store.clone() as Arc<dyn JournalStore>;
 
@@ -505,7 +511,7 @@ async fn an_audit_reports_what_it_could_not_look_at() {
 /// fails.
 #[tokio::test]
 async fn only_an_outside_checkpoint_detects_a_deletion() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let runs = sealed_runs(&store, 5).await;
     let s = store.clone() as Arc<dyn JournalStore>;
 
@@ -558,7 +564,12 @@ async fn only_an_outside_checkpoint_detects_a_deletion() {
 /// A checkpoint from a different plane is refused, not compared.
 #[tokio::test]
 async fn a_checkpoint_from_another_plane_is_refused() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap().origin("plane-a"));
+    let store = Arc::new(
+        TursoStore::open_in_memory()
+            .await
+            .unwrap()
+            .origin("plane-a"),
+    );
     let runs = sealed_runs(&store, 2).await;
     let s = store.clone() as Arc<dyn JournalStore>;
 
@@ -591,7 +602,8 @@ async fn a_checkpoint_from_another_plane_is_refused() {
 #[tokio::test]
 async fn an_audit_with_a_key_checks_who_wrote_it() {
     let store = Arc::new(
-        SqliteStore::open_in_memory()
+        TursoStore::open_in_memory()
+            .await
             .unwrap()
             .signing_as(signer("spiffe://example.org/plane-a", PLANE_A)),
     );

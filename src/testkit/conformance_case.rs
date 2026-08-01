@@ -256,7 +256,7 @@ async fn correlating_twice_yields_one_case(store: &Arc<dyn CaseStore>, r: &mut R
 /// Being explicit about what this can and cannot do: a race test corroborates,
 /// it never proves. Passing means no interleaving *found* one; the constraint in
 /// the schema is what makes the absence real. A store that serialises internally
-/// — `SQLite` behind one connection — passes trivially and correctly, having no
+/// — the embedded store behind one connection — passes trivially and correctly, having no
 /// race to lose.
 async fn two_concurrent_messages_open_one_case(store: &Arc<dyn CaseStore>, r: &mut Report) {
     const RACERS: usize = 8;

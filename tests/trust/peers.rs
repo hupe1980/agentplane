@@ -13,7 +13,7 @@
 //! on an unregistered peer, untrusted responses, and a disposition that says
 //! whether the request reached the far side.
 
-#![cfg(feature = "sqlite")]
+#![cfg(feature = "turso")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
@@ -414,7 +414,7 @@ use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted, Tim
 use agentplane::journal::JournalStore;
 use agentplane::peers::{Cached, CredentialError, CredentialSource, Fixed, TokenExchange};
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use std::time::Duration;
 
 fn ts(secs: i64) -> Timestamp {
@@ -502,7 +502,7 @@ impl Skill for Calls {
 /// it" — it is a scan of every byte the run wrote.
 #[tokio::test]
 async fn a_credential_is_presented_to_the_peer_and_never_written_to_the_journal() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let spy = Arc::new(Spy::default());
     let issuer = Issuer::new(Some(ts(9_999)));
 

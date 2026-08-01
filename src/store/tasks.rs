@@ -1,4 +1,4 @@
-//! SQLite-backed worklist.
+//! Worklist.
 //!
 //! Claiming happens inside a transaction that checks eligibility and writes the
 //! holder in one step. Two reviewers opening the same queue at the same moment
@@ -6,7 +6,7 @@
 //! write has exactly that window.
 
 use async_trait::async_trait;
-use rusqlite::{OptionalExtension, params};
+use turso::params;
 
 use crate::case::{ClaimError, TaskStore};
 use crate::core::{
@@ -14,7 +14,7 @@ use crate::core::{
     Timestamp,
 };
 
-use super::sqlite::{SqliteStore, be};
+use super::turso::{TursoStore, be, first};
 
 pub(super) const TASK_SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS tasks (
@@ -117,22 +117,46 @@ struct TaskRow {
 const COLUMNS: &str = "task_id, run_id, case_id, kind, justification, candidate_roles, \
                        excluded_actors, assignee, priority, state, on_expiry, created_at, due_at";
 
-fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
+fn row(r: &turso::Row) -> Result<TaskRow, StoreError> {
     Ok(TaskRow {
-        task_id: r.get(0)?,
-        run_id: r.get(1)?,
-        case_id: r.get(2)?,
-        kind: r.get(3)?,
-        justification: r.get(4)?,
-        candidate_roles: r.get(5)?,
-        excluded_actors: r.get(6)?,
-        assignee: r.get(7)?,
-        priority: r.get(8)?,
-        state: r.get(9)?,
-        on_expiry: r.get(10)?,
-        created_at: r.get(11)?,
-        due_at: r.get(12)?,
+        task_id: r.get(0).map_err(|e| be(&e))?,
+        run_id: r.get(1).map_err(|e| be(&e))?,
+        case_id: r.get(2).map_err(|e| be(&e))?,
+        kind: r.get(3).map_err(|e| be(&e))?,
+        justification: r.get(4).map_err(|e| be(&e))?,
+        candidate_roles: r.get(5).map_err(|e| be(&e))?,
+        excluded_actors: r.get(6).map_err(|e| be(&e))?,
+        assignee: r.get(7).map_err(|e| be(&e))?,
+        priority: r.get(8).map_err(|e| be(&e))?,
+        state: r.get(9).map_err(|e| be(&e))?,
+        on_expiry: r.get(10).map_err(|e| be(&e))?,
+        created_at: r.get(11).map_err(|e| be(&e))?,
+        due_at: r.get(12).map_err(|e| be(&e))?,
     })
+}
+
+/// Every task a query returns, built and validated.
+async fn tasks_from(mut rows: turso::Rows) -> Result<Vec<Task>, StoreError> {
+    let mut out = Vec::new();
+    while let Some(r) = rows.next().await.map_err(|e| be(&e))? {
+        out.push(build(row(&r)?)?);
+    }
+    Ok(out)
+}
+
+/// One task by id, inside whatever connection or transaction is passed.
+async fn task_by_id(conn: &turso::Connection, id: TaskId) -> Result<Option<TaskRow>, StoreError> {
+    let rows = conn
+        .query(
+            &format!("SELECT {COLUMNS} FROM tasks WHERE task_id = ?1"),
+            params![id.to_hex()],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+    match first(rows).await? {
+        Some(r) => row(&r).map(Some),
+        None => Ok(None),
+    }
 }
 
 fn build(r: TaskRow) -> Result<Task, StoreError> {
@@ -161,176 +185,143 @@ fn build(r: TaskRow) -> Result<Task, StoreError> {
 }
 
 #[async_trait]
-impl TaskStore for SqliteStore {
+impl TaskStore for TursoStore {
     async fn open(&self, task: &Task) -> Result<Task, StoreError> {
-        let t = task.clone();
-        self.with_conn(move |conn| {
-            conn.execute(
-                "INSERT INTO tasks
-                   (task_id, run_id, case_id, kind, justification, candidate_roles,
-                    excluded_actors, assignee, priority, state, on_expiry, created_at, due_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                 ON CONFLICT (task_id) DO NOTHING",
-                params![
-                    t.id.to_hex(),
-                    t.run.to_string(),
-                    t.case.map(|c| c.to_string()),
-                    t.kind,
-                    serde_json::to_string(&t.justification)?,
-                    serde_json::to_string(&t.candidate_roles)?,
-                    serde_json::to_string(&t.excluded_actors)?,
-                    t.assignee,
-                    t.priority.as_str(),
-                    t.state.as_str(),
-                    expiry_str(t.on_expiry),
-                    ts(t.created_at),
-                    t.due_at.map(ts),
-                ],
-            )
-            .map_err(|e| be(&e))?;
-
-            let found = conn
-                .query_row(
-                    &format!("SELECT {COLUMNS} FROM tasks WHERE task_id = ?1"),
-                    params![t.id.to_hex()],
-                    row,
-                )
-                .map_err(|e| be(&e))?;
-            build(found)
-        })
+        let conn = self.conn().await;
+        conn.execute(
+            "INSERT INTO tasks
+               (task_id, run_id, case_id, kind, justification, candidate_roles,
+                excluded_actors, assignee, priority, state, on_expiry, created_at, due_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT (task_id) DO NOTHING",
+            params![
+                task.id.to_hex(),
+                task.run.to_string(),
+                task.case.map(|c| c.to_string()),
+                task.kind.clone(),
+                serde_json::to_string(&task.justification)?,
+                serde_json::to_string(&task.candidate_roles)?,
+                serde_json::to_string(&task.excluded_actors)?,
+                task.assignee.clone(),
+                task.priority.as_str(),
+                task.state.as_str(),
+                expiry_str(task.on_expiry),
+                ts(task.created_at),
+                task.due_at.map(ts),
+            ],
+        )
         .await
+        .map_err(|e| be(&e))?;
+
+        match task_by_id(&conn, task.id).await? {
+            Some(found) => build(found),
+            None => Err(StoreError::NotFound(task.id.to_string())),
+        }
     }
 
     async fn task(&self, id: TaskId) -> Result<Option<Task>, StoreError> {
-        self.with_conn(move |conn| {
-            let found = conn
-                .query_row(
-                    &format!("SELECT {COLUMNS} FROM tasks WHERE task_id = ?1"),
-                    params![id.to_hex()],
-                    row,
-                )
-                .optional()
-                .map_err(|e| be(&e))?;
-            found.map(build).transpose()
-        })
-        .await
+        let conn = self.conn().await;
+        task_by_id(&conn, id).await?.map(build).transpose()
     }
 
     async fn claim(&self, id: TaskId, actor: &str, roles: &[String]) -> Result<Task, ClaimError> {
-        let actor = actor.to_owned();
-        let roles = roles.to_vec();
-        let result: Result<Result<Task, ClaimError>, StoreError> = self
-            .with_conn(move |conn| {
-                let tx = conn.transaction().map_err(|e| be(&e))?;
+        let mut conn = self.conn().await;
+        let tx = conn.transaction().await.map_err(|e| be(&e))?;
 
-                let found = tx
-                    .query_row(
-                        &format!("SELECT {COLUMNS} FROM tasks WHERE task_id = ?1"),
-                        params![id.to_hex()],
-                        row,
-                    )
-                    .optional()
-                    .map_err(|e| be(&e))?;
+        let Some(found) = task_by_id(&tx, id).await? else {
+            return Err(ClaimError::NotFound(id));
+        };
+        let task = build(found)?;
 
-                let Some(found) = found else {
-                    return Ok(Err(ClaimError::NotFound(id)));
-                };
-                let task = build(found)?;
+        // Eligibility before availability, and the order is load-bearing — see
+        // `TaskStore::claim`.
+        //
+        // Four eyes: whoever proposed the action does not approve it.
+        if task.excluded_actors.iter().any(|a| a == actor) {
+            return Err(ClaimError::Excluded {
+                actor: actor.to_owned(),
+            });
+        }
+        if !task.candidate_roles.is_empty()
+            && !task.candidate_roles.iter().any(|r| roles.contains(r))
+        {
+            return Err(ClaimError::WrongRole {
+                actor: actor.to_owned(),
+            });
+        }
+        if !task.state.is_pending() {
+            return Err(ClaimError::NotPending {
+                task: id,
+                state: task.state,
+            });
+        }
+        if let Some(holder) = &task.assignee
+            && holder != actor
+        {
+            return Err(ClaimError::AlreadyClaimed {
+                task: id,
+                holder: holder.clone(),
+            });
+        }
 
-                // Eligibility before availability, and the order is load-bearing
-                // — see `TaskStore::claim`.
-                //
-                // Four eyes: whoever proposed the action does not approve it.
-                if task.excluded_actors.iter().any(|a| a == &actor) {
-                    return Ok(Err(ClaimError::Excluded { actor }));
-                }
-                if !task.candidate_roles.is_empty()
-                    && !task.candidate_roles.iter().any(|r| roles.contains(r))
-                {
-                    return Ok(Err(ClaimError::WrongRole { actor }));
-                }
-                if !task.state.is_pending() {
-                    return Ok(Err(ClaimError::NotPending {
-                        task: id,
-                        state: task.state,
-                    }));
-                }
-                if let Some(holder) = &task.assignee
-                    && holder != &actor
-                {
-                    return Ok(Err(ClaimError::AlreadyClaimed {
-                        task: id,
-                        holder: holder.clone(),
-                    }));
-                }
+        tx.execute(
+            "UPDATE tasks SET assignee = ?2, state = 'claimed' WHERE task_id = ?1",
+            params![id.to_hex(), actor.to_owned()],
+        )
+        .await
+        .map_err(|e| be(&e))?;
 
-                tx.execute(
-                    "UPDATE tasks SET assignee = ?2, state = 'claimed' WHERE task_id = ?1",
-                    params![id.to_hex(), actor],
-                )
-                .map_err(|e| be(&e))?;
+        let updated = match task_by_id(&tx, id).await? {
+            Some(r) => build(r)?,
+            None => return Err(ClaimError::NotFound(id)),
+        };
 
-                let updated = tx
-                    .query_row(
-                        &format!("SELECT {COLUMNS} FROM tasks WHERE task_id = ?1"),
-                        params![id.to_hex()],
-                        row,
-                    )
-                    .map_err(|e| be(&e))?;
-                let updated = build(updated)?;
-
-                tx.commit().map_err(|e| be(&e))?;
-                Ok(Ok(updated))
-            })
-            .await;
-
-        result?
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(updated)
     }
 
     async fn release(&self, id: TaskId, actor: &str) -> Result<(), ClaimError> {
-        let actor = actor.to_owned();
-        let result: Result<Result<(), ClaimError>, StoreError> = self
-            .with_conn(move |conn| {
-                let n = conn
-                    .execute(
-                        "UPDATE tasks SET assignee = NULL, state = 'open'
-                         WHERE task_id = ?1 AND assignee = ?2 AND state = 'claimed'",
-                        params![id.to_hex(), actor],
-                    )
-                    .map_err(|e| be(&e))?;
-                if n == 0 {
-                    // Not "no such task": the row may exist and be held by
-                    // somebody else. Reporting success here would tell a caller
-                    // they released work they never held.
-                    return Ok(Err(ClaimError::NotHeld { task: id, actor }));
-                }
-                Ok(Ok(()))
-            })
-            .await;
-        result?
+        let conn = self.conn().await;
+        let n = conn
+            .execute(
+                "UPDATE tasks SET assignee = NULL, state = 'open'
+                 WHERE task_id = ?1 AND assignee = ?2 AND state = 'claimed'",
+                params![id.to_hex(), actor.to_owned()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if n == 0 {
+            // Not "no such task": the row may exist and be held by somebody
+            // else. Reporting success here would tell a caller they released
+            // work they never held.
+            return Err(ClaimError::NotHeld {
+                task: id,
+                actor: actor.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     async fn set_state(&self, id: TaskId, state: TaskState) -> Result<(), StoreError> {
-        self.with_conn(move |conn| {
-            let n = conn
-                .execute(
-                    "UPDATE tasks SET state = ?2 WHERE task_id = ?1",
-                    params![id.to_hex(), state.as_str()],
-                )
-                .map_err(|e| be(&e))?;
-            if n == 0 {
-                return Err(StoreError::NotFound(id.to_string()));
-            }
-            Ok(())
-        })
-        .await
+        let conn = self.conn().await;
+        let n = conn
+            .execute(
+                "UPDATE tasks SET state = ?2 WHERE task_id = ?1",
+                params![id.to_hex(), state.as_str()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if n == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
 
     async fn queue(&self, roles: &[String], limit: usize) -> Result<Vec<Task>, StoreError> {
-        let roles = roles.to_vec();
-        self.with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare(&format!(
+        let conn = self.conn().await;
+        let rows = conn
+            .query(
+                &format!(
                     "SELECT {COLUMNS} FROM tasks
                      WHERE state IN ('open', 'escalated')
                      ORDER BY CASE priority
@@ -338,86 +329,70 @@ impl TaskStore for SqliteStore {
                                 WHEN 'normal' THEN 2 ELSE 3 END,
                               created_at ASC
                      LIMIT ?1"
-                ))
-                .map_err(|e| be(&e))?;
-            let rows = stmt
-                .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], row)
-                .map_err(|e| be(&e))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| be(&e))?;
+                ),
+                params![i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await
+            .map_err(|e| be(&e))?;
 
-            let mut out = Vec::new();
-            for r in rows {
-                let t = build(r)?;
-                // Filtering here rather than in SQL keeps role semantics in one
-                // place: `may_decide` is what the claim path uses too, so the
-                // queue can never show work the claim would refuse.
-                if t.candidate_roles.is_empty()
-                    || t.candidate_roles.iter().any(|r| roles.contains(r))
-                {
-                    out.push(t);
-                }
-            }
-            Ok(out)
-        })
-        .await
+        // Filtering here rather than in SQL keeps role semantics in one place:
+        // `may_decide` is what the claim path uses too, so the queue can never
+        // show work the claim would refuse.
+        Ok(tasks_from(rows)
+            .await?
+            .into_iter()
+            .filter(|t| {
+                t.candidate_roles.is_empty() || t.candidate_roles.iter().any(|r| roles.contains(r))
+            })
+            .collect())
     }
 
     async fn for_case(&self, case: CaseId) -> Result<Vec<Task>, StoreError> {
-        self.with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT {COLUMNS} FROM tasks WHERE case_id = ?1 ORDER BY created_at"
-                ))
-                .map_err(|e| be(&e))?;
-            let rows = stmt
-                .query_map(params![case.to_string()], row)
-                .map_err(|e| be(&e))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| be(&e))?;
-            rows.into_iter().map(build).collect()
-        })
-        .await
+        let conn = self.conn().await;
+        let rows = conn
+            .query(
+                &format!("SELECT {COLUMNS} FROM tasks WHERE case_id = ?1 ORDER BY created_at"),
+                params![case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        tasks_from(rows).await
     }
 
     async fn open_count(&self) -> Result<u64, StoreError> {
-        self.with_conn(move |conn| {
-            // `claimed` counts: a task someone reserved and has not answered is
-            // still a decision the plane is waiting on. Excluding it would make
-            // the backlog shrink the moment a reviewer opened it.
-            let n: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM tasks
-                      WHERE state IN ('open', 'claimed', 'escalated')",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|e| super::sqlite::be(&e))?;
-            Ok(u64::try_from(n).unwrap_or(0))
-        })
-        .await
+        let conn = self.conn().await;
+        // `claimed` counts: a task someone reserved and has not answered is
+        // still a decision the plane is waiting on. Excluding it would make the
+        // backlog shrink the moment a reviewer opened it.
+        let rows = conn
+            .query(
+                "SELECT COUNT(*) FROM tasks
+                  WHERE state IN ('open', 'claimed', 'escalated')",
+                (),
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let n: i64 = match first(rows).await? {
+            Some(r) => r.get(0).map_err(|e| be(&e))?,
+            None => 0,
+        };
+        Ok(u64::try_from(n).unwrap_or(0))
     }
 
     async fn overdue(&self, now: Timestamp, limit: usize) -> Result<Vec<Task>, StoreError> {
-        self.with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare(&format!(
+        let conn = self.conn().await;
+        let rows = conn
+            .query(
+                &format!(
                     "SELECT {COLUMNS} FROM tasks
                      WHERE state IN ('open', 'claimed', 'escalated')
                        AND due_at IS NOT NULL AND due_at <= ?1
                      ORDER BY due_at ASC LIMIT ?2"
-                ))
-                .map_err(|e| be(&e))?;
-            let rows = stmt
-                .query_map(
-                    params![ts(now), i64::try_from(limit).unwrap_or(i64::MAX)],
-                    row,
-                )
-                .map_err(|e| be(&e))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| be(&e))?;
-            rows.into_iter().map(build).collect()
-        })
-        .await
+                ),
+                params![ts(now), i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        tasks_from(rows).await
     }
 }

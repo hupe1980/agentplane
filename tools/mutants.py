@@ -492,11 +492,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "    if let Some(prior) = None::<&Checkpoint> {",
     ),
     "TheTreeIndexIsTheStoredIndex": (
-        "src/store/sqlite.rs",
+        "src/store/turso.rs",
         "only_an_outside_checkpoint_detects_a_deletion",
         "the stored log index is used as the tree position, so gaps break inclusion",
-        "                                ROW_NUMBER() OVER (ORDER BY log_index) - 1 AS rank\n                           FROM run_seal WHERE log_index IS NOT NULL",
-        "                                log_index AS rank\n                           FROM run_seal WHERE log_index IS NOT NULL",
+        "                            ROW_NUMBER() OVER (ORDER BY log_index) - 1 AS rank\n                       FROM run_seal WHERE log_index IS NOT NULL",
+        "                            log_index AS rank\n                       FROM run_seal WHERE log_index IS NOT NULL",
     ),
     "ConsistencyProofsAreVacuous": (
         "src/core/merkle.rs",
@@ -506,21 +506,21 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "    new == *new_root && fed == proof.len()",
     ),
     "TheLogDoesNotGrowInTheBattery": (
-        "src/store/sqlite.rs",
-        "sqlite_satisfies_the_journal_store_contract",
+        "src/store/turso.rs",
+        "turso_satisfies_the_journal_store_contract",
         "consistency proofs are answered from the wrong prefix",
         "        Ok(crate::core::merkle::consistency_proof(&leaves, old))",
         "        Ok(crate::core::merkle::consistency_proof(&leaves, old.min(1)))",
     ),
     "SealsNeverEnterTheLog": (
-        "src/store/sqlite.rs",
+        "src/store/turso.rs",
         "a_sealed_run_is_committed_to",
         "a sealed run is never added to the Merkle log, so the checkpoint commits to nothing",
-        "                  WHERE run_id = ?1 AND log_index IS NULL",
-        "                  WHERE run_id = ?1 AND log_index IS NULL AND 1 = 0",
+        "              WHERE run_id = ?1 AND log_index IS NULL",
+        "              WHERE run_id = ?1 AND log_index IS NULL AND 1 = 0",
     ),
     "TheLogIndexIsReused": (
-        "src/store/sqlite.rs",
+        "src/store/turso.rs",
         "a_new_run_is_appended_after_the_survivors",
         "a new run is dropped into the gap a deleted run left, reordering the log",
         "SET log_index = (SELECT COALESCE(MAX(log_index), -1) + 1 FROM run_seal)",
@@ -555,8 +555,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                None if false => {",
     ),
     "TheStoreDropsTheSignature": (
-        "src/store/sqlite.rs",
-        "sqlite_satisfies_the_journal_store_contract",
+        "src/store/turso.rs",
+        "turso_satisfies_the_journal_store_contract",
         "the store writes records and silently discards who signed them",
         "                        record.attestation.as_ref().map(|a| a.key_id.clone()),",
         "                        None::<String>,",
@@ -591,11 +591,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         '        "cancelled" if false => Some(RunStatus::Cancelled {',
     ),
     "AStopRequestOverwritesTheAsker": (
-        "src/store/sqlite.rs",
-        "sqlite_satisfies_the_journal_store_contract",
+        "src/store/turso.rs",
+        "turso_satisfies_the_journal_store_contract",
         "a second stop request overwrites the first asker",
-        "ON CONFLICT(run_id) DO NOTHING\",\n                    params![run.to_string(), actor, reason",
-        "ON CONFLICT(run_id) DO UPDATE SET actor = excluded.actor\",\n                    params![run.to_string(), actor, reason",
+        "ON CONFLICT(run_id) DO NOTHING\",\n                params![\n                    run.to_string(),\n                    actor.to_owned(),",
+        "ON CONFLICT(run_id) DO UPDATE SET actor = excluded.actor\",\n                params![\n                    run.to_string(),\n                    actor.to_owned(),",
     ),
     # ── Wire drivers ────────────────────────────────────────────────────────
     "PeerInternalErrorIsARefusal": (
@@ -843,16 +843,16 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_write_against_a_stale_read_is_refused",
         "the version predicate is dropped from the state write, so two runs on "
         "one case silently lose each other's work",
-        '"UPDATE cases SET state = ?2, version = ?3 \\\n                     WHERE case_id = ?1 AND version = ?4"',
-        '"UPDATE cases SET state = ?2, version = ?3 \\\n                     WHERE case_id = ?1 AND ?4 IS NOT NULL"',
+        '"UPDATE cases SET state = ?2, version = ?3 \\\n                 WHERE case_id = ?1 AND version = ?4"',
+        '"UPDATE cases SET state = ?2, version = ?3 \\\n                 WHERE case_id = ?1 AND ?4 IS NOT NULL"',
     ),
     "AMissingCaseLooksLikeAConflict": (
         "src/store/cases.rs",
         "a_write_to_a_missing_case_is_not_found",
         "a write to a case that does not exist reports a conflict, sending the "
         "caller into a re-read loop against nothing",
-        "                None => Err(StoreError::NotFound(case.to_string())),",
-        "                None => Err(StoreError::CaseConflict { case: case.to_string(), expected: expected.0, current: 0 }),",
+        "            None => Err(StoreError::NotFound(case.to_string())),",
+        "            None => Err(StoreError::CaseConflict { case: case.to_string(), expected: expected.0, current: 0 }),",
     ),
     # The denial channel. Neither mutation changes what the policy decides — only
     # how much an attacker learns from asking repeatedly.
@@ -1003,14 +1003,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     "ContentionOutranksIneligibility": (
         "src/store/tasks.rs",
-        "sqlite_satisfies_the_case_layer_contracts",
+        "turso_satisfies_the_case_layer_contracts",
         "a barred reviewer is told the task is held rather than that it is not theirs",
-        "                if task.excluded_actors.iter().any(|a| a == &actor) {",
-        "                if task.assignee.is_none()\n                    && task.excluded_actors.iter().any(|a| a == &actor)\n                {",
+        "        if task.excluded_actors.iter().any(|a| a == actor) {",
+        "        if task.assignee.is_none()\n            && task.excluded_actors.iter().any(|a| a == actor)\n        {",
     ),
     "AnyoneCanReleaseAClaim": (
         "src/store/tasks.rs",
-        "sqlite_satisfies_the_case_layer_contracts",
+        "turso_satisfies_the_case_layer_contracts",
         "a claim can be released by somebody who does not hold it",
         "WHERE task_id = ?1 AND assignee = ?2 AND state = 'claimed'",
         "WHERE task_id = ?1 AND state = 'claimed'",

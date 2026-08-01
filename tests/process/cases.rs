@@ -11,7 +11,7 @@
 // These exercise the runtime end to end, which needs a store. Gated so
 // `--no-default-features` still builds and tests cleanly: an embedder who
 // brings their own backend must not be forced to compile SQLite.
-#![cfg(feature = "sqlite")]
+#![cfg(feature = "turso")]
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -136,7 +136,7 @@ impl Calendar for Corrected {
     }
 }
 
-fn runtime_with_cases(store: &Arc<SqliteStore>) -> Runtime {
+fn runtime_with_cases(store: &Arc<TursoStore>) -> Runtime {
     Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .skill(Accumulates)
@@ -152,7 +152,7 @@ fn runtime_with_cases(store: &Arc<SqliteStore>) -> Runtime {
 /// belongs to, not start a parallel one.
 #[tokio::test]
 async fn messages_sharing_a_key_join_one_case() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime_with_cases(&store);
     let keys = [key("document", "DOC-4711")];
 
@@ -187,7 +187,7 @@ async fn messages_sharing_a_key_join_one_case() {
 /// part of the tamper-evident history rather than a mutable side table.
 #[tokio::test]
 async fn the_case_binding_is_journaled() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime_with_cases(&store);
 
     let out = rt
@@ -221,7 +221,7 @@ async fn the_case_binding_is_journaled() {
 /// Different keys are different matters.
 #[tokio::test]
 async fn unrelated_keys_do_not_collide() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime_with_cases(&store);
 
     rt.run_in_case("accumulates", json!(1), "m", &[key("document", "A")])
@@ -248,7 +248,7 @@ async fn unrelated_keys_do_not_collide() {
 /// entity opens a fresh case rather than reanimating a concluded one.
 #[tokio::test]
 async fn closing_a_case_releases_its_correlation_keys() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let keys = [key("meter", "M-9")];
 
     let first = store
@@ -269,7 +269,7 @@ async fn closing_a_case_releases_its_correlation_keys() {
 /// Correlating against no keys never invents a case.
 #[tokio::test]
 async fn empty_keys_correlate_to_nothing() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
     assert_eq!(store.correlate(&[]).await.unwrap(), None);
 }
 
@@ -282,7 +282,7 @@ async fn empty_keys_correlate_to_nothing() {
 /// calendar digest beside it says which ruleset produced it.
 #[tokio::test]
 async fn the_resolved_instant_is_journaled_with_its_calendar() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .calendar(Arc::new(WorkingDays))
@@ -332,7 +332,7 @@ async fn the_resolved_instant_is_journaled_with_its_calendar() {
 /// notice, because it never asks.
 #[tokio::test]
 async fn replay_does_not_recompute_a_deadline() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let spec = DeadlineSpec::new("working-days", json!({ "n": 5 }));
 
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
@@ -386,7 +386,7 @@ async fn replay_does_not_recompute_a_deadline() {
 /// behind a tidy "closed" status.
 #[tokio::test]
 async fn a_case_with_an_open_obligation_refuses_to_close() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .skill(Obliges {
@@ -415,7 +415,7 @@ async fn a_case_with_an_open_obligation_refuses_to_close() {
 /// Satisfying the obligation unblocks closing, and the transition is journaled.
 #[tokio::test]
 async fn meeting_an_obligation_permits_closing_and_is_journaled() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .skill(Obliges {
@@ -462,7 +462,7 @@ async fn meeting_an_obligation_permits_closing_and_is_journaled() {
 /// Without it a deadline is a stored number nobody reads.
 #[tokio::test]
 async fn the_sweep_surfaces_due_and_approaching_obligations() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let now = Timestamp::now_utc();
 
     let case = store
@@ -507,7 +507,7 @@ async fn the_sweep_surfaces_due_and_approaching_obligations() {
 /// refused at admission rather than running half-configured.
 #[tokio::test]
 async fn correlation_without_a_case_store_is_refused() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .skill(Accumulates)
         .build();
@@ -522,7 +522,7 @@ async fn correlation_without_a_case_store_is_refused() {
 /// Case state survives a resumed run, and the resume does not double-append it.
 #[tokio::test]
 async fn case_state_survives_resume() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime_with_cases(&store);
     let keys = [key("document", "D-6")];
 
@@ -551,7 +551,7 @@ async fn case_state_survives_resume() {
 /// a read of it is a non-deterministic input by that definition.
 #[tokio::test]
 async fn a_strict_replay_reads_case_state_from_the_journal_not_the_store() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime_with_cases(&store);
     let keys = [key("document", "D-REPLAY")];
 
@@ -581,7 +581,7 @@ async fn a_strict_replay_reads_case_state_from_the_journal_not_the_store() {
 /// A strict replay must not write to the world, and the case store is world.
 #[tokio::test]
 async fn a_strict_replay_does_not_rewrite_case_state() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = runtime_with_cases(&store);
     let keys = [key("document", "D-NOWRITE")];
 
@@ -620,7 +620,7 @@ async fn a_strict_replay_does_not_rewrite_case_state() {
 /// work vanishes, and nothing in the record shows it happened.
 #[tokio::test]
 async fn a_write_against_a_stale_read_is_refused() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let case = store
         .correlate_or_open("m", &[key("document", "D-CAS")], Timestamp::now_utc())
         .await
@@ -660,9 +660,9 @@ async fn a_write_against_a_stale_read_is_refused() {
 /// something that will never exist.
 #[tokio::test]
 async fn a_write_to_a_missing_case_is_not_found() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     // A real id from another store, so it is well-formed but absent here.
-    let elsewhere = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let elsewhere = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let missing = elsewhere
         .correlate_or_open("m", &[key("document", "D-ELSEWHERE")], Timestamp::now_utc())
         .await
@@ -682,7 +682,7 @@ async fn a_write_to_a_missing_case_is_not_found() {
 /// Versions advance by one per write, so a reader can tell them apart.
 #[tokio::test]
 async fn each_write_advances_the_version() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let case = store
         .correlate_or_open("m", &[key("document", "D-SEQ")], Timestamp::now_utc())
         .await
@@ -723,7 +723,7 @@ async fn a_step_whose_case_moved_under_it_is_refused() {
         }
     }
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
         .skill(WritesStale)

@@ -12,7 +12,7 @@
 //! situation is that the policy set is broken and the plane has been enforcing
 //! nothing anyone intended.
 
-#![cfg(all(feature = "cedar", feature = "sqlite"))]
+#![cfg(all(feature = "cedar", feature = "turso"))]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
@@ -25,7 +25,7 @@ use agentplane::core::{
 use agentplane::journal::JournalStore;
 use agentplane::policy::CedarEngine;
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 
 fn ask<'a>(
@@ -373,7 +373,7 @@ impl Skill for Pays {
 /// Cedar governs a real run, and the rules it enforced are on the record.
 #[tokio::test]
 async fn cedar_governs_a_run_and_the_digest_lands_in_the_journal() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let world = Arc::new(Mutex::new(Vec::new()));
 
     let engine = Arc::new(
@@ -426,7 +426,7 @@ async fn cedar_governs_a_run_and_the_digest_lands_in_the_journal() {
 /// A delegation chain's owner and depth reach the rules.
 #[tokio::test]
 async fn cedar_can_key_on_the_delegation_chain() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let world = Arc::new(Mutex::new(Vec::new()));
 
     let chain = Delegation::root(Principal::new("user:hupe", Scope::root()))

@@ -32,6 +32,17 @@ current=""
 #      a genuinely confusing hour: scans disagreed with grep, failures moved
 #      between runs, and a clean-looking tree failed tests. The lock makes it
 #      impossible rather than merely unwise.
+# A mutation removes a guarantee, and dead code is the expected side effect —
+# an unused variable where a check used to read one, an unused import where a
+# constructor used to be called. Under `-D warnings` (which CI sets globally)
+# those become compile errors, and this harness reports a perfectly valid
+# mutation as "did not compile" — i.e. as an error in the *table* rather than a
+# caught guarantee.
+#
+# So the sweep compiles without warnings-as-errors. Lint strictness is `just
+# lint`'s job, on unmutated source, where a warning means something.
+export RUSTFLAGS="${RUSTFLAGS_MUTANTS:-}"
+
 LOCK="${TMPDIR:-/tmp}/agentplane-mutants.lock"
 
 restore_strays() {

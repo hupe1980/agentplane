@@ -5,7 +5,7 @@
 //! journaled rather than recomputed, so an exhausted budget is part of history
 //! rather than an artefact of when you looked at it.
 
-#![cfg(feature = "sqlite")]
+#![cfg(feature = "turso")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use serde_json::{Value, json};
 
 /// An effect that reports what it consumed.
@@ -124,13 +124,13 @@ impl Skill for Spends {
 }
 
 struct Fixture {
-    store: Arc<SqliteStore>,
+    store: Arc<TursoStore>,
     rt: Runtime,
     calls: Arc<AtomicUsize>,
 }
 
-fn fixture(n: usize, tokens: u64, budget: Budget) -> Fixture {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+async fn fixture(n: usize, tokens: u64, budget: Budget) -> Fixture {
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .budget(budget)
@@ -149,7 +149,7 @@ fn fixture(n: usize, tokens: u64, budget: Budget) -> Fixture {
 /// An unlimited budget is the explicit default and does not interfere.
 #[tokio::test]
 async fn an_unlimited_budget_does_not_interfere() {
-    let f = fixture(20, 1_000_000, Budget::unlimited());
+    let f = fixture(20, 1_000_000, Budget::unlimited()).await;
     let out = f.rt.run("demo.spend", json!({})).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(f.calls.load(Ordering::SeqCst), 20);
@@ -158,7 +158,7 @@ async fn an_unlimited_budget_does_not_interfere() {
 /// **The count limit is exact**, because counts are known in advance.
 #[tokio::test]
 async fn an_effect_count_limit_stops_a_runaway_loop_exactly() {
-    let f = fixture(100, 0, Budget::default().effects(5));
+    let f = fixture(100, 0, Budget::default().effects(5)).await;
     let out = f.rt.run("demo.spend", json!({})).await.unwrap();
 
     match &out.status {
@@ -178,7 +178,7 @@ async fn an_effect_count_limit_stops_a_runaway_loop_exactly() {
 /// needs to resize it.
 #[tokio::test]
 async fn a_token_limit_reports_where_it_stood() {
-    let f = fixture(100, 40, Budget::default().tokens(100));
+    let f = fixture(100, 40, Budget::default().tokens(100)).await;
     let out = f.rt.run("demo.spend", json!({})).await.unwrap();
 
     match &out.status {
@@ -194,7 +194,7 @@ async fn a_token_limit_reports_where_it_stood() {
 /// A cost limit works the same way, in integer minor units.
 #[tokio::test]
 async fn a_cost_limit_is_enforced_in_minor_units() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .budget(Budget::default().minor_units(250))
@@ -214,7 +214,7 @@ async fn a_cost_limit_is_enforced_in_minor_units() {
 /// A step limit stops the plan between steps, before the next one half-runs.
 #[tokio::test]
 async fn a_step_limit_stops_the_plan_between_steps() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
 
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
@@ -250,7 +250,7 @@ async fn a_step_limit_stops_the_plan_between_steps() {
 /// Stated as a test so nobody discovers it by sizing a limit at their ceiling.
 #[tokio::test]
 async fn a_metered_budget_overshoots_by_at_most_one_operation() {
-    let f = fixture(10, 60, Budget::default().tokens(100));
+    let f = fixture(10, 60, Budget::default().tokens(100)).await;
     let out = f.rt.run("demo.spend", json!({})).await.unwrap();
 
     assert!(matches!(out.status, RunStatus::Exhausted(_)));
@@ -270,7 +270,7 @@ async fn a_metered_budget_overshoots_by_at_most_one_operation() {
 /// moving answer, and the budget verdict would move with it.
 #[tokio::test]
 async fn spend_is_journaled_so_replay_bills_identically() {
-    let f = fixture(3, 25, Budget::default().tokens(1000));
+    let f = fixture(3, 25, Budget::default().tokens(1000)).await;
     let out = f.rt.run("demo.spend", json!({})).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
 
@@ -299,7 +299,7 @@ async fn spend_is_journaled_so_replay_bills_identically() {
 /// of history, not a function of the limit in force when you replayed it.
 #[tokio::test]
 async fn an_exhausted_run_replays_as_exhausted() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
     let skill = || Spends {
         n: 100,
@@ -347,7 +347,7 @@ async fn an_exhausted_run_replays_as_exhausted() {
 /// instrument works even when every operation is free.
 #[tokio::test]
 async fn free_operations_still_count() {
-    let f = fixture(50, 0, Budget::default().effects(4));
+    let f = fixture(50, 0, Budget::default().effects(4)).await;
     let out = f.rt.run("demo.spend", json!({})).await.unwrap();
     assert!(matches!(out.status, RunStatus::Exhausted(_)));
     assert_eq!(f.calls.load(Ordering::SeqCst), 4);
@@ -358,7 +358,7 @@ async fn free_operations_still_count() {
 /// that behaved exactly as instructed.
 #[tokio::test]
 async fn exhaustion_is_distinguishable_from_failure() {
-    let f = fixture(100, 0, Budget::default().effects(1));
+    let f = fixture(100, 0, Budget::default().effects(1)).await;
     let out = f.rt.run("demo.spend", json!({})).await.unwrap();
 
     assert!(matches!(out.status, RunStatus::Exhausted(_)));
@@ -373,7 +373,7 @@ async fn exhaustion_is_distinguishable_from_failure() {
 /// auditable rather than inferred.
 #[tokio::test]
 async fn exhaustion_is_journaled() {
-    let f = fixture(100, 0, Budget::default().effects(2));
+    let f = fixture(100, 0, Budget::default().effects(2)).await;
     let out = f.rt.run("demo.spend", json!({})).await.unwrap();
 
     let records = f.store.read(out.run_id, 1).await.unwrap();
@@ -392,7 +392,7 @@ async fn exhaustion_is_journaled() {
 async fn a_step_limited_run_replays_as_exhausted() {
     use agentplane::core::{ArgSource, PlanIR, PlanNode};
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .budget(Budget::default().steps(2))

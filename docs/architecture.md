@@ -420,7 +420,8 @@ Rust struct.
   handed over earlier — which means witnesses, and those are not built.
 * **Split views** — one history to one auditor, a different one to another —
   remain undetectable without a witness that has seen both.
-Both backends maintain the log. SQLite positions leaves with `MAX + 1`; Postgres
+Both backends maintain the log. The embedded store positions leaves with
+`MAX + 1`; Postgres
 uses a **sequence**, because several instances seal concurrently there — that is
 the topology it exists for — and `MAX + 1` computed by two transactions at once
 hands both the same position. A sequence is monotonic under concurrency and never
@@ -958,7 +959,7 @@ src/
   journal/   records, hash chain, replay cursor, upcasters
   case/      CaseStore, EventStore, TaskStore contracts
   plan/      the plan contract: what a plan must satisfy to run at all
-  store/     SQLite backends for both journal and cases
+  store/     Turso and Postgres backends, journal and cases alike
   runtime/   StepCtx, effect protocol, executor, sweeper, built-in effects
   batch/     batch runs: item source, outcomes, the BatchStore contract
   api/       the HTTP surface for operators (feature `http`, off by default)

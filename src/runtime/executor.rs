@@ -2391,7 +2391,7 @@ impl RuntimeBuilder {
     /// outward claims carry one identity. They are separate settings because a
     /// plane can legitimately have one without the other.
     ///
-    /// [`signing_as`]: crate::store::SqliteStore::signing_as
+    /// [`signing_as`]: crate::store::TursoStore::signing_as
     #[must_use]
     pub fn signing_as(mut self, signer: Arc<dyn crate::core::Signer>) -> Self {
         self.signer = Some(signer);

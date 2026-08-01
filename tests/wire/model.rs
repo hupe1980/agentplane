@@ -12,7 +12,7 @@
 //! loop against a flaky provider would therefore burn real money against a
 //! ceiling that read nothing.
 
-#![cfg(all(feature = "sqlite", feature = "testkit"))]
+#![cfg(all(feature = "turso", feature = "testkit"))]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use agentplane::core::{
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::model::{Completion, ModelCall, ModelError, ModelId, ModelProvider, Usage};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::SqliteStore;
+use agentplane::store::TursoStore;
 use agentplane::testkit::FakeProvider;
 use serde_json::{Value, json};
 
@@ -161,7 +161,7 @@ impl Skill for Asks {
 /// verdict than the original — it would think the failed attempt was free.
 #[tokio::test]
 async fn a_failed_completion_is_journaled_with_its_cost() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let provider = FakeProvider::new();
     provider.will_fail(ModelError::Interrupted {
         model: model(),
@@ -249,7 +249,7 @@ async fn a_failed_completion_spends_the_budget_that_stops_the_next_one() {
         }
     }
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let provider = FakeProvider::new();
     provider
         .will_fail(ModelError::Interrupted {
@@ -302,7 +302,7 @@ async fn a_failed_completion_spends_the_budget_that_stops_the_next_one() {
 /// A recorded failure bills the same on replay as it did live.
 #[tokio::test]
 async fn replay_charges_a_failed_completion_the_same_as_the_live_run() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
     let provider = FakeProvider::new();
     provider.will_fail(ModelError::Interrupted {
         model: model(),
