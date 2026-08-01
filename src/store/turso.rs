@@ -11,21 +11,12 @@
 //!   writes. A stale writer cannot interleave between the check and the append,
 //!   because there is no gap to interleave into.
 //!
-//! Turso is a from-scratch SQLite-compatible engine written in Rust. It replaced
-//! `rusqlite` outright, for two reasons that were each costing something real:
+//! Turso is `SQLite`-compatible and written in Rust: no C toolchain, and a
+//! natively async driver rather than blocking calls on a thread pool.
 //!
-//! * **No C dependency.** The bundled SQLite arrived through `libsqlite3-sys`,
-//!   which raised its own toolchain floor without declaring `rust-version` — so
-//!   cargo's resolver could not protect against it, and this crate's true
-//!   minimum drifted above the one it advertised.
-//! * **Natively async.** `rusqlite` blocks, so every journal read had to hop to
-//!   the blocking pool through `spawn_blocking`. That hop is gone.
-//!
-//! Being SQLite-*compatible* is a claim, not a guarantee, so it is checked
-//! rather than trusted: this store is held to [`crate::testkit::conformance`],
-//! which states the [`JournalStore`] contract once and names the invariant that
-//! fails. The partial index above is exactly the kind of thing a
-//! reimplementation can accept and then quietly not enforce.
+//! Compatible is a claim, not a guarantee, so it is checked: this store is held
+//! to [`crate::testkit::conformance`]. A partial index is exactly what a
+//! reimplementation can accept and then not enforce.
 //!
 //! The connection is held behind an async mutex rather than opened per call.
 //! Appends serialise anyway — each one reads the chain head and writes the next
@@ -46,12 +37,8 @@ use turso::{Connection, Row, Rows, params};
 use crate::core::{Digest, EffectKey, Epoch, RunId, Seq, StoreError};
 use crate::journal::{Append, Cancellation, Head, JournalStore, Lease, Record};
 
-/// Connection tuning.
-///
-/// `journal_mode` is deliberately absent: it reports its result as a row, and a
-/// statement that returns rows is not a batch statement — it is applied
-/// separately in [`TursoStore::init`] so a silently ignored result cannot be
-/// mistaken for a mode that was set.
+/// Connection tuning. `journal_mode` is applied separately: it returns a row,
+/// so it is a query rather than a batch statement.
 const PRAGMAS: &str = "PRAGMA foreign_keys = ON;";
 
 const JOURNAL: &str = r"
@@ -165,10 +152,9 @@ impl TursoStore {
 
     async fn init(conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch(PRAGMAS).await.map_err(|e| be(&e))?;
-        // Returns the mode it settled on, so it is issued as a query and the
-        // answer is read. A store that silently ran without WAL would still
-        // pass every test in this crate and lose durability characteristics
-        // nobody had agreed to give up.
+        // Read back rather than fired and forgotten: a store silently not in
+        // WAL passes every test here while losing durability nobody agreed to
+        // give up.
         let mut rows = conn
             .query("PRAGMA journal_mode = WAL", ())
             .await
@@ -217,10 +203,7 @@ impl TursoStore {
         self
     }
 
-    /// Exclusive access to the connection.
-    ///
-    /// The sibling modules that implement the case layer hold it for the length
-    /// of one operation, exactly as the methods here do.
+    /// Exclusive access to the connection, held for one operation.
     pub(super) async fn conn(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         self.conn.lock().await
     }
@@ -336,10 +319,7 @@ pub(super) fn be(e: &turso::Error) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
-/// The first row of a result set, or `None`.
-///
-/// Turso has no `query_row`, and the shape it replaces — "at most one row, and
-/// absence is ordinary" — appears in every lookup here.
+/// The first row of a result set, or `None`. Turso has no `query_row`.
 pub(super) async fn first(mut rows: Rows) -> Result<Option<Row>, StoreError> {
     rows.next().await.map_err(|e| be(&e))
 }
@@ -366,11 +346,8 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The last record of a run, or genesis.
-///
-/// Takes a plain `&Connection` because `Transaction` derefs to one — so the
-/// same function serves the transactional callers (which need the read and the
-/// write to be indivisible) and `head`.
+/// The last record of a run, or genesis. Takes `&Connection` so the same
+/// function serves `head` and the callers that need it inside a transaction.
 async fn head_of(conn: &Connection, run: RunId) -> Result<Head, StoreError> {
     let rows = conn
         .query(
@@ -474,10 +451,9 @@ impl JournalStore for TursoStore {
                 .await;
 
             written.map_err(|e| match e {
-                // The exactly-once index fired: this effect already started in
-                // this run. Matched on the typed variant rather than on the
-                // message text — a backend that reworded its diagnostic must not
-                // be able to turn a duplicate into an opaque backend error.
+                // The exactly-once index fired. Matched on the typed variant,
+                // not the message: a reworded diagnostic must not turn a
+                // duplicate into an opaque backend error.
                 turso::Error::Constraint(_) => record.effect_key().map_or_else(
                     || StoreError::Backend(format!("constraint violation: {e}")),
                     StoreError::DuplicateEffect,

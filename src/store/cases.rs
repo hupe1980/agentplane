@@ -142,7 +142,7 @@ fn deadline_from_row(row: &Row) -> Result<DeadlineRow, StoreError> {
     })
 }
 
-/// Every deadline a query returns, built and validated.
+/// Every deadline a query returns, validated.
 async fn deadlines_from(mut rows: turso::Rows) -> Result<Vec<Deadline>, StoreError> {
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(|e| be(&e))? {
@@ -591,9 +591,8 @@ impl CaseStore for TursoStore {
                 out.push(r.get(0).map_err(|e| be(&e))?);
             }
             out
-            // The guard is released here, on purpose: `case()` below takes it
-            // again per id, and holding it across those calls would deadlock on
-            // a non-reentrant mutex.
+            // Guard released here: `case()` below takes it again, and the mutex
+            // is not reentrant.
         };
 
         let mut cases = Vec::with_capacity(ids.len());

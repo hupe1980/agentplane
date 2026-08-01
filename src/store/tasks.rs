@@ -135,7 +135,7 @@ fn row(r: &turso::Row) -> Result<TaskRow, StoreError> {
     })
 }
 
-/// Every task a query returns, built and validated.
+/// Every task a query returns, validated.
 async fn tasks_from(mut rows: turso::Rows) -> Result<Vec<Task>, StoreError> {
     let mut out = Vec::new();
     while let Some(r) = rows.next().await.map_err(|e| be(&e))? {
@@ -144,7 +144,7 @@ async fn tasks_from(mut rows: turso::Rows) -> Result<Vec<Task>, StoreError> {
     Ok(out)
 }
 
-/// One task by id, inside whatever connection or transaction is passed.
+/// One task by id, on a connection or a transaction.
 async fn task_by_id(conn: &turso::Connection, id: TaskId) -> Result<Option<TaskRow>, StoreError> {
     let rows = conn
         .query(

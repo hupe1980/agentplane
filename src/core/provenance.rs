@@ -50,20 +50,10 @@ use crate::core::{Attestation, CaseId, Digest, EffectKey, RunId, Signer, Verifie
 /// extensions write into the same object, so an unprefixed `run_id` is a
 /// collision waiting for the first server that has its own.
 ///
-/// **Reverse DNS, under a domain this project demonstrably controls.** Both
-/// halves of that are requirements rather than taste:
-///
-/// * The MCP specification says prefixes SHOULD use reverse DNS notation, and
-///   names `example.com/` as the form *not* to use. A forward-DNS prefix is the
-///   shape the spec calls out as wrong.
-/// * `io.github.<user>` is derived from GitHub Pages, so the namespace is one
-///   whose ownership a reader can check — the same reason Maven Central issues
-///   that namespace to GitHub users. A prefix under a domain nobody here
-///   registered is a collision waiting for whoever registers it later, and
-///   these keys travel to other people's servers.
-///
-/// The second label is `github`, so this does not fall in the space MCP
-/// reserves (`modelcontextprotocol` or `mcp` as the second label).
+/// Reverse DNS, under a domain the project controls: MCP asks for reverse DNS
+/// and names `example.com/` as the form not to use, and these keys travel to
+/// other people's servers, so an unregistered domain is a collision waiting for
+/// whoever registers it.
 pub const NS: &str = "io.github.hupe1980.agentplane/";
 
 /// Who is calling, on whose behalf, for which piece of work.

@@ -91,10 +91,8 @@ impl Endpoint {
 /// mechanism exists so a peer can say what it understood, and a peer that does
 /// not understand this one still gets a well-formed message.
 ///
-/// Under a domain this project controls, and resolvable to where the extension
-/// is documented. An extension URI is an identifier a peer may also *fetch*, so
-/// pointing it at a domain nobody here registered is both a collision risk and
-/// a broken link.
+/// Under a domain the project controls: a peer may fetch this URI, so an
+/// unregistered domain is both a collision risk and a broken link.
 pub const EXTENSION_URI: &str = "https://hupe1980.github.io/agentplane/a2a/delegation/v1";
 
 /// Talks A2A to peers.

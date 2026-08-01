@@ -158,15 +158,15 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # their own backend must not be forced to compile SQLite.
 [[example]]
 name              = "durable_pipeline"
-required-features = ["sqlite"]
+required-features = ["turso"]
 
 [[example]]
 name              = "clearing_case"
-required-features = ["sqlite"]
+required-features = ["turso"]
 
 [[example]]
 name              = "plan_graph"
-required-features = ["sqlite"]
+required-features = ["turso"]
 
 # Needs `testkit` for the fake provider. Deliberately: an example that called a
 # real model would need an API key to run, and the claim it demonstrates — that
@@ -174,7 +174,7 @@ required-features = ["sqlite"]
 # stay a sentence in the README instead of something anyone can execute.
 [[example]]
 name              = "model_run"
-required-features = ["sqlite", "testkit"]
+required-features = ["turso", "testkit"]
 
 [lints.rust]
 unsafe_code = "forbid"
