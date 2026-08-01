@@ -1,0 +1,1531 @@
+//! The case layer on `PostgreSQL`.
+//!
+//! Every store here exists to settle one race, and the races are the reason this
+//! file is not a mechanical translation of the `SQLite` one:
+//!
+//! | Store | Race | How Postgres settles it |
+//! |---|---|---|
+//! | cases | two messages, one new matter | partial unique index on open keys |
+//! | events | one message, two waiters | `UPDATE … RETURNING` claims in one statement |
+//! | timers | one wake-up, two sweeps | same |
+//! | tasks | one decision, two reviewers | same |
+//! | batches | one item, two reservations | `ON CONFLICT DO NOTHING`, then read back |
+//!
+//! `UPDATE … RETURNING` is the reason several of these are *simpler* here than
+//! in `SQLite` rather than merely different. The read-then-write that `SQLite` has
+//! to wrap in a transaction becomes a single statement whose result tells you
+//! whether you won — there is no window to reason about because there is no
+//! second statement.
+//!
+//! Whether that reasoning is right is not left to the reader:
+//! `testkit::conformance_case` runs the same battery against this and against
+//! `SQLite`.
+
+use async_trait::async_trait;
+use deadpool_postgres::Pool;
+use tokio_postgres::error::SqlState;
+
+use crate::batch::{BatchCensus, BatchStore, ItemOutcome, ItemRecord};
+use crate::case::{BufferedEvent, ClaimError};
+use crate::case::{CaseCensus, CaseStore, Correlation, EventStore, TaskStore, TimerStore};
+use crate::core::{
+    BatchId, Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, DeadLetter, Deadline,
+    DeadlineState, Digest, EffectKey, InboundEvent, OnExpiry, Priority, RunId, Spend, StoreError,
+    Subscription, Task, TaskId, TaskState, Timer, Timestamp,
+};
+
+use super::postgres::PostgresStore;
+
+pub(super) const CASE_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS cases (
+    case_id   TEXT PRIMARY KEY,
+    kind      TEXT   NOT NULL,
+    status    TEXT   NOT NULL,
+    state     TEXT   NOT NULL,
+    -- Bumped by every state write, which must name the version it read. This
+    -- backend is the one that exists for several plane instances sharing a
+    -- store, so the overlapping read-modify-write is not a corner case here —
+    -- it is the normal operating condition.
+    version   BIGINT NOT NULL DEFAULT 0,
+    opened_at BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS case_correlation (
+    case_id   TEXT    NOT NULL REFERENCES cases (case_id) ON DELETE CASCADE,
+    namespace TEXT    NOT NULL,
+    value     TEXT    NOT NULL,
+    open      BOOLEAN NOT NULL DEFAULT TRUE,
+    PRIMARY KEY (case_id, namespace, value)
+);
+
+-- One open case per business key. This is the arbiter, not a hint: two inbound
+-- messages racing to open the same matter both attempt the insert, and exactly
+-- one succeeds. The loser re-reads and attaches.
+CREATE UNIQUE INDEX IF NOT EXISTS case_correlation_open
+    ON case_correlation (namespace, value) WHERE open;
+
+CREATE TABLE IF NOT EXISTS case_runs (
+    case_id TEXT   NOT NULL REFERENCES cases (case_id) ON DELETE CASCADE,
+    run_id  TEXT   NOT NULL,
+    seq     BIGINT NOT NULL,
+    PRIMARY KEY (case_id, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS case_deadlines (
+    case_id         TEXT   NOT NULL REFERENCES cases (case_id) ON DELETE CASCADE,
+    name            TEXT   NOT NULL,
+    resolved_at     BIGINT NOT NULL,
+    calendar_digest BYTEA  NOT NULL,
+    warn_at         BIGINT,
+    state           TEXT   NOT NULL,
+    PRIMARY KEY (case_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS inbound_events (
+    event_id    TEXT PRIMARY KEY,
+    kind        TEXT    NOT NULL,
+    payload     TEXT    NOT NULL,
+    received_at BIGINT  NOT NULL,
+    claimed_by  TEXT,
+    claimed_at  BIGINT,
+    dead        BOOLEAN NOT NULL DEFAULT FALSE,
+    dead_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS inbound_correlation (
+    event_id  TEXT NOT NULL REFERENCES inbound_events (event_id) ON DELETE CASCADE,
+    namespace TEXT NOT NULL,
+    value     TEXT NOT NULL,
+    PRIMARY KEY (event_id, namespace, value)
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+    run_id     TEXT   NOT NULL,
+    effect_key TEXT   NOT NULL,
+    case_id    TEXT,
+    step       BIGINT NOT NULL,
+    phase      TEXT   NOT NULL,
+    event_kind TEXT   NOT NULL,
+    namespace  TEXT   NOT NULL,
+    value      TEXT   NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (run_id, effect_key, namespace, value)
+);
+
+CREATE TABLE IF NOT EXISTS timers (
+    run_id     TEXT   NOT NULL,
+    effect_key TEXT   NOT NULL,
+    case_id    TEXT,
+    step       BIGINT NOT NULL,
+    phase      TEXT   NOT NULL,
+    fire_at    BIGINT NOT NULL,
+    claimed_at BIGINT,
+    PRIMARY KEY (run_id, effect_key)
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id         TEXT PRIMARY KEY,
+    run_id          TEXT   NOT NULL,
+    case_id         TEXT,
+    kind            TEXT   NOT NULL,
+    justification   TEXT   NOT NULL,
+    candidate_roles TEXT   NOT NULL,
+    excluded_actors TEXT   NOT NULL,
+    assignee        TEXT,
+    priority        TEXT   NOT NULL,
+    state           TEXT   NOT NULL,
+    on_expiry       TEXT   NOT NULL,
+    created_at      BIGINT NOT NULL,
+    due_at          BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS batches (
+    batch_id    TEXT PRIMARY KEY,
+    plan_digest TEXT    NOT NULL,
+    exhausted   BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS batch_items (
+    batch_id TEXT   NOT NULL REFERENCES batches (batch_id) ON DELETE CASCADE,
+    item_key TEXT   NOT NULL,
+    run_id   TEXT   NOT NULL,
+    outcome  TEXT,
+    detail   TEXT,
+    tokens   BIGINT NOT NULL DEFAULT 0,
+    minor    BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (batch_id, item_key)
+);
+";
+
+fn be(e: &tokio_postgres::Error) -> StoreError {
+    StoreError::Backend(e.to_string())
+}
+
+fn pool_err(e: &impl std::fmt::Display) -> StoreError {
+    StoreError::Backend(e.to_string())
+}
+
+fn corrupt(what: &str, e: impl std::fmt::Display) -> StoreError {
+    StoreError::Corrupt {
+        seq: 0,
+        detail: format!("{what}: {e}"),
+    }
+}
+
+fn status_from(s: &str) -> Result<CaseStatus, StoreError> {
+    Ok(match s {
+        "open" => CaseStatus::Open,
+        "awaiting_external" => CaseStatus::AwaitingExternal,
+        "awaiting_human" => CaseStatus::AwaitingHuman,
+        "escalated" => CaseStatus::Escalated,
+        "closed" => CaseStatus::Closed,
+        other => return Err(corrupt("unknown case status", other)),
+    })
+}
+
+fn deadline_state_from(s: &str) -> Result<DeadlineState, StoreError> {
+    Ok(match s {
+        "pending" => DeadlineState::Pending,
+        "warned" => DeadlineState::Warned,
+        "breached" => DeadlineState::Breached,
+        "met" => DeadlineState::Met,
+        "cancelled" => DeadlineState::Cancelled,
+        other => return Err(corrupt("unknown deadline state", other)),
+    })
+}
+
+fn task_state_from(s: &str) -> Result<TaskState, StoreError> {
+    Ok(match s {
+        "open" => TaskState::Open,
+        "claimed" => TaskState::Claimed,
+        "completed" => TaskState::Completed,
+        "expired" => TaskState::Expired,
+        "escalated" => TaskState::Escalated,
+        other => return Err(corrupt("unknown task state", other)),
+    })
+}
+
+fn priority_from(s: &str) -> Priority {
+    match s {
+        "low" => Priority::Low,
+        "high" => Priority::High,
+        "urgent" => Priority::Urgent,
+        _ => Priority::Normal,
+    }
+}
+
+fn expiry_from(s: &str) -> OnExpiry {
+    match s {
+        "escalate" => OnExpiry::Escalate,
+        "proceed" => OnExpiry::Proceed,
+        _ => OnExpiry::Deny,
+    }
+}
+
+fn expiry_str(e: OnExpiry) -> &'static str {
+    match e {
+        OnExpiry::Deny => "deny",
+        OnExpiry::Escalate => "escalate",
+        OnExpiry::Proceed => "proceed",
+    }
+}
+
+fn phase_str(p: crate::core::Phase) -> &'static str {
+    match p {
+        crate::core::Phase::Forward => "forward",
+        crate::core::Phase::Compensating => "compensating",
+    }
+}
+
+fn phase_from(s: &str) -> crate::core::Phase {
+    match s {
+        "compensating" => crate::core::Phase::Compensating,
+        _ => crate::core::Phase::Forward,
+    }
+}
+
+impl PostgresStore {
+    fn pool(&self) -> &Pool {
+        self.pool_ref()
+    }
+}
+
+#[async_trait]
+impl CaseStore for PostgresStore {
+    async fn correlate(&self, keys: &[CorrelationKey]) -> Result<Option<CaseId>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        for k in keys {
+            let row = client
+                .query_opt(
+                    "SELECT case_id FROM case_correlation
+                      WHERE namespace = $1 AND value = $2 AND open",
+                    &[&k.namespace, &k.value],
+                )
+                .await
+                .map_err(|e| be(&e))?;
+            if let Some(row) = row {
+                let id: String = row.get(0);
+                return Ok(Some(
+                    CaseId::parse(&id).map_err(|e| corrupt("bad case id", e))?,
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn correlate_or_open(
+        &self,
+        kind: &str,
+        keys: &[CorrelationKey],
+        at: Timestamp,
+    ) -> Result<Correlation, StoreError> {
+        // Two attempts, and the second is not a retry loop for flakiness — it is
+        // how the constraint arbitrates. Both messages read no open case, both
+        // try to insert, and the unique index picks a winner. The loser comes
+        // back here and *finds* the winner's row, which is exactly the answer it
+        // should have had.
+        for attempt in 0..2 {
+            if let Some(existing) = self.correlate(keys).await? {
+                return Ok(Correlation::Attached(existing));
+            }
+
+            let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+            let tx = client.transaction().await.map_err(|e| be(&e))?;
+            let id = CaseId::generate();
+            tx.execute(
+                "INSERT INTO cases (case_id, kind, status, state, opened_at)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &id.to_string(),
+                    &kind.to_owned(),
+                    &CaseStatus::Open.as_str(),
+                    &"null".to_owned(),
+                    &at.unix_timestamp(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+
+            let mut lost = false;
+            for k in keys {
+                let r = tx
+                    .execute(
+                        "INSERT INTO case_correlation (case_id, namespace, value, open)
+                         VALUES ($1, $2, $3, TRUE)",
+                        &[&id.to_string(), &k.namespace, &k.value],
+                    )
+                    .await;
+                if let Err(e) = r {
+                    if e.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+                        lost = true;
+                        break;
+                    }
+                    return Err(be(&e));
+                }
+            }
+            if lost {
+                // Someone else opened this matter first. Discard ours entirely —
+                // a half-opened case with no keys is a case nothing can reach.
+                drop(tx);
+                continue;
+            }
+            tx.commit().await.map_err(|e| be(&e))?;
+            let _ = attempt;
+            return Ok(Correlation::Opened(id));
+        }
+
+        // Two losses means a third party is opening and closing this key in a
+        // tight loop; say so rather than looping forever.
+        self.correlate(keys)
+            .await?
+            .map(Correlation::Attached)
+            .ok_or_else(|| {
+                StoreError::Backend(
+                    "could not open or attach a case: the correlation key is being opened \
+                     and closed concurrently"
+                        .into(),
+                )
+            })
+    }
+
+    async fn case(&self, id: CaseId) -> Result<Option<Case>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let Some(row) = client
+            .query_opt(
+                "SELECT kind, status, state, opened_at, version FROM cases WHERE case_id = $1",
+                &[&id.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?
+        else {
+            return Ok(None);
+        };
+        let kind: String = row.get(0);
+        let status: String = row.get(1);
+        let state: String = row.get(2);
+        let opened: i64 = row.get(3);
+        let version: i64 = row.get(4);
+
+        let corr = client
+            .query(
+                "SELECT namespace, value FROM case_correlation WHERE case_id = $1",
+                &[&id.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let runs = client
+            .query(
+                "SELECT run_id FROM case_runs WHERE case_id = $1 ORDER BY seq ASC",
+                &[&id.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+
+        Ok(Some(Case {
+            id,
+            kind,
+            status: status_from(&status)?,
+            correlation: corr
+                .iter()
+                .map(|r| CorrelationKey::new(r.get::<_, String>(0), r.get::<_, String>(1)))
+                .collect(),
+            state: serde_json::from_str(&state)?,
+            version: CaseVersion(u64::try_from(version).unwrap_or(0)),
+            opened_at: Timestamp::from_unix_timestamp(opened)
+                .map_err(|e| corrupt("unrepresentable opened_at", e))?,
+            runs: runs
+                .iter()
+                .map(|r| RunId::parse(&r.get::<_, String>(0)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| corrupt("bad run id", e))?,
+        }))
+    }
+
+    async fn attach_run(&self, case: CaseId, run: RunId) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "INSERT INTO case_runs (case_id, run_id, seq)
+                 VALUES ($1, $2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM case_runs WHERE case_id = $1))
+                 ON CONFLICT (case_id, run_id) DO NOTHING",
+                &[&case.to_string(), &run.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn put_state(
+        &self,
+        case: CaseId,
+        expected: CaseVersion,
+        state: serde_json::Value,
+    ) -> Result<CaseVersion, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let next = expected.next();
+        // The row count is read, and that is the point. The previous version of
+        // this method discarded it and returned `Ok(())` for a case that does
+        // not exist — the same defect already found once in `release` on this
+        // backend. A guard whose result nobody reads is not a guard.
+        let n = client
+            .execute(
+                "UPDATE cases SET state = $2, version = $3 WHERE case_id = $1 AND version = $4",
+                &[
+                    &case.to_string(),
+                    &state.to_string(),
+                    &i64::try_from(next.0).unwrap_or(i64::MAX),
+                    &i64::try_from(expected.0).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if n == 1 {
+            return Ok(next);
+        }
+        // Tell "gone" apart from "moved on": a missing case reported as a
+        // conflict sends the caller into a re-read loop against nothing.
+        let current = client
+            .query_opt(
+                "SELECT version FROM cases WHERE case_id = $1",
+                &[&case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        match current {
+            Some(row) => Err(StoreError::CaseConflict {
+                case: case.to_string(),
+                expected: expected.0,
+                current: u64::try_from(row.get::<_, i64>(0)).unwrap_or(0),
+            }),
+            None => Err(StoreError::NotFound(case.to_string())),
+        }
+    }
+
+    async fn set_status(&self, case: CaseId, status: CaseStatus) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "UPDATE cases SET status = $2 WHERE case_id = $1",
+                &[&case.to_string(), &status.as_str()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn close(&self, case: CaseId) -> Result<(), StoreError> {
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+
+        // An unmet obligation survives closure, because closure is the moment
+        // people stop looking.
+        let open: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM case_deadlines
+                  WHERE case_id = $1 AND state IN ('pending', 'warned')",
+                &[&case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?
+            .get(0);
+        if open > 0 {
+            return Err(StoreError::Backend(format!(
+                "case {case} has {open} unmet obligation(s) and cannot be closed"
+            )));
+        }
+
+        tx.execute(
+            "UPDATE cases SET status = $2 WHERE case_id = $1",
+            &[&case.to_string(), &CaseStatus::Closed.as_str()],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+        // Releasing the keys is what lets a later message open a *new* matter
+        // rather than reanimating an audited one.
+        tx.execute(
+            "UPDATE case_correlation SET open = FALSE WHERE case_id = $1",
+            &[&case.to_string()],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn register_deadline(&self, d: &Deadline) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "INSERT INTO case_deadlines
+                   (case_id, name, resolved_at, calendar_digest, warn_at, state)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (case_id, name) DO NOTHING",
+                &[
+                    &d.case.to_string(),
+                    &d.name,
+                    &d.resolved_at.unix_timestamp(),
+                    &d.calendar_digest.as_bytes().to_vec(),
+                    &d.warn_at.map(Timestamp::unix_timestamp),
+                    &d.state.as_str(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn deadlines(&self, case: CaseId) -> Result<Vec<Deadline>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state
+                   FROM case_deadlines WHERE case_id = $1 ORDER BY resolved_at ASC",
+                &[&case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        rows.iter().map(deadline_from).collect()
+    }
+
+    async fn set_deadline_state(
+        &self,
+        case: CaseId,
+        name: &str,
+        state: DeadlineState,
+    ) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "UPDATE case_deadlines SET state = $3 WHERE case_id = $1 AND name = $2",
+                &[&case.to_string(), &name.to_owned(), &state.as_str()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn due(&self, now: Timestamp, limit: usize) -> Result<Vec<Deadline>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state
+                   FROM case_deadlines
+                  WHERE state IN ('pending', 'warned')
+                    AND (resolved_at <= $1 OR (warn_at IS NOT NULL AND warn_at <= $1))
+                  ORDER BY resolved_at ASC LIMIT $2",
+                &[
+                    &now.unix_timestamp(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        rows.iter().map(deadline_from).collect()
+    }
+
+    async fn by_status(&self, status: CaseStatus, limit: usize) -> Result<Vec<Case>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT case_id FROM cases WHERE status = $1 ORDER BY opened_at DESC LIMIT $2",
+                &[&status.as_str(), &i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.get(0);
+            let id = CaseId::parse(&id).map_err(|e| corrupt("bad case id", e))?;
+            if let Some(c) = self.case(id).await? {
+                out.push(c);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn census(&self, now: Timestamp) -> Result<CaseCensus, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let row = client
+            .query_one(
+                "SELECT COUNT(*), MIN(opened_at) FROM cases WHERE status <> 'closed'",
+                &[],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let open: i64 = row.get(0);
+        let oldest: Option<i64> = row.get(1);
+        let due: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM case_deadlines
+                  WHERE state IN ('pending', 'warned') AND resolved_at <= $1",
+                &[&now.unix_timestamp()],
+            )
+            .await
+            .map_err(|e| be(&e))?
+            .get(0);
+
+        Ok(CaseCensus {
+            open: u64::try_from(open).unwrap_or(0),
+            oldest_age_secs: oldest.map(|o| {
+                crate::runtime::metrics::age_secs(
+                    Timestamp::from_unix_timestamp(o).unwrap_or(now),
+                    now,
+                )
+            }),
+            due: u64::try_from(due).unwrap_or(0),
+        })
+    }
+}
+
+fn deadline_from(row: &tokio_postgres::Row) -> Result<Deadline, StoreError> {
+    let case: String = row.get(0);
+    let digest: Vec<u8> = row.get(3);
+    let warn: Option<i64> = row.get(4);
+    let state: String = row.get(5);
+    let arr: [u8; 32] = digest
+        .try_into()
+        .map_err(|_| corrupt("calendar digest", "not 32 bytes"))?;
+    Ok(Deadline {
+        case: CaseId::parse(&case).map_err(|e| corrupt("bad case id", e))?,
+        name: row.get(1),
+        resolved_at: Timestamp::from_unix_timestamp(row.get::<_, i64>(2))
+            .map_err(|e| corrupt("unrepresentable deadline", e))?,
+        calendar_digest: Digest::from_bytes(arr),
+        warn_at: warn
+            .map(Timestamp::from_unix_timestamp)
+            .transpose()
+            .map_err(|e| corrupt("unrepresentable warn_at", e))?,
+        state: deadline_state_from(&state)?,
+    })
+}
+
+#[async_trait]
+impl EventStore for PostgresStore {
+    async fn buffer(&self, event: &InboundEvent, at: Timestamp) -> Result<bool, StoreError> {
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        let inserted = tx
+            .execute(
+                "INSERT INTO inbound_events (event_id, kind, payload, received_at)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (event_id) DO NOTHING",
+                &[
+                    &event.id,
+                    &event.kind,
+                    &event.payload.to_string(),
+                    &at.unix_timestamp(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if inserted == 0 {
+            tx.commit().await.map_err(|e| be(&e))?;
+            return Ok(false);
+        }
+        for k in &event.correlation {
+            tx.execute(
+                "INSERT INTO inbound_correlation (event_id, namespace, value)
+                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                &[&event.id, &k.namespace, &k.value],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(true)
+    }
+
+    async fn subscribe(&self, sub: &Subscription, at: Timestamp) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        for k in &sub.correlation {
+            client
+                .execute(
+                    "INSERT INTO subscriptions
+                       (run_id, effect_key, case_id, step, phase, event_kind,
+                        namespace, value, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     ON CONFLICT DO NOTHING",
+                    &[
+                        &sub.run.to_string(),
+                        &sub.effect.to_hex(),
+                        &sub.case.map(|c| c.to_string()),
+                        &i64::from(sub.step.0),
+                        &phase_str(sub.phase),
+                        &sub.kind,
+                        &k.namespace,
+                        &k.value,
+                        &at.unix_timestamp(),
+                    ],
+                )
+                .await
+                .map_err(|e| be(&e))?;
+        }
+        Ok(())
+    }
+
+    async fn claim_for(
+        &self,
+        sub: &Subscription,
+        at: Timestamp,
+    ) -> Result<Option<BufferedEvent>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        for k in &sub.correlation {
+            // One statement. The `claimed_by IS NULL` predicate and the write
+            // are evaluated together, so two waiters cannot both come away with
+            // the row — there is no window because there is no second statement.
+            let row = client
+                .query_opt(
+                    "UPDATE inbound_events SET claimed_by = $1, claimed_at = $2
+                      WHERE event_id = (
+                          SELECT e.event_id FROM inbound_events e
+                            JOIN inbound_correlation c ON c.event_id = e.event_id
+                           WHERE e.kind = $3 AND c.namespace = $4 AND c.value = $5
+                             AND e.claimed_by IS NULL AND NOT e.dead
+                           ORDER BY e.received_at ASC
+                           FOR UPDATE SKIP LOCKED
+                           LIMIT 1)
+                  RETURNING event_id, kind, payload, received_at",
+                    &[
+                        &sub.run.to_string(),
+                        &at.unix_timestamp(),
+                        &sub.kind,
+                        &k.namespace,
+                        &k.value,
+                    ],
+                )
+                .await
+                .map_err(|e| be(&e))?;
+            if let Some(row) = row {
+                return Ok(Some(buffered_from(&row, &client).await?));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn match_waiter(
+        &self,
+        event: &InboundEvent,
+        at: Timestamp,
+    ) -> Result<Option<Subscription>, StoreError> {
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+
+        for k in &event.correlation {
+            let Some(row) = tx
+                .query_opt(
+                    "SELECT run_id, effect_key, case_id, step, phase FROM subscriptions
+                      WHERE event_kind = $1 AND namespace = $2 AND value = $3
+                      ORDER BY created_at ASC LIMIT 1",
+                    &[&event.kind, &k.namespace, &k.value],
+                )
+                .await
+                .map_err(|e| be(&e))?
+            else {
+                continue;
+            };
+            let run: String = row.get(0);
+
+            // Claiming the event in the same transaction is what stops one
+            // message resuming two runs.
+            let claimed = tx
+                .execute(
+                    "UPDATE inbound_events SET claimed_by = $2, claimed_at = $3
+                      WHERE event_id = $1 AND claimed_by IS NULL AND NOT dead",
+                    &[&event.id, &run, &at.unix_timestamp()],
+                )
+                .await
+                .map_err(|e| be(&e))?;
+            if claimed == 0 {
+                tx.commit().await.map_err(|e| be(&e))?;
+                return Ok(None);
+            }
+
+            let effect: String = row.get(1);
+            let case: Option<String> = row.get(2);
+            let step: i64 = row.get(3);
+            let phase: String = row.get(4);
+            tx.commit().await.map_err(|e| be(&e))?;
+
+            return Ok(Some(Subscription {
+                run: RunId::parse(&run).map_err(|e| corrupt("bad run id", e))?,
+                case: case
+                    .map(|c| CaseId::parse(&c))
+                    .transpose()
+                    .map_err(|e| corrupt("bad case id", e))?,
+                effect: EffectKey::from_hex(&effect).map_err(|e| corrupt("bad effect key", e))?,
+                step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
+                phase: phase_from(&phase),
+                kind: event.kind.clone(),
+                correlation: event.correlation.clone(),
+            }));
+        }
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(None)
+    }
+
+    async fn unsubscribe(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "DELETE FROM subscriptions WHERE run_id = $1 AND effect_key = $2",
+                &[&run.to_string(), &effect.to_hex()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn sweep_unclaimed(
+        &self,
+        older_than: Timestamp,
+        reason: &str,
+    ) -> Result<usize, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let n = client
+            .execute(
+                "UPDATE inbound_events SET dead = TRUE, dead_reason = $2
+                  WHERE claimed_by IS NULL AND NOT dead AND received_at < $1",
+                &[&older_than.unix_timestamp(), &reason.to_owned()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    async fn dead_letters(&self, limit: usize) -> Result<Vec<DeadLetter>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT event_id, kind, payload, received_at, dead_reason
+                   FROM inbound_events WHERE dead
+                  ORDER BY received_at DESC LIMIT $1",
+                &[&i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let payload: String = row.get(2);
+            out.push(DeadLetter {
+                event: InboundEvent {
+                    id: row.get(0),
+                    kind: row.get(1),
+                    correlation: Vec::new(),
+                    payload: serde_json::from_str(&payload)?,
+                },
+                received_at: Timestamp::from_unix_timestamp(row.get::<_, i64>(3))
+                    .map_err(|e| corrupt("unrepresentable received_at", e))?,
+                reason: row.get::<_, Option<String>>(4).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn waiting(&self, limit: usize) -> Result<Vec<Subscription>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT run_id, effect_key, case_id, step, phase, event_kind, namespace, value
+                   FROM subscriptions ORDER BY created_at ASC LIMIT $1",
+                &[&i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let run: String = row.get(0);
+            let effect: String = row.get(1);
+            let case: Option<String> = row.get(2);
+            let step: i64 = row.get(3);
+            let phase: String = row.get(4);
+            out.push(Subscription {
+                run: RunId::parse(&run).map_err(|e| corrupt("bad run id", e))?,
+                case: case
+                    .map(|c| CaseId::parse(&c))
+                    .transpose()
+                    .map_err(|e| corrupt("bad case id", e))?,
+                effect: EffectKey::from_hex(&effect).map_err(|e| corrupt("bad effect key", e))?,
+                step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
+                phase: phase_from(&phase),
+                kind: row.get(5),
+                correlation: vec![CorrelationKey::new(
+                    row.get::<_, String>(6),
+                    row.get::<_, String>(7),
+                )],
+            });
+        }
+        Ok(out)
+    }
+}
+
+async fn buffered_from(
+    row: &tokio_postgres::Row,
+    client: &deadpool_postgres::Client,
+) -> Result<BufferedEvent, StoreError> {
+    let id: String = row.get(0);
+    let payload: String = row.get(2);
+    let corr = client
+        .query(
+            "SELECT namespace, value FROM inbound_correlation WHERE event_id = $1",
+            &[&id],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+    Ok(BufferedEvent {
+        event: InboundEvent {
+            id: id.clone(),
+            kind: row.get(1),
+            correlation: corr
+                .iter()
+                .map(|r| CorrelationKey::new(r.get::<_, String>(0), r.get::<_, String>(1)))
+                .collect(),
+            payload: serde_json::from_str(&payload)?,
+        },
+        received_at: Timestamp::from_unix_timestamp(row.get::<_, i64>(3))
+            .map_err(|e| corrupt("unrepresentable received_at", e))?,
+    })
+}
+
+/// How long a timer claim holds before another sweep may take it.
+const CLAIM_LEASE: i64 = 60;
+
+#[async_trait]
+impl TimerStore for PostgresStore {
+    async fn arm(&self, timer: &Timer) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "INSERT INTO timers (run_id, effect_key, case_id, step, phase, fire_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (run_id, effect_key) DO NOTHING",
+                &[
+                    &timer.run.to_string(),
+                    &timer.effect.to_hex(),
+                    &timer.case.map(|c| c.to_string()),
+                    &i64::from(timer.step.0),
+                    &phase_str(timer.phase),
+                    &timer.fire_at.unix_timestamp(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn claim_due(&self, now: Timestamp, limit: usize) -> Result<Vec<Timer>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // Claimed and selected in one statement, with `SKIP LOCKED` so a second
+        // sweeper takes different rows rather than blocking on the first's.
+        let rows = client
+            .query(
+                "UPDATE timers SET claimed_at = $1
+                  WHERE (run_id, effect_key) IN (
+                      SELECT run_id, effect_key FROM timers
+                       WHERE fire_at <= $1 AND (claimed_at IS NULL OR claimed_at <= $2)
+                       ORDER BY fire_at ASC
+                       FOR UPDATE SKIP LOCKED
+                       LIMIT $3)
+              RETURNING run_id, effect_key, case_id, step, phase, fire_at",
+                &[
+                    &now.unix_timestamp(),
+                    &(now.unix_timestamp() - CLAIM_LEASE),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        rows.iter().map(timer_from).collect()
+    }
+
+    async fn pending_count(&self) -> Result<u64, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let n: i64 = client
+            .query_one("SELECT COUNT(*) FROM timers", &[])
+            .await
+            .map_err(|e| be(&e))?
+            .get(0);
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    async fn disarm(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "DELETE FROM timers WHERE run_id = $1 AND effect_key = $2",
+                &[&run.to_string(), &effect.to_hex()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn pending(&self, limit: usize) -> Result<Vec<Timer>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT run_id, effect_key, case_id, step, phase, fire_at
+                   FROM timers ORDER BY fire_at ASC LIMIT $1",
+                &[&i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        rows.iter().map(timer_from).collect()
+    }
+}
+
+fn timer_from(row: &tokio_postgres::Row) -> Result<Timer, StoreError> {
+    let run: String = row.get(0);
+    let effect: String = row.get(1);
+    let case: Option<String> = row.get(2);
+    let step: i64 = row.get(3);
+    let phase: String = row.get(4);
+    Ok(Timer {
+        run: RunId::parse(&run).map_err(|e| corrupt("bad run id", e))?,
+        case: case
+            .map(|c| CaseId::parse(&c))
+            .transpose()
+            .map_err(|e| corrupt("bad case id", e))?,
+        effect: EffectKey::from_hex(&effect).map_err(|e| corrupt("bad effect key", e))?,
+        step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
+        phase: phase_from(&phase),
+        fire_at: Timestamp::from_unix_timestamp(row.get::<_, i64>(5))
+            .map_err(|e| corrupt("unrepresentable fire_at", e))?,
+    })
+}
+
+#[async_trait]
+impl TaskStore for PostgresStore {
+    async fn open(&self, task: &Task) -> Result<Task, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "INSERT INTO tasks (task_id, run_id, case_id, kind, justification,
+                                    candidate_roles, excluded_actors, assignee, priority,
+                                    state, on_expiry, created_at, due_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                 ON CONFLICT (task_id) DO NOTHING",
+                &[
+                    &task.id.to_hex(),
+                    &task.run.to_string(),
+                    &task.case.map(|c| c.to_string()),
+                    &task.kind,
+                    &serde_json::to_string(&task.justification)?,
+                    &task.candidate_roles.join(","),
+                    &task.excluded_actors.join(","),
+                    &task.assignee,
+                    &task.priority.as_str(),
+                    &task.state.as_str(),
+                    &expiry_str(task.on_expiry),
+                    &task.created_at.unix_timestamp(),
+                    &task.due_at.map(Timestamp::unix_timestamp),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(self.task(task.id).await?.unwrap_or_else(|| task.clone()))
+    }
+
+    async fn task(&self, id: TaskId) -> Result<Option<Task>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let row = client
+            .query_opt(
+                &format!("SELECT {TASK_COLS} FROM tasks WHERE task_id = $1"),
+                &[&id.to_hex()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        row.as_ref().map(task_from).transpose()
+    }
+
+    async fn claim(&self, id: TaskId, actor: &str, roles: &[String]) -> Result<Task, ClaimError> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| ClaimError::Store(pool_err(&e)))?;
+        let Some(task) = self.task(id).await.map_err(ClaimError::Store)? else {
+            return Err(ClaimError::NotFound(id));
+        };
+        // Eligibility before availability, and the order is load-bearing — see
+        // `TaskStore::claim`.
+        //
+        // Four eyes: whoever proposed the action does not approve it.
+        if task.excluded_actors.iter().any(|a| a == actor) {
+            return Err(ClaimError::Excluded {
+                actor: actor.to_owned(),
+            });
+        }
+        if !task.candidate_roles.is_empty()
+            && !task.candidate_roles.iter().any(|r| roles.contains(r))
+        {
+            return Err(ClaimError::WrongRole {
+                actor: actor.to_owned(),
+            });
+        }
+        if !task.state.is_pending() {
+            return Err(ClaimError::NotPending {
+                task: id,
+                state: task.state,
+            });
+        }
+
+        // The reservation itself is one statement, guarded on the row still
+        // being unheld. Checking above and writing here would leave a window two
+        // reviewers both pass through.
+        let updated = client
+            .execute(
+                "UPDATE tasks SET assignee = $2, state = 'claimed'
+                  WHERE task_id = $1 AND (assignee IS NULL OR assignee = $2)",
+                &[&id.to_hex(), &actor.to_owned()],
+            )
+            .await
+            .map_err(|e| ClaimError::Store(be(&e)))?;
+        if updated == 0 {
+            let holder = self
+                .task(id)
+                .await
+                .map_err(ClaimError::Store)?
+                .and_then(|t| t.assignee)
+                .unwrap_or_default();
+            return Err(ClaimError::AlreadyClaimed { task: id, holder });
+        }
+        self.task(id)
+            .await
+            .map_err(ClaimError::Store)?
+            .ok_or(ClaimError::NotFound(id))
+    }
+
+    async fn release(&self, id: TaskId, actor: &str) -> Result<(), ClaimError> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| ClaimError::Store(pool_err(&e)))?;
+        let freed = client
+            .execute(
+                "UPDATE tasks SET assignee = NULL, state = 'open'
+                  WHERE task_id = $1 AND assignee = $2 AND state = 'claimed'",
+                &[&id.to_hex(), &actor.to_owned()],
+            )
+            .await
+            .map_err(|e| ClaimError::Store(be(&e)))?;
+        // The predicate did the work; the row count is what says whether it
+        // matched. Discarding it reported success for a release that freed
+        // nothing — caught by the conformance battery, not by this backend's
+        // own tests.
+        if freed == 0 {
+            return Err(ClaimError::NotHeld {
+                task: id,
+                actor: actor.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn set_state(&self, id: TaskId, state: TaskState) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "UPDATE tasks SET state = $2 WHERE task_id = $1",
+                &[&id.to_hex(), &state.as_str()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn queue(&self, roles: &[String], limit: usize) -> Result<Vec<Task>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT {TASK_COLS} FROM tasks
+                      WHERE state IN ('open', 'escalated')
+                      ORDER BY created_at ASC LIMIT $1"
+                ),
+                &[&i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let all: Result<Vec<Task>, StoreError> = rows.iter().map(task_from).collect();
+        Ok(all?
+            .into_iter()
+            .filter(|t| {
+                t.candidate_roles.is_empty() || t.candidate_roles.iter().any(|r| roles.contains(r))
+            })
+            .collect())
+    }
+
+    async fn for_case(&self, case: CaseId) -> Result<Vec<Task>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT {TASK_COLS} FROM tasks WHERE case_id = $1 ORDER BY created_at ASC"
+                ),
+                &[&case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        rows.iter().map(task_from).collect()
+    }
+
+    async fn open_count(&self) -> Result<u64, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let n: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM tasks WHERE state IN ('open','claimed','escalated')",
+                &[],
+            )
+            .await
+            .map_err(|e| be(&e))?
+            .get(0);
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    async fn overdue(&self, now: Timestamp, limit: usize) -> Result<Vec<Task>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT {TASK_COLS} FROM tasks
+                      WHERE state IN ('open','claimed','escalated')
+                        AND due_at IS NOT NULL AND due_at <= $1
+                      ORDER BY due_at ASC LIMIT $2"
+                ),
+                &[
+                    &now.unix_timestamp(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        rows.iter().map(task_from).collect()
+    }
+}
+
+const TASK_COLS: &str = "task_id, run_id, case_id, kind, justification, candidate_roles, \
+                         excluded_actors, assignee, priority, state, on_expiry, created_at, due_at";
+
+fn split(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        s.split(',').map(ToOwned::to_owned).collect()
+    }
+}
+
+fn task_from(row: &tokio_postgres::Row) -> Result<Task, StoreError> {
+    let id: String = row.get(0);
+    let run: String = row.get(1);
+    let case: Option<String> = row.get(2);
+    let justification: String = row.get(4);
+    let roles: String = row.get(5);
+    let excluded: String = row.get(6);
+    let priority: String = row.get(8);
+    let state: String = row.get(9);
+    let on_expiry: String = row.get(10);
+    let due: Option<i64> = row.get(12);
+
+    Ok(Task {
+        id: TaskId::parse(&id).map_err(|e| corrupt("bad task id", e))?,
+        run: RunId::parse(&run).map_err(|e| corrupt("bad run id", e))?,
+        case: case
+            .map(|c| CaseId::parse(&c))
+            .transpose()
+            .map_err(|e| corrupt("bad case id", e))?,
+        kind: row.get(3),
+        justification: serde_json::from_str(&justification)?,
+        candidate_roles: split(&roles),
+        excluded_actors: split(&excluded),
+        assignee: row.get(7),
+        priority: priority_from(&priority),
+        state: task_state_from(&state)?,
+        on_expiry: expiry_from(&on_expiry),
+        created_at: Timestamp::from_unix_timestamp(row.get::<_, i64>(11))
+            .map_err(|e| corrupt("unrepresentable created_at", e))?,
+        due_at: due
+            .map(Timestamp::from_unix_timestamp)
+            .transpose()
+            .map_err(|e| corrupt("unrepresentable due_at", e))?,
+    })
+}
+
+#[async_trait]
+impl BatchStore for PostgresStore {
+    async fn open(&self, id: BatchId, plan_digest: &str) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "INSERT INTO batches (batch_id, plan_digest) VALUES ($1, $2)
+                 ON CONFLICT (batch_id) DO NOTHING",
+                &[&id.to_string(), &plan_digest.to_owned()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn mark_exhausted(&self, id: BatchId) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "UPDATE batches SET exhausted = TRUE WHERE batch_id = $1",
+                &[&id.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn is_exhausted(&self, id: BatchId) -> Result<bool, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        Ok(client
+            .query_opt(
+                "SELECT exhausted FROM batches WHERE batch_id = $1",
+                &[&id.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?
+            .is_some_and(|r| r.get::<_, bool>(0)))
+    }
+
+    async fn reserve(
+        &self,
+        batch: BatchId,
+        key: &str,
+        run: RunId,
+    ) -> Result<ItemRecord, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // `DO NOTHING` then read back: an item already reserved must hand back
+        // the *original* run id, or the journal holding its effects is orphaned
+        // and they are performed again.
+        client
+            .execute(
+                "INSERT INTO batch_items (batch_id, item_key, run_id) VALUES ($1, $2, $3)
+                 ON CONFLICT (batch_id, item_key) DO NOTHING",
+                &[&batch.to_string(), &key.to_owned(), &run.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let row = client
+            .query_one(
+                "SELECT run_id, outcome, detail, tokens, minor FROM batch_items
+                  WHERE batch_id = $1 AND item_key = $2",
+                &[&batch.to_string(), &key.to_owned()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        item_from(&row, key)
+    }
+
+    async fn record(
+        &self,
+        batch: BatchId,
+        key: &str,
+        outcome: &ItemOutcome,
+        spend: Spend,
+    ) -> Result<(), StoreError> {
+        let (state, detail) = match outcome {
+            ItemOutcome::Succeeded => ("succeeded", None),
+            ItemOutcome::Failed(d) => ("failed", Some(d.clone())),
+            ItemOutcome::Quarantined(d) => ("quarantined", Some(d.clone())),
+            ItemOutcome::Suspended(d) => ("suspended", Some(d.clone())),
+        };
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "UPDATE batch_items SET outcome = $3, detail = $4, tokens = $5, minor = $6
+                  WHERE batch_id = $1 AND item_key = $2",
+                &[
+                    &batch.to_string(),
+                    &key.to_owned(),
+                    &state,
+                    &detail,
+                    &i64::try_from(spend.tokens).unwrap_or(i64::MAX),
+                    &spend.minor_units,
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn cursor(&self, batch: BatchId) -> Result<Option<String>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // The contiguous terminal prefix: an item still running or suspended
+        // holds the cursor behind it, or a resume steps over work outstanding.
+        let first_open: Option<String> = client
+            .query_one(
+                "SELECT MIN(item_key) FROM batch_items
+                  WHERE batch_id = $1 AND (outcome IS NULL OR outcome = 'suspended')",
+                &[&batch.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?
+            .get(0);
+
+        let row = match first_open {
+            Some(open) => client
+                .query_one(
+                    "SELECT MAX(item_key) FROM batch_items
+                      WHERE batch_id = $1 AND item_key < $2",
+                    &[&batch.to_string(), &open],
+                )
+                .await
+                .map_err(|e| be(&e))?,
+            None => client
+                .query_one(
+                    "SELECT MAX(item_key) FROM batch_items WHERE batch_id = $1",
+                    &[&batch.to_string()],
+                )
+                .await
+                .map_err(|e| be(&e))?,
+        };
+        Ok(row.get(0))
+    }
+
+    async fn census(&self, batch: BatchId) -> Result<BatchCensus, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT outcome, COUNT(*), COALESCE(SUM(tokens),0), COALESCE(SUM(minor),0)
+                   FROM batch_items WHERE batch_id = $1 GROUP BY outcome",
+                &[&batch.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+
+        let mut c = BatchCensus::default();
+        for row in rows {
+            let outcome: Option<String> = row.get(0);
+            let n: i64 = row.get(1);
+            let tokens: i64 = row.get(2);
+            let minor: i64 = row.get(3);
+            let n = u64::try_from(n).unwrap_or(0);
+            match outcome.as_deref() {
+                Some("succeeded") => c.succeeded = n,
+                Some("failed") => c.failed = n,
+                Some("quarantined") => c.quarantined = n,
+                Some("suspended") => c.suspended = n,
+                _ => c.in_flight = n,
+            }
+            c.spend.tokens += u64::try_from(tokens).unwrap_or(0);
+            c.spend.minor_units += minor;
+        }
+        Ok(c)
+    }
+
+    async fn items(&self, batch: BatchId, limit: usize) -> Result<Vec<ItemRecord>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT item_key, run_id, outcome, detail, tokens, minor FROM batch_items
+                  WHERE batch_id = $1 ORDER BY item_key ASC LIMIT $2",
+                &[
+                    &batch.to_string(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let key: String = row.get(0);
+            out.push(ItemRecord {
+                key: key.clone(),
+                run: RunId::parse(&row.get::<_, String>(1))
+                    .map_err(|e| corrupt("bad run id", e))?,
+                outcome: outcome_from(row.get::<_, Option<String>>(2), row.get(3)),
+                spend: Spend {
+                    tokens: u64::try_from(row.get::<_, i64>(4)).unwrap_or(0),
+                    minor_units: row.get(5),
+                },
+            });
+        }
+        Ok(out)
+    }
+}
+
+fn outcome_from(state: Option<String>, detail: Option<String>) -> Option<ItemOutcome> {
+    let d = detail.unwrap_or_default();
+    match state?.as_str() {
+        "succeeded" => Some(ItemOutcome::Succeeded),
+        "failed" => Some(ItemOutcome::Failed(d)),
+        "quarantined" => Some(ItemOutcome::Quarantined(d)),
+        "suspended" => Some(ItemOutcome::Suspended(d)),
+        _ => None,
+    }
+}
+
+fn item_from(row: &tokio_postgres::Row, key: &str) -> Result<ItemRecord, StoreError> {
+    let run: String = row.get(0);
+    Ok(ItemRecord {
+        key: key.to_owned(),
+        run: RunId::parse(&run).map_err(|e| corrupt("bad run id", e))?,
+        outcome: outcome_from(row.get::<_, Option<String>>(1), row.get(2)),
+        spend: Spend {
+            tokens: u64::try_from(row.get::<_, i64>(3)).unwrap_or(0),
+            minor_units: row.get(4),
+        },
+    })
+}

@@ -1,0 +1,18 @@
+# Determinism gate.
+#
+# Everything listed here is ambient non-determinism. Reading it directly makes a
+# run unreplayable, which is the one bug this runtime exists to prevent. The
+# deterministic zone must reach non-determinism only through `StepCtx`, which
+# journals the result so replay reads it back instead of re-invoking.
+#
+# The runtime's own driver layer is the sole legitimate caller; those sites are
+# marked with an explicit `#[allow(clippy::disallowed_methods)]` and a comment
+# naming the journal record that captures the value.
+disallowed-methods = [
+    { path = "std::time::SystemTime::now",       reason = "non-deterministic — use StepCtx::now(), which journals the instant" },
+    { path = "std::time::Instant::now",          reason = "non-deterministic — use StepCtx::now(), which journals the instant" },
+    { path = "time::OffsetDateTime::now_utc",    reason = "non-deterministic — use StepCtx::now(), which journals the instant" },
+    { path = "rand::random",                     reason = "non-deterministic — use StepCtx::rng(), seeded from the run id" },
+    { path = "rand::rng",                        reason = "non-deterministic — use StepCtx::rng(), seeded from the run id" },
+    { path = "ulid::Ulid::new",                  reason = "non-deterministic — mint ids via StepCtx, which journals them" },
+]

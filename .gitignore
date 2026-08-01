@@ -13,9 +13,31 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Downloaded by spec/verify.sh
+.tla-cache/
+# TLC leaves these beside the specs it checks
+spec/states/
+spec/*.out
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Custom
+CONCEPT.md
+# Backups written by tools/mutants.py while a mutation is applied. Present only
+# between apply and revert; an interrupted sweep leaves one behind, and it must
+# not be mistaken for source.
+*.rs.orig
+
+# Local agent tooling. The audit skill encodes this project's own review
+# standards and is useful, but it is workflow rather than product — and it
+# references CONCEPT.md, which is itself internal.
+.claude/
+
+# Python bytecode from tools/mutants.py.
+__pycache__/
+*.py[cod]

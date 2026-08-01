@@ -1,0 +1,189 @@
+[package]
+name         = "agentplane"
+version      = "0.0.0"
+edition      = "2024"
+rust-version = "1.94"
+license      = "MIT OR Apache-2.0"
+description  = "Durable, replayable agent runtime — the journal is the plan of record"
+repository   = "https://github.com/hupe1980/agentplane"
+readme       = "README.md"
+keywords     = ["agent", "durable-execution", "replay", "runtime", "llm"]
+categories   = ["asynchronous", "data-structures"]
+
+# What ships, stated as an allowlist.
+#
+# This was an `exclude` list and that was the wrong shape: a denylist has to
+# predict every generated file, and it failed twice — first `CONCEPT.md` and
+# `mutants.out/`, then `tools/__pycache__/*.pyc`. Each time the fix was to add
+# one more line after discovering the leak, which is the pattern that produces
+# the third one.
+#
+# An allowlist cannot be surprised. Anything new in the working tree — a
+# scratch file, a profiler dump, a tool's cache — is absent from the tarball by
+# default rather than present by default. That matters more here than for most
+# crates, because a crates.io publish is immutable: a file that should not have
+# shipped cannot be withdrawn, only yanked with the contents still served.
+#
+# Development infrastructure (`tests/`, `spec/`, `tools/`, `justfile`) is
+# deliberately not published — it is in the repository, and a consumer building
+# this crate has no use for the TLA+ specs or the mutation table.
+# Leading slashes anchor to the package root. Without them these are
+# gitignore-style globs matching *any* depth, which is how `spec/README.md`
+# arrived in the tarball behind a bare `README.md`.
+include = [
+    "/src/**/*.rs",
+    "/examples/*.rs",
+    "/docs/*.md",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/clippy.toml",
+]
+
+# docs.rs builds with default features unless told otherwise, and this crate's
+# story is almost entirely in the feature-gated seams — a reader landing on the
+# published docs would find neither the HTTP surface, nor the drivers, nor the
+# policy adapter.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["sqlite"]
+# SQLite-backed journal + case store. Single-node deployments; Postgres backs
+# the active-active topology.
+sqlite  = ["dep:rusqlite"]
+# Fault injection and other harness pieces, for this crate's assurance layers
+# and for embedders testing their own stores and skills. Never in a production
+# build — nothing in `testkit` is reachable without it.
+testkit = []
+# Cedar as the authorization engine. Off by default: the crate defines the
+# policy seam and ships no evaluator, for the same reason it ships no tracing
+# exporter — picking one for the embedder is not its call.
+cedar = ["dep:cedar-policy"]
+# PostgreSQL-backed journal. The topology SQLite cannot serve: several plane
+# instances sharing one store, where fencing and exactly-once must be arbitrated
+# by the database rather than by hoping the writers agree.
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+# MCP transport. The tool *seam* and its safety model are always available; this
+# is only the wire. Separate because the catalogue is what decides what a tool is
+# allowed to do, and that decision must not depend on which transport is linked.
+mcp = ["dep:rmcp"]
+# HTTP surface for operators: the worklist, run status, event delivery. Off by
+# default — a library embedded in someone else's process should not open a port
+# unless asked.
+http = ["dep:axum"]
+# A2A transport: the wire for peer calls. The peer *seam* — audience-bound
+# credentials, attenuating delegation, the disposition vocabulary — is always
+# available; this is only the JSON-RPC client that carries it. Separate for the
+# same reason `mcp` is: what a peer is allowed to do must not depend on which
+# transport happens to be linked.
+a2a = ["dep:reqwest"]
+# Ed25519 signing for journal records. The *seam* — `Signer`, `Verifier`, the
+# attestation on every record, the verifying read path — is always available;
+# this is one concrete implementation, for deployments that do not already have
+# a workload-identity signer to plug in.
+signing = ["dep:ed25519-dalek"]
+# Model provider drivers over HTTP. The `ModelProvider` trait and the metering
+# rules are always available; this is a concrete driver.
+providers = ["dep:reqwest"]
+
+[dependencies]
+async-trait = "0.1"
+serde       = { version = "1", features = ["derive"] }
+# NOTE: this crate must not ask for `preserve_order`, but it can no longer
+# assume nobody does — cargo unifies features across the graph and cedar-policy
+# enables it. Canonical order is therefore produced by `core::canon` itself
+# rather than inherited from serde_json::Map. See that module.
+serde_json  = "1"
+thiserror   = "2"
+ulid        = { version = "1", features = ["serde"] }
+sha2        = "0.10"
+hex         = "0.4"
+# Secrets are wiped when they drop. `String` alone leaves the bytes in freed
+# heap — and reallocates copies of them on growth — which no amount of careful
+# `Debug` impl fixes. Small, audited, and unconditional: an API key is not an
+# optional-feature concern.
+zeroize     = { version = "1", features = ["alloc"] }
+time        = { version = "0.3", features = ["serde-well-known", "macros", "formatting", "parsing"] }
+rand        = "0.9"
+rand_chacha = "0.9"
+tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
+# Only `join_all` is used, to dispatch a ready set concurrently. Deliberately
+# not `futures` proper: the executor needs one combinator, not an ecosystem.
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+tracing     = "0.1"
+rusqlite    = { version = "0.40", features = ["bundled"], optional = true }
+cedar-policy = { version = "4.12.0", default-features = false, optional = true }
+tokio-postgres = { version = "0.7.18", optional = true }
+deadpool-postgres = { version = "0.14.1", optional = true }
+rmcp = { version = "3.1", default-features = false, features = ["client", "transport-io"], optional = true }
+axum = { version = "0.8.9", default-features = false, features = ["json", "http1", "tokio"], optional = true }
+# `rustls` rather than the platform's TLS: one static binary is a design
+# commitment (P11), and linking OpenSSL puts a system dependency back in.
+# `rand_core` off: keys come from the deployment, and a signer that can mint its
+# own identity is a signer whose signatures mean nothing.
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize", "signature"], optional = true }
+# `rustls` rather than the platform's TLS: one static binary is a design
+# commitment (P11), and linking OpenSSL puts a system dependency back in.
+# `webpki-roots` is listed explicitly because 0.13 split the old `rustls-tls`
+# feature into a backend and its trust anchors — asking only for `rustls` builds
+# a client that trusts nothing and fails every handshake.
+# `stream` gates `Response::bytes_stream`, which is how a model driver learns
+# what a call burned *before* the connection died. Without it the only honest
+# report for a severed response is "cost unknown", and the budget ceiling that
+# exists to bound a runaway provider reads zero while it spends.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "http2", "charset", "stream"], optional = true }
+
+[dev-dependencies]
+# For the streaming driver tests: the stub server hands axum a body stream of
+# `Bytes`, including one that errors partway so a severed response can be tested
+# without a real network.
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+rmcp = { version = "3.1", default-features = false, features = ["server", "transport-io", "macros"] }
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5.3", features = ["util"] }
+# So the telemetry tests can assert what was *emitted*, not merely what the
+# source contains. An instrumentation test that greps is checking the author's
+# intent; this checks the runtime's behaviour.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry"] }
+
+# Examples drive the runtime end to end and therefore need a store. Declaring
+# the requirement keeps `--no-default-features` building: an embedder bringing
+# their own backend must not be forced to compile SQLite.
+[[example]]
+name              = "durable_pipeline"
+required-features = ["sqlite"]
+
+[[example]]
+name              = "clearing_case"
+required-features = ["sqlite"]
+
+[[example]]
+name              = "plan_graph"
+required-features = ["sqlite"]
+
+# Needs `testkit` for the fake provider. Deliberately: an example that called a
+# real model would need an API key to run, and the claim it demonstrates — that
+# a completion replays from the journal rather than being asked again — would
+# stay a sentence in the README instead of something anyone can execute.
+[[example]]
+name              = "model_run"
+required-features = ["sqlite", "testkit"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all       = { level = "warn", priority = -1 }
+pedantic  = { level = "warn", priority = -1 }
+# Ambient non-determinism is denied crate-wide via clippy.toml: every
+# clock/RNG/ID read must go through StepCtx, which journals it.
+module_name_repetitions = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+must_use_candidate      = "allow"
+

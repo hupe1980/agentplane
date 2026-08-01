@@ -1,0 +1,352 @@
+//! Built-in effects.
+//!
+//! These are the runtime's own drivers — the small set of non-deterministic
+//! things it needs before any tool or model exists. Each is journaled like any
+//! other effect, which is why a replayed run sees the instant the original run
+//! saw rather than the instant now.
+
+use async_trait::async_trait;
+use serde_json::json;
+
+use crate::core::{Effect, EffectDescriptor, EffectError, Recovery, Sensitivity, Timestamp};
+
+/// Reads the wall clock.
+///
+/// Non-mutating and freely retryable: re-reading a clock after a crash is
+/// harmless, which is why this is one of the few effects that does not need an
+/// operator when its outcome is unknown.
+#[derive(Debug, Clone, Copy)]
+pub struct Clock;
+
+#[async_trait]
+impl Effect for Clock {
+    /// Trusted: does not cross a trust boundary.
+    ///
+    /// The journaled clock. The instant comes from the runtime and is written
+    /// to the journal, so it is the runtime's own data rather than the world's —
+    /// and a timestamp that arrived untrusted could not be used for the deadline
+    /// arithmetic it exists for.
+    fn trust(&self) -> crate::core::Trust {
+        crate::core::Trust::Trusted
+    }
+
+    type Output = Timestamp;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::nullary("clock.now")
+    }
+
+    fn mutates(&self) -> bool {
+        false
+    }
+
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    fn max_sensitivity(&self) -> Sensitivity {
+        Sensitivity::Public
+    }
+
+    // The single legitimate ambient clock read in the crate: its result is
+    // written to the journal as `EffectDone`, so every later replay reads that
+    // record instead of calling this again.
+    #[allow(clippy::disallowed_methods)]
+    async fn perform(&self) -> Result<Timestamp, EffectError> {
+        Ok(Timestamp::now_utc())
+    }
+}
+
+/// A test/demo effect that records an externally visible action.
+///
+/// Counts its own invocations so tests can assert the property the whole design
+/// exists for: **replay does not perform it again**.
+#[derive(Debug, Clone)]
+pub struct Recorded {
+    pub name: String,
+    pub payload: serde_json::Value,
+    pub calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub mutates: bool,
+    pub max_sensitivity: Sensitivity,
+}
+
+impl Recorded {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            payload: json!(null),
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mutates: true,
+            max_sensitivity: Sensitivity::Secret,
+        }
+    }
+
+    #[must_use]
+    pub fn counter(mut self, c: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.calls = c;
+        self
+    }
+
+    #[must_use]
+    pub fn payload(mut self, v: serde_json::Value) -> Self {
+        self.payload = v;
+        self
+    }
+
+    #[must_use]
+    pub fn ceiling(mut self, s: Sensitivity) -> Self {
+        self.max_sensitivity = s;
+        self
+    }
+
+    #[must_use]
+    pub fn read_only(mut self) -> Self {
+        self.mutates = false;
+        self
+    }
+}
+
+#[async_trait]
+impl Effect for Recorded {
+    /// Trusted: does not cross a trust boundary.
+    ///
+    /// A value the runtime recorded for itself. Its trust is whatever the
+    /// original source's was, carried separately; this wrapper adds none.
+    fn trust(&self) -> crate::core::Trust {
+        crate::core::Trust::Trusted
+    }
+
+    type Output = serde_json::Value;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(format!("test.{}", self.name), self.payload.clone())
+    }
+
+    fn mutates(&self) -> bool {
+        self.mutates
+    }
+
+    fn max_sensitivity(&self) -> Sensitivity {
+        self.max_sensitivity
+    }
+
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    async fn perform(&self) -> Result<serde_json::Value, EffectError> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(json!({ "call": n, "payload": self.payload }))
+    }
+}
+
+/// Resolves a deadline description to an instant via the configured calendar.
+///
+/// This is an effect, not a plain function call, for one reason: the answer
+/// depends on a calendar whose rules change over time. Journaling the resolved
+/// instant means a corrected holiday table or a new regulatory notice cannot
+/// retroactively move an obligation that was already registered — the instant
+/// is a recorded fact, and the calendar digest beside it says which ruleset
+/// produced it.
+#[derive(Debug, Clone)]
+pub struct ResolveDeadline {
+    pub(crate) calendar: std::sync::Arc<dyn crate::core::Calendar>,
+    pub(crate) name: String,
+    pub(crate) from: Timestamp,
+    pub(crate) spec: crate::core::DeadlineSpec,
+}
+
+/// What a calendar produced, and which ruleset produced it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedDeadline {
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: Timestamp,
+    pub calendar_digest: crate::core::Digest,
+}
+
+#[async_trait]
+impl Effect for ResolveDeadline {
+    /// Trusted: does not cross a trust boundary.
+    ///
+    /// A `Calendar` is configured by the operator, not supplied by the
+    /// world. Its answer is an instant the deployment chose the rules for.
+    fn trust(&self) -> crate::core::Trust {
+        crate::core::Trust::Trusted
+    }
+
+    type Output = ResolvedDeadline;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "deadline.resolve",
+            json!({
+                "name": self.name,
+                "spec": self.spec,
+                // `from` is part of the identity: the same rule anchored at a
+                // different instant is a different obligation.
+                "from": self.from.unix_timestamp(),
+            }),
+        )
+    }
+
+    fn mutates(&self) -> bool {
+        false
+    }
+
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    async fn perform(&self) -> Result<ResolvedDeadline, EffectError> {
+        let at = self
+            .calendar
+            .resolve(self.from, &self.spec)
+            .map_err(|e| EffectError::Rejected(e.to_string()))?;
+
+        // Truncate to whole seconds, deliberately and once.
+        //
+        // A deadline is a wall-clock instant; sub-second precision in a
+        // regulatory window is noise. More importantly, the instant is recorded
+        // in two places — the journal and the case store — and if they disagree
+        // by a fraction of a second then "which one is the obligation?" has two
+        // answers. Truncating here means they cannot drift.
+        let at = at
+            .replace_nanosecond(0)
+            .map_err(|e| EffectError::Rejected(format!("deadline instant out of range: {e}")))?;
+
+        Ok(ResolvedDeadline {
+            at,
+            calendar_digest: self.calendar.digest(),
+        })
+    }
+}
+
+/// Reading a case's state.
+///
+/// **A journaled effect, and it has to be.** Case state is mutable storage
+/// shared by every run correlated to the case; reading it is exactly as
+/// non-deterministic as reading a clock. Before this was an effect, a strict
+/// replay re-read the *current* state and the run's own logic reached a
+/// different answer from the same journal — the divergence the whole design
+/// exists to make impossible.
+#[derive(Debug, Clone)]
+pub struct ReadCaseState {
+    pub(crate) cases: std::sync::Arc<dyn crate::case::CaseStore>,
+    pub(crate) case: crate::core::CaseId,
+}
+
+/// A case's state, and the revision it was read at.
+///
+/// The version travels with the value because a write has to name it. Handing
+/// back the value alone is what makes a lost update easy to write.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CaseSnapshot {
+    pub state: serde_json::Value,
+    pub version: crate::core::CaseVersion,
+}
+
+#[async_trait]
+impl Effect for ReadCaseState {
+    type Output = CaseSnapshot;
+
+    /// Trusted: the plane's own storage, not the world's.
+    ///
+    /// The *contents* may well have come from an untrusted source, and the
+    /// caller receives them labeled accordingly — but the store itself is not a
+    /// trust boundary the way a tool or a peer is.
+    fn trust(&self) -> crate::core::Trust {
+        crate::core::Trust::Trusted
+    }
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new("case.read_state", json!({ "case": self.case.to_string() }))
+    }
+
+    fn mutates(&self) -> bool {
+        false
+    }
+
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    async fn perform(&self) -> Result<CaseSnapshot, EffectError> {
+        let case = self
+            .cases
+            .case(self.case)
+            .await
+            .map_err(|e| EffectError::Other(e.to_string()))?
+            .ok_or_else(|| EffectError::Rejected(format!("no case {}", self.case)))?;
+        Ok(CaseSnapshot {
+            state: case.state,
+            version: case.version,
+        })
+    }
+}
+
+/// Writing a case's state, if it has not moved.
+///
+/// Journaled for two reasons that are usually the same reason: replay must not
+/// perform it again, and the *outcome* — the new version — is something the run
+/// goes on to use. A replay that re-derived the version by writing again would
+/// be writing again.
+#[derive(Debug, Clone)]
+pub struct WriteCaseState {
+    pub(crate) cases: std::sync::Arc<dyn crate::case::CaseStore>,
+    pub(crate) case: crate::core::CaseId,
+    pub(crate) expected: crate::core::CaseVersion,
+    pub(crate) state: serde_json::Value,
+}
+
+#[async_trait]
+impl Effect for WriteCaseState {
+    type Output = crate::core::CaseVersion;
+
+    fn trust(&self) -> crate::core::Trust {
+        crate::core::Trust::Trusted
+    }
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "case.write_state",
+            json!({
+                "case": self.case.to_string(),
+                // Both in the key: writing different bytes is a different
+                // effect, and so is writing the same bytes against a different
+                // revision — the second one is a different claim about what the
+                // case said when the decision was made.
+                "expected": self.expected.0,
+                "state": self.state,
+            }),
+        )
+    }
+
+    /// It changes state other runs can observe. That is what mutating means.
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    /// Not retryable, and the version is why.
+    ///
+    /// A retry re-sends the same `expected`. If the first attempt landed, the
+    /// case has already moved past it and the retry fails as a conflict — a
+    /// confusing report of a write that in fact succeeded. Whether it landed is
+    /// exactly what the effect protocol is for.
+    fn recovery(&self) -> Recovery {
+        Recovery::Reconcile
+    }
+
+    async fn perform(&self) -> Result<crate::core::CaseVersion, EffectError> {
+        self.cases
+            .put_state(self.case, self.expected, self.state.clone())
+            .await
+            .map_err(|e| match e {
+                // A conflict is a decision the caller has to make again, not a
+                // transport failure. `Rejected` so it does not read as in-doubt.
+                crate::core::StoreError::CaseConflict { .. } => {
+                    EffectError::Rejected(e.to_string())
+                }
+                other => EffectError::Other(other.to_string()),
+            })
+    }
+}

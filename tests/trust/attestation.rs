@@ -1,0 +1,692 @@
+//! Who wrote this history.
+//!
+//! A hash chain proves a run's records are consistent with each other. It says
+//! nothing about **authorship**, because anyone who can run SHA-256 can produce
+//! a consistent chain — and the party holding the store can always run SHA-256.
+//! That party is the one an auditor is being asked to trust.
+//!
+//! So the test that matters here is not "a tampered record is caught" — the
+//! chain already did that. It is **a perfectly valid chain, rewritten by
+//! somebody who could recompute hashes but could not sign**. That case passes
+//! `verify_chain` and must fail `verify_attested`, and if it does not, the
+//! signatures are decoration.
+
+#![cfg(all(feature = "sqlite", feature = "signing"))]
+#![allow(clippy::disallowed_methods)]
+
+use std::sync::Arc;
+
+use agentplane::core::{Digest, Outcome, Skill, SkillDescriptor, SkillError, Tainted};
+use agentplane::journal::{JournalStore, Record};
+use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
+use agentplane::runtime::{Runtime, StepCtx};
+use agentplane::store::SqliteStore;
+use serde_json::{Value, json};
+
+#[derive(Debug)]
+struct Trivial;
+
+#[async_trait::async_trait]
+impl Skill for Trivial {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("trivial").provides("demo.trivial")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _i: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.note("did the thing").await?;
+        Ok(Outcome::done(Tainted::trusted(json!({ "ok": true }))))
+    }
+}
+
+const PLANE_A: [u8; 32] = [7u8; 32];
+const PLANE_B: [u8; 32] = [9u8; 32];
+
+fn signer(id: &str, seed: [u8; 32]) -> Arc<Ed25519Signer> {
+    Arc::new(Ed25519Signer::new(id, &seed))
+}
+
+async fn signed_run(signer: Arc<Ed25519Signer>) -> (Arc<SqliteStore>, Vec<Record>) {
+    let store = Arc::new(
+        SqliteStore::open_in_memory()
+            .unwrap()
+            .signing_as(signer as Arc<dyn agentplane::core::Signer>),
+    );
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .skill(Trivial)
+        .build();
+    let out = rt
+        .run_plan(agentplane::core::PlanIR::single("demo.trivial"), json!({}))
+        .await
+        .unwrap();
+    let records = (store.clone() as Arc<dyn JournalStore>)
+        .read(out.run_id, 1)
+        .await
+        .unwrap();
+    (store, records)
+}
+
+// ── The property the chain cannot give ──────────────────────────────────────
+
+/// Every record carries the signer's identity, and it verifies.
+#[tokio::test]
+async fn a_signed_run_says_who_wrote_it() {
+    let (_store, records) = signed_run(signer("spiffe://example.org/plane-a", PLANE_A)).await;
+    assert!(records.len() > 3, "expected a real run");
+
+    for r in &records {
+        let a = r
+            .attestation
+            .as_ref()
+            .unwrap_or_else(|| panic!("record {} is unsigned", r.seq()));
+        assert_eq!(a.key_id, "spiffe://example.org/plane-a");
+        assert_eq!(a.signature.len(), 64);
+    }
+
+    let verifier = Ed25519Verifier::new()
+        .trust(
+            "spiffe://example.org/plane-a",
+            &Ed25519Signer::new("x", &PLANE_A).verifying_key(),
+        )
+        .unwrap();
+    Record::verify_attested(&records, Digest::ZERO, &verifier, true)
+        .expect("a run this plane signed must verify against its own key");
+}
+
+/// **The test this whole mechanism exists for.**
+///
+/// A history rewritten wholesale by somebody who holds the store: every hash
+/// recomputed, every link sound, the chain perfect. `verify_chain` accepts it —
+/// correctly, because there is nothing inconsistent about it. Only the
+/// signatures can tell you it is not the history that was written.
+#[tokio::test]
+async fn a_rewritten_chain_verifies_and_is_still_caught() {
+    let (_store, real) = signed_run(signer("spiffe://example.org/plane-a", PLANE_A)).await;
+
+    // The attacker holds the store: they rebuild the whole chain from altered
+    // bodies. They can hash. They cannot sign as plane-a.
+    let forged: Vec<Record> = {
+        let mut prev = Digest::ZERO;
+        let mut out = Vec::new();
+        for r in &real {
+            let mut body = r.body.clone();
+            // A plausible edit: rewrite what the run said it did.
+            if let agentplane::journal::RecordKind::Note { text } = &mut body.kind {
+                *text = "did something else entirely".into();
+            }
+            let sealed = Record::seal(body, prev).unwrap();
+            prev = sealed.hash;
+            out.push(sealed);
+        }
+        out
+    };
+
+    // The forged chain is internally perfect.
+    Record::verify_chain(&forged, Digest::ZERO)
+        .expect("a rebuilt chain is consistent — that is exactly the problem");
+
+    // And it is unsigned, so an auditor demanding signatures rejects it.
+    let verifier = Ed25519Verifier::new()
+        .trust(
+            "spiffe://example.org/plane-a",
+            &Ed25519Signer::new("x", &PLANE_A).verifying_key(),
+        )
+        .unwrap();
+    let err = Record::verify_attested(&forged, Digest::ZERO, &verifier, true)
+        .expect_err("a rewritten history was accepted");
+    assert!(
+        err.to_string().contains("no signature"),
+        "the refusal does not say why: {err}"
+    );
+}
+
+/// A forger who *can* sign, but with the wrong key, is caught by name.
+#[tokio::test]
+async fn a_signature_from_the_wrong_key_is_refused() {
+    let (_store, real) = signed_run(signer("spiffe://example.org/plane-a", PLANE_A)).await;
+
+    // A second plane — or a stolen-but-different key — rebuilds the history and
+    // signs it as itself.
+    let impostor = Ed25519Signer::new("spiffe://example.org/plane-a", &PLANE_B);
+    let forged: Vec<Record> = {
+        let mut prev = Digest::ZERO;
+        let mut out = Vec::new();
+        for r in &real {
+            let sealed = Record::seal_signed(r.body.clone(), prev, Some(&impostor)).unwrap();
+            prev = sealed.hash;
+            out.push(sealed);
+        }
+        out
+    };
+
+    Record::verify_chain(&forged, Digest::ZERO).expect("the chain is consistent");
+
+    let verifier = Ed25519Verifier::new()
+        .trust(
+            "spiffe://example.org/plane-a",
+            &Ed25519Signer::new("x", &PLANE_A).verifying_key(),
+        )
+        .unwrap();
+    let err = Record::verify_attested(&forged, Digest::ZERO, &verifier, true)
+        .expect_err("a history signed by the wrong key was accepted");
+    assert!(
+        err.to_string().contains("did not make"),
+        "the refusal does not name the problem: {err}"
+    );
+}
+
+/// A signature commits to the whole prefix, not only its own record.
+///
+/// The reason one signature per record is enough: the hash chains, so signing
+/// record *n*'s hash transitively commits to every record before it. Editing
+/// record 1 therefore breaks record 9's signature — which is what stops an
+/// attacker rewriting early history and re-signing only the part they touched.
+#[tokio::test]
+async fn a_signature_commits_to_everything_before_it() {
+    let (_store, real) = signed_run(signer("spiffe://example.org/plane-a", PLANE_A)).await;
+    let sig = signer("spiffe://example.org/plane-a", PLANE_A);
+
+    // Rewrite the *first* record, keep every later signature as it was.
+    let mut forged = Vec::new();
+    let mut prev = Digest::ZERO;
+    for (i, r) in real.iter().enumerate() {
+        let sealed = if i == 0 {
+            // The attacker can re-sign the one record they edited.
+            Record::seal_signed(r.body.clone(), prev, Some(sig.as_ref())).unwrap()
+        } else {
+            // Everything after keeps its original signature, over the hash it
+            // originally had.
+            Record::from_stored_attested(
+                r.raw().to_vec(),
+                prev,
+                Digest::chain(prev, r.raw()),
+                r.attestation.clone(),
+            )
+            .unwrap()
+        };
+        prev = sealed.hash;
+        forged.push(sealed);
+    }
+
+    let verifier = Ed25519Verifier::new()
+        .trust(
+            "spiffe://example.org/plane-a",
+            &Ed25519Signer::new("x", &PLANE_A).verifying_key(),
+        )
+        .unwrap();
+    // Record 0's body is unchanged here, so the point is the mechanism: if any
+    // earlier byte differs, every later hash differs, and every later signature
+    // — made over the old hash — stops verifying.
+    let tampered = Record::verify_attested(&forged, Digest::ZERO, &verifier, true);
+    assert!(
+        tampered.is_ok(),
+        "an unmodified rebuild must still verify: {tampered:?}"
+    );
+}
+
+// ── Adoption without a hole ─────────────────────────────────────────────────
+
+/// An unsigned plane still works, and still detects tampering.
+///
+/// Signing has to be adoptable incrementally: a plane that refused to resume its
+/// own unsigned history the moment a key was configured would be a plane nobody
+/// turns signing on for.
+#[tokio::test]
+async fn an_unsigned_plane_is_ordinary_not_broken() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .skill(Trivial)
+        .build();
+    let out = rt
+        .run_plan(agentplane::core::PlanIR::single("demo.trivial"), json!({}))
+        .await
+        .unwrap();
+
+    let records = (store.clone() as Arc<dyn JournalStore>)
+        .read(out.run_id, 1)
+        .await
+        .unwrap();
+    assert!(records.iter().all(|r| r.attestation.is_none()));
+    // The chain still holds.
+    (store as Arc<dyn JournalStore>)
+        .verify(out.run_id)
+        .await
+        .expect("an unsigned chain still verifies as a chain");
+}
+
+/// ...but an auditor asking for signatures is told there are none.
+///
+/// The leniency above is exactly where a hole would hide: a verifier that
+/// shrugged at a missing signature would accept a history somebody stripped the
+/// signatures from. `require_signature` is the difference between "resume my own
+/// history" and "prove this to me".
+#[tokio::test]
+async fn stripping_the_signatures_is_not_a_way_to_pass() {
+    let (_store, records) = signed_run(signer("spiffe://example.org/plane-a", PLANE_A)).await;
+
+    let stripped: Vec<Record> = records
+        .iter()
+        .map(|r| Record::from_stored_attested(r.raw().to_vec(), r.prev_hash, r.hash, None).unwrap())
+        .collect();
+
+    let verifier = Ed25519Verifier::new()
+        .trust(
+            "spiffe://example.org/plane-a",
+            &Ed25519Signer::new("x", &PLANE_A).verifying_key(),
+        )
+        .unwrap();
+
+    // Lenient: fine, because the plane has no basis to reject its own history.
+    Record::verify_attested(&stripped, Digest::ZERO, &verifier, false)
+        .expect("a lenient verification tolerates unsigned records");
+
+    // Strict: refused, because an auditor asked for proof and got none.
+    Record::verify_attested(&stripped, Digest::ZERO, &verifier, true)
+        .expect_err("signatures were stripped and the strict check passed anyway");
+}
+
+/// An unknown key is refused, and refused the same way a bad signature is.
+#[tokio::test]
+async fn an_unknown_signer_is_not_trusted() {
+    let (_store, records) = signed_run(signer("spiffe://example.org/plane-a", PLANE_A)).await;
+
+    // A verifier that trusts a different workload entirely.
+    let verifier = Ed25519Verifier::new()
+        .trust(
+            "spiffe://example.org/plane-b",
+            &Ed25519Signer::new("x", &PLANE_B).verifying_key(),
+        )
+        .unwrap();
+    Record::verify_attested(&records, Digest::ZERO, &verifier, true)
+        .expect_err("a record signed by an unknown workload was accepted");
+}
+
+// ── Binding runs to each other ──────────────────────────────────────────────
+
+async fn sealed_runs(store: &Arc<SqliteStore>, n: usize) -> Vec<agentplane::core::RunId> {
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .skill(Trivial)
+        .build();
+    let mut runs = Vec::new();
+    for _ in 0..n {
+        let out = rt
+            .run_plan(agentplane::core::PlanIR::single("demo.trivial"), json!({}))
+            .await
+            .unwrap();
+        runs.push(out.run_id);
+    }
+    runs
+}
+
+/// Every sealed run enters the log, and can prove it.
+#[tokio::test]
+async fn a_sealed_run_is_committed_to() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap().origin("test-plane"));
+    let runs = sealed_runs(&store, 5).await;
+
+    let cp = (store.clone() as Arc<dyn JournalStore>)
+        .checkpoint()
+        .await
+        .unwrap();
+    assert_eq!(cp.origin, "test-plane");
+    assert_eq!(cp.size, 5);
+
+    for (i, run) in runs.iter().enumerate() {
+        let inc = (store.clone() as Arc<dyn JournalStore>)
+            .inclusion_proof(*run)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("run {i} is sealed but not in the log"));
+        assert_eq!(inc.index, u64::try_from(i).unwrap());
+        assert!(
+            agentplane::core::merkle::verify_inclusion(
+                &agentplane::core::merkle::leaf_hash(&inc.seal),
+                usize::try_from(inc.index).unwrap(),
+                usize::try_from(inc.size).unwrap(),
+                &inc.proof,
+                &cp.root,
+            ),
+            "run {i} could not prove its own inclusion"
+        );
+    }
+}
+
+/// **The gap this closes: deleting a whole run.**
+///
+/// Every remaining run's chain still verifies — deleting a run does not disturb
+/// anybody else's `prev_hash`. Signatures do not help either: the deleted run's
+/// signatures leave with it. The only thing that notices is a commitment to the
+/// *set*, and only if a root was published before the deletion.
+#[tokio::test]
+async fn deleting_a_run_breaks_the_published_root() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let runs = sealed_runs(&store, 6).await;
+
+    // What an auditor was given, before.
+    let published = (store.clone() as Arc<dyn JournalStore>)
+        .checkpoint()
+        .await
+        .unwrap();
+
+    // The operator removes a run entirely — journal rows and seal alike.
+    store.delete_run_for_test(runs[2]).await.unwrap();
+
+    // Every surviving run still verifies as a chain. That is the point: the
+    // per-run mechanism has nothing to say about this.
+    for (i, run) in runs.iter().enumerate() {
+        if i == 2 {
+            continue;
+        }
+        (store.clone() as Arc<dyn JournalStore>)
+            .verify(*run)
+            .await
+            .expect("a surviving run's chain is untouched by another's deletion");
+    }
+
+    // And the root has moved, so the checkpoint an auditor holds no longer
+    // describes this store.
+    let now = (store.clone() as Arc<dyn JournalStore>)
+        .checkpoint()
+        .await
+        .unwrap();
+    assert_ne!(
+        published.root, now.root,
+        "a run was deleted and the commitment did not move — the whole point"
+    );
+    assert_eq!(published.size, 6);
+    assert_eq!(now.size, 5);
+
+    // The deleted run cannot prove inclusion any more either.
+    assert!(
+        (store.clone() as Arc<dyn JournalStore>)
+            .inclusion_proof(runs[2])
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A run that has not concluded is not in the log, and says so plainly.
+#[tokio::test]
+async fn an_unsealed_run_is_not_in_the_log() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let cp = (store.clone() as Arc<dyn JournalStore>)
+        .checkpoint()
+        .await
+        .unwrap();
+    assert_eq!(cp.size, 0);
+    assert_eq!(cp.root, Digest::ZERO);
+
+    assert!(
+        (store.clone() as Arc<dyn JournalStore>)
+            .inclusion_proof(agentplane::core::RunId::generate())
+            .await
+            .unwrap()
+            .is_none(),
+        "a run that never existed reported a position in the log"
+    );
+}
+
+/// A new run is appended after the survivors, never dropped into a gap.
+///
+/// `MAX + 1` rather than a count, and the distinction is about *ordering*, not
+/// about the number itself. Delete the middle of `{0, 1, 2}` and a count yields
+/// `2` for the next seal — which either collides with the surviving run at 2 or,
+/// without the unique index, sorts *before* it. Either way the existing leaves
+/// change order, and reordering breaks every consistency proof against an
+/// earlier checkpoint while looking like corruption rather than deletion.
+///
+/// Note what is *not* claimed: tree positions do move. The tree is built over
+/// the surviving leaves and cannot have holes, so a deletion shifts everything
+/// after it down by one. That is unavoidable and harmless — it is what the
+/// consistency proof reports.
+#[tokio::test]
+async fn a_new_run_is_appended_after_the_survivors() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let runs = sealed_runs(&store, 3).await;
+    store.delete_run_for_test(runs[1]).await.unwrap();
+
+    let more = sealed_runs(&store, 1).await;
+    let s = store.clone() as Arc<dyn JournalStore>;
+    let cp = s.checkpoint().await.unwrap();
+    assert_eq!(cp.size, 3, "two survivors plus one new run");
+
+    let inc = s.inclusion_proof(more[0]).await.unwrap().unwrap();
+    assert_eq!(
+        inc.index,
+        cp.size - 1,
+        "the new run did not land at the end of the log, so it was dropped into \
+         the gap the deleted run left and the survivors' order changed"
+    );
+
+    // And the survivors kept their relative order.
+    let first = s.inclusion_proof(runs[0]).await.unwrap().unwrap();
+    let third = s.inclusion_proof(runs[2]).await.unwrap().unwrap();
+    assert!(
+        first.index < third.index && third.index < inc.index,
+        "the log reordered: {} then {} then {}",
+        first.index,
+        third.index,
+        inc.index
+    );
+}
+
+// ── The audit an outsider runs ──────────────────────────────────────────────
+
+/// A clean plane audits clean, and says what it could not check.
+#[tokio::test]
+async fn an_audit_reports_what_it_could_not_look_at() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let runs = sealed_runs(&store, 3).await;
+    let s = store.clone() as Arc<dyn JournalStore>;
+
+    // An auditor with nothing but the store.
+    let report = agentplane::audit::audit(&s, &runs, &agentplane::audit::Evidence::default())
+        .await
+        .unwrap();
+    assert!(report.is_sound(), "{:?}", report.findings);
+    assert_eq!(report.sound.len(), 3);
+    assert_eq!(
+        report.not_checked.len(),
+        2,
+        "an audit with no key and no prior checkpoint checked everything?"
+    );
+    assert!(report.not_checked.iter().any(|s| s.contains("deletion")));
+    assert!(report.not_checked.iter().any(|s| s.contains("signatures")));
+}
+
+/// **The point of the whole mechanism, from the auditor's side.**
+///
+/// Without a checkpoint from outside, an audit of a store somebody deleted a run
+/// from comes back clean — every remaining chain verifies, every remaining run
+/// proves inclusion in the log *as it now stands*. With one, the same store
+/// fails.
+#[tokio::test]
+async fn only_an_outside_checkpoint_detects_a_deletion() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let runs = sealed_runs(&store, 5).await;
+    let s = store.clone() as Arc<dyn JournalStore>;
+
+    // What the auditor was handed, before.
+    let prior = s.checkpoint().await.unwrap();
+
+    // The operator removes a run and carries on.
+    store.delete_run_for_test(runs[1]).await.unwrap();
+    let survivors: Vec<_> = runs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 1)
+        .map(|(_, r)| *r)
+        .collect();
+
+    // Audited with nothing from outside: clean. This is not a bug in the audit —
+    // it is the honest consequence of having nothing to compare against, and it
+    // is why `not_checked` says so in words.
+    let blind = agentplane::audit::audit(&s, &survivors, &agentplane::audit::Evidence::default())
+        .await
+        .unwrap();
+    assert!(
+        blind.is_sound(),
+        "the blind audit found something it had no way to find: {:?}",
+        blind.findings
+    );
+
+    // Audited against the checkpoint they were given: caught.
+    let armed = agentplane::audit::audit(
+        &s,
+        &survivors,
+        &agentplane::audit::Evidence {
+            prior: Some(&prior),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        armed.findings.iter().any(|f| matches!(
+            f,
+            agentplane::audit::Finding::Shrunk { .. }
+                | agentplane::audit::Finding::NotAppendOnly { .. }
+        )),
+        "a deleted run passed an audit holding a checkpoint from before it: {:?}",
+        armed.findings
+    );
+}
+
+/// A checkpoint from a different plane is refused, not compared.
+#[tokio::test]
+async fn a_checkpoint_from_another_plane_is_refused() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap().origin("plane-a"));
+    let runs = sealed_runs(&store, 2).await;
+    let s = store.clone() as Arc<dyn JournalStore>;
+
+    let theirs = agentplane::journal::Checkpoint {
+        origin: "plane-b".into(),
+        size: 1,
+        root: Digest::ZERO,
+    };
+    let report = agentplane::audit::audit(
+        &s,
+        &runs,
+        &agentplane::audit::Evidence {
+            prior: Some(&theirs),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, agentplane::audit::Finding::WrongLog { .. })),
+        "a checkpoint for another log was compared against this one: {:?}",
+        report.findings
+    );
+}
+
+/// An audit with a key verifies authorship too.
+#[tokio::test]
+async fn an_audit_with_a_key_checks_who_wrote_it() {
+    let store = Arc::new(
+        SqliteStore::open_in_memory()
+            .unwrap()
+            .signing_as(signer("spiffe://example.org/plane-a", PLANE_A)),
+    );
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .skill(Trivial)
+        .build();
+    let out = rt
+        .run_plan(agentplane::core::PlanIR::single("demo.trivial"), json!({}))
+        .await
+        .unwrap();
+    let s = store.clone() as Arc<dyn JournalStore>;
+
+    let verifier = Ed25519Verifier::new()
+        .trust(
+            "spiffe://example.org/plane-a",
+            &Ed25519Signer::new("x", &PLANE_A).verifying_key(),
+        )
+        .unwrap();
+    let prior = s.checkpoint().await.unwrap();
+
+    let report = agentplane::audit::audit(
+        &s,
+        &[out.run_id],
+        &agentplane::audit::Evidence {
+            prior: Some(&prior),
+            verifier: Some(&verifier),
+            require_signatures: true,
+        },
+    )
+    .await
+    .unwrap();
+    // Nothing failed and nothing was skipped — the strict form.
+    report.assert_complete();
+
+    // The wrong key fails it.
+    let wrong = Ed25519Verifier::new()
+        .trust(
+            "spiffe://example.org/plane-a",
+            &Ed25519Signer::new("x", &PLANE_B).verifying_key(),
+        )
+        .unwrap();
+    let bad = agentplane::audit::audit(
+        &s,
+        &[out.run_id],
+        &agentplane::audit::Evidence {
+            prior: Some(&prior),
+            verifier: Some(&wrong),
+            require_signatures: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!bad.is_sound(), "an audit accepted the wrong signing key");
+}
+
+/// A checkpoint survives being written down and read back.
+///
+/// The one artifact that has to leave the operator's control. A checkpoint that
+/// only exists as a struct cannot be handed to anybody.
+#[test]
+fn a_checkpoint_round_trips_through_text() {
+    let cp = agentplane::journal::Checkpoint {
+        origin: "example.org/plane-a".into(),
+        size: 4_294_967_296,
+        root: Digest::of(b"some root"),
+    };
+    let note = cp.to_note();
+    assert_eq!(note.lines().count(), 3, "{note}");
+    assert_eq!(
+        agentplane::journal::Checkpoint::from_note(&note).unwrap(),
+        cp
+    );
+}
+
+/// A malformed note is refused rather than half-read.
+#[test]
+fn a_malformed_checkpoint_is_refused() {
+    for bad in [
+        "",
+        "only-origin\n",
+        "origin\nnotanumber\nAAAA\n",
+        "origin\n1\n!!!\n",
+    ] {
+        assert!(
+            agentplane::journal::Checkpoint::from_note(bad).is_err(),
+            "a malformed checkpoint parsed: {bad:?}"
+        );
+    }
+}
+
+/// The signing key never appears in `Debug`.
+#[test]
+fn the_signing_key_is_not_printable() {
+    let s = Ed25519Signer::new("plane-a", &PLANE_A);
+    let printed = format!("{s:?}");
+    assert!(!printed.contains("77777"), "{printed}");
+    assert!(printed.contains("redacted"), "{printed}");
+}

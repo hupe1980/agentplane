@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Lint, the three feature configurations, examples, docs, and the packaging
+  # guard. One recipe, so this cannot drift from what a contributor runs.
+  #
+  # The determinism gate lives in clippy.toml: ambient clock/RNG/id reads are
+  # denied crate-wide. If this job is allowed to fail, replay silently stops
+  # being sound.
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - run: just ci
+
+  # Each seam with *only* its own features on — the configuration an embedder
+  # who wants that seam and nothing else actually builds. The `--all-features`
+  # run above would hide a seam that quietly depends on another being present.
+  seams:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        seam: [postgres, mcp, http, attestation, drivers]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - run: just test-${{ matrix.seam }}
+
+  # Its own job because it rebuilds the library once per mutation.
+  #
+  # Each guarantee is broken on purpose and the test written to catch it must
+  # fail. Without this a guarantee can be implemented, tested, and still
+  # unfalsifiable — which this project shipped once, and found by accident.
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - run: just mutants
+
+  # Two passes: the first checks the design, the second checks the check. A
+  # spec whose invariants cannot be violated proves nothing, so each is re-run
+  # against deliberately broken copies of itself.
+  specs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: extractions/setup-just@v2
+      - run: just specs
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-features
