@@ -6,7 +6,7 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use crate::batch::{BatchCensus, BatchStore, ItemOutcome, ItemRecord};
 use crate::core::{BatchId, RunId, Spend, StoreError};
 
-use super::redb::{MAX_STR, RedbStore, be};
+use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
 /// `batch_id -> (plan_digest, exhausted)`.
 const BATCHES: TableDefinition<&str, (&str, u8)> = TableDefinition::new("batches");
@@ -60,7 +60,7 @@ impl BatchStore for RedbStore {
     async fn open(&self, id: BatchId, plan_digest: &str) -> Result<(), StoreError> {
         let (key, digest) = (id.to_string(), plan_digest.to_owned());
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut t = w.open_table(BATCHES).map_err(|e| be(&e))?;
                 if t.get(key.as_str()).map_err(|e| be(&e))?.is_none() {
@@ -77,7 +77,7 @@ impl BatchStore for RedbStore {
     async fn mark_exhausted(&self, id: BatchId) -> Result<(), StoreError> {
         let key = id.to_string();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut t = w.open_table(BATCHES).map_err(|e| be(&e))?;
                 let digest = t
@@ -115,7 +115,7 @@ impl BatchStore for RedbStore {
     ) -> Result<ItemRecord, StoreError> {
         let (b, k, r) = (batch.to_string(), key.to_owned(), run.to_string());
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             let out = {
                 let mut t = w.open_table(ITEMS).map_err(|e| be(&e))?;
                 // Reserve then read back, rather than overwrite: if this item was
@@ -180,7 +180,7 @@ impl BatchStore for RedbStore {
         let tokens = i64::try_from(spend.tokens).unwrap_or(i64::MAX);
         let minor = spend.minor_units;
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut t = w.open_table(ITEMS).map_err(|e| be(&e))?;
                 let run = t

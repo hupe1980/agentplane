@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en" prefix="og: https://ogp.me/ns#">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{%- set page_title = page.title | default(value=section.title | default(value=config.title)) -%}
+{%- set page_desc = page.description | default(value=section.description | default(value=config.description)) -%}
+{%- set page_url = page.permalink | default(value=section.permalink | default(value=config.base_url)) -%}
+
+{#- The homepage carries the keyword-bearing title; inner pages lead with their
+    own name so a search result reads "Security model · agentplane". -#}
+{%- if section.extra.home | default(value=false) -%}
+  {%- set head_title = "agentplane — durable, replayable agent runtime for AI agents in Rust" -%}
+{%- else -%}
+  {%- set head_title = page_title ~ " · " ~ config.title -%}
+{%- endif %}
+<title>{{ head_title }}</title>
+<meta name="description" content="{{ page_desc }}">
+<link rel="canonical" href="{{ page_url }}">
+
+<meta property="og:type" content="{% if page.title %}article{% else %}website{% endif %}">
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:title" content="{{ head_title }}">
+<meta property="og:description" content="{{ page_desc }}">
+<meta property="og:url" content="{{ page_url }}">
+{#- No og:image until there is a real one. A tag pointing at a missing file is
+    worse than its absence: several platforms suppress the whole preview rather
+    than fall back. To enable, drop a 1200×630 PNG at site/static/og.png and
+    restore these two lines. -#}
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="{{ head_title }}">
+<meta name="twitter:description" content="{{ page_desc }}">
+
+<link rel="stylesheet" href="{{ get_url(path='main.css') }}">
+<link rel="stylesheet" href="{{ get_url(path='giallo-light.css') }}" media="(prefers-color-scheme: light)">
+<link rel="stylesheet" href="{{ get_url(path='giallo-dark.css') }}" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml">
+<meta name="theme-color" content="#0d1117">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "agentplane",
+  "description": {{ config.description | json_encode | safe }},
+  "url": {{ config.base_url | json_encode | safe }},
+  "codeRepository": {{ config.extra.repo | json_encode | safe }},
+  "programmingLanguage": "Rust",
+  "license": "https://spdx.org/licenses/MIT.html",
+  "keywords": "agent runtime, durable execution, deterministic replay, AI agent governance, Rust, EU AI Act, audit log"
+}
+</script>
+{%- if page.title %}
+{%- set docs_url = config.base_url ~ "/docs/" %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {"@type": "ListItem", "position": 1, "name": "agentplane", "item": {{ config.base_url | json_encode | safe }}},
+    {"@type": "ListItem", "position": 2, "name": "Documentation", "item": {{ docs_url | json_encode | safe }}},
+    {"@type": "ListItem", "position": 3, "name": {{ page.title | json_encode | safe }}, "item": {{ page.permalink | json_encode | safe }}}
+  ]
+}
+</script>
+{%- endif %}
+{% block head %}{% endblock head %}
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <a class="brand" href="{{ config.base_url }}/">
+    <span class="mark" aria-hidden="true"></span> agentplane
+  </a>
+  {#- Works with no JavaScript at all: it submits to the repository's own search.
+      search.js upgrades it in place to instant local results. -#}
+  <form id="search-form" class="search" role="search"
+        action="{{ config.extra.repo }}/search" method="get"
+        data-base="{{ config.base_url }}">
+    <label class="vh" for="search-input">Search the documentation</label>
+    <input id="search-input" name="q" type="search" placeholder="Search  /"
+           autocomplete="off" role="combobox" aria-expanded="false"
+           aria-controls="search-results" aria-autocomplete="list">
+    <div id="search-results" class="results" hidden role="listbox"
+         aria-label="Search results"></div>
+  </form>
+
+  <nav aria-label="Main">
+    <a href="{{ get_url(path='@/docs/getting-started.md') }}">Docs</a>
+    <a href="{{ get_url(path='@/docs/architecture.md') }}">Architecture</a>
+    <a href="{{ get_url(path='@/docs/status.md') }}">Status</a>
+    <a href="{{ config.extra.docsrs }}">API</a>
+    <a class="gh" href="{{ config.extra.repo }}">GitHub</a>
+  </nav>
+</header>
+
+<main id="main">{% block content %}{% endblock content %}</main>
+
+<footer class="foot">
+  <p><strong>agentplane</strong> — {{ config.extra.tagline }}</p>
+  <p>
+    <a href="{{ config.extra.repo }}">Source</a> ·
+    <a href="{{ config.extra.crate }}">crates.io</a> ·
+    <a href="{{ config.extra.docsrs }}">API docs</a> ·
+    <a href="{{ get_url(path='@/docs/status.md') }}">What is built</a>
+  </p>
+  <p class="fine">Pre-alpha. MIT OR Apache-2.0. Not compliance software —
+    <a href="{{ get_url(path='@/docs/regulation.md') }}">what that means</a>.</p>
+</footer>
+<script src="{{ get_url(path='search.js') }}" defer></script>
+</body>
+</html>

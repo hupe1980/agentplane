@@ -1,4 +1,8 @@
-# 🚀 Getting started
++++
+title = "Getting started"
+description = "Fifteen minutes from nothing to a run that survives a crash, replays exactly, and refuses to rewrite its own history."
+weight = 1
++++
 
 Fifteen minutes from nothing to a run that survives a crash, replays exactly, and
 refuses to rewrite its own history.
@@ -70,6 +74,7 @@ agentplane = { version = "0.1", features = ["postgres", "http", "mcp", "provider
 | `providers` | Anthropic and OpenAI model drivers |
 | `cedar` | Cedar as the authorization engine |
 | `signing` | Ed25519 record attestation |
+| `opendal` | content-addressed blob storage on S3, GCS, Azure or a filesystem — where bytes too large for the journal go |
 | `testkit` | fault injection, store conformance, a fake model provider |
 
 ## 3. Write a skill 🛠️
@@ -114,7 +119,7 @@ Two things in that signature carry most of the design:
 whether it is trusted, how sensitive it is. `peek()` reads it; `map()` transforms
 it while carrying the label along. There is no infallible unwrap, because leaving
 the lattice is a decision that gets journaled. See
-[concepts](concepts.md).
+[concepts](@/docs/concepts.md).
 
 **`cx.now()`, not `SystemTime::now()`.** The ambient clock is denied crate-wide by
 lint. Anything non-deterministic goes through `cx`, which journals it — and that
@@ -207,11 +212,11 @@ stopped counting.
 
 | | |
 |---|---|
-| 🧠 | [Concepts](concepts.md) — runs vs cases, effects, dispositions, labels |
-| 🍳 | [Cookbook](cookbook.md) — "how do I …" recipes |
-| 🏗️ | [Architecture](architecture.md) — how the mechanisms actually work |
-| 🔐 | [Security model](security.md) — the trust boundary and its limits |
-| ⚙️ | [Operations](operations.md) — running it for real |
+| 🧠 | [Concepts](@/docs/concepts.md) — runs vs cases, effects, dispositions, labels |
+| 🍳 | [Cookbook](@/docs/cookbook.md) — "how do I …" recipes |
+| 🏗️ | [Architecture](@/docs/architecture.md) — how the mechanisms actually work |
+| 🔐 | [Security model](@/docs/security.md) — the trust boundary and its limits |
+| ⚙️ | [Operations](@/docs/operations.md) — running it for real |
 
 ## Troubleshooting 🔧
 
@@ -223,7 +228,7 @@ That is the mechanism working. Use `Mode::Resume` for crash recovery of the
 **`StepError::Denied`** — the policy engine refused. The journal has the reason;
 what the *model* is told is one uniform sentence on purpose, because a precise
 refusal is an oracle an injected prompt can probe. See
-[security](security.md).
+[security](@/docs/security.md).
 
 **A run that never finishes** — it is probably suspended waiting for an event,
 a timer, or a human. `GET /runs/{id}` reports *why* it is not finishing rather

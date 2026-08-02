@@ -1,4 +1,8 @@
-# 📋 Status — what is built, and what is not
++++
+title = "Status"
+description = "What is built, what is deliberately deferred, and how to check this page is telling the truth."
+weight = 8
++++
 
 `agentplane` is pre-alpha. This page is the honest inventory: every row is a
 capability that exists in the code, with the tests that hold it. What is *not*
@@ -7,8 +11,8 @@ designed-and-deferred rather than unconsidered.
 
 The rule this page follows: **a row appears only when something would fail if the
 capability were removed.** A feature with no test that can falsify it is not a
-feature, it is an intention — see [the assurance ladder](#assurance) in the
-README.
+feature, it is an intention — the mechanisms that make that checkable are in
+[operations](@/docs/operations.md).
 
 ## ✅ Built
 
@@ -57,6 +61,10 @@ README.
 | ✅ | **HTTP surface** — worklist, claim/release, decisions, run status, event delivery, behind the `http` feature; the wire types cannot express who is acting |
 | ✅ | **Cancellation** — an operator stops a run; it unwinds what it did, refuses to unwind around an unknown outcome, and the record names who asked |
 | ✅ | **A2A** — peer calls over the wire behind the `a2a` feature; a peer's internal error is *in doubt*, a failed task has *landed* |
+| ✅ | **Content-addressed blobs** — the claim check, with the reference being the digest, so the chain commits to bytes it does not hold; a blob altered on disk is refused, not served. In memory, or on anything OpenDAL reaches behind the `opendal` feature |
+| ✅ | **A journal record size ceiling** — 1 MiB, refused rather than truncated, checked at the one point every backend seals through |
+| ✅ | **System instructions** — written once as `system` on the prompt, spelled the way each API wants it: a top-level `system` on Anthropic, `instructions` on OpenAI Responses. In the effect key like the rest of the prompt, so editing the instruction shows up on replay as divergence |
+| ✅ | **Multimodal content** — image and document blocks pass through verbatim, so a provider's own shapes work without this crate modelling any of them. The prompt is stored in the journal, so inlined media is kept forever; a media *URL* is fetched by the provider and does not pass the egress allowlist |
 | ✅ | **Model drivers** — Anthropic Messages and OpenAI Responses behind the `providers` feature; reasoning tokens are billed, a cut-off answer says so, and a completion that generated and then declined is billed for what it generated |
 | ✅ | **Structured output** — a JSON Schema enforced by the provider *during* generation and carried in the effect key; with forced-tool emulation for the many models that have no native support, and a refusal that names the rule when a schema is one strict mode cannot take |
 | ✅ | **Quorum on high-risk nodes** — several judgements from *distinct declared lenses*, because identical judges share their blind spots; a split panel has no `majority()` to fall back on, so disagreement escalates rather than resolving itself |
@@ -84,6 +92,9 @@ which is the distinction a status page exists to make.
 | ⬜ | **Wasm skill tier** — the capability-absence sandbox where determinism is enforced rather than requested. The native tier is trusted by definition, which is recorded as a residual risk rather than a control |
 | ⬜ | **Memory and compaction** — no memory store, retrieval seam, or `cx.compact` effect. The shape is fixed by the effect protocol, which is why it is written down rather than improvised later |
 | ⬜ | **Symbolic policy analysis** — Cedar's `symcc` can *prove* properties of a policy set rather than test them; nothing invokes it yet |
+| ⬜ | **OpenTelemetry GenAI conventions on effect spans** — the run span carries `gen_ai.operation.name = invoke_agent`; the tool and model calls inside it do not carry `execute_tool` / `chat`, nor the model and token attributes. Observability tooling that keys on those sees the agent invocation and not what it did. The conventions are still pre-1.0, which is why the version this targets is pinned rather than tracked |
+| ⬜ | **Retention and erasure** — no TTL, no expiry tombstone, no erasure unit. The journal keeps everything for ever, which is what Art. 12 wants and what an erasure request does not. The blob store is the half that exists: the chain commits only to a digest, so bytes can be removed without breaking it — the policy on top is missing |
+| ⬜ | **Argument-level provenance** — a tool call's arguments carry one joined label, so a single untrusted field makes the whole call untrusted. That fails closed, so it is not a hole; the cost is pressure to declassify broadly, which turns a precise mechanism into a rubber stamp. Per-argument labelling is the known remedy |
 | ⬜ | **A2A server** — the client is built, including the failure mapping that decides whether a peer acted. Serving a signed Agent Card derived from the manifest is not |
 
 ## 🔍 How to check this page is honest

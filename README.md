@@ -63,7 +63,7 @@ cargo run --example model_run --features redb,testkit
 replay that touches nothing, a crash that resumes without repeating work, and a
 changed build that is **quarantined instead of quietly rewriting history**.
 
-New here? → **[docs/getting-started.md](docs/getting-started.md)**
+New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/docs/getting-started/)**
 
 ## 📦 What you get
 
@@ -79,19 +79,20 @@ New here? → **[docs/getting-started.md](docs/getting-started.md)**
 | 🔌 | **Real wires** — MCP tools, A2A peers, Anthropic and OpenAI drivers, each with a failure mapping that says whether the call landed |
 
 Full inventory, including what is **not** built →
-**[docs/status.md](docs/status.md)**
+**[docs/status.md](https://hupe1980.github.io/agentplane/docs/status/)**
 
 ## 📚 Documentation
 
 | | |
 |---|---|
-| 🚀 | [Getting started](docs/getting-started.md) — first run, first skill, first replay |
-| 🧠 | [Concepts](docs/concepts.md) — the ideas the rest is built from |
-| 🏗️ | [Architecture](docs/architecture.md) — how it actually works, mechanism by mechanism |
-| 🍳 | [Cookbook](docs/cookbook.md) — task-shaped recipes |
-| 🔐 | [Security model](docs/security.md) — the trust boundary, and what it does not cover |
-| ⚙️ | [Operations](docs/operations.md) — deploying, HA, retention, observability |
-| 📋 | [Status](docs/status.md) — built vs designed-not-built |
+| 🚀 | [Getting started](https://hupe1980.github.io/agentplane/docs/getting-started/) — first run, first skill, first replay |
+| 🧠 | [Concepts](https://hupe1980.github.io/agentplane/docs/concepts/) — the ideas the rest is built from |
+| 🏗️ | [Architecture](https://hupe1980.github.io/agentplane/docs/architecture/) — how it actually works, mechanism by mechanism |
+| 🍳 | [Cookbook](https://hupe1980.github.io/agentplane/docs/cookbook/) — task-shaped recipes |
+| 🔐 | [Security model](https://hupe1980.github.io/agentplane/docs/security/) — the trust boundary, and what it does not cover |
+| ⚙️ | [Operations](https://hupe1980.github.io/agentplane/docs/operations/) — deploying, HA, retention, observability |
+| ⚖️ | [Regulation](https://hupe1980.github.io/agentplane/docs/regulation/) — EU AI Act obligation by obligation, and what is missing |
+| 📋 | [Status](https://hupe1980.github.io/agentplane/docs/status/) — built vs designed-not-built |
 | 🤝 | [Contributing](CONTRIBUTING.md) — the assurance ladder, and how to run it |
 
 ## 🧪 Assurance
@@ -112,7 +113,7 @@ because a spec whose invariants cannot be violated proves nothing, each is
 re-checked against 18 deliberately broken copies of itself; every mutant must be
 caught by the *specific* invariant written for it.
 
-**🧬 Mutation testing over the code.** 102 guarantees are broken on purpose, and
+**🧬 Mutation testing over the code.** 106 guarantees are broken on purpose, and
 the test *named for each one* must fail. A mutation caught by some other test is
 reported **weak**, not passing — that usually means the guarantee has no test of
 its own and is being held up by one that could be rewritten without anyone
@@ -154,8 +155,11 @@ deep, no C toolchain — with everything else opt-in.
 Honest framing on regulation: agentplane is not "compliant" and cannot be.
 Compliance attaches to a system in a context, assessed by its provider or
 deployer. What this gives you is the **technical means** to discharge EU AI Act
-Articles 12, 14 and 26 — means that are already load-bearing for recovery and
-testing, and therefore cannot quietly rot.
+Articles 12 and 14 — means that are already load-bearing for recovery and
+testing, and therefore cannot quietly rot. [Regulation](https://hupe1980.github.io/agentplane/docs/regulation/) maps
+obligation to mechanism, names what is *not* built, and notes that the Digital
+Omnibus moved the high-risk dates to December 2027 without amending the
+articles.
 
 ## 📄 License
 

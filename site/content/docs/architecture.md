@@ -1,4 +1,8 @@
-# Architecture
++++
+title = "Architecture"
+description = "How the journal, effect protocol, replay, sagas and the Merkle log actually work — mechanism by mechanism."
+weight = 4
++++
 
 How the runtime works, and why each piece is shaped the way it is.
 
@@ -43,6 +47,45 @@ reads a config file is the same bug class as a non-deterministic effect, but far
 harder to find — it only manifests on old records.
 
 ## The effect protocol
+
+<figure class="diagram">
+<svg viewBox="0 0 640 200" role="img" aria-labelledby="ep-t ep-d" xmlns="http://www.w3.org/2000/svg">
+  <title id="ep-t">The effect protocol and its two crash points</title>
+  <desc id="ep-d">An effect is announced to the journal, then performed against the
+    world, then its outcome is recorded. A crash between announce and act means the
+    call did not happen. A crash between act and record means the outcome is
+    unknown — the in-doubt case.</desc>
+
+  <rect class="box" x="8"   y="60" width="150" height="52" rx="9"/>
+  <rect class="box" x="245" y="60" width="150" height="52" rx="9"/>
+  <rect class="box" x="482" y="60" width="150" height="52" rx="9"/>
+
+  <text class="lbl" x="83"  y="82"  text-anchor="middle">1 · Announce</text>
+  <text class="sub" x="83"  y="99"  text-anchor="middle">EffectStarted</text>
+  <text class="lbl" x="320" y="82"  text-anchor="middle">2 · Act</text>
+  <text class="sub" x="320" y="99"  text-anchor="middle">the outward call</text>
+  <text class="lbl" x="557" y="82"  text-anchor="middle">3 · Record</text>
+  <text class="sub" x="557" y="99"  text-anchor="middle">EffectEnded</text>
+
+  <path class="arrow" d="M158 86 H239" marker-end="url(#ah)"/>
+  <path class="arrow" d="M395 86 H476" marker-end="url(#ah)"/>
+
+  <path class="danger" d="M201 60 V26"/>
+  <text class="danger-lbl" x="201" y="18" text-anchor="middle">crash → DidNotHappen</text>
+  <path class="danger" d="M438 112 V150"/>
+  <text class="danger-lbl" x="438" y="166" text-anchor="middle">crash → InDoubt</text>
+
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="currentColor" class="arrow"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The order is the guarantee. Announcing <em>before</em> acting is what makes
+the second gap survivable: a record exists naming a call whose outcome nobody knows,
+so the run can be quarantined rather than retried blindly or unwound as if it never
+happened.</figcaption>
+</figure>
 
 ```
     announce            act              record

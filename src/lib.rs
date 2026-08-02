@@ -87,6 +87,7 @@
 pub mod api;
 pub mod audit;
 pub mod batch;
+pub mod blob;
 pub mod case;
 pub mod core;
 pub mod journal;

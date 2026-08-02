@@ -414,6 +414,25 @@ pub enum StoreError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// A single record exceeded the size a journal will hold.
+    ///
+    /// Refused rather than written, and the distinction is the whole point. The
+    /// journal is append-only and hash-chained: an oversized record cannot be
+    /// pruned later, cannot be rewritten, and is replayed on every read of that
+    /// run. Every durable-execution engine in the field caps this — Temporal at
+    /// 2 MB with a claim check above ~256 KiB, Restate at 32 MiB after
+    /// oversized entries drove it into an unrecoverable state — and the failure
+    /// they all avoid is the one where the write succeeds and the problem
+    /// surfaces months later as a store nobody can read quickly.
+    ///
+    /// The fix is at the call site, not here: put the bytes somewhere addressed
+    /// by a digest and journal the digest.
+    #[error(
+        "record of {bytes} bytes exceeds the {limit}-byte journal limit — \
+         journal a digest and keep the bytes outside the chain"
+    )]
+    RecordTooLarge { bytes: usize, limit: usize },
+
     /// The `(run_id, effect_key)` unique index rejected a second start for one
     /// effect. Exactly-once is a database invariant here, not a code path.
     #[error("effect {0} already started in this run")]

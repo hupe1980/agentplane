@@ -11,7 +11,7 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 use crate::case::{ClaimError, TaskStore};
 use crate::core::{CaseId, StoreError, Task, TaskId, TaskState, Timestamp};
 
-use super::redb::{MAX_STR, RedbStore, be};
+use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
 /// `task_id -> the task as JSON`.
 ///
@@ -149,7 +149,7 @@ impl TaskStore for RedbStore {
         let due = task.due_at.map(ts);
         let case = task.case.map(|c| c.to_string());
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             let out = {
                 let mut tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
                 // First open wins, by id: reopening must not rewrite a task
@@ -212,7 +212,7 @@ impl TaskStore for RedbStore {
         let actor = actor.to_owned();
         let roles = roles.to_vec();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             let out = {
                 let mut tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
                 match load(&tasks, &key)? {
@@ -264,7 +264,7 @@ impl TaskStore for RedbStore {
         let key = id.to_hex();
         let actor = actor.to_owned();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             let out = {
                 let mut tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
                 let found = load(&tasks, &key)?;
@@ -298,7 +298,7 @@ impl TaskStore for RedbStore {
     async fn set_state(&self, id: TaskId, state: TaskState) -> Result<(), StoreError> {
         let key = id.to_hex();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
                 let Some(task) = load(&tasks, &key)? else {

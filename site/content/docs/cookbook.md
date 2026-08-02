@@ -1,11 +1,182 @@
-# 🍳 Cookbook
++++
+title = "Cookbook"
+description = "Task-shaped recipes: build an agent, keep large bytes out of the chain, require a human, undo work when a later step fails."
+weight = 3
++++
 
 Task-shaped recipes. Each one states the trap it avoids, because most of these
 have an obvious wrong version that works until it doesn't.
 
 For the vocabulary — effect, disposition, label — see
-[concepts](concepts.md). For why any of it is shaped this way, see
-[architecture](architecture.md).
+[concepts](@/docs/concepts.md). For why any of it is shaped this way, see
+[architecture](@/docs/architecture.md).
+
+---
+
+## 🧬 Build an agent
+
+An agent here is not a class you subclass. It is **skills** (what it can do), a
+**plan** (which capability runs when), and a **policy** (what it may do) — held
+together by a `Runtime` that journals every step.
+
+Start with a skill. The system prompt lives in the prompt value, not in a
+separate setting, because the prompt is part of the effect key: change the
+instruction and a replayed run reports divergence instead of quietly answering a
+different question.
+
+```rust
+use agentplane::core::{Outcome, Sensitivity, Skill, SkillDescriptor, SkillError, Tainted};
+use agentplane::model::{ModelCall, ModelId, ModelProvider};
+use agentplane::runtime::StepCtx;
+use serde_json::{Value, json};
+use std::sync::Arc;
+
+#[derive(Debug)]
+struct Triage {
+    provider: Arc<dyn ModelProvider>,
+}
+
+#[async_trait::async_trait]
+impl Skill for Triage {
+    fn descriptor(&self) -> SkillDescriptor {
+        // What it *provides* is a capability, not its own name. Plans bind
+        // capabilities to skills, so what a step needs is decoupled from who
+        // provides it — and swapping the implementation is a binding change.
+        SkillDescriptor::new("triage").provides("ticket.triage")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let call = ModelCall::new(
+            Arc::clone(&self.provider),
+            ModelId::new("anthropic", "claude-sonnet-4-5"),
+            json!({
+                // `system` is the instruction; each driver spells it the way its
+                // API does — top-level `system` on Anthropic, `instructions` on
+                // OpenAI Responses. Write it once.
+                "system": "You triage support tickets. Answer only with the JSON asked for.",
+                "messages": [{ "role": "user", "content": input.peek() }],
+            }),
+        )
+        // The ceiling that matters for a hosted model: a prompt assembled from a
+        // secret is an exfiltration whether or not anyone meant it.
+        .with_max_sensitivity(Sensitivity::Internal)
+        .expecting(json!({
+            "type": "object",
+            "properties": { "severity": { "type": "string" } },
+            "required": ["severity"],
+        }));
+
+        let completion = cx.effect(call).await?;
+        Ok(Outcome::done(completion.map(|c| {
+            c.structured.clone().unwrap_or(Value::Null)
+        })))
+    }
+}
+```
+
+Then wire the skills together and run. A single-capability agent needs no plan
+at all; a multi-step one gets a `PlanIR`.
+
+```rust
+use agentplane::core::{ArgSource, PlanIR, PlanNode, StepId};
+use agentplane::journal::JournalStore;
+use agentplane::runtime::Runtime;
+use agentplane::store::RedbStore;
+
+let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
+
+let rt = Runtime::builder(Arc::clone(&store))
+    .owner("support-plane")
+    .skill(Triage { provider: Arc::clone(&provider) })
+    .skill(Notify)
+    .build();
+
+// One capability: no plan needed.
+let out = rt.run("ticket.triage", json!({ "text": "printer on fire" })).await?;
+
+// Several: name the order, and what feeds what.
+let plan = PlanIR::new(vec![
+    PlanNode::new(0, "ticket.triage").arg("input", ArgSource::run_input()),
+    PlanNode::new(1, "ticket.notify")
+        .arg("triage", ArgSource::node(StepId(0)))
+        .terminal(),
+]);
+let out = rt.run_plan(plan, json!({ "text": "printer on fire" })).await?;
+```
+
+**The trap:** putting the system prompt in a config file that the run does not
+hash. The instruction is half of what the model was asked; if it can change
+without the effect key changing, a replay reads back an answer to a question
+that no longer exists, and nothing reports it.
+
+**Multimodal** needs no extra API — a `messages` array is passed through
+verbatim, so the provider's own image and document blocks work as written. Two
+things to know before sending large media, both consequences of the journal
+being the record of what happened:
+
+- The prompt is stored **in the journal**, which is append-only and hash-chained,
+  so an inlined image is kept forever and cannot be pruned. A record over
+  `Record::MAX_RECORD_BYTES` (1 MiB) is **refused**, not truncated — put the
+  bytes in a blob store and journal the digest instead (below).
+- A media **URL** is fetched by the *provider*, not by this plane, so it does not
+  pass the egress allowlist ([security](@/docs/security.md)). If where data may come
+  from is part of your threat model, fetch it yourself in a skill and inline the
+  bytes.
+
+---
+
+## 📦 Keep large bytes out of the chain
+
+The journal refuses a record over 1 MiB, because an append-only hash chain can
+never take it back. Bytes that big go in a content-addressed store, and the
+*digest* goes in the journal.
+
+```rust
+use agentplane::blob::{BlobStore, MemoryBlobs};      // or OpenDalBlobs, feature `opendal`
+
+let blobs: Arc<dyn BlobStore> = Arc::new(MemoryBlobs::new());
+
+// The store hashes the bytes; a caller does not get to say where they live.
+let digest = blobs.put(&image_bytes).await?;
+
+// Journal the address, not the payload.
+let call = ModelCall::new(provider, model, json!({
+    "system": "describe the attached screenshot",
+    "screenshot": digest.to_hex(),
+}));
+```
+
+For real deployments, `OpenDalBlobs` puts them on anything
+[OpenDAL](https://opendal.apache.org) reaches — filesystem, S3, GCS, Azure:
+
+```toml
+agentplane = { version = "0.1", features = ["opendal"] }
+```
+
+```rust
+use agentplane::blob::OpenDalBlobs;
+
+let op = opendal::Operator::new(opendal::services::S3::default().bucket("agent-blobs"))?;
+let blobs = OpenDalBlobs::new(op, "runs");
+```
+
+**The trap:** a reference that is not a digest. This is the
+[claim check](https://docs.temporal.io/external-storage) pattern every durable
+engine converges on, with one difference that carries the weight — because the
+address *is* the hash, the chain still commits to the exact bytes it does not
+contain. `get` re-hashes before returning, so a blob edited on disk is refused
+rather than served. A token pointing at mutable storage would move the
+tamper-evidence boundary without saying so, and the journal would still look
+sound.
+
+**What it does not solve:** retention. The chain proves a blob was not altered;
+it cannot conjure one somebody deleted. A missing blob reports `NotFound` — a
+configuration problem — rather than a corruption, precisely so the two are not
+confused when someone is paged.
 
 ---
 

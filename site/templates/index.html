@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="hero">
+  <p class="eyebrow">Durable execution · Deterministic replay · Policy-governed</p>
+  <h1>The journal <em>is</em> the plan of record.</h1>
+  <p class="lede">
+    An agent runtime in Rust where every outward call is written down before it
+    happens. Crash mid-run and resume from the last completed effect. Replay a
+    run and perform <em>nothing</em>. Prove afterwards what occurred — and that
+    the record was not edited.
+  </p>
+  <p class="cta">
+    <a class="btn primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+    <a class="btn" href="{{ config.extra.repo }}">View source</a>
+  </p>
+  <p class="fine">Pre-alpha · Rust 1.94+ · <code>#![forbid(unsafe_code)]</code> · MIT OR Apache-2.0</p>
+</section>
+
+<section class="problem">
+  <h2>What goes wrong without it</h2>
+  <ul class="pains">
+    <li>A 40-minute run dies at minute 38, and the retry re-issues every invoice.</li>
+    <li><em>“Why did the agent refund €4,200?”</em> has no answer, because the reasoning was a log line that scrolled away.</li>
+    <li>Untrusted tool output steers the next tool call.</li>
+    <li>A prompt change ships with no way to know what it broke.</li>
+  </ul>
+</section>
+
+<section class="pillars">
+  <h2>What it gives you</h2>
+  <div class="grid">
+    <article>
+      <h3>A journal you can audit</h3>
+      <p>Append-only and hash-chained, with per-record signatures naming the
+        workload that wrote them, and a per-plane Merkle log so deleting a whole
+        run is detectable.</p>
+    </article>
+    <article>
+      <h3>Durable execution</h3>
+      <p>Resume from the last completed effect. A suspended run costs a row on
+        disk, not a thread — so a plane can hold 10⁵ of them waiting for a human.</p>
+    </article>
+    <article>
+      <h3>Exactly-once, honestly</h3>
+      <p>Enforced by the store, not by a code path someone might forget. A call
+        whose outcome is unknown is never blindly retried and never quietly
+        unwound.</p>
+    </article>
+    <article>
+      <h3>Information-flow labels</h3>
+      <p><em>May this principal act</em> and <em>may this value go there</em> are
+        different questions. Untrusted data cannot reach a mutating sink without
+        a journaled declassification.</p>
+    </article>
+    <article>
+      <h3>Human oversight that binds</h3>
+      <p>Durable worklists with four-eyes, declared expiry behaviour, and an
+        operator who can <em>stop</em> a run and have it unwind.</p>
+    </article>
+    <article>
+      <h3>Cases, not long-lived workflows</h3>
+      <p>Runs stay minutes; business processes span months. A deploy never has to
+        migrate an in-flight workflow.</p>
+    </article>
+  </div>
+</section>
+
+<section class="proof">
+  <h2>Why you should believe any of it</h2>
+  <p class="lede">
+    Guarantees are only worth what their tests can falsify — so each one is
+    broken on purpose, and the test written for it must fail.
+  </p>
+  <dl class="stats">
+    <div><dt>6</dt><dd>TLA+ specifications, model-checked on every push</dd></div>
+    <div><dt>18</dt><dd>deliberately broken specs; each must trip its own invariant</dd></div>
+    <div><dt>106</dt><dd>code mutations, each naming the one test that must fail</dd></div>
+    <div><dt>0</dt><dd>unsafe blocks — <code>forbid(unsafe_code)</code></dd></div>
+  </dl>
+  <p class="fine">
+    This project shipped an unfalsifiable guarantee once: a refusal that was
+    implemented, tested and green, where deleting it would have failed no test.
+    It was found by accident. The sweep exists so the next one is not.
+  </p>
+</section>
+
+<section class="quickstart">
+  <h2>Thirty seconds</h2>
+
+  <pre class="code"><code><span class="c">[dependencies]</span>
+agentplane = "0.1"</code></pre>
+
+  <pre class="code"><code>let store: Arc&lt;dyn JournalStore&gt; = Arc::new(RedbStore::open_in_memory()?);
+
+let runtime = Runtime::builder(Arc::clone(&amp;store))
+    .owner("my-service")
+    .skill(Triage)
+    .build();
+
+let out = runtime.run("ticket.triage", json!({ "text": "printer on fire" })).await?;
+
+<span class="c">// Re-executes the logic and reads every effect back. Nothing is performed again.</span>
+let replayed = runtime.replay(out.run_id, Mode::Strict).await?;
+assert_eq!(out.output, replayed.output);</code></pre>
+
+  <p class="cta">
+    <a class="btn primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Read the guide</a>
+    <a class="btn" href="{{ get_url(path='@/docs/cookbook.md') }}">Cookbook</a>
+  </p>
+</section>
+
+<section class="honest">
+  <h2>What it is not</h2>
+  <table>
+    <thead><tr><th>agentplane does not</th><th>Use instead</th></tr></thead>
+    <tbody>
+      <tr><td>Ship a prompt library or IDE</td><td>Your manifests; agentplane hashes and versions them</td></tr>
+      <tr><td>Route or proxy model traffic</td><td>LiteLLM, Bifrost, your own <code>ModelProvider</code></td></tr>
+      <tr><td>Implement a vector database</td><td>LanceDB / pgvector behind a seam</td></tr>
+      <tr><td>Claim regulatory compliance</td><td>It provides technical means; compliance is the deployer's</td></tr>
+    </tbody>
+  </table>
+  <p class="fine">
+    <a href="{{ get_url(path='@/docs/status.md') }}">Status</a> lists what is built
+    and what is deliberately deferred, and
+    <a href="{{ get_url(path='@/docs/security.md') }}">the security model</a> is
+    explicit about what it does not cover.
+  </p>
+</section>
+
+{% endblock content %}

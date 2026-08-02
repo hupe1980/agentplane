@@ -383,12 +383,31 @@ impl Record {
     /// `prev_hash ‖ canonical(body)`. Because the hash chains, this signature
     /// transitively commits to every record before this one — so rewriting any
     /// part of the prefix invalidates every later signature, not just its own.
+    /// The largest a single journal record may be.
+    ///
+    /// Checked here because this is the one function every backend seals
+    /// through, so no store can be added that quietly skips it.
+    ///
+    /// A megabyte is generous for a record describing an effect and far too
+    /// small for an inlined image, which is the intent: media belongs outside a
+    /// chain that can never forget it. The number is in the same range the
+    /// field settled on — Temporal caps payloads at 2 MB and claim-checks above
+    /// 256 KiB — and is deliberately a hard refusal rather than a truncation,
+    /// because a silently shortened record is a journal that lies.
+    pub const MAX_RECORD_BYTES: usize = 1 << 20;
+
     pub fn seal_signed(
         body: RecordBody,
         prev_hash: Digest,
         signer: Option<&dyn Signer>,
     ) -> Result<Self, StoreError> {
         let raw = canon::to_bytes(&body)?;
+        if raw.len() > Self::MAX_RECORD_BYTES {
+            return Err(StoreError::RecordTooLarge {
+                bytes: raw.len(),
+                limit: Self::MAX_RECORD_BYTES,
+            });
+        }
         let hash = Digest::chain(prev_hash, &raw);
         Ok(Self {
             body,
@@ -630,6 +649,68 @@ mod tests {
             effect_key: None,
             kind,
         }
+    }
+
+    /// An oversized record is refused, not written.
+    ///
+    /// The journal is append-only and hash-chained, so a record that lands
+    /// cannot be pruned, rewritten, or skipped on read. Refusing at seal time is
+    /// the only moment the problem is still cheap — which is why every engine in
+    /// this field caps it rather than discovering it later as a store nobody can
+    /// read.
+    #[test]
+    fn a_record_larger_than_the_limit_is_refused() {
+        let huge = "x".repeat(Record::MAX_RECORD_BYTES + 1);
+        let sealed = Record::seal(
+            body(
+                1,
+                RecordKind::RunAdmitted {
+                    agent: huge,
+                    input: json!(null),
+                    policy: None,
+                },
+            ),
+            Digest::ZERO,
+        );
+        match sealed {
+            Err(StoreError::RecordTooLarge { bytes, limit }) => {
+                assert!(bytes > limit, "the error must report the real overage");
+                assert_eq!(limit, Record::MAX_RECORD_BYTES);
+            }
+            Err(other) => panic!("refused for the wrong reason: {other}"),
+            Ok(r) => panic!(
+                "a {}-byte record was accepted into an append-only chain",
+                r.raw().len()
+            ),
+        }
+    }
+
+    /// The limit does not bite ordinary records.
+    ///
+    /// Stated separately because a ceiling set too low is the same defect
+    /// wearing the opposite sign: it would refuse the work the plane exists to
+    /// do, and the test above would still pass.
+    #[test]
+    fn an_ordinary_record_is_nowhere_near_the_limit() {
+        let r = Record::seal(
+            body(
+                1,
+                RecordKind::RunAdmitted {
+                    agent: "auditor@2.0.0".into(),
+                    input: json!({ "ticket": "printer on fire" }),
+                    policy: None,
+                },
+            ),
+            Digest::ZERO,
+        )
+        .expect("an ordinary record seals");
+        assert!(
+            r.raw().len() * 100 < Record::MAX_RECORD_BYTES,
+            "an ordinary record is {} bytes against a {}-byte ceiling; the \
+             ceiling is too close to normal traffic to be a safety net",
+            r.raw().len(),
+            Record::MAX_RECORD_BYTES
+        );
     }
 
     fn chain_of(n: u64) -> Vec<Record> {

@@ -127,7 +127,7 @@ impl RedbStore {
     /// Create every table, so a read on a fresh database is not a missing-table
     /// error the read paths would each have to special-case.
     fn init(db: Database) -> Result<Self, StoreError> {
-        let w = db.begin_write().map_err(|e| be(&e))?;
+        let w = begin_write(&db)?;
         {
             w.open_table(JOURNAL).map_err(|e| be(&e))?;
             w.open_table(EFFECT_ONCE).map_err(|e| be(&e))?;
@@ -252,7 +252,7 @@ impl RedbStore {
     ) -> Result<(), StoreError> {
         let key = run.to_string();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut t = w.open_table(JOURNAL).map_err(|e| be(&e))?;
                 let existing = t
@@ -288,7 +288,7 @@ impl RedbStore {
     pub async fn delete_run_for_test(&self, run: RunId) -> Result<(), StoreError> {
         let key = run.to_string();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut j = w.open_table(JOURNAL).map_err(|e| be(&e))?;
                 let seqs: Vec<u64> = j
@@ -419,6 +419,25 @@ fn digest(bytes: &[u8]) -> Result<Digest, StoreError> {
     Ok(Digest::from_bytes(b))
 }
 
+/// Begin a write transaction with its durability stated rather than inherited.
+///
+/// redb already defaults to [`Durability::Immediate`] — a commit is persistent
+/// by the time it returns — which is exactly what the old backend spelled as
+/// `PRAGMA synchronous = FULL`. Stating it anyway, in one place every write path
+/// goes through, because "a committed record survives the process" is this
+/// crate's central promise and a promise resting on a dependency's default can
+/// be weakened by an upgrade with nothing here changing.
+///
+/// What this does *not* buy is a test: no suite here kills a process mid-commit,
+/// so a regression would not be caught. It is a belt on a guarantee the tests
+/// cannot reach, not a checked invariant.
+pub(super) fn begin_write(db: &Database) -> Result<redb::WriteTransaction, StoreError> {
+    let mut w = db.begin_write().map_err(|e| be(&e))?;
+    w.set_durability(redb::Durability::Immediate)
+        .map_err(|e| be(&e))?;
+    Ok(w)
+}
+
 pub(super) fn be<E: std::fmt::Display>(e: &E) -> StoreError {
     StoreError::Backend(e.to_string())
 }
@@ -476,7 +495,7 @@ impl JournalStore for RedbStore {
         let key = run.to_string();
 
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             let sealed = {
                 let mut journal = w.open_table(JOURNAL).map_err(|e| be(&e))?;
                 let mut once = w.open_table(EFFECT_ONCE).map_err(|e| be(&e))?;
@@ -581,7 +600,7 @@ impl JournalStore for RedbStore {
         let owner_out = owner.clone();
         let epoch = self
             .with_db(move |db| {
-                let w = db.begin_write().map_err(|e| be(&e))?;
+                let w = begin_write(db)?;
                 let epoch = {
                     let mut leases = w.open_table(RUN_LEASE).map_err(|e| be(&e))?;
                     let now = now_secs();
@@ -633,7 +652,7 @@ impl JournalStore for RedbStore {
         let key = run.to_string();
         let outcome = outcome.to_owned();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             let head_hash = {
                 {
                     let leases = w.open_table(RUN_LEASE).map_err(|e| be(&e))?;
@@ -742,7 +761,7 @@ impl JournalStore for RedbStore {
         let key = run.to_string();
         let (actor, reason) = (actor.to_owned(), reason.to_owned());
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             let first = {
                 let mut t = w.open_table(RUN_CANCEL).map_err(|e| be(&e))?;
                 // The first asker stays on the record; a retry must not rewrite

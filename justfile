@@ -118,6 +118,14 @@ mutants:
 mutants-auto file:
     cargo mutants --all-features -f {{file}} -j 4
 
+# build the docs site into site/public
+site:
+    cd site && zola build
+
+# serve the docs site locally with live reload
+site-serve:
+    cd site && zola serve
+
 # TLA+ model check, plus the spec mutants
 specs:
     ./spec/verify.sh

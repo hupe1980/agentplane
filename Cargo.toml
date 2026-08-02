@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.0.0"
+version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.94"
 license      = "MIT OR Apache-2.0"
@@ -27,13 +27,18 @@ categories   = ["asynchronous", "data-structures"]
 # Development infrastructure (`tests/`, `spec/`, `tools/`, `justfile`) is
 # deliberately not published — it is in the repository, and a consumer building
 # this crate has no use for the TLA+ specs or the mutation table.
+#
+# `docs/` is not published either, now that the guides have a home of their own
+# at hupe1980.github.io/agentplane. Shipping them here too would freeze a copy
+# inside every released version, and the README links out rather than inward so
+# the link works identically on crates.io, on GitHub, and from an unpacked
+# tarball.
 # Leading slashes anchor to the package root. Without them these are
 # gitignore-style globs matching *any* depth, which is how `spec/README.md`
 # arrived in the tarball behind a bare `README.md`.
 include = [
     "/src/**/*.rs",
     "/examples/*.rs",
-    "/docs/*.md",
     "/README.md",
     "/LICENSE-MIT",
     "/LICENSE-APACHE",
@@ -57,6 +62,14 @@ default = ["redb"]
 # Exactly-once is the table key rather than an index, so a duplicate effect
 # start is inexpressible rather than rejected.
 redb = ["dep:redb"]
+# Content-addressed blob storage on any backend OpenDAL reaches — filesystem,
+# S3, GCS, Azure. The other half of the journal's record-size limit: bytes too
+# big for the chain go here, and the chain commits to their digest.
+#
+# Deliberately *not* the journal's foundation: an object store has no ordered
+# scan, no multi-key transaction and no unique constraint, which is all the
+# journal needs and none of what a content-addressed write needs.
+opendal = ["dep:opendal"]
 # Fault injection and other harness pieces, for this crate's assurance layers
 # and for embedders testing their own stores and skills. Never in a production
 # build — nothing in `testkit` is reachable without it.
@@ -118,6 +131,10 @@ tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 tracing     = "0.1"
 redb        = { version = "3", optional = true }
+# `default-features = false`: the defaults pull in a long list of service
+# backends. An embedder picks the one they use; `services-fs` is the only one
+# that makes sense to assume.
+opendal     = { version = "0.58", default-features = false, features = ["services-fs"], optional = true }
 cedar-policy = { version = "4.12.0", default-features = false, optional = true }
 tokio-postgres = { version = "0.7.18", optional = true }
 deadpool-postgres = { version = "0.14.1", optional = true }

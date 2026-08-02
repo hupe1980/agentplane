@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <p class="eyebrow">404</p>
+  <h1>That page is not in the record.</h1>
+  <p class="lede">Which is at least consistent: this project's whole argument is
+    that if it was not written down, it did not happen.</p>
+  <p class="cta">
+    <a class="btn primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Getting started</a>
+    <a class="btn" href="{{ get_url(path='@/docs/_index.md') }}">All documentation</a>
+  </p>
+</section>
+{% endblock content %}

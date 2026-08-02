@@ -15,7 +15,7 @@ use crate::core::{
     Timestamp,
 };
 
-use super::redb::{MAX_STR, RedbStore, be};
+use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
 /// `event_id -> (kind, payload, received_at, claimed_by, claimed_at, has_claim,
 /// dead, dead_reason)`.
@@ -122,7 +122,7 @@ impl EventStore for RedbStore {
         let payload = serde_json::to_string(&event.payload)?;
         let keys = event.correlation.clone();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             let fresh = {
                 let mut ev = w.open_table(EVENTS).map_err(|e| be(&e))?;
                 if ev.get(id.as_str()).map_err(|e| be(&e))?.is_some() {
@@ -177,7 +177,7 @@ impl EventStore for RedbStore {
         let kind = sub.kind.clone();
         let keys = sub.correlation.clone();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut subs = w.open_table(SUBS).map_err(|e| be(&e))?;
                 let mut by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
@@ -238,7 +238,7 @@ impl EventStore for RedbStore {
         let kind = sub.kind.clone();
         let keys = sub.correlation.clone();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             let found = {
                 let by_key = w.open_table(EVENT_BY_KEY).map_err(|e| be(&e))?;
                 let mut events = w.open_table(EVENTS).map_err(|e| be(&e))?;
@@ -324,7 +324,7 @@ impl EventStore for RedbStore {
         let kind = event.kind.clone();
         let keys = event.correlation.clone();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             // One expression, no early returns: the tables below borrow `w`, and
             // redb's commit consumes it.
             let found = {
@@ -462,7 +462,7 @@ impl EventStore for RedbStore {
     async fn unsubscribe(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError> {
         let (run, effect) = (run.to_string(), effect.to_hex());
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut subs = w.open_table(SUBS).map_err(|e| be(&e))?;
                 let mut doomed = Vec::new();
@@ -521,7 +521,7 @@ impl EventStore for RedbStore {
         let cutoff = ts(older_than);
         let reason = reason.to_owned();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             let n = {
                 // A range over the live index, not a scan of every event ever
                 // received. `<=`, not `<`: a zero grace window must retire

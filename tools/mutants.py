@@ -554,6 +554,22 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                None if require_signature => {",
         "                None if false => {",
     ),
+    "BlobsAreServedUnverified": (
+        "src/blob/mod.rs",
+        "altered_bytes_are_detected_rather_than_served",
+        "storage is trusted, so bytes edited after the fact are served as the "
+        "ones the hash chain vouched for",
+        "    let actual = Digest::of(&bytes);\n    if actual == digest {",
+        "    let actual = Digest::of(&bytes);\n    if actual == actual {",
+    ),
+    "TheJournalTakesAnySizeRecord": (
+        "src/journal/record.rs",
+        "a_record_larger_than_the_limit_is_refused",
+        "an unbounded record is written into an append-only chain, where it "
+        "cannot be pruned, rewritten, or skipped on read",
+        "        if raw.len() > Self::MAX_RECORD_BYTES {",
+        "        if raw.len() > usize::MAX {",
+    ),
     "TheSweepForgetsToDeindexAClaim": (
         "src/store/redb_events.rs",
         "redb_satisfies_the_case_layer_contracts",

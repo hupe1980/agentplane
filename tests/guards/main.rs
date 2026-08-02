@@ -65,3 +65,4 @@ pub fn ambient_subscriber() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+mod blobs;

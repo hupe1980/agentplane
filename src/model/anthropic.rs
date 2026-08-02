@@ -321,19 +321,36 @@ impl ApiResponse {
 
 /// The prompt shape this driver accepts.
 ///
-/// Either a bare string, or the API's own `messages` array. Accepting both keeps
-/// the simple case simple without hiding the real shape from a caller who needs
-/// it — and the prompt is part of the effect key either way, so a changed prompt
-/// is a changed effect rather than a quietly different run.
+/// Either a bare string, the API's own `messages` array, or an object carrying
+/// `messages` beside a `system` instruction. Accepting all three keeps the
+/// simple case simple without hiding the real shape from a caller who needs it —
+/// and the prompt is part of the effect key either way, so a changed prompt is a
+/// changed effect rather than a quietly different run.
 fn messages(prompt: &Value) -> Value {
     match prompt {
         Value::String(s) => json!([{ "role": "user", "content": s }]),
         Value::Array(_) => prompt.clone(),
-        other => other
-            .get("messages")
-            .cloned()
-            .unwrap_or_else(|| json!([{ "role": "user", "content": other.to_string() }])),
+        other => other.get("messages").cloned().unwrap_or_else(|| {
+            // An object with no `messages` is content, not an envelope — except
+            // for `system`, which is an instruction *about* the content and
+            // would otherwise be shown to the model as part of the question.
+            let mut rest = other.clone();
+            if let Some(map) = rest.as_object_mut() {
+                map.remove("system");
+            }
+            json!([{ "role": "user", "content": rest.to_string() }])
+        }),
     }
+}
+
+/// The system instruction, if the caller set one.
+///
+/// Anthropic takes this as a **top-level parameter**, not a message role — it
+/// rejects `role: "system"` inside `messages`. So a system prompt could not be
+/// expressed through this driver at all until it was lifted out here, and one
+/// supplied in the obvious place was silently dropped.
+fn system(prompt: &Value) -> Option<Value> {
+    prompt.get("system").cloned().filter(|s| !s.is_null())
 }
 
 /// Turn an assembled answer into a [`Completion`], or say why it is not one.
@@ -408,6 +425,9 @@ impl Anthropic {
             "max_tokens": self.max_tokens,
             "messages": messages(prompt),
         });
+        if let Some(system) = system(prompt) {
+            body["system"] = system;
+        }
         if let Some(schema) = schema {
             match self.mode_for(model) {
                 // GA in 2026 as `output_config.format`, without the beta header
@@ -623,5 +643,98 @@ impl ModelProvider for Anthropic {
         } else {
             self.read_buffered(response, model, schema).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn driver() -> Anthropic {
+        Anthropic::new("test-key").expect("build the driver")
+    }
+
+    /// A system instruction has to leave as a top-level parameter.
+    ///
+    /// Anthropic rejects `role: "system"` inside `messages`, so this is the only
+    /// place it can go. It used to be dropped on the floor: the caller set it,
+    /// nothing complained, and the model was never told.
+    #[test]
+    fn a_system_instruction_rides_beside_the_messages() {
+        let body = driver().body(
+            &ModelId::new("anthropic", "claude-x"),
+            &json!({ "system": "answer only in French", "messages": [{"role": "user", "content": "hi"}] }),
+            None,
+        );
+        assert_eq!(
+            body["system"], "answer only in French",
+            "the system instruction must be a top-level parameter: {body}"
+        );
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": "hi" }]),
+            "it must not also be pushed into the conversation: {body}"
+        );
+    }
+
+    /// An instruction is not content.
+    ///
+    /// Without `messages` to key on, the object used to be stringified whole and
+    /// handed to the model as the user's question — so the caller's instruction
+    /// arrived as part of the thing being asked about.
+    #[test]
+    fn a_system_instruction_is_not_shown_as_the_question() {
+        let body = driver().body(
+            &ModelId::new("anthropic", "claude-x"),
+            &json!({ "system": "be terse", "ticket": "printer on fire" }),
+            None,
+        );
+        let asked = body["messages"][0]["content"].as_str().unwrap_or_default();
+        assert!(
+            !asked.contains("be terse"),
+            "the instruction leaked into the question: {asked}"
+        );
+        assert!(
+            asked.contains("printer on fire"),
+            "the actual content went missing: {asked}"
+        );
+    }
+
+    /// Image and document parts reach the wire unaltered.
+    ///
+    /// Multimodal content is not a separate feature here: a `messages` array is
+    /// passed through verbatim, so the provider's own content-block shapes work
+    /// without this crate modelling any of them. Worth a test anyway, because
+    /// "passes through untouched" is exactly the property a well-meaning
+    /// normalisation would break.
+    #[test]
+    fn a_multimodal_message_is_passed_through_verbatim() {
+        let parts = json!([{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is in this image?" },
+                { "type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=" } }
+            ]
+        }]);
+        let body = driver().body(
+            &ModelId::new("anthropic", "claude-x"),
+            &json!({ "messages": parts }),
+            None,
+        );
+        assert_eq!(
+            body["messages"], parts,
+            "content blocks must survive untouched: {body}"
+        );
+    }
+
+    /// No instruction, no key — an absent field is not an empty one.
+    #[test]
+    fn a_prompt_without_a_system_sends_no_system() {
+        let body = driver().body(&ModelId::new("anthropic", "claude-x"), &json!("hi"), None);
+        assert!(
+            body.get("system").is_none(),
+            "an unset instruction must not become an empty one: {body}"
+        );
     }
 }

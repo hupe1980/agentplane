@@ -6,7 +6,7 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 use crate::case::TimerStore;
 use crate::core::{CaseId, EffectKey, Phase, RunId, StoreError, Timer, Timestamp};
 
-use super::redb::{MAX_STR, RedbStore, be};
+use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
 /// `(run_id, effect_key) -> (case_id, has_case, step, phase, fire_at, claimed_at, has_claim)`.
 const TIMERS: TableDefinition<(&str, &str), (&str, u8, u32, &str, i64, i64, u8)> =
@@ -93,7 +93,7 @@ impl TimerStore for RedbStore {
         let phase = phase_str(timer.phase);
         let fire_at = timer.fire_at.unix_timestamp();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut t = w.open_table(TIMERS).map_err(|e| be(&e))?;
                 // First arming wins: re-arming must not move a timer somebody
@@ -122,7 +122,7 @@ impl TimerStore for RedbStore {
     async fn claim_due(&self, now: Timestamp, limit: usize) -> Result<Vec<Timer>, StoreError> {
         let cutoff = now.unix_timestamp();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             let out = {
                 // Selected and claimed in one transaction: a second sweeper
                 // reading concurrently finds nothing rather than a second copy
@@ -200,7 +200,7 @@ impl TimerStore for RedbStore {
     async fn disarm(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError> {
         let (run, effect) = (run.to_string(), effect.to_hex());
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut t = w.open_table(TIMERS).map_err(|e| be(&e))?;
                 if let Some(v) = t

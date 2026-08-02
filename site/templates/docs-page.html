@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="docs-layout">
+
+  <aside class="sidebar" aria-label="Documentation">
+    {% set docs = get_section(path="docs/_index.md") %}
+    <p class="side-title">Documentation</p>
+    <nav>
+      <ol>
+      {% for p in docs.pages %}
+        <li><a href="{{ p.permalink }}" {% if p.permalink == page.permalink %}aria-current="page"{% endif %}>{{ p.title }}</a></li>
+      {% endfor %}
+      </ol>
+    </nav>
+    <p class="side-title">Elsewhere</p>
+    <nav>
+      <ol>
+        <li><a href="{{ config.extra.docsrs }}">API reference</a></li>
+        <li><a href="{{ config.extra.repo }}">Source</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <article class="doc">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="{{ config.base_url }}/">agentplane</a> <span aria-hidden="true">/</span>
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a> <span aria-hidden="true">/</span>
+      <span aria-current="page">{{ page.title }}</span>
+    </nav>
+
+    <header>
+      <h1>{{ page.title }}</h1>
+      <p class="lede">{{ page.description }}</p>
+    </header>
+
+    {% if page.toc | length > 1 %}
+    <details class="toc" open>
+      <summary>On this page</summary>
+      <ol>
+        {% for h in page.toc %}
+        <li><a href="{{ h.permalink | safe }}">{{ h.title }}</a>
+          {% if h.children %}
+          <ol>{% for c in h.children %}<li><a href="{{ c.permalink | safe }}">{{ c.title }}</a></li>{% endfor %}</ol>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ol>
+    </details>
+    {% endif %}
+
+    {{ page.content | safe }}
+
+    <nav class="pager" aria-label="Documentation">
+      {%- if page.lower %}<a class="prev" href="{{ page.lower.permalink }}"><span>Previous</span>{{ page.lower.title }}</a>{% endif %}
+      {%- if page.higher %}<a class="next" href="{{ page.higher.permalink }}"><span>Next</span>{{ page.higher.title }}</a>{% endif %}
+    </nav>
+
+    <footer class="doc-foot">
+      <p><a href="{{ config.extra.repo }}/edit/main/site/content/{{ page.relative_path }}">Improve this page on GitHub</a></p>
+    </footer>
+  </article>
+</div>
+{% endblock content %}

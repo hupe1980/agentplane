@@ -1,4 +1,8 @@
-# ⚙️ Operations
++++
+title = "Operations"
+description = "Deploying, high availability, retention, observability, and a runbook for every state a run can get stuck in."
+weight = 6
++++
 
 Running this for real: topologies, the store contract, the background sweep,
 and what it reports about itself.
@@ -419,17 +423,29 @@ bare `dyn Fn` field in `src/runtime/`.
 
 ## 🗄️ Retention and erasure
 
-A full-fidelity journal is simultaneously an asset and a GDPR liability, so the
-two halves are retained differently:
+A full-fidelity journal is simultaneously an asset and a GDPR liability, and
+**this is currently your problem to solve, not the runtime's.**
 
-- **Hash chain and metadata: indefinite.** Small, and it preserves tamper
-  evidence.
-- **Blobs: a configurable TTL**, then a tombstone that keeps the hash and drops
-  the content.
+What exists today:
 
-The chain still verifies after expiry. You can prove *what happened* and *that
-the record is unaltered* without retaining the personal data — and the **case**
-is the erasure unit, because that is what an erasure request actually targets.
+- **The journal keeps everything, indefinitely.** It is append-only and
+  hash-chained: nothing in it can be edited or removed without invalidating
+  every record after it. That is the property Article 12 wants and precisely the
+  property an erasure request does not.
+- **A record over 1 MiB is refused** rather than written, so bulk content is
+  pushed out of the chain by construction. Bytes that big belong in the
+  content-addressed blob store, with only the digest journaled — see
+  [the cookbook](@/docs/cookbook.md). Deleting a blob is then a filesystem or bucket
+  operation, and the chain still verifies afterwards because it only ever
+  committed to the digest.
+
+**What is not built:** there is no TTL, no expiry tombstone, and no erasure unit.
+The design intent is that the *case* is what an erasure request targets and that
+blob content can lapse while the chain still proves what happened — but nothing
+implements it, so a deployment with erasure obligations needs its own retention
+policy over the blob store and its own answer for personal data that reached a
+journal record. [Regulation](@/docs/regulation.md) says the same thing in the
+obligations' own terms, and [status](@/docs/status.md) tracks it.
 
 ## 🚑 Runbook
 

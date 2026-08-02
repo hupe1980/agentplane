@@ -406,11 +406,27 @@ fn input(prompt: &Value) -> Value {
     match prompt {
         Value::String(s) => json!(s),
         Value::Array(_) => prompt.clone(),
-        other => other
-            .get("input")
-            .cloned()
-            .unwrap_or_else(|| json!(other.to_string())),
+        other => other.get("input").cloned().unwrap_or_else(|| {
+            // `system` is an instruction about the content, not content; leaving
+            // it in would show the caller's instruction to the model as part of
+            // the question it is answering.
+            let mut rest = other.clone();
+            if let Some(map) = rest.as_object_mut() {
+                map.remove("system");
+            }
+            json!(rest.to_string())
+        }),
     }
+}
+
+/// The system instruction, if the caller set one.
+///
+/// Spelled `system` by the caller and `instructions` on the wire, because that
+/// is what the Responses API calls it. One vocabulary across providers is the
+/// point of the seam: a prompt written once should not have to know which
+/// driver is linked.
+fn instructions(prompt: &Value) -> Option<Value> {
+    prompt.get("system").cloned().filter(|s| !s.is_null())
 }
 
 impl OpenAi {
@@ -426,6 +442,9 @@ impl OpenAi {
             "max_output_tokens": self.max_output_tokens,
             "input": input(prompt),
         });
+        if let Some(system) = instructions(prompt) {
+            body["instructions"] = system;
+        }
         if let Some(schema) = schema {
             Self::apply_schema(&mut body, schema, model, self.mode_for(model))?;
         }
@@ -660,5 +679,65 @@ impl ModelProvider for OpenAi {
         } else {
             self.read_buffered(response, model, schema).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn driver() -> OpenAi {
+        OpenAi::new("test-key").expect("build the driver")
+    }
+
+    /// The Responses API spells it `instructions`; the caller spells it `system`.
+    ///
+    /// One vocabulary across providers is the point of the seam — a prompt
+    /// written once should not have to know which driver is linked.
+    #[test]
+    fn a_system_instruction_becomes_the_instructions_field() {
+        let body = driver()
+            .body(
+                &ModelId::new("openai", "gpt-x"),
+                &json!({ "system": "answer only in French", "input": "hi" }),
+                None,
+            )
+            .expect("body");
+        assert_eq!(
+            body["instructions"], "answer only in French",
+            "the system instruction must become `instructions`: {body}"
+        );
+        assert_eq!(body["input"], "hi", "the question must survive: {body}");
+    }
+
+    #[test]
+    fn a_system_instruction_is_not_shown_as_the_question() {
+        let body = driver()
+            .body(
+                &ModelId::new("openai", "gpt-x"),
+                &json!({ "system": "be terse", "ticket": "printer on fire" }),
+                None,
+            )
+            .expect("body");
+        let asked = body["input"].as_str().unwrap_or_default();
+        assert!(
+            !asked.contains("be terse"),
+            "the instruction leaked into the question: {asked}"
+        );
+        assert!(
+            asked.contains("printer on fire"),
+            "the actual content went missing: {asked}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_without_a_system_sends_no_instructions() {
+        let body = driver()
+            .body(&ModelId::new("openai", "gpt-x"), &json!("hi"), None)
+            .expect("body");
+        assert!(
+            body.get("instructions").is_none(),
+            "an unset instruction must not become an empty one: {body}"
+        );
     }
 }

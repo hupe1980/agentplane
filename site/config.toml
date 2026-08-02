@@ -1,0 +1,45 @@
+# The site is built by one static binary, which is the same argument the runtime
+# makes about itself (P11). No Node toolchain, no node_modules, no hydration
+# model — the output is HTML and CSS, so "ships zero JavaScript" is not a
+# default that a future dependency can quietly take away.
+
+base_url = "https://hupe1980.github.io/agentplane"
+title = "agentplane"
+description = "A durable, replayable, policy-governed agent runtime in Rust. Crash mid-run and resume; replay a run exactly; prove afterwards what happened."
+default_language = "en"
+compile_sass = true
+minify_html = true
+# The index is 812 KB, so it is never part of a page load: `search.js` fetches
+# it on the first focus of the search box and not before. A page that is only
+# read still costs zero JavaScript; a page where somebody searches costs the
+# index once, cached thereafter.
+build_search_index = true
+generate_feeds = false
+
+taxonomies = []
+
+[markdown]
+smart_punctuation = true
+render_emoji = false
+external_links_target_blank = true
+bottom_footnotes = true
+
+[markdown.highlighting]
+# CSS classes rather than inline styles: one build serves both colour schemes,
+# and the palette becomes a stylesheet concern instead of a rebuild.
+style = "class"
+light_theme = "github-light"
+dark_theme = "github-dark"
+
+
+[search]
+include_title = true
+include_description = true
+include_path = true
+include_content = true
+
+[extra]
+repo = "https://github.com/hupe1980/agentplane"
+crate = "https://crates.io/crates/agentplane"
+docsrs = "https://docs.rs/agentplane"
+tagline = "The journal is the plan of record."

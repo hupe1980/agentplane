@@ -25,7 +25,7 @@ use crate::core::{
     StoreError, Timestamp,
 };
 
-use super::redb::{MAX_STR, RedbStore, be};
+use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
 /// `case_id -> (kind, status, state, version, opened_at)`.
 const CASES: TableDefinition<&str, (&str, &str, &str, u64, i64)> = TableDefinition::new("cases");
@@ -207,7 +207,7 @@ impl CaseStore for RedbStore {
         let keys = keys.to_vec();
         let id = CaseId::generate();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             // Computed inside a scope so every table borrow is released before
             // the commit below; redb takes the transaction by value.
             let outcome = {
@@ -333,7 +333,7 @@ impl CaseStore for RedbStore {
     async fn attach_run(&self, case: CaseId, run: RunId) -> Result<(), StoreError> {
         let (c, r) = (case.to_string(), run.to_string());
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut seen = w.open_table(CASE_RUN_SEEN).map_err(|e| be(&e))?;
                 if seen
@@ -371,7 +371,7 @@ impl CaseStore for RedbStore {
         let encoded = serde_json::to_string(&state)?;
         let next = expected.next();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             let result = {
                 let mut cases = w.open_table(CASES).map_err(|e| be(&e))?;
                 let current = cases.get(key.as_str()).map_err(|e| be(&e))?.map(|v| {
@@ -411,7 +411,7 @@ impl CaseStore for RedbStore {
     async fn set_status(&self, case: CaseId, status: CaseStatus) -> Result<(), StoreError> {
         let key = case.to_string();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut cases = w.open_table(CASES).map_err(|e| be(&e))?;
                 let Some(row) = cases.get(key.as_str()).map_err(|e| be(&e))?.map(|v| {
@@ -438,7 +438,7 @@ impl CaseStore for RedbStore {
     async fn close(&self, case: CaseId) -> Result<(), StoreError> {
         let key = case.to_string();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 // A case with an unmet obligation may not be closed — the check
                 // that stops a missed regulatory window disappearing behind a
@@ -522,7 +522,7 @@ impl CaseStore for RedbStore {
         let digest = deadline.calendar_digest.as_bytes().to_vec();
         let state = deadline.state.as_str();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut d = w.open_table(DEADLINES).map_err(|e| be(&e))?;
                 // First registration wins, as `ON CONFLICT DO NOTHING` did.
@@ -586,7 +586,7 @@ impl CaseStore for RedbStore {
         let (key, name) = (case.to_string(), name.to_owned());
         let to = state.as_str();
         self.with_db(move |db| {
-            let w = db.begin_write().map_err(|e| be(&e))?;
+            let w = begin_write(db)?;
             {
                 let mut d = w.open_table(DEADLINES).map_err(|e| be(&e))?;
                 let Some(row) = d

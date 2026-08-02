@@ -67,7 +67,8 @@ Two outcomes are errors rather than skips, and both mean the row is testing
 nothing: an anchor that no longer matches, and a mutation that does not compile.
 The mutation has to *remove the guarantee*, not break the file.
 
-**A doc update if you changed behaviour.** `docs/` is kept level with the code.
+**A doc update if you changed behaviour.** `site/content/docs/` is kept level
+with the code — it is the published documentation, not a copy of it.
 A design document that does not update on contact is decoration.
 
 ## 🚫 Things that will be pushed back on
@@ -97,14 +98,14 @@ fail quietly, it will be asked to fail loudly instead.
 
 | | |
 |---|---|
-| 🧠 | [Concepts](docs/concepts.md) — read this first; it is short |
-| 🏗️ | [Architecture](docs/architecture.md) — how each mechanism works |
-| 🔐 | [Security model](docs/security.md) — the trust boundary and its limits |
-| 📋 | [Status](docs/status.md) — what is built and what is not |
+| 🧠 | [Concepts](site/content/docs/concepts.md) — read this first; it is short |
+| 🏗️ | [Architecture](site/content/docs/architecture.md) — how each mechanism works |
+| 🔐 | [Security model](site/content/docs/security.md) — the trust boundary and its limits |
+| 📋 | [Status](site/content/docs/status.md) — what is built and what is not |
 
 The module layout, and the one discipline that matters (`core/` has zero I/O
 dependencies, enforced by a test), is in
-[architecture](docs/architecture.md#module-layout).
+[architecture](site/content/docs/architecture.md#module-layout).
 
 ## 🐛 Reporting something
 
@@ -113,7 +114,7 @@ mechanism does not do what the docs say. Include what you expected, from which
 document, and what happened. If a mutation survives that shouldn't, say which.
 
 **A security issue** should not go in a public issue. The threat model, including
-what is deliberately *not* covered, is in [security](docs/security.md#%EF%B8%8F-what-is-not-covered)
+what is deliberately *not* covered, is in [security](site/content/docs/security.md#%EF%B8%8F-what-is-not-covered)
 — please check there first, since several gaps are known and recorded rather than
 undiscovered.
 

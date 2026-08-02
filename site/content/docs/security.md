@@ -1,4 +1,8 @@
-# 🔐 Security model
++++
+title = "Security model"
+description = "The trust boundary, information-flow labels, delegation and egress — with an explicit account of what is not covered."
+weight = 5
++++
 
 What this runtime defends, how, and — the part most security documents omit —
 **what it does not cover**. The residual column in every table below is not
@@ -446,6 +450,27 @@ refusal is journaled as it happens and a ceiling applied afterwards bounds
 nothing an observer has not already seen.
 
 ## 🕳️ What is not covered
+
+**Two runs touching one external resource.** Exactly-once here means *one run
+performs one effect once* — enforced by the store's effect key, and by a lease
+epoch that fences a stale writer of the same run. It does **not** sequence two
+different runs that mutate the same account, meter or ledger row: nothing in
+this runtime models a resource, so nothing can say "this write must wait until
+the other run's conflicting work is exhausted".
+
+One open case per business key stops concurrent messages about one entity
+fragmenting across cases, and case state is versioned so a lost update is
+refused rather than dropped silently. Neither orders the *external* effects. If
+two of your runs can touch one resource at once, the callee needs to be
+idempotent — which is what `ToolSafety` and the reconciliation path assume.
+
+**Media the provider fetches for you.** A prompt may reference an image or a
+document by URL. That fetch is made by the model provider, from its network, so
+it does not pass this plane's egress allowlist and no journal record describes
+it — the plane cannot say where the bytes came from, because it never saw them
+being fetched. If where data may come from is part of your threat model, fetch it
+inside a skill, where it is an effect: governed, labelled, and recorded.
+
 
 Stated plainly, because a reader who assumes otherwise will size their risk
 wrongly:

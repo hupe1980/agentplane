@@ -1,4 +1,8 @@
-# 🧠 Concepts
++++
+title = "Concepts"
+description = "Runs and cases, effects and dispositions, labels and declassification — the vocabulary everything else is built from."
+weight = 2
++++
 
 The vocabulary. Eight ideas; everything else in the crate is a consequence of
 one of them. Read this once and the rest of the documentation stops needing
@@ -184,6 +188,6 @@ usually why.
 
 | | |
 |---|---|
-| 🏗️ | [Architecture](architecture.md) — how each of these is implemented |
-| 🍳 | [Cookbook](cookbook.md) — using them |
-| 🔐 | [Security model](security.md) — the trust boundary and its limits |
+| 🏗️ | [Architecture](@/docs/architecture.md) — how each of these is implemented |
+| 🍳 | [Cookbook](@/docs/cookbook.md) — using them |
+| 🔐 | [Security model](@/docs/security.md) — the trust boundary and its limits |
