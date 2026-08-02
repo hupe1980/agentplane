@@ -137,6 +137,43 @@ pub trait BlobStore: Send + Sync + Debug {
     async fn has(&self, digest: Digest) -> Result<bool, BlobError>;
 }
 
+/// Expire every blob a case produced.
+///
+/// The erasure unit, because a case is what a request actually names — nobody
+/// asks to forget a digest. Each blob is tombstoned with the same reason, so a
+/// later read says *expired, on this date, for this reason* rather than
+/// *missing*, and the journal still proves what happened.
+///
+/// Returns how many blobs were expired. Zero is an ordinary answer: a case that
+/// stored nothing has nothing to forget, and reporting that as an error would
+/// make the caller special-case the common path.
+///
+/// What this does **not** touch is the journal. Records are append-only by
+/// design, so personal data written into one cannot be removed — keep it out of
+/// records rather than expecting erasure to reach it.
+///
+/// # Errors
+///
+/// If the case's blob list cannot be read, or a blob cannot be expired.
+pub async fn erase_case(
+    blobs: &dyn BlobStore,
+    cases: &dyn crate::case::CaseStore,
+    case: crate::core::CaseId,
+    at: crate::core::Timestamp,
+    reason: &str,
+) -> Result<usize, BlobError> {
+    let digests = cases
+        .blobs_of(case)
+        .await
+        .map_err(|e| BlobError::Backend(e.to_string()))?;
+    let mut n = 0;
+    for digest in digests {
+        blobs.expire(digest, at, reason).await?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Check fetched bytes against the address they came from.
 ///
 /// Shared by every backend so the verification cannot be implemented slightly

@@ -173,12 +173,26 @@ rather than served. A token pointing at mutable storage would move the
 tamper-evidence boundary without saying so, and the journal would still look
 sound.
 
-**Erasing one later.** When a data-subject request arrives, drop the bytes and
-leave a record that you did:
+**Store through the context, not the store.** `cx.store_blob` records which case
+the bytes belong to — a digest cannot be reversed later to find that out, so the
+association has to be made now or never:
 
 ```rust
-blobs.expire(digest, cx.now().await?, "art-17 erasure request").await?;
+let digest = cx.store_blob(&image_bytes).await?;   // linked to this case
 ```
+
+**Erasing later.** A request names a person, which resolves to a case — never to
+a digest. So erase by case:
+
+```rust
+use agentplane::blob::erase_case;
+
+let n = erase_case(blobs.as_ref(), cases.as_ref(), case, now, "art-17 request").await?;
+```
+
+Every blob that case produced is tombstoned; other cases are untouched, even
+ones holding identical bytes. For a single artifact, `blobs.expire(digest, …)`
+does the same for one address.
 
 The chain still verifies — it committed to the digest, not the content — so you
 keep the proof of what happened without keeping the data. A read afterwards

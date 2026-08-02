@@ -132,6 +132,7 @@ pub struct Runtime {
     events: Option<Arc<dyn EventStore>>,
     tasks: Option<Arc<dyn TaskStore>>,
     timers: Option<Arc<dyn TimerStore>>,
+    blobs: Option<Arc<dyn crate::blob::BlobStore>>,
     batches: Option<Arc<dyn crate::batch::BatchStore>>,
     policy: Option<Arc<dyn crate::core::PolicyEngine>>,
     identity: Option<crate::core::Delegation>,
@@ -153,6 +154,7 @@ impl Runtime {
             events: None,
             tasks: None,
             timers: None,
+            blobs: None,
             batches: None,
             policy: None,
             identity: None,
@@ -177,6 +179,12 @@ impl Runtime {
     #[must_use]
     pub fn events(&self) -> Option<&Arc<dyn EventStore>> {
         self.events.as_ref()
+    }
+
+    /// The timer store, if this runtime has one.
+    #[must_use]
+    pub fn blobs(&self) -> Option<&Arc<dyn crate::blob::BlobStore>> {
+        self.blobs.as_ref()
     }
 
     /// The timer store, if this runtime has one.
@@ -1540,6 +1548,7 @@ impl Runtime {
                 mode: cx.mode,
                 case: cx.case.clone(),
                 timers: self.timers.clone(),
+                blobs: self.blobs.clone(),
                 ledger: Arc::clone(cx.ledger),
                 policy: self.policy.clone(),
                 identity: self.identity.clone(),
@@ -1738,6 +1747,7 @@ impl Runtime {
                 mode,
                 case,
                 timers: self.timers.clone(),
+                blobs: self.blobs.clone(),
                 ledger: Arc::clone(ledger),
                 policy: self.policy.clone(),
                 identity: self.identity.clone(),
@@ -2364,6 +2374,7 @@ pub struct RuntimeBuilder {
     events: Option<Arc<dyn EventStore>>,
     tasks: Option<Arc<dyn TaskStore>>,
     timers: Option<Arc<dyn TimerStore>>,
+    blobs: Option<Arc<dyn crate::blob::BlobStore>>,
     batches: Option<Arc<dyn crate::batch::BatchStore>>,
     policy: Option<Arc<dyn crate::core::PolicyEngine>>,
     identity: Option<crate::core::Delegation>,
@@ -2457,6 +2468,18 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Supply content-addressed blob storage.
+    ///
+    /// Needed by `StepCtx::store_blob`, which is how bytes too large for a
+    /// journal record get somewhere durable while the chain keeps only their
+    /// digest. A runtime without one refuses rather than silently inlining
+    /// megabytes into an append-only chain that can never take them back.
+    #[must_use]
+    pub fn blobs(mut self, blobs: Arc<dyn crate::blob::BlobStore>) -> Self {
+        self.blobs = Some(blobs);
+        self
+    }
+
     /// Supply the store that tracks batch items.
     ///
     /// Only needed for [`Runtime::run_batch`]; a plane that runs no batches does
@@ -2534,6 +2557,7 @@ impl RuntimeBuilder {
             events: self.events,
             tasks: self.tasks,
             timers: self.timers,
+            blobs: self.blobs,
             batches: self.batches,
             policy: self.policy,
             identity: self.identity,

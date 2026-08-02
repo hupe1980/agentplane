@@ -71,6 +71,18 @@ CREATE TABLE IF NOT EXISTS case_runs (
     PRIMARY KEY (case_id, run_id)
 );
 
+-- The blobs a case produced. The case is what an erasure request names, and a
+-- digest cannot be reversed to find its case, so the link has to be recorded
+-- when the bytes are written or it cannot be recovered at all.
+CREATE TABLE IF NOT EXISTS case_blobs (
+    case_id    TEXT   NOT NULL REFERENCES cases (case_id) ON DELETE CASCADE,
+    digest     BYTEA  NOT NULL,
+    written_at BIGINT NOT NULL,
+    PRIMARY KEY (case_id, digest)
+);
+
+CREATE INDEX IF NOT EXISTS case_blobs_time ON case_blobs (case_id, written_at);
+
 CREATE TABLE IF NOT EXISTS case_deadlines (
     case_id         TEXT   NOT NULL REFERENCES cases (case_id) ON DELETE CASCADE,
     name            TEXT   NOT NULL,
@@ -413,6 +425,53 @@ impl CaseStore for PostgresStore {
             .await
             .map_err(|e| be(&e))?;
         Ok(())
+    }
+
+    async fn link_blob(
+        &self,
+        case: CaseId,
+        digest: Digest,
+        at: Timestamp,
+    ) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // The primary key makes re-linking the same bytes the same record:
+        // two runs on one case writing identical content land on one digest by
+        // construction, and that is one artifact.
+        client
+            .execute(
+                "INSERT INTO case_blobs (case_id, digest, written_at)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (case_id, digest) DO NOTHING",
+                &[
+                    &case.to_string(),
+                    &digest.as_bytes().as_slice(),
+                    &at.unix_timestamp(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn blobs_of(&self, case: CaseId) -> Result<Vec<Digest>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT digest FROM case_blobs WHERE case_id = $1 ORDER BY written_at, digest",
+                &[&case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let raw: Vec<u8> = row.get(0);
+            let bytes: [u8; 32] = raw.try_into().map_err(|_| StoreError::Corrupt {
+                seq: 0,
+                detail: "a linked blob digest is not 32 bytes".into(),
+            })?;
+            out.push(Digest::from_bytes(bytes));
+        }
+        Ok(out)
     }
 
     async fn put_state(

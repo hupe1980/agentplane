@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::core::{
-    Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineState, RunId,
+    Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineState, Digest, RunId,
     StoreError, Timestamp,
 };
 
@@ -75,6 +75,35 @@ pub trait CaseStore: Send + Sync + Debug {
 
     /// Record that a run touched this case.
     async fn attach_run(&self, case: CaseId, run: RunId) -> Result<(), StoreError>;
+
+    /// Record that a case produced a blob.
+    ///
+    /// The case is what an erasure request actually names — nobody asks to
+    /// forget a digest — so something has to know which bytes belong to which
+    /// matter. That association cannot live in the blob store, which is
+    /// content-addressed on purpose and has no idea what a case is, and it
+    /// cannot be recomputed later: a digest is deliberately not reversible.
+    ///
+    /// Recording the same blob twice is the same record. Two runs on one case
+    /// storing identical bytes land on one digest by construction, and that is
+    /// one artifact, not two.
+    ///
+    /// # Errors
+    ///
+    /// If the store rejects the write.
+    async fn link_blob(
+        &self,
+        case: CaseId,
+        digest: Digest,
+        at: Timestamp,
+    ) -> Result<(), StoreError>;
+
+    /// Every blob this case produced, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be read.
+    async fn blobs_of(&self, case: CaseId) -> Result<Vec<Digest>, StoreError>;
 
     /// Replace the case's opaque state.
     /// Replace a case's state, if it is still at `expected`.

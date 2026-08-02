@@ -96,9 +96,15 @@ because it only ever committed to the digest. So you can prove *what happened*
 and *that the record is unaltered* without retaining the personal data — which
 is what makes Art. 26 and Art. 17 compatible rather than opposed.
 
-**What is still missing:** a scheduled TTL, and an erasure *unit*. You expire per
-digest, so mapping a data-subject request onto the right set of digests is your
-bookkeeping. And personal data that reached a journal **record** rather than a
+**Erasure is answered by case**, which is the unit a request actually names.
+`erase_case` tombstones every blob that case produced and leaves other cases
+alone. Bytes are linked to their case when written, through `cx.store_blob`,
+because a digest cannot be reversed afterwards to discover what matter it
+belonged to.
+
+**What is still missing:** a scheduled TTL — object-store lifecycle rules do
+age-based expiry better than a sweeper could, at the cost of deleting rather
+than tombstoning. And personal data that reached a journal **record** rather than a
 blob cannot be removed at all — the chain is append-only by design. Keep it out
 of records; the 1 MiB ceiling pushes bulk content out by construction, but a
 short string still fits.

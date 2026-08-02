@@ -473,10 +473,26 @@ knows why" is gone. So use lifecycle rules for bulk age-based expiry where that
 distinction does not matter, and call `expire` explicitly for erasure requests,
 where being able to say *when and why* is the entire point.
 
-**What is still not built** is the erasure *unit* — you call `expire` per digest,
-so mapping "erase everything for this data subject" onto a set of digests is your
-bookkeeping. The design intent is that the *case* is that unit, which needs an
-index from case to the digests it produced; that index does not exist yet. Personal data that
+**The erasure unit is the case**, which is the only unit anybody actually names —
+nobody asks to forget a digest. Write bytes through `cx.store_blob`, which
+records the link at the one moment it is knowable (a digest cannot be reversed to
+find its case), and answer a request with one call:
+
+```rust
+let n = agentplane::blob::erase_case(
+    blobs.as_ref(), cases.as_ref(), case, now, "art-17 request",
+).await?;
+```
+
+Every blob that case produced is tombstoned with the same reason. Other cases
+are untouched — including ones that stored *identical bytes*, which land on the
+same digest by construction, so the link is what scopes the erasure rather than
+the content.
+
+**What still cannot be erased** is anything written into a journal *record*. The
+chain is append-only by design; keep personal data out of records rather than
+expecting erasure to reach it. The 1 MiB refusal pushes bulk content out by
+construction, but a short string still fits. Personal data that
 reached a journal *record* rather than a blob also cannot be removed: the chain
 is append-only, which is the point. Keep it out of records — the 1 MiB refusal
 pushes bulk content out by construction, but a short string still fits.

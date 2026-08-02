@@ -110,6 +110,7 @@ pub(crate) struct Frame {
     /// it — including a retry backing off past the point where holding a worker
     /// is reasonable.
     pub timers: Option<Arc<dyn TimerStore>>,
+    pub blobs: Option<Arc<dyn crate::blob::BlobStore>>,
     pub ledger: Arc<Mutex<Ledger>>,
     /// The authorization engine, if this plane has one.
     ///
@@ -143,6 +144,7 @@ pub struct StepCtx<'a> {
     rng: ChaCha8Rng,
     case: Option<CaseContext>,
     timers: Option<Arc<dyn TimerStore>>,
+    blobs: Option<Arc<dyn crate::blob::BlobStore>>,
     /// The run's budget. Shared because it spans steps; a step never gets its
     /// own allowance to blow.
     ledger: Arc<Mutex<Ledger>>,
@@ -162,6 +164,7 @@ impl<'a> StepCtx<'a> {
             mode,
             case,
             timers,
+            blobs,
             ledger,
             policy,
             identity,
@@ -180,6 +183,7 @@ impl<'a> StepCtx<'a> {
             rng: seeded_rng(run, step),
             case,
             timers,
+            blobs,
             ledger,
             policy,
             identity,
@@ -1345,6 +1349,45 @@ impl StepCtx<'_> {
     /// # Errors
     ///
     /// [`StepError`] if this run has no case, or the read fails.
+    /// Store bytes in the blob store and record that this case produced them.
+    ///
+    /// The reason this lives on the context rather than on the blob store: the
+    /// runtime knows which case is running and the blob store deliberately does
+    /// not — it is content-addressed, and a digest cannot be reversed to find
+    /// the matter it belonged to. Writing through here means the association is
+    /// made at the only moment it is knowable, so an erasure request can later
+    /// be answered by case, which is the only unit anybody actually asks about.
+    ///
+    /// Deliberately **not** a journaled effect. The digest is a pure function of
+    /// the bytes, so a replay that re-derives it gets the same answer without
+    /// re-performing anything, and writing content-addressed bytes twice is the
+    /// same write. What *is* journaled is whatever the skill does with the
+    /// digest next — a tool call carrying it, a case-state write recording it.
+    ///
+    /// # Errors
+    ///
+    /// If no blob store is configured, if the write fails, or if this step is
+    /// not running inside a case.
+    pub async fn store_blob(&mut self, bytes: &[u8]) -> Result<crate::core::Digest, StepError> {
+        let cx = self.case_ctx()?.clone();
+        let blobs = self.blobs.clone().ok_or_else(|| {
+            StepError::Store(crate::core::StoreError::Backend(
+                "no blob store is configured; `Runtime::builder(..).blobs(..)`                  is what lets bytes live outside the journal"
+                    .into(),
+            ))
+        })?;
+        let digest = blobs
+            .put(bytes)
+            .await
+            .map_err(|e| StepError::Store(crate::core::StoreError::Backend(e.to_string())))?;
+        let at = self.now().await?;
+        cx.cases
+            .link_blob(cx.case_id, digest, at)
+            .await
+            .map_err(StepError::Store)?;
+        Ok(digest)
+    }
+
     pub async fn case_state(&mut self) -> Result<(Tainted<Value>, CaseVersion), StepError> {
         let cx = self.case_ctx()?.clone();
         let snapshot = self

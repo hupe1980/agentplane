@@ -115,7 +115,7 @@ because a spec whose invariants cannot be violated proves nothing, each is
 re-checked against 18 deliberately broken copies of itself; every mutant must be
 caught by the *specific* invariant written for it.
 
-**🧬 Mutation testing over the code.** 109 guarantees are broken on purpose, and
+**🧬 Mutation testing over the code.** 110 guarantees are broken on purpose, and
 the test *named for each one* must fail. A mutation caught by some other test is
 reported **weak**, not passing — that usually means the guarantee has no test of
 its own and is being held up by one that could be rewritten without anyone

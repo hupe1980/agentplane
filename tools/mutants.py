@@ -570,6 +570,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                if !merkle::verify_consistency(old, &old_root, new, &checkpoint.root, proof) {",
         "                if false {",
     ),
+    "ErasureIsNotScopedToTheCase": (
+        "src/store/redb_cases.rs",
+        "erasing_a_case_leaves_other_cases_alone",
+        "a case's blob list returns every case's blobs, so answering one erasure "
+        "request destroys unrelated subjects' data",
+        "                    (key.as_str(), i64::MIN, [].as_slice())\n                        ..=(key.as_str(), i64::MAX, [0xffu8; 32].as_slice()),",
+        "                    (\"\", i64::MIN, [].as_slice())\n                        ..=(MAX_STR, i64::MAX, [0xffu8; 32].as_slice()),",
+    ),
     "ErasureLooksLikeDataLoss": (
         "src/blob/memory.rs",
         "an_expired_blob_is_not_reported_as_missing",

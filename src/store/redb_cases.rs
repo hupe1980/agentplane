@@ -36,6 +36,14 @@ const CORR_OPEN: TableDefinition<(&str, &str), &str> = TableDefinition::new("cas
 /// `(case_id, namespace, value) -> ()`, every key a case ever claimed.
 const CORR_ALL: TableDefinition<(&str, &str, &str), ()> = TableDefinition::new("case_corr_all");
 
+/// `(case_id, written_at, digest) -> ()`, the blobs a case produced.
+///
+/// Keyed by time so erasure walks a case's artifacts in the order they were
+/// created, and so the key is unique even when one case stores identical bytes
+/// at two different moments — the digest alone would collide, which is correct
+/// for storage and wrong for an index that has to enumerate.
+const CASE_BLOBS: TableDefinition<(&str, i64, &[u8]), ()> = TableDefinition::new("case_blobs");
+
 /// `(case_id, seq) -> run_id`, in attachment order.
 const CASE_RUNS: TableDefinition<(&str, u64), &str> = TableDefinition::new("case_runs");
 
@@ -160,6 +168,7 @@ pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError
     w.open_table(CORR_OPEN).map_err(|e| be(&e))?;
     w.open_table(CORR_ALL).map_err(|e| be(&e))?;
     w.open_table(CASE_RUNS).map_err(|e| be(&e))?;
+    w.open_table(CASE_BLOBS).map_err(|e| be(&e))?;
     w.open_table(CASE_RUN_SEEN).map_err(|e| be(&e))?;
     w.open_table(DEADLINES).map_err(|e| be(&e))?;
     w.open_table(DEADLINES_DUE).map_err(|e| be(&e))?;
@@ -351,6 +360,58 @@ impl CaseStore for RedbStore {
             }
             w.commit().map_err(|e| be(&e))?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn link_blob(
+        &self,
+        case: CaseId,
+        digest: Digest,
+        at: Timestamp,
+    ) -> Result<(), StoreError> {
+        let key = case.to_string();
+        let bytes = digest.as_bytes().to_vec();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            {
+                w.open_table(CASE_BLOBS)
+                    .map_err(|e| be(&e))?
+                    .insert((key.as_str(), ts(at), bytes.as_slice()), ())
+                    .map_err(|e| be(&e))?;
+            }
+            w.commit().map_err(|e| be(&e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn blobs_of(&self, case: CaseId) -> Result<Vec<Digest>, StoreError> {
+        let key = case.to_string();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let t = r.open_table(CASE_BLOBS).map_err(|e| be(&e))?;
+            let mut out = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            for e in t
+                .range(
+                    (key.as_str(), i64::MIN, [].as_slice())
+                        ..=(key.as_str(), i64::MAX, [0xffu8; 32].as_slice()),
+                )
+                .map_err(|e| be(&e))?
+            {
+                let (k, _) = e.map_err(|e| be(&e))?;
+                let raw: [u8; 32] = k.value().2.try_into().map_err(|_| StoreError::Corrupt {
+                    seq: 0,
+                    detail: "a linked blob digest is not 32 bytes".into(),
+                })?;
+                // The same bytes stored twice are one artifact; erasing it twice
+                // would report a second expiry that never happened.
+                if seen.insert(raw) {
+                    out.push(Digest::from_bytes(raw));
+                }
+            }
+            Ok(out)
         })
         .await
     }

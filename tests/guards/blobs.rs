@@ -191,3 +191,103 @@ async fn a_repeated_expiry_keeps_the_first_tombstone() {
         }
     }
 }
+
+/// **Erasure is scoped to the case, which is the only unit anyone asks about.**
+///
+/// Nobody requests that a digest be forgotten; they name a person, and that
+/// resolves to a matter. So the link from case to bytes has to be recorded when
+/// the bytes are written — a digest cannot be reversed to find its case, and
+/// nothing can reconstruct it afterwards.
+///
+/// The second case is the point of the test: erasing one matter must not touch
+/// another's, and a scope bug would be invisible in a fixture with only one.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn erasing_a_case_leaves_other_cases_alone() {
+    use agentplane::blob::erase_case;
+    use agentplane::case::CaseStore;
+    use agentplane::core::CorrelationKey;
+    use agentplane::store::RedbStore;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let cases: Arc<dyn CaseStore> = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let blobs = MemoryBlobs::new();
+
+    let mine = cases
+        .correlate_or_open("matter", &[CorrelationKey::new("ns", "SUBJECT-1")], ts(10))
+        .await
+        .expect("open")
+        .case_id();
+    let theirs = cases
+        .correlate_or_open("matter", &[CorrelationKey::new("ns", "SUBJECT-2")], ts(10))
+        .await
+        .expect("open")
+        .case_id();
+
+    let a = blobs
+        .put("subject one, document a".as_bytes())
+        .await
+        .expect("put");
+    let b = blobs
+        .put("subject one, document b".as_bytes())
+        .await
+        .expect("put");
+    let other = blobs
+        .put("subject two, untouched".as_bytes())
+        .await
+        .expect("put");
+    cases.link_blob(mine, a, ts(11)).await.expect("link");
+    cases.link_blob(mine, b, ts(12)).await.expect("link");
+    cases.link_blob(theirs, other, ts(11)).await.expect("link");
+
+    let n = erase_case(&blobs, cases.as_ref(), mine, ts(500), "art-17 request")
+        .await
+        .expect("erase");
+    assert_eq!(n, 2, "both of this case's blobs should have been expired");
+
+    for (label, digest) in [("a", a), ("b", b)] {
+        match blobs.get(digest).await {
+            Err(BlobError::Expired { reason, at, .. }) => {
+                assert_eq!(at, 500);
+                assert!(reason.contains("art-17"), "blob {label} lost its reason");
+            }
+            other => panic!("blob {label} was not expired: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        blobs.get(other).await.expect("the other case is untouched"),
+        "subject two, untouched".as_bytes(),
+        "erasing one case reached into another"
+    );
+}
+
+/// Re-linking the same bytes is one artifact, not two.
+///
+/// Two runs on one case storing identical content land on one digest by
+/// construction. Counting it twice would report an erasure that did not happen.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn one_case_storing_the_same_bytes_twice_has_one_blob() {
+    use agentplane::case::CaseStore;
+    use agentplane::core::CorrelationKey;
+    use agentplane::store::RedbStore;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let cases: Arc<dyn CaseStore> = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let case = cases
+        .correlate_or_open("matter", &[CorrelationKey::new("ns", "DUP")], ts(10))
+        .await
+        .expect("open")
+        .case_id();
+
+    let d = Digest::of(b"the same bytes");
+    cases.link_blob(case, d, ts(11)).await.expect("link");
+    cases.link_blob(case, d, ts(99)).await.expect("link again");
+
+    assert_eq!(
+        cases.blobs_of(case).await.expect("read").len(),
+        1,
+        "the same content linked twice was counted as two artifacts"
+    );
+}
