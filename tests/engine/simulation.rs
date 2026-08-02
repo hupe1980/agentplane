@@ -50,7 +50,7 @@
 //! Each is caught, by the named assertion, at the first crash point where
 //! replay carries any information.
 
-#![cfg(all(feature = "turso", feature = "testkit"))]
+#![cfg(all(feature = "redb", feature = "testkit"))]
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,7 +62,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{Append, JournalStore, Record, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use agentplane::testkit::assert_replay_was_not_backstopped;
 use serde_json::{Value, json};
 
@@ -144,7 +144,7 @@ impl Skill for Touch {
     }
 }
 
-fn runtime(store: &Arc<TursoStore>, world: &World, failing: Option<&'static str>) -> Runtime {
+fn runtime(store: &Arc<RedbStore>, world: &World, failing: Option<&'static str>) -> Runtime {
     let mut b = Runtime::builder(store.clone() as Arc<dyn JournalStore>).owner("sim");
     for name in ["a", "b", "c"] {
         b = b.skill(Touch {
@@ -171,8 +171,8 @@ fn chain() -> PlanIR {
 /// A crash truncates an append-only log, so a prefix *is* a crash. Replaying the
 /// records through `append` re-forms the chain exactly as the original run did,
 /// which is also a check on the chain being a pure function of its contents.
-async fn crash_at(records: &[Record], n: usize, run: RunId) -> Arc<TursoStore> {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+async fn crash_at(records: &[Record], n: usize, run: RunId) -> Arc<RedbStore> {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let lease = store
         .acquire(run, "sim", std::time::Duration::from_mins(5))
         .await
@@ -220,7 +220,7 @@ fn already_done(prefix: &[Record]) -> BTreeSet<String> {
 /// The sweep. `failing` names a step that refuses after mutating, which drives
 /// the run into an unwind so compensation is explored too.
 async fn sweep(failing: Option<&'static str>) {
-    let origin = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let origin = Arc::new(RedbStore::open_in_memory().unwrap());
     let world = Arc::new(Mutex::new(Vec::new()));
     let rt = runtime(&origin, &world, failing);
 

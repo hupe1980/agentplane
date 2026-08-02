@@ -72,26 +72,26 @@ test-postgres:
 
 # real MCP round trips against an in-process server
 test-mcp:
-    cargo test --features mcp,turso,testkit --test wire mcp::
+    cargo test --features mcp,redb,testkit --test wire mcp::
 
 # the operator surface, with only its own features on
 test-http:
-    cargo test --features http,turso --test wire api::
+    cargo test --features http,redb --test wire api::
 
 # signed journals, including a wholesale rewrite
 test-attestation:
-    cargo test --features signing,turso --test trust attestation::
+    cargo test --features signing,redb --test trust attestation::
 
 # A2A and model-driver failure mappings
 test-drivers:
-    cargo test --features a2a,providers,http,turso,testkit --test wire drivers::
+    cargo test --features a2a,providers,http,redb,testkit --test wire drivers::
 
 # run every example end to end
 examples:
     cargo run --example durable_pipeline
     cargo run --example clearing_case
     cargo run --example plan_graph
-    cargo run --example model_run --features turso,testkit
+    cargo run --example model_run --features redb,testkit
 
 # build the rustdoc a reader would land on
 docs:

@@ -7,7 +7,7 @@
 // These exercise the runtime end to end, which needs a store. Gated so
 // `--no-default-features` still builds and tests cleanly: an embedder who
 // brings their own backend must not be forced to compile SQLite.
-#![cfg(feature = "turso")]
+#![cfg(feature = "redb")]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,7 +16,7 @@ use agentplane::core::{Outcome, Skill, SkillDescriptor, Tainted};
 use agentplane::journal::JournalStore;
 use agentplane::runtime::effects::Recorded;
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 /// A fixed three-stage pipeline that can be made to die partway through.
@@ -95,7 +95,7 @@ fn tally() -> Arc<[AtomicUsize; 4]> {
 /// resume. Stages 1 and 2 are performed exactly once, on the resume.
 #[tokio::test]
 async fn a_resumed_run_continues_instead_of_restarting() {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let crash_at = Arc::new(AtomicUsize::new(0));
     let calls = tally();
 
@@ -133,7 +133,7 @@ async fn a_resumed_run_continues_instead_of_restarting() {
 /// Resuming extends the same chain rather than starting a new history.
 #[tokio::test]
 async fn a_resumed_run_extends_the_existing_chain() {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let crash_at = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store.clone())
         .skill(pipeline(&crash_at, &tally()))
@@ -157,7 +157,7 @@ async fn a_resumed_run_extends_the_existing_chain() {
 /// performs only what is genuinely outstanding.
 #[tokio::test]
 async fn resuming_is_idempotent() {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let crash_at = Arc::new(AtomicUsize::new(1));
     let calls = tally();
     let rt = Runtime::builder(store.clone())
@@ -223,7 +223,7 @@ async fn resume_handles_a_crash_before_a_trailing_effect() {
         }
     }
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let crash_at = Arc::new(AtomicUsize::new(1));
     let calls = tally();
     let rt = Runtime::builder(store.clone())
@@ -274,7 +274,7 @@ impl Skill for Rewritten {
 /// A journal from a *different program* is divergence, not something to resume.
 #[tokio::test]
 async fn resume_refuses_a_journal_written_by_different_code() {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let crash_at = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store.clone())
         .skill(pipeline(&crash_at, &tally()))
@@ -302,7 +302,7 @@ async fn resume_refuses_a_journal_written_by_different_code() {
 async fn a_live_lease_blocks_takeover_and_says_so_precisely() {
     use agentplane::core::{RunId, StoreError};
 
-    let store = TursoStore::open_in_memory().await.unwrap();
+    let store = RedbStore::open_in_memory().unwrap();
     let run = RunId::generate();
 
     store
@@ -351,7 +351,7 @@ async fn an_orphaned_mutating_effect_is_quarantined_not_retried() {
     use agentplane::core::{EffectDescriptor, EffectKey, Recovery, RunId, StepId};
     use agentplane::journal::{Append, RecordKind};
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let run = RunId::generate();
     let plan = agentplane::core::PlanIR::single("demo.pipeline");
     let lease = store
@@ -452,7 +452,7 @@ async fn an_orphaned_mutating_effect_is_quarantined_not_retried() {
 /// is exhausted from the first instruction, so every step looks live.
 #[tokio::test]
 async fn resuming_a_finished_run_does_not_re_execute_it() {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let crash_at = Arc::new(AtomicUsize::new(NO_CRASH));
     let calls = tally();
     let rt = Runtime::builder(store.clone())

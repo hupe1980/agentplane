@@ -10,7 +10,7 @@
 
 pub mod backstop;
 pub mod conformance;
-#[cfg(feature = "turso")]
+#[cfg(feature = "redb")]
 pub mod conformance_case;
 mod fake_model;
 pub mod faults;

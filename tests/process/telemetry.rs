@@ -6,7 +6,7 @@
 //! instrumentation test that greps is checking the author's intent rather than
 //! the runtime's behaviour.
 
-#![cfg(feature = "turso")]
+#![cfg(feature = "redb")]
 #![allow(clippy::disallowed_methods)]
 // Holding a `std::sync::Mutex` across an `.await` is normally a deadlock risk,
 // and here it is the point: the lock must span the whole run, because what it
@@ -23,7 +23,7 @@ use agentplane::core::{
 };
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx, telemetry};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 use tracing::{Event, Metadata, Subscriber, span};
 
@@ -161,8 +161,8 @@ impl Skill for One {
     }
 }
 
-async fn runtime(effect: Scripted) -> (Arc<TursoStore>, Runtime) {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+fn runtime(effect: Scripted) -> (Arc<RedbStore>, Runtime) {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .owner("test")
         .skill(One(effect))
@@ -185,7 +185,7 @@ fn healthy() -> Scripted {
 #[tokio::test]
 async fn a_run_produces_run_step_and_effect_spans() {
     let rec = Recorder::default();
-    let (_s, rt) = runtime(healthy()).await;
+    let (_s, rt) = runtime(healthy());
 
     let _ambient = crate::ambient_subscriber();
 
@@ -221,8 +221,7 @@ async fn an_undecidable_outcome_emits_its_event() {
         mutates: true,
         recovery: Recovery::RequiresOperator,
         fails: Some("timeout"),
-    })
-    .await;
+    });
 
     let _ambient = crate::ambient_subscriber();
 
@@ -249,7 +248,7 @@ async fn a_budget_refusal_emits_its_event() {
     use agentplane::core::Budget;
 
     let rec = Recorder::default();
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .budget(Budget::default().effects(0))
         .skill(One(healthy()))
@@ -283,7 +282,7 @@ async fn a_budget_refusal_emits_its_event() {
 /// latency by driver" silently averages real calls with journal reads.
 #[tokio::test]
 async fn a_replayed_effect_is_not_reported_as_a_real_call() {
-    let (_s, rt) = runtime(healthy()).await;
+    let (_s, rt) = runtime(healthy());
     let first = rt.run("demo.one", json!({})).await.unwrap();
 
     let rec = Recorder::default();
@@ -360,7 +359,7 @@ async fn concurrent_steps_do_not_capture_each_others_spans() {
         }
     }
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .skill(Chatty("left"))
         .skill(Chatty("right"))

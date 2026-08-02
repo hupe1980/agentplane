@@ -959,7 +959,7 @@ src/
   journal/   records, hash chain, replay cursor, upcasters
   case/      CaseStore, EventStore, TaskStore contracts
   plan/      the plan contract: what a plan must satisfy to run at all
-  store/     Turso and Postgres backends, journal and cases alike
+  store/     redb and Postgres backends, journal and cases alike
   runtime/   StepCtx, effect protocol, executor, sweeper, built-in effects
   batch/     batch runs: item source, outcomes, the BatchStore contract
   api/       the HTTP surface for operators (feature `http`, off by default)

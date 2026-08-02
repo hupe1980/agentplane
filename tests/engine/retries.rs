@@ -11,7 +11,7 @@
 //! down: raising `max_attempts` must not make a mutating in-doubt call
 //! retryable.
 
-#![cfg(feature = "turso")]
+#![cfg(feature = "redb")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 /// How an attempt should end.
@@ -145,13 +145,13 @@ impl Skill for Once {
 }
 
 struct Fixture {
-    store: Arc<TursoStore>,
+    store: Arc<RedbStore>,
     rt: Runtime,
     calls: Arc<AtomicUsize>,
 }
 
-async fn fixture(effect: Scripted, calls: Arc<AtomicUsize>) -> Fixture {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+fn fixture(effect: Scripted, calls: Arc<AtomicUsize>) -> Fixture {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .skill(Once(effect))
         .build();
@@ -169,7 +169,7 @@ fn scripted(script: &[Attempt]) -> (Scripted, Arc<AtomicUsize>) {
 #[tokio::test]
 async fn a_clean_refusal_is_retried_and_can_succeed() {
     let (e, calls) = scripted(&[Attempt::RefusedCleanly, Attempt::Succeed]);
-    let f = fixture(e, calls).await;
+    let f = fixture(e, calls);
 
     let out = f.rt.run("demo.once", json!({})).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -184,7 +184,7 @@ async fn a_clean_refusal_is_retried_and_can_succeed() {
 #[tokio::test]
 async fn a_mutating_effect_is_retried_when_the_call_provably_did_not_land() {
     let (e, calls) = scripted(&[Attempt::RefusedCleanly, Attempt::Succeed]);
-    let f = fixture(e.mutating(), calls).await;
+    let f = fixture(e.mutating(), calls);
 
     let out = f.rt.run("demo.once", json!({})).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -199,7 +199,7 @@ async fn a_mutating_effect_is_retried_when_the_call_provably_did_not_land() {
 #[tokio::test]
 async fn a_timeout_on_a_mutating_effect_is_never_retried() {
     let (e, calls) = scripted(&[Attempt::TimedOut, Attempt::Succeed]);
-    let f = fixture(e.mutating(), calls).await;
+    let f = fixture(e.mutating(), calls);
 
     let out = f.rt.run("demo.once", json!({})).await.unwrap();
     assert_eq!(
@@ -221,7 +221,7 @@ async fn a_timeout_on_a_mutating_effect_is_never_retried() {
 #[tokio::test]
 async fn a_timeout_is_retried_when_recovery_declares_it_safe() {
     let (e, calls) = scripted(&[Attempt::TimedOut, Attempt::Succeed]);
-    let f = fixture(e.recovery(Recovery::Retry), calls).await;
+    let f = fixture(e.recovery(Recovery::Retry), calls);
 
     let out = f.rt.run("demo.once", json!({})).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -238,8 +238,7 @@ async fn an_idempotency_key_makes_a_mutating_timeout_retryable() {
             key: "order-4711".into(),
         }),
         calls,
-    )
-    .await;
+    );
 
     let out = f.rt.run("demo.once", json!({})).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -252,7 +251,7 @@ async fn an_idempotency_key_makes_a_mutating_timeout_retryable() {
 #[tokio::test]
 async fn an_effect_that_landed_is_never_repeated() {
     let (e, calls) = scripted(&[Attempt::LandedUndecodable, Attempt::Succeed]);
-    let f = fixture(e.policy(RetryPolicy::attempts(5)), calls).await;
+    let f = fixture(e.policy(RetryPolicy::attempts(5)), calls);
 
     let out = f.rt.run("demo.once", json!({})).await.unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
@@ -265,7 +264,7 @@ async fn an_effect_that_landed_is_never_repeated() {
 #[tokio::test]
 async fn attempts_are_exhausted_and_the_error_says_so() {
     let (e, calls) = scripted(&[Attempt::RefusedCleanly; 10]);
-    let f = fixture(e.policy(RetryPolicy::attempts(3)), calls).await;
+    let f = fixture(e.policy(RetryPolicy::attempts(3)), calls);
 
     let out = f.rt.run("demo.once", json!({})).await.unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 3, "exactly the limit");
@@ -282,7 +281,7 @@ async fn attempts_are_exhausted_and_the_error_says_so() {
 #[tokio::test]
 async fn a_never_policy_performs_exactly_one_attempt() {
     let (e, calls) = scripted(&[Attempt::RefusedCleanly, Attempt::Succeed]);
-    let f = fixture(e.policy(RetryPolicy::never()), calls).await;
+    let f = fixture(e.policy(RetryPolicy::never()), calls);
 
     let out = f.rt.run("demo.once", json!({})).await.unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
@@ -297,7 +296,7 @@ async fn a_never_policy_performs_exactly_one_attempt() {
 #[tokio::test]
 async fn raising_max_attempts_does_not_make_an_in_doubt_call_retryable() {
     let (e, calls) = scripted(&[Attempt::TimedOut; 10]);
-    let f = fixture(e.mutating().policy(RetryPolicy::attempts(10)), calls).await;
+    let f = fixture(e.mutating().policy(RetryPolicy::attempts(10)), calls);
 
     let out = f.rt.run("demo.once", json!({})).await.unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
@@ -313,7 +312,7 @@ async fn raising_max_attempts_does_not_make_an_in_doubt_call_retryable() {
 #[tokio::test]
 async fn every_attempt_is_journaled_with_its_number_and_disposition() {
     let (e, calls) = scripted(&[Attempt::RefusedCleanly, Attempt::RefusedCleanly]);
-    let f = fixture(e, calls).await;
+    let f = fixture(e, calls);
 
     let out = f.rt.run("demo.once", json!({})).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -358,7 +357,7 @@ async fn every_attempt_is_journaled_with_its_number_and_disposition() {
 #[tokio::test]
 async fn attempts_do_not_share_an_effect_key() {
     let (e, calls) = scripted(&[Attempt::RefusedCleanly, Attempt::RefusedCleanly]);
-    let f = fixture(e, calls).await;
+    let f = fixture(e, calls);
 
     let out = f.rt.run("demo.once", json!({})).await.unwrap();
     let records = f.store.read(out.run_id, 1).await.unwrap();
@@ -380,7 +379,7 @@ async fn attempts_do_not_share_an_effect_key() {
 #[tokio::test]
 async fn replay_reproduces_a_retry_sequence_without_repeating_it() {
     let (e, calls) = scripted(&[Attempt::RefusedCleanly, Attempt::RefusedCleanly]);
-    let f = fixture(e, calls).await;
+    let f = fixture(e, calls);
 
     let first = f.rt.run("demo.once", json!({})).await.unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
@@ -405,7 +404,7 @@ async fn replay_reproduces_a_retry_sequence_without_repeating_it() {
 #[tokio::test]
 async fn replay_follows_history_even_when_the_policy_has_since_shrunk() {
     let (e, calls) = scripted(&[Attempt::RefusedCleanly, Attempt::RefusedCleanly]);
-    let f = fixture(e, Arc::clone(&calls)).await;
+    let f = fixture(e, Arc::clone(&calls));
 
     let first = f.rt.run("demo.once", json!({})).await.unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
@@ -450,7 +449,7 @@ async fn every_attempt_is_admitted_against_the_budget() {
     use agentplane::core::Budget;
 
     let (e, calls) = scripted(&[Attempt::RefusedCleanly; 10]);
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .budget(Budget::default().effects(2))
         .skill(Once(e.policy(RetryPolicy::attempts(10))))
@@ -478,7 +477,7 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
     use agentplane::core::{EffectKey, PlanIR, StepId};
     use agentplane::journal::Append;
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let (e, calls) = scripted(&[Attempt::Succeed]);
     // Same owner identity as the lease taken below: this is one process
     // restarting after a crash, which is the realistic recovery path.
@@ -625,7 +624,7 @@ async fn an_interrupted_connection_is_in_doubt_not_retried() {
     }
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .skill(Once(Cut(Arc::clone(&calls))))
         .build();
@@ -665,7 +664,7 @@ async fn a_skill_can_reject_its_input() {
         }
     }
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .skill(Picky)
         .build();

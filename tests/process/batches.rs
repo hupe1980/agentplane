@@ -12,7 +12,7 @@
 //!   mode is re-issuing every invoice up to 3.
 //! * **Per-item cost** — "what did this run cost" is a sum, not an estimate.
 
-#![cfg(feature = "turso")]
+#![cfg(feature = "redb")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
@@ -24,7 +24,7 @@ use agentplane::core::{
 };
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{BatchSpec, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 /// Every settlement that actually reached the world, in order.
@@ -128,7 +128,7 @@ fn plan() -> PlanIR {
     ])
 }
 
-fn runtime(db: &Arc<TursoStore>, world: &World, fails: Vec<&'static str>) -> Runtime {
+fn runtime(db: &Arc<RedbStore>, world: &World, fails: Vec<&'static str>) -> Runtime {
     Runtime::builder(Arc::clone(db) as Arc<dyn JournalStore>)
         .owner("batch")
         .batches(Arc::clone(db) as Arc<dyn BatchStore>)
@@ -139,15 +139,15 @@ fn runtime(db: &Arc<TursoStore>, world: &World, fails: Vec<&'static str>) -> Run
         .build()
 }
 
-async fn db() -> Arc<TursoStore> {
-    Arc::new(TursoStore::open_in_memory().await.unwrap())
+fn db() -> Arc<RedbStore> {
+    Arc::new(RedbStore::open_in_memory().unwrap())
 }
 
 // ── The claims ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn every_item_gets_its_own_run_and_its_own_journal() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
     let id = BatchId::generate();
 
@@ -187,7 +187,7 @@ async fn every_item_gets_its_own_run_and_its_own_journal() {
 /// One bad item must not take down the batch.
 #[tokio::test]
 async fn a_failing_item_does_not_stop_the_ones_after_it() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
     let id = BatchId::generate();
 
@@ -217,7 +217,7 @@ async fn a_failing_item_does_not_stop_the_ones_after_it() {
 /// The report cannot be read as success without reading the counts.
 #[tokio::test]
 async fn partial_failure_is_terminal_and_says_so() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
     let id = BatchId::generate();
 
@@ -248,7 +248,7 @@ async fn partial_failure_is_terminal_and_says_so() {
 /// Dies at item 3, resumes at item 3 — and does not re-settle 1 and 2.
 #[tokio::test]
 async fn a_batch_resumes_at_item_granularity() {
-    let store = db().await;
+    let store = db();
     let id = BatchId::generate();
     let first: World = Arc::default();
 
@@ -297,7 +297,7 @@ async fn a_batch_resumes_at_item_granularity() {
 /// forces the slow path by running the batch again from the beginning.
 #[tokio::test]
 async fn reprocessing_a_finished_item_performs_nothing() {
-    let store = db().await;
+    let store = db();
     let id = BatchId::generate();
     let world: World = Arc::default();
 
@@ -334,7 +334,7 @@ async fn reprocessing_a_finished_item_performs_nothing() {
 /// "This settlement run cost €340" has to be a sum, not an estimate.
 #[tokio::test]
 async fn cost_is_attributed_per_item_and_summed_for_the_batch() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
     let id = BatchId::generate();
 
@@ -380,7 +380,7 @@ async fn a_source_that_errors_stops_the_batch_loudly() {
         }
     }
 
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
     let err = runtime(&store, &world, vec![])
         .run_batch(
@@ -399,7 +399,7 @@ async fn a_source_that_errors_stops_the_batch_loudly() {
 /// An empty source is a completed batch with nothing in it, not an error.
 #[tokio::test]
 async fn an_empty_source_completes_with_zero_items() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
     let report = runtime(&store, &world, vec![])
         .run_batch(
@@ -426,7 +426,7 @@ async fn an_empty_source_completes_with_zero_items() {
 /// resume steps over it and the batch reports complete while that item never ran.
 #[tokio::test]
 async fn an_unfinished_item_holds_the_cursor_behind_it() {
-    let store = db().await;
+    let store = db();
     let id = BatchId::generate();
     store.open(id, "digest").await.unwrap();
 
@@ -462,7 +462,7 @@ async fn an_unfinished_item_holds_the_cursor_behind_it() {
 /// batch with work outstanding.
 #[tokio::test]
 async fn a_suspended_item_keeps_the_batch_running() {
-    let store = db().await;
+    let store = db();
     let id = BatchId::generate();
     store.open(id, "digest").await.unwrap();
 
@@ -504,7 +504,7 @@ async fn a_suspended_item_keeps_the_batch_running() {
 /// be orphaned and its effects would happen twice.
 #[tokio::test]
 async fn reserving_twice_returns_the_original_run() {
-    let store = db().await;
+    let store = db();
     let id = BatchId::generate();
     store.open(id, "digest").await.unwrap();
 

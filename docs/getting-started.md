@@ -52,9 +52,9 @@ Read those five lines slowly, because they are the product:
 agentplane = "0.1"
 ```
 
-An embedded [Turso](https://github.com/tursodatabase/turso) store is the default
-backend — SQLite semantics in pure Rust, so there is no C toolchain in your
-build. Everything else is opt-in:
+An embedded [redb](https://github.com/cberner/redb) store is the default backend
+— pure Rust, two crates deep, with a stable on-disk format and no C toolchain in
+your build. Everything else is opt-in:
 
 ```toml
 agentplane = { version = "0.1", features = ["postgres", "http", "mcp", "providers", "cedar", "signing"] }
@@ -62,7 +62,7 @@ agentplane = { version = "0.1", features = ["postgres", "http", "mcp", "provider
 
 | feature | gives you |
 |---|---|
-| `turso` *(default)* | journal + case store, single node, embedded |
+| `redb` *(default)* | journal + case store, single node, embedded |
 | `postgres` | the same contract, for several plane instances sharing a store |
 | `http` | the operator surface: worklist, decisions, run status |
 | `mcp` | MCP tool transport |
@@ -125,10 +125,10 @@ is exactly what makes replay possible.
 ```rust
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{Mode, Runtime};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use std::sync::Arc;
 
-let store: Arc<dyn JournalStore> = Arc::new(TursoStore::open_in_memory().await?);
+let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
 
 let runtime = Runtime::builder(Arc::clone(&store))
     .owner("my-service")

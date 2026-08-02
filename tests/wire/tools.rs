@@ -20,7 +20,7 @@
 //! operator's catalogue, and the server's claims are recorded and compared but
 //! never obeyed.
 
-#![cfg(feature = "turso")]
+#![cfg(feature = "redb")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
@@ -31,7 +31,7 @@ use agentplane::core::{
 };
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use agentplane::tools::{
     Advertised, ToolCall, ToolCatalog, ToolClient, ToolError, ToolId, ToolSafety,
 };
@@ -335,7 +335,7 @@ impl Skill for Calls {
 /// A tool call is an ordinary effect: journaled once, and read back on replay.
 #[tokio::test]
 async fn a_tool_call_is_performed_once_and_replayed_from_the_journal() {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let client = Fake::ok();
     let catalog = ToolCatalog::new().allow(ToolId::new("ledger", "read"), ToolSafety::read_only());
 
@@ -406,7 +406,7 @@ async fn tool_output_cannot_steer_a_mutating_call() {
         }
     }
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let client = Fake::ok();
     let catalog = ToolCatalog::new()
         .allow(ToolId::new("ledger", "read"), ToolSafety::read_only())

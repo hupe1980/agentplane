@@ -23,7 +23,7 @@ use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted};
 use agentplane::journal::JournalStore;
 use agentplane::runtime::effects::Recorded;
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 /// Counts how many times the outside world was actually touched.
@@ -110,7 +110,7 @@ fn runtime(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store: Arc<dyn JournalStore> = Arc::new(TursoStore::open_in_memory().await?);
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
 
     // ── 1. A normal run ────────────────────────────────────────────────────
     let stages = Arc::new(AtomicUsize::new(3));

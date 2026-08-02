@@ -16,7 +16,7 @@
 //!   asked, so the guarantee is enforced rather than described.
 //! * **A permit costs no journal.** The effect's own record is the evidence.
 
-#![cfg(feature = "turso")]
+#![cfg(feature = "redb")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{
@@ -31,7 +31,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 /// Effects that actually reached the world.
@@ -153,11 +153,11 @@ impl Skill for Pays {
     }
 }
 
-async fn db() -> Arc<TursoStore> {
-    Arc::new(TursoStore::open_in_memory().await.unwrap())
+fn db() -> Arc<RedbStore> {
+    Arc::new(RedbStore::open_in_memory().unwrap())
 }
 
-fn runtime(db: &Arc<TursoStore>, world: &World, engine: Option<Arc<dyn PolicyEngine>>) -> Runtime {
+fn runtime(db: &Arc<RedbStore>, world: &World, engine: Option<Arc<dyn PolicyEngine>>) -> Runtime {
     let mut b = Runtime::builder(Arc::clone(db) as Arc<dyn JournalStore>)
         .owner("policy")
         .skill(Pays {
@@ -174,7 +174,7 @@ fn runtime(db: &Arc<TursoStore>, world: &World, engine: Option<Arc<dyn PolicyEng
 /// A denied effect never reaches the world, and the one before it still did.
 #[tokio::test]
 async fn a_denied_effect_is_refused_before_it_is_performed() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Refuses("ledger.transfer"))))
@@ -197,7 +197,7 @@ async fn a_denied_effect_is_refused_before_it_is_performed() {
 /// The reason survives to the caller. "Denied by policy" is not actionable.
 #[tokio::test]
 async fn a_denial_carries_a_reason_someone_can_act_on() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Refuses("ledger.transfer"))))
@@ -221,7 +221,7 @@ async fn a_denial_carries_a_reason_someone_can_act_on() {
 /// Admission is gated too — and a refused run leaves no journal at all.
 #[tokio::test]
 async fn a_run_the_policy_refuses_to_admit_never_starts() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
 
     let err = runtime(&store, &world, Some(Arc::new(Refuses("pay"))))
@@ -238,7 +238,7 @@ async fn a_run_the_policy_refuses_to_admit_never_starts() {
 /// A denial is recorded, because it is a place the run stopped.
 #[tokio::test]
 async fn a_denial_is_journaled_like_a_budget_refusal() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Refuses("ledger.transfer"))))
@@ -268,7 +268,7 @@ async fn a_denial_is_journaled_like_a_budget_refusal() {
 /// A permit costs nothing. The effect's own record is the evidence it was allowed.
 #[tokio::test]
 async fn a_permit_writes_no_record_of_its_own() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
     let engine = Arc::new(Counting::default());
 
@@ -295,7 +295,7 @@ async fn a_permit_writes_no_record_of_its_own() {
 /// Which rules governed a run is answerable from the journal, years later.
 #[tokio::test]
 async fn the_admission_record_names_the_policy_set() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
     let engine = Arc::new(Counting::default());
     let expected = engine.digest();
@@ -326,7 +326,7 @@ async fn the_admission_record_names_the_policy_set() {
 /// rather than from someone's memory of how the deployment was wired.
 #[tokio::test]
 async fn a_run_with_no_policy_layer_says_so_on_the_record() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, None)
@@ -355,7 +355,7 @@ async fn a_run_with_no_policy_layer_says_so_on_the_record() {
 /// last year, and the audit trail becomes a lie that still verifies.
 #[tokio::test]
 async fn strict_replay_never_asks_the_policy_engine() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Counting::default())))
@@ -384,7 +384,7 @@ async fn strict_replay_never_asks_the_policy_engine() {
 /// today's rules produces a history that never happened.
 #[tokio::test]
 async fn a_recorded_denial_replays_even_if_the_policy_would_now_permit() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Refuses("ledger.transfer"))))
@@ -417,7 +417,7 @@ async fn a_recorded_denial_replays_even_if_the_policy_would_now_permit() {
 /// Resuming a denied run does not silently retry the denied effect.
 #[tokio::test]
 async fn resuming_a_denied_run_does_not_perform_the_denied_effect() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Refuses("ledger.transfer"))))
@@ -445,7 +445,7 @@ async fn resuming_a_denied_run_does_not_perform_the_denied_effect() {
 /// allowance by asking — otherwise a denied principal still costs money.
 #[tokio::test]
 async fn authorization_is_checked_before_the_budget_is_charged() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Refuses("ledger.transfer"))))
@@ -478,7 +478,7 @@ async fn authorization_is_checked_before_the_budget_is_charged() {
 /// policy layer everyone believes is switched on.
 #[tokio::test]
 async fn the_default_engine_denies_and_explains_itself() {
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
 
     let err = runtime(
@@ -514,7 +514,7 @@ async fn the_request_carries_what_a_rule_needs() {
         }
     }
 
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
     let engine = Arc::new(Capturing::default());
     runtime(&store, &world, Some(engine.clone()))
@@ -554,7 +554,7 @@ async fn the_principal_is_stable_across_runs() {
         }
     }
 
-    let store = db().await;
+    let store = db();
     let world: World = Arc::default();
     let engine = Arc::new(Principals::default());
     for _ in 0..2 {
@@ -686,7 +686,7 @@ async fn a_run_that_keeps_being_refused_stops_learning() {
         }
     }
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .policy(Arc::new(RefusesEveryEffect))
         .budget(Budget::unlimited().denials(CEILING))

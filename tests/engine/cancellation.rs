@@ -15,7 +15,7 @@
 //!   reason a failure does — otherwise the safety control is the thing that
 //!   issues a refund for money nobody took.
 
-#![cfg(feature = "turso")]
+#![cfg(feature = "redb")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 type World = Arc<Mutex<Vec<String>>>;
@@ -123,15 +123,15 @@ fn world_of(_cx: &StepCtx<'_>) -> World {
 }
 
 struct Fixture {
-    store: Arc<TursoStore>,
+    store: Arc<RedbStore>,
     rt: Runtime,
     world: World,
 }
 
-async fn fixture<S: Skill + 'static>(skill: S) -> Fixture {
+fn fixture<S: Skill + 'static>(skill: S) -> Fixture {
     let world: World = Arc::default();
     WORLD.with(|w| *w.borrow_mut() = Some(Arc::clone(&world)));
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .events(store.clone() as Arc<dyn EventStore>)
@@ -159,7 +159,7 @@ async fn suspended_run(f: &Fixture, target: &str) -> RunId {
 /// A suspended run stops, unwinds, and says who asked.
 #[tokio::test]
 async fn stopping_a_suspended_run_undoes_what_it_did() {
-    let f = fixture(PostsThenWaits).await;
+    let f = fixture(PostsThenWaits);
     let run = suspended_run(&f, "demo.post").await;
     assert_eq!(*f.world.lock().unwrap(), vec!["posted".to_string()]);
 
@@ -188,7 +188,7 @@ async fn stopping_a_suspended_run_undoes_what_it_did() {
 /// otherwise the permanent record shows a run that stopped for no stated reason.
 #[tokio::test]
 async fn the_intervention_is_on_the_record() {
-    let f = fixture(PostsThenWaits).await;
+    let f = fixture(PostsThenWaits);
     let run = suspended_run(&f, "demo.post").await;
     f.rt.request_cancel(run, "ops-carol", "counterparty withdrew")
         .await
@@ -218,7 +218,7 @@ async fn the_intervention_is_on_the_record() {
 /// A second asker does not take the first one's place.
 #[tokio::test]
 async fn the_first_asker_owns_the_intervention() {
-    let f = fixture(PostsThenWaits).await;
+    let f = fixture(PostsThenWaits);
     let run = suspended_run(&f, "demo.post").await;
 
     assert!(f.rt.request_cancel(run, "alice", "first").await.unwrap());
@@ -238,7 +238,7 @@ async fn the_first_asker_owns_the_intervention() {
 /// would look like it worked.
 #[tokio::test]
 async fn a_stopped_run_is_not_resumed_by_a_later_event() {
-    let f = fixture(PostsThenWaits).await;
+    let f = fixture(PostsThenWaits);
     let run = suspended_run(&f, "demo.post").await;
     f.rt.request_cancel(run, "ops-carol", "withdrawn")
         .await
@@ -298,7 +298,7 @@ async fn a_stop_will_not_unwind_around_an_unknown_outcome() {
 
     let world: World = Arc::default();
     WORLD.with(|w| *w.borrow_mut() = Some(Arc::clone(&world)));
-    let db = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let db = Arc::new(RedbStore::open_in_memory().unwrap());
 
     // Fail the *terminal* record of a mutating effect, cleanly. The effect ran;
     // the journal holds its `EffectStarted` and nothing after it. That is the
@@ -358,7 +358,7 @@ async fn a_stop_will_not_unwind_around_an_unknown_outcome() {
 /// Stopping a run that never started is not an error, and does nothing.
 #[tokio::test]
 async fn stopping_an_unknown_run_is_refused_rather_than_silently_accepted() {
-    let f = fixture(PostsThenWaits).await;
+    let f = fixture(PostsThenWaits);
     let err =
         f.rt.request_cancel(RunId::generate(), "ops", "typo in the id")
             .await;
@@ -399,7 +399,7 @@ async fn stopping_a_finished_run_does_not_reopen_it() {
         }
     }
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .skill(Quick)
         .build();

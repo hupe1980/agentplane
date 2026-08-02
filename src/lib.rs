@@ -97,7 +97,7 @@ pub mod policy;
 pub mod runtime;
 pub mod tools;
 
-#[cfg(feature = "turso")]
+#[cfg(feature = "redb")]
 pub mod store;
 
 #[cfg(feature = "testkit")]

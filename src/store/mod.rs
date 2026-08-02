@@ -1,30 +1,31 @@
 //! Persistence backends.
 //!
-//! Single node runs on Turso — a SQLite-compatible engine written in Rust; the
-//! active-active topology (run-ownership leases plus fencing epochs, arbitrated
-//! by the store) is designed for `PostgreSQL`. The
+//! Single node runs on [redb](https://github.com/cberner/redb) — pure Rust, two
+//! crates deep, with a stable on-disk format. The active-active topology
+//! (run-ownership leases plus fencing epochs, arbitrated by the store) is
+//! designed for `PostgreSQL`. The
 //! [`JournalStore`](crate::journal::JournalStore) contract is identical for
 //! both, and the invariants it demands — fencing, exactly-once, chaining — are
 //! expressed as constraints so a backend cannot quietly omit one.
 
-#[cfg(feature = "turso")]
-mod batches;
-#[cfg(feature = "turso")]
-mod cases;
-#[cfg(feature = "turso")]
-mod events;
 #[cfg(feature = "postgres")]
 mod postgres;
 #[cfg(feature = "postgres")]
 mod postgres_cases;
-#[cfg(feature = "turso")]
-mod tasks;
-#[cfg(feature = "turso")]
-mod timers;
-#[cfg(feature = "turso")]
-mod turso;
+#[cfg(feature = "redb")]
+mod redb;
+#[cfg(feature = "redb")]
+mod redb_batches;
+#[cfg(feature = "redb")]
+mod redb_cases;
+#[cfg(feature = "redb")]
+mod redb_events;
+#[cfg(feature = "redb")]
+mod redb_tasks;
+#[cfg(feature = "redb")]
+mod redb_timers;
 
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresStore;
-#[cfg(feature = "turso")]
-pub use turso::TursoStore;
+#[cfg(feature = "redb")]
+pub use redb::RedbStore;

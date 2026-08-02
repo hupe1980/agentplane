@@ -5,7 +5,7 @@
 //! graph checker can see before anything runs. These tests are that checker's
 //! specification.
 
-#![cfg(feature = "turso")]
+#![cfg(feature = "redb")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use agentplane::core::{
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::plan::{Contract, validate};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 // ── Contract validation ─────────────────────────────────────────────────────
@@ -346,14 +346,14 @@ impl Skill for Echo {
 }
 
 struct Harness {
-    store: Arc<TursoStore>,
+    store: Arc<RedbStore>,
     rt: Runtime,
     seen: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
     calls: Arc<AtomicUsize>,
 }
 
-async fn harness(untrusted: &[&'static str]) -> Harness {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+fn harness(untrusted: &[&'static str]) -> Harness {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls = Arc::new(AtomicUsize::new(0));
 
@@ -377,7 +377,7 @@ async fn harness(untrusted: &[&'static str]) -> Harness {
 /// A multi-step plan runs every step, in dependency order.
 #[tokio::test]
 async fn a_multi_step_plan_executes_in_dependency_order() {
-    let h = harness(&[]).await;
+    let h = harness(&[]);
     let out = h.rt.run_plan(ok_plan(), json!({ "id": 1 })).await.unwrap();
 
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -396,7 +396,7 @@ async fn a_multi_step_plan_executes_in_dependency_order() {
 /// Each step is journaled under its own id, and the chain verifies.
 #[tokio::test]
 async fn every_step_is_journaled_separately() {
-    let h = harness(&[]).await;
+    let h = harness(&[]);
     let out = h.rt.run_plan(ok_plan(), json!({})).await.unwrap();
 
     let records = h.store.read(out.run_id, 1).await.unwrap();
@@ -413,7 +413,7 @@ async fn every_step_is_journaled_separately() {
 /// was permitted to do.
 #[tokio::test]
 async fn the_frozen_plan_is_journaled() {
-    let h = harness(&[]).await;
+    let h = harness(&[]);
     let plan = ok_plan();
     let out = h.rt.run_plan(plan.clone(), json!({})).await.unwrap();
 
@@ -434,7 +434,7 @@ async fn the_frozen_plan_is_journaled() {
 /// A step reads exactly what its arguments declare.
 #[tokio::test]
 async fn arguments_are_assembled_from_their_declared_sources() {
-    let h = harness(&[]).await;
+    let h = harness(&[]);
     h.rt.run_plan(ok_plan(), json!({ "id": 7 })).await.unwrap();
 
     let seen = h.seen.lock().unwrap();
@@ -473,7 +473,7 @@ async fn untrust_propagates_downstream() {
         }
     }
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
@@ -503,7 +503,7 @@ async fn untrust_propagates_downstream() {
 /// finding out late is half an operation performed and half not.
 #[tokio::test]
 async fn an_invalid_plan_is_rejected_before_anything_runs() {
-    let h = harness(&[]).await;
+    let h = harness(&[]);
     let bad = PlanIR::new(vec![
         PlanNode::new(0, "fetch")
             .arg("a", ArgSource::node(StepId(1)))
@@ -523,7 +523,7 @@ async fn an_invalid_plan_is_rejected_before_anything_runs() {
 /// Strict replay reproduces a multi-step run without performing anything.
 #[tokio::test]
 async fn a_multi_step_run_replays_strictly() {
-    let h = harness(&[]).await;
+    let h = harness(&[]);
     let first = h.rt.run_plan(ok_plan(), json!({ "id": 3 })).await.unwrap();
     let before = h.calls.load(Ordering::SeqCst);
 
@@ -545,7 +545,7 @@ async fn a_multi_step_run_replays_strictly() {
 /// A bare target still works: it compiles to the degenerate one-node plan.
 #[tokio::test]
 async fn a_bare_target_compiles_to_a_single_node_plan() {
-    let h = harness(&[]).await;
+    let h = harness(&[]);
     let out = h.rt.run("fetch", json!({ "x": 1 })).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(h.calls.load(Ordering::SeqCst), 1);
@@ -554,7 +554,7 @@ async fn a_bare_target_compiles_to_a_single_node_plan() {
 /// A diamond: two independent branches that rejoin.
 #[tokio::test]
 async fn a_diamond_plan_runs_both_branches_then_joins() {
-    let h = harness(&[]).await;
+    let h = harness(&[]);
     let plan = PlanIR::new(vec![
         PlanNode::new(0, "fetch").arg("input", ArgSource::run_input()),
         PlanNode::new(1, "validate").arg("left", ArgSource::node_field(StepId(0), "from")),
@@ -577,7 +577,7 @@ async fn a_diamond_plan_runs_both_branches_then_joins() {
 /// A field selector picks one part of an upstream output.
 #[tokio::test]
 async fn a_field_selector_narrows_an_upstream_output() {
-    let h = harness(&[]).await;
+    let h = harness(&[]);
     let plan = PlanIR::new(vec![
         PlanNode::new(0, "fetch").arg("input", ArgSource::run_input()),
         PlanNode::new(1, "post")
@@ -613,7 +613,7 @@ async fn a_constant_argument_is_trusted() {
         }
     }
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .skill(AssertsTrusted)
         .build();
@@ -668,7 +668,7 @@ async fn sibling_steps_in_the_ready_set_run_concurrently() {
     }
 
     let gate = Arc::new(Barrier::new(2));
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .skill(Rendezvous {
             name: "left",
@@ -753,7 +753,7 @@ async fn a_concurrently_dispatched_run_replays_strictly() {
     }
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .skill(Chatty("left", Arc::clone(&calls)))
         .skill(Chatty("right", Arc::clone(&calls)))

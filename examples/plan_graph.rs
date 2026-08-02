@@ -27,7 +27,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 /// Reads meter data from outside the trust boundary.
@@ -116,7 +116,7 @@ fn pipeline() -> PlanIR {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store: Arc<dyn JournalStore> = Arc::new(TursoStore::open_in_memory().await?);
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
     let rt = Runtime::builder(Arc::clone(&store))
         .skill(Fetch)
         .skill(Validate)

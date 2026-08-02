@@ -7,7 +7,7 @@
 // These exercise the runtime end to end, which needs a store. Gated so
 // `--no-default-features` still builds and tests cleanly: an embedder who
 // brings their own backend must not be forced to compile SQLite.
-#![cfg(feature = "turso")]
+#![cfg(feature = "redb")]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +18,7 @@ use agentplane::core::{
 use agentplane::journal::{JournalStore, Record, RecordKind};
 use agentplane::runtime::effects::Recorded;
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 // ── Test skills ─────────────────────────────────────────────────────────────
@@ -148,12 +148,8 @@ impl Skill for SinksLabeled {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-async fn store() -> Arc<dyn JournalStore> {
-    Arc::new(
-        TursoStore::open_in_memory()
-            .await
-            .expect("open in-memory store"),
-    )
+fn store() -> Arc<dyn JournalStore> {
+    Arc::new(RedbStore::open_in_memory().expect("open in-memory store"))
 }
 
 fn count_kind(records: &[Record], want: &str) -> usize {
@@ -173,7 +169,7 @@ fn count_kind(records: &[Record], want: &str) -> usize {
 #[tokio::test]
 async fn replay_does_not_re_perform_effects() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let rt = Runtime::builder(store().await)
+    let rt = Runtime::builder(store())
         .skill(CallsTool {
             calls: Arc::clone(&calls),
         })
@@ -202,7 +198,7 @@ async fn replay_does_not_re_perform_effects() {
 #[tokio::test]
 async fn replay_reproduces_the_recorded_output() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let rt = Runtime::builder(store().await)
+    let rt = Runtime::builder(store())
         .skill(CallsTool {
             calls: Arc::clone(&calls),
         })
@@ -223,7 +219,7 @@ async fn replay_reproduces_the_recorded_output() {
 /// the run it claims to reproduce — and the audit trail becomes fiction.
 #[tokio::test]
 async fn the_clock_is_journaled_not_re_read() {
-    let rt = Runtime::builder(store().await).skill(ReadsClock).build();
+    let rt = Runtime::builder(store()).skill(ReadsClock).build();
 
     let first = rt.run("reads-clock", json!({})).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -239,7 +235,7 @@ async fn the_clock_is_journaled_not_re_read() {
 /// value — otherwise a skill could not measure elapsed time.
 #[tokio::test]
 async fn effects_at_different_ordinals_are_distinct() {
-    let rt = Runtime::builder(store().await).skill(ReadsClock).build();
+    let rt = Runtime::builder(store()).skill(ReadsClock).build();
     let out = rt.run("reads-clock", json!({})).await.unwrap();
     let records = rt.store().read(out.run_id, 1).await.unwrap();
     assert_eq!(count_kind(&records, "EffectStarted"), 2);
@@ -256,7 +252,7 @@ async fn effects_at_different_ordinals_are_distinct() {
 async fn strict_replay_rejects_a_build_that_does_more_than_the_record() {
     let count = Arc::new(AtomicUsize::new(1));
     let calls = Arc::new(AtomicUsize::new(0));
-    let rt = Runtime::builder(store().await)
+    let rt = Runtime::builder(store())
         .skill(VariableEffects {
             count: Arc::clone(&count),
             calls: Arc::clone(&calls),
@@ -284,7 +280,7 @@ async fn strict_replay_rejects_a_build_that_does_more_than_the_record() {
 async fn strict_replay_rejects_a_build_that_does_something_different() {
     let count = Arc::new(AtomicUsize::new(2));
     let calls = Arc::new(AtomicUsize::new(0));
-    let rt = Runtime::builder(store().await)
+    let rt = Runtime::builder(store())
         .skill(VariableEffects {
             count: Arc::clone(&count),
             calls: Arc::clone(&calls),
@@ -327,7 +323,7 @@ async fn the_store_refuses_a_duplicate_effect_start() {
     use agentplane::core::{EffectDescriptor, EffectKey, Recovery, RunId};
     use agentplane::journal::Append;
 
-    let s = TursoStore::open_in_memory().await.unwrap();
+    let s = RedbStore::open_in_memory().unwrap();
     let run = RunId::generate();
     let lease = s
         .acquire(run, "test", std::time::Duration::from_mins(1))
@@ -367,7 +363,7 @@ async fn a_fenced_writer_cannot_append() {
     use agentplane::core::RunId;
     use agentplane::journal::Append;
 
-    let s = TursoStore::open_in_memory().await.unwrap();
+    let s = RedbStore::open_in_memory().unwrap();
     let run = RunId::generate();
 
     // Instance A takes a lease that expires immediately.
@@ -421,9 +417,7 @@ async fn a_fenced_writer_cannot_append() {
 #[tokio::test]
 async fn the_journal_chain_verifies() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let rt = Runtime::builder(store().await)
-        .skill(CallsTool { calls })
-        .build();
+    let rt = Runtime::builder(store()).skill(CallsTool { calls }).build();
     let out = rt.run("calls-tool", json!({})).await.unwrap();
 
     let head = rt.store().verify(out.run_id).await.unwrap();
@@ -440,7 +434,7 @@ async fn the_journal_chain_verifies() {
 #[tokio::test]
 async fn replay_refuses_a_tampered_journal() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let s = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let s = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(s.clone())
         .skill(CallsTool { calls })
         .build();
@@ -461,7 +455,7 @@ async fn replay_refuses_a_tampered_journal() {
 /// **Egress ceiling.** A value may not enter a sink that is not cleared for it.
 #[tokio::test]
 async fn a_sink_refuses_data_above_its_ceiling() {
-    let rt = Runtime::builder(store().await)
+    let rt = Runtime::builder(store())
         .skill(SinksLabeled {
             label_sensitivity: Sensitivity::Secret,
             ceiling: Sensitivity::Internal,
@@ -480,7 +474,7 @@ async fn a_sink_refuses_data_above_its_ceiling() {
 /// **Taint gate.** Untrusted data may not reach a mutating sink undeclassified.
 #[tokio::test]
 async fn untrusted_data_cannot_reach_a_mutating_sink() {
-    let rt = Runtime::builder(store().await)
+    let rt = Runtime::builder(store())
         .skill(SinksLabeled {
             label_sensitivity: Sensitivity::Internal,
             ceiling: Sensitivity::Secret,
@@ -502,7 +496,7 @@ async fn untrusted_data_cannot_reach_a_mutating_sink() {
 /// untrusted data, not about reading it.
 #[tokio::test]
 async fn untrusted_data_may_reach_a_read_only_sink() {
-    let rt = Runtime::builder(store().await)
+    let rt = Runtime::builder(store())
         .skill(SinksLabeled {
             label_sensitivity: Sensitivity::Internal,
             ceiling: Sensitivity::Secret,
@@ -540,7 +534,7 @@ async fn declassification_is_journaled_with_its_reason() {
         }
     }
 
-    let rt = Runtime::builder(store().await).skill(Declassifies).build();
+    let rt = Runtime::builder(store()).skill(Declassifies).build();
     let out = rt.run("declassifies", json!({})).await.unwrap();
     let records = rt.store().read(out.run_id, 1).await.unwrap();
 
@@ -576,7 +570,7 @@ async fn a_failing_skill_does_not_succeed() {
         }
     }
 
-    let rt = Runtime::builder(store().await).skill(Claims).build();
+    let rt = Runtime::builder(store()).skill(Claims).build();
     let out = rt.run("claims", json!({})).await.unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));
 }
@@ -584,7 +578,7 @@ async fn a_failing_skill_does_not_succeed() {
 /// An unknown target is refused at admission rather than half-executed.
 #[tokio::test]
 async fn an_unknown_target_is_refused_before_anything_happens() {
-    let rt = Runtime::builder(store().await).build();
+    let rt = Runtime::builder(store()).build();
     let err = rt.run("nonexistent", json!({})).await.unwrap_err();
     assert!(matches!(err, agentplane::core::RuntimeError::NoProvider(_)));
 }
@@ -594,7 +588,7 @@ async fn an_unknown_target_is_refused_before_anything_happens() {
 #[tokio::test]
 async fn skills_resolve_by_capability() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let rt = Runtime::builder(store().await)
+    let rt = Runtime::builder(store())
         .skill(CallsTool {
             calls: Arc::clone(&calls),
         })
@@ -644,7 +638,7 @@ async fn strict_replay_writes_nothing() {
         }
     }
 
-    let s = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let s = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(s.clone()).skill(Declassifies).build();
     let out = rt.run("declassifies", json!({})).await.unwrap();
 
@@ -688,7 +682,7 @@ async fn notes_are_journaled_next_to_their_effects() {
         }
     }
 
-    let rt = Runtime::builder(store().await).skill(Explains).build();
+    let rt = Runtime::builder(store()).skill(Explains).build();
     let out = rt.run("explains", json!({})).await.unwrap();
     let records = rt.store().read(out.run_id, 1).await.unwrap();
 

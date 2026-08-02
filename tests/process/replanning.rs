@@ -13,7 +13,7 @@
 //! shaping the new plan may be attacker-chosen — and choosing the authorization
 //! graph is the whole game.
 
-#![cfg(feature = "turso")]
+#![cfg(feature = "redb")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use agentplane::core::{
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::plan::{ReplanError, Replanner};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 /// Always asks for a new plan — one that does not include this step.
@@ -119,13 +119,13 @@ impl Replanner for Fallback {
 }
 
 struct Fixture {
-    store: Arc<TursoStore>,
+    store: Arc<RedbStore>,
     rt: Runtime,
     replans: Arc<AtomicUsize>,
 }
 
-async fn fixture(planner: Fallback, untrusted: bool, budget: Budget) -> Fixture {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+fn fixture(planner: Fallback, untrusted: bool, budget: Budget) -> Fixture {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let replans = Arc::clone(&planner.calls);
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .owner("test")
@@ -161,7 +161,7 @@ fn planner() -> Fallback {
 /// A step asks for a new plan, gets one, and the run finishes on it.
 #[tokio::test]
 async fn a_run_can_change_its_plan_and_finish_on_the_new_one() {
-    let f = fixture(planner(), false, Budget::default().replans(2)).await;
+    let f = fixture(planner(), false, Budget::default().replans(2));
 
     let out = f.rt.run_plan(plan(), json!({})).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -181,7 +181,7 @@ async fn a_run_can_change_its_plan_and_finish_on_the_new_one() {
 /// successor names its predecessor.
 #[tokio::test]
 async fn both_plan_versions_are_journaled_and_the_successor_names_its_parent() {
-    let f = fixture(planner(), false, Budget::default().replans(2)).await;
+    let f = fixture(planner(), false, Budget::default().replans(2));
     let out = f.rt.run_plan(plan(), json!({})).await.unwrap();
 
     let plans: Vec<PlanIR> = f
@@ -218,7 +218,7 @@ async fn both_plan_versions_are_journaled_and_the_successor_names_its_parent() {
 /// input is describing exactly the attack.
 #[tokio::test]
 async fn replanning_is_refused_once_untrusted_data_is_in_working_memory() {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .owner("test")
@@ -311,7 +311,7 @@ async fn the_replan_budget_bounds_thrashing() {
         }
     }
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .budget(Budget::default().replans(2))
         .replanner(Arc::new(Loops))
@@ -328,7 +328,7 @@ async fn the_replan_budget_bounds_thrashing() {
 /// A runtime with no planner says so, rather than failing obscurely.
 #[tokio::test]
 async fn asking_to_replan_without_a_planner_names_the_missing_piece() {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         .skill(AsksToReplan {
             name: "cheap",
@@ -354,8 +354,7 @@ async fn a_planner_that_declines_stops_the_run_with_its_reason() {
         },
         false,
         Budget::default().replans(2),
-    )
-    .await;
+    );
 
     let out = f.rt.run_plan(plan(), json!({})).await.unwrap();
     match &out.status {
@@ -376,8 +375,7 @@ async fn a_successor_without_lineage_is_rejected() {
         },
         false,
         Budget::default().replans(2),
-    )
-    .await;
+    );
 
     let out = f.rt.run_plan(plan(), json!({})).await.unwrap();
     match &out.status {
@@ -395,7 +393,7 @@ async fn a_successor_without_lineage_is_rejected() {
 /// governed it. Same rule the first plan follows, for the same reason.
 #[tokio::test]
 async fn replay_reads_the_successor_back_instead_of_asking_again() {
-    let f = fixture(planner(), false, Budget::default().replans(2)).await;
+    let f = fixture(planner(), false, Budget::default().replans(2));
 
     let first = f.rt.run_plan(plan(), json!({})).await.unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
@@ -587,8 +585,8 @@ mod unwinding {
         }
     }
 
-    async fn runtime(planner: Arc<dyn Replanner>, log: &Log) -> Runtime {
-        let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    fn runtime(planner: Arc<dyn Replanner>, log: &Log) -> Runtime {
+        let store = Arc::new(RedbStore::open_in_memory().unwrap());
         Runtime::builder(store as Arc<dyn JournalStore>)
             .owner("test")
             .budget(Budget::default().replans(2))
@@ -633,7 +631,7 @@ mod unwinding {
     #[tokio::test]
     async fn a_successor_may_not_reuse_a_completed_step_id_for_other_work() {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
-        let rt = runtime(Arc::new(Swaps), &log).await;
+        let rt = runtime(Arc::new(Swaps), &log);
 
         let out = rt.run_plan(v1(), json!({})).await.unwrap();
         match &out.status {
@@ -663,7 +661,7 @@ mod unwinding {
     #[tokio::test]
     async fn a_step_completed_before_the_replan_is_compensated_after_it() {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
-        let rt = runtime(Arc::new(Extends), &log).await;
+        let rt = runtime(Arc::new(Extends), &log);
 
         let out = rt.run_plan(v1(), json!({})).await.unwrap();
         assert!(
@@ -690,7 +688,7 @@ mod unwinding {
     #[tokio::test]
     async fn a_completed_step_the_successor_drops_is_still_compensated() {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
-        let rt = runtime(Arc::new(Drops), &log).await;
+        let rt = runtime(Arc::new(Drops), &log);
 
         let out = rt.run_plan(v1(), json!({})).await.unwrap();
         assert!(

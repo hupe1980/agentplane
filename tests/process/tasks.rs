@@ -5,7 +5,7 @@
 //! no oversight because it launders the decision. So the tests here care as much
 //! about what a task *carries* as about whether the plumbing works.
 
-#![cfg(feature = "turso")]
+#![cfg(feature = "redb")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use agentplane::core::{
 };
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
-use agentplane::store::TursoStore;
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 fn key(v: &str) -> CorrelationKey {
@@ -87,12 +87,12 @@ impl Skill for ProposesRefund {
 }
 
 struct Fixture {
-    store: Arc<TursoStore>,
+    store: Arc<RedbStore>,
     rt: Runtime,
 }
 
-async fn fixture(skill: ProposesRefund) -> Fixture {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+fn fixture(skill: ProposesRefund) -> Fixture {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .events(store.clone() as Arc<dyn EventStore>)
@@ -111,7 +111,7 @@ fn officer() -> Vec<String> {
 /// A run that needs a human suspends, and the proposal lands in a queue.
 #[tokio::test]
 async fn a_run_awaiting_a_human_suspends_and_queues_a_task() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny)).await;
+    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
 
     let out =
         f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-1")])
@@ -137,7 +137,7 @@ async fn a_run_awaiting_a_human_suspends_and_queues_a_task() {
 /// approval you cannot evaluate is not a control.
 #[tokio::test]
 async fn a_task_carries_what_a_reviewer_needs_to_disagree() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny)).await;
+    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
     f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-2")])
         .await
         .unwrap();
@@ -167,7 +167,7 @@ async fn a_task_carries_what_a_reviewer_needs_to_disagree() {
 /// A decision resumes the run and is recorded with the name of whoever made it.
 #[tokio::test]
 async fn a_decision_resumes_the_run_and_names_the_decider() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny)).await;
+    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
     let out =
         f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-3")])
             .await
@@ -202,7 +202,7 @@ async fn a_decision_resumes_the_run_and_names_the_decider() {
 async fn the_proposer_may_not_approve_their_own_proposal() {
     let mut skill = ProposesRefund::new(OnExpiry::Deny);
     skill.exclude = Some("alice");
-    let f = fixture(skill).await;
+    let f = fixture(skill);
 
     f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-4")])
         .await
@@ -235,7 +235,7 @@ async fn the_proposer_may_not_approve_their_own_proposal() {
 /// Role eligibility is enforced, and the refusal says which check failed.
 #[tokio::test]
 async fn a_reviewer_without_the_role_is_refused() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny)).await;
+    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
     f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-5")])
         .await
         .unwrap();
@@ -255,7 +255,7 @@ async fn a_reviewer_without_the_role_is_refused() {
 /// Two reviewers cannot both hold one task.
 #[tokio::test]
 async fn a_task_is_claimed_by_exactly_one_reviewer() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny)).await;
+    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
     f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-6")])
         .await
         .unwrap();
@@ -273,7 +273,7 @@ async fn a_task_is_claimed_by_exactly_one_reviewer() {
 /// The queue only shows work the claim would actually permit.
 #[tokio::test]
 async fn the_queue_respects_roles() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny)).await;
+    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
     f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-7")])
         .await
         .unwrap();
@@ -306,7 +306,7 @@ async fn the_queue_respects_roles() {
 /// collision look like correct deduplication.
 #[tokio::test]
 async fn two_runs_of_one_plan_do_not_share_one_task() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny)).await;
+    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
 
     let a =
         f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-8")])
@@ -353,7 +353,7 @@ async fn two_runs_of_one_plan_do_not_share_one_task() {
 /// moment.** The safe default refuses.
 #[tokio::test]
 async fn an_unanswered_task_denies_by_default() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny)).await;
+    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
     let out =
         f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-8")])
             .await
@@ -384,7 +384,7 @@ async fn an_unanswered_task_denies_by_default() {
 #[tokio::test]
 async fn proceeding_unattended_requires_explicit_consent() {
     // `OnExpiry::Proceed` without `allow_unattended()`.
-    let f = fixture(ProposesRefund::new(OnExpiry::Proceed)).await;
+    let f = fixture(ProposesRefund::new(OnExpiry::Proceed));
     let out =
         f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-9")])
             .await
@@ -404,7 +404,7 @@ async fn proceeding_unattended_requires_explicit_consent() {
 async fn a_pre_authorised_task_proceeds_unattended() {
     let mut skill = ProposesRefund::new(OnExpiry::Proceed);
     skill.allow_unattended = true;
-    let f = fixture(skill).await;
+    let f = fixture(skill);
 
     let out =
         f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-10")])
@@ -428,7 +428,7 @@ async fn a_pre_authorised_task_proceeds_unattended() {
 /// sweep is safe on a timer.
 #[tokio::test]
 async fn an_escalating_task_is_escalated_once() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Escalate)).await;
+    let f = fixture(ProposesRefund::new(OnExpiry::Escalate));
     f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-11")])
         .await
         .unwrap();
@@ -476,7 +476,7 @@ async fn a_breached_obligation_escalates_the_case() {
         }
     }
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .skill(JustObliges)
@@ -544,7 +544,7 @@ async fn a_met_obligation_is_not_breached() {
         }
     }
 
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .skill(MeetsIt)
@@ -568,7 +568,7 @@ async fn a_met_obligation_is_not_breached() {
 /// A sweep on a healthy plane is silent — so a non-silent one means something.
 #[tokio::test]
 async fn a_quiet_plane_sweeps_quietly() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny)).await;
+    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
     let report =
         f.rt.sweep(Timestamp::now_utc(), time::Duration::days(365))
             .await
@@ -580,7 +580,7 @@ async fn a_quiet_plane_sweeps_quietly() {
 /// Human tasks need a task store, and saying so beats hanging forever.
 #[tokio::test]
 async fn tasks_without_a_task_store_are_refused() {
-    let store = Arc::new(TursoStore::open_in_memory().await.unwrap());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .events(store.clone() as Arc<dyn EventStore>)
@@ -600,7 +600,7 @@ async fn tasks_without_a_task_store_are_refused() {
 /// A second submission of the same decision is a duplicate, not a second answer.
 #[tokio::test]
 async fn a_resubmitted_decision_is_a_duplicate() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny)).await;
+    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
     f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-15")])
         .await
         .unwrap();

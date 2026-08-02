@@ -56,7 +56,7 @@ cargo run --example clearing_case      # correlation, obligations, human tasks
 cargo run --example plan_graph         # multi-step plans, contract, provenance
 
 # Calls a model and replays without calling it again — no API key, no network.
-cargo run --example model_run --features turso,testkit
+cargo run --example model_run --features redb,testkit
 ```
 
 `durable_pipeline` prints the whole claim in four steps: a live run, a strict
@@ -148,8 +148,8 @@ records.
 deprecation. The journal record format and the storage schema will change.
 
 Rust **1.94+**. `#![forbid(unsafe_code)]`. One crate, feature-gated: an embedded
-[Turso](https://github.com/tursodatabase/turso) store by default — SQLite
-semantics, pure Rust, no C toolchain — with everything else opt-in.
+[redb](https://github.com/cberner/redb) store by default — pure Rust, two crates
+deep, no C toolchain — with everything else opt-in.
 
 Honest framing on regulation: agentplane is not "compliant" and cannot be.
 Compliance attaches to a system in a context, assessed by its provider or

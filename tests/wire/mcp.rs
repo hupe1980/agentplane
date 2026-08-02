@@ -14,7 +14,7 @@
 //!   tool ran, so the disposition must be `Landed` and the runtime must never
 //!   repeat it.
 
-#![cfg(all(feature = "mcp", feature = "turso"))]
+#![cfg(all(feature = "mcp", feature = "redb"))]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;

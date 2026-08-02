@@ -49,13 +49,14 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["turso"]
-# Embedded journal + case store, on Turso — a SQLite-compatible engine written
-# in Rust. Single-node deployments; Postgres backs the active-active topology.
+default = ["redb"]
+# Embedded journal + case store, on redb: pure Rust, two crates deep, ACID
+# transactions across tables, and a stable on-disk format. Single-node
+# deployments; Postgres backs the active-active topology.
 #
-# Turso rather than `rusqlite`/`libsqlite3-sys`: no C toolchain in the build, and
-# a natively async driver instead of blocking calls dispatched to a thread pool.
-turso = ["dep:turso"]
+# Exactly-once is the table key rather than an index, so a duplicate effect
+# start is inexpressible rather than rejected.
+redb = ["dep:redb"]
 # Fault injection and other harness pieces, for this crate's assurance layers
 # and for embedders testing their own stores and skills. Never in a production
 # build — nothing in `testkit` is reachable without it.
@@ -64,7 +65,7 @@ testkit = []
 # policy seam and ships no evaluator, for the same reason it ships no tracing
 # exporter — picking one for the embedder is not its call.
 cedar = ["dep:cedar-policy"]
-# PostgreSQL-backed journal. The topology SQLite cannot serve: several plane
+# PostgreSQL-backed journal. The topology an embedded store cannot serve: several plane
 # instances sharing one store, where fencing and exactly-once must be arbitrated
 # by the database rather than by hoping the writers agree.
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
@@ -116,11 +117,7 @@ tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
 # not `futures` proper: the executor needs one combinator, not an ecosystem.
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 tracing     = "0.1"
-# `default-features = false` on purpose: the defaults are `fts` (pulls in
-# tantivy, a search engine) and `mimalloc` (a C allocator, which would put back
-# the C toolchain this backend exists to avoid). A journal needs neither, and
-# with both on CI ran out of disk.
-turso       = { version = "0.7", default-features = false, optional = true }
+redb        = { version = "3", optional = true }
 cedar-policy = { version = "4.12.0", default-features = false, optional = true }
 tokio-postgres = { version = "0.7.18", optional = true }
 deadpool-postgres = { version = "0.14.1", optional = true }
@@ -162,15 +159,15 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # their own backend must not be forced to compile SQLite.
 [[example]]
 name              = "durable_pipeline"
-required-features = ["turso"]
+required-features = ["redb"]
 
 [[example]]
 name              = "clearing_case"
-required-features = ["turso"]
+required-features = ["redb"]
 
 [[example]]
 name              = "plan_graph"
-required-features = ["turso"]
+required-features = ["redb"]
 
 # Needs `testkit` for the fake provider. Deliberately: an example that called a
 # real model would need an API key to run, and the claim it demonstrates — that
@@ -178,7 +175,7 @@ required-features = ["turso"]
 # stay a sentence in the README instead of something anyone can execute.
 [[example]]
 name              = "model_run"
-required-features = ["turso", "testkit"]
+required-features = ["redb", "testkit"]
 
 [lints.rust]
 unsafe_code = "forbid"

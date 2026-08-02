@@ -35,7 +35,7 @@ fn core_sources() -> Vec<(String, String)> {
 #[test]
 fn core_has_no_io_dependencies() {
     const FORBIDDEN: &[&str] = &[
-        "rusqlite",
+        "redb",
         "tokio::",
         "reqwest",
         "std::fs",
@@ -782,7 +782,7 @@ fn every_feature_a_test_gates_itself_on_exists() {
         .filter(|n| !n.is_empty() && !n.starts_with('#'))
         .collect();
     assert!(
-        declared.contains(&"turso".to_string()),
+        declared.contains(&"redb".to_string()),
         "the feature table was not parsed — this guard is inert: {declared:?}"
     );
 
