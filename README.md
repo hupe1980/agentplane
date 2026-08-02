@@ -77,6 +77,8 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | 💸 | **Budgets that bind** — a failed model call is billed for what it burned, because the provider bills for it too |
 | 👤 | **Human oversight** — durable worklists with four-eyes, declared expiry behaviour, and an operator who can *stop* a run and have it unwind |
 | 🔌 | **Real wires** — MCP tools, A2A peers, Anthropic and OpenAI drivers, each with a failure mapping that says whether the call landed |
+| 🗑️ | **Erasure that keeps the proof** — drop a payload's bytes and the chain still verifies, because it only ever committed to a digest. A later read says *expired, on this date, for this reason* — never *missing* |
+| 👁️ | **A witness that refuses** — a checkpoint is cosigned only if it provably extends the last one seen, so a shrunken log and a second history of the same size are both rejected |
 
 Full inventory, including what is **not** built →
 **[docs/status.md](https://hupe1980.github.io/agentplane/docs/status/)**
@@ -113,7 +115,7 @@ because a spec whose invariants cannot be violated proves nothing, each is
 re-checked against 18 deliberately broken copies of itself; every mutant must be
 caught by the *specific* invariant written for it.
 
-**🧬 Mutation testing over the code.** 107 guarantees are broken on purpose, and
+**🧬 Mutation testing over the code.** 109 guarantees are broken on purpose, and
 the test *named for each one* must fail. A mutation caught by some other test is
 reported **weak**, not passing — that usually means the guarantee has no test of
 its own and is being held up by one that could be rewritten without anyone

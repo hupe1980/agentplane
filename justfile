@@ -130,6 +130,10 @@ mutants-auto file:
 og:
     rsvg-convert -w 1200 -h 630 site/assets/og.svg -o site/static/og.png
 
+# build the first example a reader copies, exactly as they would
+doc-examples:
+    tools/check-doc-examples.sh
+
 # build the docs site into site/public
 site:
     cd site && zola build
@@ -166,7 +170,7 @@ publish-dry:
 # run them before a release, not on every save.
 
 # everything CI runs, minus the two slow layers
-ci: lint anchors test test-default test-minimal examples docs package
+ci: lint anchors test test-default test-minimal examples doc-examples docs package
 
 # everything, including the slow layers — what a release must pass
 ci-full: ci specs mutants

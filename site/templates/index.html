@@ -59,6 +59,18 @@
         operator who can <em>stop</em> a run and have it unwind.</p>
     </article>
     <article>
+      <h3>Erasure that keeps the proof</h3>
+      <p>Drop a payload's bytes and the chain still verifies — it only ever
+        committed to a digest. A later read says <em>expired, on this date, for
+        this reason</em>, never <em>missing</em>.</p>
+    </article>
+    <article>
+      <h3>A witness that refuses</h3>
+      <p>A checkpoint is cosigned only if it provably extends the last one seen.
+        A shrunken log is rejected, and so is a second history of the same size
+        — the split view.</p>
+    </article>
+    <article>
       <h3>Cases, not long-lived workflows</h3>
       <p>Runs stay minutes; business processes span months. A deploy never has to
         migrate an in-flight workflow.</p>

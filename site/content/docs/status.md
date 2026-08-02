@@ -62,6 +62,8 @@ feature, it is an intention — the mechanisms that make that checkable are in
 | ✅ | **HTTP surface** — worklist, claim/release, decisions, run status, event delivery, behind the `http` feature; the wire types cannot express who is acting |
 | ✅ | **Cancellation** — an operator stops a run; it unwinds what it did, refuses to unwind around an unknown outcome, and the record names who asked |
 | ✅ | **A2A** — peer calls over the wire behind the `a2a` feature; a peer's internal error is *in doubt*, a failed task has *landed* |
+| ✅ | **Witness cosigning** — the `Witness` seam and the decision that matters: a checkpoint is cosigned only if it *provably extends* the last one seen. A log that shrank is refused, and so is a second history of the same size — the split view. `MemoryWitness` implements it in-process |
+| ✅ | **Erasure with a tombstone** — a blob's bytes can be dropped while the chain still proves what happened, because the chain only ever committed to a digest. A reader afterwards gets `Expired` naming the date and reason, never `NotFound` — retention doing its job and data nobody can account for are different answers, and only one is an incident |
 | ✅ | **Content-addressed blobs** — the claim check, with the reference being the digest, so the chain commits to bytes it does not hold; a blob altered on disk is refused, not served. In memory, or on anything OpenDAL reaches behind the `opendal` feature |
 | ✅ | **A journal record size ceiling** — 1 MiB, refused rather than truncated, checked at the one point every backend seals through |
 | ✅ | **System instructions** — written once as `system` on the prompt, spelled the way each API wants it: a top-level `system` on Anthropic, `instructions` on OpenAI Responses. In the effect key like the rest of the prompt, so editing the instruction shows up on replay as divergence |
@@ -88,12 +90,11 @@ which is the distinction a status page exists to make.
 
 | | |
 |---|---|
-| ⬜ | **Witness cosigning** — publishing checkpoints to a witness that can attest they saw the log grow. Until then a checkpoint that never leaves the operator's store is only as trustworthy as the operator, and a *split view* — a different history shown to each auditor — is undetectable |
 | ⬜ | **Manifest loading, signing, registry** — the runtime is wired by builder calls in the embedder's code; the manifest that would replace them, and the digest-pinning that makes a prompt change a versioned artifact, are not implemented |
 | ⬜ | **Wasm skill tier** — the capability-absence sandbox where determinism is enforced rather than requested. The native tier is trusted by definition, which is recorded as a residual risk rather than a control |
 | ⬜ | **Memory and compaction** — no memory store, retrieval seam, or `cx.compact` effect. The shape is fixed by the effect protocol, which is why it is written down rather than improvised later |
-| ⬜ | **Symbolic policy analysis** — Cedar's `symcc` can *prove* properties of a policy set rather than test them; nothing invokes it yet |
-| ⬜ | **Retention and erasure** — no TTL, no expiry tombstone, no erasure unit. The journal keeps everything for ever, which is what Art. 12 wants and what an erasure request does not. The blob store is the half that exists: the chain commits only to a digest, so bytes can be removed without breaking it — the policy on top is missing |
+| ⬜ | **Symbolic policy analysis** — Cedar's `symcc` can *prove* properties of a policy set rather than test them; nothing invokes it yet. It needs an external **cvc5** solver binary, so when it lands it will be a development-time check you run when policy changes — never a runtime dependency, and never in the shipped binary |
+| ⬜ | **A remote witness** — the seam and its verification exist, but nothing yet speaks C2SP `tlog-witness` to a second party. A witness you host yourself proves nothing about you, so until somebody else runs one the split-view guarantee is a mechanism without a counterparty |
 | ⬜ | **Argument-level provenance** — a tool call's arguments carry one joined label, so a single untrusted field makes the whole call untrusted. That fails closed, so it is not a hole; the cost is pressure to declassify broadly, which turns a precise mechanism into a rubber stamp. Per-argument labelling is the known remedy |
 | ⬜ | **A2A server** — the client is built, including the failure mapping that decides whether a peer acted. Serving a signed Agent Card derived from the manifest is not |
 

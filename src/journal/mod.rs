@@ -10,8 +10,10 @@ mod record;
 mod replay;
 mod store;
 mod upcast;
+mod witness;
 
 pub use record::{Append, Record, RecordBody, RecordKind};
 pub use replay::{EffectReplay, ReplayCursor, StepCursor};
 pub use store::{Cancellation, Checkpoint, Head, Inclusion, JournalStore, Lease};
 pub use upcast::{Identity, Upcaster};
+pub use witness::{Cosignature, MemoryWitness, Witness, WitnessError};

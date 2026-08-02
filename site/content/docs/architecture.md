@@ -507,8 +507,11 @@ Rust struct.
 * **Publishing.** A checkpoint that never leaves the operator's store is only as
   trustworthy as the operator. It becomes evidence when compared against one they
   handed over earlier — which means witnesses, and those are not built.
-* **Split views** — one history to one auditor, a different one to another —
-  remain undetectable without a witness that has seen both.
+* **Split views** — one history to one auditor, a different one to another — are
+  refused by a witness that remembers, because the second history cannot prove
+  it extends the first. The check exists; what does not is a witness run by
+  somebody other than the operator. Hosting your own proves nothing about you,
+  so treat this as ready-to-connect rather than closed.
 Both backends maintain the log, and both keep their gaps. redb advances a
 counter row inside the sealing transaction; Postgres uses a **sequence**, because
 several instances seal concurrently there — that is the topology it exists for —

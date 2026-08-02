@@ -59,10 +59,13 @@ step that did not happen.
 | Checkable by someone else | An offline auditor (`audit`) that runs against a store it did not write, and reports what it *could not* check as prominently as what it did |
 
 **The limit, stated plainly:** a checkpoint that never leaves the operator's
-store is exactly as trustworthy as the operator. Publishing checkpoints to a
-witness is designed and **not built**, so a *split view* — a different history
-shown to two auditors — remains undetectable. See
-[status](@/docs/status.md).
+store is exactly as trustworthy as the operator. The `Witness` seam now exists
+and enforces the decision that matters — a checkpoint is cosigned only if it
+provably extends the last one seen, so a shrunken log and a *split view* (a
+second history of the same size) are both refused. What does **not** yet exist
+is a remote witness speaking C2SP `tlog-witness`. Until a second party runs one,
+this is a mechanism without a counterparty: a witness you host yourself proves
+nothing about you. See [status](@/docs/status.md).
 
 ### Art. 14 — human oversight, and the ability to intervene and stop
 
@@ -87,12 +90,18 @@ cover.
 
 The journal *is* the log, it verifies offline, and it exports in a portable form.
 
-**What is missing is retention tooling.** There is no TTL, no expiry tombstone,
-and no erasure unit — so a full-fidelity journal is simultaneously the Art. 26
-asset and a GDPR liability, and reconciling the two is currently your problem.
-The design intent is that the *case* is the erasure unit and that content can be
-dropped while the hash chain still verifies, which preserves "this record is
-unaltered" without retaining personal data. None of that is implemented.
+**Erasure is possible without breaking the record.** `BlobStore::expire` drops a
+blob's bytes and leaves a tombstone; the hash chain still verifies afterwards
+because it only ever committed to the digest. So you can prove *what happened*
+and *that the record is unaltered* without retaining the personal data — which
+is what makes Art. 26 and Art. 17 compatible rather than opposed.
+
+**What is still missing:** a scheduled TTL, and an erasure *unit*. You expire per
+digest, so mapping a data-subject request onto the right set of digests is your
+bookkeeping. And personal data that reached a journal **record** rather than a
+blob cannot be removed at all — the chain is append-only by design. Keep it out
+of records; the 1 MiB ceiling pushes bulk content out by construction, but a
+short string still fits.
 
 ---
 

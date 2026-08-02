@@ -31,7 +31,7 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 
-use crate::core::Digest;
+use crate::core::{Digest, Timestamp};
 
 #[cfg(feature = "opendal")]
 mod opendal_store;
@@ -64,6 +64,29 @@ pub enum BlobError {
     /// because it is used.
     #[error("blob at {expected} hashes to {actual} — the stored bytes were altered")]
     Corrupt { expected: String, actual: String },
+
+    /// The bytes were deliberately expired, and a tombstone says so.
+    ///
+    /// The whole reason retention needs a distinct answer rather than reusing
+    /// [`NotFound`](Self::NotFound). Three states an operator must be able to
+    /// tell apart, and only one of them is an incident:
+    ///
+    /// | | means |
+    /// |---|---|
+    /// | `NotFound` | nothing was ever here, or it was lost. Investigate. |
+    /// | `Expired` | retention did its job on a stated date, for a stated reason. |
+    /// | `Corrupt` | the bytes were altered. Page someone. |
+    ///
+    /// Collapsing the middle case into the first is what makes an erasure
+    /// request indistinguishable from data loss six months later — and the
+    /// journal cannot settle it, because the journal deliberately never held
+    /// the bytes.
+    #[error("blob at {digest} was expired at {at}: {reason}")]
+    Expired {
+        digest: String,
+        at: i64,
+        reason: String,
+    },
 }
 
 /// Bytes addressed by their own hash.
@@ -85,6 +108,23 @@ pub trait BlobStore: Send + Sync + Debug {
     /// [`BlobError::NotFound`] if nothing is stored there,
     /// [`BlobError::Corrupt`] if what is stored does not hash to `digest`.
     async fn get(&self, digest: Digest) -> Result<Vec<u8>, BlobError>;
+
+    /// Drop a blob's bytes, leaving a tombstone that says it was deliberate.
+    ///
+    /// This is the erasure half of retention, and it works *because* the chain
+    /// only ever committed to a digest: the record still proves what happened
+    /// and that it was not altered, while the bytes it described are gone. That
+    /// is the property an Article 17 request needs and an Article 12 obligation
+    /// must survive — they are only in tension if the payload lives in the
+    /// chain, which is why it does not.
+    ///
+    /// Expiring twice is the same expiry; the first tombstone stands, so a
+    /// retry cannot rewrite when or why the data went.
+    ///
+    /// # Errors
+    ///
+    /// If the backing store rejects the write.
+    async fn expire(&self, digest: Digest, at: Timestamp, reason: &str) -> Result<(), BlobError>;
 
     /// Whether anything is stored at that address.
     ///

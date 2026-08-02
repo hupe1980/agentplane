@@ -73,6 +73,13 @@ was guarded. And it **refuses to answer** (exit 2) while a sweep is running,
 because a sweep holds one file mutated at a time and every anchor result in that
 window is false. A checker that answers wrongly is worse than one that declines.
 
+**The first example must still build.** `just doc-examples` assembles the
+getting-started skill and wiring into a fresh crate and runs it, because
+`cargo test --doc` only covers rustdoc inside `src/` — the markdown a newcomer
+actually copies was unverified until this existed. It is part of `just ci`, so
+renaming a public item breaks it immediately rather than at somebody's first
+five minutes with the crate.
+
 **A doc update if you changed behaviour.** `site/content/docs/` is kept level
 with the code — it is the published documentation, not a copy of it.
 A design document that does not update on contact is decoration.

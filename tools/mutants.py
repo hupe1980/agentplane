@@ -562,6 +562,22 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        Some(crate::runtime::telemetry::GEN_AI_CHAT)",
         "        None",
     ),
+    "AWitnessSignsAnyHistory": (
+        "src/journal/witness.rs",
+        "a_forked_history_is_refused",
+        "a witness cosigns a checkpoint that does not extend what it saw, so an "
+        "operator can have two contradictory histories both vouched for",
+        "                if !merkle::verify_consistency(old, &old_root, new, &checkpoint.root, proof) {",
+        "                if false {",
+    ),
+    "ErasureLooksLikeDataLoss": (
+        "src/blob/memory.rs",
+        "an_expired_blob_is_not_reported_as_missing",
+        "a deliberate erasure is reported as a missing blob, so an operator "
+        "cannot tell retention doing its job from data nobody can account for",
+        "        match stone {\n            Some((at, reason)) => Err(BlobError::Expired {",
+        "        match None::<(i64, String)> {\n            Some((at, reason)) => Err(BlobError::Expired {",
+    ),
     "BlobsAreServedUnverified": (
         "src/blob/mod.rs",
         "altered_bytes_are_detected_rather_than_served",

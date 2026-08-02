@@ -173,10 +173,24 @@ rather than served. A token pointing at mutable storage would move the
 tamper-evidence boundary without saying so, and the journal would still look
 sound.
 
-**What it does not solve:** retention. The chain proves a blob was not altered;
-it cannot conjure one somebody deleted. A missing blob reports `NotFound` — a
-configuration problem — rather than a corruption, precisely so the two are not
-confused when someone is paged.
+**Erasing one later.** When a data-subject request arrives, drop the bytes and
+leave a record that you did:
+
+```rust
+blobs.expire(digest, cx.now().await?, "art-17 erasure request").await?;
+```
+
+The chain still verifies — it committed to the digest, not the content — so you
+keep the proof of what happened without keeping the data. A read afterwards
+returns `BlobError::Expired` with the date and reason, never `NotFound`:
+retention doing its job and a blob nobody can account for are different answers,
+and only one of them is worth waking somebody for.
+
+**What it does not solve:** scheduling, and anything already inside a record. There
+is no TTL — you decide when to call `expire`. And personal data written into a
+*journal record* cannot be removed at all, because the chain is append-only. The
+1 MiB refusal keeps bulk content out by construction, but a short string still
+fits, so keep identifiers out of records deliberately.
 
 ---
 

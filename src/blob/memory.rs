@@ -6,12 +6,15 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use super::{BlobError, BlobStore, verify};
-use crate::core::Digest;
+use crate::core::{Digest, Timestamp};
 
 /// Blobs held in memory for the life of the process.
 #[derive(Debug, Default)]
 pub struct MemoryBlobs {
     blobs: Mutex<BTreeMap<[u8; 32], Vec<u8>>>,
+    /// `digest -> (when, why)`. Kept after the bytes go, because "deliberately
+    /// expired" and "missing" are different answers to an operator.
+    tombstones: Mutex<BTreeMap<[u8; 32], (i64, String)>>,
 }
 
 impl MemoryBlobs {
@@ -81,10 +84,43 @@ impl BlobStore for MemoryBlobs {
             .map_err(|_| BlobError::Backend("blob mutex poisoned".into()))?
             .get(digest.as_bytes())
             .cloned();
-        match found {
-            Some(bytes) => verify(digest, bytes),
+        if let Some(bytes) = found {
+            return verify(digest, bytes);
+        }
+        // Checked only once the bytes are absent: a tombstone beside live bytes
+        // would be a contradiction, and answering from it would hide them.
+        let stone = self
+            .tombstones
+            .lock()
+            .map_err(|_| BlobError::Backend("blob mutex poisoned".into()))?
+            .get(digest.as_bytes())
+            .cloned();
+        match stone {
+            Some((at, reason)) => Err(BlobError::Expired {
+                digest: digest.to_hex(),
+                at,
+                reason,
+            }),
             None => Err(BlobError::NotFound(digest.to_hex())),
         }
+    }
+
+    async fn expire(&self, digest: Digest, at: Timestamp, reason: &str) -> Result<(), BlobError> {
+        let mut stones = self
+            .tombstones
+            .lock()
+            .map_err(|_| BlobError::Backend("blob mutex poisoned".into()))?;
+        // First expiry wins: a retry must not rewrite when the data went, for
+        // the same reason a repeated stop request does not reassign who asked.
+        stones
+            .entry(digest.as_bytes().to_owned())
+            .or_insert_with(|| (at.unix_timestamp(), reason.to_owned()));
+        drop(stones);
+        self.blobs
+            .lock()
+            .map_err(|_| BlobError::Backend("blob mutex poisoned".into()))?
+            .remove(digest.as_bytes());
+        Ok(())
     }
 
     async fn has(&self, digest: Digest) -> Result<bool, BlobError> {

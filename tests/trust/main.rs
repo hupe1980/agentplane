@@ -22,3 +22,4 @@ mod cedar;
 mod identity;
 mod peers;
 mod policy;
+mod witness;

@@ -454,13 +454,33 @@ What exists today:
   operation, and the chain still verifies afterwards because it only ever
   committed to the digest.
 
-**What is not built:** there is no TTL, no expiry tombstone, and no erasure unit.
-The design intent is that the *case* is what an erasure request targets and that
-blob content can lapse while the chain still proves what happened — but nothing
-implements it, so a deployment with erasure obligations needs its own retention
-policy over the blob store and its own answer for personal data that reached a
-journal record. [Regulation](@/docs/regulation.md) says the same thing in the
-obligations' own terms, and [status](@/docs/status.md) tracks it.
+- **Blob bytes can be erased, and the erasure is recorded.** `BlobStore::expire`
+  drops the content and leaves a tombstone. A reader afterwards gets `Expired`
+  with the date and the reason — not `NotFound` — because "retention did its job"
+  and "data is missing and nobody knows why" are different answers and only one
+  of them is an incident. Expiring twice keeps the first tombstone, so a retry
+  cannot rewrite when the data went.
+
+**On scheduling, and why there is no TTL here.** Every object store this runs on
+already expires objects far better than a sweeper could — S3 lifecycle rules,
+GCS object lifecycle, Azure blob lifecycle — and they run without your process
+being alive. Reimplementing that would be a worse copy of a solved problem.
+
+The catch is worth knowing before you rely on it: **a lifecycle rule deletes,
+it does not tombstone.** A blob removed that way reads as `NotFound`, and the
+distinction between "retention did its job" and "data is missing and nobody
+knows why" is gone. So use lifecycle rules for bulk age-based expiry where that
+distinction does not matter, and call `expire` explicitly for erasure requests,
+where being able to say *when and why* is the entire point.
+
+**What is still not built** is the erasure *unit* — you call `expire` per digest,
+so mapping "erase everything for this data subject" onto a set of digests is your
+bookkeeping. The design intent is that the *case* is that unit, which needs an
+index from case to the digests it produced; that index does not exist yet. Personal data that
+reached a journal *record* rather than a blob also cannot be removed: the chain
+is append-only, which is the point. Keep it out of records — the 1 MiB refusal
+pushes bulk content out by construction, but a short string still fits.
+[Regulation](@/docs/regulation.md) says the same in the obligations' own terms.
 
 ## 🚑 Runbook
 
