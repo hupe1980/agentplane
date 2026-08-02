@@ -67,6 +67,12 @@ Two outcomes are errors rather than skips, and both mean the row is testing
 nothing: an anchor that no longer matches, and a mutation that does not compile.
 The mutation has to *remove the guarantee*, not break the file.
 
+`just anchors` also checks that the README and the design document state the
+real number of mutations — a count drifted three times in one day before that
+was guarded. And it **refuses to answer** (exit 2) while a sweep is running,
+because a sweep holds one file mutated at a time and every anchor result in that
+window is false. A checker that answers wrongly is worse than one that declines.
+
 **A doc update if you changed behaviour.** `site/content/docs/` is kept level
 with the code — it is the published documentation, not a copy of it.
 A design document that does not update on contact is decoration.
@@ -93,6 +99,30 @@ checking the value are three ways to write a test that cannot fail.
 degradation, compensation failure, or unmatched inbound event. Each is a loud,
 typed, journaled event someone can be paged on. If your change makes something
 fail quietly, it will be asked to fail loudly instead.
+
+## 🖼️ The site
+
+`just site` builds it; `just site-serve` runs it with reload. Two things are
+generated rather than committed by hand:
+
+- `site/static/og.png` — the social card, rasterised from `site/assets/og.svg`
+  by `just og`. The SVG is the source, so the card is reviewable in a diff
+  rather than an opaque binary.
+
+  The PNG is **committed** rather than built in CI, because the pipeline has no
+  rasteriser and a social card is not worth adding one for. That does make it a
+  second copy: **edit the SVG and it is stale until you run `just og`.** Nothing
+  checks this, so it is on you.
+- `site/public/` — the build output.
+
+Diagrams are **hand-authored inline SVG**, not a diagram-as-code toolchain.
+Three diagrams do not justify a Node build step, and inline SVG inherits the
+page's colours through `currentColor`, so it themes for free and costs nothing
+at runtime. Every one needs `<title>` and `<desc>` — a diagram a screen reader
+cannot read is decoration.
+
+`zola check` fails on a broken internal link *or anchor*, which is the check the
+prose most often gets wrong.
 
 ## 🧭 Finding your way
 

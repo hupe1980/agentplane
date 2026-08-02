@@ -826,7 +826,15 @@ impl<'a> StepCtx<'a> {
             { telemetry::EFFECT_MUTATES } = effect.mutates(),
             { telemetry::EFFECT_REPLAYED } = false,
             { telemetry::OUTCOME } = tracing::field::Empty,
+            // Present only on the effects that *are* GenAI operations. Recorded
+            // rather than declared with a value so a clock read does not carry
+            // an empty `gen_ai.operation.name`, which would make the attribute
+            // useless for the tooling that keys on it.
+            { telemetry::GEN_AI_OPERATION } = tracing::field::Empty,
         );
+        if let Some(op) = effect.gen_ai_operation() {
+            span.record(telemetry::GEN_AI_OPERATION, op);
+        }
         // `Instrument`, never `enter()`. An `Entered` guard held across an
         // `.await` stays entered on the *thread*, so when the future yields,
         // whatever runs next is attributed to this span. With concurrent step

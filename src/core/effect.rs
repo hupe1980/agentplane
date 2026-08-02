@@ -175,6 +175,26 @@ pub trait Effect: Send + Sync {
     /// a hook rather than a constructor argument.
     fn attach(&mut self, _provenance: &Provenance) {}
 
+    /// Which `OpenTelemetry` `GenAI` operation this effect is, if it is one.
+    ///
+    /// Returned as the value of `gen_ai.operation.name` — `execute_tool` for a
+    /// tool call, `chat` for a completion. Observability tooling keys on that
+    /// attribute, so an effect that does not answer here is invisible *as an
+    /// agent operation* even though its span is emitted: a trace shows the
+    /// agent invocation and nothing about the calls inside it.
+    ///
+    /// Defaulted to `None`, which is the honest answer for the effects that are
+    /// not `GenAI` operations at all — reading the clock, sleeping, writing case
+    /// state. Labelling those would make the convention meaningless.
+    ///
+    /// The conventions are still pre-1.0, which is why the version this targets
+    /// is pinned in [`telemetry::SEMCONV_VERSION`] rather than tracked.
+    ///
+    /// [`telemetry::SEMCONV_VERSION`]: crate::runtime::telemetry::SEMCONV_VERSION
+    fn gen_ai_operation(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Whether this mutates external state.
     ///
     /// Drives the recovery default and the policy engine's `resource.mutates`

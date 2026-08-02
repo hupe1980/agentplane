@@ -53,7 +53,7 @@ Read those five lines slowly, because they are the product:
 
 ```toml
 [dependencies]
-agentplane = "0.1"
+agentplane = "0.2"
 ```
 
 An embedded [redb](https://github.com/cberner/redb) store is the default backend
@@ -61,7 +61,7 @@ An embedded [redb](https://github.com/cberner/redb) store is the default backend
 your build. Everything else is opt-in:
 
 ```toml
-agentplane = { version = "0.1", features = ["postgres", "http", "mcp", "providers", "cedar", "signing"] }
+agentplane = { version = "0.2", features = ["postgres", "http", "mcp", "providers", "cedar", "signing"] }
 ```
 
 | feature | gives you |

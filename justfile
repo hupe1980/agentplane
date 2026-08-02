@@ -126,6 +126,10 @@ mutants:
 mutants-auto file:
     cargo mutants --all-features -f {{file}} -j 4
 
+# regenerate the social card from its SVG source (needs librsvg)
+og:
+    rsvg-convert -w 1200 -h 630 site/assets/og.svg -o site/static/og.png
+
 # build the docs site into site/public
 site:
     cd site && zola build

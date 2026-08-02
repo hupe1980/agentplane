@@ -54,6 +54,7 @@ feature, it is an intention — the mechanisms that make that checkable are in
 | ✅ | **MCP** — real round trips over `rmcp`, behind the `mcp` feature; every transport failure states whether the call reached the server |
 | ✅ | **Cedar** — the policy seam's first adapter, behind the `cedar` feature; a policy that *fails to evaluate* is reported as broken, not as a refusal |
 | ✅ | **Authorization** — a total, fail-closed policy seam; denials journaled, and replay never re-opens the gate |
+| ✅ | **OpenTelemetry GenAI conventions** — the run span carries `gen_ai.operation.name = invoke_agent`; tool calls carry `execute_tool` and model calls `chat`, declared by the effect itself rather than sniffed from its name. Effects that are *not* GenAI operations carry no such attribute, which is what keeps it meaningful. The conventions are pre-1.0, so the version targeted is pinned rather than tracked |
 | ✅ | **Metrics** — a declared catalogue of counters and observed gauges, guarded against declared-but-unemitted |
 | ✅ | **redb** — the default embedded backend: pure Rust, two crates deep, ACID transactions across tables, stable on-disk format |
 | ✅ | **PostgreSQL** — journal *and* case layer, for the shared-store topology |
@@ -92,7 +93,6 @@ which is the distinction a status page exists to make.
 | ⬜ | **Wasm skill tier** — the capability-absence sandbox where determinism is enforced rather than requested. The native tier is trusted by definition, which is recorded as a residual risk rather than a control |
 | ⬜ | **Memory and compaction** — no memory store, retrieval seam, or `cx.compact` effect. The shape is fixed by the effect protocol, which is why it is written down rather than improvised later |
 | ⬜ | **Symbolic policy analysis** — Cedar's `symcc` can *prove* properties of a policy set rather than test them; nothing invokes it yet |
-| ⬜ | **OpenTelemetry GenAI conventions on effect spans** — the run span carries `gen_ai.operation.name = invoke_agent`; the tool and model calls inside it do not carry `execute_tool` / `chat`, nor the model and token attributes. Observability tooling that keys on those sees the agent invocation and not what it did. The conventions are still pre-1.0, which is why the version this targets is pinned rather than tracked |
 | ⬜ | **Retention and erasure** — no TTL, no expiry tombstone, no erasure unit. The journal keeps everything for ever, which is what Art. 12 wants and what an erasure request does not. The blob store is the half that exists: the chain commits only to a digest, so bytes can be removed without breaking it — the policy on top is missing |
 | ⬜ | **Argument-level provenance** — a tool call's arguments carry one joined label, so a single untrusted field makes the whole call untrusted. That fails closed, so it is not a hole; the cost is pressure to declassify broadly, which turns a precise mechanism into a rubber stamp. Per-argument labelling is the known remedy |
 | ⬜ | **A2A server** — the client is built, including the failure mapping that decides whether a peer acted. Serving a signed Agent Card derived from the manifest is not |

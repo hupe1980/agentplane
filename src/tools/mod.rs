@@ -359,6 +359,10 @@ impl ToolCall {
 
 #[async_trait]
 impl Effect for ToolCall {
+    fn gen_ai_operation(&self) -> Option<&'static str> {
+        Some(crate::runtime::telemetry::GEN_AI_EXECUTE_TOOL)
+    }
+
     type Output = Value;
 
     fn descriptor(&self) -> EffectDescriptor {

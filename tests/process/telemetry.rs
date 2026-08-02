@@ -44,9 +44,18 @@ struct Recorder {
     /// Currently entered, innermost last.
     stack: Arc<Mutex<Vec<(u64, String)>>>,
     next: Arc<Mutex<u64>>,
+    /// Values written *after* a span opened, as `field=value`.
+    ///
+    /// Needed because an attribute the runtime only knows once it has the
+    /// effect in hand — `gen_ai.operation.name` — is `record`ed rather than
+    /// declared, and a recorder that drops `record` cannot see it at all.
+    recorded: Arc<Mutex<Vec<String>>>,
 }
 
 impl Recorder {
+    fn recorded(&self) -> Vec<String> {
+        self.recorded.lock().unwrap().clone()
+    }
     fn spans(&self) -> Vec<String> {
         self.spans.lock().unwrap().clone()
     }
@@ -83,7 +92,26 @@ impl Subscriber for Recorder {
         let id = *next;
         span::Id::from_u64(id)
     }
-    fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+    fn record(&self, _: &span::Id, values: &span::Record<'_>) {
+        struct Capture<'a>(&'a Recorder);
+        impl tracing::field::Visit for Capture<'_> {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0
+                    .recorded
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}={v:?}", f.name()));
+            }
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                self.0
+                    .recorded
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}={v}", f.name()));
+            }
+        }
+        values.record(&mut Capture(self));
+    }
     fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
     fn event(&self, event: &Event<'_>) {
         self.events
@@ -406,5 +434,94 @@ async fn concurrent_steps_do_not_capture_each_others_spans() {
         rec.still_entered().is_empty(),
         "spans were left entered after the run finished: {:?}",
         rec.still_entered()
+    );
+}
+
+// ── GenAI semantic conventions ──────────────────────────────────────────────
+
+/// A skill whose one effect is a model completion.
+///
+/// Gated with its test: the fake provider lives in `testkit`, so the type
+/// itself does not exist in a build without that feature.
+#[cfg(feature = "testkit")]
+#[derive(Debug)]
+struct Asks(Arc<agentplane::testkit::FakeProvider>);
+
+#[cfg(feature = "testkit")]
+#[async_trait::async_trait]
+impl Skill for Asks {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("asks").provides("demo.asks")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let call = agentplane::model::ModelCall::new(
+            Arc::clone(&self.0) as Arc<dyn agentplane::model::ModelProvider>,
+            agentplane::model::ModelId::new("fake", "m"),
+            json!("hello"),
+        );
+        cx.effect(call).await?;
+        Ok(Outcome::done(input))
+    }
+}
+
+/// **A completion is reported as a `GenAI` operation, not just as an effect.**
+///
+/// `gen_ai.operation.name` is the attribute observability tooling keys on. A
+/// span without it is emitted and still invisible *as an agent operation*, so a
+/// trace would show the agent invocation and nothing about the model call
+/// inside it — which is precisely the view an operator needs when a run gets
+/// expensive or slow.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_model_call_is_reported_as_a_gen_ai_chat() {
+    let rec = Recorder::default();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let provider = Arc::new(agentplane::testkit::FakeProvider::new());
+    provider.will_say("ok");
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(Asks(Arc::clone(&provider)))
+        .build();
+
+    let _ambient = crate::ambient_subscriber();
+    let guard = tracing::subscriber::set_default(rec.clone());
+    let out = rt.run("demo.asks", json!({})).await.unwrap();
+    drop(guard);
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    let recorded = rec.recorded();
+    let want = format!("{}={}", telemetry::GEN_AI_OPERATION, telemetry::GEN_AI_CHAT);
+    assert!(
+        recorded.contains(&want),
+        "the model call's span carries no `{want}`; recorded: {recorded:?}"
+    );
+}
+
+/// **An effect that is not a `GenAI` operation does not claim to be one.**
+///
+/// Stated separately because the opposite defect is just as bad and would pass
+/// the test above: labelling a clock read or a case-state write as `chat` makes
+/// the attribute meaningless, and every dashboard built on it wrong.
+#[tokio::test]
+async fn an_ordinary_effect_carries_no_gen_ai_operation() {
+    let rec = Recorder::default();
+    let (_s, rt) = runtime(healthy());
+
+    let _ambient = crate::ambient_subscriber();
+    let guard = tracing::subscriber::set_default(rec.clone());
+    let out = rt.run("demo.one", json!({})).await.unwrap();
+    drop(guard);
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    let recorded = rec.recorded();
+    assert!(
+        !recorded
+            .iter()
+            .any(|r| r.starts_with(telemetry::GEN_AI_OPERATION)),
+        "a non-GenAI effect was labelled as one: {recorded:?}"
     );
 }

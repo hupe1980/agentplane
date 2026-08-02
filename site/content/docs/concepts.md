@@ -72,6 +72,57 @@ versioning trap: a six-week workflow pins your code version for six weeks, and
 every deploy needs a migration story for in-flight instances. Inverting it —
 short runs, long cases — makes deploys free.
 
+<figure class="diagram">
+<svg viewBox="0 0 640 210" role="img" aria-labelledby="rc-t rc-d" xmlns="http://www.w3.org/2000/svg">
+  <title id="rc-t">A case spans weeks; the runs inside it last minutes</title>
+  <desc id="rc-d">One case, correlated by a business key, persists across weeks.
+    Inside it, several short runs execute and finish — one on a reply arriving,
+    one on a deadline, one on a human decision. Each run pins a code version only
+    for its own lifetime, so a deploy between runs needs no migration.</desc>
+
+  <line class="arrow" x1="20" y1="176" x2="620" y2="176" marker-end="url(#rh)"/>
+  <text class="sub" x="20" y="198">day 0</text>
+  <text class="sub" x="560" y="198">week 6</text>
+
+  <rect class="box" x="20" y="26" width="600" height="44" rx="9"/>
+  <text class="lbl" x="36" y="46">case · correlated by business key</text>
+  <text class="sub" x="36" y="62">state, deadlines, worklist — outlives every run below</text>
+
+  <g>
+    <rect class="run" x="52"  y="104" width="86" height="40" rx="8"/>
+    <text class="lbl" x="95"  y="122" text-anchor="middle">run</text>
+    <text class="sub" x="95"  y="137" text-anchor="middle">admit</text>
+
+    <rect class="run" x="238" y="104" width="86" height="40" rx="8"/>
+    <text class="lbl" x="281" y="122" text-anchor="middle">run</text>
+    <text class="sub" x="281" y="137" text-anchor="middle">reply</text>
+
+    <rect class="run" x="424" y="104" width="86" height="40" rx="8"/>
+    <text class="lbl" x="467" y="122" text-anchor="middle">run</text>
+    <text class="sub" x="467" y="137" text-anchor="middle">deadline</text>
+  </g>
+
+  <g class="tick">
+    <line x1="95"  y1="70" x2="95"  y2="104"/>
+    <line x1="281" y1="70" x2="281" y2="104"/>
+    <line x1="467" y1="70" x2="467" y2="104"/>
+  </g>
+
+  <text class="danger-lbl" x="186" y="92" text-anchor="middle">deploy — no migration</text>
+  <path class="danger" d="M186 96 V150"/>
+
+  <defs>
+    <marker id="rh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="currentColor" class="arrow"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The runs are short by design. A six-week workflow would pin its code
+version for six weeks and make every deploy a migration problem; short runs
+inside a long case move that cost to one place — case state, written with the
+version you read.</figcaption>
+</figure>
+
 The cost is that continuity must be explicit: case state, not local variables.
 And because a case is shared by several runs, writing it takes the version you
 read:

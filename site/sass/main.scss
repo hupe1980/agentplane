@@ -175,3 +175,5 @@ section > h2 { font-size: clamp(1.5rem, 3.4vw, 2.05rem); margin: 0 0 1.1rem; }
 .results .empty button { background: none; border: 0; color: var(--accent); cursor: pointer; font: inherit; text-decoration: underline; padding: 0; }
 
 @media (max-width: 720px) { .search { order: 3; width: 100%; margin: .5rem 0 0; } .search input { width: 100%; } }
+.diagram .run { fill: color-mix(in srgb, var(--accent) 12%, var(--card)); stroke: var(--accent); }
+.diagram .tick line { stroke: var(--line); stroke-dasharray: 3 3; }

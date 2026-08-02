@@ -315,6 +315,48 @@ rather than of the schedule.
 
 `Quarantined` sits highest because it is the only one that must *not* unwind.
 
+<figure class="diagram">
+<svg viewBox="0 0 640 190" role="img" aria-labelledby="st-t st-d" xmlns="http://www.w3.org/2000/svg">
+  <title id="st-t">Terminal run statuses, ordered by severity</title>
+  <desc id="st-d">When concurrently dispatched siblings disagree about how a run
+    ended, severity decides, not the order they happened to be scheduled in.
+    Quarantined outranks Failed, which outranks Exhausted, which outranks
+    Suspended. Only Quarantined refuses to unwind.</desc>
+
+  <rect class="box" x="14"  y="58" width="132" height="52" rx="9"/>
+  <rect class="box" x="176" y="58" width="132" height="52" rx="9"/>
+  <rect class="box" x="338" y="58" width="132" height="52" rx="9"/>
+  <rect class="box" x="500" y="58" width="126" height="52" rx="9"/>
+
+  <text class="lbl" x="80"  y="80"  text-anchor="middle">Quarantined</text>
+  <text class="sub" x="80"  y="97"  text-anchor="middle">must NOT unwind</text>
+  <text class="lbl" x="242" y="80"  text-anchor="middle">Failed</text>
+  <text class="sub" x="242" y="97"  text-anchor="middle">unwinds</text>
+  <text class="lbl" x="404" y="80"  text-anchor="middle">Exhausted</text>
+  <text class="sub" x="404" y="97"  text-anchor="middle">unwinds</text>
+  <text class="lbl" x="563" y="80"  text-anchor="middle">Suspended</text>
+  <text class="sub" x="563" y="97"  text-anchor="middle">still working</text>
+
+  <path class="arrow" d="M146 84 H170" marker-end="url(#sh)"/>
+  <path class="arrow" d="M308 84 H332" marker-end="url(#sh)"/>
+  <path class="arrow" d="M470 84 H494" marker-end="url(#sh)"/>
+
+  <text class="sub" x="14"  y="34">outranks →</text>
+  <text class="danger-lbl" x="80" y="140" text-anchor="middle">an outcome nobody can account for</text>
+  <text class="sub" x="563" y="140" text-anchor="middle">a wait, not an ending</text>
+
+  <defs>
+    <marker id="sh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="currentColor" class="arrow"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Ready order decides only <em>within</em> a severity, which keeps the
+outcome a property of the plan rather than of the schedule. Reporting a
+suspension over a failure would defer the unwind until an event that may never
+arrive.</figcaption>
+</figure>
+
 ### A failed compensation is not compensated further
 
 It is not a problem more compensation solves. Unwinding further would undo steps

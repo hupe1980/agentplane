@@ -199,9 +199,24 @@ JSON logs, a test recorder — without the crate choosing an exporter.
 agentplane.run                     gen_ai.operation.name = invoke_agent
 └── agentplane.step                agentplane.step.id, .capability, .phase
     └── agentplane.effect          .kind, .attempt, .mutates, .replayed
+                                   gen_ai.operation.name = execute_tool | chat
 ```
 
-Three decisions worth knowing:
+Spans follow the **OpenTelemetry GenAI semantic conventions** where they apply:
+a tool call is `execute_tool`, a completion is `chat`. Each effect *declares* its
+own operation rather than having one inferred from its name, so a new effect
+type cannot pick up a label by accident.
+
+Effects that are not GenAI operations — reading the clock, arming a timer,
+writing case state — carry no such attribute at all. That is deliberate:
+labelling them would make the attribute useless to the tooling that keys on it,
+which is the whole reason to emit it.
+
+The conventions are still pre-1.0, so the revision targeted is pinned in
+`telemetry::SEMCONV_VERSION` rather than tracked. An upstream change becomes a
+deliberate migration instead of a silent shift in what your dashboards mean.
+
+Three further decisions worth knowing:
 
 - **One span per effect *attempt*.** A retried call shows as several spans rather
   than one long one, which is what makes "how often does this driver need a

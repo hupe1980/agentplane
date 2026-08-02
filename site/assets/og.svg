@@ -1,0 +1,38 @@
+<!-- Source for static/og.png. Authored as SVG so the social card is reviewable
+     in a diff rather than an opaque binary; `just og` rasterises it. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#161d27"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1200" height="7" fill="#ff7b50"/>
+
+  <g transform="translate(88, 132)">
+    <rect x="0" y="0" width="46" height="46" rx="11" fill="#ff7b50"/>
+    <text x="70" y="35" font-family="Helvetica, Arial, sans-serif" font-size="40"
+          font-weight="700" fill="#e6edf3">agentplane</text>
+  </g>
+
+  <text x="88" y="290" font-family="Helvetica, Arial, sans-serif" font-size="62"
+        font-weight="700" fill="#e6edf3">The journal <tspan fill="#ff7b50">is</tspan> the</text>
+  <text x="88" y="362" font-family="Helvetica, Arial, sans-serif" font-size="62"
+        font-weight="700" fill="#e6edf3">plan of record.</text>
+
+  <text x="88" y="428" font-family="Helvetica, Arial, sans-serif" font-size="27"
+        fill="#9aa4b2">A durable, replayable, policy-governed agent runtime in Rust.</text>
+
+  <g font-family="Helvetica, Arial, sans-serif" font-size="21" fill="#9aa4b2">
+    <text x="88"  y="524">Crash mid-run and resume</text>
+    <text x="440" y="524">Replay and perform nothing</text>
+    <text x="836" y="524">Prove what happened</text>
+  </g>
+  <g fill="#ff7b50">
+    <rect x="88"  y="546" width="34" height="4" rx="2"/>
+    <rect x="440" y="546" width="34" height="4" rx="2"/>
+    <rect x="836" y="546" width="34" height="4" rx="2"/>
+  </g>
+</svg>

@@ -554,6 +554,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                None if require_signature => {",
         "                None if false => {",
     ),
+    "ModelCallsAreNotGenAiOperations": (
+        "src/model/mod.rs",
+        "a_model_call_is_reported_as_a_gen_ai_chat",
+        "a completion emits a span with no gen_ai.operation.name, so tracing "
+        "shows the agent invocation and nothing about the model call inside it",
+        "        Some(crate::runtime::telemetry::GEN_AI_CHAT)",
+        "        None",
+    ),
     "BlobsAreServedUnverified": (
         "src/blob/mod.rs",
         "altered_bytes_are_detected_rather_than_served",
@@ -1119,6 +1127,19 @@ def check() -> int:
     routine — rewriting the model drivers for streaming broke seven at once — so
     this is a text-only check something cheap can run.
     """
+    # A sweep mutates source in place and restores it afterwards, leaving a
+    # `.orig` beside whatever it currently holds. Anchor results are meaningless
+    # in that window — the file genuinely does not contain its anchor — and
+    # reporting them as failures sends someone hunting a defect that will
+    # disappear on its own. Refuse to answer rather than answer wrongly.
+    held = sorted(p.relative_to(ROOT) for p in ROOT.glob("src/**/*.rs.orig"))
+    if held:
+        print("a mutation sweep is running; these files are mutated right now:")
+        for f in held:
+            print(f"  {f.with_suffix('')}")
+        print("anchor results would be false. Re-run when the sweep finishes.")
+        return 2
+
     bad = 0
     for name, (path, _test, _desc, find, _replace) in MUTANTS.items():
         target = ROOT / path
@@ -1130,8 +1151,38 @@ def check() -> int:
         if n != 1:
             print(f"{name}: anchors {n} times in {path} (expected 1)")
             bad += 1
+    bad += _check_counts()
     print(f"checked {len(MUTANTS)} mutations, {bad} broken")
     return 1 if bad else 0
+
+
+def _check_counts() -> int:
+    """The prose must state the real number of mutations.
+
+    Checked here because it drifted three times in one day: the README and the
+    design document each carry the count, and a mutation added without touching
+    them leaves both quietly wrong. A number nobody verifies is a claim, and
+    this project's whole argument is about the difference.
+    """
+    import re
+
+    actual = len(MUTANTS)
+    bad = 0
+    for rel, pattern in (
+        ("README.md", r"(\d+) guarantees are broken on purpose"),
+        ("CONCEPT.md", r"checked-in table of (\d+) mutations"),
+    ):
+        path = ROOT / rel
+        if not path.exists():
+            continue  # CONCEPT.md is internal and may be absent
+        m = re.search(pattern, path.read_text())
+        if not m:
+            print(f"{rel}: the mutation count sentence is gone; this guard is now inert")
+            bad += 1
+        elif int(m.group(1)) != actual:
+            print(f"{rel}: claims {m.group(1)} mutations, the table has {actual}")
+            bad += 1
+    return bad
 
 
 def main() -> int:

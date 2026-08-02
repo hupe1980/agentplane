@@ -154,7 +154,7 @@ For real deployments, `OpenDalBlobs` puts them on anything
 [OpenDAL](https://opendal.apache.org) reaches — filesystem, S3, GCS, Azure:
 
 ```toml
-agentplane = { version = "0.1", features = ["opendal"] }
+agentplane = { version = "0.2", features = ["opendal"] }
 ```
 
 ```rust

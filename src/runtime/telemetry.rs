@@ -62,6 +62,23 @@ pub const EFFECT_SPAN: &str = "agentplane.effect";
 pub const GEN_AI_OPERATION: &str = "gen_ai.operation.name";
 /// The value of [`GEN_AI_OPERATION`] for a run.
 pub const GEN_AI_INVOKE_AGENT: &str = "invoke_agent";
+/// The value of [`GEN_AI_OPERATION`] for a tool call.
+pub const GEN_AI_EXECUTE_TOOL: &str = "execute_tool";
+/// The value of [`GEN_AI_OPERATION`] for a model completion.
+pub const GEN_AI_CHAT: &str = "chat";
+
+/// Which provider served a completion — `anthropic`, `openai`.
+pub const GEN_AI_PROVIDER: &str = "gen_ai.provider.name";
+/// The model asked for, which is not always the model that answered.
+pub const GEN_AI_REQUEST_MODEL: &str = "gen_ai.request.model";
+/// The model that actually answered, as the provider reported it.
+pub const GEN_AI_RESPONSE_MODEL: &str = "gen_ai.response.model";
+/// Prompt tokens billed.
+pub const GEN_AI_INPUT_TOKENS: &str = "gen_ai.usage.input_tokens";
+/// Completion tokens billed.
+pub const GEN_AI_OUTPUT_TOKENS: &str = "gen_ai.usage.output_tokens";
+/// The tool a call named, for `execute_tool` spans.
+pub const GEN_AI_TOOL_NAME: &str = "gen_ai.tool.name";
 
 pub const RUN_ID: &str = "agentplane.run.id";
 pub const CASE_ID: &str = "agentplane.case.id";

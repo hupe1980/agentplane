@@ -465,6 +465,10 @@ impl ModelCall {
 impl Effect for ModelCall {
     type Output = Completion;
 
+    fn gen_ai_operation(&self) -> Option<&'static str> {
+        Some(crate::runtime::telemetry::GEN_AI_CHAT)
+    }
+
     fn descriptor(&self) -> EffectDescriptor {
         // The prompt is in the key. A changed prompt is a changed effect, so an
         // edited template shows up on replay as divergence rather than as a run
