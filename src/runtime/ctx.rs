@@ -750,15 +750,7 @@ impl<'a> StepCtx<'a> {
             %reason,
         );
         metrics::count(metrics::POLICY_DENIALS, crate::core::ACTION_PERFORM);
-        self.append_effect(
-            key,
-            RecordKind::PolicyDenied {
-                reason: reason.clone(),
-                action: crate::core::ACTION_PERFORM.to_owned(),
-                resource: descriptor.kind.clone(),
-            },
-        )
-        .await?;
+
 
         // Counted after the record, and the ordering matters: the refusal has
         // already happened and belongs in the journal whatever the ceiling says.

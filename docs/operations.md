@@ -86,17 +86,18 @@ reason — a `SELECT` then `INSERT` returns the correct answer every time it is
 called one at a time.
 
 So correlation also has a racing check, and the first version of it was useless.
-Two concurrent callers serialised often enough that **dropping the unique index
+Two concurrent callers serialised often enough that **dropping the constraint
 that arbitrates correlation went undetected**. Only mutation-testing the battery
 found it; eight racers across four keys catches it on every run.
 
 * **A race test that does not reliably race reports green** — an untested
   guarantee wearing a test's clothing.
 * **A race check corroborates, it does not prove.** Passing means no interleaving
-  found a violation; the constraint in the schema is what makes absence real.
+  found a violation; the constraint in the store is what makes absence real.
 
-A store that serialises internally — the embedded store behind one connection —
-passes trivially and correctly, having no race to lose.
+A store that serialises internally — redb admits one writer at a time — passes
+trivially and correctly, having no race to lose. That is not a reason to skip it:
+the check exists for the backend where the race is real.
 
 ### Postgres
 

@@ -6,7 +6,7 @@
 //! separate write has exactly that window.
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::case::{ClaimError, TaskStore};
 use crate::core::{CaseId, StoreError, Task, TaskId, TaskState, Timestamp};
@@ -29,11 +29,24 @@ const OVERDUE: TableDefinition<(i64, &str), ()> = TableDefinition::new("tasks_ov
 /// `(case_id, created_at, task_id) -> ()`.
 const BY_CASE: TableDefinition<(&str, i64, &str), ()> = TableDefinition::new("tasks_by_case");
 
+/// `task_id -> ()`, every task still waiting on somebody.
+///
+/// Its length *is* the backlog. Counting by walking `TASKS` would parse a task
+/// from JSON per row to read one field, which turns an operator's dashboard
+/// refresh into a full deserialization of the worklist.
+///
+/// Wider than [`QUEUE`], deliberately: a claimed task has left the queue but is
+/// still a decision the plane is waiting on, and a backlog that shrank the
+/// moment a reviewer opened something would report progress that had not
+/// happened.
+const PENDING: TableDefinition<&str, ()> = TableDefinition::new("tasks_pending");
+
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
     w.open_table(TASKS).map_err(|e| be(&e))?;
     w.open_table(QUEUE).map_err(|e| be(&e))?;
     w.open_table(OVERDUE).map_err(|e| be(&e))?;
     w.open_table(BY_CASE).map_err(|e| be(&e))?;
+    w.open_table(PENDING).map_err(|e| be(&e))?;
     Ok(())
 }
 
@@ -84,6 +97,18 @@ fn reindex(
         _ => {}
     }
     drop(queue);
+
+    let mut pending = w.open_table(PENDING).map_err(|e| be(&e))?;
+    match (is_pending(before), is_pending(after)) {
+        (true, false) => {
+            pending.remove(id).map_err(|e| be(&e))?;
+        }
+        (false, true) => {
+            pending.insert(id, ()).map_err(|e| be(&e))?;
+        }
+        _ => {}
+    }
+    drop(pending);
 
     if let Some(due) = was.due_at {
         let mut overdue = w.open_table(OVERDUE).map_err(|e| be(&e))?;
@@ -148,6 +173,12 @@ impl TaskStore for RedbStore {
                             w.open_table(OVERDUE)
                                 .map_err(|e| be(&e))?
                                 .insert((d, id.as_str()), ())
+                                .map_err(|e| be(&e))?;
+                        }
+                        if pending {
+                            w.open_table(PENDING)
+                                .map_err(|e| be(&e))?
+                                .insert(id.as_str(), ())
                                 .map_err(|e| be(&e))?;
                         }
                         if let Some(c) = &case {
@@ -341,20 +372,10 @@ impl TaskStore for RedbStore {
     async fn open_count(&self) -> Result<u64, StoreError> {
         self.with_db(|db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
-            let tasks = r.open_table(TASKS).map_err(|e| be(&e))?;
-            // `claimed` counts: a task someone reserved and has not answered is
-            // still a decision the plane is waiting on. Excluding it would make
-            // the backlog shrink the moment a reviewer opened it — which is why
-            // this is not the queue index's length.
-            let mut n = 0u64;
-            for e in tasks.iter().map_err(|e| be(&e))? {
-                let (_, v) = e.map_err(|e| be(&e))?;
-                let t: Task = serde_json::from_str(v.value())?;
-                if is_pending(t.state.as_str()) {
-                    n += 1;
-                }
-            }
-            Ok(n)
+            r.open_table(PENDING)
+                .map_err(|e| be(&e))?
+                .len()
+                .map_err(|e| be(&e))
         })
         .await
     }

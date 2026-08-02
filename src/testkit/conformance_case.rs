@@ -405,6 +405,63 @@ pub async fn check_events(store: &Arc<dyn EventStore>, r: &mut Report) {
     a_repeated_event_id_is_not_buffered_twice(store, r).await;
     an_event_is_claimed_by_one_waiter_only(store, r).await;
     a_waiter_is_matched_by_one_event_only(store, r).await;
+    a_claimed_event_is_never_retired(store, r).await;
+}
+
+/// A delivered message is not garbage.
+///
+/// The sweep exists to retire messages nobody ever wanted. A backend that finds
+/// its sweep candidates through a derived index — rather than by reading every
+/// event — has to keep that index in step with the rows, and the failure is
+/// silent in the worst way: the message *was* delivered, the run *did* resume,
+/// and the operator's dead-letter queue reports it as never claimed.
+///
+/// So the grace window here is deliberately absurd. Everything buffered is old
+/// enough to retire, and the claim is the only thing standing between this
+/// event and the dead-letter list.
+async fn a_claimed_event_is_never_retired(store: &Arc<dyn EventStore>, r: &mut Report) {
+    r.checked += 1;
+    let event = InboundEvent {
+        id: "evt-swept".into(),
+        kind: "ack".into(),
+        correlation: keys("E-9"),
+        payload: serde_json::json!({}),
+    };
+    let _ = store.buffer(&event, ts(1_000)).await;
+
+    let sub = Subscription {
+        run: RunId::generate(),
+        case: None,
+        effect: effect(90),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "ack".into(),
+        correlation: keys("E-9"),
+    };
+    let _ = store.subscribe(&sub, ts(1_000)).await;
+    if !matches!(store.claim_for(&sub, ts(1_001)).await, Ok(Some(_))) {
+        r.record("sweep", "a waiting subscription did not claim its event");
+        return;
+    }
+
+    if let Err(e) = store.sweep_unclaimed(ts(9_000), "expired").await {
+        // Reported rather than ignored: a sweep that errors retires nothing, so
+        // discarding this would let a broken sweep read as a clean one.
+        r.record("sweep", format!("sweep_unclaimed failed: {e}"));
+        return;
+    }
+
+    match store.dead_letters(100).await {
+        Ok(dead) => {
+            if dead.iter().any(|d| d.event.id == "evt-swept") {
+                r.record(
+                    "sweep",
+                    "an event that was claimed and delivered was retired as unclaimed.                      The run already resumed on it, so the dead-letter queue is now                      reporting a message that was in fact acted on",
+                );
+            }
+        }
+        Err(e) => r.record("sweep", format!("dead_letters failed: {e}")),
+    }
 }
 
 async fn a_repeated_event_id_is_not_buffered_twice(store: &Arc<dyn EventStore>, r: &mut Report) {
@@ -570,6 +627,60 @@ pub async fn check_tasks(store: &Arc<dyn TaskStore>, r: &mut Report) {
     an_excluded_actor_cannot_claim(store, r).await;
     ineligibility_outranks_contention(store, r).await;
     only_the_holder_releases(store, r).await;
+    the_backlog_counts_work_somebody_is_holding(store, r).await;
+}
+
+/// Claiming a task does not answer it.
+///
+/// `open_count` is what an operator watches to know whether the plane is keeping
+/// up. A backend that counts only *unclaimed* work — or that keeps a derived
+/// count and forgets to move it when a task is claimed — makes the backlog fall
+/// the moment somebody opens an item, which reads as progress and is not.
+///
+/// Completing it is what should decrement the count, and this checks both edges
+/// rather than only the first, because a count that never moves would pass a
+/// check that only claimed.
+async fn the_backlog_counts_work_somebody_is_holding(store: &Arc<dyn TaskStore>, r: &mut Report) {
+    r.checked += 1;
+    let t = task(70, None);
+    let Ok(opened) = store.open(&t).await else {
+        r.record("backlog", "open failed");
+        return;
+    };
+    let before = store.open_count().await.unwrap_or(0);
+
+    let roles = vec!["ops".to_owned()];
+    if store.claim(opened.id, "reviewer", &roles).await.is_err() {
+        r.record("backlog", "the task could not be claimed");
+        return;
+    }
+    let claimed = store.open_count().await.unwrap_or(0);
+    if claimed != before {
+        r.record(
+            "backlog",
+            format!(
+                "the backlog moved from {before} to {claimed} when a task was merely                  claimed. A task somebody is holding is still a decision the plane is                  waiting on, so this reports progress that has not happened"
+            ),
+        );
+    }
+
+    if store
+        .set_state(opened.id, TaskState::Completed)
+        .await
+        .is_err()
+    {
+        r.record("backlog", "the task could not be completed");
+        return;
+    }
+    let done = store.open_count().await.unwrap_or(0);
+    if done + 1 != claimed {
+        r.record(
+            "backlog",
+            format!(
+                "the backlog went from {claimed} to {done} when a task was completed;                  it must fall by exactly one. A count that never moves is a dashboard                  that cannot show the queue draining"
+            ),
+        );
+    }
 }
 
 fn task(id: u8, excluded: Option<&str>) -> Task {

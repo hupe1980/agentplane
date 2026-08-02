@@ -178,9 +178,11 @@ second attempt outright.
 
 Two properties follow:
 
-- **Exactly-once** — the store's partial unique index on `(run_id, effect_key)`
-  where `kind = 'EffectStarted'` makes this a database invariant. Not a code
-  path someone might forget to call.
+- **Exactly-once** — the store keys effect starts by `(run_id, effect_key)`, so
+  a second start for one effect is a store invariant rather than a code path
+  someone might forget to call. On redb the key *is* the table's identity, so a
+  duplicate is inexpressible; on Postgres it is a partial unique index, which
+  says the same thing in that engine's terms.
 - **Divergence detection** — the key is position-sensitive, so a build that
   performs different effects, or the same effects in a different order, cannot
   quietly reuse a recorded run's history.
@@ -380,9 +382,11 @@ Three details are decisions rather than implementation:
 * **Leaf and interior hashes are domain-separated by a prefix byte.** Without
   it a leaf can be made to collide with an interior node, and an attacker who
   controls leaf content presents a subtree as a leaf.
-* **The log position is `MAX + 1`, not a count.** A count reuses a deleted run's
-  index, so a removed run can be silently replaced at the same position — and
-  even the log size looks unchanged.
+* **The log position always advances; it is never a count of what survives.** A
+  count reuses a deleted run's index, so a removed run can be silently replaced
+  at the same position — and even the log size looks unchanged. redb keeps a
+  monotonic counter, Postgres a sequence; both hand out a position that has
+  never been issued before.
 * **The proof does not authenticate its own parameters.** An inclusion proof is
   checked against `(leaf, index, size, root)`, all supplied by whoever offers it;
   the size and root come from a *signed checkpoint*. Expecting the fold to
@@ -420,12 +424,18 @@ Rust struct.
   handed over earlier — which means witnesses, and those are not built.
 * **Split views** — one history to one auditor, a different one to another —
   remain undetectable without a witness that has seen both.
-Both backends maintain the log. The embedded store positions leaves with
-`MAX + 1`; Postgres
-uses a **sequence**, because several instances seal concurrently there — that is
-the topology it exists for — and `MAX + 1` computed by two transactions at once
-hands both the same position. A sequence is monotonic under concurrency and never
-reissues after a delete.
+Both backends maintain the log, and both keep their gaps. redb advances a
+counter row inside the sealing transaction; Postgres uses a **sequence**, because
+several instances seal concurrently there — that is the topology it exists for —
+and a position derived from the current maximum by two transactions at once hands
+both the same slot.
+
+Positions therefore have holes once a run is removed, deliberately: a freed slot
+must never be reissued. The *tree* is built by walking the log in key order,
+which yields dense positions with no holes — so the position a proof uses is the
+run's rank in that walk, not its stored index. Handing back the stored index
+makes every run after a deleted one fail to prove an inclusion that is perfectly
+valid.
 
 ### Hash the bytes you wrote
 
@@ -629,13 +639,17 @@ on business keys, never a model call.
 
 Two schema constraints carry the correctness:
 
-- A **unique index on `(namespace, value)` for open cases** makes "concurrent
-  messages for one new case produce one case" a database invariant. Without it,
-  two inbound messages racing at admission fragment a process across two cases
-  and its obligations are tracked in neither.
-- An index on `(state, resolved_at)` keeps the deadline sweep a range scan at a
-  hundred thousand open obligations rather than a table scan that quietly stops
-  finishing on time.
+- **Open cases are keyed by `(namespace, value)`**, so "concurrent messages for
+  one new case produce one case" is a store invariant. Without it, two inbound
+  messages racing at admission fragment a process across two cases and its
+  obligations are tracked in neither.
+- **Every sweep has its own index, keyed by the instant it looks for.**
+  Obligations by when they first need attention, inbound events by arrival while
+  unclaimed, tasks by their closing window, the worklist backlog by membership.
+  Each keeps its sweep a bounded range scan at a hundred thousand open items,
+  rather than a table scan that quietly stops finishing on time — and on redb
+  each index is written in the same transaction as the row it describes, so it
+  cannot be left describing something that was never committed.
 
 Every record of a case-bound run carries its case id, so "show me everything
 about this matter" is one indexed range scan instead of a join across runs.
@@ -1429,8 +1443,8 @@ above this one.
 
 The obvious check — no effect performed twice — is nearly vacuous here, and the
 reason generalises. Exactly-once is enforced at two layers: replay reads a
-completed effect back from the journal, and beneath it the store holds a partial
-unique index on `EffectStarted` per `(run, effect_key)`. Delete the replay path
+completed effect back from the journal, and beneath it the store keys effect
+starts by `(run, effect_key)`. Delete the replay path
 entirely and the world *still* contains no duplicate, because the re-announcement
 is rejected one layer down. The sweep goes green over a runtime that has stopped
 replaying at all.

@@ -554,6 +554,22 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                None if require_signature => {",
         "                None if false => {",
     ),
+    "TheSweepForgetsToDeindexAClaim": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "a delivered message is left sweepable, so the run resumes on it and the "
+        "dead-letter queue reports it as never claimed",
+        "                        drop(events);\n                        // No longer sweepable: the index moves with the row it\n                        // describes, in the row's transaction.\n                        w.open_table(EVENTS_LIVE)\n                            .map_err(|e| be(&e))?\n                            .remove((received, id.as_str()))\n                            .map_err(|e| be(&e))?;",
+        "                        drop(events);",
+    ),
+    "TheBacklogDropsClaimedWork": (
+        "src/store/redb_tasks.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "the backlog counts only unclaimed work, so it falls the moment a "
+        "reviewer opens an item and reports progress that has not happened",
+        "            r.open_table(PENDING)",
+        "            r.open_table(QUEUE)",
+    ),
     "TheStoreDropsTheSignature": (
         "src/store/redb.rs",
         "redb_satisfies_the_journal_store_contract",
