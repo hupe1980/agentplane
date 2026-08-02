@@ -390,18 +390,23 @@ impl Row {
             .key_id
             .zip(self.signature)
             .map(|(key_id, signature)| crate::core::Attestation { key_id, signature });
-        Ok(Record::from_stored_attested(
+        Record::from_stored_attested(
             self.body,
             Digest::from_bytes(self.prev_hash),
             Digest::from_bytes(self.hash),
             attestation,
-        )?)
+        )
     }
 }
 
-fn push_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
-    out.extend_from_slice(b);
+fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    // A record is refused above `MAX_RECORD_BYTES`, so no field can reach 4 GiB
+    // — but the cast is checked anyway rather than assumed, because a silent
+    // wrap here would write a length prefix that disagrees with the payload and
+    // corrupt every record after it.
+    let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
 }
 
 fn take_bytes(raw: &[u8], at: usize) -> Option<(Vec<u8>, usize)> {

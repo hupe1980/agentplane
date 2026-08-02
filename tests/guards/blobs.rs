@@ -14,6 +14,10 @@ use agentplane::blob::{BlobError, BlobStore, MemoryBlobs};
 use agentplane::core::Digest;
 
 fn stores() -> Vec<(&'static str, Arc<dyn BlobStore>)> {
+    // `mut` only when a second backend exists to push. Without the annotation
+    // this is an unused-mut error in every build that does not enable
+    // `opendal` — which `--all-features` can never show you.
+    #[cfg_attr(not(feature = "opendal"), allow(unused_mut))]
     let mut out: Vec<(&'static str, Arc<dyn BlobStore>)> =
         vec![("memory", Arc::new(MemoryBlobs::new()))];
 

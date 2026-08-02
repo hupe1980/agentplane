@@ -9,8 +9,10 @@ use crate::core::{CaseId, EffectKey, Phase, RunId, StoreError, Timer, Timestamp}
 use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
 /// `(run_id, effect_key) -> (case_id, has_case, step, phase, fire_at, claimed_at, has_claim)`.
-const TIMERS: TableDefinition<(&str, &str), (&str, u8, u32, &str, i64, i64, u8)> =
-    TableDefinition::new("timers");
+/// `(case_id, has_case, step, phase, fire_at, claimed_at, has_claim)`.
+type TimerRow<'a> = (&'a str, u8, u32, &'a str, i64, i64, u8);
+
+const TIMERS: TableDefinition<(&str, &str), TimerRow<'static>> = TableDefinition::new("timers");
 
 /// `(fire_at, run_id, effect_key) -> ()`. The sweep's only access path.
 const TIMERS_DUE: TableDefinition<(i64, &str, &str), ()> = TableDefinition::new("timers_due");

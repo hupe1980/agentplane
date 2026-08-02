@@ -154,9 +154,10 @@ impl TaskStore for RedbStore {
                 let mut tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
                 // First open wins, by id: reopening must not rewrite a task
                 // somebody may already hold.
-                match load(&tasks, &id)? {
-                    Some(found) => found,
-                    None => {
+                if let Some(found) = load(&tasks, &id)? {
+                    found
+                } else {
+                    {
                         tasks
                             .insert(id.as_str(), encoded.as_str())
                             .map_err(|e| be(&e))?;

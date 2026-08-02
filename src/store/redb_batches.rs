@@ -16,8 +16,10 @@ const BATCHES: TableDefinition<&str, (&str, u8)> = TableDefinition::new("batches
 /// The row exists from the moment the item is reserved, which is what makes an
 /// interrupted item findable: a crash leaves no outcome beside a run id that can
 /// be replayed.
-const ITEMS: TableDefinition<(&str, &str), (&str, &str, u8, &str, i64, i64)> =
-    TableDefinition::new("batch_items");
+/// `(run_id, outcome, has_outcome, detail, tokens, minor)`.
+type ItemRow<'a> = (&'a str, &'a str, u8, &'a str, i64, i64);
+
+const ITEMS: TableDefinition<(&str, &str), ItemRow<'static>> = TableDefinition::new("batch_items");
 
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
     w.open_table(BATCHES).map_err(|e| be(&e))?;
@@ -113,7 +115,7 @@ impl BatchStore for RedbStore {
         key: &str,
         run: RunId,
     ) -> Result<ItemRecord, StoreError> {
-        let (b, k, r) = (batch.to_string(), key.to_owned(), run.to_string());
+        let (batch_key, item, run_id) = (batch.to_string(), key.to_owned(), run.to_string());
         self.with_db(move |db| {
             let w = begin_write(db)?;
             let out = {
@@ -122,18 +124,18 @@ impl BatchStore for RedbStore {
                 // already reserved the caller must get the *original* run id.
                 // Overwriting would orphan the first run's journal and re-perform
                 // its effects, which is the one thing this row exists to prevent.
-                if t.get((b.as_str(), k.as_str()))
+                if t.get((batch_key.as_str(), item.as_str()))
                     .map_err(|e| be(&e))?
                     .is_none()
                 {
                     t.insert(
-                        (b.as_str(), k.as_str()),
-                        (r.as_str(), "", 0u8, "", 0i64, 0i64),
+                        (batch_key.as_str(), item.as_str()),
+                        (run_id.as_str(), "", 0u8, "", 0i64, 0i64),
                     )
                     .map_err(|e| be(&e))?;
                 }
                 let row = t
-                    .get((b.as_str(), k.as_str()))
+                    .get((batch_key.as_str(), item.as_str()))
                     .map_err(|e| be(&e))?
                     .map(|v| {
                         let (run, oc, has, detail, tokens, minor) = v.value();
@@ -147,10 +149,10 @@ impl BatchStore for RedbStore {
                         )
                     });
                 let Some((run_s, outcome, has, detail, tokens, minor)) = row else {
-                    return Err(StoreError::NotFound(format!("{b}/{k}")));
+                    return Err(StoreError::NotFound(format!("{batch_key}/{item}")));
                 };
                 ItemRecord {
-                    key: k.clone(),
+                    key: item.clone(),
                     run: RunId::parse(&run_s).map_err(|e| StoreError::Corrupt {
                         seq: 0,
                         detail: format!("bad run id '{run_s}': {e}"),
@@ -175,7 +177,7 @@ impl BatchStore for RedbStore {
         outcome: &ItemOutcome,
         spend: Spend,
     ) -> Result<(), StoreError> {
-        let (b, k) = (batch.to_string(), key.to_owned());
+        let (batch_key, item) = (batch.to_string(), key.to_owned());
         let (state, detail) = outcome_to_row(outcome);
         let tokens = i64::try_from(spend.tokens).unwrap_or(i64::MAX);
         let minor = spend.minor_units;
@@ -184,12 +186,12 @@ impl BatchStore for RedbStore {
             {
                 let mut t = w.open_table(ITEMS).map_err(|e| be(&e))?;
                 let run = t
-                    .get((b.as_str(), k.as_str()))
+                    .get((batch_key.as_str(), item.as_str()))
                     .map_err(|e| be(&e))?
                     .map(|v| v.value().0.to_owned());
                 if let Some(run) = run {
                     t.insert(
-                        (b.as_str(), k.as_str()),
+                        (batch_key.as_str(), item.as_str()),
                         (run.as_str(), state, 1u8, detail.as_str(), tokens, minor),
                     )
                     .map_err(|e| be(&e))?;
@@ -202,7 +204,7 @@ impl BatchStore for RedbStore {
     }
 
     async fn cursor(&self, batch: BatchId) -> Result<Option<String>, StoreError> {
-        let b = batch.to_string();
+        let batch_key = batch.to_string();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(ITEMS).map_err(|e| be(&e))?;
@@ -213,7 +215,7 @@ impl BatchStore for RedbStore {
             // complete while it is not.
             let mut last_terminal: Option<String> = None;
             for e in t
-                .range((b.as_str(), "")..=(b.as_str(), MAX_STR))
+                .range((batch_key.as_str(), "")..=(batch_key.as_str(), MAX_STR))
                 .map_err(|e| be(&e))?
             {
                 let (k, v) = e.map_err(|e| be(&e))?;
@@ -229,13 +231,13 @@ impl BatchStore for RedbStore {
     }
 
     async fn census(&self, batch: BatchId) -> Result<BatchCensus, StoreError> {
-        let b = batch.to_string();
+        let batch_key = batch.to_string();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(ITEMS).map_err(|e| be(&e))?;
             let mut c = BatchCensus::default();
             for e in t
-                .range((b.as_str(), "")..=(b.as_str(), MAX_STR))
+                .range((batch_key.as_str(), "")..=(batch_key.as_str(), MAX_STR))
                 .map_err(|e| be(&e))?
             {
                 let (_, v) = e.map_err(|e| be(&e))?;
@@ -261,13 +263,13 @@ impl BatchStore for RedbStore {
     }
 
     async fn items(&self, batch: BatchId, limit: usize) -> Result<Vec<ItemRecord>, StoreError> {
-        let b = batch.to_string();
+        let batch_key = batch.to_string();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(ITEMS).map_err(|e| be(&e))?;
             let mut out = Vec::new();
             for e in t
-                .range((b.as_str(), "")..=(b.as_str(), MAX_STR))
+                .range((batch_key.as_str(), "")..=(batch_key.as_str(), MAX_STR))
                 .map_err(|e| be(&e))?
             {
                 if out.len() >= limit {

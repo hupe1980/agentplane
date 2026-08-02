@@ -19,8 +19,10 @@ use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
 /// `event_id -> (kind, payload, received_at, claimed_by, claimed_at, has_claim,
 /// dead, dead_reason)`.
-const EVENTS: TableDefinition<&str, (&str, &str, i64, &str, i64, u8, u8, &str)> =
-    TableDefinition::new("inbound_events");
+/// `(kind, payload, received_at, claimed_by, claimed_at, has_claim, dead, dead_reason)`.
+type EventRow<'a> = (&'a str, &'a str, i64, &'a str, i64, u8, u8, &'a str);
+
+const EVENTS: TableDefinition<&str, EventRow<'static>> = TableDefinition::new("inbound_events");
 
 /// `(event_id, namespace, value) -> ()`, an event's own keys.
 const EVENT_CORR: TableDefinition<(&str, &str, &str), ()> =
@@ -34,11 +36,17 @@ const EVENT_BY_KEY: TableDefinition<(&str, &str, i64, &str), ()> =
     TableDefinition::new("inbound_by_key");
 
 /// `(run_id, effect_key, namespace, value) -> (case_id, has_case, step, phase, kind, created_at)`.
-const SUBS: TableDefinition<(&str, &str, &str, &str), (&str, u8, u32, &str, &str, i64)> =
+/// `(case_id, has_case, step, phase, kind, created_at)`.
+type SubRow<'a> = (&'a str, u8, u32, &'a str, &'a str, i64);
+
+const SUBS: TableDefinition<(&str, &str, &str, &str), SubRow<'static>> =
     TableDefinition::new("subscriptions");
 
+/// `(event_kind, namespace, value, created_at, run_id, effect_key)`.
+type SubKey<'a> = (&'a str, &'a str, &'a str, i64, &'a str, &'a str);
+
 /// `(event_kind, namespace, value, created_at, run_id, effect_key) -> ()`.
-const SUBS_BY_KEY: TableDefinition<(&str, &str, &str, i64, &str, &str), ()> =
+const SUBS_BY_KEY: TableDefinition<SubKey<'static>, ()> =
     TableDefinition::new("subscriptions_by_key");
 
 /// `(received_at, event_id) -> ()`, unclaimed and live — the sweep's access
@@ -112,6 +120,62 @@ fn load_correlation(
         out.push(CorrelationKey::new(ns.to_owned(), v.to_owned()));
     }
     Ok(out)
+}
+
+/// A waiting subscription's identity and the fields needed to rebuild it:
+/// `(run_id, effect_key, case_id, has_case, step, phase)`.
+type Waiter = (String, String, String, u8, u32, String);
+
+/// The oldest subscription waiting on any of `keys` for this event kind.
+///
+/// Separate from [`EventStore::match_waiter`] because it answers a different
+/// question — *who is waiting* — from the one the caller acts on, which is
+/// *may I claim this for them*. Returns the wait's identity and the fields the
+/// caller needs to rebuild it.
+fn oldest_waiter(
+    by_key: &impl ReadableTable<SubKey<'static>, ()>,
+    subs: &impl ReadableTable<(&'static str, &'static str, &'static str, &'static str), SubRow<'static>>,
+    kind: &str,
+    keys: &[CorrelationKey],
+) -> Result<Option<Waiter>, StoreError> {
+    for k in keys {
+        for e in by_key
+            .range(
+                (
+                    kind,
+                    k.namespace.as_str(),
+                    k.value.as_str(),
+                    i64::MIN,
+                    "",
+                    "",
+                )
+                    ..=(
+                        kind,
+                        k.namespace.as_str(),
+                        k.value.as_str(),
+                        i64::MAX,
+                        MAX_STR,
+                        MAX_STR,
+                    ),
+            )
+            .map_err(|e| be(&e))?
+        {
+            let (sk, _) = e.map_err(|e| be(&e))?;
+            let (_, ns, val, _, run, effect) = sk.value();
+            if let Some(v) = subs.get((run, effect, ns, val)).map_err(|e| be(&e))? {
+                let (case, has_case, step, phase, _, _) = v.value();
+                return Ok(Some((
+                    run.to_owned(),
+                    effect.to_owned(),
+                    case.to_owned(),
+                    has_case,
+                    step,
+                    phase.to_owned(),
+                )));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[async_trait]
@@ -330,46 +394,7 @@ impl EventStore for RedbStore {
             let found = {
                 let by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
                 let subs = w.open_table(SUBS).map_err(|e| be(&e))?;
-
-                let mut hit = None;
-                'outer: for k in &keys {
-                    for e in by_key
-                        .range(
-                            (
-                                kind.as_str(),
-                                k.namespace.as_str(),
-                                k.value.as_str(),
-                                i64::MIN,
-                                "",
-                                "",
-                            )
-                                ..=(
-                                    kind.as_str(),
-                                    k.namespace.as_str(),
-                                    k.value.as_str(),
-                                    i64::MAX,
-                                    MAX_STR,
-                                    MAX_STR,
-                                ),
-                        )
-                        .map_err(|e| be(&e))?
-                    {
-                        let (sk, _) = e.map_err(|e| be(&e))?;
-                        let (_, ns, val, _, run, effect) = sk.value();
-                        if let Some(v) = subs.get((run, effect, ns, val)).map_err(|e| be(&e))? {
-                            let (c, hc, st, ph, _, _) = v.value();
-                            hit = Some((
-                                run.to_owned(),
-                                effect.to_owned(),
-                                c.to_owned(),
-                                hc,
-                                st,
-                                ph.to_owned(),
-                            ));
-                            break 'outer;
-                        }
-                    }
-                }
+                let hit = oldest_waiter(&by_key, &subs, &kind, &keys)?;
                 drop(by_key);
 
                 match hit {
@@ -387,9 +412,7 @@ impl EventStore for RedbStore {
                         let claimable = row
                             .as_ref()
                             .is_some_and(|(_, _, _, hc, dead)| *hc == 0 && *dead == 0);
-                        if !claimable {
-                            None
-                        } else {
+                        if claimable {
                             let (kd, pl, ra, _, _) = row.expect("claimable implies present");
                             events
                                 .insert(
@@ -449,6 +472,8 @@ impl EventStore for RedbStore {
                                 kind: kind.clone(),
                                 correlation,
                             })
+                        } else {
+                            None
                         }
                     }
                 }

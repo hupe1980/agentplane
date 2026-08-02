@@ -43,7 +43,10 @@ const CASE_RUNS: TableDefinition<(&str, u64), &str> = TableDefinition::new("case
 const CASE_RUN_SEEN: TableDefinition<(&str, &str), u64> = TableDefinition::new("case_run_seen");
 
 /// `(case_id, name) -> (resolved_at, calendar_digest, warn_at, has_warn, state)`.
-const DEADLINES: TableDefinition<(&str, &str), (i64, &[u8], i64, u8, &str)> =
+/// `(resolved_at, calendar_digest, warn_at, has_warn, state)`.
+type DeadlineRow<'a> = (i64, &'a [u8], i64, u8, &'a str);
+
+const DEADLINES: TableDefinition<(&str, &str), DeadlineRow<'static>> =
     TableDefinition::new("case_deadlines");
 
 /// `(trigger_at, case_id, name) -> resolved_at`, pending and warned only.
@@ -127,16 +130,7 @@ fn parse_case_id(id: &str) -> Result<CaseId, StoreError> {
     })
 }
 
-#[expect(
-    clippy::type_complexity,
-    reason = "the stored deadline tuple mirrors the table definition; naming it \
-              elsewhere would let the two drift"
-)]
-fn build_deadline(
-    case: &str,
-    name: &str,
-    row: (i64, &[u8], i64, u8, &str),
-) -> Result<Deadline, StoreError> {
+fn build_deadline(case: &str, name: &str, row: DeadlineRow<'_>) -> Result<Deadline, StoreError> {
     let (resolved_at, digest, warn_at, has_warn, state) = row;
     let bytes: [u8; 32] = digest.try_into().map_err(|_| StoreError::Corrupt {
         seq: 0,

@@ -23,11 +23,19 @@ fmt:
 # and examples are exempt from, and those are where fixtures rot.
 
 # fmt + clippy across all three feature configurations
+# `-D warnings` here, not only in CI. The pipeline sets it globally, so without
+# it locally `just ci` passes on a tree the pipeline rejects — which is exactly
+# the drift this file exists to prevent, and it happened: fifteen lints and a
+# feature-combination error reached CI green from here.
+#
+# `--all-features` cannot see a lint that only fires when a feature is OFF, so
+# the seam configurations below are not redundant with the first line.
 lint:
     cargo fmt --all -- --check
-    cargo clippy --all-targets --all-features
-    cargo clippy --all-targets
-    cargo clippy --no-default-features
+    RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features
+    RUSTFLAGS="-D warnings" cargo clippy --all-targets
+    RUSTFLAGS="-D warnings" cargo clippy --no-default-features
+    RUSTFLAGS="-D warnings" cargo clippy --all-targets --features postgres,testkit
 
 # the full suite, all features
 test:
