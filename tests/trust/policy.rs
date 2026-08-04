@@ -949,3 +949,151 @@ async fn a_run_that_keeps_being_refused_stops_learning() {
         "the fixture must actually be refused, or this asserts nothing"
     );
 }
+
+// ── Provenance is visible to authorization, not only to the hardcoded gates ──
+
+/// Denies a mutating sink whenever the value it will send is untrusted.
+///
+/// A rule an operator would plausibly write, and one that cannot be written at
+/// all unless the label reaches the request.
+#[derive(Debug)]
+struct RefusesUntrustedArguments;
+
+impl PolicyEngine for RefusesUntrustedArguments {
+    fn authorize(&self, r: &PolicyRequest<'_>) -> PolicyDecision {
+        if r.action != ACTION_PERFORM {
+            return PolicyDecision::Permit;
+        }
+        match r.context["label"]["trust"].as_str() {
+            Some("untrusted") => PolicyDecision::deny(format!(
+                "'{}' may not be called with untrusted arguments",
+                r.resource
+            )),
+            // Absent means the gate cannot see provenance at all, which is the
+            // defect this test exists to catch — permit, so the assertion below
+            // reports the missing field rather than an unrelated denial.
+            _ => PolicyDecision::Permit,
+        }
+    }
+    fn bundle(&self) -> PolicyBundleIdentity {
+        test_bundle(b"refuses-untrusted-arguments")
+    }
+}
+
+/// Sends a labelled value through `sink`.
+#[derive(Debug)]
+struct Posts {
+    trusted: bool,
+}
+
+#[async_trait::async_trait]
+impl Skill for Posts {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("posts").provides("demo.post")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _i: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let args = if self.trusted {
+            Tainted::trusted(json!({ "memo": "quarterly close" }))
+        } else {
+            Tainted::from_source(
+                json!({ "memo": "quarterly close" }),
+                SourceId::new("peer:broker-x"),
+            )
+        };
+        let call = Bound {
+            args: args.peek().clone(),
+        };
+        let out = cx.sink(call, &args).await?;
+        Ok(Outcome::done(out.map(|v| v)))
+    }
+}
+
+/// A mutating sink that binds its outbound arguments and declares no protected
+/// fields, so only the whole-value gate and policy stand in front of it.
+#[derive(Debug)]
+struct Bound {
+    args: Value,
+}
+
+#[async_trait::async_trait]
+impl Effect for Bound {
+    type Output = Value;
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new("ledger.post_entry", self.args.clone())
+    }
+    fn sink_arguments(&self) -> Option<&Value> {
+        Some(&self.args)
+    }
+    /// Raised so this test isolates *provenance*: the crate's own ceiling would
+    /// otherwise refuse the untrusted value first, for a different reason.
+    fn max_sensitivity(&self) -> agentplane::core::Sensitivity {
+        agentplane::core::Sensitivity::Internal
+    }
+    /// Declared non-mutating for the same reason: the unconditional taint gate
+    /// would refuse before policy is consulted, and what is under test is
+    /// whether a *rule* can see where the value came from.
+    fn mutates(&self) -> bool {
+        false
+    }
+    fn retry(&self) -> RetryPolicy {
+        RetryPolicy::never()
+    }
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+    async fn perform(&self) -> Result<Value, EffectError> {
+        Ok(json!({ "posted": true }))
+    }
+}
+
+/// A rule may key on **where the value came from**, not only on what it is.
+///
+/// Provenance and authorization are two graphs, and an attack lives in the gap
+/// between them: an agent is permitted to call a tool in general, and that
+/// permission never accounts for the provenance of the particular value it is
+/// called with. This crate closes the gap with hardcoded checks — the taint gate
+/// and per-field source rules — but if the label never reaches the policy
+/// request, a *deployment* cannot express the alignment at all. It can say
+/// "amounts over 5000 need approval"; it cannot say "not with data that passed
+/// through that peer", which is the rule the attack calls for.
+#[tokio::test]
+async fn a_rule_can_refuse_an_effect_for_where_its_arguments_came_from() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .policy(Arc::new(RefusesUntrustedArguments))
+        .skill(Posts { trusted: false })
+        .build();
+
+    let out = rt.run("demo.post", json!({})).await.unwrap();
+    let RunStatus::Failed(why) = &out.status else {
+        panic!(
+            "a rule keyed on provenance did not fire — the policy request \
+             carries no label, so authorization cannot see where the value came \
+             from: {:?}",
+            out.status
+        );
+    };
+    assert!(
+        why.contains("untrusted arguments"),
+        "denied for an unrelated reason: {why}"
+    );
+}
+
+/// And the same rule permits the same call when the value is trusted, so the
+/// test above refuses the *provenance* rather than refusing everything.
+#[tokio::test]
+async fn the_same_rule_permits_the_same_effect_when_the_value_is_trusted() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .policy(Arc::new(RefusesUntrustedArguments))
+        .skill(Posts { trusted: true })
+        .build();
+
+    let out = rt.run("demo.post", json!({})).await.unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded, "got {:?}", out.status);
+}

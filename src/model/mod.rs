@@ -637,6 +637,13 @@ pub struct ModelCall {
     media: Option<Arc<dyn crate::blob::BlobStore>>,
     #[cfg(feature = "media")]
     media_grants: std::collections::BTreeSet<(crate::core::Digest, String)>,
+    /// `/system` when the prompt has one, empty otherwise.
+    ///
+    /// Computed at construction rather than returned fresh, because
+    /// [`Effect::protected_fields`] hands back a borrowed slice — and because a
+    /// declared field is *mandatory*, so declaring `/system` unconditionally
+    /// would refuse every prompt that legitimately has no instruction.
+    protected: Vec<crate::core::ProtectedField>,
 }
 
 impl ModelCall {
@@ -657,7 +664,38 @@ impl ModelCall {
             media: None,
             #[cfg(feature = "media")]
             media_grants: std::collections::BTreeSet::new(),
+            protected: Vec::new(),
         }
+        .with_protected_instruction()
+    }
+
+    /// Require the instruction to be trusted, when there is one.
+    ///
+    /// # The instruction slot carries authority; the content does not
+    ///
+    /// A model reads its instruction and its data as the same undifferentiated
+    /// text, so text that *arrives as data* and reads like an instruction is
+    /// obeyed like one. The usual defence — label the data, gate the sinks —
+    /// contains what the model may then *do*, and this crate does that. It does
+    /// not answer the prior question of who was allowed to give the order.
+    ///
+    /// So `/system` is protected: if the prompt has an instruction, it must be
+    /// trusted. Untrusted material belongs in `messages`, where it is content
+    /// the model reasons *about* rather than a directive it reasons *under*.
+    ///
+    /// The consequence is deliberate and it will be met immediately. Building a
+    /// prompt with `untrusted.map(|d| json!({"system": "…", "messages": [d]}))`
+    /// is refused, because `map` cannot prove how a closure reshaped a value and
+    /// so conservatively taints the whole thing — instruction included.
+    /// [`Tainted::object`](crate::core::Tainted::object) keeps the two apart,
+    /// which is what it is for.
+    fn with_protected_instruction(mut self) -> Self {
+        self.protected = if self.prompt.get("system").is_some_and(|s| !s.is_null()) {
+            vec![crate::core::ProtectedField::trusted("/system")]
+        } else {
+            Vec::new()
+        };
+        self
     }
 
     /// Tell the model which tools it may ask for.
@@ -789,6 +827,17 @@ impl Effect for ModelCall {
     /// — see `spend` — but a second completion does not move money twice.
     fn mutates(&self) -> bool {
         false
+    }
+
+    /// `/system` when the prompt has an instruction.
+    ///
+    /// A model reads its instruction and its data as the same undifferentiated
+    /// text, so text arriving as *data* that reads like a directive is obeyed
+    /// like one. Every other control here bounds what the model may then **do**;
+    /// this is the only one that asks who was allowed to give the order.
+    /// Untrusted material belongs in `messages`.
+    fn protected_fields(&self) -> &[crate::core::ProtectedField] {
+        &self.protected
     }
 
     fn recovery(&self) -> Recovery {

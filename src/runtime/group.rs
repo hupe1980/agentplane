@@ -78,7 +78,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::core::{AnyEffect, Effect, StepError, Tainted};
+use crate::core::{AnyEffect, Effect, GroupOutcome, StepError, Tainted};
 use crate::journal::RecordKind;
 use crate::runtime::StepCtx;
 
@@ -110,44 +110,17 @@ impl Invariant {
     }
 }
 
-/// How a group ended.
-///
-/// Four outcomes rather than two, because "nothing happened" and "we could not
-/// establish what happened" are different situations and an operator acts on
-/// them differently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GroupOutcome {
-    /// Every member took. Deferred members ran; reversals were discarded.
-    Committed,
-    /// No member is standing. Reversible members were reversed, and deferred
-    /// members never ran.
-    Aborted,
-    /// Neither could be established. Some member is in doubt, or a reversal
-    /// failed, and unwinding further would compound the damage.
-    ///
-    /// The run is quarantined. This is the honest answer, and the one a
-    /// half-applied group is usually reported as by systems that do not have
-    /// this variant.
-    Quarantined,
-}
-
-impl GroupOutcome {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Committed => "committed",
-            Self::Aborted => "aborted",
-            Self::Quarantined => "quarantined",
-        }
-    }
-}
-
 /// A member that ran and can be taken back.
 struct Reversal {
     resource: String,
     kind: String,
     undo: Box<dyn AnyEffect>,
+}
+
+/// A member that commits with the journal, in the journal's own transaction.
+pub(crate) struct AtomicMember {
+    resource: String,
+    inner: std::sync::Arc<dyn crate::journal::AtomicResource>,
 }
 
 /// A member held at the gate until the group commits.
@@ -169,6 +142,7 @@ pub(crate) struct OpenGroup {
     /// later member may depend on an earlier one still being in place.
     reversals: Vec<Reversal>,
     deferred: Vec<Deferred>,
+    atomic: Vec<AtomicMember>,
 }
 
 impl std::fmt::Debug for OpenGroup {
@@ -178,6 +152,7 @@ impl std::fmt::Debug for OpenGroup {
             .field("resources", &self.resources)
             .field("reversible", &self.reversals.len())
             .field("deferred", &self.deferred.len())
+            .field("atomic", &self.atomic.len())
             .finish()
     }
 }
@@ -269,10 +244,24 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
         self.check_footprint(resource)?;
         let kind = effect.descriptor().kind;
         let out = self.cx.effect(effect).await?;
+        let undo = undo(out.peek());
+        // A **quarantine**, not a refusal, and the difference is the whole
+        // point: the forward member has already landed, and an undo that
+        // cannot be dispatched means the runtime has no way to take it back.
+        // Reporting that as an ordinary error would let the abort settle the
+        // group as `Aborted` with nothing registered to reverse — the journal
+        // saying discharged while the hold still stands.
+        if let Some(detail) = Self::check_dispatchable(&undo) {
+            let group = self.group_name();
+            self.cx
+                .settle_open_group(GroupOutcome::Quarantined, Some(&detail))
+                .await?;
+            return Err(StepError::GroupUnsettled { group, detail });
+        }
         let reversal = Reversal {
             resource: resource.to_owned(),
             kind,
-            undo: Box::new(undo(out.peek())),
+            undo: Box::new(undo),
         };
         self.open()?.reversals.push(reversal);
         Ok(out)
@@ -326,11 +315,64 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
         effect: E,
     ) -> Result<(), StepError> {
         self.check_footprint(resource)?;
+        // Nothing has run for this member yet, so refusing is free and the
+        // group can still be taken back whole.
+        if let Some(detail) = Self::check_dispatchable(&effect) {
+            return Err(StepError::GroupFootprint {
+                group: self.group_name(),
+                detail,
+            });
+        }
         let member = Deferred {
             resource: resource.to_owned(),
             effect: Box::new(effect),
         };
         self.open()?.deferred.push(member);
+        Ok(())
+    }
+
+    /// Register a member that commits **with the journal**, in one transaction.
+    ///
+    /// The strongest class available, and it is available only when the resource
+    /// lives in the same database as the journal. Nothing is externalised and
+    /// later reversed, so no reversal can fail; there is no in-doubt state,
+    /// because a transaction either committed or did not; and an abort is a
+    /// rollback, which cannot itself fail halfway. Compensation that never has
+    /// to run beats compensation that runs correctly.
+    ///
+    /// It does not run here. It runs inside the transaction that
+    /// [`commit`](Self::commit) opens, alongside the records saying it
+    /// happened — so a caller cannot see its result before the frontier, which
+    /// is the price of it being atomic with the frontier.
+    ///
+    /// # Errors
+    ///
+    /// If `resource` is outside the declared footprint, or the journal cannot
+    /// offer its transaction. The second is checked **here**, not at commit: a
+    /// group that discovered its backend at the frontier would have already
+    /// performed every eager member.
+    pub fn atomic(
+        &mut self,
+        resource: &str,
+        member: std::sync::Arc<dyn crate::journal::AtomicResource>,
+    ) -> Result<(), StepError> {
+        self.check_footprint(resource)?;
+        if !self.cx.store_is_atomic() {
+            return Err(StepError::GroupFootprint {
+                group: self.group_name(),
+                detail: format!(
+                    "'{}' must commit with the journal, and this store has no transaction \
+                     a resource can join — an embedded backend has no notion of a foreign \
+                     table, so the capability is absent rather than failing",
+                    member.descriptor().kind
+                ),
+            });
+        }
+        let member = AtomicMember {
+            resource: resource.to_owned(),
+            inner: member,
+        };
+        self.open()?.atomic.push(member);
         Ok(())
     }
 
@@ -360,10 +402,37 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
             return Err(StepError::GroupAborted { what });
         }
 
-        let (name, deferred) = {
+        let (name, deferred, atomic) = {
             let open = self.cx.open_group_mut().ok_or_else(no_group)?;
-            (open.name.clone(), std::mem::take(&mut open.deferred))
+            (
+                open.name.clone(),
+                std::mem::take(&mut open.deferred),
+                std::mem::take(&mut open.atomic),
+            )
         };
+
+        // The database part, before the outside-world part. If the transaction
+        // does not commit, nothing in it happened and the group can still be
+        // taken back whole; telling anyone about it first would be announcing
+        // work that may yet vanish.
+        let touched = atomic
+            .iter()
+            .map(|m| m.resource.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !atomic.is_empty()
+            && let Err(e) = self.cx.commit_atomic(&name, atomic).await
+        {
+            // A transaction that did not commit changed nothing, so the eager
+            // members can still be reversed. That is the property this class
+            // exists for, and it is why the failure path here is the *cheap*
+            // one rather than a quarantine.
+            let what = format!("the atomic members on [{touched}] did not commit: {e}");
+            self.cx.abort_open_group(&what).await?;
+            return Err(StepError::GroupAborted { what });
+        }
 
         let mut outputs = Vec::with_capacity(deferred.len());
         for member in deferred {
@@ -417,17 +486,34 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
         self.cx.abort_open_group(why).await
     }
 
-    /// What this group touches, for a caller that needs to check.
-    ///
-    /// # Errors
-    ///
-    /// If the group is no longer open.
-    pub fn resources(&self) -> Result<&[String], StepError> {
-        Ok(&self.cx.open_group().ok_or_else(no_group)?.resources)
-    }
-
     fn open(&mut self) -> Result<&mut OpenGroup, StepError> {
         self.cx.open_group_mut().ok_or_else(no_group)
+    }
+
+    /// Refuse a member that must go through `sink`, at the moment it is
+    /// registered.
+    ///
+    /// `StepCtx::effect` refuses any effect exposing outbound arguments,
+    /// because the information-flow check cannot be skipped and a group has no
+    /// labelled value to bind on a member's behalf. Left to dispatch, that
+    /// refusal surfaces during an **abort** — the run is already failing, and
+    /// the diagnostic arrives about the undo rather than about the member that
+    /// was wrong. Catching it here costs nothing and names the right thing.
+    fn check_dispatchable(effect: &dyn AnyEffect) -> Option<String> {
+        effect.sink_arguments().is_some().then(|| {
+            format!(
+                "'{}' binds the arguments it sends, so it must be dispatched with \
+                 StepCtx::sink and cannot be a group member — a group has no labelled \
+                 value to bind on its behalf",
+                effect.descriptor().kind
+            )
+        })
+    }
+
+    fn group_name(&self) -> String {
+        self.cx
+            .open_group()
+            .map_or_else(String::new, |g| g.name.clone())
     }
 
     fn check_footprint(&self, resource: &str) -> Result<(), StepError> {
@@ -516,6 +602,7 @@ impl<'a> StepCtx<'a> {
             resources,
             reversals: Vec::new(),
             deferred: Vec::new(),
+            atomic: Vec::new(),
         });
         Ok(EffectGroup::new(self))
     }
@@ -529,13 +616,46 @@ impl<'a> StepCtx<'a> {
         let reversals = std::mem::take(&mut open.reversals);
         open.deferred.clear();
 
-        let total = reversals.len();
         // Undo is exempt from the gate, exactly as a compensating phase is: a
         // ceiling exists to bound work, not to strand it half-done. The spend
         // is still billed and journaled, so an overshoot is visible rather than
         // silent.
+        //
+        // The exemption is set and cleared **around a single call**, with
+        // nothing between the two but one `await`, so no path through the
+        // reversal can leave it standing. That matters more than it looks: the
+        // flag suppresses the manifest check, policy and the budget, so a
+        // reversal that returned early with it still set would leave every
+        // later effect in the step ungated — a security hole reached by adding
+        // an ordinary `?` to a loop.
         self.set_reversing(true);
-        for (reversed, member) in reversals.into_iter().rev().enumerate() {
+        let reversed = self.reverse_each(reversals).await;
+        self.set_reversing(false);
+
+        match reversed {
+            Ok(()) => {
+                self.settle_open_group(GroupOutcome::Aborted, Some(why))
+                    .await
+            }
+            Err(detail) => {
+                self.settle_open_group(GroupOutcome::Quarantined, Some(&detail))
+                    .await?;
+                Err(StepError::GroupUnsettled {
+                    group: name,
+                    detail,
+                })
+            }
+        }
+    }
+
+    /// Take the members back, newest first.
+    ///
+    /// Returns the reason on failure rather than a `StepError`, so the caller
+    /// settles the group exactly once and this function has no reason to reach
+    /// for `?`.
+    async fn reverse_each(&mut self, reversals: Vec<Reversal>) -> Result<(), String> {
+        let total = reversals.len();
+        for (done, member) in reversals.into_iter().rev().enumerate() {
             let Reversal {
                 resource,
                 kind,
@@ -544,22 +664,12 @@ impl<'a> StepCtx<'a> {
             if let Err(e) = self.effect(undo).await {
                 // Stop. Reversing further members around one that would not
                 // come back leaves a shape nobody declared and nobody can read.
-                let detail = format!(
-                    "reversing '{kind}' on '{resource}' failed after {reversed} of {total}: {e}"
-                );
-                self.set_reversing(false);
-                self.settle_open_group(GroupOutcome::Quarantined, Some(&detail))
-                    .await?;
-                return Err(StepError::GroupUnsettled {
-                    group: name,
-                    detail,
-                });
+                return Err(format!(
+                    "reversing '{kind}' on '{resource}' failed after {done} of {total}: {e}"
+                ));
             }
         }
-
-        self.set_reversing(false);
-        self.settle_open_group(GroupOutcome::Aborted, Some(why))
-            .await
+        Ok(())
     }
 
     /// Write the group's ending and close it.
@@ -577,5 +687,162 @@ impl<'a> StepCtx<'a> {
             detail: detail.map(ToOwned::to_owned),
         })
         .await
+    }
+}
+
+// ── Applying the atomic members ─────────────────────────────────────────────
+
+/// The group's atomic members, as one unit of work for the store.
+///
+/// Holds everything needed to build the records *inside* the transaction,
+/// because the records carry the members' outputs and nothing outside the
+/// transaction can know those yet.
+struct GroupCommit {
+    run: crate::core::RunId,
+    step: crate::core::StepId,
+    phase: crate::core::Phase,
+    case: Option<crate::core::CaseId>,
+    /// Members with the effect key each was assigned, in declaration order.
+    members: Vec<(crate::core::EffectKey, AtomicMember)>,
+}
+
+impl GroupCommit {
+    fn stamp(&self, kind: RecordKind) -> crate::journal::Append {
+        let mut a = crate::journal::Append::new(self.run, kind)
+            .step(self.step)
+            .phase(self.phase);
+        if let Some(c) = self.case {
+            a = a.case(c);
+        }
+        a
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::journal::AtomicWork for GroupCommit {
+    async fn run(
+        &self,
+        tx: &dyn crate::journal::AtomicTx,
+    ) -> Result<Vec<crate::journal::Append>, crate::core::EffectError> {
+        let mut appends = Vec::with_capacity(self.members.len() * 2 + 1);
+        for (key, member) in &self.members {
+            let descriptor = member.inner.descriptor();
+            // Announced and recorded in the same transaction as the work. The
+            // announce/record split exists because an ordinary effect acts
+            // *outside* the transaction that records it, leaving a window a
+            // crash can land in. Here there is no window — so both records are
+            // written, for the operator and for replay, but neither is load
+            // bearing for recovery.
+            appends.push(
+                self.stamp(RecordKind::EffectStarted {
+                    descriptor: descriptor.clone(),
+                    recovery: crate::core::Recovery::Retry,
+                    mutates: true,
+                    attempt: 1,
+                    backoff_ms: 0,
+                })
+                .effect(*key),
+            );
+            let output = member.inner.apply(tx).await?;
+            appends.push(
+                self.stamp(RecordKind::EffectDone {
+                    output,
+                    source: None,
+                    spend: crate::core::Spend::default(),
+                })
+                .effect(*key),
+            );
+        }
+        // Deliberately **not** the group's settlement. The guarantee this class
+        // offers is that a member's write and the record that it happened
+        // commit together; a group is not finished when its transaction is,
+        // because deferred members run afterwards and can still fail. A
+        // `GroupSettled { Committed }` inside the transaction would be a claim
+        // about work that had not been attempted yet.
+        //
+        // A crash between the transaction and the settlement therefore leaves
+        // an opened group with no settlement beside it — which is exactly the
+        // query an operator runs, and a resumed run re-walks the members from
+        // history and settles.
+        Ok(appends)
+    }
+}
+
+impl StepCtx<'_> {
+    /// Whether this run's store can lend a resource its transaction.
+    pub(crate) fn store_is_atomic(&self) -> bool {
+        self.journal().atomic().is_some()
+    }
+
+    /// Apply the atomic members and settle the group, in one transaction.
+    ///
+    /// On replay this performs nothing: the members' records are already in
+    /// history, so the cursor is walked and the recorded outputs stand. A
+    /// transaction re-applied on replay would be a second real write, which is
+    /// the failure the effect protocol exists to prevent — atomicity does not
+    /// exempt anything from it.
+    pub(crate) async fn commit_atomic(
+        &mut self,
+        group: &str,
+        members: Vec<AtomicMember>,
+    ) -> Result<(), StepError> {
+        let mut keyed = Vec::with_capacity(members.len());
+        for member in members {
+            let descriptor = member.inner.descriptor();
+            let key = self.next_effect_key(&descriptor);
+            if self.replaying() {
+                // Consume the recorded pair. The output is discarded rather
+                // than returned: an atomic member's result is not handed back
+                // to the caller in the first place, because it cannot be seen
+                // before the frontier it commits with.
+                match self.cursor_next(key)? {
+                    Some(crate::journal::EffectReplay::Done { .. }) => continue,
+                    Some(_) | None if self.is_strict() => {
+                        return Err(StepError::ReplayOverrun { actual: key });
+                    }
+                    _ => {}
+                }
+            }
+            // Gated **before** the transaction opens, and one member at a
+            // time. An atomic member is a write to a real database chosen by
+            // skill code and, in the tool-calling tier, shaped by a model:
+            // being wrapped in a transaction makes it reliable, not
+            // authorised. Skipping this would leave the one mutating path that
+            // *commits* as the only one policy, the manifest and the budget all
+            // miss.
+            //
+            // Before rather than inside, because a refusal must cost nothing:
+            // opening a transaction to discover the caller had no right to it
+            // would be a rollback where a refusal would do, and the journaled
+            // denial would land after work the run was never allowed to start.
+            self.gate(key, &descriptor, true, None).await?;
+            keyed.push((key, member));
+        }
+        if keyed.is_empty() {
+            // Everything was replayed, so the settlement is already recorded
+            // too — this group committed once and is not committing again.
+            return Ok(());
+        }
+
+        let work = GroupCommit {
+            run: self.run_id(),
+            step: self.step_id(),
+            phase: self.phase_of(),
+            case: self.bound_case(),
+            members: keyed,
+        };
+        let atomic = self
+            .journal()
+            .atomic()
+            .ok_or_else(|| StepError::GroupFootprint {
+                group: group.to_owned(),
+                detail: "the store stopped offering a transaction between registration \
+                         and commit"
+                    .to_owned(),
+            })?;
+        atomic
+            .append_atomic(self.run_id(), self.epoch(), &work)
+            .await?;
+        Ok(())
     }
 }

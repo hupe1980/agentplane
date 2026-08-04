@@ -254,6 +254,55 @@ impl<'a> StepCtx<'a> {
         self.reversing = reversing;
     }
 
+    /// The next effect key at this step, consuming an ordinal.
+    ///
+    /// Shared with the ordinary dispatch path rather than reimplemented: two
+    /// derivations of one key is two chances for a replay to look like
+    /// divergence.
+    pub(crate) fn next_effect_key(&mut self, descriptor: &EffectDescriptor) -> EffectKey {
+        let ordinal = self.ordinal;
+        self.ordinal += 1;
+        EffectKey::derive(
+            self.step,
+            self.phase,
+            ordinal,
+            1,
+            &descriptor.kind,
+            &canon::value_bytes(&descriptor.args),
+        )
+    }
+
+    pub(crate) fn replaying(&self) -> bool {
+        self.mode.is_replaying()
+    }
+
+    pub(crate) const fn is_strict(&self) -> bool {
+        matches!(self.mode, Mode::Strict)
+    }
+
+    pub(crate) fn cursor_next(
+        &mut self,
+        key: EffectKey,
+    ) -> Result<Option<crate::journal::EffectReplay>, StepError> {
+        self.cursor.next(key)
+    }
+
+    pub(crate) const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    pub(crate) const fn phase_of(&self) -> Phase {
+        self.phase
+    }
+
+    pub(crate) fn bound_case(&self) -> Option<crate::core::CaseId> {
+        self.case.as_ref().map(CaseContext::id)
+    }
+
+    pub(crate) fn journal(&self) -> &Arc<dyn JournalStore> {
+        self.store
+    }
+
     pub(crate) fn open_group(&self) -> Option<&super::group::OpenGroup> {
         self.open_group.as_ref()
     }
@@ -482,18 +531,19 @@ impl<'a> StepCtx<'a> {
             }
             .into());
         }
-        self.effect_after_sink_gate(effect).await
+        self.effect_after_sink_gate(effect, None).await
     }
 
     /// Dispatch an effect once any required information-flow checks have run.
     async fn effect_after_sink_gate<E: Effect>(
         &mut self,
         effect: E,
+        outbound: Option<&crate::core::Label>,
     ) -> Result<Tainted<E::Output>, StepError> {
         let trust = effect.trust();
         let declared = effect.output_sensitivity();
         let kind = effect.descriptor().kind;
-        let output = self.effect_unlabelled(effect).await?;
+        let output = self.effect_unlabelled(effect, outbound).await?;
 
         let labelled = match trust {
             crate::core::Trust::Trusted => Tainted::trusted(output),
@@ -517,6 +567,7 @@ impl<'a> StepCtx<'a> {
     async fn effect_unlabelled<E: Effect>(
         &mut self,
         mut effect: E,
+        outbound: Option<&crate::core::Label>,
     ) -> Result<E::Output, StepError> {
         let descriptor = effect.descriptor();
         let policy = effect.retry();
@@ -621,7 +672,8 @@ impl<'a> StepCtx<'a> {
             // ceiling exists to bound work, not to strand it half-done. The
             // spend is still billed and journaled, so the overshoot is visible
             // rather than silent.
-            self.gate(key, &descriptor, effect.mutates()).await?;
+            self.gate(key, &descriptor, effect.mutates(), outbound)
+                .await?;
 
             let backoff = policy.backoff(self.run, key, attempt);
             if !backoff.is_zero() {
@@ -883,11 +935,12 @@ impl<'a> StepCtx<'a> {
             .tool_grant(&crate::tools::ToolId::new(server, tool).reference())
     }
 
-    async fn gate(
+    pub(crate) async fn gate(
         &mut self,
         key: EffectKey,
         descriptor: &EffectDescriptor,
         mutates: bool,
+        outbound: Option<&crate::core::Label>,
     ) -> Result<(), StepError> {
         // A compensating phase, or a group being taken back inside a forward
         // one. Both are undo, and both are exempt for the same reason: refusing
@@ -906,7 +959,7 @@ impl<'a> StepCtx<'a> {
         // advertisement and the grant is the operator's decision about it.
         #[cfg(feature = "manifest")]
         let mutates = mutates || self.tool_grant_for(descriptor).is_some_and(|g| g.mutates);
-        self.authorize(key, descriptor, mutates).await?;
+        self.authorize(key, descriptor, mutates, outbound).await?;
         self.admit(key, &descriptor.kind).await
     }
 
@@ -1031,6 +1084,7 @@ impl<'a> StepCtx<'a> {
         key: EffectKey,
         descriptor: &EffectDescriptor,
         mutates: bool,
+        outbound: Option<&crate::core::Label>,
     ) -> Result<(), StepError> {
         let Some(engine) = self.policy.as_ref() else {
             return Ok(());
@@ -1047,6 +1101,23 @@ impl<'a> StepCtx<'a> {
             "mutates": mutates,
             "args": descriptor.args,
         });
+        // **Where the value came from**, not only what it is.
+        //
+        // Provenance and authorization are two graphs, and an attack lives in
+        // the gap between them: an agent is permitted to call a tool in general,
+        // and that permission never accounts for the provenance of the
+        // particular value it is called with. This crate closes the gap with
+        // checks written *here* — the taint gate and per-field source rules —
+        // but without the label in the request a **deployment** cannot express
+        // the alignment at all. It could say "amounts over 5000 need approval";
+        // it could not say "not with data that passed through that peer".
+        //
+        // Present only for `sink`, which is the only call that has a labelled
+        // value to bind. Absent is not "trusted": a rule that requires a source
+        // simply does not match, so it fails closed.
+        if let Some(label) = outbound {
+            context["label"] = serde_json::to_value(label).unwrap_or(Value::Null);
+        }
         merge_identity(&mut context, self.identity.as_ref());
         let request = crate::core::PolicyRequest {
             principal: &self.agent,
@@ -1549,7 +1620,9 @@ impl<'a> StepCtx<'a> {
 
         Self::enforce_protected_fields(&effect, args, sink_name)?;
 
-        self.effect_after_sink_gate(effect).await
+        // The same label the gates above enforced, handed to the deployment's
+        // own rules. See `authorize` for why it belongs there too.
+        self.effect_after_sink_gate(effect, Some(label)).await
     }
 
     fn enforce_protected_fields<E: Effect>(
@@ -1899,9 +1972,11 @@ impl<'a> StepCtx<'a> {
 
     /// Tag a record with this step's run, step, and case.
     ///
-    /// Every record of a case-bound run carries its case, which is what turns
-    /// "show me everything about this matter" into one indexed range scan
-    /// instead of a join across runs.
+    /// Every record of a case-bound run carries its case, which is what
+    /// `JournalStore::case_history` scans. Without it, "show me everything
+    /// about this matter" is a join over the case's runs — and one that misses
+    /// every record written by a run the case does not own, which is exactly
+    /// what a sweep is.
     fn stamp(&self, kind: RecordKind) -> Append {
         let mut a = Append::new(self.run, kind)
             .step(self.step)
@@ -2460,7 +2535,12 @@ impl StepCtx<'_> {
     /// Move the case to a new status.
     pub async fn set_case_status(&mut self, status: CaseStatus) -> Result<(), StepError> {
         let cx = self.case_ctx()?.clone();
-        cx.cases.set_status(cx.case_id, status).await?;
+        self.effect(crate::runtime::effects::SetCaseStatus {
+            cases: Arc::clone(&cx.cases),
+            case: cx.case_id,
+            status,
+        })
+        .await?;
         Ok(())
     }
 
@@ -2534,15 +2614,24 @@ impl StepCtx<'_> {
         to: DeadlineState,
     ) -> Result<(), StepError> {
         let cx = self.case_ctx()?.clone();
-        let before = cx
-            .cases
-            .deadlines(cx.case_id)
+        // The read of `from` happens *inside* the effect, so it is journaled
+        // with the write it describes rather than beside it. Reading here would
+        // put a store lookup in the deterministic zone, and a replay would
+        // report whatever the deadline says now as the state it moved from.
+        let before = self
+            .effect(crate::runtime::effects::TransitionDeadline {
+                cases: Arc::clone(&cx.cases),
+                case: cx.case_id,
+                name: name.to_owned(),
+                to,
+            })
             .await?
-            .into_iter()
-            .find(|d| d.name == name)
-            .map_or(DeadlineState::Pending, |d| d.state);
+            .into_unlabelled();
 
-        cx.cases.set_deadline_state(cx.case_id, name, to).await?;
+        // A readable summary beside the effect record, for the same reason
+        // `StepCompensated` exists: "met" and "cancelled" mean very different
+        // things to whoever reads this in six months, and reconstructing them
+        // from an effect descriptor is work nobody does.
         self.append(RecordKind::DeadlineTransition {
             name: name.to_owned(),
             from: before,

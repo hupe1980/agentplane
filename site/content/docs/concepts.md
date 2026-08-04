@@ -177,7 +177,45 @@ reference. A probe turns an undecidable outcome into a decided one.
 forgets to describe itself gets the conservative treatment, not the convenient
 one.
 
-## 7. 🏷️ Labels
+## 7. 🧬 Effect group
+
+The unit between an effect and a step: several calls that take together, or not
+at all.
+
+A step-level compensation is handed the step's **output**, and a step that failed
+has none — so a step that reserved inventory, authorised a card and then failed
+asks its own undo logic to guess. A group removes the guess. Each reversible
+member registers the concrete call that reverses it, built from what that member
+*actually returned*:
+
+```rust
+let mut g = cx.group("checkout", ["inventory", "notify"]).await?;
+
+let hold = g.reversible("inventory", Reserve::new(sku), |out| {
+    Release::new(out["hold"].as_str().unwrap_or_default())
+}).await?;
+
+g.deferred("notify", Notify::new("order confirmed"))?;   // does not run yet
+
+g.commit(&[Invariant::new("the hold covers the order", covered)]).await?;
+```
+
+`commit` is the **frontier**: the last instant at which failing is free.
+Invariants are checked there, and only then are deferred members released. Past
+it there is no group, and a failure does not unwind — undoing a committed group
+would reverse a decision the world has acted on.
+
+**Why it matters:** `deferred` is the only place in this design where putting an
+effect *inside* a transaction makes it safer rather than merely tidier. A member
+that runs and is compensated leaves a trace someone saw — the email arrived, then
+a correction arrived. A member held until the group is certain leaves none.
+
+Doubt reverses nothing, and a group nobody settled does not commit: the runtime
+reverses what an abandoned handle left standing, because a group that commits by
+being forgotten would make the most consequential outcome the one you get by
+writing nothing.
+
+## 8. 🏷️ Labels
 
 Every payload is opaque to the engine and never *unlabeled*:
 
@@ -208,7 +246,7 @@ trust and/or sensitivity dimension, exact fields, destination, basis and
 evidence; policy authorizes `data:release`; the journal records the decision.
 The returned value remains labeled and keeps its provenance.
 
-## 8. 📐 The plan is an authorization graph
+## 9. 📐 The plan is an authorization graph
 
 A plan is compiled from **trusted input only**, frozen, content-addressed, and
 journaled. Because it is built before any untrusted data is ingested, injected

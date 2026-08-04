@@ -198,8 +198,50 @@ pub trait JournalStore: Send + Sync + Debug {
     /// would leave a journal that describes something that never happened.
     async fn append(&self, epoch: Epoch, batch: Vec<Append>) -> Result<Vec<Record>, StoreError>;
 
+    /// This store's own transaction, when a co-located resource can join it.
+    ///
+    /// `None` — the default — means the backend cannot offer it, which is the
+    /// honest answer for an embedded store with no notion of a foreign table.
+    /// A capability spelled as absence rather than as a method that fails at
+    /// commit: an atomic member is refused when it is *registered*, which is the
+    /// only time refusing is free.
+    ///
+    /// See [`AtomicJournal`](crate::journal::AtomicJournal) for why this is
+    /// worth having at all — where the resource shares the journal's database,
+    /// compensation that never has to run beats compensation that runs
+    /// correctly.
+    fn atomic(&self) -> Option<&dyn crate::journal::AtomicJournal> {
+        None
+    }
+
     /// Read a run's records from `from` (inclusive, 1-based) onward.
     async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError>;
+
+    /// Every record belonging to a case, oldest first.
+    ///
+    /// *Show me everything about this matter* is the question a regulated
+    /// deployment asks, and it is not answerable by listing the case's runs and
+    /// reading each: that is a join whose cost grows with the case's life, and
+    /// it **misses** every record written by a run the case does not own.
+    ///
+    /// A sweep is exactly that run. One tick may escalate several cases and
+    /// belongs to none of them, so the record explaining *why this case is
+    /// escalated* is invisible to a per-run walk. This is the read that finds
+    /// it.
+    ///
+    /// Bounded, and the bound is visible: a caller that gets `limit` records
+    /// back has learned that there are at least that many, not that there are
+    /// exactly that many. See [`crate::runtime::Saturation`] for the same
+    /// distinction on the sweep side.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable.
+    async fn case_history(
+        &self,
+        case: crate::core::CaseId,
+        limit: usize,
+    ) -> Result<Vec<Record>, StoreError>;
 
     /// The run's current chain head.
     async fn head(&self, run: RunId) -> Result<Head, StoreError>;

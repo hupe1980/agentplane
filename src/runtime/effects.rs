@@ -455,3 +455,125 @@ impl Effect for RememberMemory {
             .map_err(|e| EffectError::Other(e.to_string()))
     }
 }
+
+/// Changing a case's status, as an effect.
+///
+/// # Why this is not a plain store call
+///
+/// A case's status is shared mutable state that outlives the run: several runs
+/// and an operator all write it over months. A write performed outside the
+/// journal has two holes, and the second one is worse.
+///
+/// It is performed **again on every replay**. Replaying last quarter's history
+/// to answer a question would close a case that has since been reopened — a
+/// replay is supposed to read history, not rewrite the world it happened in.
+///
+/// And it leaves **no record**. *Who closed this case, and when* is exactly the
+/// question the journal exists to answer, and a status that changed without one
+/// is a change nobody can attribute.
+#[derive(Debug, Clone)]
+pub struct SetCaseStatus {
+    pub(crate) cases: std::sync::Arc<dyn crate::case::CaseStore>,
+    pub(crate) case: crate::core::CaseId,
+    pub(crate) status: crate::core::CaseStatus,
+}
+
+#[async_trait]
+impl Effect for SetCaseStatus {
+    type Output = ();
+
+    /// The runtime's own write against a store it owns. Nothing crosses a trust
+    /// boundary, and the value is `()`.
+    fn trust(&self) -> crate::core::Trust {
+        crate::core::Trust::Trusted
+    }
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "case.set_status",
+            json!({ "case": self.case.to_string(), "status": self.status }),
+        )
+    }
+
+    /// It changes state other runs observe.
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    /// Setting a status is idempotent in the value: the second write of
+    /// `Closed` leaves the case exactly as the first did. So a repeat is safe,
+    /// unlike a versioned state write where the retry would report a conflict
+    /// for a write that in fact succeeded.
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    async fn perform(&self) -> Result<(), EffectError> {
+        self.cases
+            .set_status(self.case, self.status)
+            .await
+            .map_err(|e| EffectError::Other(e.to_string()))
+    }
+}
+
+/// Moving a deadline out of `Pending`, as an effect.
+///
+/// Same reasoning as [`SetCaseStatus`], plus one of its own: the transition was
+/// previously written to the store and *then* journaled, so a crash in between
+/// left an obligation marked met with nothing saying who met it. Announce
+/// before act is the rule, and it was inverted here.
+#[derive(Debug, Clone)]
+pub struct TransitionDeadline {
+    pub(crate) cases: std::sync::Arc<dyn crate::case::CaseStore>,
+    pub(crate) case: crate::core::CaseId,
+    pub(crate) name: String,
+    pub(crate) to: crate::core::DeadlineState,
+}
+
+#[async_trait]
+impl Effect for TransitionDeadline {
+    /// The state it was in before, so the record can say what changed rather
+    /// than only what it became.
+    type Output = crate::core::DeadlineState;
+
+    fn trust(&self) -> crate::core::Trust {
+        crate::core::Trust::Trusted
+    }
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "case.transition_deadline",
+            json!({
+                "case": self.case.to_string(),
+                "name": self.name,
+                "to": self.to,
+            }),
+        )
+    }
+
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    /// Idempotent in the value, as above.
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    async fn perform(&self) -> Result<crate::core::DeadlineState, EffectError> {
+        let before = self
+            .cases
+            .deadlines(self.case)
+            .await
+            .map_err(|e| EffectError::Other(e.to_string()))?
+            .into_iter()
+            .find(|d| d.name == self.name)
+            .map_or(crate::core::DeadlineState::Pending, |d| d.state);
+
+        self.cases
+            .set_deadline_state(self.case, &self.name, self.to)
+            .await
+            .map_err(|e| EffectError::Other(e.to_string()))?;
+        Ok(before)
+    }
+}

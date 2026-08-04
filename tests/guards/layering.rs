@@ -43,7 +43,17 @@ fn core_has_no_io_dependencies() {
         "std::process",
     ];
 
-    for (name, src) in core_sources() {
+    let sources = core_sources();
+    // The same shape-3 trap as above: an empty `src/core` would satisfy every
+    // prohibition below by having nothing to prohibit.
+    assert!(
+        sources.len() > 10,
+        "only {} core sources were found, so this guard is reading the wrong \
+         directory rather than passing",
+        sources.len()
+    );
+
+    for (name, src) in sources {
         // Strip the doc/comment lines: prose may legitimately mention a backend.
         let code: String = src
             .lines()
@@ -113,11 +123,13 @@ fn every_hash_goes_through_the_canonical_writer() {
     // `preserve_order` on — which it now is — such a call takes insertion order
     // into a hash, and two runs performing the same effect derive different
     // keys. Exactly-once fails, and it fails silently.
+    let mut scanned = 0usize;
     for file in walk("src") {
         if file.ends_with("canon.rs") {
             continue; // the canonical writer is allowed to serialize
         }
         let src = code_only(&read(&file));
+        scanned += 1;
         {
             let call = "serde_json::to_vec";
             assert!(
@@ -128,6 +140,16 @@ fn every_hash_goes_through_the_canonical_writer() {
             );
         }
     }
+
+    // Shape 3: a checker that read nothing passes for the wrong reason. This
+    // one walks a tree, and a tree that comes back empty — a moved directory, a
+    // renamed extension — turns a crate-wide prohibition into a no-op that
+    // still reports success.
+    assert!(
+        scanned > 20,
+        "only {scanned} sources were scanned for non-canonical hashing, so this \
+         guard is reading the wrong tree rather than passing"
+    );
 }
 
 /// `unsafe` is forbidden, not merely discouraged.
@@ -142,6 +164,56 @@ fn unsafe_code_is_forbidden() {
 /// Which test checks each spec invariant against the implementation:
 /// `(spec, invariant, test)`.
 const CLAIMS: &[(&str, &str, &str)] = &[
+    (
+        "EffectGroup",
+        "DeferredOnlyPastTheFrontier",
+        "a_deferred_member_runs_last_and_only_on_commit",
+    ),
+    (
+        "EffectGroup",
+        "NoSilentCommit",
+        "a_group_left_open_is_reversed_rather_than_committed",
+    ),
+    (
+        "EffectGroup",
+        "ReversalFollowsLanding",
+        "a_deferred_member_runs_last_and_only_on_commit",
+    ),
+    (
+        "EffectGroup",
+        "ReversalIsBackwards",
+        "reversals_run_in_the_opposite_order_to_the_members",
+    ),
+    (
+        "EffectGroup",
+        "ReversedAtMostOnce",
+        "a_reversal_is_journaled_and_is_not_repeated_on_replay",
+    ),
+    (
+        "EffectGroup",
+        "NoUnwindUnderDoubt",
+        "a_group_in_doubt_is_quarantined_rather_than_reversed",
+    ),
+    (
+        "EffectGroup",
+        "NoUnwindPastAnExternalisedDeferred",
+        "a_gated_member_that_fails_after_another_landed_does_not_unwind",
+    ),
+    (
+        "EffectGroup",
+        "TransactionPrecedesTheGate",
+        "an_atomic_member_commits_with_the_journal",
+    ),
+    (
+        "EffectGroup",
+        "AbortIsComplete",
+        "an_aborted_group_never_runs_its_deferred_member",
+    ),
+    (
+        "EffectGroup",
+        "CommitIsComplete",
+        "a_deferred_member_runs_last_and_only_on_commit",
+    ),
     (
         "Delegation",
         "ScopeNeverWidens",
@@ -532,10 +604,66 @@ fn no_public_enum_variant_is_dead() {
 /// guard *stricter*, because it removes text rather than adding it. A variant
 /// that survives this is one somebody actually builds.
 fn strip_match_patterns(src: &str) -> String {
-    src.lines()
+    // Two shapes, and the second one is why this guard once passed a variant
+    // nobody constructed. A `match` arm is easy: everything left of `=>` is a
+    // pattern. A `matches!(x, A | B | C)` is not — every name in it is a
+    // pattern too, and none of them is a construction, but nothing about the
+    // line says so.
+    //
+    // A `SweptAction` variant survived here for exactly that reason: it was
+    // mentioned only inside a `matches!` in a predicate that nothing called,
+    // and the guard read it as used. Dropping the whole macro call is coarse —
+    // a construction genuinely inside one is now invisible — and that is the
+    // safe direction: this guard's failure mode must be a false *alarm*, not a
+    // false pass.
+    let without_matches = strip_matches_macro(src);
+    without_matches
+        .lines()
         .map(|l| l.split_once("=>").map_or(l, |(_, rhs)| rhs))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Drop the **pattern** argument of every `matches!(expr, PATTERNS)`.
+///
+/// The first argument is an expression and may legitimately construct
+/// something; everything after the first top-level comma is a pattern and
+/// constructs nothing. Dropping the whole call was the first attempt and it was
+/// too coarse — seven variants that *are* constructed became false alarms, and
+/// a guard that cries wolf seven times is a guard people delete.
+///
+/// Parentheses are balanced rather than scanning to the next `)`, because
+/// patterns routinely contain their own: `Some(x)`, `Fenced { .. }`.
+fn strip_matches_macro(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(at) = rest.find("matches!(") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + "matches!(".len()..];
+
+        let mut depth = 1usize;
+        let mut first_comma = None;
+        let mut end = after.len();
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                ',' if depth == 1 && first_comma.is_none() => first_comma = Some(i),
+                _ => {}
+            }
+        }
+        // Keep the scrutinee, drop the patterns.
+        out.push_str(&after[..first_comma.unwrap_or(end)]);
+        rest = after.get(end + 1..).unwrap_or("");
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Drop comment lines, so prose mentioning a name is not mistaken for using it.
@@ -961,7 +1089,7 @@ fn every_metric_explains_itself() {
 /// is a prompt injection reaching a mutating tool.
 #[test]
 fn every_trusted_effect_is_named() {
-    // Six, and each is the runtime's own machinery rather than the world's:
+    // Eight, and each is the runtime's own machinery rather than the world's:
     //
     //   Clock           — the journaled instant, written by the runtime.
     //   Recorded        — a value the runtime recorded for itself; adds no trust.
@@ -980,7 +1108,19 @@ fn every_trusted_effect_is_named() {
     //                     content is labelled from each item's declared
     //                     provenance by `cx.recall`, which is the whole defence
     //                     against a poisoned memory promoting itself.
-    const KNOWN_TRUSTED: usize = 6;
+    //   SetCaseStatus   — the runtime writing a status it chose, to a store it
+    //                     owns. Its output is `()`: there is no value to
+    //                     mislabel, and the argument for trust is that there is
+    //                     nothing to trust.
+    //   TransitionDeadline — the same write, and its output *is* read back from
+    //                     the store, which is the one that deserves a sentence.
+    //                     Unlike case state, which is an opaque `Value` anybody
+    //                     may have written, this is a four-variant enum the
+    //                     runtime itself defines and only the runtime writes;
+    //                     the worst a second writer can do is a wrong-but-valid
+    //                     variant, and it reaches nothing but the `from` field
+    //                     of a record.
+    const KNOWN_TRUSTED: usize = 8;
 
     // Anchored on the *declaration*, not on the token. `Trust::Trusted` also
     // appears in the doc comment that explains the rule and in the match arm
@@ -1386,5 +1526,55 @@ fn every_api_route_is_covered_by_the_unauthenticated_test() {
          test, so nothing checks that they refuse a caller with no \
          credentials:\n  {}",
         uncovered.join("\n  ")
+    );
+}
+
+/// A journaled record names only `core` vocabulary.
+///
+/// The journal is the durable contract. Every type inside a `RecordKind` is a
+/// word that history is written in, so it belongs in `core` beside
+/// `Compensation`, `Disposition` and `Recovery` — the layer with no I/O and
+/// nothing above it.
+///
+/// A field reaching *upward* into `runtime`, `store` or a transport is the
+/// inversion this catches: it makes the durable format depend on an executor
+/// that may be reorganised, and it hides a domain word in a module where
+/// nobody looks for the journal's vocabulary. `GroupOutcome` was written in
+/// `runtime` for exactly one release and read perfectly naturally there.
+#[test]
+fn every_journaled_record_field_names_core_vocabulary() {
+    let src = std::fs::read_to_string("src/journal/record.rs").expect("record.rs");
+    let start = src.find("pub enum RecordKind").expect("RecordKind");
+    let end = src[start..].find("\nimpl RecordKind").expect("end of enum") + start;
+    let body = &src[start..end];
+
+    let mut checked = 0usize;
+    for (n, line) in body.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with("//") || code.starts_with("#[") {
+            continue;
+        }
+        for hit in code.match_indices("crate::") {
+            checked += 1;
+            let rest = &code[hit.0 + "crate::".len()..];
+            let module: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert_eq!(
+                module,
+                "core",
+                "RecordKind names `crate::{module}` at record.rs line {} — a journaled \
+                 field must come from `core`, or the durable format depends on a layer \
+                 above it:\n  {code}",
+                n + 1
+            );
+        }
+    }
+
+    assert!(
+        checked > 3,
+        "the guard found only {checked} qualified paths in RecordKind, so it is \
+         probably reading the wrong span rather than passing"
     );
 }

@@ -37,6 +37,30 @@ use crate::journal::{Append, Cancellation, Head, JournalStore, Lease, Record};
 /// history is a range scan and its head is the last entry of that range.
 const JOURNAL: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("journal");
 
+/// Every journaled record that belongs to a case, in case order.
+///
+/// `(tenant, case, run, seq) -> ()`. The primary row stays in [`JOURNAL`]; this
+/// is only the ordering, so a record has exactly one home and the two cannot
+/// disagree about its bytes.
+///
+/// Why an index rather than a filter: *show me everything about this matter* is
+/// the question a regulated deployment asks, and answering it by listing a
+/// case's runs and reading each one is a join whose cost grows with the case's
+/// life. It also **misses** any record written by a run the case does not own —
+/// which is exactly what a sweep is, since one tick may escalate several cases
+/// and belongs to none of them.
+///
+/// Tenant-first, like every other key here, so a scan that forgets the
+/// predicate returns nothing rather than somebody else's matter.
+///
+/// The write costs one B-tree insert inside the transaction that was already
+/// open. Measured against uncased appends it is **below the noise floor**: two
+/// runs of 2,000 appends disagreed about the sign, because a durable append is
+/// dominated by the fsync and this is not. A number quoted from either run
+/// would have been noise with a decimal point.
+const JOURNAL_BY_CASE: TableDefinition<(&str, &str, &str, u64), ()> =
+    TableDefinition::new("journal_by_case");
+
 /// `(run_id, effect_key) -> seq`. Exactly-once. Only `EffectStarted` is written
 /// here, which is the `WHERE` clause of the partial index this replaces.
 const EFFECT_ONCE: TableDefinition<(&str, &str), u64> = TableDefinition::new("effect_once");
@@ -138,6 +162,7 @@ impl RedbStore {
         let w = begin_write(&db)?;
         {
             w.open_table(JOURNAL).map_err(|e| be(&e))?;
+            w.open_table(JOURNAL_BY_CASE).map_err(|e| be(&e))?;
             w.open_table(EFFECT_ONCE).map_err(|e| be(&e))?;
             w.open_table(RUN_LEASE).map_err(|e| be(&e))?;
             w.open_table(RUN_SEAL).map_err(|e| be(&e))?;
@@ -556,11 +581,13 @@ impl JournalStore for RedbStore {
         }
         let signer = self.signer.clone();
         let key = self.run_key(run);
+        let tenant = self.tenant_name();
 
         self.with_db(move |db| {
             let w = begin_write(db)?;
             let sealed = {
                 let mut journal = w.open_table(JOURNAL).map_err(|e| be(&e))?;
+                let mut by_case = w.open_table(JOURNAL_BY_CASE).map_err(|e| be(&e))?;
                 let mut once = w.open_table(EFFECT_ONCE).map_err(|e| be(&e))?;
 
                 // Fence inside the write transaction: no window between the
@@ -614,6 +641,21 @@ impl JournalStore for RedbStore {
                     journal
                         .insert((key.as_str(), seq), row.encode().as_slice())
                         .map_err(|e| be(&e))?;
+                    // Written in the same transaction as the row it points at,
+                    // so the index cannot outlive or precede its record.
+                    if let Some(case) = record.body.case {
+                        by_case
+                            .insert(
+                                (
+                                    tenant.as_str(),
+                                    case.to_string().as_str(),
+                                    key.as_str(),
+                                    seq,
+                                ),
+                                (),
+                            )
+                            .map_err(|e| be(&e))?;
+                    }
 
                     head = Head {
                         seq,
@@ -641,6 +683,41 @@ impl JournalStore for RedbStore {
             {
                 let (_, v) = entry.map_err(|e| be(&e))?;
                 out.push(Row::decode(v.value())?.into_record()?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn case_history(
+        &self,
+        case: crate::core::CaseId,
+        limit: usize,
+    ) -> Result<Vec<Record>, StoreError> {
+        let tenant = self.tenant_name();
+        let case = case.to_string();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let idx = r.open_table(JOURNAL_BY_CASE).map_err(|e| be(&e))?;
+            let j = r.open_table(JOURNAL).map_err(|e| be(&e))?;
+            let mut out = Vec::new();
+            for entry in idx
+                .range(
+                    (tenant.as_str(), case.as_str(), "", 0)
+                        ..=(tenant.as_str(), case.as_str(), MAX_STR, u64::MAX),
+                )
+                .map_err(|e| be(&e))?
+            {
+                if out.len() >= limit {
+                    break;
+                }
+                let (k, _) = entry.map_err(|e| be(&e))?;
+                let (_, _, run, seq) = k.value();
+                // The index carries the ordering; the row carries the bytes. A
+                // record has one home, so the two cannot disagree about it.
+                if let Some(v) = j.get((run, seq)).map_err(|e| be(&e))? {
+                    out.push(Row::decode(v.value())?.into_record()?);
+                }
             }
             Ok(out)
         })

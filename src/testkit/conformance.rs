@@ -28,7 +28,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::core::{Digest, EffectKey, RunId, StepId};
+use crate::core::{CaseId, Digest, EffectKey, RunId, StepId};
 use crate::journal::{Append, JournalStore, Record, RecordKind};
 
 /// What a store got wrong.
@@ -156,6 +156,7 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     a_takeover_advances_the_epoch(fresh, &mut r).await;
     a_rejected_batch_writes_nothing(fresh, &mut r).await;
     read_starts_where_it_is_told(fresh, &mut r).await;
+    a_case_scan_selects_one_matter(fresh, &mut r).await;
     a_stop_request_needs_no_lease(fresh, &mut r).await;
     the_first_asker_stays_on_the_record(fresh, &mut r).await;
     an_attestation_survives_the_round_trip(fresh, &mut r).await;
@@ -898,6 +899,68 @@ async fn a_rejected_batch_writes_nothing(fresh: Factory<'_>, r: &mut Report) {
                 after - before
             ),
         );
+    }
+}
+
+/// A case's history is a scan over one matter, and only that matter.
+///
+/// The question is *show me everything about this matter*. Answering it by
+/// listing the case's runs and reading each is a join that also **misses**
+/// every record written by a run the case does not own — which is exactly what
+/// a sweep is, since one tick may act on several cases and belongs to none.
+///
+/// Both halves are checked, because either alone passes for the wrong reason: a
+/// scan that returns nothing satisfies "no foreign records", and a scan that
+/// returns everything satisfies "finds its own".
+async fn a_case_scan_selects_one_matter(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let mine = CaseId::generate();
+    let theirs = CaseId::generate();
+
+    // Two records for one matter and one for another, written by runs that
+    // belong to neither — the shape a sweep produces.
+    for (case, count) in [(mine, 2), (theirs, 1)] {
+        let run = RunId::generate();
+        let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+            return;
+        };
+        for _ in 0..count {
+            let _ = store
+                .append(lease.epoch, vec![admitted(run).case(case)])
+                .await;
+        }
+    }
+
+    match store.case_history(mine, 100).await {
+        Ok(records) => {
+            if records.len() != 2 {
+                r.record(
+                    "case history",
+                    format!(
+                        "case_history must return this matter's records, got {} of 2",
+                        records.len()
+                    ),
+                );
+            }
+            if records.iter().any(|rec| rec.body.case != Some(mine)) {
+                r.record(
+                    "case history",
+                    "case_history returned a record belonging to another matter".to_owned(),
+                );
+            }
+        }
+        Err(e) => r.record("case history", format!("case_history failed: {e}")),
+    }
+
+    // The bound is applied rather than advisory.
+    match store.case_history(mine, 1).await {
+        Ok(records) if records.len() == 1 => {}
+        Ok(records) => r.record(
+            "case history",
+            format!("case_history(limit=1) returned {} records", records.len()),
+        ),
+        Err(e) => r.record("case history", format!("case_history(limit=1) failed: {e}")),
     }
 }
 

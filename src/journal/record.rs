@@ -312,7 +312,7 @@ pub enum RecordKind {
     /// reconstruct the meaning of.
     GroupSettled {
         group: String,
-        outcome: crate::runtime::GroupOutcome,
+        outcome: crate::core::GroupOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
@@ -384,6 +384,28 @@ pub enum RecordKind {
         outcome: String,
         chain_head: Digest,
     },
+
+    /// Something the sweeper did to work nobody was watching.
+    ///
+    /// The sweeper acts on a clock rather than on a request, so there is no run
+    /// whose history explains why a case became `Escalated`. State alone cannot
+    /// distinguish *the sweep breached this at 02:00* from *somebody set it*,
+    /// and for the plane's most consequential automated decisions that is the
+    /// difference between an audit trail and a database.
+    ///
+    /// Written into a sweep's own sealed run, so it inherits the chain, the
+    /// signature and the Merkle inclusion every other record has — and the
+    /// external audit tool checks it without being taught anything new.
+    Swept {
+        /// The case, task or event acted on.
+        subject: String,
+        action: crate::core::SweptAction,
+        /// The obligation's name, the expiry policy applied, the reason an
+        /// event aged out — whatever makes the entry readable six months later
+        /// without reconstructing it from the state it produced.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
 }
 
 impl RecordKind {
@@ -413,6 +435,7 @@ impl RecordKind {
             Self::Released { .. } => "Released",
             Self::RunCancelled { .. } => "RunCancelled",
             Self::RunSealed { .. } => "RunSealed",
+            Self::Swept { .. } => "Swept",
         }
     }
 

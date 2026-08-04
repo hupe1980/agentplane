@@ -121,6 +121,7 @@ printf '\n%sspecs%s\n' "$DIM" "$OFF"
 check_spec EffectProtocol
 check_spec RetrySafety
 check_spec Saga
+check_spec EffectGroup
 check_spec Fencing
 check_spec Authorization
 check_spec Delegation

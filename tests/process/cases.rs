@@ -805,3 +805,360 @@ async fn case_state_does_not_launder_untrusted_data() {
          of the lattice that never passes cx.release"
     );
 }
+
+// ── Case mutations are effects, or they are holes ───────────────────────────
+
+/// Closes the case and meets its obligation.
+#[derive(Debug)]
+struct Closes;
+
+#[async_trait::async_trait]
+impl Skill for Closes {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("closes").provides("case.close")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _i: Tainted<Value>,
+    ) -> Result<Outcome, agentplane::core::SkillError> {
+        cx.deadline(
+            "respond-by",
+            &DeadlineSpec::new("working-days", json!({ "n": 5 })),
+            None,
+        )
+        .await?;
+        cx.meet_deadline("respond-by").await?;
+        cx.set_case_status(CaseStatus::Closed).await?;
+        Ok(Outcome::done(Tainted::trusted(json!("closed"))))
+    }
+}
+
+/// Changing a case's status is an effect, so a replay does not do it again.
+///
+/// Status is shared mutable state that outlives the run: several runs and an
+/// operator all write it over months. A write performed outside the journal is
+/// performed **again** on every replay — so re-running last quarter's history to
+/// answer a question would close a case that has since been reopened. And with
+/// no record, *who closed this and when* is not answerable from the one place
+/// that is supposed to answer it.
+///
+/// Observed rather than counted: the case is deliberately reopened after the
+/// live run, so a replay that re-performed the write would close it again and
+/// the assertion sees the state of the world rather than a call count.
+#[tokio::test]
+async fn changing_a_case_status_is_journaled_and_not_repeated_on_replay() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .calendar(Arc::new(WorkingDays) as Arc<dyn Calendar>)
+        .skill(Closes)
+        .build();
+
+    let out = rt
+        .run_in_case("case.close", json!({}), "matter", &[key("matter", "M-9")])
+        .await
+        .unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded, "got {:?}", out.status);
+
+    let cases = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let case = cases
+        .correlate(&[key("matter", "M-9")])
+        .await
+        .unwrap()
+        .expect("the case exists");
+    assert_eq!(
+        cases.case(case).await.unwrap().expect("case").status,
+        CaseStatus::Closed
+    );
+
+    // Both mutations must be on the record: an unjournaled change to shared
+    // state is a change nobody can attribute.
+    let kinds: Vec<String> = store
+        .read(out.run_id, 1)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.kind().kind_str().to_owned())
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k == "DeadlineTransition"),
+        "the deadline transition was not journaled: {kinds:?}"
+    );
+
+    // The world moves on: an operator reopens the case.
+    cases.set_status(case, CaseStatus::Open).await.unwrap();
+    let deadline_before = cases
+        .deadlines(case)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.name == "respond-by")
+        .expect("the deadline exists")
+        .state;
+    cases
+        .set_deadline_state(case, "respond-by", DeadlineState::Pending)
+        .await
+        .unwrap();
+    assert_eq!(deadline_before, DeadlineState::Met);
+
+    let replayed = rt.replay(out.run_id, Mode::Strict).await.unwrap();
+    assert_eq!(replayed.status, RunStatus::Succeeded);
+
+    assert_eq!(
+        cases.case(case).await.unwrap().expect("case").status,
+        CaseStatus::Open,
+        "strict replay set the case status again — replaying history to answer a \
+         question closed a case that had since been reopened"
+    );
+    assert_eq!(
+        cases
+            .deadlines(case)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name == "respond-by")
+            .expect("the deadline exists")
+            .state,
+        DeadlineState::Pending,
+        "strict replay transitioned the deadline again"
+    );
+}
+
+/// A capped sweep says it was capped.
+///
+/// A bounded query returns a list shaped exactly like a complete one. Without a
+/// signal, the tick that handled its cap and the tick that handled everything
+/// produce identical-looking reports — and they are the two states an operator
+/// most needs to tell apart, because the first means the backlog is growing
+/// while the numbers look ordinary.
+#[tokio::test]
+async fn a_sweep_that_hits_its_cap_says_so() {
+    use agentplane::core::{Deadline, DeadlineState};
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let cases = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let now = Timestamp::from_unix_timestamp(1_800_000_000).unwrap();
+
+    // One more than the sweep will take in a tick.
+    for i in 0..=512 {
+        let case = cases
+            .correlate_or_open("matter", &[key("matter", &format!("M-{i}"))], now)
+            .await
+            .unwrap()
+            .case_id();
+        cases
+            .register_deadline(&Deadline {
+                case,
+                name: "respond-by".to_owned(),
+                resolved_at: now - time::Duration::hours(1),
+                calendar_digest: Digest::of(b"test-calendar"),
+                warn_at: None,
+                state: DeadlineState::Pending,
+            })
+            .await
+            .unwrap();
+    }
+
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&cases))
+        .build();
+
+    let report = rt.sweep(now, time::Duration::minutes(5)).await.unwrap();
+    assert!(
+        report.saturated.deadlines,
+        "the sweep took its full batch and reported an ordinary tick — the \
+         backlog grows while the numbers look normal: {report:?}"
+    );
+    assert!(
+        report.needs_attention(),
+        "a saturated sweep is exactly when a human should look"
+    );
+    assert!(!report.is_quiet(), "a capped sweep is not a quiet one");
+
+    // And an ordinary tick is not falsely flagged, so the signal means something.
+    let after = rt.sweep(now, time::Duration::minutes(5)).await.unwrap();
+    assert!(
+        !after.saturated.deadlines,
+        "the remaining handful still reported saturation: {after:?}"
+    );
+}
+
+/// What the sweeper did is on the record, not only in a log.
+///
+/// The sweeper makes the plane's most consequential *automated* decisions —
+/// it breaches an obligation and escalates a case, and nothing asked it to.
+/// There is no run whose history explains the change, so without a record of
+/// its own, *why is this case escalated* is answerable only from the resulting
+/// state. State cannot distinguish "the sweep breached this at 02:00" from
+/// "somebody set it", and no human was present to remember which.
+#[tokio::test]
+async fn a_sweep_records_what_it_did_in_a_sealed_run() {
+    use agentplane::core::{Deadline, DeadlineState, SweptAction};
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let cases = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let now = Timestamp::from_unix_timestamp(1_800_000_000).unwrap();
+
+    let case = cases
+        .correlate_or_open("matter", &[key("matter", "M-77")], now)
+        .await
+        .unwrap()
+        .case_id();
+    cases
+        .register_deadline(&Deadline {
+            case,
+            name: "respond-by".to_owned(),
+            resolved_at: now - time::Duration::hours(1),
+            calendar_digest: Digest::of(b"test-calendar"),
+            warn_at: None,
+            state: DeadlineState::Pending,
+        })
+        .await
+        .unwrap();
+
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&cases))
+        .build();
+
+    let report = rt.sweep(now, time::Duration::minutes(5)).await.unwrap();
+    assert_eq!(report.breached, 1);
+
+    let run = report
+        .record
+        .expect("a sweep that breached an obligation left no record of doing so");
+
+    let records = store.read(run, 1).await.unwrap();
+    let swept: Vec<(String, SweptAction)> = records
+        .iter()
+        .filter_map(|r| match r.kind() {
+            RecordKind::Swept {
+                subject, action, ..
+            } => Some((subject.clone(), *action)),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        swept.contains(&(case.to_string(), SweptAction::DeadlineBreached)),
+        "the breach was not recorded against the case: {swept:?}"
+    );
+    assert!(
+        swept.contains(&(case.to_string(), SweptAction::CaseEscalated)),
+        "the escalation was not recorded: {swept:?}"
+    );
+
+    // Sealed, so it enters the Merkle log and the external audit tool checks it
+    // without being taught what a sweep is.
+    store
+        .verify(run)
+        .await
+        .expect("the sweep's own chain does not verify");
+    assert!(
+        records
+            .iter()
+            .any(|r| matches!(r.kind(), RecordKind::RunSealed { .. })),
+        "the sweep's record was left open, so it never enters the Merkle log"
+    );
+
+    // A quiet tick writes nothing: a log of nothings is where the somethings
+    // hide, and the Merkle log should not fill with evidence of inactivity.
+    let quiet = rt.sweep(now, time::Duration::minutes(5)).await.unwrap();
+    assert!(
+        quiet.record.is_none(),
+        "a tick that decided nothing still opened a run"
+    );
+}
+
+/// A case's history includes what happened *to* it, not only what its runs did.
+///
+/// "Show me everything about this matter" is answered by a range scan over the
+/// journal, not by listing the case's runs and reading each. The difference is
+/// not only cost: a per-run walk **misses** every record written by a run the
+/// case does not own — and a sweep is exactly that, since one tick may escalate
+/// several cases and belongs to none of them.
+///
+/// So the record explaining *why this case is escalated* is reachable from the
+/// case, which is the entire reason for writing it down.
+#[tokio::test]
+async fn a_case_s_history_includes_a_sweep_that_escalated_it() {
+    use agentplane::core::{Deadline, DeadlineState, SweptAction};
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let cases = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let now = Timestamp::from_unix_timestamp(1_800_000_000).unwrap();
+
+    let case = cases
+        .correlate_or_open("matter", &[key("matter", "M-88")], now)
+        .await
+        .unwrap()
+        .case_id();
+    // A second matter, so the scan is shown to select rather than to return
+    // everything it can find.
+    let other = cases
+        .correlate_or_open("matter", &[key("matter", "M-89")], now)
+        .await
+        .unwrap()
+        .case_id();
+    for c in [case, other] {
+        cases
+            .register_deadline(&Deadline {
+                case: c,
+                name: "respond-by".to_owned(),
+                resolved_at: now - time::Duration::hours(1),
+                calendar_digest: Digest::of(b"test-calendar"),
+                warn_at: None,
+                state: DeadlineState::Pending,
+            })
+            .await
+            .unwrap();
+    }
+
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&cases))
+        .build();
+    let report = rt.sweep(now, time::Duration::minutes(5)).await.unwrap();
+    assert_eq!(report.breached, 2);
+
+    let history = store.case_history(case, 100).await.unwrap();
+    assert!(
+        !history.is_empty(),
+        "the case has no history at all, so the scan is reading the wrong thing"
+    );
+
+    let escalations: Vec<SweptAction> = history
+        .iter()
+        .filter_map(|r| match r.kind() {
+            RecordKind::Swept { action, .. } => Some(*action),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        escalations.contains(&SweptAction::CaseEscalated),
+        "the case's own history does not say why it was escalated: {escalations:?}"
+    );
+
+    // Every record belongs to *this* matter. A scan that returned the other
+    // case's escalation would be a scan that answers the wrong question, and it
+    // would pass the assertion above.
+    for record in &history {
+        assert_eq!(
+            record.body.case,
+            Some(case),
+            "a record from another matter appeared in this case's history"
+        );
+    }
+    assert_eq!(
+        store.case_history(other, 100).await.unwrap().len(),
+        history.len(),
+        "the two matters should have symmetrical histories"
+    );
+
+    // The bound is visible rather than silent.
+    assert_eq!(
+        store.case_history(case, 1).await.unwrap().len(),
+        1,
+        "the limit was not applied"
+    );
+}

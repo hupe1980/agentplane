@@ -37,6 +37,31 @@ lint:
     RUSTFLAGS="-D warnings" cargo clippy --no-default-features
     RUSTFLAGS="-D warnings" cargo clippy --all-targets --features postgres,testkit
 
+# Every optional feature, compiled on its own.
+#
+# `--all-features` cannot see this and neither can a curated combination: a
+# feature that uses a module it never declared builds perfectly as long as
+# something else in the set happens to enable that module. `a2a-server` did
+# exactly that with `push` — it had never once been compiled alone.
+#
+# Cheap because the dependency graph is shared: after the first, each is a
+# handful of crates.
+features:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for f in $(python3 -c "
+    import pathlib
+    c = pathlib.Path('Cargo.toml').read_text()
+    b = c[c.index('[features]'):c.index('[dependencies]')]
+    print(' '.join(
+        l.split('=')[0].strip()
+        for l in b.splitlines()
+        if '=' in l and not l.strip().startswith('#') and l.split('=')[0].strip() != 'default'
+    ))"); do
+        printf '  %s\n' "$f"
+        cargo check --quiet --no-default-features --features "$f"
+    done
+
 # the full suite, all features
 test:
     cargo test --all-features
@@ -231,7 +256,7 @@ publish-dry:
 # run them before a release, not on every save.
 
 # everything CI runs, minus the two slow layers
-ci: lint anchors test test-default test-minimal examples cli-smoke doc-examples docs package
+ci: lint features anchors test test-default test-minimal examples cli-smoke doc-examples docs package
 
 # everything, including the slow layers — what a release must pass
 ci-full: ci specs mutants

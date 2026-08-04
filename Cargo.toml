@@ -121,7 +121,11 @@ witness-http = ["dep:reqwest"]
 # transport happens to be linked.
 a2a = ["dep:reqwest"]
 # Serve this plane as an A2A agent: the public card plus the JSON-RPC methods.
-a2a-server = ["http", "manifest", "dep:async-stream"]
+# `push` is not optional here: A2A 1.0 defines push notification configs as
+# part of the protocol, and this server implements them unconditionally. A
+# feature that uses a module without declaring it is a feature that does not
+# build alone — which nothing noticed until every feature was built alone.
+a2a-server = ["http", "manifest", "push", "dep:async-stream"]
 # Webhook delivery for A2A push notifications: a durable config store plus
 # SSRF-guarded outbound POSTs.
 push = ["dep:reqwest"]
@@ -174,7 +178,12 @@ serde_yaml_ng = { version = "0.10", optional = true }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"], optional = true }
 opendal     = { version = "0.58", default-features = false, features = ["services-fs"], optional = true }
 cedar-policy = { version = "4.12.0", default-features = false, optional = true }
-tokio-postgres = { version = "0.7.18", optional = true }
+tokio-postgres = { version = "0.7.18", optional = true, features = [
+  # `jsonb` parameters for a co-located resource. Without it `SqlValue::Json`
+  # would have to be bound as text, and a resource updating a jsonb column
+  # would get a type error at runtime rather than a value.
+  "with-serde_json-1",
+] }
 deadpool-postgres = { version = "0.14.1", optional = true }
 rmcp = { version = "3.1", default-features = false, features = ["client", "transport-io"], optional = true }
 axum = { version = "0.8.9", default-features = false, features = ["json", "http1", "tokio"], optional = true }

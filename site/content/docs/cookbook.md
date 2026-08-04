@@ -50,13 +50,30 @@ impl Skill for Triage {
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
-        let prompt = input.map(|input| json!({
-            // `system` is the instruction; each driver spells it the way its
-            // API does — top-level `system` on Anthropic, `instructions` on
-            // OpenAI Responses. Write it once.
-            "system": "You triage support tickets. Answer only with the JSON asked for.",
-            "messages": [{ "role": "user", "content": input }],
-        }));
+        // `Tainted::object`, not `input.map(...)`. The two slots mean different
+        // things and must not share a label: `/system` is the order the model
+        // reasons *under*, and it is a protected field — untrusted text there is
+        // refused before the model sees it. `messages` is content it reasons
+        // *about*, and may stay untrusted.
+        //
+        // `map` cannot prove how a closure reshaped a value, so it taints the
+        // whole result — instruction included. That is why building the prompt
+        // this way is not a style preference.
+        let prompt = Tainted::object([
+            // Each driver spells the instruction the way its API does —
+            // top-level `system` on Anthropic, `instructions` on OpenAI
+            // Responses. Write it once.
+            (
+                "system".to_owned(),
+                Tainted::trusted(json!(
+                    "You triage support tickets. Answer only with the JSON asked for."
+                )),
+            ),
+            (
+                "messages".to_owned(),
+                Tainted::array([input.map(|i| json!({ "role": "user", "content": i }))]),
+            ),
+        ]);
         let call = ModelCall::new(
             Arc::clone(&self.provider),
             ModelId::new("anthropic", "claude-sonnet-4-5"),
@@ -109,8 +126,20 @@ let plan = PlanIR::new(vec![
 let out = rt.run_plan(plan, json!({ "text": "printer on fire" })).await?;
 ```
 
-**The trap:** putting the system prompt in a config file that the run does not
-hash. The instruction is half of what the model was asked; if it can change
+**The trap:** letting untrusted text become the instruction. A model reads its
+order and its data as the same undifferentiated text, so a document saying
+*"ignore previous instructions"* is obeyed like one if it lands in `/system`.
+Labelling the data and gating the sinks bounds what the model may then *do* —
+this crate does that — but it never answers who was allowed to give the order.
+`/system` is therefore protected: untrusted material belongs in `messages`.
+
+This bites the moment an agent is exposed over A2A, because a peer's message
+arrives **untrusted** while a locally-invoked run's input is trusted. An agent
+built with `input.map(...)` works on your machine and is refused in production,
+which is the right way round but worth knowing before it happens.
+
+**The second trap:** putting the system prompt in a config file that the run does
+not hash. The instruction is half of what the model was asked; if it can change
 without the effect key changing, a replay reads back an answer to a question
 that no longer exists, and nothing reports it.
 
@@ -690,7 +719,12 @@ names its resource and one outside the declared set is refused *before it runs*.
 A group that could touch anything has committed to nothing, and the frontier
 would be a boundary around nothing.
 
-**The third trap:** expecting `?` to leave the group alone. It does not — the
+**The third trap:** reaching for a member that must go through `cx.sink`. An
+effect binding its own outbound arguments needs a labelled value checked against
+them, and a group has none to offer on its behalf. Do the sink call outside the
+group and let a plain effect be the member.
+
+**The fourth trap:** expecting `?` to leave the group alone. It does not — the
 executor reverses what the abandoned handle left standing, and a step that
 returns *successfully* with a group still open is reversed **and** failed. A
 group that commits by being forgotten would make the most consequential thing it
@@ -700,6 +734,48 @@ Reversals go through the ordinary effect path, so they are journaled, retried an
 metered like any other call and a replay does not perform them twice. Doubt
 reverses nothing: a member whose outcome cannot be established quarantines the
 run rather than unwinding around it.
+
+## 🧱 Commit a member *with* the journal
+
+If the table lives in the same Postgres as the journal, do not compensate — be
+atomic:
+
+```rust
+#[async_trait]
+impl AtomicResource for PostEntry {
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new("ledger.post", json!({ "account": self.account }))
+    }
+
+    async fn apply(&self, tx: &dyn AtomicTx) -> Result<Value, EffectError> {
+        tx.execute(
+            "UPDATE ledger SET balance = balance + $2 WHERE account = $1",
+            &[SqlValue::from(self.account.as_str()), SqlValue::from(self.amount)],
+        ).await?;
+        Ok(json!({ "posted": self.amount }))
+    }
+}
+
+let mut g = cx.group("checkout", ["inventory", "ledger"]).await?;
+g.reversible("inventory", Reserve::new(&sku), |o| Release::new(o))?.await?;
+g.atomic("ledger", Arc::new(PostEntry { account, amount }))?;
+g.commit(&[]).await?;
+```
+
+The member's write and the record that it happened commit together. Nothing is
+externalised and taken back, so no reversal can fail; there is no in-doubt state,
+because a transaction either committed or did not; and if it refuses, the group
+is taken back *whole* — the cheap path, not a quarantine.
+
+**The trap:** expecting the result. An atomic member returns nothing to the
+caller, because it has not happened yet when you register it and cannot be seen
+before the frontier it commits with. If a later member needs the value, it is not
+an atomic member — it is a `reversible` one.
+
+**The second trap:** reaching for it on an embedded store. `RedbStore` has no
+notion of a foreign table, so it lends no transaction and the member is refused
+at registration. That is a capability being absent, and it is refused where
+refusing costs nothing rather than after the eager members have run.
 
 ## 🔐 Restrict where the plane may connect
 

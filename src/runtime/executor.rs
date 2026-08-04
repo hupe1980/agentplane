@@ -2902,7 +2902,7 @@ async fn settle_abandoned_group(
             Ok(_) => String::new(),
         };
         let settled = cx
-            .settle_open_group(crate::runtime::GroupOutcome::Quarantined, Some(&detail))
+            .settle_open_group(crate::core::GroupOutcome::Quarantined, Some(&detail))
             .await;
         return match settled {
             Ok(()) => result,
@@ -2918,10 +2918,18 @@ async fn settle_abandoned_group(
         // step was reporting: a partly unwound group is the more dangerous fact.
         Err(e) => Err(SkillError::Step(e)),
         Ok(()) => match result {
+            // A reported failure keeps its own reason. `Outcome::Fail` is an
+            // `Ok` at the type level and a failure in fact: leaving the group
+            // to the runtime is the ordinary path there, not an author bug, and
+            // overwriting the reason would tell an operator the step "returned
+            // successfully" while hiding why it actually stopped.
             Err(e) => Err(e),
+            failed @ Ok(Outcome::Fail { .. }) => failed,
+            // Anything else claimed to make progress while leaving a group
+            // unsettled.
             Ok(_) => Err(SkillError::Step(StepError::GroupAborted {
                 what: format!(
-                    "step returned successfully with group '{name}' still open — it was \
+                    "step made progress with group '{name}' still open — it was \
                      reversed, because a group that commits by being forgotten is worse \
                      than one that does not commit at all"
                 ),

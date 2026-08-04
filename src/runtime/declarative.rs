@@ -123,7 +123,17 @@ impl Declarative {
             })
             .collect();
 
-        let prompt = input.map(|input| json!({ "system": system, "input": input }));
+        // `Tainted::object`, not `input.map(...)`. The instruction comes from the
+        // manifest — reviewed, and inside the digest — so it is trusted; the
+        // input is whoever called us and stays whatever it arrived as. `map`
+        // cannot prove how a closure reshaped a value, so it taints the whole
+        // result and the *declared* instruction becomes indistinguishable from
+        // the caller's data. `/system` is a protected field precisely so that
+        // conflation is refused rather than obeyed.
+        let prompt = Tainted::object([
+            ("system".to_owned(), Tainted::trusted(json!(system))),
+            ("input".to_owned(), input),
+        ]);
         let mut exchanges: Vec<crate::model::ToolExchange> = Vec::new();
 
         for _turn in 0..self.max_turns {
@@ -255,7 +265,17 @@ impl Skill for Declarative {
 
         match self.kind {
             ExecutionKind::Completion => {
-                let prompt = input.map(|input| json!({ "system": system, "input": input }));
+                // `Tainted::object`, not `input.map(...)`. The instruction comes from the
+                // manifest — reviewed, and inside the digest — so it is trusted; the
+                // input is whoever called us and stays whatever it arrived as. `map`
+                // cannot prove how a closure reshaped a value, so it taints the whole
+                // result and the *declared* instruction becomes indistinguishable from
+                // the caller's data. `/system` is a protected field precisely so that
+                // conflation is refused rather than obeyed.
+                let prompt = Tainted::object([
+                    ("system".to_owned(), Tainted::trusted(json!(system))),
+                    ("input".to_owned(), input),
+                ]);
                 let mut call =
                     ModelCall::new(Arc::clone(&self.provider), model, prompt.peek().clone());
                 if let Some(schema) = schema {

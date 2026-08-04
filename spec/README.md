@@ -1,6 +1,6 @@
 # Formal specifications
 
-Four TLA+ models covering the parts of the runtime that must be unconditionally
+Seven TLA+ models covering the parts of the runtime that must be unconditionally
 correct, and that are hardest to convince yourself of by reading code:
 
 | Spec | Question it answers |
@@ -8,7 +8,10 @@ correct, and that are hardest to convince yourself of by reading code:
 | [`EffectProtocol.tla`](EffectProtocol.tla) | Can a crash — anywhere — cause an effect to be performed twice, or to happen with no durable trace? |
 | [`RetrySafety.tla`](RetrySafety.tla) | When a call fails without saying whether it landed, is repeating it ever safe — and does asking the provider help? |
 | [`Saga.tla`](Saga.tla) | When a step fails, what may be undone — and what must be left exactly where it is? |
+| [`EffectGroup.tla`](EffectGroup.tla) | Below a step: when several calls must take together, what may be held until the group is certain, what commits *with* the journal, and what can no longer be taken back? |
 | [`Fencing.tla`](Fencing.tla) | Can a paused instance wake up after its run was taken over and still land a write? |
+| [`Authorization.tla`](Authorization.tla) | Can a replay re-open a decision policy already made, and is a refusal always on the record? |
+| [`Delegation.tla`](Delegation.tla) | Can authority grow as it is passed on, and is a chain read from storage trusted or re-checked? |
 
 These check the **design**. The `madsim` simulation (planned) checks the
 **implementation** against deliberately the same invariant list, and the
@@ -26,7 +29,10 @@ them is checked too:
 | `EffectProtocol` | verified | 113 distinct states, depth 16 |
 | `RetrySafety` | verified | 493 distinct states |
 | `Saga` | verified | 63 distinct states |
+| `EffectGroup` | verified | 39 distinct states |
 | `Fencing` | verified | 1171 distinct states |
+| `Authorization` | verified | 13 distinct states |
+| `Delegation` | verified | 9510 distinct states |
 
 ```sh
 spec/verify.sh          # Docker; no local Java needed
@@ -62,7 +68,16 @@ specific invariant written for it (see [`mutations.py`](mutations.py)):
 | Completed steps are undone in the order they ran | `Saga` | `UnwindIsReverse` |
 | A resumed unwind repeats compensations it already performed | `Saga` | `CompensatedAtMostOnce` |
 | The unwind passes over a step it could have undone | `Saga` | `UnwindIsComplete` |
+| Gated members released before the frontier is reached at all | `EffectGroup` | `DeferredOnlyPastTheFrontier` |
+| The gate opens while the atomic members are still uncommitted | `EffectGroup` | `TransactionPrecedesTheGate` |
+| A group unwinds after a gated member has already externalised | `EffectGroup` | `NoUnwindPastAnExternalisedDeferred` |
+| A group left open is committed rather than taken back | `EffectGroup` | `NoSilentCommit` |
+| A group reports aborted with a landed member never taken back | `EffectGroup` | `AbortIsComplete` |
 | Store accepts a write without checking the epoch | `Fencing` | `EpochsNeverRegress` |
+| A delegate is granted authority its delegator does not hold | `Delegation` | `ScopeNeverWidens` |
+| A chain loaded from storage is trusted rather than re-checked | `Delegation` | `RehydratedChainsAreWellFormed` |
+| Policy is re-evaluated while replaying a recorded run | `Authorization` | `ReplayNeverConsultsPolicy` |
+| A run stops on a denial without recording it | `Authorization` | `DenialIsDurable` |
 
 Tripping the top-level `Safety` conjunction is not accepted: that shows only
 that *something* broke. Each generated config names one invariant so a mutation
@@ -169,6 +184,84 @@ the stoppers can never compensate more than one step — and `UnwindIsReverse` a
 `CompensatedAtMostOnce` then pass for want of a second element rather than
 because the protocol is right. The first version of this model did exactly that,
 in 25 states. See [`Saga.cfg`](Saga.cfg).
+
+**`EffectGroup`**
+
+The unit below a step. A step's compensation is handed the step's *output*, and
+a step that failed has none — so it is asked to guess what to undo. A group's
+members register the concrete call that reverses them at the moment they land,
+which is why this spec can talk about completeness at all.
+
+- `DeferredOnlyPastTheFrontier` — a gated member runs only once every reversible
+  member has landed and the invariants hold. Stated over the frontier rather
+  than over the outcome, because a member is legitimately released while the
+  group is still open: commit is what *follows* the last release, not what
+  precedes the first. An earlier version said "only for a committed group" and
+  TLC rejected it in five states.
+- `AbortIsComplete` — an aborted group has nothing standing: every member that
+  landed was taken back, and no gated member ever ran. This is the half that
+  makes deferral worth having, and the one that catches a group reporting
+  *discharged* while a hold is still in place.
+- `NoSilentCommit` — a group nobody settled does not commit. The safe reading of
+  a forgotten group is that it was never meant to take; the alternative makes
+  the most consequential outcome the one an author gets by writing nothing.
+- `NoUnwindPastAnExternalisedDeferred` — once an irreversible member is out in
+  the world, the group is never taken back. Reversing then undoes everything
+  *except* the thing that actually happened, which is the worst of the three
+  answers available and the one that looks tidiest in a log.
+- `TransactionPrecedesTheGate` — atomic members commit before anything is told
+  about it. A gated member released while the transaction was still pending
+  would announce work that may yet vanish; and if the transaction then failed,
+  the group could no longer be taken back whole, because the cheap path would
+  already have been spent on an email.
+- `CommitIsComplete` — "committed" must not mean "committed except the email".
+- `NoUnwindUnderDoubt`, `ReversalIsBackwards`, `ReversedAtMostOnce`,
+  `ReversalFollowsLanding` — the saga's rules, restated at member granularity.
+- `AlwaysSettles` (temporal) — no group stays open forever. `quarantined` counts:
+  refusing to decide is a decision, and the one an operator can act on.
+
+The constants carry the same weight they do in `Saga`. Two gated members are the
+minimum that distinguishes "the first one failed" from "one already went out",
+and the second case is the only way `NoUnwindPastAnExternalisedDeferred` is
+reachable at all. With one gated member it would pass vacuously. See
+[`EffectGroup.cfg`](EffectGroup.cfg).
+
+This spec also produced the clearest example of why the mutation pass exists.
+Adding the transaction made an *existing* mutant survive: `txState # "pending"`
+transitively implies `invariantsHold`, because only `CommitTransaction` clears it
+and that requires the invariants — so a mutation removing `invariantsHold` alone
+left the property true for a second reason. A mutation that had been catching
+something quietly stopped, and nothing but running it would have said so.
+
+**`Authorization`**
+
+- `ReplayNeverConsultsPolicy` — the load-bearing one. If policy were re-evaluated
+  during replay, editing a rule would silently re-judge last year's run under
+  this year's rules, and the audit trail would quietly become a lie.
+- `DenialIsDurable` — a run that stopped on a denial recorded that it did.
+  Without the record, replay reaches that point, finds no history, and reports
+  "this build performs more effects than the recorded one" — sending an operator
+  to look for a code change that does not exist.
+- `NothingForbiddenIsPerformed` — nothing reaches the world that policy refused.
+- `ReplayPerformsNothing` — a replay dispatches nothing at all, so re-judging is
+  not merely forbidden but impossible.
+- `NoRedundantPermitRecords` — a *permit* gets no record. The effect's own
+  `EffectStarted` is already the evidence that it was allowed, and journaling
+  "yes" beside every call doubles the log to say nothing.
+
+**`Delegation`**
+
+- `ScopeNeverWidens` — authority only narrows as it is passed on. A delegate that
+  could be granted something its delegator does not hold is not delegation; it is
+  privilege escalation with paperwork.
+- `RehydratedChainsAreWellFormed` — a chain read back from storage is re-checked
+  rather than trusted. Storage is not an authority: a chain that was valid when
+  written and a chain that was edited afterwards look identical on the way in.
+- `NoLinkExceedsTheOwner` — no link anywhere in a chain holds more than the
+  original owner did, not merely more than the link before it. Checking only
+  adjacent pairs would let authority be laundered across several hops that each
+  look like a narrowing.
+- `DepthIsBounded` — the chain cannot grow without limit.
 
 **`Fencing`**
 

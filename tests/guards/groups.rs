@@ -246,6 +246,9 @@ impl Skill for Checkout {
             // The step walks away without settling. The executor must not read
             // that as a commit.
             "walk away" => Ok(Outcome::done(Tainted::trusted(json!("left open")))),
+            // A reported failure, with the group deliberately left to the
+            // runtime. This is the ordinary path, not an author bug.
+            "outcome fail" => Ok(Outcome::fail("the warehouse said no")),
             "abort" => {
                 g.abort("the caller changed their mind")
                     .await
@@ -1187,6 +1190,731 @@ async fn a_group_survives_waiting_for_an_event() {
         world.did("held") && !world.did("released"),
         "a run waiting for a reply had its group reversed — it is waiting, not \
          failing: {:?}",
+        world.entries()
+    );
+}
+
+/// A step that *reports* a failure keeps its own reason.
+///
+/// `Outcome::Fail` is an `Ok` at the type level and a failure in fact. Treating
+/// it as the forgot-to-settle bug replaces the author's reason with a message
+/// about groups — so the operator reading the run is told the step "returned
+/// successfully" and never sees why it actually stopped.
+#[tokio::test]
+async fn a_step_that_reports_failure_keeps_its_own_reason() {
+    let world = World::new();
+    let out = run(&world, json!({ "ending": "outcome fail" })).await;
+
+    let RunStatus::Failed(why) = &out.status else {
+        panic!("expected a failure, got {:?}", out.status);
+    };
+    assert!(
+        why.contains("the warehouse said no"),
+        "the step's own reason was replaced by a message about groups: {why}"
+    );
+    assert!(
+        !why.contains("returned successfully"),
+        "a step that reported a failure was described as succeeding: {why}"
+    );
+    assert!(
+        world.did("released sku-1") && world.did("voided"),
+        "the group was left standing: {:?}",
+        world.entries()
+    );
+}
+
+/// The gate exemption ends with the reversal that needed it.
+///
+/// Undo is exempt from the manifest check, policy and the budget, because a
+/// ceiling exists to bound work rather than to strand it half-done. That
+/// exemption is a hole for exactly as long as it is open, and nothing about a
+/// step that *had* a group makes its later calls privileged. A reversal that
+/// returned with the flag still set would leave every effect after it ungated —
+/// reached by adding an ordinary `?` to a loop, and invisible without this test.
+#[tokio::test]
+async fn the_gate_exemption_ends_with_the_reversal() {
+    use agentplane::core::Budget;
+
+    #[derive(Debug)]
+    struct AbortsThenActs {
+        world: Arc<World>,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for AbortsThenActs {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("aborts").provides("aborts")
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let mut g = cx
+                .group("aborts", ["inventory"])
+                .await
+                .map_err(SkillError::Step)?;
+            g.reversible(
+                "inventory",
+                Call::new("stock.hold", "held", &self.world),
+                |_| Call::new("stock.release", "released", &self.world),
+            )
+            .await
+            .map_err(SkillError::Step)?;
+            g.abort("changed our mind")
+                .await
+                .map_err(SkillError::Step)?;
+
+            // Past the group. This must be gated like any other call.
+            cx.effect(Call::new("stock.hold", "held again", &self.world))
+                .await
+                .map_err(SkillError::Step)?;
+            Ok(Outcome::done(Tainted::trusted(json!("done"))))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let world = World::new();
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        // Exactly one admitted effect: the forward member. The reversal is
+        // exempt and consumes none, so the call *after* the group has no
+        // allowance left — unless the exemption leaked.
+        .budget(Budget::unlimited().effects(1))
+        .skill(AbortsThenActs {
+            world: Arc::clone(&world),
+        })
+        .build();
+
+    let out = rt.run("aborts", json!({})).await.expect("run");
+
+    assert!(
+        world.did("released"),
+        "the reversal itself was refused, so the exemption is not working at all: {:?}",
+        world.entries()
+    );
+    assert!(
+        !world.did("held again"),
+        "an effect after the group ran without an allowance — the reversal left \
+         the gate open, and every later call skipped the manifest check, policy \
+         and the budget: {:?}",
+        world.entries()
+    );
+    assert!(
+        matches!(out.status, RunStatus::Exhausted(_)),
+        "expected the ceiling to refuse the call after the group, got {:?}",
+        out.status
+    );
+}
+
+/// A member that binds outbound arguments is refused when it is registered.
+///
+/// `cx.effect` refuses any effect exposing `sink_arguments`, because the
+/// information-flow check cannot be skipped. A group has no labelled value to
+/// bind on a member's behalf, so such a member cannot be a reversal or a
+/// deferred call — and the place to say so is **registration**, which is free.
+/// Left to dispatch, the reversal one fires during an abort: the run is already
+/// failing, and the diagnostic arrives about the undo rather than about the
+/// member that was wrong.
+#[tokio::test]
+async fn a_member_that_binds_outbound_arguments_is_refused_at_registration() {
+    /// Exposes outbound arguments, so it must go through `cx.sink`.
+    #[derive(Debug)]
+    struct Bound {
+        args: Value,
+        world: Arc<World>,
+    }
+
+    #[async_trait::async_trait]
+    impl Effect for Bound {
+        type Output = Value;
+        fn descriptor(&self) -> EffectDescriptor {
+            EffectDescriptor::new("ledger.post", self.args.clone())
+        }
+        fn sink_arguments(&self) -> Option<&Value> {
+            Some(&self.args)
+        }
+        async fn perform(&self) -> Result<Value, EffectError> {
+            self.world.record("ledger.post", "posted")
+        }
+    }
+
+    #[derive(Debug)]
+    struct Registers {
+        world: Arc<World>,
+        /// Which registration is under test.
+        deferred: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Registers {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("registers").provides("registers")
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let w = &self.world;
+            let bound = || Bound {
+                args: json!({ "amount": 1 }),
+                world: Arc::clone(w),
+            };
+            let mut g = cx
+                .group("registers", ["inventory"])
+                .await
+                .map_err(SkillError::Step)?;
+
+            let err = if self.deferred {
+                g.deferred("inventory", bound())
+                    .expect_err("a sink-bound member was accepted as deferred")
+            } else {
+                g.reversible("inventory", Call::new("stock.hold", "held", w), |_| bound())
+                    .await
+                    .expect_err("a sink-bound reversal was accepted")
+            };
+            Err(SkillError::Step(err))
+        }
+    }
+
+    for deferred in [true, false] {
+        let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+        let world = World::new();
+        let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+            .skill(Registers {
+                world: Arc::clone(&world),
+                deferred,
+            })
+            .build();
+
+        let out = rt.run("registers", json!({})).await.expect("run");
+        // Deferred: nothing has run, so it is an ordinary refusal and the group
+        // can still be taken back whole. Reversible: the forward member has
+        // already landed and there is no usable way to undo it, which is a
+        // quarantine — settling that as `Aborted` would say discharged while
+        // the hold still stands.
+        let why = match &out.status {
+            RunStatus::Failed(why) if deferred => why,
+            RunStatus::Quarantined(why) if !deferred => why,
+            other => panic!("expected a refusal (deferred={deferred}), got {other:?}"),
+        };
+        assert!(
+            why.contains("ledger.post"),
+            "the refusal did not name the member that binds arguments \
+             (deferred={deferred}): {why}"
+        );
+        assert!(
+            !world.did("posted"),
+            "the sink-bound member ran (deferred={deferred}): {:?}",
+            world.entries()
+        );
+    }
+}
+
+/// Once an irreversible member is out, the group is never taken back.
+///
+/// The distinction the deferred phase turns on. If the *first* gated member
+/// fails, nothing has externalised and the group can still be taken back whole.
+/// If a *later* one fails, reversing would undo everything except the thing
+/// that actually happened — which is the worst of the three answers available
+/// and the one that looks tidiest in a log. So the group is reported unsettled
+/// and the run quarantined instead.
+#[tokio::test]
+async fn a_gated_member_that_fails_after_another_landed_does_not_unwind() {
+    #[derive(Debug)]
+    struct TwoSends {
+        world: Arc<World>,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for TwoSends {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("two-sends").provides("two.sends")
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let w = &self.world;
+            let mut g = cx
+                .group("two-sends", ["inventory", "notify"])
+                .await
+                .map_err(SkillError::Step)?;
+            g.reversible("inventory", Call::new("stock.hold", "held", w), |_| {
+                Call::new("stock.release", "released", w)
+            })
+            .await
+            .map_err(SkillError::Step)?;
+            // Two gated members. The first lands; the second refuses.
+            g.deferred("notify", Call::new("mail.send", "emailed", w))
+                .map_err(SkillError::Step)?;
+            g.deferred("notify", Call::new("sms.send", "texted", w))
+                .map_err(SkillError::Step)?;
+            g.commit(&[]).await.map_err(SkillError::Step)?;
+            Ok(Outcome::done(Tainted::trusted(json!("sent"))))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let world = World::new();
+    world.fail("sms.send", Failure::DidNotHappen);
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .skill(TwoSends {
+            world: Arc::clone(&world),
+        })
+        .build();
+
+    let out = rt.run("two.sends", json!({})).await.expect("run");
+
+    assert!(
+        matches!(out.status, RunStatus::Quarantined(_)),
+        "a group with an irreversible member already out reported {:?}",
+        out.status
+    );
+    assert!(
+        world.did("emailed"),
+        "the first gated member did not run, so this test proves nothing about \
+         what happens after one has: {:?}",
+        world.entries()
+    );
+    assert!(
+        !world.did("released"),
+        "the group unwound after an irreversible member had already gone out — \
+         undoing everything except the thing that actually happened: {:?}",
+        world.entries()
+    );
+}
+
+/// A group that spans a suspension is bracketed once, not once per attempt.
+///
+/// `GroupOpened` is written by an ordinary annotation append, which is a no-op
+/// while replay consumes history and live once it runs out. A group opened
+/// right at the boundary would therefore be announced twice, and "an opened
+/// group with no settlement beside it" — the query an operator runs to find
+/// work that was neither taken nor taken back — would count one unit as two.
+#[tokio::test]
+async fn a_group_spanning_a_suspension_is_announced_once() {
+    use agentplane::case::TimerStore;
+
+    #[derive(Debug)]
+    struct Waits {
+        world: Arc<World>,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Waits {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("waits2").provides("waits2")
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let mut g = cx
+                .group("waits2", ["inventory"])
+                .await
+                .map_err(SkillError::Step)?;
+            g.reversible(
+                "inventory",
+                Call::new("stock.hold", "held", &self.world),
+                |_| Call::new("stock.release", "released", &self.world),
+            )
+            .await
+            .map_err(SkillError::Step)?;
+            let _ = g;
+            cx.sleep(std::time::Duration::from_hours(1))
+                .await
+                .map_err(SkillError::Step)?;
+            unreachable!("never resumes in this test")
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let world = World::new();
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .timers(Arc::clone(&store) as Arc<dyn TimerStore>)
+        .skill(Waits {
+            world: Arc::clone(&world),
+        })
+        .build();
+
+    let out = rt.run("waits2", json!({})).await.expect("run");
+    assert!(out.status.is_suspended());
+
+    // Resume: the step re-runs from the top, replaying the member.
+    let _ = rt
+        .replay(out.run_id, agentplane::runtime::Mode::Resume)
+        .await;
+
+    let opened = store
+        .read(out.run_id, 1)
+        .await
+        .expect("records")
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r.kind(),
+                agentplane::journal::RecordKind::GroupOpened { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        opened, 1,
+        "the group was announced {opened} times across one suspension, so an \
+         operator counting unsettled groups counts one unit as several"
+    );
+}
+
+// ── Committing with the journal, rather than beside it ──────────────────────
+//
+// Gated on `testkit`: the fixture that lends a transaction lives there, because
+// a store which *models* atomicity has no business in a shipped binary. The
+// real property is checked against Postgres in `postgres.rs`.
+
+/// A member that writes to a table in the journal's own database.
+#[cfg(feature = "testkit")]
+#[derive(Debug)]
+struct Posts {
+    account: String,
+    amount: i64,
+    refuses: bool,
+    world: Arc<World>,
+}
+
+#[cfg(feature = "testkit")]
+#[async_trait::async_trait]
+impl agentplane::journal::AtomicResource for Posts {
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "ledger.post",
+            json!({ "account": self.account, "amount": self.amount }),
+        )
+    }
+
+    async fn apply(&self, tx: &dyn agentplane::journal::AtomicTx) -> Result<Value, EffectError> {
+        if self.refuses {
+            return Err(EffectError::Rejected("the account is closed".into()));
+        }
+        tx.execute(
+            "UPDATE ledger SET balance = balance + $2 WHERE account = $1",
+            &[
+                agentplane::journal::SqlValue::from(self.account.as_str()),
+                agentplane::journal::SqlValue::from(self.amount),
+            ],
+        )
+        .await
+        .map_err(|e| EffectError::Other(e.to_string()))?;
+        self.world
+            .log
+            .lock()
+            .expect("lock")
+            .push("posted".to_owned());
+        Ok(json!({ "posted": self.amount }))
+    }
+}
+
+#[cfg(feature = "testkit")]
+/// Drives a group with one atomic member and one reversible one.
+#[derive(Debug)]
+struct Books {
+    world: Arc<World>,
+    refuses: bool,
+}
+
+#[cfg(feature = "testkit")]
+#[async_trait::async_trait]
+impl Skill for Books {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("books").provides("books")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let w = &self.world;
+        let mut g = cx
+            .group("books", ["inventory", "ledger"])
+            .await
+            .map_err(SkillError::Step)?;
+
+        // Eager and external: this is the class that needs taking back.
+        g.reversible("inventory", Call::new("stock.hold", "held", w), |_| {
+            Call::new("stock.release", "released", w)
+        })
+        .await
+        .map_err(SkillError::Step)?;
+
+        g.atomic(
+            "ledger",
+            Arc::new(Posts {
+                account: "AC-1".to_owned(),
+                amount: 129,
+                refuses: self.refuses,
+                world: Arc::clone(w),
+            }),
+        )
+        .map_err(SkillError::Step)?;
+
+        g.commit(&[]).await.map_err(SkillError::Step)?;
+        Ok(Outcome::done(Tainted::trusted(json!("booked"))))
+    }
+}
+
+#[cfg(feature = "testkit")]
+fn staged() -> (
+    Arc<agentplane::testkit::StagedAtomic>,
+    Arc<agentplane::store::RedbStore>,
+) {
+    let redb = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let staged =
+        agentplane::testkit::StagedAtomic::wrap(Arc::clone(&redb) as Arc<dyn JournalStore>);
+    (staged, redb)
+}
+
+/// An atomic member runs at the frontier, with the record that it happened.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn an_atomic_member_commits_with_the_journal() {
+    let (store, _redb) = staged();
+    let world = World::new();
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Books {
+            world: Arc::clone(&world),
+            refuses: false,
+        })
+        .build();
+
+    let out = rt.run("books", json!({})).await.expect("run");
+    assert_eq!(out.status, RunStatus::Succeeded);
+    assert_eq!(
+        world.entries(),
+        vec!["held", "posted"],
+        "the atomic member ran before the frontier, or not at all"
+    );
+    assert_eq!(
+        store.applied().len(),
+        1,
+        "the resource's statement was not applied: {:?}",
+        store.applied()
+    );
+
+    // The settlement is written once, after everything — a group is not
+    // finished when its transaction is, because deferred members run after it.
+    let records: Vec<String> = store
+        .read(out.run_id, 1)
+        .await
+        .expect("records")
+        .iter()
+        .map(|r| r.kind().kind_str().to_owned())
+        .collect();
+    assert!(
+        records.contains(&"GroupSettled".to_owned()),
+        "the group did not settle: {records:?}"
+    );
+    assert_eq!(
+        records.iter().filter(|k| *k == "GroupSettled").count(),
+        1,
+        "the group settled twice — once inside the transaction and once beside \
+         it: {records:?}"
+    );
+}
+
+/// A member that refuses takes the whole unit with it, and the group is taken
+/// back whole.
+///
+/// This is the class's reason for existing: nothing was externalised, so the
+/// failure path is the *cheap* one — an abort — rather than a quarantine.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_refused_atomic_member_leaves_nothing_behind() {
+    let (store, _redb) = staged();
+    let world = World::new();
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Books {
+            world: Arc::clone(&world),
+            refuses: true,
+        })
+        .build();
+
+    let out = rt.run("books", json!({})).await.expect("run");
+
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "a refused atomic member quarantined rather than aborting — nothing was \
+         externalised, so this should be the cheap path: {:?}",
+        out.status
+    );
+    assert!(
+        store.applied().is_empty(),
+        "statements survived a unit of work that refused: {:?}",
+        store.applied()
+    );
+    assert!(
+        world.did("released"),
+        "the eager member was not taken back: {:?}",
+        world.entries()
+    );
+    let settled: Vec<String> = store
+        .read(out.run_id, 1)
+        .await
+        .expect("records")
+        .iter()
+        .filter_map(|r| match r.kind() {
+            agentplane::journal::RecordKind::GroupSettled { outcome, .. } => {
+                Some(outcome.as_str().to_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        settled,
+        vec!["aborted".to_owned()],
+        "the journal did not record the group as taken back"
+    );
+}
+
+/// A replayed run does not apply the statements a second time.
+///
+/// Atomicity exempts nothing from the effect protocol: a transaction re-run on
+/// replay is a second real write, and the fact that it is transactional makes
+/// it a *reliable* second write rather than an acceptable one.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_replayed_atomic_member_is_not_applied_again() {
+    let (store, _redb) = staged();
+    let world = World::new();
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Books {
+            world: Arc::clone(&world),
+            refuses: false,
+        })
+        .build();
+
+    let out = rt.run("books", json!({})).await.expect("run");
+    assert_eq!(out.status, RunStatus::Succeeded);
+    let after_live = store.applied().len();
+    assert_eq!(after_live, 1);
+
+    let replayed = rt
+        .replay(out.run_id, agentplane::runtime::Mode::Strict)
+        .await
+        .expect("replay");
+    assert_eq!(replayed.status, RunStatus::Succeeded);
+    assert_eq!(
+        store.applied().len(),
+        after_live,
+        "strict replay applied the resource's statement again, so replaying a \
+         committed group posts to the ledger twice"
+    );
+    assert_eq!(
+        world.entries(),
+        vec!["held", "posted"],
+        "replay performed a member again: {:?}",
+        world.entries()
+    );
+}
+
+/// A store that cannot lend a transaction refuses the member at registration.
+///
+/// The capability is absent, not broken. Discovering it at the frontier would
+/// mean every eager member had already run.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn an_atomic_member_is_refused_by_a_store_that_cannot_enlist() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let world = World::new();
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .skill(Books {
+            world: Arc::clone(&world),
+            refuses: false,
+        })
+        .build();
+
+    let out = rt.run("books", json!({})).await.expect("run");
+    let RunStatus::Failed(why) = &out.status else {
+        panic!("expected a refusal, got {:?}", out.status);
+    };
+    assert!(
+        why.contains("no transaction"),
+        "the refusal did not explain that the capability is absent: {why}"
+    );
+    assert!(
+        world.did("released"),
+        "the eager member that had already landed was not taken back: {:?}",
+        world.entries()
+    );
+}
+
+/// An atomic member is gated like every other mutating effect.
+///
+/// It is a write to a real database, chosen by skill code and — in the
+/// tool-calling tier — shaped by a model. Being wrapped in a transaction makes
+/// it *reliable*, not *authorised*. A member that skipped the gate would be the
+/// one mutating path in the runtime that policy, the manifest and the budget all
+/// miss, and it would be the most consequential one: it commits.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn an_atomic_member_is_authorized_before_it_commits() {
+    use agentplane::core::{PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest};
+
+    #[derive(Debug)]
+    struct RefusesTheLedger;
+
+    impl PolicyEngine for RefusesTheLedger {
+        fn authorize(&self, r: &PolicyRequest<'_>) -> PolicyDecision {
+            if r.resource == "ledger.post" {
+                PolicyDecision::deny("this agent may not post to the ledger".to_owned())
+            } else {
+                PolicyDecision::Permit
+            }
+        }
+        fn bundle(&self) -> PolicyBundleIdentity {
+            PolicyBundleIdentity::new(
+                agentplane::core::Digest::of(b"refuses-the-ledger"),
+                "agentplane-test/policy-v1",
+            )
+        }
+    }
+
+    let (store, _redb) = staged();
+    let world = World::new();
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(Arc::new(RefusesTheLedger))
+        .skill(Books {
+            world: Arc::clone(&world),
+            refuses: false,
+        })
+        .build();
+
+    let out = rt.run("books", json!({})).await.expect("run");
+
+    let RunStatus::Failed(why) = &out.status else {
+        panic!(
+            "a denied atomic member committed anyway — policy has no say over \
+             the one mutating path that commits: {:?}",
+            out.status
+        );
+    };
+    assert!(
+        why.contains("may not post to the ledger"),
+        "refused for an unrelated reason: {why}"
+    );
+    assert!(
+        store.applied().is_empty(),
+        "the denied member's statement was applied: {:?}",
+        store.applied()
+    );
+    assert!(
+        world.did("released"),
+        "the eager member was not taken back after the denial: {:?}",
         world.entries()
     );
 }

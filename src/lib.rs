@@ -35,7 +35,7 @@
 //!    `Ulid::new` and friends crate-wide.
 //! 2. **Effect-key verification** — on replay, a recomputed key that differs
 //!    from the journaled one quarantines the run rather than diverging silently
-//!    ([`core::RuntimeError::NonDeterminism`]).
+//!    ([`core::StepError::NonDeterminism`]).
 //! 3. **Storage constraints** — the journal's unique index makes "an effect is
 //!    started at most once per run" a database invariant, not a code path.
 //!

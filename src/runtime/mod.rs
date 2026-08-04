@@ -16,5 +16,5 @@ pub use ctx::{Mode, StepCtx};
 #[cfg(feature = "manifest")]
 pub use executor::Agent;
 pub use executor::{LEASE_TTL, MIN_LEASE_TTL, RunOutcome, RunStatus, Runtime, RuntimeBuilder};
-pub use group::{EffectGroup, GroupOutcome, Invariant};
-pub use sweeper::SweepReport;
+pub use group::{EffectGroup, Invariant};
+pub use sweeper::{Saturation, SweepReport};

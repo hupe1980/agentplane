@@ -349,6 +349,39 @@ pub trait Effect: Send + Sync {
     }
 }
 
+/// How a group ended.
+///
+/// Four outcomes rather than two, because "nothing happened" and "we could not
+/// establish what happened" are different situations and an operator acts on
+/// them differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupOutcome {
+    /// Every member took. Deferred members ran; reversals were discarded.
+    Committed,
+    /// No member is standing. Reversible members were reversed, and deferred
+    /// members never ran.
+    Aborted,
+    /// Neither could be established. Some member is in doubt, or a reversal
+    /// failed, and unwinding further would compound the damage.
+    ///
+    /// The run is quarantined. This is the honest answer, and the one a
+    /// half-applied group is usually reported as by systems that do not have
+    /// this variant.
+    Quarantined,
+}
+
+impl GroupOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::Aborted => "aborted",
+            Self::Quarantined => "quarantined",
+        }
+    }
+}
+
 /// An [`Effect`] whose output type has been erased to [`Value`].
 ///
 /// # Why erasure, when generics are right everywhere else

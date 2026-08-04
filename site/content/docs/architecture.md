@@ -467,6 +467,15 @@ registering a reversal because it has nothing to take back, and an effect that
 took that exemption while leaving something standing is exactly the member the
 unwind would miss.
 
+Nor can a member bind its own outbound arguments. Anything exposing
+`sink_arguments` must go through `cx.sink`, which checks a labelled value the
+group does not have on the member's behalf. A **deferred** member is refused
+outright, because nothing has run and the group can still be taken back whole.
+A **reversal** that turns out to be undispatchable is a *quarantine*: the
+forward member has already landed and there is now no way to undo it, so
+settling as aborted would put "discharged" in the journal while the hold still
+stands.
+
 ### Four endings, because two would lie
 
 | Outcome | What is standing |
@@ -484,6 +493,76 @@ does: continuing would undo members *around* one now in an unknown state.
 A group is bracketed in the journal by `GroupOpened` and `GroupSettled`, so an
 opened group with no settlement beside it is a query rather than a grep — the
 work that was neither taken nor taken back.
+
+### The model, and what it proves
+
+The frontier is specified in TLA+ and model-checked, because "several calls take
+together" is the kind of claim that reads as obviously true and has interleavings
+nobody thinks of. The invariants worth naming are that a gated member runs only
+past the frontier, that an aborted group has **nothing standing** — every member
+reversed, no gated member run — that a group nobody settled does not commit, and
+that once an irreversible member is out the group is never taken back.
+
+Each is checked twice over: a mutant of the model must be caught by the invariant
+written for it, and every invariant is mapped to a test that checks the same
+property against the code. A model verifying a protocol the runtime does not
+implement is a green job that says nothing, so that mapping is itself enforced.
+
+One invariant had to be weakened before it verified, and the weakening is the
+interesting part: "a gated member runs only for a **committed** group" is false,
+because a member is legitimately released while the group is still open — commit
+is what *follows* the last release. Stated over the frontier instead, it holds.
+The model rejected the sentence a person would have written.
+
+### The strongest class: committing *with* the journal
+
+Everything above is the saga form, and it is the right answer when the members
+live in systems that cannot share a transaction. It is **not** the best answer
+when the resource lives in the same database as the journal.
+
+```rust
+g.atomic("ledger", Arc::new(PostEntry { account, amount }))?;
+```
+
+That member does not run when it is registered. It runs inside the transaction
+`commit` opens, alongside the records saying it happened — and the difference
+that buys is not a refinement:
+
+- **nothing is externalised and later reversed**, so no reversal can fail;
+- **there is no in-doubt state.** A transaction committed or it did not. The
+  undecidable window the whole effect protocol exists to survive is not handled
+  here, it is *absent*;
+- **an abort is a `ROLLBACK`**, which is free and cannot itself fail halfway.
+
+Compensation that never has to run beats compensation that runs correctly. DBOS
+makes the same observation for same-database steps, and it is the one place this
+design can do better than a saga rather than merely do a saga carefully.
+
+The seam is SQL, and only Postgres offers it. That is the premise, not a
+limitation to apologise for: the resource is *already there* — a ledger table
+beside the journal — so the seam speaks the language that table is written in. A
+key-value seam every backend could implement would only reach a table this crate
+defined, which is not the table anyone wants to be atomic with. A store that
+cannot lend its transaction answers `None`, and the member is refused when it is
+**registered** rather than at the frontier, because by then every eager member
+has already run.
+
+Two things it deliberately does not do. The transaction carries the members and
+their records, **not** the group's settlement: a group is not finished when its
+transaction is, since deferred members run afterwards and can still fail, and a
+`Committed` record inside the transaction would be a claim about work not yet
+attempted. And replay applies nothing — atomicity exempts no one from the effect
+protocol, and a transaction re-run on replay is a second real write made
+*reliable* rather than acceptable by being transactional.
+
+### What a group is not
+
+It is not a distributed transaction, and nothing here pretends otherwise: there
+is no two-phase commit across a payment provider and a warehouse, because those
+systems do not offer one. Where one transaction is available the section above
+takes it; everywhere else a group is the saga form made precise — captured
+reversals, an explicit frontier, and deferral for what must not be externalised
+early.
 
 ### Forgetting to settle is not a commit
 
@@ -1175,6 +1254,11 @@ policy-bundle identity covering rules, schema, static entities, adapter
 configuration/extensions, and evaluator semantics. An open run may resume only
 under that exact bundle because resume can dispatch past the recorded prefix.
 Dynamic request facts are not bundle inputs; they stay in each policy request.
+An effect's request carries the run, step, tenant, whether it mutates, the
+arguments — and, when the call came through `sink`, the **label** of the value it
+will send. That last one is what lets a rule key on *where the data came from*
+rather than only on what it is; without it, provenance and authorization would be
+two graphs that meet only in the checks this crate happens to have written.
 `Strict` performs nothing and therefore neither loads nor compares policy, which
 keeps offline verification independent of historical evaluator availability.
 
@@ -1792,6 +1876,26 @@ defaulting either way is wrong half the time. `forget` is what a **correction**
 needs: a stale memory whose summaries remain legitimate should not take them
 with it. `forget_cascading` is what an **erasure** needs: the memory and
 everything transitively derived from it.
+
+### Every case mutation is an effect
+
+A case's status and its obligations are shared mutable state that outlives the
+run: several runs and an operator all write them over months. Both changes go
+through the effect protocol, and the two reasons are separate.
+
+**A write outside the journal is performed again on every replay.** Replaying
+last quarter's history to answer a question would close a case that has since
+been reopened — a replay reads history, it does not rewrite the world that
+history happened in.
+
+**And it leaves nothing to attribute.** *Who closed this case, and when* is
+exactly what the journal is for, and a status that changed without a record is a
+change nobody can answer for.
+
+The deadline transition also reads the state it moved *from* inside the effect
+rather than before it. Reading first would put a store lookup in the
+deterministic zone, and a replay would report whatever the deadline says now as
+the state it moved from.
 
 ### A lease answers "is the owner dead?", and nothing else
 

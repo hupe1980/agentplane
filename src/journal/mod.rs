@@ -6,6 +6,7 @@
 //! The system would stop working with it. Logging that exists only for
 //! compliance always rots; this cannot.
 
+mod atomic;
 mod note;
 mod record;
 mod replay;
@@ -15,6 +16,7 @@ mod witness;
 #[cfg(feature = "witness-http")]
 mod witness_http;
 
+pub use atomic::{AtomicJournal, AtomicResource, AtomicTx, AtomicWork, SqlValue};
 pub use note::{NoteSignature, SignedNote, key_id};
 pub use record::{AgentIdentity, Append, Record, RecordBody, RecordKind};
 pub use replay::{EffectReplay, ReplayCursor, StepCursor};

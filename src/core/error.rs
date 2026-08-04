@@ -43,21 +43,6 @@ pub enum RuntimeError {
     #[error("quota: {0}")]
     QuotaExceeded(#[from] crate::quota::QuotaError),
 
-    /// Replay recomputed a different effect key than the journal holds — the
-    /// deterministic zone took a different path than the recorded run.
-    ///
-    /// The run is quarantined. It is never allowed to silently diverge, because
-    /// a diverging replay produces an audit trail that is quietly a lie.
-    #[error(
-        "non-determinism at seq {seq}: journal has {expected}, replay recomputed {actual} \
-         — the deterministic zone is not deterministic; run quarantined"
-    )]
-    NonDeterminism {
-        seq: Seq,
-        expected: EffectKey,
-        actual: EffectKey,
-    },
-
     /// The journal's hash chain does not verify. Either a record was altered
     /// after the fact, or a writer produced bytes it did not hash.
     #[error("journal integrity broken at seq {seq}: {detail}")]
@@ -640,13 +625,16 @@ impl RuntimeError {
 
     /// Whether this run should be abandoned by *this* instance rather than
     /// retried. Both cases are terminal for the current owner: fencing means
-    /// someone else owns it, divergence means the recorded history can no longer
-    /// be trusted to describe this code.
+    /// someone else owns it, and a broken chain means the recorded history can
+    /// no longer be trusted to describe anything.
+    ///
+    /// Divergence is deliberately not here. It is not a `RuntimeError` at all —
+    /// a replay that recomputes a different key quarantines the *run*, through
+    /// [`StepError::NonDeterminism`], and a run status is not something an
+    /// owner abandons. A second spelling of it lived on this enum, unconstructed
+    /// and pointed at by the crate's own front page, until a guard noticed.
     #[must_use]
     pub fn is_terminal_for_owner(&self) -> bool {
-        matches!(
-            self,
-            Self::Fenced { .. } | Self::NonDeterminism { .. } | Self::ChainBroken { .. }
-        )
+        matches!(self, Self::Fenced { .. } | Self::ChainBroken { .. })
     }
 }

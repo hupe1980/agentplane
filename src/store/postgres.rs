@@ -44,7 +44,12 @@ use tokio_postgres::error::SqlState;
 use crate::core::{Digest, EffectKey, Epoch, RunId, Seq, StoreError};
 use std::sync::Arc;
 
-use crate::journal::{Append, Cancellation, Head, JournalStore, Lease, Record};
+use serde_json::Value;
+
+use crate::journal::{
+    Append, AtomicJournal, AtomicTx, AtomicWork, Cancellation, Head, JournalStore, Lease, Record,
+    SqlValue,
+};
 
 /// The schema, applied on connect.
 ///
@@ -70,8 +75,20 @@ CREATE TABLE IF NOT EXISTS journal (
     -- detects edits, it just cannot say who made them.
     key_id     TEXT,
     signature  BYTEA,
+    -- Which matter this record belongs to, when it belongs to one.
+    --
+    -- A column and not only a field inside `raw`: *show me everything about
+    -- this matter* is answerable by a range scan here, and by a join over the
+    -- case's runs otherwise — a join that also **misses** every record written
+    -- by a run the case does not own, which is exactly what a sweep is.
+    case_id    TEXT,
     PRIMARY KEY (tenant, run_id, seq)
 );
+
+-- One matter's history, in order, without touching another tenant's.
+CREATE INDEX IF NOT EXISTS journal_by_case
+    ON journal (tenant, case_id, run_id, seq)
+    WHERE case_id IS NOT NULL;
 
 -- Exactly-once, as a constraint rather than a code path. A second
 -- `EffectStarted` for one effect key in one run cannot be written, whichever
@@ -261,20 +278,17 @@ impl PostgresStore {
     }
 }
 
-#[async_trait]
-impl JournalStore for PostgresStore {
-    fn tenant(&self) -> &str {
-        self.tenant.as_str()
-    }
-
-    async fn append(&self, epoch: Epoch, batch: Vec<Append>) -> Result<Vec<Record>, StoreError> {
-        if batch.is_empty() {
-            return Ok(Vec::new());
-        }
-        let run = batch[0].run;
-        let mut client = self.pool.get().await.map_err(|e| pool_err(&e))?;
-        let tx = client.transaction().await.map_err(|e| be(&e))?;
-
+impl PostgresStore {
+    /// Refuse a displaced writer, under the row lock the lease is taken with.
+    ///
+    /// Split out so the ordinary append and the atomic one cannot drift: a
+    /// second copy of a fence is a fence with a second chance to be wrong.
+    async fn fence(
+        &self,
+        tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
+        run: RunId,
+        epoch: Epoch,
+    ) -> Result<(), StoreError> {
         // Fencing and the chain head are read under the row lock the lease is
         // taken with, so a concurrent writer either waits or is refused. The
         // `FOR UPDATE` is what makes the epoch check and the append one
@@ -298,6 +312,17 @@ impl JournalStore for PostgresStore {
             }
         }
 
+        Ok(())
+    }
+
+    /// Seal and insert a batch inside a transaction the caller owns.
+    async fn append_within(
+        &self,
+        tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
+        run: RunId,
+        epoch: Epoch,
+        batch: Vec<Append>,
+    ) -> Result<Vec<Record>, StoreError> {
         let head = tx
             .query_opt(
                 "SELECT seq, hash FROM journal
@@ -327,8 +352,8 @@ impl JournalStore for PostgresStore {
                 .execute(
                     "INSERT INTO journal
                        (tenant, run_id, seq, epoch, kind, effect_key, prev_hash, hash,
-                        raw, key_id, signature)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                        raw, key_id, signature, case_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                     &[
                         &self.tenant_name(),
                         &run.to_string(),
@@ -341,6 +366,7 @@ impl JournalStore for PostgresStore {
                         &record.raw().to_vec(),
                         &record.attestation.as_ref().map(|a| a.key_id.clone()),
                         &record.attestation.as_ref().map(|a| a.signature.clone()),
+                        &record.body.case.map(|c| c.to_string()),
                     ],
                 )
                 .await;
@@ -359,6 +385,31 @@ impl JournalStore for PostgresStore {
             sealed.push(record);
         }
 
+        Ok(sealed)
+    }
+}
+
+#[async_trait]
+impl JournalStore for PostgresStore {
+    fn tenant(&self) -> &str {
+        self.tenant.as_str()
+    }
+
+    /// This backend can. That is the whole reason the capability is a question
+    /// rather than an assumption.
+    fn atomic(&self) -> Option<&dyn AtomicJournal> {
+        Some(self)
+    }
+
+    async fn append(&self, epoch: Epoch, batch: Vec<Append>) -> Result<Vec<Record>, StoreError> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let run = batch[0].run;
+        let mut client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        self.fence(&tx, run, epoch).await?;
+        let sealed = self.append_within(&tx, run, epoch, batch).await?;
         tx.commit().await.map_err(|e| be(&e))?;
         Ok(sealed)
     }
@@ -388,6 +439,47 @@ impl JournalStore for PostgresStore {
             let _ = seq;
             // Zipped, not defaulted: half a signature is a half-written row
             // rather than an unsigned record.
+            let attestation = key_id
+                .zip(signature)
+                .map(|(key_id, signature)| crate::core::Attestation { key_id, signature });
+            out.push(Record::from_stored_attested(
+                raw,
+                digest_from(&prev)?,
+                digest_from(&hash)?,
+                attestation,
+            )?);
+        }
+        Ok(out)
+    }
+
+    async fn case_history(
+        &self,
+        case: crate::core::CaseId,
+        limit: usize,
+    ) -> Result<Vec<Record>, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT raw, prev_hash, hash, key_id, signature FROM journal
+                  WHERE tenant = $1 AND case_id = $2
+                  ORDER BY run_id, seq ASC
+                  LIMIT $3",
+                &[
+                    &self.tenant_name(),
+                    &case.to_string(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let raw: Vec<u8> = row.get(0);
+            let prev: Vec<u8> = row.get(1);
+            let hash: Vec<u8> = row.get(2);
+            let key_id: Option<String> = row.get(3);
+            let signature: Option<Vec<u8>> = row.get(4);
             let attestation = key_id
                 .zip(signature)
                 .map(|(key_id, signature)| crate::core::Attestation { key_id, signature });
@@ -660,4 +752,156 @@ fn digest_from(bytes: &[u8]) -> Result<Digest, StoreError> {
         detail: format!("a hash column holds {} bytes, not 32", bytes.len()),
     })?;
     Ok(Digest::from_bytes(arr))
+}
+
+// ── Committing with the journal, rather than beside it ───────────────────────
+
+/// The journal's own transaction, as much of it as a co-located resource may
+/// use.
+///
+/// Holds a borrow rather than a pool handle on purpose: the resource cannot
+/// outlive the transaction, cannot commit it, and cannot start another. What it
+/// can do is exactly what makes this worth having — write to its own table in
+/// the transaction that is about to record that it did.
+struct PgAtomicTx<'a>(&'a deadpool_postgres::tokio_postgres::Transaction<'a>);
+
+/// Bind a portable value to this driver's parameter type.
+///
+/// Owned first, then borrowed: `tokio_postgres` wants `&(dyn ToSql + Sync)`, and
+/// the temporaries have to outlive the call.
+fn bind(params: &[SqlValue]) -> Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> {
+    params
+        .iter()
+        .map(|v| -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
+            match v {
+                SqlValue::Null => Box::new(Option::<i64>::None),
+                SqlValue::Bool(b) => Box::new(*b),
+                SqlValue::Int(i) => Box::new(*i),
+                SqlValue::Float(f) => Box::new(*f),
+                SqlValue::Text(s) => Box::new(s.clone()),
+                SqlValue::Bytes(b) => Box::new(b.clone()),
+                SqlValue::Json(j) => Box::new(j.clone()),
+            }
+        })
+        .collect()
+}
+
+fn as_refs(
+    owned: &[Box<dyn tokio_postgres::types::ToSql + Sync + Send>],
+) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
+    owned.iter().map(|b| &**b as _).collect()
+}
+
+#[async_trait]
+impl AtomicTx for PgAtomicTx<'_> {
+    async fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, StoreError> {
+        let owned = bind(params);
+        self.0
+            .execute(sql, &as_refs(&owned))
+            .await
+            .map_err(|e| be(&e))
+    }
+
+    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Value>, StoreError> {
+        let owned = bind(params);
+        let rows = self
+            .0
+            .query(sql, &as_refs(&owned))
+            .await
+            .map_err(|e| be(&e))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut obj = serde_json::Map::new();
+            for (i, col) in row.columns().iter().enumerate() {
+                obj.insert(col.name().to_owned(), column_json(row, i, col.type_())?);
+            }
+            out.push(Value::Object(obj));
+        }
+        Ok(out)
+    }
+}
+
+/// One column, as JSON.
+///
+/// Converted per Postgres type rather than by asking for a `Value` and taking
+/// what comes: only `json`/`jsonb` answer that, so every other column would come
+/// back **null** — a wrong answer wearing the shape of a missing one, which is
+/// the worst of both. An unknown type is an error for the same reason: a
+/// resource reading a column this does not understand should be told, not handed
+/// a null it will treat as a zero.
+fn column_json(
+    row: &deadpool_postgres::tokio_postgres::Row,
+    i: usize,
+    ty: &tokio_postgres::types::Type,
+) -> Result<Value, StoreError> {
+    use tokio_postgres::types::Type;
+
+    macro_rules! get {
+        ($t:ty) => {
+            row.try_get::<_, Option<$t>>(i)
+                .map_err(|e| StoreError::Backend(e.to_string()))?
+                .map_or(Value::Null, Value::from)
+        };
+    }
+
+    Ok(match *ty {
+        Type::BOOL => get!(bool),
+        Type::INT2 => get!(i16),
+        Type::INT4 => get!(i32),
+        Type::INT8 => get!(i64),
+        Type::FLOAT4 => get!(f32),
+        Type::FLOAT8 => get!(f64),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => get!(String),
+        Type::JSON | Type::JSONB => row
+            .try_get::<_, Option<Value>>(i)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+            .unwrap_or(Value::Null),
+        Type::BYTEA => row
+            .try_get::<_, Option<Vec<u8>>>(i)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+            .map_or(Value::Null, |b| Value::String(hex(&b))),
+        ref other => {
+            return Err(StoreError::Backend(format!(
+                "column '{}' has type {other}, which this seam does not convert — \
+                 select it as text or jsonb rather than being handed a null that \
+                 reads as a zero",
+                row.columns()[i].name()
+            )));
+        }
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+#[async_trait]
+impl AtomicJournal for PostgresStore {
+    async fn append_atomic(
+        &self,
+        run: RunId,
+        epoch: Epoch,
+        work: &dyn AtomicWork,
+    ) -> Result<Vec<Record>, StoreError> {
+        let mut client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+
+        // Before the work, not after. A displaced writer's statements should
+        // never run at all, and the transaction rolling them back afterwards is
+        // a weaker property that happens to look the same.
+        self.fence(&tx, run, epoch).await?;
+
+        let batch = work
+            .run(&PgAtomicTx(&tx))
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+        let sealed = self.append_within(&tx, run, epoch, batch).await?;
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(sealed)
+    }
 }

@@ -249,3 +249,36 @@ impl Deadline {
             && now < self.resolved_at
     }
 }
+
+/// What the sweeper did to something nobody was watching.
+///
+/// # Why these are on the record and not only in a log
+///
+/// The sweeper makes the plane's most consequential *automated* decisions: it
+/// breaches an obligation, escalates a case, expires a person's task. Nothing
+/// asked it to — that is the point of it — so there is no run whose history
+/// explains why the state changed.
+///
+/// Without a record, *why is this case escalated* is answerable only from the
+/// resulting state, and state cannot distinguish "the sweep breached this at
+/// 02:00" from "somebody set it". That is the same distinction
+/// [`RecordKind::StepCompensated`](crate::journal::RecordKind::StepCompensated)
+/// exists for, and it matters more here because no human was present.
+///
+/// A typed enum rather than a message: an operator alerting on breaches should
+/// not be matching on prose, and a variant added here is one every reader must
+/// consider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweptAction {
+    /// An obligation is approaching and its warning instant passed.
+    DeadlineWarned,
+    /// An obligation passed unmet.
+    DeadlineBreached,
+    /// A case was escalated because one of its obligations was breached.
+    CaseEscalated,
+    /// A person's task window closed and the declared policy was applied.
+    TaskExpired,
+    /// A task's audience was widened because nobody answered in time.
+    TaskEscalated,
+}

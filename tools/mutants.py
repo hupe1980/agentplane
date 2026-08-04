@@ -25,12 +25,21 @@ moved and the mutation is silently testing nothing.
 Usage:  mutants.py --list           (tab-separated: name, file, test, description)
         mutants.py <name> --apply   (rewrite the file in place)
         mutants.py <name> --revert  (restore from the .orig backup)
+        mutants.py <name> --verify  (apply, run the test it names, restore)
+
+`--check` proves a mutation still *matches* the code. Only `--verify` proves it
+still *kills*: a mutation whose test was rewritten around it passes quietly, and
+a guarantee that stopped being checked looks exactly like one that is. The
+feature set comes from the test's own `cfg` gates rather than a second list, so
+there is nothing to keep in step.
 """
 
 from __future__ import annotations
 
 import os
 import pathlib
+import re
+import subprocess
 import shutil
 import sys
 import time
@@ -2040,8 +2049,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "reversals_run_in_the_opposite_order_to_the_members",
         "members are taken back in the order they landed, so a reversal that "
         "depends on an earlier member still being in place runs after it is gone",
-        "        for (reversed, member) in reversals.into_iter().rev().enumerate() {",
-        "        for (reversed, member) in reversals.into_iter().enumerate() {",
+        "        for (done, member) in reversals.into_iter().rev().enumerate() {",
+        "        for (done, member) in reversals.into_iter().enumerate() {",
     ),
     "TheGateOpensBeforeTheInvariants": (
         "src/runtime/group.rs",
@@ -2095,6 +2104,217 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "through a bug",
         "        if !self.phase.is_forward() || self.reversing {",
         "        if !self.phase.is_forward() {",
+    ),
+    "AReportedFailureIsCalledSuccess": (
+        "src/runtime/executor.rs",
+        "a_step_that_reports_failure_keeps_its_own_reason",
+        "a step that reports a failure has its reason replaced by a message "
+        "about groups, so the operator reading the run is told the step returned "
+        "successfully and never learns why it actually stopped",
+        "            failed @ Ok(Outcome::Fail { .. }) => failed,",
+        "",
+    ),
+    "ReversalLeavesTheGateOpen": (
+        "src/runtime/group.rs",
+        "the_gate_exemption_ends_with_the_reversal",
+        "the gate exemption is never cleared after a reversal, so every effect "
+        "the step performs afterwards skips the manifest check, policy and the "
+        "budget — a security hole that looks like a missing line",
+        "        let reversed = self.reverse_each(reversals).await;\n        self.set_reversing(false);",
+        "        let reversed = self.reverse_each(reversals).await;",
+    ),
+    "PolicyCannotSeeProvenance": (
+        "src/runtime/ctx.rs",
+        "a_rule_can_refuse_an_effect_for_where_its_arguments_came_from",
+        "the label never reaches the authorization request, so provenance and "
+        "authorization are two graphs that only meet in checks written in this "
+        "crate — a deployment can say 'amounts over 5000 need approval' but not "
+        "'not with data that passed through that peer'",
+        "        if let Some(label) = outbound {\n            context[\"label\"] = serde_json::to_value(label).unwrap_or(Value::Null);\n        }",
+        "",
+    ),
+    "ASinkBoundMemberIsAcceptedSilently": (
+        "src/runtime/group.rs",
+        "a_member_that_binds_outbound_arguments_is_refused_at_registration",
+        "a member that binds its outbound arguments is registered without "
+        "complaint, so the refusal arrives during an abort — about the undo "
+        "rather than about the member that was wrong — or, for a reversal, the "
+        "group settles as aborted with nothing registered to take the hold back",
+        "        effect.sink_arguments().is_some().then(|| {",
+        "        effect.sink_arguments().is_none().then(|| {",
+    ),
+    "AnUntrustedInstructionIsObeyed": (
+        "src/model/mod.rs",
+        "an_untrusted_instruction_is_refused_before_the_model_sees_it",
+        "the instruction slot is not protected, so text that arrived as *data* "
+        "can be handed to the model as the order it reasons under — and the "
+        "agent follows instructions written by whoever authored the page it read",
+        "        self.protected = if self.prompt.get(\"system\").is_some_and(|s| !s.is_null()) {\n"
+        "            vec![crate::core::ProtectedField::trusted(\"/system\")]\n"
+        "        } else {\n"
+        "            Vec::new()\n"
+        "        };",
+        "        self.protected = Vec::new();",
+    ),
+    "AToolLoopInstructionIsTaintedByItsCaller": (
+        "src/runtime/declarative.rs",
+        "a_declared_instruction_survives_an_untrusted_input_in_the_tool_loop",
+        "the tool-calling loop builds its prompt by mapping over the caller's "
+        "input, so the manifest's reviewed instruction inherits the caller's "
+        "label — and this is the tier where it matters most, because the "
+        "model's answer chooses which granted tool runs",
+        "        let prompt = Tainted::object([\n"
+        "            (\"system\".to_owned(), Tainted::trusted(json!(system))),\n"
+        "            (\"input\".to_owned(), input),\n"
+        "        ]);",
+        "        let prompt = input.map(|input| json!({ \"system\": system, \"input\": input }));",
+    ),
+    "ADeclaredInstructionIsTaintedByItsCaller": (
+        "src/runtime/declarative.rs",
+        "a_declared_instruction_survives_an_untrusted_input",
+        "a declarative agent builds its prompt by mapping over the caller's "
+        "input, so the manifest's own reviewed, digest-pinned instruction "
+        "inherits the caller's label — the declared order becomes "
+        "indistinguishable from the data, and an agent reachable over A2A is "
+        "refused as though the peer had written its prompt",
+        "                let prompt = Tainted::object([\n"
+        "                    (\"system\".to_owned(), Tainted::trusted(json!(system))),\n"
+        "                    (\"input\".to_owned(), input),\n"
+        "                ]);",
+        "                let prompt = input.map(|input| json!({ \"system\": system, \"input\": input }));",
+    ),
+    # ── Committing with the journal ─────────────────────────────────────────
+    "AtomicMembersRunBeforeTheFrontier": (
+        "src/runtime/group.rs",
+        "an_atomic_member_commits_with_the_journal",
+        "atomic members are never applied, so a group reports committed while "
+        "the ledger it was supposed to post to never moved — the quietest "
+        "possible failure, because nothing errors",
+        "        if !atomic.is_empty()\n            && let Err(e) = self.cx.commit_atomic(&name, atomic).await\n        {",
+        "        if false\n            && let Err(e) = self.cx.commit_atomic(&name, atomic).await\n        {",
+    ),
+    "AFailedTransactionQuarantines": (
+        "src/runtime/group.rs",
+        "a_refused_atomic_member_leaves_nothing_behind",
+        "a transaction that did not commit is treated as damage rather than as "
+        "nothing happening, so the group quarantines instead of being taken "
+        "back — throwing away the one property this class exists for",
+        "            self.cx.abort_open_group(&what).await?;\n            return Err(StepError::GroupAborted { what });\n        }\n\n        let mut outputs = Vec::with_capacity(deferred.len());",
+        "            self.cx\n                .settle_open_group(GroupOutcome::Quarantined, Some(&what))\n                .await?;\n            return Err(StepError::GroupUnsettled { group: name, detail: what });\n        }\n\n        let mut outputs = Vec::with_capacity(deferred.len());",
+    ),
+    "AReplayedTransactionRuns": (
+        "src/runtime/group.rs",
+        "a_replayed_atomic_member_is_not_applied_again",
+        "a replayed run applies the transaction again, so replaying a committed "
+        "group posts to the ledger twice — reliably, because it is transactional",
+        "            if self.replaying() {",
+        "            if false {",
+    ),
+    "AnAbsentTransactionIsDiscoveredAtTheFrontier": (
+        "src/runtime/group.rs",
+        "an_atomic_member_is_refused_by_a_store_that_cannot_enlist",
+        "a store that cannot lend a transaction is discovered at commit instead "
+        "of at registration, by which time every eager member has already run",
+        "        if !self.cx.store_is_atomic() {",
+        "        if false {",
+    ),
+    "CaseStatusIsWrittenOutsideTheJournal": (
+        "src/runtime/ctx.rs",
+        "changing_a_case_status_is_journaled_and_not_repeated_on_replay",
+        "a case's status is written straight to the store, so the change is "
+        "unattributable *and* performed again on every replay — replaying last "
+        "quarter's history to answer a question closes a case that has since "
+        "been reopened",
+        "        self.effect(crate::runtime::effects::SetCaseStatus {\n"
+        "            cases: Arc::clone(&cx.cases),\n"
+        "            case: cx.case_id,\n"
+        "            status,\n"
+        "        })\n"
+        "        .await?;",
+        "        cx.cases.set_status(cx.case_id, status).await?;",
+    ),
+    "ADeadlineTransitionIsWrittenOutsideTheJournal": (
+        "src/runtime/ctx.rs",
+        "changing_a_case_status_is_journaled_and_not_repeated_on_replay",
+        "a deadline transition is written straight to the store and journaled "
+        "afterwards, so a crash between the two marks an obligation met with "
+        "nothing saying who met it — and a replay meets it a second time",
+        "        let before = self\n"
+        "            .effect(crate::runtime::effects::TransitionDeadline {\n"
+        "                cases: Arc::clone(&cx.cases),\n"
+        "                case: cx.case_id,\n"
+        "                name: name.to_owned(),\n"
+        "                to,\n"
+        "            })\n"
+        "            .await?\n"
+        "            .into_unlabelled();",
+        "        let before = {\n"
+        "            let seen = cx\n"
+        "                .cases\n"
+        "                .deadlines(cx.case_id)\n"
+        "                .await?\n"
+        "                .into_iter()\n"
+        "                .find(|d| d.name == name)\n"
+        "                .map_or(DeadlineState::Pending, |d| d.state);\n"
+        "            cx.cases.set_deadline_state(cx.case_id, name, to).await?;\n"
+        "            seen\n"
+        "        };",
+    ),
+    "AnAtomicMemberSkipsTheGate": (
+        "src/runtime/group.rs",
+        "an_atomic_member_is_authorized_before_it_commits",
+        "an atomic member commits without passing the gate, so the one mutating "
+        "path that *commits* is the only one policy, the manifest and the budget "
+        "all miss — and being wrapped in a transaction makes it reliable rather "
+        "than authorised",
+        "            self.gate(key, &descriptor, true, None).await?;",
+        "",
+    ),
+    "ACappedSweepLooksOrdinary": (
+        "src/runtime/sweeper.rs",
+        "a_sweep_that_hits_its_cap_says_so",
+        "a sweep that handled its full batch reports an ordinary tick, so a "
+        "growing backlog and a quiet plane produce the same numbers — and the "
+        "one an operator needs to see is the one that looks normal",
+        "        if due.len() >= DEADLINE_BATCH {\n            report.saturated.deadlines = true;\n        }",
+        "",
+    ),
+    "ASweepLeavesNoRecord": (
+        "src/runtime/sweeper.rs",
+        "a_sweep_records_what_it_did_in_a_sealed_run",
+        "the sweeper breaches obligations and escalates cases without recording "
+        "that it did, so *why is this case escalated* is answerable only from "
+        "the resulting state — which cannot tell 'the sweep breached this at "
+        "02:00' from 'somebody set it', and no human was there to remember",
+        "        report.record = ledger.seal(self.store()).await;",
+        "",
+    ),
+    "AQuietSweepOpensARun": (
+        "src/runtime/sweeper.rs",
+        "a_sweep_records_what_it_did_in_a_sealed_run",
+        "a tick that decided nothing still opens and seals a run, so the Merkle "
+        "log fills with evidence of inactivity — and a log of nothings is where "
+        "the somethings hide",
+        "    const fn new() -> Self {\n        Self {\n            run: None,\n            entries: Vec::new(),\n        }\n    }",
+        "    fn new() -> Self {\n        Self {\n            run: Some(RunId::generate()),\n            entries: Vec::new(),\n        }\n    }",
+    ),
+    "ASweepRecordIsNotReachableFromItsCase": (
+        "src/runtime/sweeper.rs",
+        "a_case_s_history_includes_a_sweep_that_escalated_it",
+        "a sweep's records are written without the case they are about, so the "
+        "record explaining *why this case is escalated* is unreachable from the "
+        "case — which is the only reason for writing it down",
+        "        if let Some(case) = case {\n            entry = entry.case(case);\n        }",
+        "",
+    ),
+    "ACaseScanReturnsEveryMatter": (
+        "src/store/redb.rs",
+        "a_case_s_history_includes_a_sweep_that_escalated_it",
+        "the case index is written without the case in its key, so one matter's "
+        "history returns another's — the worst possible answer to a question "
+        "asked by a regulator",
+        "                    if let Some(case) = record.body.case {",
+        "                    if false && let Some(case) = record.body.case {",
     ),
     "MetricsLeakTheTenantByDefault": (
         "src/runtime/metrics.rs",
@@ -2674,6 +2894,97 @@ def check() -> int:
     return 1 if bad else 0
 
 
+
+def _locate(test: str) -> tuple[str, set[str]] | None:
+    """Which target runs `test`, and which features it needs to build and exist.
+
+    Read from the source rather than configured, because a second list of
+    feature sets is a second thing to keep in step — and the one that rots is
+    always the one nobody runs.
+
+    Two unions, and both are necessary for different reasons. Cargo compiles a
+    test *target* as one binary, so **every** module in it must compile: the
+    features come from every file's `#![cfg(...)]`, not just the one holding the
+    test. And the function itself may carry its own `#[cfg(...)]`, which decides
+    whether it exists inside a module that already compiled.
+
+    Missing either produces a run reporting `0 passed`, which looks exactly like
+    a mutation that was caught — the failure this whole command exists to stop.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent / "tests"
+    for path in sorted(root.rglob("*.rs")):
+        src = path.read_text()
+        at = src.find(f"fn {test}(")
+        if at < 0:
+            continue
+
+        target = path.relative_to(root).parts[0]
+        feats: set[str] = set()
+        # Every module in the target, because the whole binary must compile.
+        for sibling in sorted((root / target).rglob("*.rs")):
+            for line in sibling.read_text().splitlines():
+                if line.startswith("#!["):
+                    feats.update(re.findall(r'feature\s*=\s*"([a-z0-9-]+)"', line))
+        # This function's own gate.
+        feats.update(
+            re.findall(r'feature\s*=\s*"([a-z0-9-]+)"', src[max(0, at - 400) : at])
+        )
+        return target, feats
+    return None
+
+
+def verify(name: str) -> int:
+    """Apply one mutation, run the test it names, and report whether it died.
+
+    The catalogue records which test each mutation must kill, and `--check`
+    proves the mutation still *matches* the code. Neither proves it still
+    *kills*: a mutation whose test was rewritten around it passes quietly, and
+    a guarantee that stopped being checked looks exactly like one that is.
+
+    Restores the file on every path, including a failure to build.
+    """
+    path, test, _desc, _find, _replace = MUTANTS[name]
+    found = _locate(test)
+    if not found:
+        print(f"{name}: no test named '{test}' under tests/")
+        return 2
+    target, feats = found
+    # `redb` and `testkit` are what a test needs to stand up a plane at all.
+    feats |= {"redb", "testkit"}
+    features = ",".join(sorted(feats))
+
+    if apply(name) != 0:
+        return 2
+    try:
+        proc = subprocess.run(
+            ["cargo", "test", "--features", features, "--test", target, test],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+            check=False,
+        )
+    finally:
+        revert(name)
+
+    out = proc.stdout + proc.stderr
+    ran = re.search(r"test result: \w+\. (\d+) passed; (\d+) failed", out)
+    if not ran:
+        print(f"{name}: could not run '{test}' in {target} ({features})")
+        print("\n".join(out.splitlines()[-6:]))
+        return 2
+    passed, failed = int(ran.group(1)), int(ran.group(2))
+    if failed >= 1:
+        print(f"{name}: KILLED by {test}")
+        return 0
+    if passed == 0:
+        # The single most misleading outcome: nothing ran, and "0 failed" reads
+        # like the mutation was caught.
+        print(f"{name}: NOT RUN — '{test}' matched nothing in {target} ({features})")
+        return 2
+    print(f"{name}: SURVIVED — {test} passes with this bug present, in {path}")
+    return 1
+
+
 def main() -> int:
     if len(sys.argv) == 2 and sys.argv[1] == "--check":
         return check()
@@ -2689,6 +3000,8 @@ def main() -> int:
         return apply(name)
     if action == "--revert":
         return revert(name)
+    if action == "--verify":
+        return verify(name)
     print(__doc__, file=sys.stderr)
     return 2
 

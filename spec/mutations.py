@@ -56,6 +56,91 @@ MUTATIONS: dict[str, tuple[str, str, str, str, str]] = {
         """    /\\ acted # Current
     /\\ world' = Append(world, Current)""",
     ),
+    # ── Effect groups ───────────────────────────────────────────────────────
+    # Opening the gate before the frontier at all: no invariants, no landed
+    # members, no committed transaction. The irreversible send goes out for a
+    # group whose preconditions were never checked.
+    #
+    # The guard is stripped WHOLE rather than one conjunct at a time, and that
+    # is not laziness. `txState # "pending"` transitively implies
+    # `invariantsHold`, because only `CommitTransaction` clears it and that
+    # requires the invariants — so removing `invariantsHold` alone leaves the
+    # property true for a second reason and the mutant survives. It did, when
+    # the transaction was added: a mutation that had been catching something
+    # quietly stopped, which is the decoration-that-looks-like-evidence failure
+    # this whole pass exists to find. `GateBeforeTransaction` covers the other
+    # conjunct on its own.
+    "GateBeforeFrontier": (
+        "EffectGroup",
+        "DeferredOnlyPastTheFrontier",
+        "gated members released before the frontier is reached at all",
+        """    /\\ pos = Reversibles + 1
+    /\\ invariantsHold
+    /\\ txState # "pending"
+    /\\ gatePos <= Deferreds""",
+        """    /\\ gatePos <= Deferreds""",
+    ),
+    # Unwinding after an irreversible member has already gone out. This undoes
+    # everything EXCEPT the thing that actually happened — the worst of the
+    # three answers available, and the one that looks tidiest in a log.
+    "ReverseAfterSending": (
+        "EffectGroup",
+        "NoUnwindPastAnExternalisedDeferred",
+        "a group unwinds after a gated member has already externalised",
+        """    /\\ Len(sent) > 0
+    /\\ settled' = "quarantined"
+    /\\ UNCHANGED <<landed, reversed, sent, pos, gatePos, unwindPos, doubt, invariantsHold,
+                   txState>>""",
+        """    /\\ Len(sent) > 0
+    /\\ unwindPos' = Len(landed)
+    /\\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState,
+                   settled>>""",
+    ),
+    # Committing a group nobody settled. The most consequential outcome becomes
+    # the one an author gets by writing nothing at all.
+    "AbandonCommits": (
+        "EffectGroup",
+        "NoSilentCommit",
+        "a group left open is committed rather than taken back",
+        """    /\\ Len(sent) = 0
+    /\\ unwindPos' = Len(landed)
+    /\\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState,
+                   settled>>""",
+        """    /\\ Len(sent) = 0
+    /\\ settled' = "committed"
+    /\\ UNCHANGED <<landed, reversed, sent, pos, gatePos, unwindPos, doubt, invariantsHold,
+                   txState>>""",
+    ),
+    # Reporting a group aborted while a member it landed is still standing.
+    # The journal says discharged; the hold is still there.
+    "AbortLeavesAMemberStanding": (
+        "EffectGroup",
+        "AbortIsComplete",
+        "a group reports aborted with a landed member never taken back",
+        """FinishUnwind ==
+    /\\ settled = "open"
+    /\\ unwindPos = 0
+    /\\ Len(reversed) = Len(landed)
+    /\\ Len(landed) > 0""",
+        """FinishUnwind ==
+    /\\ settled = "open"
+    /\\ unwindPos = 0
+    /\\ Len(landed) > 0""",
+    ),
+    # Opening the gate while the transaction is still pending. The gated member
+    # announces work that may yet vanish -- and if the transaction then fails,
+    # the group can no longer be taken back whole, because the cheap path has
+    # already been spent on an email.
+    "GateBeforeTransaction": (
+        "EffectGroup",
+        "TransactionPrecedesTheGate",
+        "the gate opens while the atomic members are still uncommitted",
+        """    /\\ invariantsHold
+    /\\ txState # "pending"
+    /\\ gatePos <= Deferreds""",
+        """    /\\ invariantsHold
+    /\\ gatePos <= Deferreds""",
+    ),
     # Retrying an in-doubt failure without checking whether repeating was
     # declared safe. The single most tempting bug in the whole runtime: the
     # call timed out, retrying "obviously" helps, and the payment goes twice.

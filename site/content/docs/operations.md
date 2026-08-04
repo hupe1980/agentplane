@@ -199,6 +199,93 @@ Every field of `SweepReport` is a number worth alerting on. `is_quiet()` is the
 useful predicate: a healthy plane sweeps silently, so a non-silent sweep means
 something happened.
 
+### One matter, one scan
+
+*Show me everything about this matter* is the question a regulated deployment
+asks, and there are two ways to answer it. Listing the case's runs and reading
+each is a join whose cost grows with the case's life — and it **misses** every
+record written by a run the case does not own.
+
+A sweep is exactly that run. One tick may escalate several cases and belongs to
+none of them, so a per-run walk never reaches the record explaining why a case
+was escalated — which is the only reason for writing it down.
+
+So the journal carries the case on the record and indexes it:
+
+```rust
+let history = store.case_history(case, 200).await?;
+```
+
+One range scan, tenant-first like every other key here, so a query that forgets
+the predicate returns nothing rather than another customer's matter. Both
+backends are held to it by the same conformance battery, which checks the two
+halves separately — that the scan finds this matter's records, *and* that it
+returns no other's. Either alone passes for the wrong reason: a scan returning
+nothing satisfies the second, and one returning everything satisfies the first.
+
+`GET /cases/{id}` includes it, with `history_truncated` when the bound bit,
+because a shortened list is shaped exactly like a complete one.
+
+### The sweep writes its own history
+
+The sweeper makes the plane's most consequential *automated* decisions: it
+breaches an obligation, escalates a case, expires a person's task. Nothing asked
+it to — that is the point of it — so there is no run whose history explains why
+the state changed.
+
+Without a record, *why is this case escalated* is answerable only from the
+resulting state, and state cannot distinguish **the sweep breached this at
+02:00** from **somebody set it**. No human was present to remember which.
+
+So a tick that decides anything writes its decisions into a **sealed run of its
+own**: `Swept { subject, action, detail }`, one per action, with a typed action
+rather than a message. It inherits the chain, the per-record signature and the
+Merkle inclusion every other run has, so the external audit tool checks it
+without being taught what a sweep is.
+
+```rust
+let report = plane.sweep(now, grace).await?;
+if let Some(run) = report.record {
+    // Exactly what this tick decided, verifiable like any other run.
+    let entries = store.read(run, 1).await?;
+}
+```
+
+**A quiet tick writes nothing.** A healthy plane sweeps constantly, and a Merkle
+log filling with evidence of inactivity is where the somethings hide.
+
+Two things are deliberately *not* in it, and both are worth knowing. Dead-lettered
+events are counted rather than named, because the event store reports how many
+aged out and not which — they stay in the report and the emitted event, and
+there is deliberately no `SweptAction` for them, because a variant nobody
+constructs reads as a capability. And a sweep run is not a *plan*: it is sealed
+with the outcome `swept` rather than a run status, because a tick that breached
+forty obligations is not a plan that completed.
+
+### A capped tick says it was capped
+
+Each sweep takes a bounded batch — 128 timers, 512 obligations, 512 expired
+tasks — so one tick is bounded. A sweeper still working through a backlog is a
+sweeper not noticing the *next* obligation, which is the failure the whole
+mechanism exists against.
+
+The hazard is that a bounded query returns a list shaped exactly like a complete
+one. A tick that handled its cap and a tick that handled everything produce the
+same counters, and they are the two states most worth telling apart: the first
+means the backlog is growing while the report looks ordinary.
+
+So `SweepReport::saturated` names which sweeps came back full, and
+`needs_attention()` is true when any did. A saturated tick means *at least* the
+cap was waiting — never that the cap was all there was.
+
+```rust
+let report = plane.sweep(now, grace).await?;
+if report.saturated.deadlines {
+    // More obligations were outstanding than one tick will take.
+    // Sweep more often, or find out why they are accumulating.
+}
+```
+
 ## Metrics
 
 ### The runtime does not measure durations
@@ -432,10 +519,17 @@ tenant waiting on a hundred approvals could start nothing. It follows that a
 resume is not gated: that work was admitted already, and refusing it would
 strand a run waiting on something that has now happened.
 
-**Spend** bounds a period and is checked at admission. A run already executing
-when the ceiling is crossed finishes, so the overshoot is bounded and
-computable — at most the concurrency ceiling times the per-run budget, both of
-which you set — rather than unknown.
+**Spend** bounds a period and is checked at admission, against what has been
+*accrued* — and a run accrues when it finishes. A run already executing when the
+ceiling is crossed therefore runs to completion, so the overshoot is at most the
+concurrency ceiling times the per-run budget.
+
+Both of those are yours to set, and the second one has a default worth knowing:
+`RuntimeBuilder` starts at `Budget::unlimited()`. A deployment that sets a tenant
+ceiling and no per-run budget has bounded *nothing* — the product has an
+unbounded factor in it. A declarative agent cannot make that mistake, because a
+manifest without `budgets` fails validation rather than defaulting; a Rust
+deployment has to decide the same thing deliberately.
 
 A refusal is `RuntimeError::QuotaExceeded`, deliberately not a policy denial: a
 denial means *you may not* and retrying is pointless; a ceiling means *not right

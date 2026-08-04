@@ -904,6 +904,14 @@ async fn decide(
     })))
 }
 
+/// How much of a matter's history one view returns.
+///
+/// Bounded because a case can run for months and an operator page is not a
+/// bulk export. The response says when it truncated, because a shortened list
+/// is shaped exactly like a complete one and a reader who cannot tell will read
+/// absence as evidence.
+const CASE_HISTORY_LIMIT: usize = 200;
+
 async fn case_view(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -920,11 +928,37 @@ async fn case_view(
         .ok_or_else(|| not_found("case"))?;
     let deadlines = cases.deadlines(id).await.map_err(|_| store_failed())?;
 
+    // "Why is this escalated" is the question that follows "what is this", and
+    // the state alone cannot answer it: a breached deadline looks the same
+    // whether the sweep set it at 02:00 or somebody edited it. The history can.
+    //
+    // A scan over the matter rather than a walk over its runs, because a sweep
+    // belongs to no case and its record would otherwise be unreachable from
+    // the very case it escalated.
+    let history = s
+        .plane
+        .journal()
+        .case_history(id, CASE_HISTORY_LIMIT)
+        .await
+        .map_err(|_| store_failed())?;
+
     Ok(Json(json!({
         "case": serde_json::to_value(&found).unwrap_or(Value::Null),
         // Shown with the case because "when does this stop being my problem" is
         // the question that follows "what is this".
         "deadlines": serde_json::to_value(&deadlines).unwrap_or(Value::Null),
+        "history": history
+            .iter()
+            .map(|r| json!({
+                "seq": r.seq(),
+                "run": r.body.run.to_string(),
+                "kind": r.kind().kind_str(),
+                "record": serde_json::to_value(r.kind()).unwrap_or(Value::Null),
+            }))
+            .collect::<Vec<_>>(),
+        // Said out loud: a truncated history is shaped exactly like a complete
+        // one, and a reader who cannot tell will read absence as evidence.
+        "history_truncated": history.len() >= CASE_HISTORY_LIMIT,
     })))
 }
 

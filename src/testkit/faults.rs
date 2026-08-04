@@ -296,6 +296,14 @@ impl JournalStore for Faulty {
         self.inner.read(run, from).await
     }
 
+    async fn case_history(
+        &self,
+        case: crate::core::CaseId,
+        limit: usize,
+    ) -> Result<Vec<Record>, StoreError> {
+        self.inner.case_history(case, limit).await
+    }
+
     async fn head(&self, run: RunId) -> Result<Head, StoreError> {
         self.inner.head(run).await
     }
