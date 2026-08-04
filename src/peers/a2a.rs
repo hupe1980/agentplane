@@ -31,13 +31,18 @@
 //! `failed` is *not* in doubt: the peer has told us it acted and the action did
 //! not succeed, so `Recovery` has nothing left to resolve.
 //!
-//! # The endpoint is operator-pinned
+//! # The endpoint is reachability, never authority
 //!
-//! This client intentionally takes a configured JSON-RPC endpoint. Agent Card
-//! discovery, signature verification, and interface negotiation are separate
-//! capabilities and are not implemented here. A document served by the peer
-//! must never widen the grant in [`PeerRegistry`](super::PeerRegistry): a party
-//! describing its own capabilities is not a source of truth about its authority.
+//! This client takes a configured endpoint. One can also be built from a peer's
+//! card — see [`CardClient`](super::CardClient) — which fetches it under an
+//! egress allowlist, optionally verifies its signature, and selects an interface
+//! by binding and version.
+//!
+//! Either way the card supplies only *where to connect*. What a peer may be sent
+//! comes from [`PeerRegistry`](super::PeerRegistry), which an operator writes: a
+//! party describing its own capabilities is not a source of truth about its
+//! authority. That split is why a forged card is survivable — the worst it can
+//! do is send a request somewhere useless.
 
 use std::time::Duration;
 
@@ -60,6 +65,16 @@ pub struct Endpoint {
     /// Not "how long before we retry" — a timeout here produces `InDoubt`, and
     /// what happens next is the effect's declared [`Recovery`](crate::core::Recovery).
     pub timeout: Duration,
+    /// A2A's opaque routing identifier, echoed on every request.
+    ///
+    /// The spec's rule is exact: set it to the value declared on the interface
+    /// selected from the peer's card, and omit it when that interface omits it.
+    /// It is not this plane's own tenant — it names *whose agent* at the far end
+    /// is being addressed, and the two are unrelated.
+    ///
+    /// Without it a client can only ever reach a peer serving the default
+    /// tenant: anything else refuses the request as meant for somebody else.
+    pub tenant: Option<String>,
 }
 
 impl Endpoint {
@@ -74,7 +89,15 @@ impl Endpoint {
         Self {
             url: url.into(),
             timeout: Self::DEFAULT_TIMEOUT,
+            tenant: None,
         }
+    }
+
+    /// Address a named tenant at the far end.
+    #[must_use]
+    pub fn for_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
     }
 
     #[must_use]
@@ -151,6 +174,7 @@ impl A2aClient {
         payload: &Value,
         acting_as: &Delegation,
         provenance: Option<&crate::core::Provenance>,
+        tenant: Option<&str>,
     ) -> Value {
         // Under the same declared extension the delegation chain travels in, so
         // a peer that does not implement the extension ignores both together
@@ -183,6 +207,11 @@ impl A2aClient {
             "id": 1,
             "method": "SendMessage",
             "params": {
+                // Omitted entirely when the interface declares none. An empty
+                // string is a *value*, and a server comparing against its own
+                // advertised tenant would read it as a request for a different
+                // agent.
+                "tenant": tenant,
                 "message": {
                     "role": "ROLE_USER",
                     "messageId": message_id,
@@ -392,7 +421,13 @@ impl PeerClient for A2aClient {
             .post(&self.endpoint.url)
             .header("A2A-Version", PROTOCOL_VERSION)
             .header("A2A-Extensions", EXTENSION_URI)
-            .json(&Self::body(capability, payload, acting_as, provenance));
+            .json(&Self::body(
+                capability,
+                payload,
+                acting_as,
+                provenance,
+                self.endpoint.tenant.as_deref(),
+            ));
 
         // The credential is audience-bound before it reaches here — the registry
         // refuses to hand over one minted for somebody else — so presenting it

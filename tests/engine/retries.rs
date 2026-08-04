@@ -677,3 +677,77 @@ async fn a_skill_can_reject_its_input() {
         other => panic!("bad input is a failure, not a quarantine: {other:?}"),
     }
 }
+
+/// Exhausting the attempts must not turn "it was refused" into "we cannot tell".
+///
+/// A driver reports [`Disposition::DidNotHappen`] to say the call was declined
+/// *before* it reached anything. The runtime used to flatten that into an
+/// untyped error on the way out, and an untyped error reads as `InDoubt` — the
+/// most dangerous verdict available. Everything that acts on doubt was then
+/// acting on a fabrication: a saga would refuse to unwind around a call that
+/// provably did nothing, and an escalation would be raised for a failure that
+/// needed nobody.
+///
+/// Invisible until something read the disposition back off the error rather
+/// than off the record, which is exactly what an effect group does.
+#[tokio::test]
+async fn exhausting_the_attempts_keeps_the_driver_s_verdict() {
+    use agentplane::core::{Disposition, EffectDescriptor, EffectError, RetryPolicy};
+
+    #[derive(Debug)]
+    struct AlwaysRefused;
+
+    #[async_trait::async_trait]
+    impl agentplane::core::Effect for AlwaysRefused {
+        type Output = Value;
+        fn descriptor(&self) -> EffectDescriptor {
+            EffectDescriptor::nullary("test.refused")
+        }
+        fn retry(&self) -> RetryPolicy {
+            RetryPolicy::attempts(2)
+                .with_backoff(Duration::from_millis(1), Duration::from_millis(1))
+        }
+        async fn perform(&self) -> Result<Value, EffectError> {
+            Err(EffectError::Rejected("declined outright".into()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Reports;
+
+    #[async_trait::async_trait]
+    impl Skill for Reports {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("reports").provides("demo.reports")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let err = cx
+                .effect(AlwaysRefused)
+                .await
+                .expect_err("a refused effect succeeded");
+            let agentplane::core::StepError::Effect(inner) = &err else {
+                panic!("expected an effect failure, got {err:?}");
+            };
+            Ok(Outcome::done(Tainted::trusted(json!({
+                "disposition": format!("{:?}", inner.disposition()),
+            }))))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .skill(Reports)
+        .build();
+
+    let out = rt.run("demo.reports", json!({})).await.unwrap();
+    assert_eq!(
+        out.output.expect("output")["disposition"],
+        format!("{:?}", Disposition::DidNotHappen),
+        "the retry wrapper laundered a refusal into doubt — everything that \
+         decides whether it is safe to unwind now has the wrong answer"
+    );
+}

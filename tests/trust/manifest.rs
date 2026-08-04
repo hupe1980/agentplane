@@ -2366,9 +2366,14 @@ fn an_agent_card_is_derived_from_the_manifest() {
         "streaming is implemented — `SendStreamingMessage` and `SubscribeToTask` \
          are served from the journal — so the flag must say so"
     );
-    assert!(
-        !card.capabilities.push_notifications,
-        "push notifications have no callback store behind them"
+    // Tracks the build rather than a hardcoded answer: the flag exists to tell
+    // a caller what *this* deployment can do, and "we compiled that out" is not
+    // a distinction a peer can discover any other way.
+    assert_eq!(
+        card.capabilities.push_notifications,
+        cfg!(feature = "push"),
+        "the card's push flag disagrees with whether this build has the \
+         machinery — a caller plans against it either way"
     );
     assert!(
         card.capabilities.extended_agent_card,
@@ -2454,10 +2459,10 @@ fn the_extended_card_discloses_more_but_not_the_model() {
         public.capabilities.streaming,
         "the extended card must agree with the public one about streaming"
     );
-    assert!(
-        !public.capabilities.push_notifications,
-        "push notifications have no callback store behind them, and a card is a \
-         promise a caller plans against"
+    assert_eq!(
+        public.capabilities.push_notifications,
+        cfg!(feature = "push"),
+        "the extended card must agree with the build about push notifications"
     );
 
     // What it still will not say. The model is a fact about a supply chain, and
@@ -2536,7 +2541,7 @@ fn the_card_uses_the_spec_field_names() {
     // are spelled the spec's way too.
     let caps = &json["capabilities"];
     assert_eq!(caps["streaming"], true);
-    assert_eq!(caps["pushNotifications"], false);
+    assert_eq!(caps["pushNotifications"], cfg!(feature = "push"));
 }
 
 // ── Card signing ────────────────────────────────────────────────────────────
@@ -2730,5 +2735,48 @@ fn a_card_carries_no_numbers_to_canonicalize() {
          ECMAScript number formatting, which this crate's canonicalizer does not \
          implement — so a signature over this card may not verify elsewhere. \
          Either format the value as a string or implement JCS numbers."
+    );
+}
+
+/// An interface is selected by binding **and** version, in card order.
+///
+/// An agent may publish the same binding at several protocol versions, so
+/// matching on the binding alone picks an endpoint speaking a protocol this
+/// client does not — and the failure surfaces as a confusing wire error rather
+/// than as "we do not speak that".
+#[cfg(feature = "a2a")]
+#[test]
+fn an_interface_is_selected_by_binding_and_version() {
+    use agentplane::peers::{AgentCard, CardInterface, JSONRPC};
+
+    let m = Manifest::parse(GOOD).expect("parse");
+    let mut card = AgentCard::derive(&m, "https://plane/a2a").expect("derive");
+
+    // An older JSON-RPC interface first, then the current one. Card order is the
+    // publisher's preference, so selection must respect it *within* the
+    // versions it can actually speak.
+    card.supported_interfaces.insert(
+        0,
+        CardInterface {
+            url: "https://plane/a2a/v0".to_owned(),
+            protocol_binding: JSONRPC.to_owned(),
+            protocol_version: "0.3".to_owned(),
+            tenant: None,
+        },
+    );
+
+    let chosen = card
+        .select_interface(JSONRPC, "1.0")
+        .expect("no 1.0 interface was found");
+    assert_eq!(
+        chosen.url, "https://plane/a2a",
+        "selection took the first entry regardless of version, so the client \
+         would speak 1.0 at a 0.3 endpoint"
+    );
+
+    // And a binding this crate does not speak is not selected at all.
+    assert!(
+        card.select_interface("GRPC", "1.0").is_none(),
+        "a gRPC interface was selected by a JSON-RPC client"
     );
 }

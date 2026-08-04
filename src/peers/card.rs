@@ -76,9 +76,10 @@ impl CardCapabilities {
             // `SendStreamingMessage` and `SubscribeToTask`, served from the
             // journal — see `api::a2a_stream`.
             streaming: true,
-            // Needs a callback store and governed outbound delivery. Absent, so
-            // it says absent.
-            push_notifications: false,
+            // True only when this build has the machinery. A card is a promise
+            // a caller plans against, and "we compiled that out" is not a
+            // distinction a peer can discover any other way.
+            push_notifications: cfg!(feature = "push"),
             extended_agent_card: true,
         }
     }

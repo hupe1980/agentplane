@@ -358,6 +358,48 @@ reachable. `DenyAll` exists for wiring the surface up before the rules are
 written. One ungoverned tenant among governed ones is the one an attacker looks
 for, which is why the check is over every plane rather than the first.
 
+### Checking a driver against the real thing
+
+`just test-live` exercises the OpenAI driver against the actual API, loading a
+key from `.env`. It is gated twice — `AGENTPLANE_LIVE=1` **and** the key — and is
+never part of `just ci`: a developer with `OPENAI_API_KEY` exported would
+otherwise be billed for running the test suite, and would find out at the end of
+the month.
+
+Worth having because a stubbed provider cannot have the defects a real one finds.
+It accepts any request shape and returns whatever it is told to, so a driver that
+sends a malformed body, or mis-reads a response, passes every offline test. Both
+bugs these found were of exactly that kind: a tool declaration in the wrong shape
+for the API being called, and a tool call read as an empty answer.
+
+### Putting a tenant on your metrics
+
+Off by default, and the default is the interesting part. A tenant name is
+frequently a customer name, and a metrics backend is usually the least protected
+system in a deployment: sampled into third-party services, on a dashboard nobody
+signs into, retained past every other record. A deployment that has not decided
+where its metrics go has not decided that customer names may travel there.
+
+```rust
+.metric_tenant(TenantLabel::Name)
+```
+
+**Cardinality is bounded by configuration, not by data.** The label is *this
+plane's* tenant, so the number of streams is the number of planes you wired.
+There is no request that can grow it — a tenant read from a request would be
+exactly the unbounded label that makes a metrics backend fall over.
+
+There is deliberately **no pseudonymous option**. Hashing the name here would
+cover one of the many places a tenant already appears — store keys, blob paths,
+the policy request, the checkpoint origin published to witnesses, and the
+`tenant` field on an Agent Card served unauthenticated at a well-known path. A
+control that covers one exit and not the other nine is worse than none, because
+it invites the belief that the name is contained.
+
+If customer names must not leak, **do not put them in the tenant id**.
+`TenantId::new("t-9f3a")` covers every one of those places at once, costs no
+code, and cannot fall out of step with a surface added later.
+
 ### Per-tenant ceilings
 
 Budgets bound one run. They do not bound a tenant: a caller that can start runs

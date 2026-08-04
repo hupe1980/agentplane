@@ -112,6 +112,8 @@ pub(crate) struct Frame {
     /// is reasonable.
     pub timers: Option<Arc<dyn TimerStore>>,
     pub blobs: Option<Arc<dyn crate::blob::BlobStore>>,
+    pub memories: Option<Arc<dyn crate::memory::MemoryStore>>,
+    pub meter: crate::runtime::metrics::Meter,
     #[cfg(feature = "keyring")]
     pub keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
     pub tenant: crate::core::TenantId,
@@ -159,6 +161,8 @@ pub struct StepCtx<'a> {
     case: Option<CaseContext>,
     timers: Option<Arc<dyn TimerStore>>,
     blobs: Option<Arc<dyn crate::blob::BlobStore>>,
+    memories: Option<Arc<dyn crate::memory::MemoryStore>>,
+    meter: crate::runtime::metrics::Meter,
     #[cfg(feature = "keyring")]
     keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
     tenant: crate::core::TenantId,
@@ -172,6 +176,21 @@ pub struct StepCtx<'a> {
     #[cfg(feature = "manifest")]
     manifest: Option<Arc<crate::manifest::Manifest>>,
     signer: Option<Arc<dyn crate::core::Signer>>,
+    /// Whether this context is currently taking a group back.
+    ///
+    /// A reversal runs in the step's **forward** phase — same step, same cursor
+    /// — so the phase cannot say what it is. Without this flag a reversal is
+    /// gated like a forward call, and a run that reached its ceiling mid-group
+    /// could not undo the hold it had already placed. That is the exact outcome
+    /// the compensation exemption exists to prevent, reached by a different
+    /// road.
+    reversing: bool,
+    /// The effect group this step is inside, if any.
+    ///
+    /// Here rather than in the `EffectGroup` handle because a skill that fails
+    /// with `?` drops the handle without settling, and `Drop` cannot run an
+    /// async reversal. The executor settles what the handle abandoned.
+    open_group: Option<super::group::OpenGroup>,
 }
 
 impl<'a> StepCtx<'a> {
@@ -185,6 +204,8 @@ impl<'a> StepCtx<'a> {
             case,
             timers,
             blobs,
+            memories,
+            meter,
             #[cfg(feature = "keyring")]
             keyring,
             tenant,
@@ -210,6 +231,8 @@ impl<'a> StepCtx<'a> {
             case,
             timers,
             blobs,
+            memories,
+            meter,
             #[cfg(feature = "keyring")]
             keyring,
             tenant,
@@ -221,7 +244,30 @@ impl<'a> StepCtx<'a> {
             #[cfg(feature = "manifest")]
             manifest,
             signer,
+            reversing: false,
+            open_group: None,
         }
+    }
+
+    /// Run something with the gate exempted, because it is taking work back.
+    pub(crate) fn set_reversing(&mut self, reversing: bool) {
+        self.reversing = reversing;
+    }
+
+    pub(crate) fn open_group(&self) -> Option<&super::group::OpenGroup> {
+        self.open_group.as_ref()
+    }
+
+    pub(crate) fn open_group_mut(&mut self) -> Option<&mut super::group::OpenGroup> {
+        self.open_group.as_mut()
+    }
+
+    pub(crate) fn set_open_group(&mut self, group: super::group::OpenGroup) {
+        self.open_group = Some(group);
+    }
+
+    pub(crate) fn take_open_group(&mut self) -> Option<super::group::OpenGroup> {
+        self.open_group.take()
     }
 
     /// Commission another agent on this plane, and journal that you did.
@@ -725,7 +771,8 @@ impl<'a> StepCtx<'a> {
             step = %self.step,
             verdict = ?outcome.disposition(),
         );
-        metrics::count(metrics::RECONCILIATIONS, outcome.disposition().as_str());
+        self.meter
+            .count(metrics::RECONCILIATIONS, outcome.disposition().as_str());
         self.append_effect(
             key,
             RecordKind::EffectReconciled {
@@ -806,7 +853,7 @@ impl<'a> StepCtx<'a> {
             replayed = true,
             outcome = "done",
         );
-        metrics::count(metrics::EFFECTS_REPLAYED, kind);
+        self.meter.count(metrics::EFFECTS_REPLAYED, kind);
         self.bill(spend);
     }
 
@@ -842,7 +889,10 @@ impl<'a> StepCtx<'a> {
         descriptor: &EffectDescriptor,
         mutates: bool,
     ) -> Result<(), StepError> {
-        if !self.phase.is_forward() {
+        // A compensating phase, or a group being taken back inside a forward
+        // one. Both are undo, and both are exempt for the same reason: refusing
+        // to undo is how a run ends with a charged card and no order.
+        if !self.phase.is_forward() || self.reversing {
             return Ok(());
         }
         // First, because it is the cheapest and the most fundamental: an effect
@@ -942,7 +992,8 @@ impl<'a> StepCtx<'a> {
             resource = %descriptor.kind,
             %reason,
         );
-        metrics::count(metrics::POLICY_DENIALS, crate::core::ACTION_DECLARED);
+        self.meter
+            .count(metrics::POLICY_DENIALS, crate::core::ACTION_DECLARED);
 
         // Journaled under the refused effect's key, for the same reason a budget
         // refusal is: a replay that found no history here would report that the
@@ -1029,7 +1080,8 @@ impl<'a> StepCtx<'a> {
             resource = %descriptor.kind,
             %reason,
         );
-        metrics::count(metrics::POLICY_DENIALS, crate::core::ACTION_PERFORM);
+        self.meter
+            .count(metrics::POLICY_DENIALS, crate::core::ACTION_PERFORM);
         self.append_effect(
             key,
             RecordKind::PolicyDenied {
@@ -1075,7 +1127,8 @@ impl<'a> StepCtx<'a> {
             %kind,
             limit = %exceeded,
         );
-        metrics::count(metrics::BUDGET_REFUSALS, exceeded.as_str());
+        self.meter
+            .count(metrics::BUDGET_REFUSALS, exceeded.as_str());
         self.append_effect(
             key,
             RecordKind::BudgetRefused {
@@ -1123,7 +1176,8 @@ impl<'a> StepCtx<'a> {
         // tries has performed two effects against the world, and a count that
         // collapsed them would hide exactly the retry rate an operator is
         // looking for.
-        metrics::count(metrics::EFFECTS, &effect.descriptor().kind);
+        self.meter
+            .count(metrics::EFFECTS, &effect.descriptor().kind);
         let outcome = self
             .perform_once(effect, key, attempt, waited_ms, true)
             .instrument(span.clone())
@@ -1212,10 +1266,13 @@ impl<'a> StepCtx<'a> {
 
         match disposition {
             Disposition::Landed => {
-                return Some(StepError::Effect(crate::core::EffectError::Other(format!(
-                    "effect {key} took effect and its response could not be used ({message}); \
-                     repeating it would perform it a second time"
-                ))));
+                return Some(StepError::Effect(crate::core::EffectError::Final {
+                    detail: format!(
+                        "effect {key} took effect and its response could not be used \
+                         ({message}); repeating it would perform it a second time"
+                    ),
+                    disposition,
+                }));
             }
             Disposition::InDoubt => match recovery {
                 // Safe to repeat by declaration: either genuinely idempotent,
@@ -1245,11 +1302,18 @@ impl<'a> StepCtx<'a> {
             Disposition::DidNotHappen => {}
         }
 
+        // The disposition travels with the failure. Flattening it to `Other`
+        // here — which reads as `InDoubt` — would tell every caller that a call
+        // the driver explicitly *refused* might have happened, and the callers
+        // that act on doubt are exactly the ones that must not be misled.
         (!policy.permits(attempt)).then(|| {
-            StepError::Effect(crate::core::EffectError::Other(format!(
-                "effect {key} failed on attempt {attempt} of {}: {message}",
-                policy.max_attempts
-            )))
+            StepError::Effect(crate::core::EffectError::Final {
+                detail: format!(
+                    "effect {key} failed on attempt {attempt} of {}: {message}",
+                    policy.max_attempts
+                ),
+                disposition,
+            })
         })
     }
 
@@ -1698,7 +1762,8 @@ impl<'a> StepCtx<'a> {
             resource = "information_flow.label",
             %reason,
         );
-        metrics::count(metrics::POLICY_DENIALS, crate::core::ACTION_RELEASE);
+        self.meter
+            .count(metrics::POLICY_DENIALS, crate::core::ACTION_RELEASE);
         self.append_effect(
             key,
             RecordKind::PolicyDenied {
@@ -1822,7 +1887,7 @@ impl<'a> StepCtx<'a> {
         Ok(())
     }
 
-    async fn append(&self, kind: RecordKind) -> Result<(), StepError> {
+    pub(crate) async fn append(&self, kind: RecordKind) -> Result<(), StepError> {
         if !self.writes_enabled() {
             return Ok(());
         }
@@ -1939,6 +2004,244 @@ impl StepCtx<'_> {
             cx.case_id
         )));
         Ok((Tainted::with_label(snapshot.state, label), snapshot.version))
+    }
+
+    /// Recall what this agent remembers about a subject.
+    ///
+    /// # Every item comes back labelled from its **provenance**
+    ///
+    /// Never from its content. Text asserting its own reliability is the
+    /// cheapest thing an attacker can write, so a memory derived from a model,
+    /// a peer or an inbound message stays untrusted however many times it is
+    /// re-read — and reaching a mutating sink with it takes the same journaled
+    /// release as any other untrusted value.
+    ///
+    /// That is the defence against the attack this whole module is shaped by: a
+    /// poisoned write becomes a standing instruction only if something later
+    /// treats it as one.
+    ///
+    /// # Journaled, and replayed by version
+    ///
+    /// The **selection** is recorded — ids, versions, content digests — and a
+    /// replay re-materialises exactly those versions rather than re-running the
+    /// search. So a run replayed after the corpus changed reads what it read,
+    /// not what a fresh ranking would return now.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError`] if this plane has no memory store, if the recall fails, or
+    /// if a version this run read can no longer be reproduced — which is a
+    /// deliberate loud failure, not an empty result: a memory that was forgotten
+    /// makes the history that used it unreplayable, and saying so beats
+    /// replaying a different memory.
+    pub async fn recall(
+        &mut self,
+        query: crate::memory::Recall,
+    ) -> Result<Vec<Tainted<crate::memory::MemoryItem>>, StepError> {
+        let memories = self.memories.clone().ok_or_else(|| {
+            StepError::Store(crate::core::StoreError::Backend(
+                "no memory store is configured; `Runtime::builder(..).memory(..)` is what \
+                 gives an agent something to remember"
+                    .to_owned(),
+            ))
+        })?;
+
+        let selected = self
+            .effect(crate::runtime::effects::RecallMemory {
+                memories: Arc::clone(&memories),
+                query,
+            })
+            .await?
+            .into_unlabelled();
+
+        let mut out = Vec::with_capacity(selected.len());
+        for pick in selected {
+            let item = memories
+                .version(&pick.id, pick.version)
+                .await
+                .map_err(StepError::Store)?
+                .ok_or_else(|| {
+                    StepError::Store(crate::core::StoreError::Backend(
+                        crate::memory::MemoryError::Forgotten {
+                            id: pick.id.clone(),
+                            version: pick.version,
+                        }
+                        .to_string(),
+                    ))
+                })?;
+
+            // A version is supposed to be immutable. If the content moved under
+            // one, the store cannot reproduce its own history — and a replay
+            // that quietly used the new content would be a different run wearing
+            // the old one's journal.
+            if item.digest() != pick.digest {
+                return Err(StepError::Store(crate::core::StoreError::Backend(
+                    crate::memory::MemoryError::Rewritten {
+                        id: pick.id,
+                        version: pick.version,
+                    }
+                    .to_string(),
+                )));
+            }
+
+            let label = item.label();
+            out.push(Tainted::with_label(item, label));
+        }
+        Ok(out)
+    }
+
+    /// Remember something, as a new version.
+    ///
+    /// Journaled: a replay that wrote again would append a second version of a
+    /// memory this run wrote once, and the version number the run went on to use
+    /// would be wrong.
+    ///
+    /// The item's `trust` and `provenance` are the writer's declaration about
+    /// **where the content came from**, and everything that later reads it is
+    /// labelled from them. Declaring model output trusted here is the one way to
+    /// launder it, which is why it is a decision a reviewer can see rather than
+    /// a default.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError`] if this plane has no memory store, or the write fails.
+    pub async fn remember(&mut self, item: crate::memory::MemoryItem) -> Result<u64, StepError> {
+        let memories = self.memories.clone().ok_or_else(|| {
+            StepError::Store(crate::core::StoreError::Backend(
+                "no memory store is configured; `Runtime::builder(..).memory(..)` is what \
+                 gives an agent something to remember"
+                    .to_owned(),
+            ))
+        })?;
+        let mut item = item;
+        item.written_by = self.run.to_string();
+        Ok(self
+            .effect(crate::runtime::effects::RememberMemory { memories, item })
+            .await?
+            .into_unlabelled())
+    }
+
+    /// Summarise memories into a new, derived memory.
+    ///
+    /// # The label is derived, never declared
+    ///
+    /// This is the difference between `compact` and
+    /// [`remember`](Self::remember). A writer declares where ordinary content
+    /// came from; a summary's provenance is not a matter of opinion — it is the
+    /// **join of what was summarised**, plus the model that wrote it. Letting a
+    /// caller declare it would make compaction the laundering step: read three
+    /// untrusted memories, summarise, call the result trusted, and every gate
+    /// downstream has nothing to act on.
+    ///
+    /// So the summary is untrusted whenever any input is, carries every input's
+    /// sources, and takes the highest sensitivity of any of them.
+    ///
+    /// # It records what it was made from
+    ///
+    /// Sources are recorded with the exact versions read. That is what makes a
+    /// summary **repairable**: a poisoned memory does not stop being a problem
+    /// when it is forgotten, because its content keeps arriving in every summary
+    /// that absorbed it. `MemoryStore::derivatives` walks that edge, and
+    /// `forget_cascading` is the form an erasure request needs.
+    ///
+    /// # Compaction is an egress decision
+    ///
+    /// It sends the memories to a model. So [`Compaction::max_sensitivity`](crate::memory::Compaction::max_sensitivity)
+    /// bounds what that model may be shown, and it defaults to `Public` —
+    /// summarising is otherwise the way to move confidential content past a
+    /// ceiling that stops every other path, while looking like housekeeping.
+    ///
+    /// # The originals stay
+    ///
+    /// Compaction adds; it does not delete. What a summary is *for* — fitting a
+    /// context window — is a reason to stop reading the originals, not a reason
+    /// to destroy the only record of what the summary claims to represent.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError`] if this plane has no memory store, if the model call fails,
+    /// or if the write fails.
+    pub async fn compact(
+        &mut self,
+        into: crate::memory::Compaction,
+        sources: &[Tainted<crate::memory::MemoryItem>],
+        provider: Arc<dyn crate::model::ModelProvider>,
+        model: crate::model::ModelId,
+    ) -> Result<u64, StepError> {
+        // The prompt is **built here**, from the sources, rather than accepted
+        // from the caller. `cx.sink` refuses an effect whose outbound arguments
+        // differ from the labelled value it checked, and a caller passing a
+        // pre-built call would have to reproduce this assembly exactly to get
+        // past that gate — an obligation nobody would meet twice.
+        //
+        // Labelled by the join of the sources, so the model call is checked like
+        // any other outbound value rather than around it.
+        let prompt = Tainted::object([
+            (
+                "instruction".to_owned(),
+                Tainted::trusted(serde_json::Value::String(into.instruction.clone())),
+            ),
+            (
+                "memories".to_owned(),
+                Tainted::array(sources.iter().map(|s| {
+                    let label = s.label().clone();
+                    Tainted::with_label(s.peek().content.clone(), label)
+                })),
+            ),
+        ]);
+
+        let call = crate::model::ModelCall::new(provider, model, prompt.peek().clone())
+            .with_max_sensitivity(into.max_sensitivity);
+        let completion = self.sink(call, &prompt).await?;
+        let label = completion.label().clone();
+        let summary = completion.map(|c| c.structured.unwrap_or(serde_json::Value::String(c.text)));
+
+        let mut provenance: Vec<crate::core::SourceId> = label.provenance.iter().cloned().collect();
+        let mut sensitivity = label.sensitivity;
+        let mut trust = label.trust;
+        let mut derived_from = Vec::with_capacity(sources.len());
+        for source in sources {
+            let item = source.peek();
+            derived_from.push(crate::memory::Selected {
+                id: item.id.clone(),
+                version: item.version,
+                digest: item.digest(),
+            });
+            let l = source.label();
+            provenance.extend(l.provenance.iter().cloned());
+            sensitivity = sensitivity.max(l.sensitivity);
+            // Doubled on purpose, and no test can distinguish the two halves.
+            // A summary is already untrusted because a model wrote it —
+            // `ModelCall` declares `Trust::Untrusted` unconditionally — so this
+            // line changes no outcome today. It is here for the day a
+            // deterministic local summariser is declared trusted, at which point
+            // the model half stops carrying it and this half is the only thing
+            // between an untrusted memory and a trusted summary.
+            //
+            // Sensitivity and provenance above are *not* doubled: each is the
+            // only thing computing its own field, and both are mutation-tested.
+            if l.trust == crate::core::Trust::Untrusted {
+                trust = crate::core::Trust::Untrusted;
+            }
+        }
+        provenance.sort();
+        provenance.dedup();
+
+        self.remember(crate::memory::MemoryItem {
+            id: into.id,
+            subject: into.subject,
+            purpose: into.purpose,
+            content: summary.into_unlabelled(),
+            provenance,
+            sensitivity,
+            trust,
+            written_by: String::new(),
+            version: 0,
+            created_at: into.at,
+            superseded_at: None,
+            derived_from,
+        })
+        .await
     }
 
     /// Store bytes in the blob store and record that this case produced them.

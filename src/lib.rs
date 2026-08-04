@@ -97,10 +97,14 @@ pub mod keyring;
 pub mod manifest;
 #[cfg(feature = "media")]
 pub mod media;
+pub mod memory;
 pub mod model;
+pub mod netguard;
 pub mod peers;
 pub mod plan;
 pub mod policy;
+#[cfg(feature = "push")]
+pub mod push;
 pub mod quota;
 pub mod runtime;
 pub mod tools;

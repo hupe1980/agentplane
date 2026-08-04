@@ -53,6 +53,8 @@ pub mod a2a;
 mod card;
 #[cfg(feature = "manifest")]
 mod card_sig;
+#[cfg(all(feature = "manifest", feature = "a2a"))]
+mod discovery;
 #[cfg(feature = "manifest")]
 pub use card::{
     AgentCard, CardCapabilities, CardInterface, CardSkill, ExtendedAgentCard, ExtendedBudget,
@@ -62,6 +64,8 @@ pub use card::{
 pub use card_sig::{
     ALG, CardSignature, CardSignatureError, CardSigner, CardVerifier, signing_input,
 };
+#[cfg(all(feature = "manifest", feature = "a2a"))]
+pub use discovery::{CardClient, DiscoveryError, JSONRPC};
 mod credentials;
 pub use credentials::{Cached, CredentialError, CredentialSource, Fixed, TokenExchange};
 

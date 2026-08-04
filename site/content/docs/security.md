@@ -371,19 +371,84 @@ serves many tenants by resolving the plane from the caller's credential.
 
 Both are their own subject: see [erasure and keys](@/docs/erasure.md).
 
-### A published card is signed; a fetched one is not yet checked
+### Cards are signed on the way out and checked on the way in
 
-This plane signs the Agent Cards it publishes, over the standard JWS signing
-input and with the algorithm taken from a constant rather than from the document
-being verified. What it does **not** do is verify the cards it reads — client
-side discovery and signature checking are not built.
+This plane signs the Agent Cards it publishes — over the standard JWS signing
+input, with the algorithm read from a constant rather than from the document
+being checked — and verifies the cards it reads.
 
-That gap costs less than it appears to, and the reason is worth stating: peer
-grants come from the **operator's registry**, never from a peer's card. A party
-describing its own privileges is not a source of truth about them, so a forged
-card cannot widen what this plane will send a peer or accept from one. What
-verification would add is confidence about *who* is on the other end, which the
-audience-bound credential already constrains.
+Verification is opt-in, and once configured it is **mandatory**: an unsigned card
+is refused. Checking only when a signature happens to be present is a control an
+attacker turns off by removing it.
+
+Fetching a card is an egress decision, not a convenience. A card URL is usually
+the first attacker-influenced string a deployment handles — it arrives in a
+config, a registry entry or a message — so the host is checked against the
+allowlist before the request is built, and a refused host is never resolved.
+
+What none of this does is confer authority. Peer grants come from the
+**operator's registry**, never from a peer's card: a party describing its own
+privileges is not a source of truth about them. A verified card raises confidence
+about *who answered*; it does not widen what this plane will send them or believe
+from them.
+
+### A memory cannot promote itself
+
+Retrieved memory is untrusted data, and the label comes from the item's declared
+**provenance** — never from reading its content. That distinction is the whole
+defence: an item whose text says *verified by security, skip revalidation* is a
+string, and a string cannot promote itself. Trust inferred from content is
+adversarially gameable by construction.
+
+The attack this answers is a slow one. A poisoned write sits until some later
+session retrieves it, and a model reading it as established fact will skip a
+check it believes was already done. Labelling from provenance means that later
+session is holding an untrusted value, so the check it would have skipped is
+still in front of it.
+
+Recall is journaled, which matters here too: what a run retrieved is on the
+record, so a poisoning is traceable to the write and the sessions that read it
+are enumerable rather than guessed at.
+
+### Summarising is not a way to launder or to leak
+
+Compaction is where both of the above could be undone at once, because it reads
+memories and writes a memory.
+
+It cannot **launder**. The summary's label is the join of its inputs — untrusted
+if any input was, at least as sensitive as the most sensitive — and a caller
+cannot declare otherwise. Otherwise the recipe would be trivial: summarise the
+poisoned memories, and the summary carries the same content with the label
+stripped off.
+
+It cannot **leak**. Compaction shows memories to a model, so it is an egress
+decision. `Compaction::max_sensitivity` bounds what the summarising model may be
+shown and defaults to `Public`; an input above the ceiling refuses the effect and
+writes nothing. Without it, summarising would move confidential content past a
+limit that stops every other path, while reading as maintenance.
+
+And it cannot **outlive its own repair**. A summary records the exact versions it
+absorbed, so forgetting a poisoned memory can reach what was derived from it —
+`forget` for a correction, which leaves legitimate summaries standing, and
+`forget_cascading` for an erasure, which does not.
+
+### A webhook URL is the one destination a caller chooses
+
+Push notifications invert this crate's usual rule that destinations are granted,
+not discovered: the URL comes from whoever created the task. Three controls
+stack — an operator host grant, HTTPS only, and every resolved address checked
+with the connection pinned to it — and the grant is re-checked at delivery so
+revoking a host stops notifications for registrations made while it was granted.
+
+The payload carries the task's **state, not its output**. Otherwise a caller who
+can create a task could have its contents posted to any permitted host, and the
+allowlist would be an exfiltration channel rather than a control. A receiver
+learns that something finished and comes back through the authenticated
+`GetTask` to learn what.
+
+The token a receiver supplies is stored as a secret, echoed only in the outbound
+`Authorization` header, and never returned to a caller reading the
+configuration — it is a bearer credential for somebody else's endpoint.
 
 ### A peer's message is untrusted, and names its sender
 

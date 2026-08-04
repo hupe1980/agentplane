@@ -520,13 +520,21 @@ impl OpenAi {
         if self.stream {
             body["stream"] = json!(true);
         }
-        // Responses wraps each declaration: `{type: "function", function: {name,
-        // description, parameters}}`, where Anthropic takes the three fields at
-        // the top level under `input_schema`. `strict` enforces the argument
-        // schema *during* generation rather than checking afterwards — worth
-        // having, and not a security control: a well-formed argument is still
-        // an untrusted one, and the sink's field-provenance rules are what
-        // refuse it.
+        // **Flat**, which is what Responses takes: `{type, name, description,
+        // parameters, strict}`. Chat Completions is the API that nests them
+        // under a `function` object, and this file used to do that — Responses
+        // answers `Missing required parameter: 'tools[0].name'` and the call
+        // never reaches a model.
+        //
+        // It went unnoticed because a stubbed provider accepts any shape, and
+        // because the forced-tool path a few lines above already had it right:
+        // the file disagreed with itself, and only the half nothing exercised
+        // was wrong. This is what the live tests exist for.
+        //
+        // `strict` enforces the argument schema *during* generation rather than
+        // checking afterwards — worth having, and not a security control: a
+        // well-formed argument is still an untrusted one, and the sink's
+        // field-provenance rules are what refuse it.
         if !tools.is_empty() {
             body["tools"] = Value::Array(
                 tools
@@ -534,12 +542,10 @@ impl OpenAi {
                     .map(|t| {
                         json!({
                             "type": "function",
-                            "function": {
-                                "name": t.name,
-                                "description": t.description,
-                                "parameters": t.parameters,
-                                "strict": true,
-                            }
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                            "strict": true,
                         })
                     })
                     .collect(),
@@ -593,11 +599,20 @@ impl OpenAi {
         // `truncated`, so a caller can tell "it said nothing" from "it was still
         // talking".
         //
-        // Skipped in emulated mode, and the skip is load-bearing: a forced
-        // function call answers with a `function_call` item and **no text**, so
-        // an unguarded emptiness check here rejects a call that worked.
+        // **A tool call is not an empty answer.** Responses returns a
+        // `function_call` item and no text whenever the model calls a tool —
+        // both when this crate forces one to emulate structured output, and when
+        // the model picks a declared tool of its own accord. Only the first was
+        // exempted here, so an ordinary tool call came back as `Unusable` and
+        // every declared-tool loop against `OpenAI` failed on a response that
+        // had worked perfectly.
+        //
+        // It survived because a stubbed provider always returns text: nothing in
+        // the suite could produce the shape a real model produces. A live test
+        // found it on its first run.
         let emulating = schema.is_some() && self.mode_for(model) == SchemaMode::ForcedTool;
-        if text.is_empty() && !truncated && !emulating {
+        let calls = parsed.tool_calls();
+        if text.is_empty() && calls.is_empty() && !truncated && !emulating {
             return Err(ModelError::Unusable {
                 model: model.clone(),
                 usage,
@@ -631,7 +646,7 @@ impl OpenAi {
 
         Ok(Completion {
             structured: structured_value,
-            tool_calls: parsed.tool_calls(),
+            tool_calls: calls,
             text,
             usage,
             stop_reason: Some(parsed.incomplete_details.as_ref().map_or_else(
@@ -856,11 +871,79 @@ mod tool_tests {
     use super::*;
     use crate::model::ToolDeclaration;
 
-    /// Responses wraps a declaration; Anthropic does not.
+    /// A tool call is an answer, not an empty one.
     ///
-    /// `{type: "function", function: {name, description, parameters}}` against
-    /// Anthropic's three top-level fields under `input_schema`. Sending either
-    /// shape to the other provider is rejected, so both are pinned.
+    /// Responses returns a `function_call` item and **no text** whenever the
+    /// model calls a tool. The emptiness check exempted only the forced call
+    /// this crate makes to emulate structured output, so an ordinary declared
+    /// tool call came back `Unusable` — a response that had worked perfectly,
+    /// reported as a fault, and billed.
+    ///
+    /// Nothing offline could produce that shape, because a stubbed provider
+    /// always returns text. This pins it without needing an API key.
+    #[test]
+    fn a_tool_call_with_no_text_is_a_usable_answer() {
+        let response: ApiResponse = serde_json::from_value(json!({
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "weather_lookup",
+                "arguments": "{\"city\":\"Berlin\"}"
+            }],
+            "usage": { "input_tokens": 55, "output_tokens": 15 }
+        }))
+        .expect("a Responses payload carrying only a function call");
+
+        let completion = OpenAi::new("test-key")
+            .expect("driver")
+            .interpret(&response, &ModelId::new("openai", "gpt-x"), None)
+            .expect(
+                "a tool call with no text was rejected as an empty answer, so \
+                 every declared-tool loop against OpenAI fails on a response \
+                 that worked",
+            );
+
+        assert_eq!(completion.tool_calls.len(), 1);
+        assert_eq!(completion.tool_calls[0].name, "weather_lookup");
+        assert_eq!(completion.tool_calls[0].arguments["city"], "Berlin");
+    }
+
+    /// An answer with neither text nor a tool call is still unusable.
+    ///
+    /// The other half: the fix must not turn the emptiness check off, only
+    /// teach it that a tool call counts.
+    #[test]
+    fn an_answer_with_neither_text_nor_a_tool_call_is_unusable() {
+        let response: ApiResponse = serde_json::from_value(json!({
+            "status": "completed",
+            "output": [],
+            "usage": { "input_tokens": 10, "output_tokens": 0 }
+        }))
+        .expect("an empty Responses payload");
+
+        assert!(
+            OpenAi::new("test-key")
+                .expect("driver")
+                .interpret(&response, &ModelId::new("openai", "gpt-x"), None)
+                .is_err(),
+            "an answer carrying nothing at all was accepted, so the emptiness \
+             check was removed rather than corrected"
+        );
+    }
+
+    /// Responses takes a **flat** declaration; Chat Completions nests one.
+    ///
+    /// `{type, name, description, parameters, strict}` — not
+    /// `{type, function: {…}}`, which is the Chat Completions shape and which
+    /// Responses rejects outright with *"Missing required parameter:
+    /// `tools[0].name`"*.
+    ///
+    /// This test previously asserted the nested shape. It was written from the
+    /// same misreading as the code, so it passed forever and gave the wrong
+    /// contract the appearance of being pinned — a stubbed provider accepts any
+    /// shape, so nothing else could disagree. A live call against the real API
+    /// found it on its first run.
     #[test]
     fn a_declared_tool_is_rendered_in_openais_shape() {
         let body = OpenAi::new("test-key")
@@ -879,21 +962,48 @@ mod tool_tests {
             .expect("a body with tools");
 
         let f = &body["tools"][0];
+        assert_eq!(f["type"], "function", "{body}");
         assert_eq!(
-            f["type"], "function",
-            "Responses requires the wrapper: {body}"
+            f["name"], "ledger.read",
+            "the name must be at the top level — Responses answers `Missing \
+             required parameter: tools[0].name` to the nested Chat Completions \
+             shape, and the call never reaches a model: {body}"
         );
-        assert_eq!(f["function"]["name"], "ledger.read");
+        assert!(
+            f["function"].is_null(),
+            "the declaration is nested under `function`, which is the Chat \
+             Completions shape and is rejected by Responses: {body}"
+        );
         assert_eq!(
-            f["function"]["parameters"]["type"], "object",
+            f["parameters"]["type"], "object",
             "OpenAI names the argument schema `parameters`; `input_schema` is \
              Anthropic's spelling: {body}"
         );
         assert_eq!(
-            f["function"]["strict"], true,
+            f["strict"], true,
             "strict mode enforces the argument schema during generation rather \
              than checking after the tokens are paid for: {body}"
         );
+
+        // The same shape the forced-tool path already used. They disagreed, and
+        // only the half nothing exercised was wrong.
+        let forced = OpenAi::new("test-key")
+            .expect("driver")
+            .body(
+                &ModelId::new("openai", "gpt-x"),
+                &json!({ "input": "hi" }),
+                Some(&json!({ "type": "object", "additionalProperties": false })),
+                &[],
+                &[],
+            )
+            .expect("a body with a schema");
+        if let Some(tool) = forced["tools"].get(0) {
+            assert!(
+                tool["name"].is_string(),
+                "the two tool-rendering paths in this file disagree about where \
+                 the name goes: {forced}"
+            );
+        }
     }
 }
 

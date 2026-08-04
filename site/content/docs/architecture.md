@@ -282,6 +282,13 @@ card and no order. The ceiling exists to bound work, not to strand it half-done.
 Compensating effects are still billed and journaled, so the overshoot is visible
 rather than silent.
 
+A **group reversal** carries the same exemption, and needs it stated separately
+because it cannot be inferred: a reversal runs in the step's *forward* phase, so
+the phase — which is what exempts a compensating effect — says nothing about it.
+Without the exemption a run that reached its ceiling mid-group could not release
+the hold it had already placed, which is the outcome above reached by a different
+road.
+
 ### A compensation may wait for a human
 
 A refund that needs four eyes is still a refund. `compensate()` may suspend like
@@ -372,6 +379,125 @@ the forward result back as the compensation's, and the store's uniqueness
 constraint would reject the second announcement. The phase is skipped in the wire
 format when `Forward`, so ordinary records cost no extra bytes and hash
 identically whether or not compensation exists in the build.
+
+## Effect groups: the unit between an effect and a step
+
+A per-step saga leaves a gap, and it is a sharp one. `Skill::compensate`
+receives the step's **output** — and a step that failed has none. So a step that
+reserved inventory, authorised a card and then failed hands its compensation the
+absence of an output and asks it to guess what to undo. Both available guesses
+are wrong: reverse something that never happened, or leave a charge standing
+while unwinding everything around it.
+
+The missing unit is smaller than a step and larger than an effect.
+
+```rust
+let mut g = cx.group("checkout", ["inventory", "payments", "notify"]).await?;
+
+// Runs now. The reversal is built from the id this call actually returned.
+let hold = g.reversible("inventory", Reserve::new(sku, 2), |out| {
+    Release::new(out["hold"].as_str().unwrap_or_default())
+}).await?;
+
+// A read has nothing to take back, and is not asked to declare one.
+let stock = g.read("inventory", Look::new(sku)).await?;
+
+// Held at the gate. An aborted group never sends it at all.
+g.deferred("notify", Notify::new("order confirmed"))?;
+
+// The frontier.
+g.commit(&[Invariant::new("the hold covers the order", covered)]).await?;
+```
+
+### A reversal is captured, not reconstructed
+
+Each reversible member registers the concrete call that undoes it, built from
+that member's **actual output at the moment it landed** — the hold id, the
+authorisation reference. Nothing is reconstructed later from state that may have
+moved since, and nothing is looked up in a name-to-constructor registry that can
+disagree with the code.
+
+That choice has a corollary worth stating: reversals dispatch through the
+ordinary effect path. An undo is journaled, keyed, retried, policy-gated and
+metered exactly like the forward call, and a replayed run reads it back rather
+than performing it a second time. Nothing about being an undo makes it
+privileged.
+
+### The frontier is where reversibility ends
+
+A group has two regions and one boundary.
+
+**Before the frontier**, members are reversible and the group can still be
+abandoned at no cost to the outside world.
+
+**The frontier** is `commit`. It checks the invariants that must hold before
+anything becomes permanent, and only then releases the deferred members.
+Invariants are checked *there* rather than earlier for the reason that makes
+them worth having: it is the last instant at which failing them is free. Naming
+one — rather than writing `if !ok { return Err(..) }` — puts *which* condition
+stopped the group on the record instead of in a message someone can reword.
+
+**After the frontier** there is no group. A skill that continues with ordinary
+`cx.effect` calls is past the point of no return, and a failure there does not
+unwind: undoing a committed group would reverse a decision the outside world has
+already acted on. That is the saga pivot rule, applied at the granularity where
+the individual calls live.
+
+### Deferral is stronger than compensation
+
+A member that runs immediately and is undone on abort leaves a visible trace:
+the reservation existed, the webhook fired, the email arrived and a correction
+arrived after it. A member that does not run **at all** until the group is
+certain leaves none.
+
+So `deferred` is where an irreversible send belongs — the mail, the capture, the
+published event. This is the one place where putting an effect *inside* a
+transaction makes it safer rather than merely tidier, and it is why a group is
+not just a saga with smaller steps.
+
+### The footprint is enforced, not documented
+
+A group declares the resources it touches and every member names the resource it
+touches; a member naming anything else is refused **before it runs**. Without
+that, "this group touches inventory and payments" is a comment, and a frontier
+over an unknown set of resources is a frontier over nothing.
+
+An effect that mutates cannot be declared a group `read`. A read is exempt from
+registering a reversal because it has nothing to take back, and an effect that
+took that exemption while leaving something standing is exactly the member the
+unwind would miss.
+
+### Four endings, because two would lie
+
+| Outcome | What is standing |
+|---|---|
+| `Committed` | Every member. Deferred members ran; reversals were discarded. |
+| `Aborted` | Nothing. Reversible members were reversed; deferred members never ran. |
+| `Quarantined` | Unknown. A member is in doubt, or a reversal would not come back. |
+
+Doubt is the one condition under which nothing may be reversed — undoing a call
+that may or may not have landed is a coin flip with the outside world's money on
+it — so a group in doubt is reported unsettled and the run is quarantined. A
+reversal that fails stops the unwind for the same reason a failed compensation
+does: continuing would undo members *around* one now in an unknown state.
+
+A group is bracketed in the journal by `GroupOpened` and `GroupSettled`, so an
+opened group with no settlement beside it is a query rather than a grep — the
+work that was neither taken nor taken back.
+
+### Forgetting to settle is not a commit
+
+A skill that fails with `?` never reaches `commit` or `abort`, and `Drop` cannot
+run an async reversal. So the group lives on the step context rather than in the
+handle, and the executor settles what the handle abandoned — the same
+relationship it already has with a step's compensation. A step that *returns
+successfully* with a group still open has its group reversed and fails loudly,
+because a group that commits by being forgotten would make the most consequential
+thing a group does the thing that happens when an author writes nothing.
+
+A suspension is not an abandonment. The frame is persisted and the step re-runs
+from the top, rebuilding the group from the journal as it replays the members, so
+a group may legitimately span a durable wait.
 
 ## The journal
 
@@ -1086,6 +1212,12 @@ src/
   case/      CaseStore, EventStore, TaskStore contracts
   plan/      the plan contract: what a plan must satisfy to run at all
   policy/    authorization-engine adapters; the seam itself is core::policy
+  memory/    what an agent remembers between runs: versioned items, journaled
+             retrieval, and labels taken from provenance rather than content
+  netguard/  which IP addresses this plane will connect to — one rule, shared
+             by governed media and webhook delivery
+  push/      A2A push notifications: webhook registrations and guarded delivery
+             (feature `push`)
   quota/     per-tenant ceilings on concurrent work and spend, accounted in
              the store so they survive a second instance
   store/     redb and Postgres backends, journal and cases alike
@@ -1095,7 +1227,8 @@ src/
              erasure that reaches copies deletion cannot (feature `keyring`)
   media/     governed URL dereferencing, DNS pinning, bounded validation and
              digest-only model materialization (feature `media`, off by default)
-  runtime/   StepCtx, effect protocol, executor, sweeper, built-in effects
+  runtime/   StepCtx, effect protocol, effect groups, executor, sweeper,
+             built-in effects
   batch/     batch runs: item source, outcomes, the BatchStore contract
   tools/     calling tools on other people's servers, and the annotation
              trust decision that implies
@@ -1309,6 +1442,39 @@ provenance block is separately attested and bound to the call, so a peer with th
 workload verifier can check who made that exact request; neither substitutes for
 the peer's own authorization decision.
 
+#### Reading somebody else's card
+
+`CardClient` fetches a card from the well-known path, optionally verifies it, and
+selects an interface. Four rules, each of which exists because the obvious
+version is wrong.
+
+**Fetching is an egress decision.** A card URL usually arrives from a config, a
+registry entry or a message — the first attacker-influenced string a deployment
+handles — and "just fetch it" is how a plane is made to probe its own network.
+The host is checked against the allowlist before the request is built, so a
+refused host is never even resolved.
+
+**Verification is opt-in, and once on it is mandatory.** Most cards in the wild
+are unsigned, so a client that refused them all would not be used. But a client
+that verifies *only when a signature is present* is one an attacker downgrades by
+stripping it — so with a verifier configured, an unsigned card is refused.
+
+**Selection matches binding and version.** An agent may publish the same binding
+at several protocol versions; matching the binding alone picks an endpoint
+speaking a protocol this client does not, and the failure then surfaces as a
+confusing wire error rather than "we do not speak that". Card order is the
+publisher's preference and is respected within the versions we can speak.
+
+**The tenant travels with the endpoint.** A2A says to echo the selected
+interface's `tenant` on every request and to omit it when the interface omits it.
+A client that skips this can only ever reach an agent serving the default
+tenant — which is why `Endpoint` carries it rather than leaving it to each call
+site.
+
+None of this produces authority. A card describes *reachability*; what a peer may
+be sent comes from the operator's `PeerRegistry`. That split is what makes a
+forged card survivable — the worst it can do is waste a request.
+
 ### A2A, being called (`a2a-server`)
 
 The other half, and a different problem: everything arriving here was written by
@@ -1328,7 +1494,7 @@ the invariant for the one route nobody would think to check.
 | `GetExtendedAgentCard` | the authenticated card |
 | `SendStreamingMessage`, `SubscribeToTask` | SSE, read from the journal |
 | `ListTasks` | `-32004`, unsupported |
-| the push-notification configs | `-32003`, not supported |
+| the push-notification configs | registrations, behind `push` |
 | anything else | `-32601`, method not found |
 
 **Blocking is the default, and unset means blocking** — the spec's rule.
@@ -1411,6 +1577,41 @@ UTF-16 code unit exactly as RFC 8785 requires. The one JCS rule it does not
 implement is ECMAScript number formatting — and a guard asserts the card carries
 no numbers, so the day somebody adds an integer field that is a failing test
 rather than a signature two implementations disagree about.
+
+#### Push: the one URL a caller chooses
+
+Every other outbound destination in this crate is granted by an operator. A
+webhook URL is supplied by whoever created the task, which makes push the one
+feature where an untrusted party names an address this plane will connect to,
+with a payload about somebody's work.
+
+Three controls, none sufficient alone:
+
+- **An operator host grant.** A caller may pick any URL under a permitted host
+  and no host outside it. This is the primary control; the rest are the second
+  lock. Matching is exact — suffix matching is how a grant for `acme.example` is
+  satisfied by `evil-acme.example`.
+- **Every resolved address checked, and the connection pinned to them.** One
+  private answer refuses the whole resolution, so a name that answers with a
+  public address and a private one reaches nothing — and pinning means the
+  client cannot be handed a different answer on the second lookup.
+- **HTTPS only.** The payload describes a task; sending it in clear to an
+  address the recipient chose is a disclosure with extra steps.
+
+The grant is re-checked **at delivery**, not only at registration. A
+registration outlives the configuration that permitted it, and the tasks that
+outlive a config change are exactly the long-running ones push exists for.
+
+What is delivered is the task's **state, not its output**. A webhook is an
+endpoint we were told about by a caller; it learns that something finished and
+must come back through `GetTask` — authenticated — to learn what. That is
+stricter than the spec requires, because otherwise a caller who can create a task
+can have its contents posted to any permitted host, which turns an allowlist into
+an exfiltration channel.
+
+The IP classification is [`netguard`](#module-layout), shared with governed
+media. Two implementations of one rule diverge, and the one that diverges is
+whichever nobody probed at the boundary.
 
 #### The stream is a view of the journal, not an event bus
 
@@ -1520,6 +1721,77 @@ interrupting between "announced" and "recorded" manufactures exactly the
 in-doubt case the effect protocol exists to avoid. A suspended run has no thread
 to notice anything, so `request_cancel` resumes it itself; a run executing
 elsewhere sees the request at its own next boundary.
+
+### Memory is delayed code
+
+A vector store bolted onto an agent looks like a cache and behaves like a
+program. What is written today is read back tomorrow *into a context window*,
+where a model treats it as established fact — so a single poisoned write becomes
+a standing instruction that fires on every later session, and nothing at read
+time looks wrong. Three rules follow, and none of them is about the storage
+engine.
+
+**Trust comes from provenance, never from content.** A recalled item is labelled
+by where it came from. Content-inferred trust is gameable by construction: text
+asserting its own reliability is the cheapest thing an attacker can write. So a
+memory derived from a model, a peer or an inbound message stays untrusted however
+many times it is re-read, and reaching a mutating sink with it takes the same
+journaled release as any other untrusted value.
+
+**Retrieval is an effect, not a lookup.** Memory is mutable state outside the
+chain, so a search inside the deterministic zone would make a replayed run
+retrieve whatever the store holds *now* — different items, different
+conclusions, a history that disagrees with itself. The journal records the
+**selection**: ids, versions and content digests. Replay re-materialises those
+exact versions instead of re-running the ranking, so the result cannot drift as
+the corpus grows.
+
+Two consequences fall out of recording the selection rather than the content.
+Personal data stays in an erasable store rather than a hash chain that cannot be
+redacted. And a version that was forgotten makes the history that used it
+**unreplayable** — reported loudly, because replaying a different memory would be
+worse than admitting the record is gone.
+
+**Items are versioned and supersedable, never edited.** A memory rewritten in
+place cannot be audited and cannot be repaired: there is no way to ask what the
+agent believed last Tuesday, and no way to undo one bad write without guessing
+what it replaced. Writes append; forgetting is selective and reaches every
+version, because an erasure that left history behind would be reported
+discharged while the data it named was still readable by id.
+
+### A summary is a memory, and it inherits what it summarised
+
+`cx.compact` sends a set of memories to a model and stores the result as a new
+memory. Every part of that sentence is a hazard, and the shape of the effect is
+what answers each one.
+
+**It is an egress, not housekeeping.** Compaction *shows the memories to a
+model*. Without a bound, summarising would be the way to move confidential
+content past a limit that stops every other path — and it would look like
+tidying up. So `Compaction::max_sensitivity` is the ceiling the summarising
+model may be shown; the effect is refused, and nothing is written, when an input
+exceeds it. It defaults to `Public`, which refuses to summarise anything above
+it.
+
+**Its label is derived, never declared.** The summary's trust, sensitivity and
+provenance are the join of the inputs: untrusted if any input was, at least as
+sensitive as the most sensitive one, carrying every source. A caller supplies
+only where the summary lands — id, subject, purpose, instruction — because the
+rest are not matters of opinion. A summary that could declare itself trusted
+would make compaction a laundry: read untrusted memories, write a trusted one,
+and every gate downstream has nothing left to act on.
+
+**It records what it was made from.** Each summary carries `derived_from` — the
+ids, versions and digests actually read. That is what makes it repairable. A
+poisoned memory does not stop being a problem when it is forgotten; without the
+edge, it stops being *visible* while its content keeps arriving in every summary
+that absorbed it, and the attack outlives its own remedy.
+
+Forgetting therefore comes in two forms, and they are separate calls because
+defaulting either way is wrong half the time. `forget` is what a **correction**
+needs: a stale memory whose summaries remain legitimate should not take them
+with it. `forget_cascading` is what an **erasure** needs: the memory and
+everything transitively derived from it.
 
 ### A lease answers "is the owner dead?", and nothing else
 

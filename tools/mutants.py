@@ -92,13 +92,16 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "an_effect_that_landed_is_never_repeated",
         "an effect that definitely landed is retried anyway",
         """            Disposition::Landed => {
-                return Some(StepError::Effect(crate::core::EffectError::Other(format!(
-                    "effect {key} took effect and its response could not be used ({message}); \\
-                     repeating it would perform it a second time"
-                ))));
+                return Some(StepError::Effect(crate::core::EffectError::Final {
+                    detail: format!(
+                        "effect {key} took effect and its response could not be used \\
+                         ({message}); repeating it would perform it a second time"
+                    ),
+                    disposition,
+                }));
             }""",
         """            Disposition::Landed => {
-                let _ = (&key, &message);
+                let _ = (&key, &message, &disposition);
                 return None;
             }""",
     ),
@@ -745,9 +748,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if false {",
     ),
     "MediaAcceptsPrivateDnsAnswers": (
-        "src/media/mod.rs",
+        "src/netguard/mod.rs",
         "one_private_dns_answer_refuses_the_entire_resolution",
-        "a public DNS answer launders a private or metadata address in the same response",
+        "a public DNS answer launders a private or metadata address in the same "
+        "response — one rule, so this breaks governed media and webhook delivery "
+        "together",
         "        if !is_public_ip(address.ip()) {",
         "        if false {",
     ),
@@ -1826,8 +1831,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_declared_tool_is_rendered_in_openais_shape",
         "declared tools drop strict mode, so arguments are checked after the "
         "tokens are paid for rather than enforced during generation",
-        "                                \"strict\": true,",
-        "                                \"strict\": false,",
+        "                            \"strict\": true,",
+        "                            \"strict\": false,",
     ),
     "AModelsToolNameResolvesApproximately": (
         "src/tools/mod.rs",
@@ -1980,6 +1985,309 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "artifacts land in another tenant's erasure unit",
         "        assert!(\n            blobs.tenant() == tenant.as_str(),",
         "        assert!(\n            blobs.tenant() != \"never\",",
+    ),
+    "ASummaryDropsItsSensitivity": (
+        "src/runtime/ctx.rs",
+        "a_summary_inherits_the_join_of_what_it_summarised",
+        "a summary takes a lower sensitivity than its most sensitive input, so "
+        "summarising is a declassification nobody authorised",
+        "            sensitivity = sensitivity.max(l.sensitivity);",
+        "",
+    ),
+    "CompactionIgnoresTheCeiling": (
+        "src/runtime/ctx.rs",
+        "compaction_cannot_exceed_the_sensitivity_ceiling",
+        "compaction does not bound what the summarising model may be shown, so "
+        "summarising becomes the route by which confidential memories reach a "
+        "model that may not see them — while looking like housekeeping",
+        "        let call = crate::model::ModelCall::new(provider, model, prompt.peek().clone())\n            .with_max_sensitivity(into.max_sensitivity);",
+        "        let call = crate::model::ModelCall::new(provider, model, prompt.peek().clone())\n            .with_max_sensitivity(crate::core::Sensitivity::Secret);",
+    ),
+    "ASummaryForgetsWhatItWasMadeFrom": (
+        "src/store/redb_memory.rs",
+        "forgetting_a_source_can_reach_what_was_derived_from_it",
+        "derivation edges are not written, so a poisoned memory can be forgotten "
+        "while every summary that absorbed it stays readable — the attack "
+        "outliving its own remedy",
+        "                for source in &item.derived_from {\n"
+        "                    derived\n"
+        "                        .insert((tenant.as_str(), source.id.as_str(), id.as_str()), ())\n"
+        "                        .map_err(|e| be(&e))?;\n"
+        "                }",
+        "",
+    ),
+    # ── Transactional effect groups ─────────────────────────────────────────
+    "AGroupCommitsByBeingForgotten": (
+        "src/runtime/executor.rs",
+        "a_group_left_open_is_reversed_rather_than_committed",
+        "a step that returns without settling its group leaves the members "
+        "standing, so the most consequential thing a group does is what happens "
+        "when the author writes nothing at all",
+        "    let Some(name) = cx.open_group().map(|g| g.name.clone()) else {\n        return result;\n    };",
+        "    let Some(name) = cx.open_group().map(|g| g.name.clone()) else {\n        return result;\n    };\n    let _ = &name;\n    if true {\n        return result;\n    }",
+    ),
+    "AGroupReversesThroughDoubt": (
+        "src/runtime/executor.rs",
+        "a_group_in_doubt_is_quarantined_rather_than_reversed",
+        "a group unwinds around a member whose outcome nobody can establish — "
+        "undoing a call that may or may not have landed, which is a coin flip "
+        "with the outside world's money on it",
+        "    let doubt = match &result {\n        Err(SkillError::Step(e)) => crate::runtime::group::in_doubt(e),\n        _ => false,\n    };",
+        "    let doubt = false;",
+    ),
+    "ReversalsRunForwards": (
+        "src/runtime/group.rs",
+        "reversals_run_in_the_opposite_order_to_the_members",
+        "members are taken back in the order they landed, so a reversal that "
+        "depends on an earlier member still being in place runs after it is gone",
+        "        for (reversed, member) in reversals.into_iter().rev().enumerate() {",
+        "        for (reversed, member) in reversals.into_iter().enumerate() {",
+    ),
+    "TheGateOpensBeforeTheInvariants": (
+        "src/runtime/group.rs",
+        "a_broken_invariant_reverses_the_group_and_names_itself",
+        "deferred members are released without checking the invariants, so the "
+        "irreversible send goes out for a group that should never have committed",
+        "        if let Some(broken) = invariants.iter().find(|i| !i.holds) {",
+        "        if let Some(broken) = invariants.iter().find(|_| false) {",
+    ),
+    "AnUndeclaredResourceIsAdmitted": (
+        "src/runtime/group.rs",
+        "a_member_outside_the_footprint_is_refused_before_it_runs",
+        "a member may touch a resource the group never declared, which makes the "
+        "footprint a comment and the frontier a boundary around nothing",
+        "        if open.resources.iter().any(|r| r == resource) {\n            return Ok(());\n        }",
+        "        if true {\n            let _ = resource;\n            return Ok(());\n        }",
+    ),
+    "AMutatingEffectPassesAsARead": (
+        "src/runtime/group.rs",
+        "a_mutating_effect_cannot_be_declared_a_group_read",
+        "an effect that mutates is admitted as a group read, taking the exemption "
+        "from declaring a reversal while leaving something standing",
+        "        if effect.mutates() {",
+        "        if false {",
+    ),
+    "ARefusalBecomesDoubt": (
+        "src/runtime/ctx.rs",
+        "exhausting_the_attempts_keeps_the_driver_s_verdict",
+        "exhausting the attempts flattens the driver's verdict into an untyped "
+        "error, which reads as in-doubt — so a call that was provably refused is "
+        "reported as one that may have happened, and everything that acts on "
+        "doubt acts on a fabrication",
+        "            StepError::Effect(crate::core::EffectError::Final {\n"
+        "                detail: format!(\n"
+        "                    \"effect {key} failed on attempt {attempt} of {}: {message}\",\n"
+        "                    policy.max_attempts\n"
+        "                ),\n"
+        "                disposition,\n"
+        "            })",
+        "            StepError::Effect(crate::core::EffectError::Other(format!(\n"
+        "                \"effect {key} failed on attempt {attempt} of {}: {message}\",\n"
+        "                policy.max_attempts\n"
+        "            )))",
+    ),
+    "AReversalCannotAffordItself": (
+        "src/runtime/ctx.rs",
+        "a_group_is_taken_back_even_when_the_budget_is_exhausted",
+        "a group reversal is gated like a forward call, so a run that reaches "
+        "its ceiling mid-group cannot release the hold it already placed — a "
+        "charged card and no order, reached through the budget rather than "
+        "through a bug",
+        "        if !self.phase.is_forward() || self.reversing {",
+        "        if !self.phase.is_forward() {",
+    ),
+    "MetricsLeakTheTenantByDefault": (
+        "src/runtime/metrics.rs",
+        "metrics_carry_no_tenant_unless_asked",
+        "a plane puts its tenant on every metric without being asked, so "
+        "customer names reach whatever backend the deployment happens to point "
+        "at — usually the least protected system it runs",
+        "    #[default]\n    Omitted,",
+        "    Omitted,\n    #[default]",
+    ),
+    "AMemoryIsTrustedByWhatItSays": (
+        "src/memory/mod.rs",
+        "a_memory_cannot_promote_itself_by_what_it_says",
+        "a recalled memory's trust is read from its content, so text asserting "
+        "its own reliability is believed — one poisoned write becomes a standing "
+        "instruction on every later session",
+        "        let mut label = if self.trust == Trust::Trusted {",
+        "        let mut label = if self.trust == Trust::Trusted\n"
+        "            || self.content.get(\"trusted\") == Some(&serde_json::Value::Bool(true))\n"
+        "        {",
+    ),
+    "ARecalledMemoryDropsItsProvenance": (
+        "src/memory/mod.rs",
+        "a_memory_cannot_promote_itself_by_what_it_says",
+        "a recalled memory arrives without the sources it declared, so nothing "
+        "downstream can require a named source and a protected field has "
+        "nothing to check",
+        "        for source in &self.provenance {\n            label.provenance.insert(source.clone());\n        }",
+        "",
+    ),
+    "ARecallIsNotAnEffect": (
+        "src/runtime/ctx.rs",
+        "a_replayed_recall_does_not_search_again",
+        "a recall queries the store directly instead of through the effect "
+        "protocol, so a replayed run retrieves whatever the corpus holds now and "
+        "produces a history that disagrees with itself",
+        "        let selected = self\n"
+        "            .effect(crate::runtime::effects::RecallMemory {\n"
+        "                memories: Arc::clone(&memories),\n"
+        "                query,\n"
+        "            })\n"
+        "            .await?\n"
+        "            .into_unlabelled();",
+        "        let selected: Vec<crate::memory::Selected> = memories\n"
+        "            .recall(&query)\n"
+        "            .await\n"
+        "            .map_err(StepError::Store)?\n"
+        "            .iter()\n"
+        "            .map(|i| crate::memory::Selected {\n"
+        "                id: i.id.clone(),\n"
+        "                version: i.version,\n"
+        "                digest: i.digest(),\n"
+        "            })\n"
+        "            .collect();",
+    ),
+    "AForgottenMemoryLeavesItsHistory": (
+        "src/store/redb_memory.rs",
+        "forgetting_one_memory_reaches_all_its_versions_and_spares_the_rest",
+        "forgetting removes only the current version, so an erasure is reported "
+        "discharged while every superseded version is still readable by id",
+        "                for version in doomed {\n"
+        "                    items\n"
+        "                        .remove((tenant.as_str(), id.as_str(), version))\n"
+        "                        .map_err(|e| be(&e))?;\n"
+        "                }",
+        "                if let Some(version) = doomed.last() {\n"
+        "                    items\n"
+        "                        .remove((tenant.as_str(), id.as_str(), *version))\n"
+        "                        .map_err(|e| be(&e))?;\n"
+        "                }",
+    ),
+    "OneTenantRecallsAnothersMemories": (
+        "src/store/redb_memory.rs",
+        "one_tenants_memories_are_not_another_tenants",
+        "reading a memory by id drops the tenant, so one tenant reads another's "
+        "memory while holding nothing but an id — and a memory is read into a "
+        "context window as established fact",
+        "            let Some(raw) = items\n"
+        "                .get((tenant.as_str(), id.as_str(), version))\n"
+        "                .map_err(|e| be(&e))?",
+        "            let Some(raw) = items\n"
+        "                .range((\"\", id.as_str(), version)..=(MAX_STR, id.as_str(), version))\n"
+        "                .map_err(|e| be(&e))?\n"
+        "                .next()\n"
+        "                .transpose()\n"
+        "                .map_err(|e| be(&e))?\n"
+        "                .map(|(_, v)| v)",
+    ),
+    "OpenAiNestsItsToolDeclarations": (
+        "src/model/openai.rs",
+        "a_declared_tool_is_rendered_in_openais_shape",
+        "tool declarations are nested under `function`, which is the Chat "
+        "Completions shape — Responses answers `Missing required parameter: "
+        "tools[0].name` and the call never reaches a model",
+        "                        json!({\n"
+        "                            \"type\": \"function\",\n"
+        "                            \"name\": t.name,\n"
+        "                            \"description\": t.description,\n"
+        "                            \"parameters\": t.parameters,\n"
+        "                            \"strict\": true,\n"
+        "                        })",
+        "                        json!({\n"
+        "                            \"type\": \"function\",\n"
+        "                            \"function\": {\n"
+        "                                \"name\": t.name,\n"
+        "                                \"description\": t.description,\n"
+        "                                \"parameters\": t.parameters,\n"
+        "                                \"strict\": true,\n"
+        "                            }\n"
+        "                        })",
+    ),
+    "AToolCallReadsAsAnEmptyAnswer": (
+        "src/model/openai.rs",
+        "a_tool_call_with_no_text_is_a_usable_answer",
+        "a tool call with no text is rejected as an empty answer, so every "
+        "declared-tool loop against OpenAI fails on a response that worked — and "
+        "is billed for it",
+        "        if text.is_empty() && calls.is_empty() && !truncated && !emulating {",
+        "        if text.is_empty() && !truncated && !emulating {",
+    ),
+    "AWebhookHostIsMatchedBySuffix": (
+        "src/push/mod.rs",
+        "a_webhook_host_must_be_granted",
+        "webhook hosts are matched by suffix, so `hooks.acme.example.evil.example` "
+        "satisfies a grant for `hooks.acme.example` and the allowlist is bypassed "
+        "by registering a domain",
+        "        if !self.hosts.contains(&host) {",
+        "        if !self.hosts.iter().any(|h| host.ends_with(h.as_str())) {",
+    ),
+    "AWebhookMayBePlaintext": (
+        "src/push/mod.rs",
+        "a_webhook_must_be_https",
+        "a webhook may be plain http, so a payload describing somebody's task "
+        "crosses the network in clear to an address the recipient chose",
+        "        if parsed.scheme() != \"https\" {\n            return Err(PushError::NotHttps);\n        }",
+        "",
+    ),
+    "DeliveryTrustsTheRegistrationTimeCheck": (
+        "src/push/mod.rs",
+        "a_revoked_host_stops_receiving_notifications",
+        "the grant is checked only when a webhook is registered, so a host "
+        "removed from the allowlist keeps receiving notifications for every task "
+        "registered while it was still granted",
+        "        self.policy.check(&config.url)?;",
+        "",
+    ),
+    "AWebhookMayResolveInward": (
+        "src/push/mod.rs",
+        "a_webhook_resolving_to_a_private_address_is_refused",
+        "resolved webhook addresses are not checked, so a granted hostname "
+        "pointing at loopback or a metadata service is connected to",
+        "        let addrs = crate::netguard::all_public(&host, resolved).map_err(PushError::Unroutable)?;",
+        "        let addrs: Vec<std::net::SocketAddr> = resolved.collect();",
+    ),
+    "AWebhookTokenIsEchoedBack": (
+        "src/push/mod.rs",
+        "a_configuration_read_back_does_not_carry_its_token",
+        "a configuration read back carries its token, so a caller learns the "
+        "bearer credential for somebody else's webhook",
+        "            \"url\": self.url,\n        })",
+        "            \"url\": self.url,\n            \"token\": self.token.as_ref().map(crate::core::Secret::expose),\n        })",
+    ),
+    "OneTenantReadsAnothersWebhooks": (
+        "src/store/redb_push.rs",
+        "one_tenants_webhooks_are_not_another_tenants",
+        "webhook registrations drop the tenant from their key, so any tenant "
+        "holding a valid task id reads another's destination and bearer token",
+        "                .get((tenant.as_str(), task_key.as_str(), id.as_str()))",
+        "                .get((\"\", task_key.as_str(), id.as_str()))",
+    ),
+    "AnUnsignedCardPassesVerification": (
+        "src/peers/discovery.rs",
+        "discovery_refuses_an_unsigned_card_when_verification_is_required",
+        "verification is skipped when a card carries no signature, so an "
+        "attacker downgrades it by removing the signature rather than forging one",
+        "        if let Some(verifier) = &self.verifier {",
+        "        if let Some(verifier) = &self.verifier\n            && !card.signatures.is_empty()\n        {",
+    ),
+    "InterfaceSelectionIgnoresTheTenant": (
+        "src/peers/discovery.rs",
+        "a_client_discovers_verifies_and_calls_a_tenant_scoped_agent",
+        "the endpoint built from a card drops the interface's tenant, so a "
+        "client can only ever reach an agent serving the default tenant",
+        "        Ok(match &iface.tenant {\n            Some(t) => endpoint.for_tenant(t.clone()),\n            None => endpoint,\n        })",
+        "        Ok(endpoint)",
+    ),
+    "InterfaceSelectionIgnoresTheVersion": (
+        "src/peers/discovery.rs",
+        "an_interface_is_selected_by_binding_and_version",
+        "interface selection ignores the protocol version, so a client picks an "
+        "endpoint speaking a protocol it does not",
+        "            .find(|i| i.protocol_binding == binding && major_minor(&i.protocol_version) == want)",
+        "            .find(|i| i.protocol_binding == binding)",
     ),
     "ACardSignatureCoversItself": (
         "src/peers/card_sig.rs",

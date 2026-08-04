@@ -354,3 +354,104 @@ impl Effect for WriteCaseState {
             })
     }
 }
+
+/// Recalling memories, as an effect.
+///
+/// Journaled because memory is mutable state outside the chain: a lookup done
+/// inside the deterministic zone would make a replayed run retrieve whatever the
+/// store holds *now*, reach different conclusions, and produce a history that
+/// disagrees with itself.
+///
+/// The output is the **selection** — ids, versions and content digests — and not
+/// the content. Two reasons, and both matter. Personal data must not enter a
+/// hash chain that cannot be redacted; and pinning versions means a replay
+/// re-materialises exactly what was read rather than re-running a ranking that
+/// drifts as the corpus grows.
+#[derive(Debug, Clone)]
+pub struct RecallMemory {
+    pub(crate) memories: std::sync::Arc<dyn crate::memory::MemoryStore>,
+    pub(crate) query: crate::memory::Recall,
+}
+
+#[async_trait]
+impl Effect for RecallMemory {
+    type Output = Vec<crate::memory::Selected>;
+
+    /// Trusted: this plane's own store, not the world's.
+    ///
+    /// The *contents* are another matter entirely, and the caller receives them
+    /// labelled from each item's declared provenance — see
+    /// [`StepCtx::recall`](crate::runtime::StepCtx::recall).
+    fn trust(&self) -> crate::core::Trust {
+        crate::core::Trust::Trusted
+    }
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "memory.recall",
+            serde_json::to_value(&self.query).unwrap_or(json!(null)),
+        )
+    }
+
+    fn mutates(&self) -> bool {
+        false
+    }
+
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    async fn perform(&self) -> Result<Self::Output, EffectError> {
+        let found = self
+            .memories
+            .recall(&self.query)
+            .await
+            .map_err(|e| EffectError::Other(e.to_string()))?;
+        Ok(found
+            .iter()
+            .map(|item| crate::memory::Selected {
+                id: item.id.clone(),
+                version: item.version,
+                digest: item.digest(),
+            })
+            .collect())
+    }
+}
+
+/// Writing a memory, as an effect.
+///
+/// A write is external mutable state, so a replay that performed it again would
+/// append a second version of a memory the run wrote once — and the version
+/// number the run went on to use would be wrong.
+#[derive(Debug, Clone)]
+pub struct RememberMemory {
+    pub(crate) memories: std::sync::Arc<dyn crate::memory::MemoryStore>,
+    pub(crate) item: crate::memory::MemoryItem,
+}
+
+#[async_trait]
+impl Effect for RememberMemory {
+    type Output = u64;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "memory.remember",
+            json!({
+                "id": self.item.id,
+                "subject": self.item.subject,
+                "purpose": self.item.purpose,
+                // The content's digest, not the content: an effect key is
+                // recorded verbatim, and a memory's content belongs in a store
+                // that can be erased.
+                "content": self.item.digest().to_hex(),
+            }),
+        )
+    }
+
+    async fn perform(&self) -> Result<u64, EffectError> {
+        self.memories
+            .remember(&self.item)
+            .await
+            .map_err(|e| EffectError::Other(e.to_string()))
+    }
+}

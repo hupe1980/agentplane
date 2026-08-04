@@ -23,6 +23,10 @@ mod redb_cases;
 #[cfg(feature = "redb")]
 mod redb_events;
 #[cfg(feature = "redb")]
+mod redb_memory;
+#[cfg(all(feature = "redb", feature = "push"))]
+mod redb_push;
+#[cfg(feature = "redb")]
 mod redb_quota;
 #[cfg(feature = "redb")]
 mod redb_tasks;

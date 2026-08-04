@@ -117,7 +117,7 @@ impl Runtime {
         // Observed last, so the reading reflects what this sweep just resolved
         // rather than the backlog it was about to clear.
         report.census = self.census(now).await?;
-        report.census.emit();
+        self.meter().census(&report.census);
 
         Ok(report)
     }
@@ -213,7 +213,7 @@ impl Runtime {
                 step = %timer.step,
                 due = %timer.fire_at,
             );
-            metrics::count(metrics::TIMERS_FIRED, "");
+            self.meter().count(metrics::TIMERS_FIRED, "");
             self.replay(timer.run, Mode::Resume).await?;
             fired += 1;
         }
@@ -254,7 +254,7 @@ impl Runtime {
                     obligation = %deadline.name,
                     due = %deadline.resolved_at,
                 );
-                metrics::count(metrics::DEADLINE_BREACHES, "");
+                self.meter().count(metrics::DEADLINE_BREACHES, "");
                 report.breached += 1;
             } else if deadline.needs_warning(now) {
                 cases

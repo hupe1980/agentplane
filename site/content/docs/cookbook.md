@@ -652,6 +652,55 @@ replay makes zero calls:
 cargo run --example saga_checkout
 ```
 
+## 🧬 Undo work when a *call* fails, not a whole step
+
+A step-level compensation is handed the step's **output**, and a step that failed
+does not have one. So a step that reserved inventory, authorised a card and then
+failed asks its own `compensate` to guess. Group the calls instead:
+
+```rust
+let mut g = cx.group("checkout", ["inventory", "payments", "notify"]).await?;
+
+// Runs now. The reversal closes over what this call actually returned.
+let hold = g.reversible("inventory", Reserve::new(&sku, 2), |out| {
+    Release::new(out["hold"].as_str().unwrap_or_default())
+}).await?;
+
+let auth = g.reversible("payments", Authorize::new(amount), |out| {
+    Void::new(out["auth"].as_str().unwrap_or_default())
+}).await?;
+
+// A read declares no reversal, because it has nothing to take back.
+let stock = g.read("inventory", Look::new(&sku)).await?;
+
+// Held at the gate: an aborted group never sends it.
+g.deferred("notify", Notify::new("order confirmed"))?;
+
+// The frontier. Past here nothing unwinds.
+g.commit(&[Invariant::new("the hold covers the order", covered)]).await?;
+```
+
+**The trap:** putting the irreversible send in `reversible` with an apology as
+its undo. `deferred` is the stronger tool and costs nothing to use — the member
+does not run until the group is certain, so an abort leaves no trace anyone saw.
+A compensating email is a second email.
+
+**The second trap:** treating the resource list as documentation. Every member
+names its resource and one outside the declared set is refused *before it runs*.
+A group that could touch anything has committed to nothing, and the frontier
+would be a boundary around nothing.
+
+**The third trap:** expecting `?` to leave the group alone. It does not — the
+executor reverses what the abandoned handle left standing, and a step that
+returns *successfully* with a group still open is reversed **and** failed. A
+group that commits by being forgotten would make the most consequential thing it
+does the thing that happens when you write nothing.
+
+Reversals go through the ordinary effect path, so they are journaled, retried and
+metered like any other call and a replay does not perform them twice. Doubt
+reverses nothing: a member whose outcome cannot be established quarantines the
+run rather than unwinding around it.
+
 ## 🔐 Restrict where the plane may connect
 
 ```rust
@@ -734,6 +783,91 @@ its author thought of — and those are the ones they were already thinking abou
 while writing it, so the invariant they misread is by construction the one with
 no test. The battery states the contract once and runs against every backend,
 including a racing check no sequential test can replace.
+
+## 🧠 Give an agent a memory
+
+```rust
+let store = Arc::new(RedbStore::open("plane.redb")?);
+let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+    .memory(store as Arc<dyn MemoryStore>)
+    .skill(Triage)
+    .build();
+```
+
+Inside a skill:
+
+```rust
+let known = cx.recall(Recall::about(&account).for_purpose("support").limit(5)).await?;
+// Every item is labelled. Reading metadata is free; acting on the content is not.
+for memory in &known {
+    println!("{} (trust {:?})", memory.peek().id, memory.label().trust);
+}
+
+cx.remember(MemoryItem {
+    id: format!("triage-{account}"),
+    subject: account.clone(),
+    purpose: "support".to_owned(),
+    content: summary,
+    // Where it came from. This is what everything downstream is labelled by.
+    provenance: vec![SourceId::new("model:triage")],
+    trust: Trust::Untrusted,
+    ..item
+}).await?;
+```
+
+**The trap:** writing model output with `trust: Trusted` because it looks fine.
+That is the one way to launder it — the label everything later reads is taken
+from this field, not from the content. Declaring it trusted here is the same act
+as `cx.release`, without the policy check or the record. If a memory genuinely
+needs to be believed, release it explicitly where a reviewer can see the
+decision.
+
+**The second trap:** expecting `forget` to be enough for an erasure request. It
+removes one memory and every version of it, which is what selective repair
+needs; a *subject* is the unit a person's erasure names, and `forget_subject` is
+that. If summaries were made from the memory, see the next recipe — erasure has
+to reach them too.
+
+## 🗜️ Compact a memory without laundering it
+
+Summarising is itself a memory write, so it goes through the effect protocol
+rather than around it:
+
+```rust
+let old = cx.recall(Recall::about(&account).for_purpose("support").limit(50)).await?;
+
+cx.compact(
+    Compaction {
+        id: format!("digest-{account}"),
+        subject: account.clone(),
+        purpose: "support".to_owned(),
+        at: cx.now().await?,
+        instruction: "Summarise these support interactions in under 200 words.".to_owned(),
+        // What the summarising model may be shown. Refuses if an input exceeds it.
+        max_sensitivity: Sensitivity::Confidential,
+    },
+    &old,
+    provider,
+    ModelId::new("gpt-5"),
+).await?;
+```
+
+Notice what you did **not** pass: trust, sensitivity, provenance, or the prompt.
+All four are derived. The label is the join of the inputs, so a summary of
+untrusted memories is untrusted; and the prompt is assembled from the sources
+here rather than accepted, because a caller who could shape it could show the
+model something other than what was checked.
+
+**The trap:** treating `max_sensitivity` as a storage detail. Compaction sends
+memories *to a model*, so it is an egress. Set it too high and summarising
+becomes the quiet route around every other limit; it defaults to `Public` for
+that reason, and refuses rather than truncating.
+
+**The second trap:** forgetting a poisoned memory and considering it handled. Its
+content is now inside every summary that read it. `forget` is right for a
+**correction** — the memory was stale, the summaries are still legitimate.
+`forget_cascading` is right for an **erasure**, and takes the derivatives with
+it; `derivatives(id)` shows you what that would remove before you commit to it.
 
 ## 🏢 Serve several tenants from one process
 

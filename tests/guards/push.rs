@@ -1,0 +1,226 @@
+#![cfg(all(feature = "push", feature = "redb"))]
+
+//! Webhook registration and delivery.
+//!
+//! Push is the one feature where an **untrusted party names an address this
+//! plane will connect to**. Every other outbound destination is granted by an
+//! operator; a webhook URL comes from whoever created the task. So these tests
+//! are mostly about the three controls that keeps honest, and about what the
+//! payload is allowed to contain.
+
+use std::sync::Arc;
+
+use agentplane::core::{RunId, Secret};
+use agentplane::push::{PushConfig, PushError, PushPolicy, PushStore};
+use agentplane::store::RedbStore;
+
+fn config(url: &str) -> PushConfig {
+    PushConfig {
+        id: "cfg-1".to_owned(),
+        task: RunId::generate(),
+        url: url.to_owned(),
+        token: Some(Secret::new("the-receivers-token")),
+    }
+}
+
+// ── The grant ───────────────────────────────────────────────────────────────
+
+/// A webhook host must be granted, and the grant is exact.
+#[test]
+fn a_webhook_host_must_be_granted() {
+    let policy = PushPolicy::new().allow_host("acme.example");
+
+    policy
+        .check("https://acme.example/a2a")
+        .expect("a granted host was refused");
+
+    // A host nobody listed.
+    assert!(matches!(
+        policy.check("https://evil.example/a2a"),
+        Err(PushError::HostNotGranted(_))
+    ));
+
+    // The two ways a near-match is talked into passing, and both are ordinary
+    // to register:
+    //
+    // `evil-acme.example` *ends with* the granted host, so any implementation
+    // that matches on a suffix accepts it — the classic allowlist bypass.
+    assert!(
+        matches!(
+            policy.check("https://evil-acme.example/a2a"),
+            Err(PushError::HostNotGranted(_))
+        ),
+        "a host ending in the granted one was accepted, so the allowlist is \
+         bypassed by registering a domain"
+    );
+    // And a subdomain is a different host, not a covered one.
+    assert!(matches!(
+        policy.check("https://hooks.acme.example/a2a"),
+        Err(PushError::HostNotGranted(_))
+    ));
+}
+
+/// Plaintext webhooks are refused.
+///
+/// The payload describes somebody's task. Sending it in clear to an address the
+/// recipient chose is a disclosure with extra steps.
+#[test]
+fn a_webhook_must_be_https() {
+    let policy = PushPolicy::new().allow_host("hooks.acme.example");
+    assert!(matches!(
+        policy.check("http://hooks.acme.example/a2a"),
+        Err(PushError::NotHttps)
+    ));
+}
+
+/// The grant is re-checked at delivery, not only at registration.
+///
+/// A registration outlives the configuration that permitted it. A host removed
+/// from the allowlist must stop receiving notifications for tasks registered
+/// while it was still granted — a check performed only at write time cannot do
+/// that, and the tasks that outlive a config change are exactly the long-running
+/// ones this feature exists for.
+#[tokio::test]
+async fn a_revoked_host_stops_receiving_notifications() {
+    use agentplane::push::PushSender;
+
+    // Registered under one policy...
+    let permissive = PushPolicy::new().allow_host("hooks.acme.example");
+    let registered = config("https://hooks.acme.example/a2a");
+    permissive.check(&registered.url).expect("granted at first");
+
+    // ...delivered under another, which no longer names the host.
+    let sender = PushSender::new(PushPolicy::new().allow_host("hooks.other.example"));
+    let refused = sender
+        .deliver(&registered, &serde_json::json!({"statusUpdate": {}}))
+        .await;
+    assert!(
+        matches!(refused, Err(PushError::HostNotGranted(_))),
+        "a webhook registered before its host was revoked was still delivered \
+         to: {refused:?}"
+    );
+}
+
+/// A host that resolves inward is refused, however it was granted.
+///
+/// The second lock. An operator can grant a host by name; they cannot grant it
+/// past the address check, so a name that resolves to loopback or a metadata
+/// service reaches nothing.
+#[tokio::test]
+async fn a_webhook_resolving_to_a_private_address_is_refused() {
+    use agentplane::push::PushSender;
+
+    // `localhost` is granted by name and still refused, because the refusal is
+    // about where it resolves.
+    let sender = PushSender::new(PushPolicy::new().allow_host("localhost"));
+    let outcome = sender
+        .deliver(
+            &config("https://localhost/hook"),
+            &serde_json::json!({"statusUpdate": {}}),
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(PushError::Unroutable(_))),
+        "a granted host resolving to loopback was connected to: {outcome:?}"
+    );
+}
+
+// ── What the payload says ───────────────────────────────────────────────────
+
+/// A configuration read back never carries its token.
+///
+/// The token is a bearer credential for somebody else's endpoint. A caller that
+/// can read a configuration it did not create would otherwise learn it — and the
+/// only party that needs it already has it.
+#[test]
+fn a_configuration_read_back_does_not_carry_its_token() {
+    let shown = config("https://hooks.acme.example/a2a").redacted();
+    let text = serde_json::to_string(&shown).expect("serialize");
+    assert!(
+        !text.contains("the-receivers-token"),
+        "a webhook token was echoed back to a caller: {text}"
+    );
+    assert_eq!(shown["url"], "https://hooks.acme.example/a2a");
+}
+
+/// A token does not appear in a debug rendering either.
+#[test]
+fn a_webhook_token_is_not_printable() {
+    let text = format!("{:?}", config("https://hooks.acme.example/a2a"));
+    assert!(
+        !text.contains("the-receivers-token"),
+        "a webhook token is printable, so it is one log line from disclosure: {text}"
+    );
+}
+
+// ── Storage ─────────────────────────────────────────────────────────────────
+
+/// Registrations survive, are listed per task, and are deleted idempotently.
+#[tokio::test]
+async fn registrations_round_trip() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn PushStore>;
+    let mut first = config("https://hooks.acme.example/one");
+    let task = first.task;
+    first.id = "one".to_owned();
+    let second = PushConfig {
+        id: "two".to_owned(),
+        task,
+        url: "https://hooks.acme.example/two".to_owned(),
+        token: None,
+    };
+
+    store.put(&first).await.expect("put");
+    store.put(&second).await.expect("put");
+
+    let back = store.get(task, "one").await.expect("get").expect("present");
+    assert_eq!(back.url, first.url);
+    assert_eq!(
+        back.token.as_ref().map(Secret::expose),
+        Some("the-receivers-token"),
+        "the token did not survive storage, so every notification after a \
+         restart would be unauthenticated at the receiver"
+    );
+
+    let all = store.list(task).await.expect("list");
+    assert_eq!(all.len(), 2, "a task's registrations were not both listed");
+
+    store.delete(task, "one").await.expect("delete");
+    store.delete(task, "one").await.expect("deleting twice");
+    assert!(store.get(task, "one").await.expect("get").is_none());
+    assert_eq!(store.list(task).await.expect("list").len(), 1);
+}
+
+/// One tenant cannot read another's webhooks.
+///
+/// A task id is not a capability. Without the tenant leading the key, a handle
+/// for one tenant holding a valid task id would read another tenant's webhook —
+/// disclosing both a destination and the bearer token for it.
+#[tokio::test]
+async fn one_tenants_webhooks_are_not_another_tenants() {
+    use agentplane::core::TenantId;
+
+    let base = RedbStore::open_in_memory().expect("store");
+    let acme = Arc::new(
+        base.clone()
+            .for_tenant(TenantId::new("acme").expect("valid")),
+    ) as Arc<dyn PushStore>;
+    let globex =
+        Arc::new(base.for_tenant(TenantId::new("globex").expect("valid"))) as Arc<dyn PushStore>;
+
+    let theirs = config("https://hooks.acme.example/secret");
+    let task = theirs.task;
+    acme.put(&theirs).await.expect("acme registers");
+
+    assert!(
+        globex.get(task, "cfg-1").await.expect("get").is_none(),
+        "one tenant read another's webhook while holding nothing but a valid \
+         task id — disclosing a destination and its bearer token"
+    );
+    assert!(
+        globex.list(task).await.expect("list").is_empty(),
+        "one tenant listed another's webhooks"
+    );
+
+    // And acme still reads its own, so this isolated rather than broke it.
+    assert!(acme.get(task, "cfg-1").await.expect("get").is_some());
+}

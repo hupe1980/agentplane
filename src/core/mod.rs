@@ -46,7 +46,7 @@ pub use provenance::{NS as PROVENANCE_NS, Provenance};
 pub use case::{
     Case, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineSpec, DeadlineState,
 };
-pub use effect::{Effect, EffectDescriptor, Reconciliation, Recovery};
+pub use effect::{AnyEffect, Effect, EffectDescriptor, Reconciliation, Recovery};
 pub use error::{
     Disposition, EffectError, PolicyError, REFUSED, RuntimeError, SkillError, StepError, StoreError,
 };

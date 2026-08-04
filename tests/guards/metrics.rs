@@ -42,6 +42,7 @@ struct Sample {
     unit: String,
     value: u64,
     dim: String,
+    tenant: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -72,6 +73,7 @@ struct Fields {
     unit: String,
     value: u64,
     dim: String,
+    tenant: String,
 }
 
 impl tracing::field::Visit for Fields {
@@ -86,6 +88,7 @@ impl tracing::field::Visit for Fields {
             "kind" => self.kind = v.to_string(),
             "unit" => self.unit = v.to_string(),
             "dim" => self.dim = v.to_string(),
+            "tenant" => self.tenant = v.to_string(),
             _ => {}
         }
     }
@@ -116,6 +119,7 @@ impl Subscriber for Meter {
             unit: f.unit,
             value: f.value,
             dim: f.dim,
+            tenant: f.tenant,
         });
     }
     fn enter(&self, _: &span::Id) {}
@@ -448,4 +452,84 @@ async fn every_sample_matches_its_declaration() {
             );
         }
     }
+}
+
+// ── Tenant attribution ──────────────────────────────────────────────────────
+
+/// A plane emits no tenant label unless asked.
+///
+/// A tenant name is frequently a customer name, and a metrics backend is
+/// usually the least protected system in a deployment — sampled into third-party
+/// services, on a dashboard nobody signs into, retained past every other record. A
+/// deployment that has not decided where its metrics go has not decided that
+/// customer names may travel there.
+#[tokio::test]
+async fn metrics_carry_no_tenant_unless_asked() {
+    use agentplane::core::TenantId;
+    use agentplane::runtime::metrics::TenantLabel;
+
+    // Named, not merely relied upon: "no label by default" and "the default is
+    // `Omitted`" are different claims, and a new default that also happened to
+    // emit nothing would pass the first while making the type a lie.
+    assert_eq!(TenantLabel::default(), TenantLabel::Omitted);
+
+    let meter = Meter::default();
+    let samples = {
+        let _guard = tracing::subscriber::set_default(meter.clone());
+        let store = Arc::new(
+            RedbStore::open_in_memory()
+                .unwrap()
+                .for_tenant(TenantId::new("acme-financial").expect("valid")),
+        );
+        let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+            .tenant(TenantId::new("acme-financial").expect("valid"))
+            // Stated explicitly here, which is also what a deployment writes
+            // when it wants the default behaviour on the record.
+            .metric_tenant(TenantLabel::Omitted)
+            .skill(Pinger)
+            .build();
+        rt.run("ping", json!({})).await.expect("run");
+        meter.samples()
+    };
+
+    assert!(!samples.is_empty(), "nothing was measured at all");
+    assert!(
+        samples.iter().all(|s| s.tenant.is_empty()),
+        "a tenant name reached the metrics backend without anyone asking for it: {:?}",
+        samples.iter().map(|s| &s.tenant).collect::<Vec<_>>()
+    );
+}
+
+/// Asked for, the label is the plane's own tenant — which is what bounds it.
+///
+/// Cardinality is the number of planes an operator configured, not a number any
+/// request can grow. A tenant read from a *request* would be the unbounded label
+/// that makes a metrics backend fall over.
+#[tokio::test]
+async fn an_asked_for_tenant_label_is_the_planes_own() {
+    use agentplane::core::TenantId;
+    use agentplane::runtime::metrics::TenantLabel;
+
+    let meter = Meter::default();
+    let samples = {
+        let _guard = tracing::subscriber::set_default(meter.clone());
+        let store = Arc::new(
+            RedbStore::open_in_memory()
+                .unwrap()
+                .for_tenant(TenantId::new("acme").expect("valid")),
+        );
+        let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+            .tenant(TenantId::new("acme").expect("valid"))
+            .metric_tenant(TenantLabel::Name)
+            .skill(Pinger)
+            .build();
+        rt.run("ping", json!({})).await.expect("run");
+        meter.samples()
+    };
+
+    assert!(
+        samples.iter().all(|s| s.tenant == "acme"),
+        "samples carried a tenant other than the plane's: {:?}",
+        samples.iter().map(|s| &s.tenant).collect::<Vec<_>>()
+    );
 }

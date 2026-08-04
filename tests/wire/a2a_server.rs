@@ -118,7 +118,14 @@ impl Authenticator for HeaderAuth {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or(AuthError::Missing)?;
-        Ok(Caller::new(bearer, vec!["peer".to_owned()]))
+        // Same `tenant:actor` shape as the header path. A real deployment reads
+        // the tenant out of the credential too — it is the one field that must
+        // not come from the request.
+        let (tenant, actor) = match bearer.split_once(':') {
+            Some((t, a)) => (TenantId::new(t).map_err(|_| AuthError::Rejected)?, a),
+            None => (TenantId::default(), bearer),
+        };
+        Ok(Caller::new(actor, vec!["peer".to_owned()]).in_tenant(tenant))
     }
 }
 
@@ -1309,5 +1316,189 @@ async fn a_published_card_can_be_signed_and_verified() {
         moved.verify(&verifier as &dyn CardVerifier).is_err(),
         "a card whose interface URL was rewritten still verified — a peer would \
          connect to an address the publisher never named"
+    );
+}
+
+// ── Discovery ───────────────────────────────────────────────────────────────
+
+/// A client discovers this plane's card, verifies it, and calls the interface
+/// it names — including the tenant.
+///
+/// The whole client half in one path, against a real socket. Each step is
+/// worthless alone: discovery that skips verification trusts whoever answered,
+/// verification that ignores the selected interface calls an address the
+/// signature never covered, and selection that drops the tenant can only ever
+/// reach an agent serving the default one.
+#[cfg(all(feature = "signing", feature = "a2a"))]
+#[tokio::test]
+async fn a_client_discovers_verifies_and_calls_a_tenant_scoped_agent() {
+    use agentplane::core::{Delegation, Principal, Scope, TenantId};
+    use agentplane::peers::a2a::A2aClient;
+    use agentplane::peers::{
+        CardClient, CardSigner, CardVerifier, PeerClient, PeerCredential, PeerId,
+    };
+    use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
+
+    let signer = Ed25519Signer::new("did:example:acme", &[5u8; 32]);
+    let verifier = Ed25519Verifier::new()
+        .trust("did:example:acme", &signer.verifying_key())
+        .expect("a valid key");
+
+    // A plane serving a *named* tenant, so the card advertises one and the
+    // client has to echo it back.
+    let manifest = Manifest::parse(ONE_SKILL).expect("parse");
+    let tenant = TenantId::new("acme").expect("valid");
+    let store = Arc::new(
+        RedbStore::open_in_memory()
+            .unwrap()
+            .for_tenant(tenant.clone()),
+    );
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .tenant(tenant)
+        .skill(Echoes {
+            capability: "settlement.check",
+            seen: seen.clone(),
+        })
+        .build();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = A2aServer::new(
+        rt,
+        Arc::new(HeaderAuth),
+        &manifest,
+        format!("http://{addr}/a2a"),
+    )
+    .expect("wired")
+    .signing_cards_with(&signer as &dyn CardSigner)
+    .expect("sign")
+    .router();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    // Discovery, with verification made mandatory.
+    let cards = CardClient::new().verifying_with(Arc::new(verifier) as Arc<dyn CardVerifier>);
+    let card = cards
+        .discover(&format!("http://{addr}"))
+        .await
+        .expect("the plane's own signed card did not survive discovery");
+    assert_eq!(card.name, "settlement-checker");
+
+    // Interface selection carries the tenant the card advertises.
+    let endpoint = card
+        .endpoint()
+        .expect("the card offers no usable interface");
+    assert_eq!(
+        endpoint.tenant.as_deref(),
+        Some("acme"),
+        "the endpoint dropped the tenant the card advertises, so every request \
+         would be refused as meant for a different agent"
+    );
+
+    // And a call through it is served — which it would not be without the
+    // tenant, because the server checks the request against its own card.
+    let peer = PeerId::new("acme-plane");
+    let chain = Delegation::root(Principal::new("user:operator", Scope::root()));
+    let client = A2aClient::new(endpoint).unwrap();
+    let credential = PeerCredential::for_audience(peer.clone(), "acme:caller");
+    client
+        .send(
+            &peer,
+            "settlement.check",
+            &json!({"amount": 10}),
+            &chain,
+            Some(&credential),
+            None,
+        )
+        .await
+        .expect("a discovered, verified, tenant-scoped call was refused");
+
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the call did not reach the skill"
+    );
+}
+
+/// A card whose signature does not verify is refused at discovery.
+#[cfg(all(feature = "signing", feature = "a2a"))]
+#[tokio::test]
+async fn discovery_refuses_a_card_signed_by_a_stranger() {
+    use agentplane::peers::{CardClient, CardSigner, CardVerifier};
+    use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
+
+    let stranger = Ed25519Signer::new("did:example:stranger", &[8u8; 32]);
+    let expected = Ed25519Signer::new("did:example:acme", &[5u8; 32]);
+    let verifier = Ed25519Verifier::new()
+        .trust("did:example:acme", &expected.verifying_key())
+        .expect("a valid key");
+
+    let f = fixture();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = A2aServer::new(
+        f.rt.clone(),
+        Arc::new(HeaderAuth),
+        &f.manifest,
+        format!("http://{addr}/a2a"),
+    )
+    .expect("wired")
+    .signing_cards_with(&stranger as &dyn CardSigner)
+    .expect("sign")
+    .router();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let cards = CardClient::new().verifying_with(Arc::new(verifier) as Arc<dyn CardVerifier>);
+    assert!(
+        cards.discover(&format!("http://{addr}")).await.is_err(),
+        "a card signed by an unknown key was accepted, so verification checks \
+         nothing"
+    );
+}
+
+/// With verification configured, an **unsigned** card is refused.
+///
+/// The downgrade an attacker performs is removing the signature, not forging
+/// one. A verifier that checks "if a signature is present" is one that can be
+/// switched off by whoever serves the document.
+#[cfg(all(feature = "signing", feature = "a2a"))]
+#[tokio::test]
+async fn discovery_refuses_an_unsigned_card_when_verification_is_required() {
+    use agentplane::peers::{CardClient, CardVerifier};
+    use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
+
+    let key = Ed25519Signer::new("did:example:acme", &[5u8; 32]);
+    let verifier = Ed25519Verifier::new()
+        .trust("did:example:acme", &key.verifying_key())
+        .expect("a valid key");
+
+    let f = fixture();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Served unsigned.
+    let router = f.router();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let cards = CardClient::new().verifying_with(Arc::new(verifier) as Arc<dyn CardVerifier>);
+    assert!(
+        cards.discover(&format!("http://{addr}")).await.is_err(),
+        "an unsigned card was accepted while verification was required — the \
+         downgrade is removing the signature, not forging one"
+    );
+
+    // Without a verifier the same card is fine, so this refuses the *unsigned*
+    // case rather than refusing everything.
+    assert!(
+        CardClient::new()
+            .discover(&format!("http://{addr}"))
+            .await
+            .is_ok()
     );
 }

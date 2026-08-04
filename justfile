@@ -103,9 +103,32 @@ test-attestation:
 test-drivers:
     cargo test --features a2a,providers,http,redb,testkit --test wire drivers::
 
+# Tests that call a real provider and therefore cost money.
+#
+# Never part of `ci`, and gated twice: this recipe supplies AGENTPLANE_LIVE=1,
+# and the key comes from .env (gitignored). An exported OPENAI_API_KEY alone
+# does nothing — a credential being available is not a decision to spend it.
+test-live:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f .env ]; then
+        echo "no .env — put OPENAI_API_KEY in it, or export it and set AGENTPLANE_LIVE=1" >&2
+        exit 1
+    fi
+    set -a; . ./.env; set +a
+    AGENTPLANE_LIVE=1 cargo test --features providers,redb,testkit --test live -- --nocapture --test-threads=1
+
+# memory: provenance labelling, journaled recall, versioning and forgetting
+test-memory:
+    cargo test --features redb,testkit --test guards memory::
+
+# webhook grants, SSRF guards, and what a notification may contain
+test-push:
+    cargo test --features push,media,redb,testkit --test guards push::
+
 # being called: the public card, the 1.0 methods, and a client/server round trip
 test-a2a-server:
-    cargo test --features a2a-server,a2a,redb,testkit --test wire a2a_server::
+    cargo test --features a2a-server,a2a,signing,redb,testkit --test wire a2a_server::
 
 # run every example end to end
 examples:
@@ -114,6 +137,7 @@ examples:
     cargo run --example plan_graph
     cargo run --example governed_transfer
     cargo run --example saga_checkout
+    cargo run --example effect_group
     cargo run --example model_run --features redb,testkit
     cargo run --example media_run --features redb,testkit,media
     cargo run --example manifest_run --features redb,testkit,manifest

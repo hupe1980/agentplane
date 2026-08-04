@@ -647,6 +647,7 @@ const AXES: &[(&str, &[&str])] = &[
     ("concurrency", &["multi_thread"]),
     ("replan", &["Outcome::Replan", "Replanner"]),
     ("budget", &["Budget::"]),
+    ("group", &["cx.group", "EffectGroup"]),
 ];
 
 /// Pairs that share no machinery, with the reason each is exempt.
@@ -960,7 +961,7 @@ fn every_metric_explains_itself() {
 /// is a prompt injection reaching a mutating tool.
 #[test]
 fn every_trusted_effect_is_named() {
-    // Five, and each is the runtime's own machinery rather than the world's:
+    // Six, and each is the runtime's own machinery rather than the world's:
     //
     //   Clock           — the journaled instant, written by the runtime.
     //   Recorded        — a value the runtime recorded for itself; adds no trust.
@@ -972,7 +973,14 @@ fn every_trusted_effect_is_named() {
     //                     them back labeled rather than passing this through.
     //   WriteCaseState  — same store, and its output is a version number the
     //                     runtime itself assigned.
-    const KNOWN_TRUSTED: usize = 5;
+    //   RecallMemory    — the same distinction as ReadCaseState, and the one
+    //                     most worth stating: this effect's *output* is a
+    //                     selection — ids, versions, digests the runtime
+    //                     computed — and never the remembered content. The
+    //                     content is labelled from each item's declared
+    //                     provenance by `cx.recall`, which is the whole defence
+    //                     against a poisoned memory promoting itself.
+    const KNOWN_TRUSTED: usize = 6;
 
     // Anchored on the *declaration*, not on the token. `Trust::Trusted` also
     // appears in the doc comment that explains the rule and in the match arm

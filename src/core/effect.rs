@@ -349,6 +349,170 @@ pub trait Effect: Send + Sync {
     }
 }
 
+/// An [`Effect`] whose output type has been erased to [`Value`].
+///
+/// # Why erasure, when generics are right everywhere else
+///
+/// An [`EffectGroup`](crate::runtime::EffectGroup) has to hold the *concrete
+/// call that undoes* each member it performed — built from that member's actual
+/// output, at the moment it landed — and hold several of them, of different
+/// types, in one list. A generic cannot do that.
+///
+/// The alternative would be to journal the undo call and reconstruct it later
+/// from a name-to-constructor registry. That was rejected: a registry is a
+/// second place where an effect must be declared, it fails at *recovery* time
+/// rather than at compile time when someone forgets, and it makes an undo
+/// dispatchable by anyone who can write a name into a record.
+///
+/// Erasure keeps the undo a value the compiler checked, and — because
+/// `Box<dyn AnyEffect>` implements [`Effect`] — it travels the **same**
+/// dispatch path as any other effect: journaled, keyed, retried, gated by
+/// policy, metered against the budget. Nothing about being an undo makes it
+/// privileged.
+#[async_trait]
+pub trait AnyEffect: Send + Sync {
+    fn descriptor(&self) -> EffectDescriptor;
+    fn attach_erased(&mut self, provenance: &Provenance);
+    fn gen_ai_operation(&self) -> Option<&'static str>;
+    fn mutates(&self) -> bool;
+    fn recovery(&self) -> Recovery;
+    fn retry(&self) -> RetryPolicy;
+    fn max_sensitivity(&self) -> Sensitivity;
+    fn sink_arguments(&self) -> Option<&Value>;
+    fn protected_fields(&self) -> &[ProtectedField];
+    fn delegation_depth(&self) -> Option<usize>;
+    fn trust(&self) -> Trust;
+    fn output_sensitivity(&self) -> Sensitivity;
+    fn spend_erased(&self, output: &Value) -> Spend;
+    async fn perform_erased(&self) -> Result<Value, EffectError>;
+    async fn reconcile_erased(&self) -> Result<Reconciliation<Value>, EffectError>;
+}
+
+#[async_trait]
+impl<E> AnyEffect for E
+where
+    E: Effect,
+{
+    fn descriptor(&self) -> EffectDescriptor {
+        Effect::descriptor(self)
+    }
+    fn attach_erased(&mut self, provenance: &Provenance) {
+        Effect::attach(self, provenance);
+    }
+    fn gen_ai_operation(&self) -> Option<&'static str> {
+        Effect::gen_ai_operation(self)
+    }
+    fn mutates(&self) -> bool {
+        Effect::mutates(self)
+    }
+    fn recovery(&self) -> Recovery {
+        Effect::recovery(self)
+    }
+    fn retry(&self) -> RetryPolicy {
+        Effect::retry(self)
+    }
+    fn max_sensitivity(&self) -> Sensitivity {
+        Effect::max_sensitivity(self)
+    }
+    fn sink_arguments(&self) -> Option<&Value> {
+        Effect::sink_arguments(self)
+    }
+    fn protected_fields(&self) -> &[ProtectedField] {
+        Effect::protected_fields(self)
+    }
+    fn delegation_depth(&self) -> Option<usize> {
+        Effect::delegation_depth(self)
+    }
+    fn trust(&self) -> Trust {
+        Effect::trust(self)
+    }
+    fn output_sensitivity(&self) -> Sensitivity {
+        Effect::output_sensitivity(self)
+    }
+    /// Round-trips the output to ask the typed effect what it cost.
+    ///
+    /// A type that cannot be deserialized from its own serialization is already
+    /// broken for replay — `Effect::Output` requires the round-trip, and the
+    /// journal reconstructs every output that way. Charging zero here is the
+    /// same answer replay would reach, and the defect surfaces where it belongs.
+    fn spend_erased(&self, output: &Value) -> Spend {
+        serde_json::from_value::<E::Output>(output.clone())
+            .map(|o| Effect::spend(self, &o))
+            .unwrap_or_default()
+    }
+    async fn perform_erased(&self) -> Result<Value, EffectError> {
+        let out = Effect::perform(self).await?;
+        serde_json::to_value(out).map_err(EffectError::OutputShape)
+    }
+    async fn reconcile_erased(&self) -> Result<Reconciliation<Value>, EffectError> {
+        Ok(match Effect::reconcile(self).await? {
+            Reconciliation::Landed(o) => {
+                Reconciliation::Landed(serde_json::to_value(o).map_err(EffectError::OutputShape)?)
+            }
+            Reconciliation::DidNotHappen => Reconciliation::DidNotHappen,
+            Reconciliation::Inconclusive => Reconciliation::Inconclusive,
+        })
+    }
+}
+
+/// So an erased effect dispatches exactly like a typed one, with no second
+/// code path in the runtime that could drift from the first.
+///
+/// Written over `dyn AnyEffect + 'e` rather than the `'static` default: the
+/// executor re-enters itself through a commission, so this impl has to hold for
+/// whatever lifetime the surrounding future is inferred at, and pinning it to
+/// `'static` makes that proof fail for every specific one.
+#[async_trait]
+impl Effect for Box<dyn AnyEffect + '_> {
+    type Output = Value;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        (**self).descriptor()
+    }
+    fn attach(&mut self, provenance: &Provenance) {
+        (**self).attach_erased(provenance);
+    }
+    fn gen_ai_operation(&self) -> Option<&'static str> {
+        (**self).gen_ai_operation()
+    }
+    fn mutates(&self) -> bool {
+        (**self).mutates()
+    }
+    fn recovery(&self) -> Recovery {
+        (**self).recovery()
+    }
+    fn retry(&self) -> RetryPolicy {
+        (**self).retry()
+    }
+    fn max_sensitivity(&self) -> Sensitivity {
+        (**self).max_sensitivity()
+    }
+    fn sink_arguments(&self) -> Option<&Value> {
+        (**self).sink_arguments()
+    }
+    fn protected_fields(&self) -> &[ProtectedField] {
+        (**self).protected_fields()
+    }
+    fn delegation_depth(&self) -> Option<usize> {
+        (**self).delegation_depth()
+    }
+    fn trust(&self) -> Trust {
+        (**self).trust()
+    }
+    fn output_sensitivity(&self) -> Sensitivity {
+        (**self).output_sensitivity()
+    }
+    fn spend(&self, output: &Value) -> Spend {
+        (**self).spend_erased(output)
+    }
+    async fn perform(&self) -> Result<Value, EffectError> {
+        (**self).perform_erased().await
+    }
+    async fn reconcile(&self) -> Result<Reconciliation<Value>, EffectError> {
+        (**self).reconcile_erased().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,7 +542,10 @@ mod tests {
                 Ok(())
             }
         }
-        assert!(matches!(Mutating.recovery(), Recovery::RequiresOperator));
+        assert!(matches!(
+            Effect::recovery(&Mutating),
+            Recovery::RequiresOperator
+        ));
     }
 
     #[test]
@@ -397,6 +564,6 @@ mod tests {
                 Ok(())
             }
         }
-        assert!(matches!(ReadOnly.recovery(), Recovery::Retry));
+        assert!(matches!(Effect::recovery(&ReadOnly), Recovery::Retry));
     }
 }

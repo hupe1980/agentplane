@@ -317,46 +317,6 @@ pub const CATALOGUE: &[Instrument] = &[
     OPEN_TASKS,
 ];
 
-/// Emit a counter occurrence.
-pub(crate) fn count(i: Instrument, dim: &str) {
-    tracing::info!(
-        target: METRIC,
-        metric = i.name,
-        kind = i.kind.as_str(),
-        unit = i.unit,
-        value = 1_u64,
-        dim,
-    );
-}
-
-/// Emit several occurrences at once.
-///
-/// A sweep retires a whole batch of dead letters in one pass; emitting the batch
-/// as one event with `value = n` keeps the counter honest without pretending the
-/// sweep saw them one at a time.
-pub(crate) fn count_by(i: Instrument, dim: &str, by: u64) {
-    tracing::info!(
-        target: METRIC,
-        metric = i.name,
-        kind = i.kind.as_str(),
-        unit = i.unit,
-        value = by,
-        dim,
-    );
-}
-
-/// Emit a gauge reading.
-pub(crate) fn gauge(i: Instrument, value: u64) {
-    tracing::info!(
-        target: METRIC,
-        metric = i.name,
-        kind = i.kind.as_str(),
-        unit = i.unit,
-        value,
-        dim = "",
-    );
-}
-
 /// A point-in-time reading of everything a plane is holding.
 ///
 /// Assembled by querying the stores rather than by accumulating deltas — see the
@@ -375,22 +335,7 @@ pub struct Census {
     pub open_tasks: u64,
 }
 
-impl Census {
-    /// Emit every gauge in this reading.
-    ///
-    /// `oldest_case_age_secs` is skipped when no case is open, rather than
-    /// reported as zero: zero is a real reading meaning "a case was opened this
-    /// instant", and an empty plane is not that.
-    pub fn emit(&self) {
-        gauge(OPEN_CASES, self.open_cases);
-        if let Some(age) = self.oldest_case_age_secs {
-            gauge(OLDEST_CASE_AGE, age);
-        }
-        gauge(DUE_DEADLINES, self.due_deadlines);
-        gauge(PENDING_TIMERS, self.pending_timers);
-        gauge(OPEN_TASKS, self.open_tasks);
-    }
-}
+impl Census {}
 
 /// Seconds between two instants, floored at zero.
 ///
@@ -400,4 +345,105 @@ impl Census {
 #[must_use]
 pub fn age_secs(opened_at: Timestamp, now: Timestamp) -> u64 {
     u64::try_from(now.unix_timestamp() - opened_at.unix_timestamp()).unwrap_or(0)
+}
+
+// ── Tenant attribution ──────────────────────────────────────────────────────
+
+/// Whether and how a tenant appears on this plane's metrics.
+///
+/// Two separate problems, and a design that answers only one of them is worse
+/// than none.
+///
+/// **Cardinality.** An unbounded label is what makes a metrics backend fall
+/// over, and a tenant read from a *request* would be exactly that. This label is
+/// the plane's own tenant, so the number of streams is the number of planes an
+/// operator configured — a configuration fact, not a data fact. There is no
+/// input that can grow it.
+///
+/// **Disclosure.** A tenant name is frequently a customer name, and a metrics
+/// backend is usually the least protected system in a deployment: sampled into
+/// third-party services, on a dashboard nobody signs into, retained past every other
+/// record. So the default is to emit nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TenantLabel {
+    /// No tenant dimension at all. The default.
+    ///
+    /// A single-tenant plane learns nothing from the label, and a deployment
+    /// that has not decided where its metrics go has not decided that customer
+    /// names may travel there.
+    #[default]
+    Omitted,
+    /// The tenant's own name.
+    ///
+    /// Appropriate when the tenant id is not itself sensitive — an operator's own
+    /// environments, or ids that were opaque to begin with.
+    Name,
+}
+
+impl TenantLabel {
+    /// The label for this tenant under this policy.
+    #[must_use]
+    pub fn render(self, tenant: &crate::core::TenantId) -> String {
+        match self {
+            Self::Omitted => String::new(),
+            Self::Name => tenant.to_string(),
+        }
+    }
+}
+
+/// Emits this plane's metrics with its tenant attribution.
+///
+/// Threaded rather than global: two planes in one process serve different
+/// tenants, and a process-wide label would attribute one's counters to the
+/// other — silently, and in the direction that makes a busy tenant look quiet.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Meter {
+    tenant: String,
+}
+
+impl Meter {
+    pub(crate) fn new(policy: TenantLabel, tenant: &crate::core::TenantId) -> Self {
+        Self {
+            tenant: policy.render(tenant),
+        }
+    }
+
+    pub(crate) fn count(&self, i: Instrument, dim: &str) {
+        self.count_by(i, dim, 1);
+    }
+
+    pub(crate) fn count_by(&self, i: Instrument, dim: &str, by: u64) {
+        tracing::info!(
+            target: METRIC,
+            metric = i.name,
+            kind = i.kind.as_str(),
+            unit = i.unit,
+            value = by,
+            dim,
+            tenant = self.tenant,
+        );
+    }
+
+    pub(crate) fn gauge(&self, i: Instrument, value: u64) {
+        tracing::info!(
+            target: METRIC,
+            metric = i.name,
+            kind = i.kind.as_str(),
+            unit = i.unit,
+            value,
+            dim = "",
+            tenant = self.tenant,
+        );
+    }
+
+    /// Emit every gauge in a census.
+    pub(crate) fn census(&self, c: &Census) {
+        self.gauge(OPEN_CASES, c.open_cases);
+        if let Some(age) = c.oldest_case_age_secs {
+            self.gauge(OLDEST_CASE_AGE, age);
+        }
+        self.gauge(DUE_DEADLINES, c.due_deadlines);
+        self.gauge(PENDING_TIMERS, c.pending_timers);
+        self.gauge(OPEN_TASKS, c.open_tasks);
+    }
 }

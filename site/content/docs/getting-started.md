@@ -133,6 +133,7 @@ agentplane = { version = "0.2", features = ["postgres", "http", "mcp", "provider
 | `mcp` | MCP tool transport |
 | `a2a` | A2A peer transport — calling other agents |
 | `a2a-server` | being called: the public Agent Card and the A2A 1.0 JSON-RPC methods |
+| `push` | A2A push notifications: durable webhook registrations and SSRF-guarded delivery |
 | `providers` | Anthropic and OpenAI model drivers |
 | `media` | governed remote-media fetch: exact grants, SSRF-safe pinned DNS, redirects, limits, validation, digest and retention |
 | `cedar` | Cedar as the authorization engine |

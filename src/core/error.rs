@@ -218,6 +218,21 @@ pub enum EffectError {
     #[error("effect output did not match its declared type: {0}")]
     OutputShape(#[from] serde_json::Error),
 
+    /// Every permitted attempt failed, and this is the last one's verdict.
+    ///
+    /// Carries the **disposition** rather than flattening it. A driver that
+    /// said [`Rejected`](Self::Rejected) — refused before anything happened —
+    /// must not be reported upward as undecidable merely because the runtime
+    /// stopped retrying. Anything deciding whether it is safe to unwind would
+    /// then refuse to, for a call that provably did nothing; and the failure
+    /// that most needs an operator would be indistinguishable from the one that
+    /// needs nobody.
+    #[error("{detail}")]
+    Final {
+        detail: String,
+        disposition: Disposition,
+    },
+
     #[error("{0}")]
     Other(String),
 }
@@ -240,7 +255,7 @@ impl EffectError {
     #[must_use]
     pub fn disposition(&self) -> Disposition {
         match self {
-            Self::Metered { disposition, .. } => *disposition,
+            Self::Metered { disposition, .. } | Self::Final { disposition, .. } => *disposition,
             Self::Unavailable { .. } | Self::Rejected(_) => Disposition::DidNotHappen,
             Self::OutputShape(_) | Self::Performed(_) => Disposition::Landed,
             // `Other` shares the in-doubt arm deliberately: an error that does
@@ -343,6 +358,32 @@ pub enum StepError {
         resource: String,
         reason: String,
     },
+
+    /// A member did not fit the group it was added to.
+    ///
+    /// A footprint violation, a mutating effect declared as a read, a nested
+    /// group, or an empty footprint. Every one of these is caught **before**
+    /// the effect runs, which is the only time catching it is free.
+    #[error("effect group '{group}': {detail}")]
+    GroupFootprint { group: String, detail: String },
+
+    /// A group was taken back whole, and nothing it did is standing.
+    ///
+    /// Not a quarantine and not a silent failure: every reversible member was
+    /// reversed, no deferred member ran, and `what` says which condition
+    /// stopped it. A caller may handle this and carry on, which is the point of
+    /// grouping in the first place.
+    #[error("effect group aborted and fully reversed: {what}")]
+    GroupAborted { what: String },
+
+    /// A group could be neither committed nor taken back.
+    ///
+    /// A reversal failed, or a member is in doubt. The run is quarantined,
+    /// because a partially unwound group is a state nobody declared and no
+    /// later code can reason about. This is the honest report of the situation
+    /// that other systems surface as a success with a warning.
+    #[error("effect group '{group}' could not be settled: {detail} — run quarantined")]
+    GroupUnsettled { group: String, detail: String },
 
     /// Strict replay reached the end of history and the code asked for another
     /// effect. The recorded run did less than this code does — divergence that

@@ -174,7 +174,7 @@ impl Runtime {
             .await
             .map_err(RuntimeError::from_store)?;
 
-        metrics::count(metrics::BATCH_ITEMS, result.as_str());
+        self.meter().count(metrics::BATCH_ITEMS, result.as_str());
         Ok(result)
     }
 

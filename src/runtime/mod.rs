@@ -6,6 +6,7 @@ mod ctx;
 mod declarative;
 pub mod effects;
 mod executor;
+pub mod group;
 pub mod metrics;
 mod sweeper;
 pub mod telemetry;
@@ -15,4 +16,5 @@ pub use ctx::{Mode, StepCtx};
 #[cfg(feature = "manifest")]
 pub use executor::Agent;
 pub use executor::{LEASE_TTL, MIN_LEASE_TTL, RunOutcome, RunStatus, Runtime, RuntimeBuilder};
+pub use group::{EffectGroup, GroupOutcome, Invariant};
 pub use sweeper::SweepReport;

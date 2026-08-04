@@ -122,6 +122,9 @@ witness-http = ["dep:reqwest"]
 a2a = ["dep:reqwest"]
 # Serve this plane as an A2A agent: the public card plus the JSON-RPC methods.
 a2a-server = ["http", "manifest", "dep:async-stream"]
+# Webhook delivery for A2A push notifications: a durable config store plus
+# SSRF-guarded outbound POSTs.
+push = ["dep:reqwest"]
 # Ed25519 signing for journal records. The *seam* — `Signer`, `Verifier`, the
 # attestation on every record, the verifying read path — is always available;
 # this is one concrete implementation, for deployments that do not already have
@@ -221,7 +224,15 @@ path              = "src/bin/agentplane.rs"
 required-features = ["cli"]
 
 [[example]]
+name              = "openai_live"
+required-features = ["redb", "providers"]
+
+[[example]]
 name              = "durable_pipeline"
+required-features = ["redb"]
+
+[[example]]
+name              = "effect_group"
 required-features = ["redb"]
 
 [[example]]

@@ -209,6 +209,10 @@ pub struct Runtime {
     /// How long a run's lease lasts, and how long a crashed owner's runs stay
     /// unclaimable.
     lease_ttl: Duration,
+    /// Where this plane's agents remember things, when a deployment wires one.
+    memories: Option<Arc<dyn crate::memory::MemoryStore>>,
+    /// How this plane attributes its metrics.
+    meter: super::metrics::Meter,
     /// Durable per-tenant ceilings, when a deployment wires them.
     quotas: Option<Arc<dyn crate::quota::QuotaStore>>,
     quota: crate::quota::TenantQuota,
@@ -239,6 +243,8 @@ impl Runtime {
             skills: Vec::new(),
             owner: None,
             lease_ttl: LEASE_TTL,
+            memories: None,
+            metric_tenant: super::metrics::TenantLabel::default(),
             quotas: None,
             quota: crate::quota::TenantQuota::default(),
             budget: Budget::unlimited(),
@@ -409,6 +415,10 @@ impl Runtime {
 
     /// The journal, under the name the batch driver reads it by.
     #[must_use]
+    pub(crate) fn meter(&self) -> &super::metrics::Meter {
+        &self.meter
+    }
+
     pub fn journal(&self) -> &Arc<dyn JournalStore> {
         &self.store
     }
@@ -858,7 +868,8 @@ impl Runtime {
             resource = %capability,
             %reason,
         );
-        metrics::count(metrics::POLICY_DENIALS, crate::core::ACTION_ADMIT);
+        self.meter
+            .count(metrics::POLICY_DENIALS, crate::core::ACTION_ADMIT);
         Err(RuntimeError::PolicyDenied(
             crate::core::PolicyError::Denied {
                 principal: principal.to_owned(),
@@ -1580,7 +1591,12 @@ impl Runtime {
             self.freeze(journal.run, journal.epoch, &next, journal.stamp)
                 .await?;
         }
-        announce_replan(journal.run, &next, next.reason.as_deref().unwrap_or(""));
+        announce_replan(
+            &self.meter,
+            journal.run,
+            &next,
+            next.reason.as_deref().unwrap_or(""),
+        );
         Ok(Ok(next))
     }
 
@@ -1926,7 +1942,7 @@ impl Runtime {
             // `StepCompensated` would report one compensation as two.
             if result.is_ok() {
                 tracing::info!(target: telemetry::COMPENSATED, run = %cx.run, %step);
-                metrics::count(metrics::COMPENSATIONS, "done");
+                self.meter.count(metrics::COMPENSATIONS, "done");
             }
             if cx.writing && !already_undone.contains(&step) {
                 self.store
@@ -1955,7 +1971,7 @@ impl Runtime {
                     %step,
                     detail = %outcome,
                 );
-                metrics::count(metrics::COMPENSATIONS, "failed");
+                self.meter.count(metrics::COMPENSATIONS, "failed");
                 // Not a problem more compensation solves. Unwinding further
                 // would undo steps *before* one that is now in an unknown
                 // state, which is strictly worse than stopping and saying so.
@@ -2037,6 +2053,8 @@ impl Runtime {
                 case: cx.case.clone(),
                 timers: self.timers.clone(),
                 blobs: self.blobs.clone(),
+                memories: self.memories.clone(),
+                meter: self.meter.clone(),
                 #[cfg(feature = "keyring")]
                 keyring: self.keyring.clone(),
                 tenant: self.tenant.clone(),
@@ -2242,6 +2260,8 @@ impl Runtime {
                 case,
                 timers: self.timers.clone(),
                 blobs: self.blobs.clone(),
+                memories: self.memories.clone(),
+                meter: self.meter.clone(),
                 #[cfg(feature = "keyring")]
                 keyring: self.keyring.clone(),
                 tenant: self.tenant.clone(),
@@ -2256,10 +2276,11 @@ impl Runtime {
             },
         );
         let result = skill.invoke(&mut cx, step_input).await;
+        let result = settle_abandoned_group(&mut cx, result).await;
         let cursor = cx.into_cursor();
         ledger.lock().expect("budget mutex").record_step();
 
-        let (status, output) = classify(result);
+        let (status, output) = classify(&self.meter, result);
         tracing::Span::current().record(telemetry::OUTCOME, status.as_str());
         if let RunStatus::Quarantined(why) = &status {
             tracing::error!(target: telemetry::QUARANTINED, %step, reason = %why);
@@ -2366,7 +2387,7 @@ impl Runtime {
         // mean a tenant waiting on a hundred approvals could start nothing.
         self.settle_quota(run, spend).await;
 
-        announce(run, &status);
+        announce(&self.meter, run, &status);
 
         Ok(RunOutcome {
             run_id: run,
@@ -2419,7 +2440,7 @@ fn completion(ir: &PlanIR, done: &BTreeSet<StepId>) -> RunStatus {
 }
 
 /// Say that a run changed its plan, and what it changed from.
-fn announce_replan(run: RunId, next: &PlanIR, reason: &str) {
+fn announce_replan(meter: &super::metrics::Meter, run: RunId, next: &PlanIR, reason: &str) {
     tracing::info!(
         target: telemetry::REPLANNED,
         %run,
@@ -2427,19 +2448,19 @@ fn announce_replan(run: RunId, next: &PlanIR, reason: &str) {
         version = next.version,
         %reason,
     );
-    metrics::count(metrics::REPLANS, "");
+    meter.count(metrics::REPLANS, "");
 }
 
 /// Say how a run ended, on the run span and — for the loud ones — as an event.
-fn announce(run: RunId, status: &RunStatus) {
+fn announce(meter: &super::metrics::Meter, run: RunId, status: &RunStatus) {
     // Counted here and nowhere else. A step that quarantines also fails its run,
     // so counting at both levels would report one incident as two — and the
     // terminal status is the fact an operator is counting.
-    metrics::count(metrics::RUNS, status.as_str());
+    meter.count(metrics::RUNS, status.as_str());
     match status {
         RunStatus::Quarantined(why) => {
             tracing::error!(target: telemetry::QUARANTINED, %run, reason = %why);
-            metrics::count(metrics::QUARANTINES, "");
+            meter.count(metrics::QUARANTINES, "");
         }
         RunStatus::Exhausted(limit) => {
             tracing::warn!(target: telemetry::BUDGET_REFUSED, %run, %limit);
@@ -2837,7 +2858,80 @@ fn resolve_arg(
 /// human has to look before anything else happens. Folding them into `Failed`
 /// would put them in the same bucket as "the invoice was rejected", and they
 /// would be retried like one.
+/// Settle a group the skill left open, because `Drop` cannot.
+///
+/// A skill that fails with `?` never reaches `commit` or `abort`, so the handle
+/// is dropped with members standing. Reversing them is async and `Drop` is not,
+/// which is why the group lives on the context and the executor finishes what
+/// the handle abandoned — the same relationship the executor already has with a
+/// step's compensation.
+///
+/// Three situations, and they are not the same:
+///
+/// * **suspended** — the step has not ended. Its frame is persisted and it will
+///   re-run from the top, rebuilding the group from the journal as it replays
+///   the members. Reversing here would undo a run that is merely waiting.
+/// * **failed** — abort, unless the failure leaves the world in doubt. Doubt is
+///   the one condition under which nothing may be reversed.
+/// * **succeeded with a group still open** — an author bug, and the safe
+///   reading is that the group was never meant to take. It is reversed and the
+///   step fails loudly, because a group that commits by being forgotten is
+///   worse than one that does not commit at all.
+async fn settle_abandoned_group(
+    cx: &mut StepCtx<'_>,
+    result: Result<Outcome, crate::core::SkillError>,
+) -> Result<Outcome, crate::core::SkillError> {
+    use crate::core::{SkillError, StepError};
+
+    let Some(name) = cx.open_group().map(|g| g.name.clone()) else {
+        return result;
+    };
+    if matches!(&result, Err(SkillError::Step(StepError::Suspended(_)))) {
+        return result;
+    }
+
+    // Doubt travels no further. Reversing around a call that may or may not
+    // have happened is a coin flip with the outside world's money on it.
+    let doubt = match &result {
+        Err(SkillError::Step(e)) => crate::runtime::group::in_doubt(e),
+        _ => false,
+    };
+    if doubt {
+        let detail = match &result {
+            Err(e) => e.to_string(),
+            Ok(_) => String::new(),
+        };
+        let settled = cx
+            .settle_open_group(crate::runtime::GroupOutcome::Quarantined, Some(&detail))
+            .await;
+        return match settled {
+            Ok(()) => result,
+            Err(e) => Err(SkillError::Step(e)),
+        };
+    }
+
+    match cx
+        .abort_open_group("the step ended without settling the group")
+        .await
+    {
+        // The abort itself could not be completed. That outranks whatever the
+        // step was reporting: a partly unwound group is the more dangerous fact.
+        Err(e) => Err(SkillError::Step(e)),
+        Ok(()) => match result {
+            Err(e) => Err(e),
+            Ok(_) => Err(SkillError::Step(StepError::GroupAborted {
+                what: format!(
+                    "step returned successfully with group '{name}' still open — it was \
+                     reversed, because a group that commits by being forgotten is worse \
+                     than one that does not commit at all"
+                ),
+            })),
+        },
+    }
+}
+
 fn classify(
+    meter: &super::metrics::Meter,
     result: Result<Outcome, crate::core::SkillError>,
 ) -> (RunStatus, Option<Tainted<Value>>) {
     use crate::core::{SkillError, StepError};
@@ -2880,15 +2974,15 @@ fn classify(
                         target: telemetry::NONDETERMINISM,
                         %seq, %expected, %actual,
                     );
-                    metrics::count(metrics::DIVERGENCES, "");
+                    meter.count(metrics::DIVERGENCES, "");
                 }
                 SkillError::Step(StepError::ReplayOverrun { actual }) => {
                     tracing::error!(target: telemetry::NONDETERMINISM, %actual, overrun = true);
-                    metrics::count(metrics::DIVERGENCES, "");
+                    meter.count(metrics::DIVERGENCES, "");
                 }
                 SkillError::Step(StepError::Undecidable { key, detail, .. }) => {
                     tracing::error!(target: telemetry::UNDECIDABLE, %key, %detail);
-                    metrics::count(metrics::UNDECIDABLE, "");
+                    meter.count(metrics::UNDECIDABLE, "");
                 }
                 _ => {}
             }
@@ -2899,6 +2993,7 @@ fn classify(
                     StepError::NonDeterminism { .. }
                         | StepError::ReplayOverrun { .. }
                         | StepError::Undecidable { .. }
+                        | StepError::GroupUnsettled { .. }
                 )
             );
             if untrustworthy {
@@ -3097,6 +3192,8 @@ pub struct RuntimeBuilder {
     tenant: crate::core::TenantId,
     owner: Option<String>,
     lease_ttl: Duration,
+    memories: Option<Arc<dyn crate::memory::MemoryStore>>,
+    metric_tenant: super::metrics::TenantLabel,
     quotas: Option<Arc<dyn crate::quota::QuotaStore>>,
     quota: crate::quota::TenantQuota,
     budget: Budget,
@@ -3190,6 +3287,36 @@ impl RuntimeBuilder {
              it is still working"
         );
         self.lease_ttl = ttl;
+        self
+    }
+
+    /// Put this plane's tenant on its metrics.
+    ///
+    /// Off by default. Read [`metrics::TenantLabel`](super::metrics::TenantLabel)
+    /// before turning it on: a tenant name is often a customer name, and a
+    /// metrics backend is usually the least protected system in a deployment.
+    ///
+    /// Cardinality is bounded by construction — the label is *this plane's*
+    /// tenant, so the number of streams is the number of planes configured, and
+    /// no request can grow it.
+    #[must_use]
+    pub const fn metric_tenant(mut self, label: super::metrics::TenantLabel) -> Self {
+        self.metric_tenant = label;
+        self
+    }
+
+    /// Give this plane's agents a memory.
+    ///
+    /// Optional, and absent by default: an agent with no memory is a normal
+    /// agent, and one that quietly gained persistent state because a store was
+    /// wired for something else would be a surprise.
+    ///
+    /// Read [`crate::memory`] before wiring one. Writable memory is delayed
+    /// code: what is written today is read into a context window tomorrow, where
+    /// a model treats it as established fact.
+    #[must_use]
+    pub fn memory(mut self, memories: Arc<dyn crate::memory::MemoryStore>) -> Self {
+        self.memories = Some(memories);
         self
     }
 
@@ -3590,9 +3717,11 @@ impl RuntimeBuilder {
             by_capability,
             #[cfg(feature = "manifest")]
             published_by,
+            meter: super::metrics::Meter::new(self.metric_tenant, &self.tenant),
             tenant: self.tenant,
             owner: self.owner.unwrap_or_else(default_owner),
             lease_ttl: self.lease_ttl,
+            memories: self.memories,
             quotas: self.quotas,
             quota: self.quota,
             budget: self.budget,
@@ -3760,7 +3889,8 @@ impl Runtime {
             // for it. That is the failure which otherwise presents as a process
             // silently never completing.
             tracing::error!(target: telemetry::DEAD_LETTERED, count = retired, %cutoff);
-            metrics::count_by(metrics::DEAD_LETTERS, "", retired as u64);
+            self.meter
+                .count_by(metrics::DEAD_LETTERS, "", retired as u64);
         }
         Ok(retired)
     }

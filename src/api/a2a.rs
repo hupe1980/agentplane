@@ -113,10 +113,18 @@ pub mod action {
     pub const TASK_READ: &str = "a2a:task.read";
     pub const TASK_CANCEL: &str = "a2a:task.cancel";
     pub const CARD_EXTENDED: &str = "a2a:card.extended";
+    /// Registering, reading or removing a webhook for a task.
+    pub const TASK_PUSH: &str = "a2a:task.push";
 
     /// Every action this surface can ask about, so a deployment can enumerate
     /// what it must write rules for.
-    pub const ALL: &[&str] = &[MESSAGE_SEND, TASK_READ, TASK_CANCEL, CARD_EXTENDED];
+    pub const ALL: &[&str] = &[
+        MESSAGE_SEND,
+        TASK_READ,
+        TASK_CANCEL,
+        CARD_EXTENDED,
+        TASK_PUSH,
+    ];
 }
 
 /// The `A2A-Version` service parameter.
@@ -289,6 +297,13 @@ struct CommonParams {
     id: Option<String>,
     #[serde(default)]
     configuration: Option<SendConfiguration>,
+    /// `TaskPushNotificationConfig` fields, flattened as the RPC sends them.
+    #[serde(default, rename = "taskId")]
+    push_task: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// A JSON-RPC error, carrying the HTTP status it should be served with.
@@ -344,6 +359,8 @@ pub struct A2aServer {
     extended: ExtendedAgentCard,
     /// The card's advertised skill ids — what a caller may ask for.
     skills: Vec<String>,
+    /// Webhook storage and delivery, when this deployment wires them.
+    push: Option<(Arc<dyn crate::push::PushStore>, crate::push::PushSender)>,
 }
 
 impl std::fmt::Debug for A2aServer {
@@ -412,6 +429,7 @@ impl A2aServer {
             card,
             extended,
             skills,
+            push: None,
         })
     }
 
@@ -438,6 +456,68 @@ impl A2aServer {
         self.card.sign(signer)?;
         self.extended.public.sign(signer)?;
         Ok(self)
+    }
+
+    /// Deliver push notifications for tasks peers register webhooks against.
+    ///
+    /// Without this the four `…PushNotificationConfig` methods refuse with the
+    /// spec's code and the card advertises `pushNotifications: false` — so a
+    /// deployment that has not made the egress decision is not quietly making
+    /// outbound requests to addresses its callers chose.
+    #[must_use]
+    pub fn with_push(
+        mut self,
+        store: Arc<dyn crate::push::PushStore>,
+        sender: crate::push::PushSender,
+    ) -> Self {
+        self.push = Some((store, sender));
+        self
+    }
+
+    /// Tell every webhook registered for this task what state it reached.
+    ///
+    /// Called when a task concludes. Best-effort by construction: a webhook is
+    /// somebody else's endpoint, and its being down is ordinary rather than a
+    /// failure of the run that finished. Outcomes are logged, not raised.
+    ///
+    /// The payload is a `StreamResponse` carrying the task's **state** and not
+    /// its output — see [`crate::push`] for why an allowlist plus a body is an
+    /// exfiltration channel.
+    pub async fn notify(&self, task: RunId) {
+        let Some((store, sender)) = self.push.as_ref() else {
+            return;
+        };
+        let Ok(configs) = store.list(task).await else {
+            tracing::warn!(%task, "could not read this task's webhooks");
+            return;
+        };
+        if configs.is_empty() {
+            return;
+        }
+        let Some((current, case, _)) = super::a2a_stream::current(&self.runtime, task).await else {
+            return;
+        };
+        let payload = json!({
+            "statusUpdate": {
+                "taskId": task.to_string(),
+                "contextId": case.unwrap_or_else(|| task.to_string()),
+                "status": { "state": current.status.state },
+            }
+        });
+
+        for config in &configs {
+            match sender.deliver(config, &payload).await {
+                Ok(crate::push::Delivered::Accepted) => {}
+                Ok(other) => tracing::info!(
+                    %task, config = %config.id, outcome = ?other,
+                    "a webhook did not accept a notification"
+                ),
+                Err(why) => tracing::warn!(
+                    %task, config = %config.id, %why,
+                    "a webhook is registered but may no longer be delivered to"
+                ),
+            }
+        }
     }
 
     /// The router.
@@ -717,13 +797,10 @@ async fn dispatch(
             code::UNSUPPORTED_OPERATION,
             "this agent does not implement ListTasks",
         )),
-        method::CREATE_PUSH | method::GET_PUSH | method::LIST_PUSH | method::DELETE_PUSH => {
-            Err(RpcError::new(
-                code::PUSH_NOT_SUPPORTED,
-                "this agent does not implement push notifications; its card \
-                 advertises pushNotifications as false",
-            ))
-        }
+        method::CREATE_PUSH => push_create(server, headers, params).await,
+        method::GET_PUSH => push_get(server, headers, &params).await,
+        method::LIST_PUSH => push_list(server, headers, &params).await,
+        method::DELETE_PUSH => push_delete(server, headers, &params).await,
         other => Err(RpcError::new(
             code::METHOD_NOT_FOUND,
             format!("no such A2A method: {other}"),
@@ -807,6 +884,12 @@ async fn send_message(
         }
         Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
     };
+
+    // The run is over by the time a blocking send returns, so any webhook
+    // registered against it is told now. A caller that both blocks *and*
+    // registers gets the answer twice, which is its choice — and cheaper than a
+    // notification that never arrives because it registered a moment too late.
+    server.notify(outcome.run_id).await;
 
     Ok(json!({
         "task": task_of(
@@ -1016,4 +1099,156 @@ pub(super) fn task_of(run: RunId, state: TaskState, detail: &str, case: Option<S
         },
         metadata: None,
     }
+}
+
+// ── Push notification configuration ─────────────────────────────────────────
+//
+// Every one of these authorizes against the **task**, not against the method.
+// A webhook registration is permission to be told about somebody's work, so the
+// question is "may this caller touch this task", and a caller that may not read
+// a task must not be able to attach a URL to it either.
+
+/// The push machinery, or the spec's refusal when this build has none.
+fn push_parts(
+    server: &A2aServer,
+) -> Result<(&Arc<dyn crate::push::PushStore>, &crate::push::PushSender), RpcError> {
+    server.push.as_ref().map(|p| (&p.0, &p.1)).ok_or_else(|| {
+        RpcError::new(
+            code::PUSH_NOT_SUPPORTED,
+            "this agent does not implement push notifications; its card \
+             advertises pushNotifications as false",
+        )
+    })
+}
+
+/// The task a push request names, refusing one that does not exist.
+async fn push_task(server: &A2aServer, raw: Option<&str>) -> Result<RunId, RpcError> {
+    let Some(raw) = raw else {
+        return Err(RpcError::new(code::INVALID_PARAMS, "`taskId` is required"));
+    };
+    let id = RunId::parse(raw)
+        .map_err(|_| RpcError::new(code::TASK_NOT_FOUND, format!("no such task: {raw}")))?;
+    // Checked against the journal rather than taken on faith: registering a
+    // webhook for a task that does not exist would let a caller park a
+    // destination against an id somebody else is about to be issued.
+    let records = server
+        .runtime
+        .journal()
+        .read(id, 1)
+        .await
+        .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the journal could not be read"))?;
+    if records.is_empty() {
+        return Err(RpcError::new(
+            code::TASK_NOT_FOUND,
+            format!("no such task: {id}"),
+        ));
+    }
+    Ok(id)
+}
+
+async fn push_create(
+    server: &A2aServer,
+    headers: &HeaderMap,
+    params: CommonParams,
+) -> Result<Value, RpcError> {
+    let (store, _) = push_parts(server)?;
+    let task = push_task(server, params.push_task.as_deref()).await?;
+    server
+        .gate(headers, action::TASK_PUSH, &task.to_string())
+        .await?;
+
+    let Some(url) = params.url else {
+        return Err(RpcError::new(code::INVALID_PARAMS, "`url` is required"));
+    };
+
+    // Checked before anything is stored, so a caller learns now that its
+    // webhook will never be called — rather than waiting for a notification
+    // that silently never comes.
+    let (_, sender) = push_parts(server)?;
+    sender
+        .policy()
+        .check(&url)
+        .map_err(|e| RpcError::new(code::INVALID_PARAMS, e.to_string()))?;
+
+    let config = crate::push::PushConfig {
+        id: params.id.unwrap_or_else(|| format!("push-{task}")),
+        task,
+        url,
+        token: params.token.map(crate::core::Secret::new),
+    };
+    store
+        .put(&config)
+        .await
+        .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))?;
+    Ok(config.redacted())
+}
+
+async fn push_get(
+    server: &A2aServer,
+    headers: &HeaderMap,
+    params: &CommonParams,
+) -> Result<Value, RpcError> {
+    let (store, _) = push_parts(server)?;
+    let task = push_task(server, params.push_task.as_deref()).await?;
+    server
+        .gate(headers, action::TASK_PUSH, &task.to_string())
+        .await?;
+
+    let id = params
+        .id
+        .as_deref()
+        .ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "`id` is required"))?;
+    store
+        .get(task, id)
+        .await
+        .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))?
+        .map(|c| c.redacted())
+        .ok_or_else(|| {
+            RpcError::new(
+                code::TASK_NOT_FOUND,
+                format!("no push configuration '{id}' for task {task}"),
+            )
+        })
+}
+
+async fn push_list(
+    server: &A2aServer,
+    headers: &HeaderMap,
+    params: &CommonParams,
+) -> Result<Value, RpcError> {
+    let (store, _) = push_parts(server)?;
+    let task = push_task(server, params.push_task.as_deref()).await?;
+    server
+        .gate(headers, action::TASK_PUSH, &task.to_string())
+        .await?;
+
+    let configs = store
+        .list(task)
+        .await
+        .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))?;
+    Ok(json!({
+        "configs": configs.iter().map(crate::push::PushConfig::redacted).collect::<Vec<_>>()
+    }))
+}
+
+async fn push_delete(
+    server: &A2aServer,
+    headers: &HeaderMap,
+    params: &CommonParams,
+) -> Result<Value, RpcError> {
+    let (store, _) = push_parts(server)?;
+    let task = push_task(server, params.push_task.as_deref()).await?;
+    server
+        .gate(headers, action::TASK_PUSH, &task.to_string())
+        .await?;
+
+    let id = params
+        .id
+        .as_deref()
+        .ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "`id` is required"))?;
+    store
+        .delete(task, id)
+        .await
+        .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))?;
+    Ok(json!({}))
 }

@@ -289,6 +289,34 @@ pub enum RecordKind {
         resource: String,
     },
 
+    /// A set of effects that must take together was opened.
+    ///
+    /// Brackets the members the way `StepStarted` brackets a step, and it earns
+    /// its place on the crash path: a run that died mid-group otherwise shows a
+    /// handful of effects with nothing saying they were one unit. An opened
+    /// group with no [`GroupSettled`](Self::GroupSettled) beside it is the query
+    /// an operator runs to find work that was neither taken nor taken back.
+    GroupOpened {
+        group: String,
+        /// What the group declared it may touch. Every member is checked
+        /// against this, so the record is the footprint that was enforced
+        /// rather than one that was described.
+        resources: Vec<String>,
+    },
+
+    /// How a group ended.
+    ///
+    /// `detail` carries the failing invariant, the reversal that would not
+    /// come back, or the reason an abort was asked for — the sentence whoever
+    /// picks up the escalation needs, rather than a status they have to
+    /// reconstruct the meaning of.
+    GroupSettled {
+        group: String,
+        outcome: crate::runtime::GroupOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
     /// A completed step was undone because a later one failed.
     ///
     /// The declaration is on the record as well as the outcome, because "this
@@ -377,6 +405,8 @@ impl RecordKind {
             Self::EffectFailed { .. } => "EffectFailed",
             Self::EffectReconciled { .. } => "EffectReconciled",
             Self::StepCompensated { .. } => "StepCompensated",
+            Self::GroupOpened { .. } => "GroupOpened",
+            Self::GroupSettled { .. } => "GroupSettled",
             Self::BudgetRefused { .. } => "BudgetRefused",
             Self::IdentityBound { .. } => "IdentityBound",
             Self::PolicyDenied { .. } => "PolicyDenied",
