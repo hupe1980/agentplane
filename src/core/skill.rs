@@ -71,18 +71,19 @@ impl SkillDescriptor {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Outcome {
+    // `Delegate` used to sit here. It was removed rather than left declared,
+    // because no build ever provided it: returning it produced a run failure
+    // saying the feature was unavailable, which is a public API whose only
+    // reachable outcome is an error.
+    //
+    // Handing work to another agent is an **effect** — see the `blog_room`
+    // example. That is not a workaround but the better shape: an effect is
+    // journaled under a key, so a replay reads the sub-agent's answer back
+    // instead of commissioning the work a second time. An outcome variant
+    // would have reached another runtime outside the effect protocol, which is
+    // exactly the bypass the protocol exists to prevent.
     /// Finished, with a labeled result.
     Done(Tainted<Value>),
-    /// Hand off to another agent or a remote peer.
-    ///
-    /// Requires a `collaborative` topology with a declared justification:
-    /// collaboration buys parallelism at the price of the single largest
-    /// measured failure category in multi-agent systems, so it is never a
-    /// default.
-    Delegate {
-        target: String,
-        input: Tainted<Value>,
-    },
     /// Recoverable fault; ask the planner for a new plan version.
     Replan { reason: String },
     /// Terminal failure.

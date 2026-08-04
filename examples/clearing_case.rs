@@ -246,6 +246,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Day 1: the acknowledgement arrives, knowing only the document ──────
     let ack = InboundEvent::new(
+        // Who sent it. With the id, this is the dedup identity — an id is
+        // unique only within one counterparty.
+        "urn:clearing:counterparty-a",
         "MSG-88219",
         "acknowledgement.received",
         json!({ "status": "rejected", "code": "E_0624", "detail": "meter unknown" }),
@@ -381,6 +384,7 @@ async fn finish_and_close(
 async fn demonstrate_early_arrival(rt: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
     let early_keys = [CorrelationKey::new("document", "DOC-9999")];
     let early = InboundEvent::new(
+        "urn:clearing:counterparty-a",
         "MSG-EARLY",
         "acknowledgement.received",
         json!({ "status": "very prompt" }),

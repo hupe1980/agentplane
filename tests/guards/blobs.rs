@@ -240,9 +240,19 @@ async fn erasing_a_case_leaves_other_cases_alone() {
     cases.link_blob(mine, b, ts(12)).await.expect("link");
     cases.link_blob(theirs, other, ts(11)).await.expect("link");
 
-    let n = erase_case(&blobs, cases.as_ref(), mine, ts(500), "art-17 request")
-        .await
-        .expect("erase");
+    let n = erase_case(
+        &blobs,
+        cases.as_ref(),
+        #[cfg(feature = "keyring")]
+        None,
+        #[cfg(feature = "keyring")]
+        &agentplane::core::TenantId::default(),
+        mine,
+        ts(500),
+        "art-17 request",
+    )
+    .await
+    .expect("erase");
     assert_eq!(n, 2, "both of this case's blobs should have been expired");
 
     for (label, digest) in [("a", a), ("b", b)] {
@@ -289,5 +299,422 @@ async fn one_case_storing_the_same_bytes_twice_has_one_blob() {
         cases.blobs_of(case).await.expect("read").len(),
         1,
         "the same content linked twice was counted as two artifacts"
+    );
+}
+
+// ── Tenancy ─────────────────────────────────────────────────────────────────
+//
+// Every test below hands the attacker a **valid** identifier belonging to the
+// other tenant, because that is the realistic leak: not a guessed id, but a real
+// one arriving through a path that never checked whose it was. Each also carries
+// a positive half — the owning tenant must still reach its own — since a lookup
+// broken for everybody passes every negative assertion here.
+
+/// Two producers using the same id are two events, not one.
+///
+/// `CloudEvents` defines uniqueness as `(source, id)`, and the reason is exactly
+/// this: an id is unique *within* a producer, so deduplicating on it alone makes
+/// two producers swallow each other's messages. The collision is silent, because
+/// the second message looks precisely like a retry of the first — the failure
+/// mode is a message that was never processed and never reported missing.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn two_producers_sharing_an_id_are_not_one_event() {
+    use agentplane::case::EventStore;
+    use agentplane::core::{CorrelationKey, InboundEvent};
+    use agentplane::store::RedbStore;
+
+    let store = RedbStore::open_in_memory().expect("store");
+    let from = |source: &str| InboundEvent {
+        source: source.to_owned(),
+        // The same id from both — ordinary, since each producer numbers its own.
+        id: "42".to_owned(),
+        kind: "ack.received".to_owned(),
+        correlation: vec![CorrelationKey::new("document", "DOC-1")],
+        payload: serde_json::json!({"from": source}),
+    };
+
+    assert!(
+        store.buffer(&from("erp"), ts(1)).await.expect("first"),
+        "the first event was not buffered"
+    );
+    assert!(
+        store.buffer(&from("crm"), ts(2)).await.expect("second"),
+        "a second producer's message with the same id was swallowed as a \
+         duplicate — it will never be processed and nothing will report it"
+    );
+
+    // And a genuine retry *is* still deduplicated, so this did not simply
+    // disable the dedup it is checking.
+    assert!(
+        !store.buffer(&from("erp"), ts(3)).await.expect("retry"),
+        "the same producer's retry was accepted twice, so deduplication is off \
+         rather than correctly scoped"
+    );
+}
+
+/// A store handle for one tenant cannot read another's journal.
+///
+/// The base case the rest of tenancy rests on. The attacker holds a **valid**
+/// run id belonging to the other tenant — which is the realistic leak, since ids
+/// travel in URLs, logs and error messages — and the read must find nothing
+/// rather than find it filtered.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn a_tenant_cannot_read_another_tenants_run_even_holding_its_id() {
+    use agentplane::core::{Label, RunId, TenantId};
+    use agentplane::journal::{Append, JournalStore, RecordKind};
+    use agentplane::store::RedbStore;
+
+    let base = RedbStore::open_in_memory().expect("store");
+    let acme = base
+        .clone()
+        .for_tenant(TenantId::new("acme").expect("valid"));
+    let globex = base.for_tenant(TenantId::new("globex").expect("valid"));
+
+    let run = RunId::generate();
+    let lease = acme
+        .acquire(run, "acme-worker", std::time::Duration::from_mins(1))
+        .await
+        .expect("acme leases");
+    acme.append(
+        lease.epoch,
+        vec![Append::new(
+            run,
+            RecordKind::RunAdmitted {
+                capability: "settlement.check".into(),
+                governed_by: None,
+                input_label: Label::trusted(),
+                input: serde_json::Value::Null,
+                policy_bundle: None,
+            },
+        )],
+    )
+    .await
+    .expect("acme appends");
+
+    assert!(
+        globex.read(run, 0).await.expect("globex reads").is_empty(),
+        "a store handle for one tenant read another tenant's journal while \
+         holding nothing but a valid run id"
+    );
+    assert_eq!(
+        globex.head(run).await.expect("globex head").seq,
+        0,
+        "another tenant's chain head leaked, which tells them a run exists"
+    );
+
+    // The owning tenant still reads its own, so this isolated rather than
+    // broke reads.
+    assert_eq!(
+        acme.read(run, 0).await.expect("acme reads").len(),
+        1,
+        "the owning tenant lost its own record"
+    );
+}
+
+/// A sweeper does not claim another tenant's timers.
+///
+/// Timers are swept by due time, which is a global ordering: without the tenant
+/// leading the index, the soonest timer anywhere is the next one this plane
+/// fires. It would then wake another tenant's run under this plane's identity.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn a_sweep_does_not_claim_another_tenants_timers() {
+    use agentplane::case::TimerStore;
+    use agentplane::core::{EffectKey, Phase, RunId, StepId, TenantId, Timer};
+    use agentplane::store::RedbStore;
+
+    let base = RedbStore::open_in_memory().expect("store");
+    let acme = base
+        .clone()
+        .for_tenant(TenantId::new("acme").expect("valid"));
+    let globex = base.for_tenant(TenantId::new("globex").expect("valid"));
+
+    let timer = |run| Timer {
+        run,
+        effect: EffectKey::from_hex(&"aa".repeat(32)).expect("a key"),
+        case: None,
+        step: StepId(0),
+        phase: Phase::Forward,
+        fire_at: ts(10),
+    };
+
+    let acme_run = RunId::generate();
+    acme.arm(&timer(acme_run)).await.expect("acme arms");
+
+    let mine = globex.claim_due(ts(100), 10).await.expect("globex sweeps");
+    assert!(
+        mine.is_empty(),
+        "a sweeper claimed another tenant's timer, which wakes that tenant's \
+         run under this plane's identity: {mine:?}"
+    );
+
+    let ours = acme.claim_due(ts(100), 10).await.expect("acme sweeps");
+    assert_eq!(
+        ours.len(),
+        1,
+        "the owning tenant must still find its own timer, or the scoping \
+         removed the feature rather than isolating it"
+    );
+    assert_eq!(ours[0].run, acme_run);
+}
+
+/// One tenant's event never resumes another tenant's waiting run.
+///
+/// The worst thing an event store can do. Subscriptions are matched by kind and
+/// correlation — both business-shaped values that two tenants will legitimately
+/// share, since `document`/`DOC-1` means something different to each. Without
+/// the tenant leading the match index, a delivery would find the other tenant's
+/// waiter and resume *their* run with *this* payload.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn one_tenants_event_does_not_resume_another_tenants_run() {
+    use agentplane::case::EventStore;
+    use agentplane::core::{
+        CorrelationKey, EffectKey, InboundEvent, Phase, RunId, StepId, Subscription, TenantId,
+    };
+    use agentplane::store::RedbStore;
+
+    let base = RedbStore::open_in_memory().expect("store");
+    let acme = base
+        .clone()
+        .for_tenant(TenantId::new("acme").expect("valid"));
+    let globex = base.for_tenant(TenantId::new("globex").expect("valid"));
+
+    // Globex is waiting on a correlation key acme also uses — the realistic
+    // case, since business keys are not globally unique.
+    let waiting = RunId::generate();
+    let sub = Subscription {
+        run: waiting,
+        effect: EffectKey::from_hex(&"bb".repeat(32)).expect("a key"),
+        case: None,
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "ack.received".to_owned(),
+        correlation: vec![CorrelationKey::new("document", "DOC-1")],
+    };
+    globex.subscribe(&sub, ts(1)).await.expect("globex waits");
+
+    let event = InboundEvent {
+        source: "erp".to_owned(),
+        id: "evt-1".to_owned(),
+        kind: "ack.received".to_owned(),
+        correlation: vec![CorrelationKey::new("document", "DOC-1")],
+        payload: serde_json::json!({"ok": true}),
+    };
+
+    // Buffered *in acme*, which is what makes this a tenancy question rather
+    // than a "no such event" one: the row exists, under the wrong tenant.
+    assert!(acme.buffer(&event, ts(2)).await.expect("acme buffers"));
+    assert!(
+        acme.match_waiter(&event, ts(3))
+            .await
+            .expect("acme matches")
+            .is_none(),
+        "one tenant's message resumed another tenant's waiting run, handing it \
+         a payload nobody sent it"
+    );
+
+    // The same message inside globex does resume it, so the match path works
+    // and the assertion above failed for the reason it claims.
+    assert!(globex.buffer(&event, ts(4)).await.expect("globex buffers"));
+    let matched = globex
+        .match_waiter(&event, ts(5))
+        .await
+        .expect("globex matches")
+        .expect("globex's own event must resume its own waiter");
+    assert_eq!(matched.run, waiting);
+}
+
+/// One tenant's run never joins another tenant's case.
+///
+/// Correlation keys are business values — `document`/`DOC-1` means something
+/// different to every tenant, and two of them using the same one is ordinary,
+/// not a collision. Without the tenant leading the correlation index, the second
+/// tenant's run would be attached to the first's case: they would share a
+/// history, a deadline set, and an erasure unit.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn one_tenants_run_does_not_join_another_tenants_case() {
+    use agentplane::case::CaseStore;
+    use agentplane::core::{CorrelationKey, TenantId};
+    use agentplane::store::RedbStore;
+
+    let base = RedbStore::open_in_memory().expect("store");
+    let acme = base
+        .clone()
+        .for_tenant(TenantId::new("acme").expect("valid"));
+    let globex = base.for_tenant(TenantId::new("globex").expect("valid"));
+    let key = [CorrelationKey::new("document", "DOC-1")];
+
+    let theirs = acme
+        .correlate_or_open("clearing", &key, ts(1))
+        .await
+        .expect("acme opens");
+    let mine = globex
+        .correlate_or_open("clearing", &key, ts(2))
+        .await
+        .expect("globex opens");
+
+    assert_ne!(
+        theirs.case_id(),
+        mine.case_id(),
+        "globex joined acme's case on a shared business key — the two would \
+         share a history, a deadline set and an erasure unit"
+    );
+
+    // And each still finds its own, so this isolated rather than broke it.
+    assert_eq!(
+        acme.correlate(&key).await.expect("acme correlates"),
+        Some(theirs.case_id()),
+        "acme cannot find the case it just opened"
+    );
+    assert_eq!(
+        globex.correlate(&key).await.expect("globex correlates"),
+        Some(mine.case_id()),
+        "globex cannot find the case it just opened"
+    );
+}
+
+/// A plane and a store scoped to different tenants is refused at build.
+///
+/// The two are set separately — the plane's tenant scopes data keys and the
+/// policy request, the store's scopes its keys — and nothing about the mismatch
+/// is visible afterwards. It works: runs are admitted, effects are authorized
+/// under the right tenant, blobs are sealed under the right key, and every row
+/// lands in a keyspace belonging to somebody else.
+#[cfg(feature = "redb")]
+#[test]
+fn a_plane_will_not_start_over_another_tenants_store() {
+    use agentplane::core::TenantId;
+    use agentplane::runtime::Runtime;
+    use agentplane::store::RedbStore;
+
+    let store = std::sync::Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(TenantId::new("globex").expect("valid")),
+    );
+    let acme = TenantId::new("acme").expect("valid");
+
+    let mismatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        drop(Runtime::builder(store).tenant(acme).build());
+    }));
+    assert!(
+        mismatched.is_err(),
+        "a plane started as 'acme' over a store serving 'globex' — its runs go \
+         into globex's keyspace and nothing about that is visible at runtime"
+    );
+
+    // Matched, it starts — so the check is a check and not a refusal to run.
+    let store = std::sync::Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(TenantId::new("acme").expect("valid")),
+    );
+    let _ = Runtime::builder(store)
+        .tenant(TenantId::new("acme").expect("valid"))
+        .build();
+}
+
+/// A plane will not start over another tenant's blob store.
+///
+/// The same mismatch as the journal one and a separate wire: a plane can be
+/// given a correctly-scoped journal and a blob store still on `default`, and
+/// nothing about that is visible at runtime. Its artifacts would land in another
+/// tenant's erasure unit — so an erasure request for *that* tenant destroys
+/// this one's data, and this tenant's own erasure reaches nothing.
+#[cfg(feature = "redb")]
+#[test]
+fn a_plane_will_not_start_over_another_tenants_blobs() {
+    use agentplane::blob::{BlobStore, MemoryBlobs};
+    use agentplane::core::TenantId;
+    use agentplane::runtime::Runtime;
+    use agentplane::store::RedbStore;
+
+    let acme = || TenantId::new("acme").expect("valid");
+    let store = || {
+        std::sync::Arc::new(
+            RedbStore::open_in_memory()
+                .expect("store")
+                .for_tenant(acme()),
+        )
+    };
+
+    let mismatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(
+            Runtime::builder(store())
+                .tenant(acme())
+                // Correct journal, blob store left on the default tenant.
+                .blobs(std::sync::Arc::new(MemoryBlobs::new()) as std::sync::Arc<dyn BlobStore>)
+                .build(),
+        );
+    }));
+    assert!(
+        mismatched.is_err(),
+        "a plane on 'acme' started over a blob store serving another tenant — \
+         its artifacts land in that tenant's erasure unit, so their erasure \
+         destroys this tenant's data and this tenant's erasure reaches nothing"
+    );
+
+    // Matched, it starts, so this is a check rather than a refusal to run.
+    let _ = Runtime::builder(store())
+        .tenant(acme())
+        .blobs(std::sync::Arc::new(MemoryBlobs::new().for_tenant(acme()))
+            as std::sync::Arc<dyn BlobStore>)
+        .build();
+}
+
+/// Erasing one tenant's blob does not destroy another tenant's.
+///
+/// The severe half of blob tenancy, and the one encryption does not fix. Blobs
+/// are content-addressed, so two tenants writing identical bytes — a standard
+/// form, an empty document, a common attachment — land on one object when the
+/// path has no tenant in it. Expiring it to discharge one tenant's erasure
+/// request then destroys the other tenant's data *and reports both requests
+/// satisfied*: the request nobody made is marked done, and the data that should
+/// have survived is gone.
+#[cfg(feature = "opendal")]
+#[tokio::test]
+async fn erasing_one_tenants_blob_leaves_another_tenants_alone() {
+    use agentplane::blob::OpenDalBlobs;
+    use agentplane::core::TenantId;
+
+    let dir = std::env::temp_dir().join(format!("agentplane-tenant-blobs-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let op = opendal::Operator::new(opendal::services::Fs::default().root(&dir.to_string_lossy()))
+        .expect("fs operator");
+
+    let base = OpenDalBlobs::new(op, "blobs");
+    let acme = base
+        .clone()
+        .for_tenant(TenantId::new("acme").expect("valid"));
+    let globex = base.for_tenant(TenantId::new("globex").expect("valid"));
+
+    // The realistic collision: the same bytes, written independently.
+    let shared = b"the standard terms, filed by everyone";
+    let mine = acme.put(shared).await.expect("acme put");
+    let theirs = globex.put(shared).await.expect("globex put");
+    assert_eq!(
+        mine, theirs,
+        "content addressing must still give one digest — this test is about \
+         the storage path, not the address"
+    );
+
+    acme.expire(mine, ts(1), "an article 17 request")
+        .await
+        .expect("acme erases");
+
+    assert!(
+        globex.get(theirs).await.is_ok(),
+        "erasing one tenant's blob destroyed another tenant's identical bytes, \
+         and reported an erasure nobody asked for as discharged"
+    );
+    // And the erasure did reach acme's own copy, so it isolated rather than
+    // simply failing to erase.
+    assert!(
+        acme.get(mine).await.is_err(),
+        "the erasure reached nothing at all"
     );
 }

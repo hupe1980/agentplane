@@ -105,6 +105,105 @@ pub trait Signer: Send + Sync + Debug {
     }
 }
 
+/// Bind a signature to what it is *about*, not just to the bytes it covers.
+///
+/// [`Signer::sign`] takes a bare 32-byte digest, so a signature over a manifest
+/// and a signature over a record's chain hash are structurally identical: the
+/// same key, the same algorithm, the same input shape. Nothing in either says
+/// which question it was answering. That is the classic cross-protocol
+/// confusion, and the defence is to hash a domain label in alongside the payload
+/// so the two can never be mistaken for one another.
+///
+/// The label is separated from the payload by a `0x00` byte, so no domain can be
+/// a prefix of another with the boundary landing inside the payload — the same
+/// reason canonical encodings length-prefix their fields.
+///
+/// **Not yet universal, and said plainly rather than implied.** Record
+/// attestations and witness cosignatures predate this and still sign their
+/// digest directly; unifying them is a known follow-up. The practical risk today
+/// is nil — confusing the two would need a *preimage*, since a manifest's digest
+/// is a hash of its own content and cannot be steered onto a chosen chain hash —
+/// but that argument is exactly the kind that stops holding when somebody adds a
+/// surface where the signer's input is more attacker-shaped. New surfaces use
+/// this.
+#[must_use]
+pub fn signing_hash(domain: &str, payload: &Digest) -> Digest {
+    let mut bytes = Vec::with_capacity(domain.len() + 33);
+    bytes.extend_from_slice(domain.as_bytes());
+    bytes.push(0x00);
+    bytes.extend_from_slice(payload.as_bytes());
+    Digest::of(&bytes)
+}
+
+/// The domain a manifest signature is made under.
+pub const DOMAIN_MANIFEST: &str = "io.github.hupe1980.agentplane/manifest/v1";
+
+/// Signs the rare, high-value things: checkpoints and cosignatures.
+///
+/// A deliberate second trait, and the split is about **granularity**, not taste.
+/// [`Signer`] runs on the write path of every journaled effect, so it must not
+/// perform I/O — a network round trip per record would make the journal
+/// unavailable whenever a KMS is. That constraint is right there and wrong here.
+///
+/// A checkpoint is signed once per seal; a witness cosignature once per
+/// observation. At that rate a network call costs nothing, and the key involved
+/// is the most valuable in the system: a witness key is the trust anchor, so
+/// keeping it in the memory of the process whose history it vouches for
+/// concedes the property it exists to provide. Dedicated witness hardware is
+/// where this role is going in the wider ecosystem, and a trait that forbids I/O
+/// cannot reach it.
+///
+/// Fallible, unlike [`Signer`]. A local key cannot fail to sign; a KMS can be
+/// throttled, unreachable, or have revoked the key. Returning `Vec<u8>`
+/// infallibly would force every remote implementation to panic or to fabricate
+/// a signature, and a fabricated signature is worse than an outage.
+///
+/// Any [`Signer`] is usable here, so a deployment holding a local key writes no
+/// adapter.
+#[async_trait::async_trait]
+pub trait CheckpointSigner: Send + Sync + Debug {
+    /// The identity this signer writes as.
+    fn key_id(&self) -> KeyId;
+
+    /// Sign, or say why not.
+    ///
+    /// # Errors
+    ///
+    /// If the signing service refuses or cannot be reached.
+    async fn sign(&self, hash: &Digest) -> Result<Vec<u8>, SignError>;
+}
+
+/// Why a signature could not be produced.
+///
+/// Its own error rather than a string, because the two cases call for different
+/// operator responses: a service that is merely unreachable will work again, and
+/// a key that has been revoked or denied never will.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SignError {
+    /// The signing service could not be reached. Retryable.
+    #[error("signing service unavailable: {0}")]
+    Unavailable(String),
+    /// The service answered and refused — revoked key, denied policy, wrong
+    /// audience. Retrying reproduces it.
+    #[error("signing refused for key '{key_id}': {detail}")]
+    Refused { key_id: KeyId, detail: String },
+}
+
+/// Every local signer is a checkpoint signer.
+///
+/// So the common deployment — one Ed25519 key held in process — needs no
+/// adapter, and only somebody actually reaching for a KMS writes code.
+#[async_trait::async_trait]
+impl<T: Signer + ?Sized> CheckpointSigner for T {
+    fn key_id(&self) -> KeyId {
+        Signer::key_id(self)
+    }
+
+    async fn sign(&self, hash: &Digest) -> Result<Vec<u8>, SignError> {
+        Ok(Signer::sign(self, hash))
+    }
+}
+
 /// Checks a signature against the key that claims to have made it.
 ///
 /// Deliberately separate from [`Signer`]: an auditor verifies without being able

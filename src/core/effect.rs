@@ -21,8 +21,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::core::{
-    EffectError, EffectKey, Phase, Provenance, RetryPolicy, Sensitivity, Spend, StepId, Trust,
-    canon,
+    EffectError, EffectKey, Phase, ProtectedField, Provenance, RetryPolicy, Sensitivity, Spend,
+    StepId, Trust, canon,
 };
 
 impl EffectKey {
@@ -238,13 +238,47 @@ pub trait Effect: Send + Sync {
         Sensitivity::Public
     }
 
+    /// The exact value this effect will send to its sink.
+    ///
+    /// [`StepCtx::sink`](crate::runtime::StepCtx::sink) compares this value to
+    /// the labeled value it checks. Returning `None` means the effect has not
+    /// bound its outbound arguments and is therefore refused by `sink`.
+    /// Without this binding a caller could present a harmless trusted value to
+    /// the gate while the effect sent unrelated attacker-controlled arguments.
+    fn sink_arguments(&self) -> Option<&Value> {
+        None
+    }
+
+    /// Field-specific source and sensitivity rules for a structured sink.
+    ///
+    /// Declared selectors are enforced for every effect: a read-only URL,
+    /// tenant, model, path, or query can still carry authority. A mutating
+    /// effect with no protected fields additionally receives the conservative
+    /// whole-object taint gate. Once fields are declared, those selectors carry
+    /// the stricter trust/source checks while ordinary content may remain
+    /// untrusted. This avoids broad whole-value releases merely to preserve a
+    /// trusted recipient or amount beside untrusted descriptive text.
+    fn protected_fields(&self) -> &[ProtectedField] {
+        &[]
+    }
+
+    /// The resulting delegation depth when this effect hands authority onward.
+    ///
+    /// `None` means the effect does not delegate. A peer call returns the depth
+    /// of the attenuated chain it will put on the wire, allowing a manifest to
+    /// enforce a ceiling at the last boundary before dispatch without teaching
+    /// core about any particular peer protocol.
+    fn delegation_depth(&self) -> Option<usize> {
+        None
+    }
+
     /// How much this effect's *output* may be trusted.
     ///
     /// **Defaults to [`Trust::Untrusted`]**, and the direction of that default is
     /// the point. An effect is how the deterministic zone reaches the outside
     /// world, so its result is the outside world's data — a tool response, a
     /// peer's answer, a model completion. Those are the three most important
-    /// untrusted inputs an agent runtime handles, and §12's whole architecture
+    /// untrusted inputs an agent runtime handles, and the whole architecture
     /// rests on them being labelled *at the source* rather than remembered about
     /// later.
     ///

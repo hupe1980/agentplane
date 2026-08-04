@@ -347,7 +347,7 @@ impl Skill for Echo {
 
 struct Harness {
     store: Arc<RedbStore>,
-    rt: Runtime,
+    rt: Arc<Runtime>,
     seen: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
     calls: Arc<AtomicUsize>,
 }
@@ -740,10 +740,11 @@ async fn a_concurrently_dispatched_run_replays_strictly() {
         ) -> Result<Outcome, SkillError> {
             // Several effects each, so the two steps' records interleave.
             for i in 0..4 {
-                cx.effect(agentplane::runtime::effects::Recorded::new(format!(
-                    "{}-{i}",
-                    self.0
-                )))
+                let arguments = Tainted::trusted(Value::Null);
+                cx.sink(
+                    agentplane::runtime::effects::Recorded::new(format!("{}-{i}", self.0)),
+                    &arguments,
+                )
                 .await?;
                 tokio::task::yield_now().await;
             }
@@ -841,4 +842,59 @@ fn a_panel_of_identical_judges_cannot_be_declared() {
         "identical judges share their blind spots, so this is repetition \
          wearing diversity's clothing"
     );
+}
+
+/// Every collaboration justification must reject *something*.
+///
+/// The three reasons ask different questions, so a plan failing one may
+/// legitimately satisfy another — that is not a bypass. What *is* a bypass is a
+/// justification that accepts every plan ever constructed: it costs nothing to
+/// claim, so anyone blocked by a real check writes that word instead, and the
+/// checked reasons become optional.
+///
+/// This is the collaboration equivalent of a permissive default. A gate with a
+/// free door is a gate nobody walks through.
+#[test]
+fn every_collaboration_justification_rejects_some_plan() {
+    // Two branches reading one field: not disjoint.
+    let overlapping = || {
+        vec![
+            PlanNode::new(0, "fetch").arg("a", ArgSource::input_field("shared")),
+            PlanNode::new(1, "validate").arg("b", ArgSource::input_field("shared")),
+            PlanNode::new(2, "post")
+                .arg("x", ArgSource::node(StepId(0)))
+                .arg("y", ArgSource::node(StepId(1)))
+                .terminal(),
+        ]
+    };
+    // One capability throughout: no authority to separate.
+    let single = || {
+        vec![
+            PlanNode::new(0, "fetch").arg("a", ArgSource::input_field("left")),
+            PlanNode::new(1, "fetch").arg("b", ArgSource::input_field("right")),
+            PlanNode::new(2, "fetch")
+                .arg("x", ArgSource::node(StepId(0)))
+                .arg("y", ArgSource::node(StepId(1)))
+                .terminal(),
+        ]
+    };
+
+    for reason in [
+        Collaboration::ParallelDisjoint,
+        Collaboration::DistinctAuthority,
+    ] {
+        let refused = [overlapping(), single()].into_iter().any(|nodes| {
+            validate(
+                &PlanIR::new(nodes).topology(Topology::Collaborative(reason)),
+                &contract(),
+            )
+            .is_err()
+        });
+        assert!(
+            refused,
+            "{reason:?} accepted every plan put to it, so declaring it costs \
+             nothing — and a justification that costs nothing is the one every \
+             plan blocked by a real check will claim instead"
+        );
+    }
 }

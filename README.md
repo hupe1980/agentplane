@@ -54,9 +54,27 @@ only to satisfy an auditor always rots.
 cargo run --example durable_pipeline   # crash, resume, divergence
 cargo run --example clearing_case      # correlation, obligations, human tasks
 cargo run --example plan_graph         # multi-step plans, contract, provenance
+cargo run --example governed_transfer  # field provenance, protected arguments
+cargo run --example saga_checkout      # reverse compensation, replay-safe unwind
 
 # Calls a model and replays without calling it again — no API key, no network.
 cargo run --example model_run --features redb,testkit
+
+# Digest-only multimodal dispatch and zero-I/O replay — also fully offline.
+cargo run --example media_run --features redb,testkit,media
+
+# An agent whose prompt, model, result shape and ceilings come from a file.
+cargo run --example manifest_run --features redb,testkit,manifest
+
+# Three agents — an orchestrator and two specialists — each with its own manifest.
+cargo run --example blog_room --features redb,testkit,manifest
+```
+
+Or skip Rust entirely — a file and a key are the whole agent:
+
+```sh
+cargo install agentplane --features cli
+agentplane run examples/summariser.yaml --input '{"ticket": "printer on fire"}'
 ```
 
 `durable_pipeline` prints the whole claim in four steps: a live run, a strict
@@ -72,13 +90,29 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | 🧾 | **A journal you can audit** — append-only, hash-chained, per-record signatures naming the workload that wrote them, and a per-plane Merkle log so deleting a whole run is detectable |
 | ⏱️ | **Durable execution** — crash mid-run and resume from the last completed effect; a suspended run costs a row on disk, not a task |
 | 🗂️ | **Cases, not long-lived workflows** — runs stay minutes, business processes span months, so a deploy never has to migrate an in-flight workflow |
-| 🛡️ | **Policy before every effect** — a total, I/O-free gate; a run denied at step 7 never starts at step 1 |
-| 🏷️ | **Information-flow labels** — *may this principal act* and *may this value go there* are different questions, and both are answerable |
+| 🛡️ | **Policy before live dispatch** — a total, I/O-free gate; denials are journaled, strict replay never re-judges history, and plan authority is checked before step 1 |
+| 🏷️ | **Field-level information flow** — exact outbound arguments are bound to hierarchical provenance; recipient, amount, path, URL and other authority-bearing fields can require trusted or named sources while ordinary content remains untrusted |
+| 🔓 | **Typed, authorized release** — improving trust or sensitivity names the exact fields, destination, basis and evidence, asks policy under `data:release`, retains provenance, and leaves a permanent decision record |
 | 💸 | **Budgets that bind** — a failed model call is billed for what it burned, because the provider bills for it too |
 | 👤 | **Human oversight** — durable worklists with four-eyes, declared expiry behaviour, and an operator who can *stop* a run and have it unwind |
-| 🔌 | **Real wires** — MCP tools, A2A peers, Anthropic and OpenAI drivers, each with a failure mapping that says whether the call landed |
+| 🔌 | **Real wires** — MCP tools, an A2A 1.0 JSON-RPC `SendMessage` client, and Anthropic/OpenAI drivers, each with a failure mapping that says whether the call landed |
+| 🪪 | **Agent Cards derived, not written** — an A2A v1.0 card built from the manifest, so what an agent advertises and what it is permitted cannot drift. Its skills are exactly the declared capabilities, and unimplemented transports are advertised as **absent** rather than aspirational |
+| 📡 | **An A2A server** — other agents can call this plane. The card is public, every method is authorized, a peer's message arrives **untrusted**, and the capability it runs is **named rather than inferred** — guessing would let the sender choose what runs by writing text |
+| 🖼️ | **Governed remote media** — provider-side URLs are refused; the `media` feature fetches through exact host/port grants, all-answer public-IP checks, pinned DNS, manual redirects, byte/time/type/signature bounds, versioned content validators, digest-only journaling and explicit retention. Bytes materialize only inside live model dispatch, never strict replay |
 | 🗑️ | **Erasure that keeps the proof** — drop a payload's bytes and the chain still verifies, because it only ever committed to a digest. A later read says *expired, on this date, for this reason* — never *missing* |
-| 👁️ | **A witness that refuses** — a checkpoint is cosigned only if it provably extends the last one seen, so a shrunken log and a second history of the same size are both rejected |
+| 🔑 | **Erasure that reaches the backups** — deleting clears the live store; the backup taken an hour earlier still has everything, and backups are offsite and often immutable *by design*. So payload bytes are sealed under a per-case data key wrapped by a key the crate never holds: erasing a case **destroys the key**, and every copy becomes unreadable at once — including the ones nobody can reach. Rotation re-wraps without rewriting bulk data; an erased case never comes back. `VaultTransit` speaks Vault's transit engine, so the wrapping key never leaves Vault |
+| 📄 | **An agent that is only a file** — `agentplane run agent.yaml`. No Rust, no `main`, no skill. The digest covers the agent *in its entirety* rather than only its boundary, **and** the run is journaled and deterministically replayable. Declarative formats give you the first; durable platforms give you the second; the pairing is what makes the evidence about something you can actually read |
+| 🧑‍⚖️ | **Oversight in the file, not in the code** — `oversight.approval: required` makes a declarative agent wait for a person, showing them its actual answer. Declared where nothing would apply it, it is *refused* — a file must not claim a human is in the loop when none is |
+| 🛠️ | **Tool calling where the model proposes and the operator decides** — `execution.kind: tool-calling` runs the loop from a file. The model is offered exactly the manifest's grants, and the name it picks is matched **byte for byte** — a resolver that corrects a near miss lets a model reach a tool by describing it. A name matching nothing comes back as a failed call, so the model can correct itself and never gets the tool it nearly named. Arguments stay untrusted, so protected fields and the egress ceiling apply. `max_turns` bounds it, and an agent still asking when it runs out fails rather than passing off half-formed reasoning as an answer. Every turn is a journaled effect, so a replay reassembles the conversation without calling a model or a tool |
+| 🔒 | **The declaration binds** — an effect naming a model or tool the file never listed is refused *before dispatch* and journaled, under an action distinct from a policy denial. A config field read by convention is two copies of one decision; this is one |
+| 📜 | **Grants and prompts declared in a file, not a builder call** — a manifest states an agent's instructions, tools and ceilings where a reviewer sees them as a diff, and refuses a field it does not recognise, because `max_tokns:` in a permissive parser means *no token ceiling at all*. The prompt is inside the digest, so rewording it is a version bump rather than an untracked deploy |
+| 🕸️ | **Multi-agent shape is declared, not emergent** — `single` / `routed` / `collaborative`, with roles `specialist` / `orchestrator` / `router`. A **specialist may not delegate**, which is the structural answer to the handoff loop; collaboration must state *why*, because it opens a failure surface the other modes structurally do not have |
+| 🔀 | **A model swap is a version bump** — provider and model id are in the digest, and `dual-llm` is refused unless the quarantined role names a *different* model than the privileged one; one model in both roles keeps the label and removes the control |
+| ✍️ | **Signed manifests, bound to their purpose** — a digest says *what* was published; a signature says *who*. Made over a domain-separated hash, so a record attestation can never be replayed as a publisher's blessing of an agent |
+| 📌 | **A registry that will not rewrite history or authorship** — a published version is immutable; an unsigned artifact can adopt its first publisher attestation, but that identity cannot be silently reassigned. A resolve can be pinned to a digest, which is the check that still holds when the registry is the compromised party |
+| 👁️ | **Witnessing by somebody who is not you** — a checkpoint is cosigned only if it provably extends the last one seen, so a shrunken log and a second history of the same size are both rejected. `HttpWitness` speaks C2SP `tlog-witness`, so the counterparty can be the existing public network rather than a second process you also own. A **409 is a stale cursor, never a fork**: one is a routine retry, the other an integrity incident, and conflating them is how the alert that matters stops being believed |
+| 🏢 | **Multi-tenancy in the key, not in a filter** — the tenant leads every stored key on both backends, so a query that forgets it returns *nothing* rather than another tenant's rows. Blob paths lead with it too: content addressing otherwise puts two tenants' identical bytes in one object, and erasing it for one destroys the other's data while reporting both requests done. One process serves many tenants, resolving the plane from the caller's credential — never from the request — and refusing a tenant it does not serve rather than falling back to a default |
+| 🛰️ | **One plane, several agents** — a runtime owns the journal, the drivers and the process identity; an agent owns a manifest and its skills. Each agent on a plane is separately declared, bounded and answerable, and two of them claiming one capability is *refused at startup* rather than silently resolved. `StepCtx::commission` hands work to a peer as a **journaled effect**, so a replay reassembles the room without waking it, the label travels with the answer, and the specialist's spend is billed to the run that asked |
 
 Full inventory, including what is **not** built →
 **[docs/status.md](https://hupe1980.github.io/agentplane/docs/status/)**
@@ -92,6 +126,7 @@ Full inventory, including what is **not** built →
 | 🏗️ | [Architecture](https://hupe1980.github.io/agentplane/docs/architecture/) — how it actually works, mechanism by mechanism |
 | 🍳 | [Cookbook](https://hupe1980.github.io/agentplane/docs/cookbook/) — task-shaped recipes |
 | 🔐 | [Security model](https://hupe1980.github.io/agentplane/docs/security/) — the trust boundary, and what it does not cover |
+| 🗝️ | [Erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) — erasure that reaches backups, key rotation and revocation, and how tenants are kept apart |
 | ⚙️ | [Operations](https://hupe1980.github.io/agentplane/docs/operations/) — deploying, HA, retention, observability |
 | ⚖️ | [Regulation](https://hupe1980.github.io/agentplane/docs/regulation/) — EU AI Act obligation by obligation, and what is missing |
 | 📋 | [Status](https://hupe1980.github.io/agentplane/docs/status/) — built vs designed-not-built |
@@ -109,14 +144,14 @@ just ci-full      # the above, plus TLA+ specs and the full mutation sweep
 
 Two are unusual enough to name:
 
-**🔬 Formal specs.** Six TLA+ specifications are model-checked on every push —
-the effect protocol, retry safety, sagas, fencing, authorization, delegation. And
+**🔬 Formal specs.** TLA+ specifications are model-checked on every push — the
+effect protocol, retry safety, sagas, fencing, authorization, delegation. And
 because a spec whose invariants cannot be violated proves nothing, each is
-re-checked against 18 deliberately broken copies of itself; every mutant must be
+re-checked against deliberately broken copies of itself; every mutant must be
 caught by the *specific* invariant written for it.
 
-**🧬 Mutation testing over the code.** 110 guarantees are broken on purpose, and
-the test *named for each one* must fail. A mutation caught by some other test is
+**🧬 Mutation testing over the code.** Every load-bearing guarantee is broken on
+purpose, and the test *named for each one* must fail. A mutation caught by some other test is
 reported **weak**, not passing — that usually means the guarantee has no test of
 its own and is being held up by one that could be rewritten without anyone
 noticing what it protected.
@@ -131,7 +166,7 @@ one is not.
 
 | agentplane does **not** | Use instead |
 |---|---|
-| Ship a prompt library or IDE | Your manifests; agentplane hashes and versions them |
+| Ship a prompt library or IDE | Your prompts; agentplane pins the manifest that governs them by digest |
 | Route or proxy model traffic | LiteLLM, Bifrost, your own `ModelProvider` |
 | Implement a vector database | LanceDB / pgvector behind a seam |
 | Replace a deterministic protocol engine | Keep it; agentplane sits *beside* it, never inside it |

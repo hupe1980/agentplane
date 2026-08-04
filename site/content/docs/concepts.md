@@ -1,6 +1,6 @@
 +++
 title = "Concepts"
-description = "Runs and cases, effects and dispositions, labels and declassification — the vocabulary everything else is built from."
+description = "Runs and cases, effects and dispositions, labels and typed release — the vocabulary everything else is built from."
 weight = 2
 +++
 
@@ -20,10 +20,13 @@ whole protocol — announcing first is what makes a crash mid-call detectable at
 all, because the journal then holds an intention with no outcome.
 
 ```rust
-let answer = cx.effect(ModelCall::new(provider, model, prompt)).await?;
+let prompt = Tainted::trusted(prompt);
+let call = ModelCall::new(provider, model, prompt.peek().clone());
+let answer = cx.sink(call, &prompt).await?;
 ```
 
-Live, that performs the call and journals the result. On replay, it performs
+Model prompts are outbound data, so `sink` binds the exact labelled value to
+the call before dispatch. Live, that performs the call and journals the result. On replay, it performs
 nothing and returns the recorded answer. The skill code is identical either way,
 which is the point: replay is not a special mode a skill has to know about.
 
@@ -194,9 +197,16 @@ The label is applied **by the effect, at the source** — not by the caller. A
 label the caller applies is a label the caller forgets, and this crate's own test
 fixtures forgot it once, which made an existing guarantee untestable for months.
 
-Two gates run at every sink: an **egress ceiling** (a value's sensitivity may not
-exceed what the sink is cleared for) and a **taint gate** (untrusted data may not
-reach a *mutating* sink without an explicit, journaled declassification).
+Every outbound effect must use `cx.sink`, which binds the exact dispatched JSON
+to the labels being checked. An **egress ceiling** limits sensitivity. A mutating
+sink either refuses any untrusted argument, or declares protected JSON fields
+whose trust, provenance sources and sensitivity are checked independently — so
+an untrusted memo may accompany a trusted recipient without acquiring authority.
+
+`cx.release` is the only way to improve a label. Its typed request names the
+trust and/or sensitivity dimension, exact fields, destination, basis and
+evidence; policy authorizes `data:release`; the journal records the decision.
+The returned value remains labeled and keeps its provenance.
 
 ## 8. 📐 The plan is an authorization graph
 

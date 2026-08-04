@@ -66,9 +66,6 @@ pub enum ReplanError {
     /// The planner declined — no better plan exists for this fault.
     #[error("no alternative plan: {0}")]
     NoAlternative(String),
-
-    #[error("{0}")]
-    Other(String),
 }
 
 impl PlanIR {

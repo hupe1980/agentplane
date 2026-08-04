@@ -50,9 +50,11 @@ impl Skill for RequestAndWait {
         cx: &mut StepCtx<'_>,
         _input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
-        cx.effect(
+        let arguments = Tainted::trusted(Value::Null);
+        cx.sink(
             agentplane::runtime::effects::Recorded::new("send-request")
                 .counter(Arc::clone(&self.sends)),
+            &arguments,
         )
         .await?;
 
@@ -71,7 +73,7 @@ impl Skill for RequestAndWait {
 
 struct Fixture {
     store: Arc<RedbStore>,
-    rt: Runtime,
+    rt: Arc<Runtime>,
     sends: Arc<AtomicUsize>,
 }
 
@@ -90,7 +92,7 @@ fn fixture(doc: &'static str) -> Fixture {
 }
 
 fn reply(id: &str, doc: &str, body: Value) -> InboundEvent {
-    InboundEvent::new(id, "reply.received", body).correlate(key(doc))
+    InboundEvent::new("urn:test:counterparty", id, "reply.received", body).correlate(key(doc))
 }
 
 // ── The happy path ──────────────────────────────────────────────────────────
@@ -638,4 +640,93 @@ async fn a_wait_in_a_later_step_resumes_and_completes() {
         "the resumed run must reach a conclusion, not suspend again"
     );
     store.verify(out.run_id).await.unwrap();
+}
+
+/// The sender is in the awaited value's provenance, live and on replay alike.
+///
+/// A sink may allow an authority-bearing field from `event:reply.received` in
+/// general, or from one counterparty in particular — `sender:` is what makes the
+/// second expressible. It is journaled rather than recomputed for the usual
+/// reason: a replayed run that labelled the same value differently would reach a
+/// different verdict at every taint gate downstream, which is divergence.
+#[tokio::test]
+async fn an_awaited_events_sender_is_in_its_provenance_and_survives_replay() {
+    use agentplane::core::{Label, SourceId};
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct Seen(Mutex<Vec<Label>>);
+
+    #[derive(Debug)]
+    struct Waits(Arc<Seen>);
+
+    #[async_trait::async_trait]
+    impl Skill for Waits {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("waits").provides("demo.request")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let reply = cx
+                .await_event(&AwaitSpec::new("reply.received", "reply").correlate(key("DOC-77")))
+                .await?;
+            self.0.0.lock().expect("seen").push(reply.label().clone());
+            Ok(Outcome::done(reply))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let seen = Arc::new(Seen::default());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .skill(Waits(Arc::clone(&seen)))
+        .build();
+
+    let out = rt
+        .run_in_case("demo.request", json!({}), "clearing", &[key("DOC-77")])
+        .await
+        .expect("run");
+    rt.deliver(&reply("EV-77", "DOC-77", json!({ "status": "ok" })))
+        .await
+        .expect("deliver");
+
+    let live = seen
+        .0
+        .lock()
+        .expect("seen")
+        .last()
+        .cloned()
+        .expect("a label");
+    assert!(
+        live.provenance
+            .contains(&SourceId::new("event:reply.received")),
+        "the event kind must be in provenance: {live:?}"
+    );
+    assert!(
+        live.provenance
+            .contains(&SourceId::new("sender:urn:test:counterparty")),
+        "the sender must be in provenance, or a sink cannot say which \
+         counterparty an authority-bearing field may come from: {live:?}"
+    );
+
+    // The whole point of journaling it: replay must label it identically.
+    rt.replay(out.run_id, agentplane::runtime::Mode::Strict)
+        .await
+        .expect("replay");
+    let replayed = seen
+        .0
+        .lock()
+        .expect("seen")
+        .last()
+        .cloned()
+        .expect("a label");
+    assert_eq!(
+        replayed, live,
+        "a replayed run labelled the same value differently from the live one, \
+         so every taint gate downstream may reach a different verdict"
+    );
 }

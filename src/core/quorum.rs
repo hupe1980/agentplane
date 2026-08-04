@@ -1,6 +1,6 @@
 //! Judging a high-stakes step more than once, and disagreeing usefully.
 //!
-//! §1.2's measurement is the whole argument: an agent at 61 % pass^1 is around
+//! The measurement is the whole argument: an agent at 61 % pass^1 is around
 //! **25 % at pass^8**. A single execution of a judgement that moves money or
 //! closes a regulatory case is therefore not adequate evidence, however
 //! confident it sounds.

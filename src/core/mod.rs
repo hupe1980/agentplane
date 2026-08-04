@@ -26,8 +26,12 @@ mod retry;
 mod secret;
 mod skill;
 mod task;
+mod tenant;
 
-pub use attest::{AttestError, Attestation, KeyId, Signer, Verifier};
+pub use attest::{
+    AttestError, Attestation, CheckpointSigner, DOMAIN_MANIFEST, KeyId, SignError, Signer,
+    Verifier, signing_hash,
+};
 pub use budget::{Budget, BudgetExceeded, Consumed, Ledger, Spend};
 pub use calendar::{Calendar, CalendarError, WallClock};
 mod quorum;
@@ -53,12 +57,16 @@ pub use id::{BatchId, CaseId, Digest, EffectKey, Epoch, Phase, RunId, Seq, StepI
 pub use identity::{
     Delegation, DelegationError, DelegationScheme, MAX_DELEGATION_DEPTH, Principal, Scope,
 };
-pub use label::{Label, Sensitivity, SourceId, Tainted, Trust};
+pub use label::{
+    Label, ProtectedField, Release, ReleaseScope, Sensitivity, SourceId, Tainted, Trust,
+};
 pub use plan::{ArgSource, Collaboration, PlanError, PlanIR, PlanNode, Topology};
 pub use policy::{
-    ACTION_ADMIT, ACTION_PERFORM, DenyAll, PolicyDecision, PolicyEngine, PolicyRequest,
+    ACTION_ADMIT, ACTION_DECLARED, ACTION_PERFORM, ACTION_RELEASE, DenyAll, PolicyBundleIdentity,
+    PolicyDecision, PolicyEngine, PolicyRequest,
 };
 pub use retry::RetryPolicy;
 pub use secret::Secret;
 pub use skill::{AgentRef, Capability, Compensation, Outcome, Skill, SkillDescriptor};
 pub use task::{Decision, Justification, OnExpiry, Priority, Task, TaskId, TaskSpec, TaskState};
+pub use tenant::{TenantError, TenantId};

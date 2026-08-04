@@ -101,9 +101,11 @@ fn admitted(run: RunId) -> Append {
     Append::new(
         run,
         RecordKind::RunAdmitted {
-            agent: "conformance".into(),
+            capability: "conformance".into(),
+            governed_by: None,
+            input_label: crate::core::Label::trusted(),
             input: serde_json::Value::Null,
-            policy: None,
+            policy_bundle: None,
         },
     )
 }
@@ -158,7 +160,185 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     the_first_asker_stays_on_the_record(fresh, &mut r).await;
     an_attestation_survives_the_round_trip(fresh, &mut r).await;
     the_log_only_grows(fresh, &mut r).await;
+    a_released_lease_is_free_at_once(fresh, &mut r).await;
+    a_release_does_not_forget_the_epoch(fresh, &mut r).await;
+    a_fenced_caller_cannot_release_the_new_owners_lease(fresh, &mut r).await;
     r
+}
+
+/// A released lease is available immediately, without waiting out the TTL.
+///
+/// The counterpart to expiry, and the reason an owner can afford to be unique
+/// per process. Without a release, a restart waits out the lease — and the
+/// tempting fix is a constant owner string so the replacement "renews" instead,
+/// which silently disables fencing, because two live instances then read each
+/// other's lease as their own.
+async fn a_released_lease_is_free_at_once(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let run = RunId::generate();
+    let Ok(a) = store.acquire(run, "instance-a", LEASE).await else {
+        return;
+    };
+    if let Err(e) = store.release_lease(run, a.epoch).await {
+        r.record("fencing", format!("release() of a held lease failed: {e}"));
+        return;
+    }
+
+    match store.acquire(run, "instance-b", LEASE).await {
+        Ok(b) => {
+            // The epoch *must* advance. An earlier version of this battery
+            // asserted the opposite — "a handover is not a crash, so there is
+            // nothing to fence" — which is wrong: releasing says the owner
+            // intends to stop, not that it already has. An un-awaited task or a
+            // crash between release and exit leaves an append in flight, and
+            // the only thing that stops it is a bump. The property worth having
+            // is that takeover is *immediate*, not that the epoch stands still.
+            if b.epoch <= a.epoch {
+                r.record(
+                    "fencing",
+                    format!(
+                        "a released lease was reclaimed at epoch {} without advancing past \
+                         {} — an append still in flight from the releasing owner would not \
+                         be fenced",
+                        b.epoch, a.epoch
+                    ),
+                );
+            }
+        }
+        Err(e) => r.record(
+            "fencing",
+            format!(
+                "a released lease was still held ({e}) — every restart then waits out the \
+                 TTL, which is the pressure that makes deployments alias their owner strings"
+            ),
+        ),
+    }
+
+    // Releasing twice is releasing once.
+    if let Err(e) = store.release_lease(run, a.epoch).await {
+        r.record("fencing", format!("release() is not idempotent: {e}"));
+    }
+}
+
+/// Releasing frees the lease without forgetting the epoch.
+///
+/// The epoch lives in the lease row, so a release that *deletes* the row throws
+/// the fence away with it. Two things then go wrong at once, and both are
+/// silent: `append` fences against the row it can no longer find, so a stale
+/// writer is not stopped; and the next `acquire` sees nothing and starts again
+/// at 1, so a previously fenced writer holding epoch 2 now **outranks** the new
+/// legitimate owner. The mechanism does not merely stop working — it inverts.
+async fn a_release_does_not_forget_the_epoch(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let run = RunId::generate();
+
+    // Take it, lose it to a takeover, so the epoch is above 1.
+    let Ok(first) = store.acquire(run, "instance-a", SHORT).await else {
+        return;
+    };
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let Ok(second) = store.acquire(run, "instance-b", LEASE).await else {
+        r.record("fencing", "an expired lease could not be taken over");
+        return;
+    };
+    if second.epoch <= first.epoch {
+        r.record("fencing", "a takeover did not advance the epoch");
+        return;
+    }
+
+    // The current owner shuts down cleanly.
+    if store.release_lease(run, second.epoch).await.is_err() {
+        r.record("fencing", "release_lease of a held lease failed");
+        return;
+    }
+
+    // The stale instance must still be fenced. If the epoch was forgotten there
+    // is nothing left to compare against and this append succeeds.
+    match store.append(first.epoch, vec![admitted(run)]).await {
+        Err(crate::core::StoreError::Fenced { .. }) => {}
+        Err(e) => r.record(
+            "fencing",
+            format!("unexpected error from a stale append: {e}"),
+        ),
+        Ok(_) => r.record(
+            "fencing",
+            "a fenced writer appended after the lease was released — releasing threw \
+             away the epoch, so there was nothing left to fence against",
+        ),
+    }
+
+    // And the next owner must rank *above* the fenced one, not restart at 1.
+    match store.acquire(run, "instance-c", LEASE).await {
+        Ok(third) => {
+            if third.epoch <= first.epoch {
+                r.record(
+                    "fencing",
+                    format!(
+                        "after a release the epoch restarted at {} — a writer fenced at {} \
+                         now outranks the legitimate owner",
+                        third.epoch, first.epoch
+                    ),
+                );
+            }
+        }
+        Err(e) => r.record(
+            "fencing",
+            format!("a released lease was not claimable: {e}"),
+        ),
+    }
+}
+
+/// A fenced caller cannot free the lease of whoever replaced it.
+///
+/// The safety half. A process that was taken over is still running and will
+/// eventually shut down; if its release freed the *current* owner's lease, it
+/// would hand the run to a third party while the rightful owner is mid-write —
+/// manufacturing exactly the split-brain the epoch exists to prevent.
+async fn a_fenced_caller_cannot_release_the_new_owners_lease(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let run = RunId::generate();
+    let Ok(old) = store.acquire(run, "instance-a", SHORT).await else {
+        return;
+    };
+    // Waited out rather than faked, because expiry is only reachable through
+    // the public API — the same reason the fencing case does it this way.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    // Expired, so the takeover is legitimate and bumps the epoch.
+    let Ok(new) = store.acquire(run, "instance-b", LEASE).await else {
+        r.record("fencing", "an expired lease could not be taken over");
+        return;
+    };
+    if new.epoch == old.epoch {
+        r.record("fencing", "a takeover did not advance the epoch");
+        return;
+    }
+
+    // The stale instance shuts down and releases. It must not succeed, and it
+    // must not be an error either: being fenced is not a reason to fail an
+    // orderly exit.
+    if let Err(e) = store.release_lease(run, old.epoch).await {
+        r.record(
+            "fencing",
+            format!("a fenced caller's release must be a no-op, not an error: {e}"),
+        );
+    }
+
+    match store.acquire(run, "instance-c", LEASE).await {
+        Err(crate::core::StoreError::LeaseHeld { .. }) => {}
+        Err(e) => r.record(
+            "fencing",
+            format!("unexpected error after a stale release: {e}"),
+        ),
+        Ok(_) => r.record(
+            "fencing",
+            "a fenced caller released the lease of the instance that replaced it, handing \
+             the run to a third party while its rightful owner is still writing",
+        ),
+    }
 }
 
 /// A sealed run enters the log, and the log only ever grows.

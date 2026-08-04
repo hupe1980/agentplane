@@ -25,17 +25,22 @@ use std::sync::{
 };
 
 use agentplane::core::{
-    ACTION_ADMIT, ACTION_PERFORM, Digest, Effect, EffectDescriptor, EffectError, Outcome,
-    PolicyDecision, PolicyEngine, PolicyRequest, Recovery, RetryPolicy, RunId, Skill,
-    SkillDescriptor, SkillError, Tainted,
+    ACTION_ADMIT, ACTION_PERFORM, Digest, Effect, EffectDescriptor, EffectError, Outcome, PlanIR,
+    PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest, Recovery, Release,
+    ReleaseScope, RetryPolicy, RunId, RuntimeError, Skill, SkillDescriptor, SkillError, SourceId,
+    Tainted,
 };
-use agentplane::journal::{JournalStore, RecordKind};
+use agentplane::journal::{Append, JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 /// Effects that actually reached the world.
 type World = Arc<Mutex<Vec<String>>>;
+
+fn test_bundle(rules: &'static [u8]) -> PolicyBundleIdentity {
+    PolicyBundleIdentity::new(Digest::of(rules), "agentplane-test/policy-v1")
+}
 
 // ── Engines ─────────────────────────────────────────────────────────────────
 
@@ -50,8 +55,8 @@ impl PolicyEngine for Counting {
         self.asked.fetch_add(1, Ordering::SeqCst);
         PolicyDecision::Permit
     }
-    fn digest(&self) -> Digest {
-        Digest::of(b"counting")
+    fn bundle(&self) -> PolicyBundleIdentity {
+        test_bundle(b"counting")
     }
 }
 
@@ -67,8 +72,26 @@ impl PolicyEngine for Refuses {
             PolicyDecision::Permit
         }
     }
-    fn digest(&self) -> Digest {
-        Digest::of(b"refuses")
+    fn bundle(&self) -> PolicyBundleIdentity {
+        test_bundle(b"refuses")
+    }
+}
+
+/// Refuses only attempts to release data from the information-flow lattice.
+#[derive(Debug)]
+struct RefusesRelease;
+
+impl PolicyEngine for RefusesRelease {
+    fn authorize(&self, r: &PolicyRequest<'_>) -> PolicyDecision {
+        if r.action == "data:release" {
+            PolicyDecision::deny("this agent may not release externally sourced data")
+        } else {
+            PolicyDecision::Permit
+        }
+    }
+
+    fn bundle(&self) -> PolicyBundleIdentity {
+        test_bundle(b"refuses-release")
     }
 }
 
@@ -89,8 +112,25 @@ impl PolicyEngine for MustNotBeAsked {
             r.action, r.resource
         );
     }
-    fn digest(&self) -> Digest {
-        Digest::of(b"must-not-be-asked")
+    fn bundle(&self) -> PolicyBundleIdentity {
+        test_bundle(b"must-not-be-asked")
+    }
+}
+
+/// Panics if consulted while presenting the same identity as `Refuses`.
+#[derive(Debug)]
+struct RefusesIdentityButMustNotBeAsked;
+
+impl PolicyEngine for RefusesIdentityButMustNotBeAsked {
+    fn authorize(&self, r: &PolicyRequest<'_>) -> PolicyDecision {
+        panic!(
+            "resume re-evaluated a recorded refusal ('{}' on '{}')",
+            r.action, r.resource
+        );
+    }
+
+    fn bundle(&self) -> PolicyBundleIdentity {
+        test_bundle(b"refuses")
     }
 }
 
@@ -157,7 +197,11 @@ fn db() -> Arc<RedbStore> {
     Arc::new(RedbStore::open_in_memory().unwrap())
 }
 
-fn runtime(db: &Arc<RedbStore>, world: &World, engine: Option<Arc<dyn PolicyEngine>>) -> Runtime {
+fn runtime(
+    db: &Arc<RedbStore>,
+    world: &World,
+    engine: Option<Arc<dyn PolicyEngine>>,
+) -> Arc<Runtime> {
     let mut b = Runtime::builder(Arc::clone(db) as Arc<dyn JournalStore>)
         .owner("policy")
         .skill(Pays {
@@ -169,7 +213,131 @@ fn runtime(db: &Arc<RedbStore>, world: &World, engine: Option<Arc<dyn PolicyEngi
     b.build()
 }
 
+#[derive(Debug)]
+struct Releases;
+
+#[async_trait::async_trait]
+impl Skill for Releases {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("release").provides("release")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let external = Tainted::from_source(json!({ "account": "customer" }), SourceId::new("crm"));
+        let released = cx
+            .release(
+                external,
+                Release::whole(
+                    ReleaseScope::trust(),
+                    "reviewed against the settlement record",
+                    "run.output",
+                    ["review:SET-42".to_owned()],
+                ),
+            )
+            .await?;
+        Ok(Outcome::done(released))
+    }
+}
+
 // ── The gate ────────────────────────────────────────────────────────────────
+
+/// A release is an authority-bearing operation, not a logging helper.
+#[tokio::test]
+async fn policy_can_refuse_a_release_before_the_label_is_improved() {
+    let store = db();
+    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .owner("policy")
+        .policy(Arc::new(RefusesRelease))
+        .skill(Releases)
+        .build();
+
+    let out = runtime.run("release", json!({})).await.unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+
+    let records = store.read(out.run_id, 1).await.unwrap();
+    assert!(
+        !records
+            .iter()
+            .any(|record| matches!(record.kind(), RecordKind::Released { .. })),
+        "a denied release removed the label and recorded it as approved"
+    );
+    assert!(records.iter().any(|record| matches!(
+        record.kind(),
+        RecordKind::PolicyDenied { action, .. } if action == "data:release"
+    )));
+
+    let replay = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .owner("policy")
+        .policy(Arc::new(MustNotBeAsked))
+        .skill(Releases)
+        .build()
+        .replay(out.run_id, Mode::Strict)
+        .await
+        .expect("recorded release denial replays");
+    assert_eq!(replay.status, out.status);
+}
+
+#[derive(Debug)]
+struct ReleasesWithBasis(&'static str);
+
+#[async_trait::async_trait]
+impl Skill for ReleasesWithBasis {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("release-with-basis").provides("release-with-basis")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let external = Tainted::from_source(json!({ "account": "customer" }), SourceId::new("crm"));
+        Ok(Outcome::done(
+            cx.release(
+                external,
+                Release::whole(
+                    ReleaseScope::trust(),
+                    self.0,
+                    "run.output",
+                    ["review:SET-42".to_owned()],
+                ),
+            )
+            .await?,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn changing_release_evidence_is_replay_divergence() {
+    let store = db();
+    let first = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(ReleasesWithBasis("matched settlement revision 1"))
+        .build()
+        .run("release-with-basis", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Succeeded);
+
+    let replay = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(ReleasesWithBasis("matched settlement revision 2"))
+        .build()
+        .replay(first.run_id, Mode::Strict)
+        .await
+        .unwrap();
+    assert!(
+        matches!(replay.status, RunStatus::Quarantined(_)),
+        "changed release evidence rewrote history: {:?}",
+        replay.status
+    );
+}
 
 /// A denied effect never reaches the world, and the one before it still did.
 #[tokio::test]
@@ -292,13 +460,13 @@ async fn a_permit_writes_no_record_of_its_own() {
     );
 }
 
-/// Which rules governed a run is answerable from the journal, years later.
+/// Which complete policy bundle governed a run is answerable years later.
 #[tokio::test]
 async fn the_admission_record_names_the_policy_set() {
     let store = db();
     let world: World = Arc::default();
     let engine = Arc::new(Counting::default());
-    let expected = engine.digest();
+    let expected = engine.bundle();
 
     let out = runtime(&store, &world, Some(engine))
         .run("pay", json!({}))
@@ -309,14 +477,14 @@ async fn the_admission_record_names_the_policy_set() {
     let admitted = records
         .iter()
         .find_map(|r| match r.kind() {
-            RecordKind::RunAdmitted { policy, .. } => Some(*policy),
+            RecordKind::RunAdmitted { policy_bundle, .. } => Some(policy_bundle.clone()),
             _ => None,
         })
         .expect("RunAdmitted");
     assert_eq!(
         admitted,
         Some(expected),
-        "the policy digest must be on the admission record"
+        "the complete policy bundle must be on the admission record"
     );
 }
 
@@ -335,14 +503,14 @@ async fn a_run_with_no_policy_layer_says_so_on_the_record() {
         .unwrap();
 
     let records = store.read(out.run_id, 1).await.unwrap();
-    let policy = records
+    let policy_bundle = records
         .iter()
         .find_map(|r| match r.kind() {
-            RecordKind::RunAdmitted { policy, .. } => Some(*policy),
+            RecordKind::RunAdmitted { policy_bundle, .. } => Some(policy_bundle.clone()),
             _ => None,
         })
         .expect("RunAdmitted");
-    assert_eq!(policy, None);
+    assert_eq!(policy_bundle, None);
     assert!(matches!(out.status, RunStatus::Succeeded));
 }
 
@@ -375,6 +543,65 @@ async fn strict_replay_never_asks_the_policy_engine() {
         replayed.lock().unwrap().is_empty(),
         "a strict replay performs nothing"
     );
+}
+
+/// Resume may dispatch work after the recorded prefix, so it cannot silently
+/// switch to a different policy bundle midway through one run.
+#[tokio::test]
+async fn an_open_run_refuses_to_resume_under_a_different_policy_bundle() {
+    let store = db();
+    let run = RunId::generate();
+    let plan = PlanIR::single("pay");
+    let admitted = Counting::default().bundle();
+    let lease = store
+        .acquire(run, "policy", std::time::Duration::from_mins(1))
+        .await
+        .unwrap();
+    store
+        .append(
+            lease.epoch,
+            vec![
+                Append::new(
+                    run,
+                    RecordKind::RunAdmitted {
+                        capability: "pay".into(),
+                        governed_by: None,
+                        input: json!({}),
+                        input_label: agentplane::core::Label::trusted(),
+                        policy_bundle: Some(admitted),
+                    },
+                ),
+                Append::new(
+                    run,
+                    RecordKind::PlanFrozen {
+                        digest: plan.digest(),
+                        steps: vec!["pay".into()],
+                        plan: serde_json::to_value(plan).unwrap(),
+                    },
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let world: World = Arc::default();
+    let err = runtime(&store, &world, Some(Arc::new(Refuses("nothing"))))
+        .replay(run, Mode::Resume)
+        .await
+        .expect_err("bundle drift must stop resume before dispatch");
+    assert!(matches!(err, RuntimeError::PolicyBundleChanged { .. }));
+    assert!(world.lock().unwrap().is_empty());
+
+    // Offline verification does not compare or consult policy. This prefix may
+    // still be reported as incomplete, which is a separate replay result.
+    let strict = runtime(&store, &world, Some(Arc::new(MustNotBeAsked)))
+        .replay(run, Mode::Strict)
+        .await;
+    assert!(!matches!(
+        strict,
+        Err(RuntimeError::PolicyBundleChanged { .. })
+    ));
+    assert!(world.lock().unwrap().is_empty());
 }
 
 /// A recorded denial replays as that denial, under any policy set.
@@ -426,10 +653,14 @@ async fn resuming_a_denied_run_does_not_perform_the_denied_effect() {
         .unwrap();
 
     let resumed: World = Arc::default();
-    let again = runtime(&store, &resumed, Some(Arc::new(MustNotBeAsked)))
-        .replay(out.run_id, Mode::Resume)
-        .await
-        .expect("resume reads the denial back");
+    let again = runtime(
+        &store,
+        &resumed,
+        Some(Arc::new(RefusesIdentityButMustNotBeAsked)),
+    )
+    .replay(out.run_id, Mode::Resume)
+    .await
+    .expect("resume reads the denial back");
 
     assert!(matches!(again.status, RunStatus::Failed(_)));
     assert!(
@@ -509,8 +740,8 @@ async fn the_request_carries_what_a_rule_needs() {
             ));
             PolicyDecision::Permit
         }
-        fn digest(&self) -> Digest {
-            Digest::of(b"capturing")
+        fn bundle(&self) -> PolicyBundleIdentity {
+            test_bundle(b"capturing")
         }
     }
 
@@ -549,8 +780,8 @@ async fn the_principal_is_stable_across_runs() {
             self.0.lock().unwrap().push(r.principal.to_string());
             PolicyDecision::Permit
         }
-        fn digest(&self) -> Digest {
-            Digest::of(b"principals")
+        fn bundle(&self) -> PolicyBundleIdentity {
+            test_bundle(b"principals")
         }
     }
 
@@ -659,10 +890,12 @@ async fn a_run_that_keeps_being_refused_stops_learning() {
             // Each refusal is swallowed and the loop asks again, which is
             // exactly the behaviour the ceiling exists to bound.
             for i in 0..ATTEMPTS {
+                let arguments = Tainted::trusted(Value::Null);
                 let _ = cx
-                    .effect(agentplane::runtime::effects::Recorded::new(format!(
-                        "probe-{i}"
-                    )))
+                    .sink(
+                        agentplane::runtime::effects::Recorded::new(format!("probe-{i}")),
+                        &arguments,
+                    )
                     .await;
             }
             Ok(Outcome::done(Tainted::trusted(json!("done probing"))))
@@ -681,8 +914,8 @@ async fn a_run_that_keeps_being_refused_stops_learning() {
                 PolicyDecision::Permit
             }
         }
-        fn digest(&self) -> Digest {
-            Digest::of(b"refuses-every-effect")
+        fn bundle(&self) -> PolicyBundleIdentity {
+            test_bundle(b"refuses-every-effect")
         }
     }
 

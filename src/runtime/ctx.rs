@@ -4,6 +4,7 @@
 //! that is what makes replay sound. A skill holds no clock, no socket, and no
 //! RNG of its own; it holds a context that journals.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use rand::SeedableRng;
@@ -111,6 +112,9 @@ pub(crate) struct Frame {
     /// is reasonable.
     pub timers: Option<Arc<dyn TimerStore>>,
     pub blobs: Option<Arc<dyn crate::blob::BlobStore>>,
+    #[cfg(feature = "keyring")]
+    pub keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
+    pub tenant: crate::core::TenantId,
     pub ledger: Arc<Mutex<Ledger>>,
     /// The authorization engine, if this plane has one.
     ///
@@ -122,6 +126,16 @@ pub(crate) struct Frame {
     pub identity: Option<crate::core::Delegation>,
     /// Who is acting, for the policy principal.
     pub agent: String,
+    /// The plane this step runs on, so it can commission other agents on it.
+    pub plane: std::sync::Weak<super::Runtime>,
+    /// The declaration this agent runs under, if it has one.
+    ///
+    /// Held by the *runtime* and handed down, never held by a skill. An agent
+    /// has skills, not the other way round — a skill separately configured with
+    /// a copy of the agent's own declaration would be able to disagree with the
+    /// agent about what the agent is.
+    #[cfg(feature = "manifest")]
+    pub manifest: Option<Arc<crate::manifest::Manifest>>,
     /// The plane's workload identity, for signing what it tells a callee.
     ///
     /// Separate from the store's signer even though a deployment should give
@@ -145,12 +159,18 @@ pub struct StepCtx<'a> {
     case: Option<CaseContext>,
     timers: Option<Arc<dyn TimerStore>>,
     blobs: Option<Arc<dyn crate::blob::BlobStore>>,
+    #[cfg(feature = "keyring")]
+    keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
+    tenant: crate::core::TenantId,
     /// The run's budget. Shared because it spans steps; a step never gets its
     /// own allowance to blow.
     ledger: Arc<Mutex<Ledger>>,
     policy: Option<Arc<dyn crate::core::PolicyEngine>>,
     identity: Option<crate::core::Delegation>,
     agent: String,
+    plane: std::sync::Weak<super::Runtime>,
+    #[cfg(feature = "manifest")]
+    manifest: Option<Arc<crate::manifest::Manifest>>,
     signer: Option<Arc<dyn crate::core::Signer>>,
 }
 
@@ -165,10 +185,16 @@ impl<'a> StepCtx<'a> {
             case,
             timers,
             blobs,
+            #[cfg(feature = "keyring")]
+            keyring,
+            tenant,
             ledger,
             policy,
             identity,
             agent,
+            plane,
+            #[cfg(feature = "manifest")]
+            manifest,
             signer,
         } = frame;
         Self {
@@ -184,12 +210,81 @@ impl<'a> StepCtx<'a> {
             case,
             timers,
             blobs,
+            #[cfg(feature = "keyring")]
+            keyring,
+            tenant,
             ledger,
             policy,
             identity,
             agent,
+            plane,
+            #[cfg(feature = "manifest")]
+            manifest,
             signer,
         }
+    }
+
+    /// Commission another agent on this plane, and journal that you did.
+    ///
+    /// The hand-off, done properly. A skill cannot hold an `Arc<Runtime>` —
+    /// the runtime needs the skill before the skill can have the runtime — so
+    /// commissioning belongs to the runtime and is reached through here.
+    ///
+    /// Three properties, none of them optional:
+    ///
+    /// * **Journaled**, so a strict replay reads the answer back instead of
+    ///   commissioning the work a second time. A skill that called another
+    ///   runtime inline would be doing non-deterministic work outside the
+    ///   journal, and replay would re-run the whole room.
+    /// * **The label travels.** A specialist's answer is untrusted — it came
+    ///   from a model — and the next agent is commissioned with that label
+    ///   intact, so the receiving run's taint gates judge what they were
+    ///   actually given.
+    /// * **The cost comes back**, and is billed to the commissioning run, so an
+    ///   orchestrator's ceiling bounds the work it ordered rather than its own
+    ///   idling.
+    ///
+    /// The answer is untrusted whatever the org chart says: another agent's
+    /// output is somebody else's data.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError`] if the sub-run fails. Reported as *in doubt* rather than
+    /// *did not happen*: the commissioned agent may have performed effects
+    /// before failing, and its own journal is where that is answered.
+    pub async fn commission(
+        &mut self,
+        capability: &str,
+        input: Tainted<Value>,
+    ) -> Result<Tainted<Value>, StepError> {
+        let plane = self.plane.clone();
+        let commissioned = self
+            .effect(Commission {
+                capability: capability.to_owned(),
+                input: input.peek().clone(),
+                label: input.label().clone(),
+                plane,
+            })
+            .await?;
+        Ok(commissioned.map(|c| c.answer))
+    }
+
+    /// The declaration this agent runs under.
+    ///
+    /// `None` when the runtime was wired by builder calls instead. A skill asks
+    /// its context which agent it is part of — it does not hold a manifest of
+    /// its own, because **an agent has skills**, and a skill carrying a separate
+    /// copy of the agent's declaration could disagree with the agent about what
+    /// the agent is.
+    ///
+    /// What a skill typically wants from it: the system prompt
+    /// ([`Identity::system_prompt`](crate::manifest::Identity::system_prompt)),
+    /// the model role to call, and
+    /// [`output_schema`](crate::manifest::Manifest::output_schema).
+    #[cfg(feature = "manifest")]
+    #[must_use]
+    pub fn manifest(&self) -> Option<&crate::manifest::Manifest> {
+        self.manifest.as_deref()
     }
 
     /// What this run tells a callee about itself, sealed for one call.
@@ -197,8 +292,28 @@ impl<'a> StepCtx<'a> {
     /// Unsigned when the plane has no workload identity, which is honest: a
     /// self-signed block would look attested and prove nothing, the same
     /// reasoning that leaves unsigned journal records unsigned.
-    fn provenance(&self, key: EffectKey, descriptor: &EffectDescriptor) -> crate::core::Provenance {
+    fn provenance(
+        &self,
+        key: EffectKey,
+        ordinal: u32,
+        descriptor: &EffectDescriptor,
+    ) -> crate::core::Provenance {
+        // The same key with the attempt pinned to zero: one identity for the
+        // logical dispatch, however many times it is attempted. A callee
+        // deduplicates on this, because "have I already done this work?" must
+        // answer *yes* for a retry — while the effect key must differ per
+        // attempt so replay reads back the retry rather than the failure before
+        // it. Two questions, two identifiers.
+        let dispatch = EffectKey::derive(
+            self.step,
+            self.phase,
+            ordinal,
+            0,
+            &descriptor.kind,
+            &canon::value_bytes(&descriptor.args),
+        );
         let block = crate::core::Provenance::new(self.run, key, self.agent.clone())
+            .dispatching(dispatch)
             .in_case(self.case.as_ref().map(|c| c.case_id));
         match &self.signer {
             Some(signer) => block.seal(signer.as_ref(), &descriptor.kind, &descriptor.args),
@@ -308,13 +423,27 @@ impl<'a> StepCtx<'a> {
     /// [`Tainted`], labelled from the effect's own [`Effect::trust`]
     /// declaration — which defaults to untrusted.
     ///
-    /// That is what makes §12's architecture hold rather than merely be
+    /// That is what makes the architecture hold rather than merely be
     /// described. A tool result flowing into a downstream step's input is
     /// labelled automatically, so the replan refusal and the taint gate see it
     /// without the skill author having to remember; and a skill that wants to
     /// treat a tool response as trusted has to say so, in a call that leaves a
     /// record.
     pub async fn effect<E: Effect>(&mut self, effect: E) -> Result<Tainted<E::Output>, StepError> {
+        if effect.sink_arguments().is_some() {
+            return Err(PolicyError::SinkGateRequired {
+                sink: effect.descriptor().kind,
+            }
+            .into());
+        }
+        self.effect_after_sink_gate(effect).await
+    }
+
+    /// Dispatch an effect once any required information-flow checks have run.
+    async fn effect_after_sink_gate<E: Effect>(
+        &mut self,
+        effect: E,
+    ) -> Result<Tainted<E::Output>, StepError> {
         let trust = effect.trust();
         let declared = effect.output_sensitivity();
         let kind = effect.descriptor().kind;
@@ -363,12 +492,12 @@ impl<'a> StepCtx<'a> {
             // Hand the effect what it needs to identify itself to a callee.
             // After the key is derived and before anything is announced: the key
             // is part of the block, and the block is signed for *this* call.
-            effect.attach(&self.provenance(key, &descriptor));
+            effect.attach(&self.provenance(key, ordinal, &descriptor));
 
             // ── Replay: is this attempt already in history? ────────────────
             if self.mode.is_replaying() {
                 match self.cursor.next(key)? {
-                    Some(EffectReplay::Done { output, spend }) => {
+                    Some(EffectReplay::Done { output, spend, .. }) => {
                         self.replayed_done(&descriptor.kind, attempt, spend);
                         return Ok(serde_json::from_value(output)?);
                     }
@@ -623,9 +752,17 @@ impl<'a> StepCtx<'a> {
         cx: &CaseContext,
     ) -> Result<Option<Tainted<Value>>, StepError> {
         match self.cursor.next(key)? {
-            Some(EffectReplay::Done { output, spend }) => {
+            Some(EffectReplay::Done {
+                output,
+                source,
+                spend,
+            }) => {
                 self.bill(spend);
-                Ok(Some(Self::label_inbound(output, &spec.kind)))
+                Ok(Some(Self::label_inbound(
+                    output,
+                    &spec.kind,
+                    source.as_deref(),
+                )))
             }
             Some(EffectReplay::Refused { limit, used }) => {
                 Err(StepError::Budget(crate::core::BudgetExceeded::Recorded {
@@ -681,6 +818,24 @@ impl<'a> StepCtx<'a> {
     ///
     /// Compensation is exempt from both, for the same reason: refusing to undo
     /// is how a run ends with a charged card and no order.
+    /// The reviewed grant for an effect, if the manifest names one.
+    ///
+    /// The bridge between a declaration and a dispatch. Without it
+    /// `ToolGrant::mutates` and `ToolGrant::max_sensitivity` are fields a
+    /// reviewer approves and nothing consults — the "manufactures confidence"
+    /// failure the binding rule exists to prevent.
+    #[cfg(feature = "manifest")]
+    fn tool_grant_for(&self, descriptor: &EffectDescriptor) -> Option<&crate::manifest::ToolGrant> {
+        if descriptor.kind != "mcp.tools/call" {
+            return None;
+        }
+        let server = descriptor.args["server"].as_str()?;
+        let tool = descriptor.args["tool"].as_str()?;
+        self.manifest
+            .as_ref()?
+            .tool_grant(&crate::tools::ToolId::new(server, tool).reference())
+    }
+
     async fn gate(
         &mut self,
         key: EffectKey,
@@ -690,8 +845,124 @@ impl<'a> StepCtx<'a> {
         if !self.phase.is_forward() {
             return Ok(());
         }
+        // First, because it is the cheapest and the most fundamental: an effect
+        // the agent's own declaration never mentioned should not reach the
+        // deployment's policy engine, let alone the world.
+        #[cfg(feature = "manifest")]
+        self.declared(key, descriptor).await?;
+        // The reviewed grant may only tighten. A tool the operator declared
+        // mutating gets the cautious treatment even if the catalogue advertises
+        // otherwise, because a server's own description of itself is an
+        // advertisement and the grant is the operator's decision about it.
+        #[cfg(feature = "manifest")]
+        let mutates = mutates || self.tool_grant_for(descriptor).is_some_and(|g| g.mutates);
         self.authorize(key, descriptor, mutates).await?;
         self.admit(key, &descriptor.kind).await
+    }
+
+    /// Check an effect against the agent's **own manifest**, journalling any
+    /// refusal.
+    ///
+    /// This is what makes a manifest a control rather than a comment. Without
+    /// it, `spec.models` and `spec.tools` describe what the code is *supposed*
+    /// to do: a reviewer approves `model: haiku`, the code calls opus, and
+    /// nothing anywhere disagrees. The declaration and the behaviour are then
+    /// two independent copies of one decision, which is the failure mode a
+    /// single reviewable file exists to remove.
+    ///
+    /// Only the fields a descriptor can be checked against are enforced here —
+    /// the model and the tool reference. An effect kind this does not recognise
+    /// passes, because inventing a constraint for it would be worse than saying
+    /// nothing.
+    ///
+    /// Runs on live dispatch only, like every other gate: a replayed effect
+    /// reads its result from the journal, so editing a manifest cannot re-judge
+    /// a run that already happened.
+    #[cfg(feature = "manifest")]
+    async fn declared(
+        &mut self,
+        key: EffectKey,
+        descriptor: &EffectDescriptor,
+    ) -> Result<(), StepError> {
+        let Some(manifest) = self.manifest.as_ref() else {
+            return Ok(());
+        };
+
+        let refusal = match descriptor.kind.as_str() {
+            "model.complete" => {
+                let provider = descriptor.args["provider"].as_str().unwrap_or_default();
+                let model = descriptor.args["model"].as_str().unwrap_or_default();
+                (!manifest.permits_model(provider, model)).then(|| {
+                    format!(
+                        "manifest '{}' does not declare the model '{provider}/{model}' —                          a model this agent's declaration never named is a behaviour                          change nobody reviewed",
+                        manifest.metadata.name
+                    )
+                })
+            }
+            "mcp.tools/call" => {
+                let server = descriptor.args["server"].as_str().unwrap_or_default();
+                let tool = descriptor.args["tool"].as_str().unwrap_or_default();
+                let reference = crate::tools::ToolId::new(server, tool).reference();
+                match manifest.tool_grant(&reference) {
+                    None => Some(format!(
+                        "manifest '{}' does not grant '{reference}' — a tool the                          agent's declaration never listed is authority nobody granted",
+                        manifest.metadata.name
+                    )),
+                    // Compared canonically. The descriptor sorts on the way
+                    // out, so the grant must be sorted too or a manifest whose
+                    // fields were listed in another order is refused for a
+                    // difference that means nothing.
+                    Some(grant)
+                        if serde_json::to_value(crate::tools::sorted_fields(
+                            &grant.protected_fields,
+                        ))
+                        .ok()
+                            != descriptor.args.get("protected_fields").cloned() =>
+                    {
+                        Some(format!(
+                            "manifest '{}' and the live catalogue disagree about protected fields for '{reference}' — authority-bearing argument policy must be digest-covered and exact",
+                            manifest.metadata.name
+                        ))
+                    }
+                    Some(_) => None,
+                }
+            }
+            _ => None,
+        };
+
+        let Some(reason) = refusal else {
+            return Ok(());
+        };
+
+        tracing::error!(
+            target: telemetry::POLICY_DENIED,
+            run = %self.run,
+            step = %self.step,
+            action = crate::core::ACTION_DECLARED,
+            resource = %descriptor.kind,
+            %reason,
+        );
+        metrics::count(metrics::POLICY_DENIALS, crate::core::ACTION_DECLARED);
+
+        // Journaled under the refused effect's key, for the same reason a budget
+        // refusal is: a replay that found no history here would report that the
+        // *build* performs more effects than the record, sending an operator to
+        // look for a code change that does not exist.
+        self.append_effect(
+            key,
+            RecordKind::PolicyDenied {
+                reason: reason.clone(),
+                action: crate::core::ACTION_DECLARED.to_owned(),
+                resource: descriptor.kind.clone(),
+            },
+        )
+        .await?;
+
+        Err(StepError::Denied {
+            action: crate::core::ACTION_DECLARED.to_owned(),
+            resource: descriptor.kind.clone(),
+            reason,
+        })
     }
 
     /// Check an effect against the policy in force, journalling any denial.
@@ -717,6 +988,11 @@ impl<'a> StepCtx<'a> {
         let mut context = serde_json::json!({
             "run": self.run.to_string(),
             "step": self.step.0,
+            // Every authorization request carries the tenant, not only
+            // admission. A gate that knows which tenant is acting at the door
+            // and forgets by the time an effect reaches the world is a gate
+            // that cannot express "this tenant may not call that tool".
+            "tenant": self.tenant.as_str(),
             "mutates": mutates,
             "args": descriptor.args,
         });
@@ -1121,8 +1397,9 @@ impl<'a> StepCtx<'a> {
     ///   is allowed to receive. This is the exfiltration path that actually
     ///   matters: not the network, but a legitimate-looking call carrying a
     ///   secret that was read three steps ago.
-    /// * **Taint gate** — untrusted data may not reach a *mutating* sink without
-    ///   an explicit, journaled declassification.
+    /// * **Authority-bearing fields** — a mutating sink either refuses all
+    ///   untrusted arguments or declares protected JSON fields with explicit
+    ///   trust, source, and sensitivity constraints.
     pub async fn sink<E: Effect>(
         &mut self,
         effect: E,
@@ -1131,7 +1408,55 @@ impl<'a> StepCtx<'a> {
         let sink_name = effect.descriptor().kind;
         let label = args.label();
 
-        let ceiling = effect.max_sensitivity();
+        let Some(bound) = effect.sink_arguments() else {
+            return Err(PolicyError::UnboundSinkArguments { sink: sink_name }.into());
+        };
+        if canon::value_bytes(bound) != canon::value_bytes(args.peek()) {
+            return Err(PolicyError::SinkArgumentsMismatch { sink: sink_name }.into());
+        }
+
+        // Manifest-derived ceilings apply to **live dispatch only**.
+        //
+        // A replay re-executes the deterministic zone and reads every effect
+        // back from the journal; if today's manifest were consulted here, a
+        // tightened ceiling would refuse an effect that already happened and a
+        // loosened one would bless an effect that was refused. Either way the
+        // replay stops reproducing the run and starts re-judging it under rules
+        // that did not exist at the time — which this design rejects for policy
+        // and must reject for declarations too, since a manifest is policy a
+        // reviewer wrote.
+        //
+        // The sink's *own* ceiling still applies: that is code, and a code
+        // change that alters an outcome is divergence, which quarantine exists
+        // to catch.
+        #[cfg(feature = "manifest")]
+        let manifest_gates = !self.mode.is_replaying();
+
+        let ceiling = {
+            let effect_ceiling = effect.max_sensitivity();
+            #[cfg(feature = "manifest")]
+            {
+                // Three ceilings, and the strictest wins: the sink's own, the
+                // agent-wide egress ceiling, and the ceiling on *this tool's*
+                // reviewed grant. The last is the finest-grained of the three —
+                // "this tool may see internal data, that one may not" — and
+                // omitting it made a per-tool declaration decorative.
+                let effect_ceiling = self
+                    .tool_grant_for(&effect.descriptor())
+                    .and_then(|g| g.max_sensitivity)
+                    .filter(|_| manifest_gates)
+                    .map_or(effect_ceiling, |grant| effect_ceiling.min(grant));
+                self.manifest
+                    .as_ref()
+                    .filter(|_| manifest_gates)
+                    .and_then(|m| m.spec.security.max_sensitivity_egress)
+                    .map_or(effect_ceiling, |manifest_ceiling| {
+                        effect_ceiling.min(manifest_ceiling)
+                    })
+            }
+            #[cfg(not(feature = "manifest"))]
+            effect_ceiling
+        };
         if label.sensitivity > ceiling {
             return Err(PolicyError::EgressCeiling {
                 sink: sink_name,
@@ -1141,33 +1466,260 @@ impl<'a> StepCtx<'a> {
             .into());
         }
 
-        if effect.mutates() && label.is_untrusted() {
-            return Err(PolicyError::TaintGate { sink: sink_name }.into());
+        #[cfg(feature = "manifest")]
+        if let (Some(actual), Some(ceiling)) = (
+            effect.delegation_depth(),
+            self.manifest
+                .as_ref()
+                .filter(|_| manifest_gates)
+                .and_then(|m| m.spec.security.max_delegation_depth),
+        ) && actual > usize::from(ceiling)
+        {
+            return Err(PolicyError::DelegationDepth {
+                sink: sink_name,
+                actual,
+                ceiling: usize::from(ceiling),
+            }
+            .into());
         }
 
-        self.effect(effect).await
+        Self::enforce_protected_fields(&effect, args, sink_name)?;
+
+        self.effect_after_sink_gate(effect).await
     }
 
-    /// Take a value out of the information-flow lattice.
+    fn enforce_protected_fields<E: Effect>(
+        effect: &E,
+        args: &Tainted<Value>,
+        sink_name: String,
+    ) -> Result<(), StepError> {
+        let label = args.label();
+        let protected = effect.protected_fields();
+        if protected.is_empty() {
+            if effect.mutates() && label.is_untrusted() {
+                return Err(PolicyError::TaintGate { sink: sink_name }.into());
+            }
+            return Ok(());
+        }
+
+        for field in protected {
+            let path = field.path();
+            let Some(field_label) = args.label_at(path) else {
+                return Err(PolicyError::ProtectedFieldMissing {
+                    sink: sink_name,
+                    path: path.to_owned(),
+                }
+                .into());
+            };
+            if field.requires_trusted() && field_label.is_untrusted() {
+                return Err(PolicyError::ProtectedFieldTaint {
+                    sink: sink_name,
+                    path: path.to_owned(),
+                }
+                .into());
+            }
+            if !field.allowed_sources().is_empty() {
+                let source = field_label
+                    .provenance
+                    .iter()
+                    .find(|source| !field.allowed_sources().contains(*source));
+                if let Some(source) = source {
+                    return Err(PolicyError::ProtectedFieldSource {
+                        sink: sink_name,
+                        path: path.to_owned(),
+                        actual_source: source.to_string(),
+                    }
+                    .into());
+                }
+                if field_label.provenance.is_empty() {
+                    return Err(PolicyError::ProtectedFieldSource {
+                        sink: sink_name,
+                        path: path.to_owned(),
+                        actual_source: "<no provenance>".to_owned(),
+                    }
+                    .into());
+                }
+            }
+            if let Some(field_ceiling) = field.sensitivity_ceiling()
+                && field_label.sensitivity > field_ceiling
+            {
+                return Err(PolicyError::ProtectedFieldSensitivity {
+                    sink: sink_name,
+                    path: path.to_owned(),
+                    actual: field_label.sensitivity,
+                    ceiling: field_ceiling,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Improve a whole value's label, or selected structured field labels.
     ///
-    /// The only exit, and it is never silent: the reason and the label it left
-    /// with are written to the journal, permanently.
-    pub async fn declassify<T>(
+    /// The release is policy-authorized and permanently records the releaser,
+    /// basis, field scope, destination, evidence, and prior label. A selected
+    /// field release is accepted only when the value was assembled with
+    /// [`Tainted::object`](crate::core::Tainted::object) or
+    /// [`Tainted::array`](crate::core::Tainted::array), so precision can never
+    /// be invented after provenance was flattened.
+    pub async fn release(
         &mut self,
-        value: Tainted<T>,
-        reason: impl Into<String>,
-    ) -> Result<T, StepError> {
-        let (inner, label) = value.into_parts();
-        let reason = reason.into();
-        self.append(RecordKind::Declassified { reason, label })
-            .await?;
-        Ok(inner)
+        value: Tainted<Value>,
+        release: crate::core::Release,
+    ) -> Result<Tainted<Value>, StepError> {
+        release
+            .validate()
+            .map_err(|detail| PolicyError::InvalidRelease {
+                detail: detail.to_owned(),
+            })?;
+        let label = value.label().clone();
+        let field_labels = value
+            .field_labels()
+            .map(|(path, label)| (path.to_owned(), label.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let value_bytes = canon::value_bytes(value.peek());
+        let value_digest = crate::core::Digest::of(&value_bytes);
+        let released = value
+            .apply_release(&release)
+            .ok_or(PolicyError::UntrackedReleaseField)?;
+        let result_label = released.label().clone();
+        let result_field_labels = released
+            .field_labels()
+            .map(|(path, label)| (path.to_owned(), label.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let descriptor = EffectDescriptor::new(
+            crate::core::ACTION_RELEASE,
+            serde_json::json!({
+                "release": &release,
+                "label": &label,
+                "field_labels": &field_labels,
+                "result_label": &result_label,
+                "result_field_labels": &result_field_labels,
+                "value": value_digest,
+            }),
+        );
+        let key = EffectKey::derive(
+            self.step,
+            self.phase,
+            self.ordinal,
+            1,
+            &descriptor.kind,
+            &canon::value_bytes(&descriptor.args),
+        );
+        self.ordinal += 1;
+
+        if self.mode.is_replaying() {
+            match self.cursor.next(key)? {
+                Some(EffectReplay::Done { .. }) => return Ok(released),
+                Some(EffectReplay::Denied {
+                    reason,
+                    action,
+                    resource,
+                }) => {
+                    return Err(StepError::Denied {
+                        action,
+                        resource,
+                        reason,
+                    });
+                }
+                Some(_) => {
+                    return Err(StepError::ReplayOverrun { actual: key });
+                }
+                None if self.mode == Mode::Strict => {
+                    return Err(StepError::ReplayOverrun { actual: key });
+                }
+                None => {}
+            }
+        }
+
+        self.authorize_release(key, &release, &label).await?;
+        self.append_effect(
+            key,
+            RecordKind::Released {
+                releaser: self.agent.clone(),
+                release,
+                label,
+                field_labels,
+                result_label,
+                result_field_labels,
+                value: value_digest,
+            },
+        )
+        .await?;
+        Ok(released)
+    }
+
+    /// Authorize a live release from the information-flow lattice.
+    ///
+    /// Historical releases are facts and are never re-judged during replay,
+    /// matching the effect authorization rule. A denial is still journaled:
+    /// otherwise a run would stop at a policy decision with no durable account
+    /// of why it stopped.
+    async fn authorize_release(
+        &mut self,
+        key: EffectKey,
+        release: &crate::core::Release,
+        label: &crate::core::Label,
+    ) -> Result<(), StepError> {
+        let Some(engine) = self.policy.clone() else {
+            return Ok(());
+        };
+
+        let mut context = serde_json::json!({
+            "run": self.run.to_string(),
+            "step": self.step.0,
+            "release": release,
+            "label": label,
+        });
+        merge_identity(&mut context, self.identity.as_ref());
+        let request = crate::core::PolicyRequest {
+            principal: &self.agent,
+            action: crate::core::ACTION_RELEASE,
+            resource: "information_flow.label",
+            context: &context,
+        };
+
+        self.ledger
+            .lock()
+            .expect("budget mutex")
+            .admit_policy_check()
+            .map_err(StepError::Budget)?;
+
+        let crate::core::PolicyDecision::Deny { reason } = engine.authorize(&request) else {
+            return Ok(());
+        };
+
+        tracing::error!(
+            target: telemetry::POLICY_DENIED,
+            run = %self.run,
+            step = %self.step,
+            action = crate::core::ACTION_RELEASE,
+            resource = "information_flow.label",
+            %reason,
+        );
+        metrics::count(metrics::POLICY_DENIALS, crate::core::ACTION_RELEASE);
+        self.append_effect(
+            key,
+            RecordKind::PolicyDenied {
+                reason: reason.clone(),
+                action: crate::core::ACTION_RELEASE.to_owned(),
+                resource: "information_flow.label".to_owned(),
+            },
+        )
+        .await?;
+
+        Err(StepError::Denied {
+            action: crate::core::ACTION_RELEASE.to_owned(),
+            resource: "information_flow.label".to_owned(),
+            reason,
+        })
     }
 
     /// Whether non-effect records should be written right now.
     ///
     /// Effects carry keys and are matched against history individually, so they
-    /// look after themselves. Bookkeeping records — notes, declassifications —
+    /// look after themselves. Bookkeeping records — notes, releases —
     /// have no key, so they need this rule instead:
     ///
     /// * `Live` — always write.
@@ -1229,6 +1781,9 @@ impl<'a> StepCtx<'a> {
                     key,
                     RecordKind::EffectDone {
                         output: json,
+                        // Not an inbound event: only an awaited delivery has a
+                        // sender to record.
+                        source: None,
                         spend,
                     },
                 )
@@ -1349,6 +1904,43 @@ impl StepCtx<'_> {
     /// # Errors
     ///
     /// [`StepError`] if this run has no case, or the read fails.
+    pub async fn case_state(&mut self) -> Result<(Tainted<Value>, CaseVersion), StepError> {
+        let cx = self.case_ctx()?.clone();
+        let snapshot = self
+            .effect(crate::runtime::effects::ReadCaseState {
+                cases: Arc::clone(&cx.cases),
+                case: cx.case_id,
+            })
+            .await?;
+        let snapshot = snapshot.into_unlabelled();
+        // **Untrusted, always.** Case state is shared mutable state: several
+        // runs write it over a process that may last months, and the engine
+        // never interprets a byte of it. So a read is only as trustworthy as
+        // the least trustworthy thing anybody ever wrote — and nothing here
+        // knows what that was.
+        //
+        // Returning `trusted()` made this an exit from the lattice. A skill
+        // holding a model completion could `peek` it into case state and read
+        // it back clean in a later step, or a later *run*, having passed none of
+        // `cx.release`'s policy check and leaving no record that a
+        // declassification happened. Every taint gate downstream then had
+        // nothing to act on, which is the failure the labels exist to prevent.
+        //
+        // Storing the writer's label instead would be no better: it would
+        // describe one write of many and read as authoritative. The join of
+        // every writer is the only honest label, it decays to untrusted the
+        // moment anything untrusted lands, and it never recovers on its own —
+        // so this *is* that answer, without the machinery to arrive at it.
+        //
+        // A caller who genuinely needs it trusted asks for a release, which is
+        // journaled, policy-checked, and names who decided.
+        let label = crate::core::Label::untrusted(crate::core::SourceId::new(format!(
+            "case:{}",
+            cx.case_id
+        )));
+        Ok((Tainted::with_label(snapshot.state, label), snapshot.version))
+    }
+
     /// Store bytes in the blob store and record that this case produced them.
     ///
     /// The reason this lives on the context rather than on the blob store: the
@@ -1357,6 +1949,9 @@ impl StepCtx<'_> {
     /// the matter it belonged to. Writing through here means the association is
     /// made at the only moment it is knowable, so an erasure request can later
     /// be answered by case, which is the only unit anybody actually asks about.
+    /// The association is made before the blob write: a crash can leave a
+    /// harmless dangling link, repaired by retry, but never durable bytes that
+    /// case erasure cannot discover.
     ///
     /// Deliberately **not** a journaled effect. The digest is a pure function of
     /// the bytes, so a replay that re-derives it gets the same answer without
@@ -1368,41 +1963,157 @@ impl StepCtx<'_> {
     ///
     /// If no blob store is configured, if the write fails, or if this step is
     /// not running inside a case.
-    pub async fn store_blob(&mut self, bytes: &[u8]) -> Result<crate::core::Digest, StepError> {
-        let cx = self.case_ctx()?.clone();
+    /// The blob store for this run, sealed to its case.
+    ///
+    /// **Use this rather than a store held from the builder.** With a key ring
+    /// configured, bytes written here are encrypted under the case's data key,
+    /// and a store obtained any other way writes them in the clear — the two
+    /// would disagree about what erasing the case actually erased. It is also
+    /// what a skill passes to
+    /// [`ModelCall::with_media`](crate::model::ModelCall::with_media), so
+    /// materialization reads through the same envelope that sealed the bytes.
+    ///
+    /// # Errors
+    ///
+    /// If no blob store is configured, or the run belongs to no case while a
+    /// key ring is — there would be no erasure unit to scope the key to, and
+    /// falling back to storing in the clear would silently drop the guarantee.
+    pub fn blobs(&self) -> Result<Arc<dyn crate::blob::BlobStore>, StepError> {
+        self.blobs_scoped(None)
+    }
+
+    /// The blob store, sealed to whichever unit owns erasure for these bytes.
+    ///
+    /// `scope` overrides the case, for bytes whose lifecycle another controller
+    /// owns — named external media retention is the only such caller. Sealing
+    /// those under a case they do not belong to would put them in an erasure
+    /// unit that does not own them; not sealing them would leave a hole in a
+    /// deployment that asked for none.
+    fn blobs_scoped(
+        &self,
+        scope: Option<&str>,
+    ) -> Result<Arc<dyn crate::blob::BlobStore>, StepError> {
         let blobs = self.blobs.clone().ok_or_else(|| {
             StepError::Store(crate::core::StoreError::Backend(
-                "no blob store is configured; `Runtime::builder(..).blobs(..)`                  is what lets bytes live outside the journal"
-                    .into(),
+                "no blob store is configured; `Runtime::builder(..).blobs(..)` is what lets \
+                 bytes live outside the journal"
+                    .to_owned(),
             ))
         })?;
-        let digest = blobs
-            .put(bytes)
-            .await
-            .map_err(|e| StepError::Store(crate::core::StoreError::Backend(e.to_string())))?;
+
+        #[cfg(feature = "keyring")]
+        if let Some(keys) = self.keyring.clone() {
+            // The tenant prefixes every scope. Without it two tenants sharing a
+            // key ring collide the moment they use the same case or retention
+            // name — and the collision is invisible until one tenant's erasure
+            // destroys the other's key. `TenantId` refuses `/` for exactly this
+            // reason, so the prefix cannot be forged by naming a tenant
+            // `acme/prod`.
+            let unit = match scope {
+                Some(s) => s.to_owned(),
+                None => self
+                    .case
+                    .as_ref()
+                    .ok_or_else(|| {
+                        StepError::Store(crate::core::StoreError::Backend(
+                            "a key ring is configured but this run belongs to no case and no \
+                             other erasure unit was named, so there is nothing to scope its data \
+                             key to. Bind the run to a case, name an external retention policy, \
+                             or drop the key ring — storing these bytes in the clear would leave \
+                             an erasure that silently does not reach them"
+                                .to_owned(),
+                        ))
+                    })?
+                    .case_id
+                    .to_string(),
+            };
+            let scope = crate::keyring::scope(&self.tenant, &unit);
+            return Ok(Arc::new(crate::keyring::EncryptedBlobs::new(
+                blobs, keys, scope,
+            )));
+        }
+        let _ = scope;
+        Ok(blobs)
+    }
+
+    pub async fn store_blob(&mut self, bytes: &[u8]) -> Result<crate::core::Digest, StepError> {
+        let cx = self.case_ctx()?.clone();
+        let digest = crate::core::Digest::of(bytes);
+        // Through `blobs()`, so a sealed deployment seals these too rather than
+        // having one write path that encrypts and another that does not.
+        let blobs = if self.mode == Mode::Strict {
+            None
+        } else {
+            Some(self.blobs()?)
+        };
         let at = self.now().await?;
+        let Some(blobs) = blobs else {
+            return Ok(digest);
+        };
+        // Link before put: a crash may leave a dangling, erasable reference,
+        // but can never leave durable bytes unreachable from case erasure.
         cx.cases
             .link_blob(cx.case_id, digest, at)
             .await
             .map_err(StepError::Store)?;
+        let stored = blobs
+            .put(bytes)
+            .await
+            .map_err(|e| StepError::Store(crate::core::StoreError::Backend(e.to_string())))?;
+        debug_assert_eq!(stored, digest, "blob stores compute the content digest");
         Ok(digest)
     }
 
-    pub async fn case_state(&mut self) -> Result<(Tainted<Value>, CaseVersion), StepError> {
-        let cx = self.case_ctx()?.clone();
-        let snapshot = self
-            .effect(crate::runtime::effects::ReadCaseState {
-                cases: Arc::clone(&cx.cases),
+    /// Fetch remote media through the governed, replayable ingestion boundary.
+    ///
+    /// The URL stays labelled and is bound byte-for-byte to the fetch effect.
+    /// The fetcher checks and pins DNS, validates every redirect, caps time and
+    /// bytes, refuses content coding and ungranted media types, runs configured
+    /// validators, and writes the bytes to content-addressed blob storage. The
+    /// journal receives only [`FetchedMedia`](crate::media::FetchedMedia).
+    ///
+    /// When the run belongs to a case, the digest is linked before blob storage
+    /// so [`erase_case`](crate::blob::erase_case) can enforce retention even
+    /// across crashes. Strict replay consumes the same clock record but never
+    /// rewrites that link.
+    ///
+    /// # Errors
+    ///
+    /// If no blob store is configured, any fetch control refuses the URL or
+    /// response, validation fails, or blob/case storage fails.
+    #[cfg(feature = "media")]
+    pub async fn fetch_media(
+        &mut self,
+        fetcher: &crate::media::GovernedMedia,
+        url: Tainted<String>,
+    ) -> Result<Tainted<crate::media::FetchedMedia>, StepError> {
+        if fetcher.requires_case() && self.case.is_none() {
+            return Err(StepError::Store(crate::core::StoreError::Backend(
+                "governed media requires a case for retention; configure a named external retention policy only when another lifecycle controller owns erasure"
+                    .to_owned(),
+            )));
+        }
+        // Through the sealed accessor: media bytes are payload bytes, and a
+        // fetch path that wrote them in the clear would leave exactly the hole
+        // this deployment configured a key ring to close.
+        // Propagated rather than replaced. Mapping every failure onto "no blob
+        // store is configured" would report a missing *erasure unit* as a
+        // missing store, and send whoever reads it to fix the wrong thing.
+        let blobs = self.blobs_scoped(fetcher.external_scope())?;
+        let raw = url.peek().clone();
+        let arguments = Tainted::object([("url".to_owned(), url.map(Value::String))]);
+        let case_link = if let Some(cx) = self.case.clone() {
+            let at = self.now().await?;
+            (self.mode != Mode::Strict).then_some(crate::media::MediaCaseLink {
+                cases: cx.cases,
                 case: cx.case_id,
+                at,
             })
-            .await?;
-        let snapshot = snapshot.into_unlabelled();
-        // Case state is data the engine never interprets, and it may well have
-        // come from an earlier untrusted source. It is handed back labeled.
-        Ok((
-            Tainted::with_label(snapshot.state, crate::core::Label::trusted()),
-            snapshot.version,
-        ))
+        } else {
+            None
+        };
+        self.sink(fetcher.effect(blobs, &raw, case_link), &arguments)
+            .await
     }
 
     /// Replace the case's opaque state, if it is still at `at`.
@@ -1754,11 +2465,16 @@ impl StepCtx<'_> {
                 key,
                 RecordKind::EffectDone {
                     output: buffered.event.payload.clone(),
+                    source: Some(buffered.event.source.clone()),
                     spend: crate::core::Spend::default(),
                 },
             )
             .await?;
-            return Ok(Self::label_inbound(buffered.event.payload, &spec.kind));
+            return Ok(Self::label_inbound(
+                buffered.event.payload,
+                &spec.kind,
+                Some(&buffered.event.source),
+            ));
         }
 
         Err(StepError::Suspended(self.suspend_reason(spec, &cx).await?))
@@ -1784,8 +2500,25 @@ impl StepCtx<'_> {
 
     /// An inbound message is external data by definition, and is labeled as
     /// such — including when it comes from a first-party system.
-    fn label_inbound(payload: Value, kind: &str) -> Tainted<Value> {
-        Tainted::from_source(payload, crate::core::SourceId::new(format!("event:{kind}")))
+    ///
+    /// The label names the *kind*, not the sender, and that is a limitation
+    /// rather than a choice. A replayed run rebuilds this from the recorded
+    /// await, which carries the payload and not the source — so deriving the
+    /// label from `InboundEvent::source` would give a live run and its replay
+    /// two different labels, which is divergence. Naming the sender in
+    /// provenance needs the source journaled with the await first.
+    fn label_inbound(payload: Value, kind: &str, source: Option<&str>) -> Tainted<Value> {
+        let mut label =
+            crate::core::Label::untrusted(crate::core::SourceId::new(format!("event:{kind}")));
+        // Provenance accumulates, so the kind and the sender are both there: a
+        // sink may allow an authority-bearing field from `event:ack` generally,
+        // or from one counterparty in particular.
+        if let Some(source) = source {
+            label
+                .provenance
+                .insert(crate::core::SourceId::new(format!("sender:{source}")));
+        }
+        Tainted::with_label(payload, label)
     }
 
     /// The instant an obligation falls due.
@@ -1826,7 +2559,7 @@ impl StepCtx<'_> {
 /// Fold a delegation chain into a policy context object.
 ///
 /// Merged rather than nested under a key so a rule reads `context.owner` and
-/// `context.delegation_depth` directly — which is the shape §11.1's Cedar
+/// `context.delegation_depth` directly — which is the shape the Cedar
 /// examples assume, and a rule that has to reach through an extra level is a
 /// rule somebody writes wrong once.
 pub(crate) fn merge_identity(
@@ -1867,5 +2600,100 @@ mod tests {
         let c: u64 = seeded_rng(other, StepId(0)).random();
         assert_ne!(a, b, "steps must not share a stream");
         assert_ne!(a, c, "runs must not share a stream");
+    }
+}
+
+/// One agent commissioning another on the same plane.
+///
+/// An effect rather than a direct call, so the sub-run's answer is journaled
+/// under a key and a replay reads it back. Its arguments carry the label, so
+/// commissioning the same work with a *differently trusted* brief is a different
+/// effect rather than a cache hit on this one.
+#[derive(Debug)]
+struct Commission {
+    capability: String,
+    input: Value,
+    label: crate::core::Label,
+    plane: std::sync::Weak<super::Runtime>,
+}
+
+/// What a commission produced, and what it cost.
+///
+/// The cost travels with the answer because [`Effect::spend`] is handed the
+/// output and nothing else — a commission whose output were the bare answer
+/// could not report what the sub-run spent.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Commissioned {
+    answer: Value,
+    tokens: u64,
+    minor_units: i64,
+}
+
+#[async_trait::async_trait]
+impl Effect for Commission {
+    type Output = Commissioned;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "agent.commission",
+            serde_json::json!({
+                "capability": self.capability,
+                "input": self.input,
+                "label": self.label,
+            }),
+        )
+    }
+
+    /// Commissioning is not itself a mutation of the world: whatever the
+    /// sub-run does is journaled in the sub-run, where it belongs.
+    fn mutates(&self) -> bool {
+        false
+    }
+
+    /// Another agent's answer is somebody else's data.
+    fn trust(&self) -> crate::core::Trust {
+        crate::core::Trust::Untrusted
+    }
+
+    /// Bill the commissioning run for what the sub-run spent, so a delegating
+    /// agent's ceiling bounds the work it ordered.
+    fn spend(&self, output: &Self::Output) -> crate::core::Spend {
+        crate::core::Spend {
+            tokens: output.tokens,
+            minor_units: output.minor_units,
+        }
+    }
+
+    async fn perform(&self) -> Result<Self::Output, crate::core::EffectError> {
+        let plane = self
+            .plane
+            .upgrade()
+            .ok_or_else(|| crate::core::EffectError::Other("the plane is gone".into()))?;
+
+        // `Interrupted`, not `Rejected`: this caller cannot know whether the
+        // commissioned agent performed effects before it failed, and asserting
+        // that nothing was applied would be a claim it has no basis for.
+        let out = plane
+            .run_tainted(
+                &self.capability,
+                Tainted::with_label(self.input.clone(), self.label.clone()),
+            )
+            .await
+            .map_err(|e| crate::core::EffectError::Interrupted {
+                driver: self.capability.clone(),
+                detail: e.to_string(),
+            })?;
+
+        let answer = out
+            .output
+            .ok_or_else(|| crate::core::EffectError::Interrupted {
+                driver: self.capability.clone(),
+                detail: format!("'{}' finished without producing output", self.capability),
+            })?;
+        Ok(Commissioned {
+            answer,
+            tokens: out.spend.tokens,
+            minor_units: out.spend.minor_units,
+        })
     }
 }

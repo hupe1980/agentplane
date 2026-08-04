@@ -111,7 +111,7 @@ fn store() -> Arc<RedbStore> {
     Arc::new(RedbStore::open_in_memory().unwrap())
 }
 
-fn runtime(store: Arc<dyn JournalStore>, world: &World) -> Runtime {
+fn runtime(store: Arc<dyn JournalStore>, world: &World) -> Arc<Runtime> {
     Runtime::builder(store)
         .owner("faults")
         .skill(Charger {

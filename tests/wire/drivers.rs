@@ -25,12 +25,15 @@ use agentplane::core::{Delegation, Disposition, Principal, Scope};
 use agentplane::model::anthropic::Anthropic;
 use agentplane::model::openai::OpenAi;
 use agentplane::model::{ModelError, ModelId, ModelProvider, SchemaMode};
-use agentplane::peers::a2a::{A2aClient, EXTENSION_URI, Endpoint};
+use agentplane::peers::a2a::{A2aClient, EXTENSION_URI, Endpoint, PROTOCOL_VERSION};
 use agentplane::peers::{PeerClient, PeerError, PeerId};
 use axum::Router;
 use axum::extract::State;
 use axum::routing::post;
 use serde_json::{Value, json};
+
+type SeenBody = Arc<std::sync::Mutex<Option<Value>>>;
+type SeenHeaders = Arc<std::sync::Mutex<Option<axum::http::HeaderMap>>>;
 
 /// Answers every request with a canned body and status.
 #[derive(Clone)]
@@ -38,14 +41,17 @@ struct Canned {
     status: u16,
     body: Value,
     /// What the server saw, so a test can assert what we sent.
-    seen: Arc<std::sync::Mutex<Option<Value>>>,
+    seen: SeenBody,
+    seen_headers: SeenHeaders,
 }
 
 async fn handle(
     State(canned): State<Canned>,
+    headers: axum::http::HeaderMap,
     body: Option<axum::Json<Value>>,
 ) -> (axum::http::StatusCode, axum::Json<Value>) {
     *canned.seen.lock().unwrap() = body.map(|b| b.0);
+    *canned.seen_headers.lock().unwrap() = Some(headers);
     (
         axum::http::StatusCode::from_u16(canned.status).unwrap(),
         axum::Json(canned.body),
@@ -67,16 +73,24 @@ async fn serve(canned: Canned) -> String {
     format!("http://{addr}")
 }
 
-fn canned(status: u16, body: Value) -> (Canned, Arc<std::sync::Mutex<Option<Value>>>) {
+fn canned_observed(status: u16, body: Value) -> (Canned, SeenBody, SeenHeaders) {
     let seen = Arc::new(std::sync::Mutex::new(None));
+    let seen_headers = Arc::new(std::sync::Mutex::new(None));
     (
         Canned {
             status,
             body,
             seen: Arc::clone(&seen),
+            seen_headers: Arc::clone(&seen_headers),
         },
         seen,
+        seen_headers,
     )
+}
+
+fn canned(status: u16, body: Value) -> (Canned, SeenBody) {
+    let (canned, seen, _) = canned_observed(status, body);
+    (canned, seen)
 }
 
 fn chain() -> Delegation {
@@ -88,7 +102,9 @@ fn chain() -> Delegation {
 /// A JSON-RPC decline is `DidNotHappen`: the peer read it and refused.
 #[tokio::test]
 async fn a_declined_request_did_not_happen() {
-    for code in [-32700, -32600, -32601, -32602, -32001, -32004, -32006] {
+    for code in [
+        -32700, -32600, -32601, -32602, -32001, -32004, -32005, -32007, -32008, -32009,
+    ] {
         let (c, _) = canned(
             200,
             json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": "no" } }),
@@ -112,6 +128,35 @@ async fn a_declined_request_did_not_happen() {
             "code {code} was not read as a clean refusal: {err}"
         );
     }
+}
+
+/// A2A 1.0 defines `-32006` as `InvalidAgentResponseError` and maps it to
+/// INTERNAL/HTTP 500. It cannot prove that this request caused no work.
+#[tokio::test]
+async fn an_invalid_agent_response_is_in_doubt() {
+    let (c, _) = canned(
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "code": -32006, "message": "invalid agent response" }
+        }),
+    );
+    let url = serve(c).await;
+    let client = A2aClient::new(Endpoint::new(url)).unwrap();
+    let err = client
+        .send(
+            &PeerId::new("peer"),
+            "audit.check",
+            &json!({}),
+            &chain(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.disposition(), Disposition::InDoubt, "{err}");
+    assert!(matches!(err, PeerError::InvalidResponse { .. }), "{err}");
 }
 
 /// An internal error is **not** a refusal.
@@ -196,7 +241,17 @@ async fn a_failed_task_landed() {
         200,
         json!({
             "jsonrpc": "2.0", "id": 1,
-            "result": { "id": "task-1", "status": { "state": "failed", "message": "declined" } }
+            "result": { "task": {
+                "id": "task-1",
+                "status": {
+                    "state": "TASK_STATE_FAILED",
+                    "message": {
+                        "messageId": "failure-1",
+                        "role": "ROLE_AGENT",
+                        "parts": [{ "text": "declined" }]
+                    }
+                }
+            } }
         }),
     );
     let url = serve(c).await;
@@ -227,7 +282,9 @@ async fn an_accepted_task_is_not_a_failure() {
         200,
         json!({
             "jsonrpc": "2.0", "id": 1,
-            "result": { "id": "task-9", "status": { "state": "working" } }
+            "result": { "task": {
+                "id": "task-9", "status": { "state": "TASK_STATE_WORKING" }
+            } }
         }),
     );
     let url = serve(c).await;
@@ -270,7 +327,16 @@ async fn an_unreachable_peer_did_not_happen() {
 /// The delegation chain travels under a declared extension URI.
 #[tokio::test]
 async fn the_delegation_chain_rides_a_declared_extension() {
-    let (c, seen) = canned(200, json!({ "jsonrpc": "2.0", "id": 1, "result": {} }));
+    let (c, seen, seen_headers) = canned_observed(
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "message": {
+                "messageId": "reply-1", "role": "ROLE_AGENT", "parts": [{ "data": {} }]
+            } }
+        }),
+    );
     let url = serve(c).await;
     let client = A2aClient::new(Endpoint::new(url)).unwrap();
     client
@@ -287,6 +353,12 @@ async fn the_delegation_chain_rides_a_declared_extension() {
 
     let body = seen.lock().unwrap().clone().expect("the server saw a body");
     let msg = &body["params"]["message"];
+    assert_eq!(body["method"], "SendMessage");
+    assert_eq!(msg["role"], "ROLE_USER");
+    assert!(
+        msg["parts"][0].get("kind").is_none(),
+        "A2A 1.0 removed the legacy part discriminator: {body}"
+    );
     assert_eq!(
         msg["extensions"][0], EXTENSION_URI,
         "the extension is not declared, so a peer cannot say it understood it"
@@ -296,6 +368,36 @@ async fn the_delegation_chain_rides_a_declared_extension() {
         "the delegation chain did not travel: {body}"
     );
     assert_eq!(msg["parts"][0]["data"]["doc"], "INV-1");
+    let headers = seen_headers.lock().unwrap();
+    let headers = headers.as_ref().expect("the server saw headers");
+    assert_eq!(headers["a2a-version"], PROTOCOL_VERSION);
+    assert_eq!(headers["a2a-extensions"], EXTENSION_URI);
+}
+
+/// A successful response that violates the `SendMessageResponse` oneof is
+/// unknown after dispatch, never a retryable clean rejection.
+#[tokio::test]
+async fn a_malformed_send_message_response_is_in_doubt() {
+    for result in [
+        json!({}),
+        json!({ "task": {}, "message": {} }),
+        json!({ "task": "not-an-object" }),
+    ] {
+        let (c, _) = canned(200, json!({ "jsonrpc": "2.0", "id": 1, "result": result }));
+        let client = A2aClient::new(Endpoint::new(serve(c).await)).unwrap();
+        let err = client
+            .send(
+                &PeerId::new("peer"),
+                "audit.check",
+                &json!({}),
+                &chain(),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.disposition(), Disposition::InDoubt, "{err}");
+    }
 }
 
 // ── The model driver: what a failure consumed ───────────────────────────────
@@ -330,6 +432,48 @@ async fn a_completion_reports_what_it_cost() {
     let body = seen.lock().unwrap().clone().unwrap();
     assert_eq!(body["model"], "claude-opus-5");
     assert_eq!(body["messages"][0]["content"], "say hello");
+}
+
+/// Remote media must not escape inside an otherwise governed model request.
+///
+/// The provider would fetch this URL from its own network, outside the plane's
+/// egress policy and journal. Refusing before the model endpoint is reached is
+/// the safe hard cut until a governed fetch effect can replace the URL with
+/// bytes.
+#[tokio::test]
+async fn anthropic_never_receives_a_provider_fetched_media_url() {
+    let (c, seen) = canned(
+        200,
+        json!({
+            "content": [{ "type": "text", "text": "should not run" }],
+            "usage": { "input_tokens": 1, "output_tokens": 1 },
+            "stop_reason": "end_turn"
+        }),
+    );
+    let provider = Anthropic::new("k").unwrap().base(serve(c).await).buffered();
+    let prompt = json!({
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "source": {
+                    "type": "url",
+                    "url": "https://media.example/private.png"
+                }
+            }]
+        }]
+    });
+
+    let err = provider
+        .complete(ask(&model(), &prompt))
+        .await
+        .expect_err("provider-side URL fetching must be refused");
+    assert!(matches!(err, ModelError::Refused { .. }), "{err}");
+    assert_eq!(err.disposition(), Disposition::DidNotHappen);
+    assert!(
+        seen.lock().unwrap().is_none(),
+        "the model endpoint was reached before the media URL was refused"
+    );
 }
 
 /// A refusal before generating cost nothing.
@@ -446,11 +590,47 @@ fn ask<'a>(model: &'a ModelId, prompt: &'a Value) -> agentplane::model::Request<
         model,
         prompt,
         schema: None,
+        tools: &[],
+        exchanges: &[],
     }
 }
 
 fn gpt() -> ModelId {
     ModelId::new("openai", "gpt-5")
+}
+
+/// The `OpenAI` Responses spelling of the same provider-side fetch is refused.
+#[tokio::test]
+async fn openai_never_receives_a_provider_fetched_media_url() {
+    let (c, seen) = canned(
+        200,
+        json!({
+            "status": "completed",
+            "output": [{ "content": [{ "type": "output_text", "text": "should not run" }] }],
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        }),
+    );
+    let provider = OpenAi::new("k").unwrap().base(serve(c).await).buffered();
+    let prompt = json!({
+        "input": [{
+            "role": "user",
+            "content": [{
+                "type": "input_image",
+                "image_url": "https://media.example/private.png"
+            }]
+        }]
+    });
+
+    let err = provider
+        .complete(ask(&gpt(), &prompt))
+        .await
+        .expect_err("provider-side URL fetching must be refused");
+    assert!(matches!(err, ModelError::Refused { .. }), "{err}");
+    assert_eq!(err.disposition(), Disposition::DidNotHappen);
+    assert!(
+        seen.lock().unwrap().is_none(),
+        "the model endpoint was reached before the media URL was refused"
+    );
 }
 
 /// A completed response, with reasoning tokens counted.
@@ -696,6 +876,8 @@ async fn a_schema_is_sent_as_a_strict_constraint() {
             model: &gpt(),
             prompt: &json!("how much"),
             schema: Some(&sch),
+            tools: &[],
+            exchanges: &[],
         })
         .await
         .unwrap();
@@ -733,6 +915,8 @@ async fn the_anthropic_driver_sends_a_schema_too() {
             model: &model(),
             prompt: &json!("how much"),
             schema: Some(&sch),
+            tools: &[],
+            exchanges: &[],
         })
         .await
         .unwrap();
@@ -767,6 +951,8 @@ async fn an_unparseable_structured_answer_is_billed_and_loud() {
             model: &gpt(),
             prompt: &json!("x"),
             schema: Some(&sch),
+            tools: &[],
+            exchanges: &[],
         })
         .await
         .unwrap_err();
@@ -839,6 +1025,8 @@ async fn anthropic_can_emulate_a_schema_with_a_forced_tool() {
             model: &model(),
             prompt: &json!("how much"),
             schema: Some(&sch),
+            tools: &[],
+            exchanges: &[],
         })
         .await
         .unwrap();
@@ -890,6 +1078,8 @@ async fn openai_can_emulate_a_schema_with_a_forced_tool() {
             model: &gpt(),
             prompt: &json!("how much"),
             schema: Some(&sch),
+            tools: &[],
+            exchanges: &[],
         })
         .await
         .unwrap();
@@ -935,6 +1125,8 @@ async fn the_schema_mode_is_chosen_per_model() {
             model: &ModelId::new("anthropic", "claude-legacy-1"),
             prompt: &json!("x"),
             schema: Some(&sch),
+            tools: &[],
+            exchanges: &[],
         })
         .await
         .unwrap();
@@ -965,6 +1157,8 @@ async fn the_schema_mode_is_chosen_per_model() {
             model: &ModelId::new("anthropic", "claude-opus-4-5"),
             prompt: &json!("x"),
             schema: Some(&sch),
+            tools: &[],
+            exchanges: &[],
         })
         .await
         .unwrap();
@@ -1004,6 +1198,8 @@ async fn a_model_that_ignores_the_forced_tool_is_caught() {
             model: &model(),
             prompt: &json!("x"),
             schema: Some(&sch),
+            tools: &[],
+            exchanges: &[],
         })
         .await
         .unwrap_err();
@@ -1053,6 +1249,8 @@ async fn an_incompatible_schema_is_refused_with_the_reason() {
                 model: &gpt(),
                 prompt: &json!("x"),
                 schema: Some(&sch),
+                tools: &[],
+                exchanges: &[],
             })
             .await
             .unwrap_err();
@@ -1092,6 +1290,8 @@ async fn a_conformant_schema_is_not_rewritten() {
             model: &gpt(),
             prompt: &json!("x"),
             schema: Some(&sch),
+            tools: &[],
+            exchanges: &[],
         })
         .await
         .expect("a conformant schema must be accepted");
@@ -1457,6 +1657,8 @@ data: {\"type\":\"message_stop\"}
             model: &model(),
             prompt: &prompt,
             schema: Some(&sch),
+            tools: &[],
+            exchanges: &[],
         })
         .await
         .unwrap();
@@ -1498,6 +1700,8 @@ data: {\"type\":\"message_stop\"}
             model: &model(),
             prompt: &prompt,
             schema: Some(&sch),
+            tools: &[],
+            exchanges: &[],
         })
         .await
         .expect_err("the fragments do not reassemble into JSON");
@@ -1627,7 +1831,12 @@ data: {{\"type\":\"response.incomplete\",\"response\":{{\"status\":\"incomplete\
 async fn a_peer_call_carries_attested_provenance() {
     let (c, seen) = canned(
         200,
-        json!({ "jsonrpc": "2.0", "id": 1, "result": { "id": "t", "status": { "state": "completed" } } }),
+        json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "task": {
+                "id": "t", "status": { "state": "TASK_STATE_COMPLETED" }
+            } }
+        }),
     );
     let url = serve(c).await;
     let client = A2aClient::new(Endpoint::new(url)).unwrap();
@@ -1682,7 +1891,12 @@ async fn a_peer_call_carries_attested_provenance() {
 async fn a_peer_call_without_provenance_sends_none() {
     let (c, seen) = canned(
         200,
-        json!({ "jsonrpc": "2.0", "id": 1, "result": { "id": "t", "status": { "state": "completed" } } }),
+        json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "task": {
+                "id": "t", "status": { "state": "TASK_STATE_COMPLETED" }
+            } }
+        }),
     );
     let url = serve(c).await;
     let client = A2aClient::new(Endpoint::new(url)).unwrap();
@@ -1838,4 +2052,40 @@ async fn without_an_allowlist_nothing_is_restricted() {
         .complete(ask(&model(), &prompt))
         .await
         .expect("no egress policy means no egress control");
+}
+
+/// A retried peer call carries the same `messageId`.
+///
+/// A2A deduplicates on `messageId`, so the answer to "have I already done this
+/// work?" must be *yes* for a retry. The effect key cannot supply that: it
+/// hashes the attempt number, because a retry must not collide with the
+/// recorded failure of the attempt before it. Two questions, two identifiers —
+/// and using the wrong one lets a peer act twice on one logical call.
+#[test]
+fn a_retry_keeps_the_peers_duplicate_detection_key() {
+    use agentplane::core::{EffectKey, Provenance, RunId};
+
+    let run = RunId::generate();
+    // What the runtime derives for two attempts of one dispatch.
+    let dispatch = EffectKey::from_hex(&"aa".repeat(32)).expect("key");
+    let attempt_one = EffectKey::from_hex(&"11".repeat(32)).expect("key");
+    let attempt_two = EffectKey::from_hex(&"22".repeat(32)).expect("key");
+
+    let first = Provenance::new(run, attempt_one, "agent").dispatching(dispatch);
+    let second = Provenance::new(run, attempt_two, "agent").dispatching(dispatch);
+
+    assert_ne!(
+        first.effect, second.effect,
+        "attempts must differ, or replay reads back the wrong record"
+    );
+    assert_eq!(
+        first.dedupe_key(),
+        second.dedupe_key(),
+        "both attempts are one logical call, so the peer must see one message id"
+    );
+
+    // Without a dispatch id the effect key is the fallback — wrong across
+    // retries, right for anything that never retries, and never silently absent.
+    let bare = Provenance::new(run, attempt_one, "agent");
+    assert_eq!(bare.dedupe_key(), attempt_one);
 }

@@ -11,7 +11,7 @@
 //!
 //! > **Model output derived from untrusted input stays untrusted.**
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,331 @@ pub struct Label {
     pub provenance: BTreeSet<SourceId>,
     pub trust: Trust,
     pub sensitivity: Sensitivity,
+}
+
+/// A stricter information-flow rule for one JSON field sent to a sink.
+///
+/// Paths use RFC 6901 JSON Pointer syntax. An operator can require a protected
+/// field to remain trusted, or permit it only when every contributing source is
+/// in an explicit set. Ordinary content fields may remain untrusted without
+/// granting them influence over recipient, amount, command, path, URL, tenant,
+/// audience, model, or tool selectors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectedField {
+    path: String,
+    #[serde(default)]
+    require_trusted: bool,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    allowed_sources: BTreeSet<SourceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_sensitivity: Option<Sensitivity>,
+}
+
+/// A typed request to improve labels on a whole value or selected JSON fields.
+///
+/// Every release names its basis, destination, field scope, and evidence. The
+/// runtime supplies the releaser identity, asks policy, and journals all of it.
+/// This prevents a reason string from serving as an unstructured universal
+/// escape hatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Release {
+    scope: ReleaseScope,
+    basis: String,
+    destination: String,
+    fields: BTreeSet<String>,
+    evidence: BTreeSet<String>,
+}
+
+/// Which label dimensions an authorized release may improve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseScope {
+    trust: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sensitivity: Option<Sensitivity>,
+}
+
+impl ReleaseScope {
+    /// Improve trust to `trusted` while retaining provenance and sensitivity.
+    #[must_use]
+    pub const fn trust() -> Self {
+        Self {
+            trust: true,
+            sensitivity: None,
+        }
+    }
+
+    /// Lower sensitivity to the named classification while retaining trust.
+    #[must_use]
+    pub const fn sensitivity(target: Sensitivity) -> Self {
+        Self {
+            trust: false,
+            sensitivity: Some(target),
+        }
+    }
+
+    /// Improve trust and lower sensitivity in one indivisible policy decision.
+    #[must_use]
+    pub const fn trust_and_sensitivity(target: Sensitivity) -> Self {
+        Self {
+            trust: true,
+            sensitivity: Some(target),
+        }
+    }
+}
+
+impl Release {
+    /// Release an entire value.
+    ///
+    /// # Panics
+    ///
+    /// If basis, destination, or evidence is empty.
+    #[must_use]
+    pub fn whole(
+        scope: ReleaseScope,
+        basis: impl Into<String>,
+        destination: impl Into<String>,
+        evidence: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self::new(scope, [String::new()], basis, destination, evidence)
+    }
+
+    /// Release selected fields identified by absolute JSON Pointers.
+    ///
+    /// # Panics
+    ///
+    /// If the field set, basis, destination, or evidence is empty; a field is
+    /// not an absolute RFC 6901 JSON Pointer; or whole-value and field scopes
+    /// are mixed.
+    #[must_use]
+    pub fn fields(
+        scope: ReleaseScope,
+        fields: impl IntoIterator<Item = String>,
+        basis: impl Into<String>,
+        destination: impl Into<String>,
+        evidence: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self::new(scope, fields, basis, destination, evidence)
+    }
+
+    fn new(
+        scope: ReleaseScope,
+        fields: impl IntoIterator<Item = String>,
+        basis: impl Into<String>,
+        destination: impl Into<String>,
+        evidence: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let basis = basis.into();
+        let destination = destination.into();
+        let fields = fields.into_iter().collect::<BTreeSet<_>>();
+        let evidence = evidence.into_iter().collect::<BTreeSet<_>>();
+        assert!(
+            scope.trust || scope.sensitivity.is_some(),
+            "a release scope must improve trust, sensitivity, or both"
+        );
+        assert!(!basis.trim().is_empty(), "a release must state its basis");
+        assert!(
+            !destination.trim().is_empty(),
+            "a release must name its destination"
+        );
+        assert!(!fields.is_empty(), "a release must name at least one field");
+        assert!(
+            fields.len() == 1 || !fields.contains(""),
+            "a whole-value release cannot be mixed with field releases"
+        );
+        for path in &fields {
+            if !path.is_empty() {
+                assert_json_pointer(path);
+            }
+        }
+        assert!(
+            !evidence.is_empty() && evidence.iter().all(|item| !item.trim().is_empty()),
+            "a release must carry non-empty evidence"
+        );
+        Self {
+            scope,
+            basis,
+            destination,
+            fields,
+            evidence,
+        }
+    }
+
+    #[must_use]
+    pub fn basis(&self) -> &str {
+        &self.basis
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> ReleaseScope {
+        self.scope
+    }
+
+    #[must_use]
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+
+    #[must_use]
+    pub fn fields_scope(&self) -> &BTreeSet<String> {
+        &self.fields
+    }
+
+    #[must_use]
+    pub fn evidence(&self) -> &BTreeSet<String> {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub fn is_whole_value(&self) -> bool {
+        self.fields.contains("")
+    }
+
+    /// Validate a release deserialized from outside the safe constructors.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.scope.trust && self.scope.sensitivity.is_none() {
+            return Err("scope must improve trust, sensitivity, or both");
+        }
+        if self.basis.trim().is_empty() || self.destination.trim().is_empty() {
+            return Err("basis and destination must be non-empty");
+        }
+        if self.fields.is_empty()
+            || (self.fields.len() > 1 && self.fields.contains(""))
+            || self
+                .fields
+                .iter()
+                .any(|path| !path.is_empty() && !is_json_pointer(path))
+        {
+            return Err("field scope is not a valid whole-value or JSON Pointer selection");
+        }
+        if self.evidence.is_empty() || self.evidence.iter().any(|item| item.trim().is_empty()) {
+            return Err("evidence must contain at least one non-empty reference");
+        }
+        Ok(())
+    }
+}
+
+impl ProtectedField {
+    /// Require a field to derive only from trusted data.
+    ///
+    /// # Panics
+    ///
+    /// If `path` is not an absolute JSON Pointer.
+    #[must_use]
+    pub fn trusted(path: impl Into<String>) -> Self {
+        let path = path.into();
+        assert_json_pointer(&path);
+        Self {
+            path,
+            require_trusted: true,
+            allowed_sources: BTreeSet::new(),
+            max_sensitivity: None,
+        }
+    }
+
+    /// Permit an untrusted field only when all of its provenance is drawn from
+    /// the named sources.
+    ///
+    /// An empty source set would permit nothing while looking configured, so it
+    /// is rejected at construction.
+    ///
+    /// # Panics
+    ///
+    /// If `path` is not an absolute JSON Pointer or `sources` is empty.
+    #[must_use]
+    pub fn from_sources(
+        path: impl Into<String>,
+        sources: impl IntoIterator<Item = SourceId>,
+    ) -> Self {
+        let path = path.into();
+        assert_json_pointer(&path);
+        let allowed_sources = sources.into_iter().collect::<BTreeSet<_>>();
+        assert!(
+            !allowed_sources.is_empty(),
+            "a protected field source constraint must name at least one source"
+        );
+        Self {
+            path,
+            require_trusted: false,
+            allowed_sources,
+            max_sensitivity: None,
+        }
+    }
+
+    /// Apply a field-specific sensitivity ceiling stricter than the sink-wide
+    /// ceiling.
+    #[must_use]
+    pub const fn max_sensitivity(mut self, sensitivity: Sensitivity) -> Self {
+        self.max_sensitivity = Some(sensitivity);
+        self
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    #[must_use]
+    pub const fn requires_trusted(&self) -> bool {
+        self.require_trusted
+    }
+
+    #[must_use]
+    pub fn allowed_sources(&self) -> &BTreeSet<SourceId> {
+        &self.allowed_sources
+    }
+
+    #[must_use]
+    pub const fn sensitivity_ceiling(&self) -> Option<Sensitivity> {
+        self.max_sensitivity
+    }
+
+    /// Validate a rule deserialized from an external declaration.
+    ///
+    /// Constructors enforce these invariants for Rust callers; manifests and
+    /// other serialized inputs must prove them after deserialization.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !is_json_pointer(&self.path) {
+            return Err("path must be a non-empty absolute RFC 6901 JSON Pointer");
+        }
+        if self.require_trusted && !self.allowed_sources.is_empty() {
+            return Err("require_trusted and allowed_sources are mutually exclusive");
+        }
+        if !self.require_trusted
+            && self.allowed_sources.is_empty()
+            && self.max_sensitivity.is_none()
+        {
+            return Err("at least one trust, source, or sensitivity constraint is required");
+        }
+        Ok(())
+    }
+}
+
+fn assert_json_pointer(path: &str) {
+    assert!(
+        is_json_pointer(path),
+        "a protected field path must be a non-empty absolute RFC 6901 JSON Pointer"
+    );
+}
+
+fn is_json_pointer(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'~' {
+            index += 1;
+            if index == bytes.len() || !matches!(bytes[index], b'0' | b'1') {
+                return false;
+            }
+        }
+        index += 1;
+    }
+    true
 }
 
 impl Label {
@@ -125,12 +450,18 @@ impl Default for Label {
 /// Deliberately exposes no `DerefMut` and no infallible unwrap. Reading is
 /// allowed — a skill that cannot look at data cannot do anything useful, and the
 /// enforcement point is at *sinks*, not at reads. Producing an owned, unlabeled
-/// value requires `StepCtx::declassify`, which consults policy and writes a
-/// `Declassified` journal record.
+/// value is intentionally not a public operation. `StepCtx::release` consults
+/// policy and improves only the named label dimensions while retaining the
+/// value in the lattice and writing a `Released` journal record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tainted<T> {
     value: T,
     label: Label,
+    /// Labels for structured sub-values, keyed by RFC 6901 JSON Pointer.
+    /// Missing paths conservatively inherit their nearest labeled ancestor,
+    /// ultimately the whole-value label.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    fields: BTreeMap<String, Label>,
 }
 
 impl<T> Tainted<T> {
@@ -140,6 +471,7 @@ impl<T> Tainted<T> {
         Self {
             value,
             label: Label::trusted(),
+            fields: BTreeMap::new(),
         }
     }
 
@@ -148,11 +480,16 @@ impl<T> Tainted<T> {
         Self {
             value,
             label: Label::untrusted(source),
+            fields: BTreeMap::new(),
         }
     }
 
     pub fn with_label(value: T, label: Label) -> Self {
-        Self { value, label }
+        Self {
+            value,
+            label,
+            fields: BTreeMap::new(),
+        }
     }
 
     pub fn label(&self) -> &Label {
@@ -167,12 +504,12 @@ impl<T> Tainted<T> {
     /// operation that leaves the lattice without a journal record, and it should
     /// read like something you had to mean. The sanctioned exit for anything
     /// derived from the outside world is
-    /// [`StepCtx::declassify`](crate::runtime::StepCtx::declassify), which
-    /// records the reason and the label it left with.
+    /// [`StepCtx::release`](crate::runtime::StepCtx::release), which records
+    /// the typed scope, destination, evidence, and label it left with.
     ///
     /// Legitimate here only when the value never entered the lattice — the
     /// runtime unwrapping its own journaled clock, for instance.
-    pub fn into_unlabelled(self) -> T {
+    pub(crate) fn into_unlabelled(self) -> T {
         self.value
     }
 
@@ -180,29 +517,185 @@ impl<T> Tainted<T> {
         &self.value
     }
 
-    /// Transform in place; the label rides along.
+    /// Transform in place; the whole-value label rides along.
+    ///
+    /// Arbitrary transforms invalidate JSON Pointer paths, so structured field
+    /// labels are deliberately discarded. Use [`Tainted::object`] or
+    /// [`Tainted::array`] when assembling structured values whose field-level
+    /// provenance must survive to a sink.
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Tainted<U> {
         Tainted {
             value: f(self.value),
             label: self.label,
+            fields: BTreeMap::new(),
         }
     }
 
     /// Combine two labeled values. Labels join, which is how untrust
     /// propagates: mixing anything with an untrusted value yields untrusted.
+    /// Arbitrary tuple construction invalidates structured JSON paths, so any
+    /// field maps are deliberately discarded.
     pub fn zip<U>(self, other: Tainted<U>) -> Tainted<(T, U)> {
         let label = self.label.join(&other.label);
         Tainted {
             value: (self.value, other.value),
             label,
+            fields: BTreeMap::new(),
+        }
+    }
+}
+
+impl Tainted<serde_json::Value> {
+    /// Build a JSON object without flattening the labels of its fields.
+    pub fn object(fields: impl IntoIterator<Item = (String, Self)>) -> Self {
+        let mut value = serde_json::Map::new();
+        let mut label = Label::trusted();
+        let mut field_labels = BTreeMap::new();
+
+        for (name, field) in fields {
+            let base = format!("/{}", escape_pointer_token(&name));
+            label = label.join(&field.label);
+            field_labels.insert(base.clone(), field.label);
+            for (path, nested) in field.fields {
+                field_labels.insert(format!("{base}{path}"), nested);
+            }
+            value.insert(name, field.value);
+        }
+
+        Self {
+            value: serde_json::Value::Object(value),
+            label,
+            fields: field_labels,
         }
     }
 
-    /// Escape hatch for the runtime itself — declassification (which is
-    /// policy-checked and journaled) is implemented in terms of this.
-    pub(crate) fn into_parts(self) -> (T, Label) {
-        (self.value, self.label)
+    /// Build a JSON array without flattening the labels of its elements.
+    pub fn array(elements: impl IntoIterator<Item = Self>) -> Self {
+        let mut value = Vec::new();
+        let mut label = Label::trusted();
+        let mut field_labels = BTreeMap::new();
+
+        for (index, element) in elements.into_iter().enumerate() {
+            let base = format!("/{index}");
+            label = label.join(&element.label);
+            field_labels.insert(base.clone(), element.label);
+            for (path, nested) in element.fields {
+                field_labels.insert(format!("{base}{path}"), nested);
+            }
+            value.push(element.value);
+        }
+
+        Self {
+            value: serde_json::Value::Array(value),
+            label,
+            fields: field_labels,
+        }
     }
+
+    /// The label at a JSON Pointer, inheriting conservatively from the nearest
+    /// labeled ancestor when the value was not assembled field by field.
+    #[must_use]
+    pub fn label_at(&self, path: &str) -> Option<&Label> {
+        self.value.pointer(path)?;
+        if path.is_empty() {
+            return Some(&self.label);
+        }
+
+        let mut candidate = path;
+        loop {
+            if let Some(label) = self.fields.get(candidate) {
+                return Some(label);
+            }
+            let Some(split) = candidate.rfind('/') else {
+                return Some(&self.label);
+            };
+            if split == 0 {
+                return Some(&self.label);
+            }
+            candidate = &candidate[..split];
+        }
+    }
+
+    /// Every explicitly tracked field label in stable pointer order.
+    pub fn field_labels(&self) -> impl Iterator<Item = (&str, &Label)> {
+        self.fields
+            .iter()
+            .map(|(path, label)| (path.as_str(), label))
+    }
+
+    /// Select a top-level object field while preserving and rebasing every
+    /// tracked descendant label. Used by plan argument assembly; returning
+    /// `None` distinguishes an absent field from a present JSON null.
+    pub(crate) fn project_field(&self, name: &str) -> Option<Self> {
+        let value = self.value.get(name)?.clone();
+        let base = format!("/{}", escape_pointer_token(name));
+        let label = self.label_at(&base)?.clone();
+        let prefix = format!("{base}/");
+        let fields = self
+            .fields
+            .iter()
+            .filter_map(|(path, label)| {
+                path.strip_prefix(&prefix)
+                    .map(|relative| (format!("/{relative}"), label.clone()))
+            })
+            .collect();
+        Some(Self {
+            value,
+            label,
+            fields,
+        })
+    }
+
+    /// Apply an authorized release. The runtime owns the only call site.
+    pub(crate) fn apply_release(mut self, release: &Release) -> Option<Self> {
+        if release.is_whole_value() {
+            self.label = apply_release_scope(&self.label, release.scope);
+            for label in self.fields.values_mut() {
+                *label = apply_release_scope(label, release.scope);
+            }
+            return Some(self);
+        }
+
+        // A field release requires explicit field lineage. Falling back to the
+        // whole-value label would let a caller claim precision the runtime does
+        // not actually possess.
+        if release
+            .fields
+            .iter()
+            .any(|path| !self.fields.contains_key(path) || self.value.pointer(path).is_none())
+        {
+            return None;
+        }
+
+        for released in &release.fields {
+            let descendants = format!("{released}/");
+            for (path, label) in &mut self.fields {
+                if path == released || path.starts_with(&descendants) {
+                    *label = apply_release_scope(label, release.scope);
+                }
+            }
+        }
+        self.label = self
+            .fields
+            .values()
+            .fold(Label::trusted(), |joined, label| joined.join(label));
+        Some(self)
+    }
+}
+
+fn apply_release_scope(label: &Label, scope: ReleaseScope) -> Label {
+    let mut released = label.clone();
+    if scope.trust {
+        released.trust = Trust::Trusted;
+    }
+    if let Some(target) = scope.sensitivity {
+        released.sensitivity = label.sensitivity.min(target);
+    }
+    released
+}
+
+fn escape_pointer_token(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
 }
 
 #[cfg(test)]
@@ -261,5 +754,63 @@ mod tests {
         let mapped = t.map(str::to_uppercase);
         assert!(mapped.label().is_untrusted());
         assert_eq!(mapped.peek(), "X");
+    }
+
+    #[test]
+    fn field_projection_preserves_only_the_selected_lineage() {
+        let nested = Tainted::object([
+            ("safe".to_owned(), Tainted::trusted(serde_json::json!("ok"))),
+            (
+                "body".to_owned(),
+                Tainted::from_source(serde_json::json!("outside"), src("model")),
+            ),
+        ]);
+        let value = Tainted::object([
+            ("selected".to_owned(), nested),
+            (
+                "other".to_owned(),
+                Tainted::from_source(serde_json::json!("noise"), src("tool")),
+            ),
+        ]);
+
+        let selected = value.project_field("selected").unwrap();
+        assert!(selected.label_at("/safe").unwrap().provenance.is_empty());
+        assert_eq!(
+            selected.label_at("/body").unwrap().provenance,
+            BTreeSet::from([src("model")])
+        );
+        assert!(selected.label_at("/other").is_none());
+    }
+
+    #[test]
+    fn field_release_improves_only_its_declared_scope() {
+        let value = Tainted::object([
+            (
+                "recipient".to_owned(),
+                Tainted::from_source(serde_json::json!("treasury"), src("model")),
+            ),
+            (
+                "memo".to_owned(),
+                Tainted::from_source(serde_json::json!("outside"), src("model")),
+            ),
+        ]);
+        let release = Release::fields(
+            ReleaseScope::trust(),
+            ["/recipient".to_owned()],
+            "operator verified account",
+            "ledger.transfer",
+            ["approval:42".to_owned()],
+        );
+
+        let released = value.apply_release(&release).unwrap();
+        let recipient = released.label_at("/recipient").unwrap();
+        assert_eq!(recipient.trust, Trust::Trusted);
+        assert_eq!(recipient.sensitivity, Sensitivity::Internal);
+        assert_eq!(recipient.provenance, BTreeSet::from([src("model")]));
+        assert!(released.label_at("/memo").unwrap().is_untrusted());
+        assert!(
+            released.label().is_untrusted(),
+            "unreleased content still taints"
+        );
     }
 }

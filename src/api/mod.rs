@@ -23,9 +23,10 @@
 //!
 //! Authentication says *who*. It does not say *what they may do*, and an
 //! operator surface that stops at authentication grants every authenticated
-//! caller the whole plane. So every route also passes through the runtime's
-//! [`PolicyEngine`](crate::core::PolicyEngine) with an `api:` action, and [`Api::new`] **refuses to build**
-//! against a runtime that has none.
+//! caller the whole plane. So every route also passes through the answering
+//! plane's [`PolicyEngine`](crate::core::PolicyEngine) with an `api:` action,
+//! and [`Api::new`] **refuses to build** if any plane has none — one ungoverned
+//! tenant among governed ones is the one an attacker looks for.
 //!
 //! That refusal is the point. Inside the process an absent engine is a choice —
 //! the caller is the embedder. On a socket it is a hole, and the failure mode of
@@ -33,6 +34,24 @@
 //! [`DenyAll`](crate::core::DenyAll) exists for wiring the surface up before its
 //! rules are written; starting closed and opening deliberately is the order that
 //! fails safe.
+//!
+//! # One surface, many tenants
+//!
+//! [`Api::new`] takes [`Planes`] — a registry keyed by tenant — so one process
+//! can serve several. A single-tenant deployment passes its runtime and reads
+//! exactly as before.
+//!
+//! Which plane answers comes from [`Caller::tenant`], which the
+//! [`Authenticator`] derives from the credential like `actor` and `roles`. That
+//! is the field selecting a *store*, so a body-supplied one would be a
+//! cross-tenant read with an authentication step in front of it.
+//!
+//! The gate hands each route the resolved plane **with** the caller, and this
+//! struct holds no runtime of its own. A handler therefore cannot read a store
+//! without having established whose it is: the cross-tenant read is unspellable
+//! rather than guarded against. A caller whose tenant has no plane is refused,
+//! never served by a default — a fallback would turn an unregistered tenant
+//! into somebody else's data, and it would look like working software.
 //!
 //! # No authenticator is shipped
 //!
@@ -102,6 +121,7 @@ use serde_json::{Value, json};
 
 use crate::core::{
     CaseId, Decision, Delivery, InboundEvent, PolicyDecision, PolicyRequest, RunId, Task, TaskId,
+    TenantId,
 };
 use crate::journal::RecordKind;
 use crate::runtime::Runtime;
@@ -116,14 +136,35 @@ pub struct Caller {
     pub actor: String,
     /// What this caller is eligible for. Not self-declared.
     pub roles: Vec<String>,
+    /// Whose data this caller may reach.
+    ///
+    /// Derived by the [`Authenticator`] from the credential, exactly as `actor`
+    /// and `roles` are, and for the same reason: a request that can name its own
+    /// tenant is a request that can name somebody else's. It is the one field
+    /// here that decides which *store* answers, so a body-supplied value would
+    /// be a cross-tenant read with an authentication step in front of it.
+    ///
+    /// Defaults to [`TenantId::DEFAULT`] via [`Caller::new`], which is the whole
+    /// of a single-tenant deployment: one real tenant rather than an absence, so
+    /// the single-tenant path is the same code as the multi-tenant one.
+    pub tenant: TenantId,
 }
 
 impl Caller {
+    /// A caller in the default tenant.
     pub fn new(actor: impl Into<String>, roles: Vec<String>) -> Self {
         Self {
             actor: actor.into(),
             roles,
+            tenant: TenantId::default(),
         }
+    }
+
+    /// A caller in a named tenant.
+    #[must_use]
+    pub fn in_tenant(mut self, tenant: TenantId) -> Self {
+        self.tenant = tenant;
+        self
     }
 }
 
@@ -168,6 +209,17 @@ pub enum ApiSetupError {
          with `DenyAll`) before opening a port"
     )]
     NoPolicy,
+
+    /// No plane was registered, so the surface would answer for nobody.
+    ///
+    /// Serving zero tenants is not a configuration, it is a startup that looks
+    /// successful and refuses every request — the failure an operator debugs
+    /// from the wrong end.
+    #[error(
+        "no planes were registered — this surface would authenticate callers \
+         and then refuse all of them; register at least one with `Planes::one`"
+    )]
+    NoPlanes,
 }
 
 /// What a stop request looks like on the wire.
@@ -299,12 +351,98 @@ pub struct Worklist {
     pub truncated: bool,
 }
 
+#[cfg(feature = "a2a-server")]
+pub mod a2a;
+
+/// The tenants this process serves, one plane each.
+///
+/// # Why a registry rather than a tenant parameter
+///
+/// The tenant is a key component of a store handle, not an argument to it — a
+/// query that forgets a predicate returns another tenant's rows, and a query
+/// that cannot name them returns nothing. Keeping that property while serving
+/// several tenants means several handles, and therefore several planes: one per
+/// tenant, sharing one database and one connection pool.
+///
+/// So this maps a caller's tenant to the plane that answers for it. A caller
+/// whose tenant has no plane is **refused**, not served from a default — a
+/// fallback here would turn an unregistered tenant into somebody else's data.
+///
+/// # Registration cannot put a plane under the wrong name
+///
+/// A plane is filed under the tenant it was built with, never under a name given
+/// alongside it. Two arguments that must agree are two arguments that can
+/// disagree, and the disagreement here is silent: the plane works, and it
+/// answers for the wrong people.
+#[derive(Debug, Clone, Default)]
+pub struct Planes {
+    by_tenant: std::collections::HashMap<TenantId, Arc<Runtime>>,
+}
+
+impl Planes {
+    /// Serve one tenant — the single-tenant deployment, spelled out.
+    #[must_use]
+    pub fn one(plane: Arc<Runtime>) -> Self {
+        Self::default().and(plane)
+    }
+
+    /// Also serve this plane's tenant.
+    ///
+    /// # Panics
+    ///
+    /// If a plane for that tenant is already registered. Two planes for one
+    /// tenant is a wiring mistake with no correct resolution — whichever wins,
+    /// half the configuration is silently inert.
+    #[must_use]
+    pub fn and(mut self, plane: Arc<Runtime>) -> Self {
+        let tenant = plane.tenant().clone();
+        assert!(
+            self.by_tenant.insert(tenant.clone(), plane).is_none(),
+            "two planes are registered for tenant '{tenant}'. Whichever won, \
+             the other's skills, budgets and policy would be silently inert"
+        );
+        self
+    }
+
+    /// The plane answering for this tenant, if this process serves it.
+    #[must_use]
+    pub fn get(&self, tenant: &TenantId) -> Option<&Arc<Runtime>> {
+        self.by_tenant.get(tenant)
+    }
+
+    /// Every tenant served, for an operator checking their wiring.
+    pub fn tenants(&self) -> impl Iterator<Item = &TenantId> {
+        self.by_tenant.keys()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_tenant.is_empty()
+    }
+}
+
+impl From<Arc<Runtime>> for Planes {
+    fn from(plane: Arc<Runtime>) -> Self {
+        Self::one(plane)
+    }
+}
+
+/// What one authenticated request may touch.
+///
+/// The plane travels with the caller, and there is deliberately no other way for
+/// a route to reach one: `Api` holds a *registry*, not a runtime, so a handler
+/// cannot read a store without first having resolved which tenant's store it is.
+/// The cross-tenant read is not guarded against here — it is unspellable.
+struct Session {
+    caller: Caller,
+    plane: Arc<Runtime>,
+}
+
 /// Everything the routes need.
 #[derive(Clone)]
 pub struct Api {
-    runtime: Arc<Runtime>,
+    planes: Planes,
     auth: Arc<dyn Authenticator>,
-    policy: Arc<dyn crate::core::PolicyEngine>,
     /// How many worklist items one request may return.
     limit: usize,
 }
@@ -312,7 +450,7 @@ pub struct Api {
 impl std::fmt::Debug for Api {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Api")
-            .field("policy", &self.policy.digest())
+            .field("tenants", &self.planes.tenants().collect::<Vec<_>>())
             .field("limit", &self.limit)
             .finish_non_exhaustive()
     }
@@ -322,18 +460,33 @@ impl Api {
     /// Default worklist page size.
     pub const DEFAULT_LIMIT: usize = 100;
 
-    /// Build the surface.
+    /// Build the surface over one plane, or several.
+    ///
+    /// Takes anything that becomes [`Planes`], so a single-tenant deployment
+    /// still passes its runtime and reads the same as before.
     ///
     /// # Errors
     ///
-    /// [`ApiSetupError::NoPolicy`] if the runtime has no policy engine. See the
-    /// module docs on why that is a build-time refusal and not a warning.
-    pub fn new(runtime: Arc<Runtime>, auth: Arc<dyn Authenticator>) -> Result<Self, ApiSetupError> {
-        let policy = runtime.policy().ok_or(ApiSetupError::NoPolicy)?.clone();
+    /// [`ApiSetupError::NoPolicy`] if **any** plane has no policy engine — one
+    /// ungoverned tenant among governed ones is the one an attacker looks for.
+    /// [`ApiSetupError::NoPlanes`] if none was registered, which would serve
+    /// nobody while starting cleanly.
+    pub fn new(
+        planes: impl Into<Planes>,
+        auth: Arc<dyn Authenticator>,
+    ) -> Result<Self, ApiSetupError> {
+        let planes = planes.into();
+        if planes.is_empty() {
+            return Err(ApiSetupError::NoPlanes);
+        }
+        for plane in planes.by_tenant.values() {
+            if plane.policy().is_none() {
+                return Err(ApiSetupError::NoPolicy);
+            }
+        }
         Ok(Self {
-            runtime,
+            planes,
             auth,
-            policy,
             limit: Self::DEFAULT_LIMIT,
         })
     }
@@ -363,28 +516,51 @@ impl Api {
             .with_state(self)
     }
 
-    /// Authenticate, then authorize, then hand back the caller.
+    /// Authenticate, resolve the tenant's plane, then authorize.
     ///
-    /// One function so that a route cannot do half of it. `action` is the `api:`
-    /// verb the policy set keys on.
+    /// One function so that a route cannot do part of it, and returning the
+    /// plane so that a route cannot reach a different one. `action` is the
+    /// `api:` verb the policy set keys on.
+    ///
+    /// The order is load-bearing. The plane is resolved **before** the policy
+    /// question, because the policy that answers it belongs to that tenant: a
+    /// shared engine would let one tenant's rules decide another's requests, and
+    /// the tenant with the laxest rules would effectively set everybody's.
     async fn gate(
         &self,
         headers: &HeaderMap,
         action: &str,
         resource: &str,
-    ) -> Result<Caller, ApiError> {
+    ) -> Result<Session, ApiError> {
         let caller = self.auth.authenticate(headers).await?;
-        // Roles go in the context so a policy set can key on them without this
-        // crate deciding what a role means.
-        let context = json!({ "roles": caller.roles });
-        let decision = self.policy.authorize(&PolicyRequest {
+
+        // Refused, never defaulted. Falling back to a default plane would turn
+        // an unregistered tenant into somebody else's data, and it would look
+        // like working software.
+        let plane = self.planes.get(&caller.tenant).ok_or_else(|| {
+            ApiError(
+                StatusCode::FORBIDDEN,
+                "this deployment serves no plane for your tenant".to_owned(),
+            )
+        })?;
+        let policy = plane.policy().ok_or_else(|| {
+            ApiError(StatusCode::FORBIDDEN, "this plane is ungoverned".to_owned())
+        })?;
+
+        // Roles and tenant go in the context so a policy set can key on them
+        // without this crate deciding what either means.
+        let context = json!({ "roles": caller.roles, "tenant": caller.tenant.as_str() });
+        let decision = policy.authorize(&PolicyRequest {
             principal: &caller.actor,
             action,
             resource,
             context: &context,
         });
         match decision {
-            PolicyDecision::Permit => Ok(caller),
+            PolicyDecision::Permit => Ok(Session {
+                caller,
+                plane: Arc::clone(plane),
+            }),
             PolicyDecision::Deny { reason } => Err(ApiError(StatusCode::FORBIDDEN, reason)),
         }
     }
@@ -476,11 +652,11 @@ async fn run_view(
 ) -> Result<Json<RunView>, ApiError> {
     // Authorized against the run id, so a policy set can scope a caller to the
     // runs they are entitled to see rather than to the endpoint.
-    api.gate(&headers, action::RUN_READ, &run).await?;
+    let s = api.gate(&headers, action::RUN_READ, &run).await?;
     let id = RunId::parse(&run).map_err(|_| bad("run"))?;
 
-    let records = api
-        .runtime
+    let records = s
+        .plane
         .journal()
         .read(id, 1)
         .await
@@ -505,8 +681,8 @@ async fn run_view(
         .iter()
         .find_map(|r| r.body.case.map(|c| c.to_string()));
 
-    let cancellation_requested_by = api
-        .runtime
+    let cancellation_requested_by = s
+        .plane
         .cancellation(id)
         .await
         .map_err(|_| store_failed())?
@@ -536,21 +712,21 @@ async fn cancel_run(
     Path(run): Path<String>,
     Json(body): Json<CancelRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let caller = api.gate(&headers, action::RUN_CANCEL, &run).await?;
+    let s = api.gate(&headers, action::RUN_CANCEL, &run).await?;
     let id = RunId::parse(&run).map_err(|_| bad("run"))?;
 
     // The actor is the authenticated caller; `CancelRequest` has no field for
     // one. Same rule as deciding a task.
-    let fresh = api
-        .runtime
-        .request_cancel(id, &caller.actor, &body.reason)
+    let fresh = s
+        .plane
+        .request_cancel(id, &s.caller.actor, &body.reason)
         .await
         .map_err(|e| ApiError(StatusCode::CONFLICT, e.to_string()))?;
 
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({
-            "requested_by": caller.actor,
+            "requested_by": s.caller.actor,
             // False means somebody else got there first, and *their* name is on
             // the record. Told plainly rather than swallowed, so a second
             // operator does not believe they own the intervention.
@@ -560,8 +736,8 @@ async fn cancel_run(
 }
 
 async fn worklist(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Worklist>, ApiError> {
-    let caller = api.gate(&headers, action::TASK_LIST, "*").await?;
-    let tasks = api.runtime.tasks().ok_or_else(|| unavailable("task"))?;
+    let s = api.gate(&headers, action::TASK_LIST, "*").await?;
+    let tasks = s.plane.tasks().ok_or_else(|| unavailable("task"))?;
 
     // Filtered by the caller's *authenticated* roles. A caller cannot widen the
     // queue by asking for one they do not hold, because there is nowhere in the
@@ -571,7 +747,7 @@ async fn worklist(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Wor
     // distinguishable. Inferring it from `len() == limit` would call a queue of
     // exactly 100 truncated.
     let mut queued = tasks
-        .queue(&caller.roles, api.limit + 1)
+        .queue(&s.caller.roles, api.limit + 1)
         .await
         .map_err(|_| store_failed())?;
     let truncated = queued.len() > api.limit;
@@ -580,7 +756,7 @@ async fn worklist(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Wor
     Ok(Json(Worklist {
         tasks: queued
             .into_iter()
-            .map(|t| TaskView::of(t, &caller))
+            .map(|t| TaskView::of(t, &s.caller))
             .collect(),
         truncated,
     }))
@@ -591,9 +767,9 @@ async fn task_view(
     headers: HeaderMap,
     Path(task): Path<String>,
 ) -> Result<Json<TaskView>, ApiError> {
-    let caller = api.gate(&headers, action::TASK_READ, &task).await?;
+    let s = api.gate(&headers, action::TASK_READ, &task).await?;
     let id = TaskId::parse(&task).map_err(|_| bad("task"))?;
-    let tasks = api.runtime.tasks().ok_or_else(|| unavailable("task"))?;
+    let tasks = s.plane.tasks().ok_or_else(|| unavailable("task"))?;
 
     let found = tasks
         .task(id)
@@ -605,7 +781,7 @@ async fn task_view(
     // still needs to see that the item exists and why they cannot act on it.
     // `decidable_by_you` carries that, and the store — not this handler —
     // remains the thing that refuses the decision.
-    Ok(Json(TaskView::of(found, &caller)))
+    Ok(Json(TaskView::of(found, &s.caller)))
 }
 
 /// Reserve a task, so two reviewers do not both work it.
@@ -622,15 +798,15 @@ async fn claim(
     headers: HeaderMap,
     Path(task): Path<String>,
 ) -> Result<Json<TaskView>, ApiError> {
-    let caller = api.gate(&headers, action::TASK_CLAIM, &task).await?;
+    let s = api.gate(&headers, action::TASK_CLAIM, &task).await?;
     let id = TaskId::parse(&task).map_err(|_| bad("task"))?;
-    let tasks = api.runtime.tasks().ok_or_else(|| unavailable("task"))?;
+    let tasks = s.plane.tasks().ok_or_else(|| unavailable("task"))?;
 
     let claimed = tasks
-        .claim(id, &caller.actor, &caller.roles)
+        .claim(id, &s.caller.actor, &s.caller.roles)
         .await
         .map_err(|e| claim_refused(&e))?;
-    Ok(Json(TaskView::of(claimed, &caller)))
+    Ok(Json(TaskView::of(claimed, &s.caller)))
 }
 
 /// Give a task back without deciding it.
@@ -644,14 +820,14 @@ async fn release(
     headers: HeaderMap,
     Path(task): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let caller = api.gate(&headers, action::TASK_RELEASE, &task).await?;
+    let s = api.gate(&headers, action::TASK_RELEASE, &task).await?;
     let id = TaskId::parse(&task).map_err(|_| bad("task"))?;
-    let tasks = api.runtime.tasks().ok_or_else(|| unavailable("task"))?;
+    let tasks = s.plane.tasks().ok_or_else(|| unavailable("task"))?;
 
     // Only the holder may release. The store enforces it by matching the
     // assignee in the `UPDATE`, so a caller cannot free somebody else's work.
     tasks
-        .release(id, &caller.actor)
+        .release(id, &s.caller.actor)
         .await
         .map_err(|e| claim_refused(&e))?;
     Ok(StatusCode::NO_CONTENT)
@@ -690,7 +866,7 @@ async fn decide(
     Path(task): Path<String>,
     Json(body): Json<DecisionRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = api.gate(&headers, action::TASK_DECIDE, &task).await?;
+    let s = api.gate(&headers, action::TASK_DECIDE, &task).await?;
     let id = TaskId::parse(&task).map_err(|_| bad("task"))?;
 
     // The actor is the authenticated caller. There is no other source for it:
@@ -698,7 +874,7 @@ async fn decide(
     // followed but the only construction available.
     let decision = Decision {
         approved: body.approved,
-        actor: caller.actor.clone(),
+        actor: s.caller.actor.clone(),
         reason: body.reason,
         amendment: body.amendment,
     };
@@ -707,8 +883,8 @@ async fn decide(
     // checks against the store. The control lives there, not in this handler —
     // an HTTP surface that enforced it itself would be a second copy that can
     // disagree with the one the in-process caller goes through.
-    api.runtime
-        .decide_task(id, &decision, &caller.roles)
+    s.plane
+        .decide_task(id, &decision, &s.caller.roles)
         .await
         .map_err(|e| match e {
             // A refused claim is a 403 with the store's own reason: "you
@@ -721,7 +897,7 @@ async fn decide(
         })?;
 
     Ok(Json(json!({
-        "decided_by": caller.actor,
+        "decided_by": s.caller.actor,
         "approved": decision.approved,
     })))
 }
@@ -731,9 +907,9 @@ async fn case_view(
     headers: HeaderMap,
     Path(case): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    api.gate(&headers, action::CASE_READ, &case).await?;
+    let s = api.gate(&headers, action::CASE_READ, &case).await?;
     let id = CaseId::parse(&case).map_err(|_| bad("case"))?;
-    let cases = api.runtime.cases().ok_or_else(|| unavailable("case"))?;
+    let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
 
     let found = cases
         .case(id)
@@ -750,19 +926,43 @@ async fn case_view(
     })))
 }
 
+/// An event as a caller may state it.
+///
+/// Deliberately **not** [`InboundEvent`]: that carries a `source`, and a caller
+/// does not get to choose one. The source is half the deduplication identity and
+/// the sender's name in provenance, so a body that set it would let one
+/// counterparty deduplicate against another's messages, or post under a name a
+/// policy trusts. It comes from the authenticated caller instead.
+#[derive(serde::Deserialize)]
+struct DeliverBody {
+    id: String,
+    kind: String,
+    #[serde(default)]
+    correlation: Vec<crate::core::CorrelationKey>,
+    payload: Value,
+}
+
 async fn deliver(
     State(api): State<Api>,
     headers: HeaderMap,
-    Json(event): Json<InboundEvent>,
+    Json(body): Json<DeliverBody>,
 ) -> Result<Json<Value>, ApiError> {
     // Authorized on the event *kind*, so a policy set can let a counterparty
     // gateway post `acknowledgement.received` without also letting it post
     // whatever else the plane happens to wait on.
-    api.gate(&headers, action::EVENT_DELIVER, &event.kind)
+    let s = api
+        .gate(&headers, action::EVENT_DELIVER, &body.kind)
         .await?;
 
-    let delivery = api
-        .runtime
+    // The source is who the transport says they are, never who the body claims.
+    // A self-asserted source would make `(source, id)` a pair a caller controls
+    // both halves of — so one counterparty could deduplicate against another's
+    // messages by naming them.
+    let mut event = InboundEvent::new(s.caller.actor.clone(), body.id, body.kind, body.payload);
+    event.correlation = body.correlation;
+
+    let delivery = s
+        .plane
         .deliver(&event)
         .await
         .map_err(|e| ApiError(StatusCode::CONFLICT, e.to_string()))?;

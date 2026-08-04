@@ -78,6 +78,15 @@ test-minimal:
 test-postgres:
     cargo test --features postgres,testkit --test guards postgres::
 
+# the key-ring contract, against a real Vault container
+#
+# The in-process ring cannot get a status code wrong and the adapter cannot get
+# a HashMap wrong, so one passing says nothing about the other. This found three
+# real defects the unit tests could not: Vault reports a destroyed key as a 400
+# with a message, not a 404.
+test-vault:
+    cargo test --features keyring-vault,testkit --test guards vault:: -- --test-threads=1
+
 # real MCP round trips against an in-process server
 test-mcp:
     cargo test --features mcp,redb,testkit --test wire mcp::
@@ -94,16 +103,34 @@ test-attestation:
 test-drivers:
     cargo test --features a2a,providers,http,redb,testkit --test wire drivers::
 
+# being called: the public card, the 1.0 methods, and a client/server round trip
+test-a2a-server:
+    cargo test --features a2a-server,a2a,redb,testkit --test wire a2a_server::
+
 # run every example end to end
 examples:
     cargo run --example durable_pipeline
     cargo run --example clearing_case
     cargo run --example plan_graph
+    cargo run --example governed_transfer
+    cargo run --example saga_checkout
     cargo run --example model_run --features redb,testkit
+    cargo run --example media_run --features redb,testkit,media
+    cargo run --example manifest_run --features redb,testkit,manifest
+    cargo run --example blog_room --features redb,testkit,manifest
+
+# the binary is never exercised by `cargo test` — it only compiles
+cli-smoke:
+    tools/cli-smoke.sh
 
 # build the rustdoc a reader would land on
+#
+# `-D warnings` because a broken intra-doc link is invisible otherwise: two
+# references to `TursoStore` survived the move to redb — one of them in the
+# crate-level docs, which is the first thing a reader sees — and nothing in the
+# gate said a word. Clippy does not check doc links; only rustdoc does.
 docs:
-    cargo doc --no-deps --all-features
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
 # the crate still builds on the declared minimum Rust
 msrv:
@@ -153,10 +180,20 @@ specs:
 # with the contents still served.
 
 # list the publish tarball and refuse if the internal design doc is in it
+#
+# `--allow-dirty` because this runs in `ci`, and `cargo package` otherwise
+# refuses any tree with uncommitted work — which is every tree a developer is
+# actually working in. Without it the recipe fails for a reason that has nothing
+# to do with what it checks, and the check silently never runs: three CI passes
+# went by with this step erroring on a dirty tree and the tarball unexamined.
+#
+# Listing uncommitted files is exactly right here. The question this asks is
+# "would the *current* contents ship", and the current contents are what a
+# release is cut from.
 package:
-    cargo package --list
+    cargo package --list --allow-dirty
     @echo
-    @cargo package --list | grep -qx 'CONCEPT.md' \
+    @cargo package --list --allow-dirty | grep -qx 'CONCEPT.md' \
         && (echo "REFUSED: CONCEPT.md is in the tarball" && exit 1) \
         || echo "ok: the internal design document is not in the tarball"
 
@@ -170,7 +207,7 @@ publish-dry:
 # run them before a release, not on every save.
 
 # everything CI runs, minus the two slow layers
-ci: lint anchors test test-default test-minimal examples doc-examples docs package
+ci: lint anchors test test-default test-minimal examples cli-smoke doc-examples docs package
 
 # everything, including the slow layers — what a release must pass
 ci-full: ci specs mutants

@@ -128,7 +128,7 @@ fn plan() -> PlanIR {
     ])
 }
 
-fn runtime(db: &Arc<RedbStore>, world: &World, fails: Vec<&'static str>) -> Runtime {
+fn runtime(db: &Arc<RedbStore>, world: &World, fails: Vec<&'static str>) -> Arc<Runtime> {
     Runtime::builder(Arc::clone(db) as Arc<dyn JournalStore>)
         .owner("batch")
         .batches(Arc::clone(db) as Arc<dyn BatchStore>)

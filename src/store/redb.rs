@@ -55,7 +55,7 @@ const RUN_SEAL: TableDefinition<&str, (&str, &[u8], u64)> = TableDefinition::new
 /// positions; that is what makes the `ROW_NUMBER() OVER (ORDER BY log_index)`
 /// the SQL backend needed unnecessary here, and with it the rank-vs-index bug
 /// that cost an afternoon.
-const SEAL_LOG: TableDefinition<u64, &str> = TableDefinition::new("seal_log");
+const SEAL_LOG: TableDefinition<(&str, u64), &str> = TableDefinition::new("seal_log");
 
 /// `run_id -> (actor, reason, requested_at)`. An operator's stop request.
 ///
@@ -87,6 +87,14 @@ pub struct RedbStore {
     signer: Option<Arc<dyn crate::core::Signer>>,
     /// Names this plane's Merkle log in every checkpoint.
     origin: String,
+    /// Which tenant's keyspace this handle addresses.
+    ///
+    /// Part of the *key*, not a filter applied after reading. A store handle for
+    /// tenant A cannot name tenant B's run: the key it builds does not exist, so
+    /// a cross-tenant read is a miss rather than a row that some `WHERE` clause
+    /// was supposed to remove. A filter that can be forgotten is not isolation,
+    /// and the query that forgets it looks exactly like working software.
+    tenant: crate::core::TenantId,
 }
 
 impl RedbStore {
@@ -147,7 +155,42 @@ impl RedbStore {
             db: Arc::new(db),
             signer: None,
             origin: "agentplane".to_owned(),
+            tenant: crate::core::TenantId::default(),
         })
+    }
+
+    /// A handle addressing one tenant's keyspace.
+    ///
+    /// Every key this store builds is prefixed, so two tenants may share one
+    /// physical database and still not reach each other: a read for a run that
+    /// belongs to another tenant finds nothing, because the key it looks under
+    /// was never written.
+    ///
+    /// The origin moves with it. Two tenants sharing a database would otherwise
+    /// publish checkpoints under one origin name, and a witness could not tell
+    /// whose history it was cosigning.
+    #[must_use]
+    pub fn for_tenant(mut self, tenant: crate::core::TenantId) -> Self {
+        self.origin = format!("{}/{}", self.origin, tenant);
+        self.tenant = tenant;
+        self
+    }
+
+    /// The storage key for a run, and the only place one is derived.
+    ///
+    /// One derivation because the alternative is eleven, and eleven places
+    /// building the same string is how one of them ends up building a slightly
+    /// different one.
+    pub(super) fn run_key(&self, run: RunId) -> String {
+        format!("{}/{run}", self.tenant)
+    }
+
+    /// This handle's tenant, for a key or a range bound.
+    ///
+    /// Owned rather than borrowed because every caller moves it into a closure
+    /// that outlives the borrow.
+    pub(super) fn tenant_name(&self) -> String {
+        self.tenant.to_string()
     }
 
     /// Name this plane's Merkle log.
@@ -189,12 +232,19 @@ impl RedbStore {
 
     /// The log's leaves, in seal order.
     async fn log_leaves(&self) -> Result<Vec<Digest>, StoreError> {
-        self.with_db(|db| {
+        let tenant = self.tenant.clone();
+        self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let log = r.open_table(SEAL_LOG).map_err(|e| be(&e))?;
             let seals = r.open_table(RUN_SEAL).map_err(|e| be(&e))?;
             let mut out = Vec::new();
-            for entry in log.iter().map_err(|e| be(&e))? {
+            // This tenant's range only. Iterating the whole table would build a
+            // Merkle log covering other tenants' runs, so a checkpoint would
+            // commit to history its holder may not see.
+            for entry in log
+                .range((tenant.as_str(), 0)..=(tenant.as_str(), u64::MAX))
+                .map_err(|e| be(&e))?
+            {
                 let (_, run) = entry.map_err(|e| be(&e))?;
                 let Some(seal) = seals.get(run.value()).map_err(|e| be(&e))? else {
                     continue;
@@ -212,13 +262,17 @@ impl RedbStore {
     /// The position is the run's index in seal order, counted while iterating —
     /// dense by construction, because the tree is built from the same walk.
     async fn log_position(&self, run: RunId) -> Result<Option<(usize, Digest)>, StoreError> {
-        let key = run.to_string();
+        let key = self.run_key(run);
+        let tenant = self.tenant.clone();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let log = r.open_table(SEAL_LOG).map_err(|e| be(&e))?;
             let seals = r.open_table(RUN_SEAL).map_err(|e| be(&e))?;
             let mut rank = 0usize;
-            for entry in log.iter().map_err(|e| be(&e))? {
+            for entry in log
+                .range((tenant.as_str(), 0)..=(tenant.as_str(), u64::MAX))
+                .map_err(|e| be(&e))?
+            {
                 let (_, run_id) = entry.map_err(|e| be(&e))?;
                 let Some(seal) = seals.get(run_id.value()).map_err(|e| be(&e))? else {
                     continue;
@@ -250,7 +304,7 @@ impl RedbStore {
         seq: Seq,
         body: Vec<u8>,
     ) -> Result<(), StoreError> {
-        let key = run.to_string();
+        let key = self.run_key(run);
         self.with_db(move |db| {
             let w = begin_write(db)?;
             {
@@ -286,7 +340,7 @@ impl RedbStore {
     /// If the write fails.
     #[doc(hidden)]
     pub async fn delete_run_for_test(&self, run: RunId) -> Result<(), StoreError> {
-        let key = run.to_string();
+        let key = self.run_key(run);
         self.with_db(move |db| {
             let w = begin_write(db)?;
             {
@@ -485,6 +539,10 @@ where
 
 #[async_trait]
 impl JournalStore for RedbStore {
+    fn tenant(&self) -> &str {
+        self.tenant.as_str()
+    }
+
     async fn append(&self, epoch: Epoch, batch: Vec<Append>) -> Result<Vec<Record>, StoreError> {
         if batch.is_empty() {
             return Ok(Vec::new());
@@ -497,7 +555,7 @@ impl JournalStore for RedbStore {
             )));
         }
         let signer = self.signer.clone();
-        let key = run.to_string();
+        let key = self.run_key(run);
 
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -572,7 +630,7 @@ impl JournalStore for RedbStore {
     }
 
     async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
-        let key = run.to_string();
+        let key = self.run_key(run);
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(JOURNAL).map_err(|e| be(&e))?;
@@ -590,7 +648,7 @@ impl JournalStore for RedbStore {
     }
 
     async fn head(&self, run: RunId) -> Result<Head, StoreError> {
-        let key = run.to_string();
+        let key = self.run_key(run);
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(JOURNAL).map_err(|e| be(&e))?;
@@ -600,7 +658,7 @@ impl JournalStore for RedbStore {
     }
 
     async fn acquire(&self, run: RunId, owner: &str, ttl: Duration) -> Result<Lease, StoreError> {
-        let key = run.to_string();
+        let key = self.run_key(run);
         let owner = owner.to_owned();
         let owner_out = owner.clone();
         let epoch = self
@@ -619,12 +677,19 @@ impl JournalStore for RedbStore {
                     let epoch = match existing {
                         // Fresh run.
                         None => 1,
-                        // Ours: renew without bumping — the epoch only moves on
-                        // takeover.
+                        // Expired or released: take over and fence whoever held
+                        // it, **including this caller**. Checked before the
+                        // ownership test on purpose — a lease that has lapsed is
+                        // not yours to renew, because you cannot know whether
+                        // somebody took over in the gap. Assuming you were
+                        // fenced is the only safe reading.
+                        Some((_, epoch, expires_at)) if expires_at <= now => epoch + 1,
+                        // Ours and still live: renew without bumping, or the
+                        // owner fences its own in-flight writes.
                         Some((held_by, epoch, _)) if held_by == owner => epoch,
                         // Someone else's, still live. Not a fencing situation:
                         // this caller is not stale, it is simply not the owner.
-                        Some((held_by, epoch, expires_at)) if expires_at > now => {
+                        Some((held_by, epoch, expires_at)) => {
                             return Err(StoreError::LeaseHeld {
                                 run: key.clone(),
                                 owner: held_by,
@@ -632,8 +697,6 @@ impl JournalStore for RedbStore {
                                 remaining_secs: expires_at.saturating_sub(now),
                             });
                         }
-                        // Expired: take over and fence the previous owner.
-                        Some((_, epoch, _)) => epoch + 1,
                     };
 
                     leases
@@ -653,8 +716,41 @@ impl JournalStore for RedbStore {
         })
     }
 
+    async fn release_lease(&self, run: RunId, epoch: Epoch) -> Result<(), StoreError> {
+        let key = self.run_key(run);
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            {
+                let mut leases = w.open_table(RUN_LEASE).map_err(|e| be(&e))?;
+                let held = leases
+                    .get(key.as_str())
+                    .map_err(|e| be(&e))?
+                    .map(|v| v.value().1);
+                // Only the epoch that holds it may free it. A fenced caller
+                // shutting down must not hand the run to a third party while
+                // the instance that took over is mid-write.
+                //
+                // Marked expired rather than **removed**, and that distinction
+                // is the whole safety of this operation. The epoch lives in
+                // this row: delete it and `append` has nothing to fence
+                // against, while the next `acquire` restarts at 1 — so a writer
+                // already fenced at 2 outranks the new owner. Releasing must
+                // free the lease without forgetting what has happened to it.
+                if held == Some(epoch) {
+                    leases
+                        .insert(key.as_str(), ("", epoch, 0))
+                        .map_err(|e| be(&e))?;
+                }
+            }
+            w.commit().map_err(|e| be(&e))?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn seal(&self, run: RunId, epoch: Epoch, outcome: &str) -> Result<Digest, StoreError> {
-        let key = run.to_string();
+        let key = self.run_key(run);
+        let tenant = self.tenant.clone();
         let outcome = outcome.to_owned();
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -694,17 +790,21 @@ impl JournalStore for RedbStore {
 
                     // Enter the log in the same transaction that seals: a seal
                     // the checkpoint does not commit to is the hole this closes.
+                    // The counter is per tenant too. A shared counter would
+                    // interleave two tenants' indices in one sequence, and the
+                    // log would no longer be dense for either.
+                    let counter = format!("{NEXT_LOG_INDEX}/{tenant}");
                     let mut counters = w.open_table(COUNTERS).map_err(|e| be(&e))?;
                     let next = counters
-                        .get(NEXT_LOG_INDEX)
+                        .get(counter.as_str())
                         .map_err(|e| be(&e))?
                         .map_or(0, |v| v.value());
                     w.open_table(SEAL_LOG)
                         .map_err(|e| be(&e))?
-                        .insert(next, key.as_str())
+                        .insert((tenant.as_str(), next), key.as_str())
                         .map_err(|e| be(&e))?;
                     counters
-                        .insert(NEXT_LOG_INDEX, next + 1)
+                        .insert(counter.as_str(), next + 1)
                         .map_err(|e| be(&e))?;
                 }
                 head.hash
@@ -763,7 +863,7 @@ impl JournalStore for RedbStore {
         actor: &str,
         reason: &str,
     ) -> Result<bool, StoreError> {
-        let key = run.to_string();
+        let key = self.run_key(run);
         let (actor, reason) = (actor.to_owned(), reason.to_owned());
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -786,7 +886,7 @@ impl JournalStore for RedbStore {
     }
 
     async fn cancellation(&self, run: RunId) -> Result<Option<Cancellation>, StoreError> {
-        let key = run.to_string();
+        let key = self.run_key(run);
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(RUN_CANCEL).map_err(|e| be(&e))?;

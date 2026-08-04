@@ -14,8 +14,8 @@ use serde_json::Value;
 use crate::case::{CaseStore, EventStore, TaskStore, TimerStore};
 use crate::core::{
     ArgSource, Budget, Calendar, Capability, CorrelationKey, Delivery, Digest, InboundEvent,
-    Ledger, Outcome, Phase, PlanIR, PlanNode, RunId, RuntimeError, Skill, Spend, StepId, Tainted,
-    WallClock,
+    Ledger, Outcome, Phase, PlanIR, PlanNode, PolicyBundleIdentity, RunId, RuntimeError, Skill,
+    Spend, StepId, Tainted, WallClock,
 };
 use crate::journal::{Append, JournalStore, Record, RecordKind, ReplayCursor, StepCursor};
 
@@ -26,7 +26,18 @@ use tracing::Instrument;
 
 /// Default lease duration. A crashed owner's runs become claimable this long
 /// after its last heartbeat.
-pub(super) const LEASE_TTL: Duration = Duration::from_secs(30);
+///
+/// This bounds how long a *dead* owner's runs are stranded, not how long a run
+/// may take: a live run renews while it executes. Set per plane with
+/// [`RuntimeBuilder::lease_ttl`].
+pub const LEASE_TTL: Duration = Duration::from_secs(30);
+
+/// The shortest lease a live run can actually hold.
+///
+/// Both stores keep expiry in whole seconds and lapse on `expires_at <= now`, so
+/// a one-second lease is expired for part of every second it exists. Two is the
+/// smallest value a renewal can stay ahead of.
+pub const MIN_LEASE_TTL: Duration = Duration::from_secs(2);
 
 /// What a run produced.
 #[derive(Debug, Clone)]
@@ -120,19 +131,94 @@ impl RunStatus {
     }
 }
 
+/// A run that exists but has not run.
+///
+/// Produced by admission and consumed by execution, so the two can happen in
+/// different places — the same request for a blocking call, and a background
+/// task for a non-blocking one.
+struct Admitted {
+    run: RunId,
+    epoch: crate::core::Epoch,
+    budget: Budget,
+    agent: String,
+    plan: PlanIR,
+    input: Tainted<Value>,
+    case: Option<CaseContext>,
+}
+
+/// Keeps a run's lease alive for as long as it is executing.
+///
+/// A lease answers one question — *is this owner dead?* — and it answers by
+/// expiry. Without renewal it also answers a question it was never asked: a
+/// healthy run that outlives its TTL looks exactly like a crashed one, and agent
+/// runs routinely outlive a lease because a single model call can. Another
+/// instance then takes the run over, bumps the epoch, and the original is fenced
+/// on its next append: killed mid-flight, having already done real work.
+///
+/// Renewing while executing separates the two. The TTL then bounds how long a
+/// *crashed* owner strands its runs, which is what it is for, and stops bounding
+/// how long a run may take, which it should never have bounded.
+///
+/// Aborted on drop, so the renewal stops the moment execution returns — by any
+/// path, including a panic unwinding through it. A heartbeat that outlived its
+/// run would hold a lease nobody is using and strand it for a full TTL after a
+/// crash, which is the failure this exists to prevent, arriving late.
+struct Heartbeat(tokio::task::JoinHandle<()>);
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The runtime.
 #[derive(Debug, Clone)]
 pub struct Runtime {
     store: Arc<dyn JournalStore>,
     skills: HashMap<String, Arc<dyn Skill>>,
     by_capability: HashMap<Capability, String>,
+    /// A handle to this plane, for steps that commission other agents on it.
+    ///
+    /// Weak, and that is not an optimisation: a strong self-reference would
+    /// leak every runtime ever built. It exists because commissioning belongs to
+    /// the *runtime* — a skill holding an `Arc<Runtime>` cannot work, since the
+    /// runtime needs the skill before the skill can have the runtime.
+    self_ref: std::sync::Weak<Runtime>,
+    /// The declaration governing each skill, by skill name.
+    ///
+    /// Per skill rather than per runtime, because a plane runs several agents
+    /// and a step must be judged against *its own* agent's manifest.
+    #[cfg(feature = "manifest")]
+    governed_by: HashMap<String, Arc<crate::manifest::Manifest>>,
+    /// Which tenant this plane runs as.
+    ///
+    /// One plane serves one tenant. A plane serving several would need every
+    /// key, lease, correlation and blob path to carry the tenant, and a single
+    /// place that forgot would be an isolation hole indistinguishable from
+    /// working software. A process per tenant is the boundary this crate can
+    /// actually hold up.
+    tenant: crate::core::TenantId,
+    /// Who vouched for each declaration, by agent name.
+    ///
+    /// Separate from the manifest because it is *not* in it: a document cannot
+    /// state who signed it. It arrives beside the manifest from a verified
+    /// registry resolution, and an absent entry means nobody vouched.
+    #[cfg(feature = "manifest")]
+    published_by: HashMap<String, crate::core::KeyId>,
     owner: String,
+    /// How long a run's lease lasts, and how long a crashed owner's runs stay
+    /// unclaimable.
+    lease_ttl: Duration,
     budget: Budget,
+
     cases: Option<Arc<dyn CaseStore>>,
     events: Option<Arc<dyn EventStore>>,
     tasks: Option<Arc<dyn TaskStore>>,
     timers: Option<Arc<dyn TimerStore>>,
     blobs: Option<Arc<dyn crate::blob::BlobStore>>,
+    /// Where data keys live, when payload bytes are sealed.
+    #[cfg(feature = "keyring")]
+    keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
     batches: Option<Arc<dyn crate::batch::BatchStore>>,
     policy: Option<Arc<dyn crate::core::PolicyEngine>>,
     identity: Option<crate::core::Delegation>,
@@ -149,17 +235,27 @@ impl Runtime {
             signer: None,
             skills: Vec::new(),
             owner: None,
+            lease_ttl: LEASE_TTL,
             budget: Budget::unlimited(),
             cases: None,
             events: None,
             tasks: None,
             timers: None,
             blobs: None,
+            #[cfg(feature = "keyring")]
+            keyring: None,
+            #[cfg(feature = "manifest")]
+            tools: None,
+            tenant: crate::core::TenantId::default(),
             batches: None,
             policy: None,
             identity: None,
             replanner: None,
             calendar: None,
+            #[cfg(feature = "manifest")]
+            agents: Vec::new(),
+            #[cfg(feature = "manifest")]
+            providers: HashMap::new(),
         }
     }
 
@@ -181,7 +277,18 @@ impl Runtime {
         self.events.as_ref()
     }
 
-    /// The timer store, if this runtime has one.
+    /// The ceilings every run under this runtime starts with.
+    ///
+    /// Readable because "what is this plane allowed to spend" is a question an
+    /// operator asks of a running system, and answering it by re-reading the
+    /// config that *should* have been applied is how a misapplied budget stays
+    /// invisible.
+    #[must_use]
+    pub const fn budget(&self) -> &Budget {
+        &self.budget
+    }
+
+    /// The blob store, if this runtime has one.
     #[must_use]
     pub fn blobs(&self) -> Option<&Arc<dyn crate::blob::BlobStore>> {
         self.blobs.as_ref()
@@ -289,6 +396,12 @@ impl Runtime {
         self.policy.as_ref()
     }
 
+    /// Which tenant this plane runs as.
+    #[must_use]
+    pub fn tenant(&self) -> &crate::core::TenantId {
+        &self.tenant
+    }
+
     /// The journal, under the name the batch driver reads it by.
     #[must_use]
     pub fn journal(&self) -> &Arc<dyn JournalStore> {
@@ -300,10 +413,100 @@ impl Runtime {
         &self.store
     }
 
-    /// This instance's identity, as it appears in run leases.
+    /// This **process instance's** identity, as it appears in run leases.
+    ///
+    /// Not the agent's name. Several instances of one agent are normal, and a
+    /// lease is renewed without a fencing bump only when the holder is the same
+    /// owner — so two instances sharing this string would each renew the other's
+    /// lease and both write to one run. See
+    /// [`RuntimeBuilder::owner`](RuntimeBuilder::owner).
+    ///
+    /// Public because "which instance holds this run" is a question an operator
+    /// asks of a stuck system, and the answer is otherwise only in a store row.
     #[must_use]
-    pub(super) fn owner(&self) -> &str {
+    pub fn owner_id(&self) -> &str {
         &self.owner
+    }
+
+    /// The declaration governing a skill, if its agent has one.
+    ///
+    /// Per skill, not per plane: a runtime runs several agents, and a step must
+    /// be judged against the manifest of the agent whose skill it is. Looking up
+    /// one plane-wide manifest would apply another agent's ceilings.
+    #[cfg(feature = "manifest")]
+    fn governing(&self, skill: &dyn Skill) -> Option<Arc<crate::manifest::Manifest>> {
+        self.governed_by.get(&skill.descriptor().name).cloned()
+    }
+
+    /// The ceilings a run gets: its agent's, or the plane's if it has no agent.
+    ///
+    /// Per agent, because that is who declared them. A plane-wide budget would
+    /// let one agent's generosity bound another's runs, which is the whole
+    /// reason a declaration belongs to an identity rather than to a process.
+    /// Renew this run's lease until the returned guard is dropped.
+    ///
+    /// Requires a Tokio runtime, as the rest of this crate's timing does.
+    fn heartbeat(&self, run: RunId, epoch: crate::core::Epoch) -> Heartbeat {
+        let store = Arc::clone(&self.store);
+        let owner = self.owner.clone();
+        let ttl = self.lease_ttl;
+        // A third of the TTL, so two renewals can be lost to a slow store before
+        // the lease lapses. Renewing *at* the TTL would mean any hesitation
+        // leaves it expired, and an expired lease is one anybody may take —
+        // including, per `acquire`, this caller, which would fence the run with
+        // its own heartbeat.
+        let period = ttl / 3;
+        Heartbeat(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(period).await;
+                match store.acquire(run, &owner, ttl).await {
+                    // Still ours, at the epoch we are writing under.
+                    Ok(lease) if lease.epoch == epoch => {}
+                    // Somebody fenced us, or we renewed late enough that our own
+                    // renewal bumped the epoch — which fences us just the same.
+                    // Stop either way: the run's next append will fail, which is
+                    // the correct outcome, and renewing now would only prolong a
+                    // run that is no longer allowed to write.
+                    _ => return,
+                }
+            }
+        }))
+    }
+
+    fn budget_for(&self, target: &str) -> Budget {
+        #[cfg(feature = "manifest")]
+        if let Ok(skill) = self.resolve(target)
+            && let Some(m) = self.governing(skill.as_ref())
+        {
+            return m.budget();
+        }
+        let _ = target;
+        self.budget
+    }
+
+    /// Which declaration governs runs of this capability, if a declared agent
+    /// does.
+    ///
+    /// Resolved the same way the budget is, and for the same reason: a run is
+    /// governed by the agent that answers its entry capability. A commissioned
+    /// sub-run opens its own run and records its own governor, so every run in a
+    /// room has exactly one — there is no case where this has to pick.
+    ///
+    /// The digest is computed here rather than stored on the agent because it is
+    /// only needed at admission, and a manifest that cannot produce one is a
+    /// manifest that could not have been published; recording `None` in that
+    /// case would claim the run was ungoverned, so the failure is surfaced as an
+    /// absent identity rather than a false one.
+    #[cfg(feature = "manifest")]
+    fn identity_for(&self, target: &str) -> Option<crate::journal::AgentIdentity> {
+        let skill = self.resolve(target).ok()?;
+        let m = self.governing(skill.as_ref())?;
+        Some(crate::journal::AgentIdentity {
+            name: m.metadata.name.clone(),
+            version: m.metadata.version.clone(),
+            digest: m.digest().ok()?,
+            publisher: self.published_by.get(&m.metadata.name).cloned(),
+        })
     }
 
     fn resolve(&self, target: &str) -> Result<Arc<dyn Skill>, RuntimeError> {
@@ -321,6 +524,77 @@ impl Runtime {
 
     /// Execute a fresh run with no case attached.
     pub async fn run(&self, target: &str, input: Value) -> Result<RunOutcome, RuntimeError> {
+        self.admit(target, Tainted::trusted(input), None).await
+    }
+
+    /// Admit a run and let it proceed in the background, returning its id.
+    ///
+    /// The asynchronous counterpart to [`run_tainted`](Self::run_tainted), for
+    /// callers that want a handle rather than an answer — A2A's
+    /// `return_immediately`, a queue worker, an operator kicking something off.
+    ///
+    /// **Admission happens before this returns.** The policy gate, the lease and
+    /// the admission records are all written first, so a refusal is an error
+    /// here and not a task that never appears, and the id handed back can be
+    /// read immediately. What continues in the background is the *work*.
+    ///
+    /// The run is durable, so a process that dies mid-flight leaves a journal
+    /// another instance resumes; the background task is where the work happens,
+    /// not where it is kept.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, as the rest of this crate's timing does.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run) — anything admission itself refuses.
+    pub async fn spawn(
+        self: &Arc<Self>,
+        target: &str,
+        input: Tainted<Value>,
+    ) -> Result<RunId, RuntimeError> {
+        // Resolved before the id is minted: an unknown capability is the
+        // caller's mistake and must be an error, not a run that exists and
+        // immediately fails.
+        let skill = self.resolve(target)?;
+        let capability = skill
+            .descriptor()
+            .provides
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Capability::new(skill.descriptor().name));
+
+        let run = RunId::generate();
+        let admitted = self
+            .admit_only(run, PlanIR::single(capability), input, None)
+            .await?;
+
+        let plane = Arc::clone(self);
+        tokio::spawn(async move { plane.execute_admitted(admitted).await });
+        Ok(run)
+    }
+
+    /// Start a run whose input carries a label.
+    ///
+    /// The hand-off boundary. A specialist's answer is untrusted — it came from
+    /// a model — and an orchestrator commissioning the next specialist with it
+    /// must not launder it on the way. Passing the labelled value keeps the
+    /// provenance, and the label is journaled so a replay reaches the same
+    /// verdict at the same gates.
+    ///
+    /// Without this the only door was [`run`](Self::run), whose input is trusted
+    /// by definition, so **every agent-to-agent hand-off washed the taint out**
+    /// — the one thing "risk context must survive delegation" forbids.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run).
+    pub async fn run_tainted(
+        &self,
+        target: &str,
+        input: Tainted<Value>,
+    ) -> Result<RunOutcome, RuntimeError> {
         self.admit(target, input, None).await
     }
 
@@ -337,8 +611,12 @@ impl Runtime {
         case_kind: &str,
         keys: &[CorrelationKey],
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit(target, input, Some((case_kind.to_owned(), keys.to_vec())))
-            .await
+        self.admit(
+            target,
+            Tainted::trusted(input),
+            Some((case_kind.to_owned(), keys.to_vec())),
+        )
+        .await
     }
 
     /// Execute an explicit multi-step plan.
@@ -346,7 +624,7 @@ impl Runtime {
     /// The plan is validated and frozen *before the first step runs*: one that
     /// would fail at step seven must not begin at step one.
     pub async fn run_plan(&self, plan: PlanIR, input: Value) -> Result<RunOutcome, RuntimeError> {
-        self.admit_plan(plan, input, None).await
+        self.admit_plan(plan, Tainted::trusted(input), None).await
     }
 
     /// Execute an explicit plan inside a long-lived case.
@@ -357,8 +635,12 @@ impl Runtime {
         case_kind: &str,
         keys: &[CorrelationKey],
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit_plan(plan, input, Some((case_kind.to_owned(), keys.to_vec())))
-            .await
+        self.admit_plan(
+            plan,
+            Tainted::trusted(input),
+            Some((case_kind.to_owned(), keys.to_vec())),
+        )
+        .await
     }
 
     /// The contract this runtime enforces on every plan.
@@ -369,7 +651,7 @@ impl Runtime {
     async fn admit(
         &self,
         target: &str,
-        input: Value,
+        input: Tainted<Value>,
         case: Option<(String, Vec<CorrelationKey>)>,
     ) -> Result<RunOutcome, RuntimeError> {
         // A bare target is the degenerate plan: one node, terminal.
@@ -387,7 +669,7 @@ impl Runtime {
     async fn admit_plan(
         &self,
         plan: PlanIR,
-        input: Value,
+        input: Tainted<Value>,
         case: Option<(String, Vec<CorrelationKey>)>,
     ) -> Result<RunOutcome, RuntimeError> {
         self.admit_plan_as(RunId::generate(), plan, input, case)
@@ -441,16 +723,65 @@ impl Runtime {
     /// A denial here leaves no journal at all, which is correct: nothing
     /// happened, and a run record for something that was never allowed to start
     /// would be a run nobody can explain.
-    fn authorize_admission(&self, agent: &str, input: &Value) -> Result<(), RuntimeError> {
+    fn authorize_admission(
+        &self,
+        capability: &str,
+        governed_by: Option<&crate::journal::AgentIdentity>,
+        input: &Value,
+    ) -> Result<(), RuntimeError> {
         let Some(engine) = self.policy.as_ref() else {
             return Ok(());
         };
-        let mut context = serde_json::json!({ "input": input });
+        let mut context = serde_json::json!({ "input": input, "tenant": self.tenant.as_str() });
+        // The declaration, so a rule can bind to the **digest** rather than to a
+        // name anyone can reuse: "this exact declaration may admit, and an
+        // edited one may not" is otherwise inexpressible, and a name-only rule
+        // keeps permitting an agent whose prompt and grants have since changed.
+        if let Some(id) = governed_by {
+            context["agent"] = serde_json::json!({
+                "name": id.name,
+                "version": id.version,
+                "digest": id.digest.to_hex(),
+                // The grouping a real rule binds to. `name` is beside it for
+                // readability and must not be authorized on: a file claims a
+                // name, but only the holder of a key can claim a publisher.
+                "publisher": id.publisher,
+            });
+        }
         super::ctx::merge_identity(&mut context, self.identity.as_ref());
+        // Who is acting, and what is being asked for. Passing one string as both
+        // made every admission rule a tautology — `principal == resource` cannot
+        // express "this agent may not run that capability", which is the whole
+        // question at admission on a plane hosting several agents.
+        //
+        // The principal is an **authenticated** identity or it is nothing. The
+        // scope check a few lines above already denies under the delegation
+        // subject, so anything else here would give one refused run two answers
+        // to "who was refused" in the same error type.
+        //
+        // The agent's `metadata.name` is deliberately *not* used, tempting as it
+        // is. A name is self-asserted — a manifest is a file, and its name is
+        // whatever the author typed — so a rule granting authority to a name
+        // grants it to any file claiming that name. A name is only as good as
+        // the resolution path that produced it, and at admission the runtime
+        // cannot know whether it came from a verified registry lookup or a
+        // string literal. Worse, a fallback would be *silent*: `principal == X`
+        // would mean an authenticated identity in a deployment with a delegation
+        // chain and a self-asserted label in one without, so the same rule would
+        // change meaning with the wiring.
+        //
+        // Rules that need to bind to the agent bind to `context.agent.digest`,
+        // which is content-addressed and pins what the declaration actually
+        // said. The capability is the fallback because it claims nothing: it is
+        // what was asked for, not who asked.
+        let principal = self
+            .identity
+            .as_ref()
+            .map_or(capability, |chain| chain.subject().id.as_str());
         let request = crate::core::PolicyRequest {
-            principal: agent,
+            principal,
             action: crate::core::ACTION_ADMIT,
-            resource: agent,
+            resource: capability,
             context: &context,
         };
         let crate::core::PolicyDecision::Deny { reason } = engine.authorize(&request) else {
@@ -460,15 +791,15 @@ impl Runtime {
         tracing::error!(
             target: telemetry::POLICY_DENIED,
             action = crate::core::ACTION_ADMIT,
-            resource = %agent,
+            resource = %capability,
             %reason,
         );
         metrics::count(metrics::POLICY_DENIALS, crate::core::ACTION_ADMIT);
         Err(RuntimeError::PolicyDenied(
             crate::core::PolicyError::Denied {
-                principal: agent.to_owned(),
+                principal: principal.to_owned(),
                 action: crate::core::ACTION_ADMIT.to_owned(),
-                resource: agent.to_owned(),
+                resource: capability.to_owned(),
             },
         ))
     }
@@ -479,13 +810,40 @@ impl Runtime {
     /// *before* the run starts, so that a crash leaves a reservation pointing at
     /// a journal that can be replayed rather than an item that must be guessed
     /// about. The id therefore has to be minted by the caller, one layer up.
-    pub(crate) async fn admit_plan_as(
+    /// The record that opens a run.
+    ///
+    /// Its own function because the label matters: journaled rather than
+    /// recomputed, so a replay reaches the same verdict at every taint gate as
+    /// the run it reproduces.
+    fn admission(
+        &self,
+        capability: &str,
+        governed_by: Option<crate::journal::AgentIdentity>,
+        input: &Tainted<Value>,
+    ) -> RecordKind {
+        RecordKind::RunAdmitted {
+            capability: capability.to_owned(),
+            governed_by,
+            input: input.peek().clone(),
+            input_label: input.label().clone(),
+            policy_bundle: self.policy.as_ref().map(|p| p.bundle()),
+        }
+    }
+
+    /// Everything up to and including the admission records, and no work.
+    ///
+    /// The seam a non-blocking submit needs. Admission is what makes a run
+    /// *exist*: the policy gate, the lease, and the records that say what is
+    /// about to happen. Splitting there means a caller can be told the run was
+    /// accepted — or refused — before any of it runs, and a refusal stays an
+    /// immediate answer rather than becoming a task that silently never appears.
+    async fn admit_only(
         &self,
         run: RunId,
         plan: PlanIR,
-        input: Value,
+        input: Tainted<Value>,
         case: Option<(String, Vec<CorrelationKey>)>,
-    ) -> Result<RunOutcome, RuntimeError> {
+    ) -> Result<Admitted, RuntimeError> {
         crate::plan::validate(&plan, &self.contract())
             .map_err(|e| RuntimeError::PlanContract(e.to_string()))?;
 
@@ -494,26 +852,27 @@ impl Runtime {
             .first()
             .map_or_else(|| "plan".to_owned(), |n| n.capability.to_string());
 
+        // Resolved once: the gate and the record must agree about which
+        // declaration governs this run, and computing it twice is how they
+        // start disagreeing.
+        #[cfg(feature = "manifest")]
+        let governed_by = self.identity_for(&agent);
+        #[cfg(not(feature = "manifest"))]
+        let governed_by: Option<crate::journal::AgentIdentity> = None;
+
         self.authorize_scope(&plan)?;
-        self.authorize_admission(&agent, &input)?;
+        self.authorize_admission(&agent, governed_by.as_ref(), input.peek())?;
 
         // Admission: take ownership, then record what we are about to do —
         // before doing any of it.
         let lease = self
             .store
-            .acquire(run, &self.owner, LEASE_TTL)
+            .acquire(run, &self.owner, self.lease_ttl)
             .await
             .map_err(RuntimeError::from_store)?;
 
         let mut records = vec![
-            Append::new(
-                run,
-                RecordKind::RunAdmitted {
-                    agent: agent.clone(),
-                    input: input.clone(),
-                    policy: self.policy.as_ref().map(|p| p.digest()),
-                },
-            ),
+            Append::new(run, self.admission(&agent, governed_by, &input)),
             // From here the plan is an authorization graph: compiled from
             // trusted input, frozen before anything untrusted was read, and
             // recorded so the journal that follows can be checked against it.
@@ -585,23 +944,73 @@ impl Runtime {
             .await
             .map_err(RuntimeError::from_store)?;
 
+        Ok(Admitted {
+            run,
+            epoch: lease.epoch,
+            budget: self.budget_for(&agent),
+            agent,
+            plan,
+            input,
+            case: case_ctx,
+        })
+    }
+
+    /// Execute a run that has already been admitted.
+    async fn execute_admitted(&self, a: Admitted) -> Result<RunOutcome, RuntimeError> {
         let mut cursor = ReplayCursor::default();
+        // Named, not `_`: `let _ = ` drops immediately, which would renew
+        // nothing at all while looking exactly like this.
+        let _heartbeat = self.heartbeat(a.run, a.epoch);
         self.execute(
             Execution {
-                run,
-                epoch: lease.epoch,
-                plan: &plan,
-                input,
+                run: a.run,
+                epoch: a.epoch,
+                plan: &a.plan,
+                input: a.input,
                 mode: Mode::Live,
-                case: case_ctx,
-                budget: self.budget,
-                agent,
+                case: a.case,
+                budget: a.budget,
+                agent: a.agent,
                 refusal: None,
                 successors: Vec::new(),
             },
             &mut cursor,
         )
         .await
+    }
+
+    /// Admit and execute, which is what every blocking entry point does.
+    pub(crate) async fn admit_plan_as(
+        &self,
+        run: RunId,
+        plan: PlanIR,
+        input: Tainted<Value>,
+        case: Option<(String, Vec<CorrelationKey>)>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let admitted = self.admit_only(run, plan, input, case).await?;
+        self.execute_admitted(admitted).await
+    }
+
+    /// Ensure an open run cannot cross its history frontier under different
+    /// authorization semantics than those recorded at admission.
+    fn ensure_resume_policy_bundle(&self, records: &[Record]) -> Result<(), RuntimeError> {
+        let recorded = records
+            .iter()
+            .find_map(|record| match record.kind() {
+                RecordKind::RunAdmitted { policy_bundle, .. } => Some(policy_bundle.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                RuntimeError::PlanContract("journal has no RunAdmitted record".into())
+            })?;
+        let configured = self.policy.as_ref().map(|policy| policy.bundle());
+        if recorded != configured {
+            return Err(RuntimeError::PolicyBundleChanged {
+                recorded: recorded.as_ref().map(PolicyBundleIdentity::digest),
+                configured: configured.as_ref().map(PolicyBundleIdentity::digest),
+            });
+        }
+        Ok(())
     }
 
     /// Re-execute a recorded run from its journal.
@@ -635,15 +1044,9 @@ impl Runtime {
         // splicing history from another run.
         Record::verify_chain(&records, Digest::ZERO).map_err(RuntimeError::from_store)?;
 
-        let input = records
-            .iter()
-            .find_map(|r| match r.kind() {
-                RecordKind::RunAdmitted { input, .. } => Some(input.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                RuntimeError::PlanContract("journal has no RunAdmitted record".into())
-            })?;
+        let input = records.iter().find_map(recorded_input).ok_or_else(|| {
+            RuntimeError::PlanContract("journal has no RunAdmitted record".into())
+        })?;
 
         // The plan is read back from history rather than recompiled. Recompiling
         // could produce a different graph — a changed manifest, a different
@@ -681,6 +1084,15 @@ impl Runtime {
             });
         }
 
+        // Resume can dispatch new effects after it reaches the end of history.
+        // They must be judged by the same complete bundle recorded at
+        // admission, or one run would claim one policy while later effects were
+        // authorized by another. Strict replay performs no effects and remains
+        // usable as an offline verifier without loading the historical engine.
+        if mode == Mode::Resume {
+            self.ensure_resume_policy_bundle(&records)?;
+        }
+
         // The case binding is read back from history rather than recomputed.
         // Re-correlating could land on a different case if the keys were since
         // released, which would silently rewrite which business fact this run
@@ -709,12 +1121,14 @@ impl Runtime {
             records.last().map_or(1, |r| r.body.epoch)
         } else {
             self.store
-                .acquire(run, &self.owner, LEASE_TTL)
+                .acquire(run, &self.owner, self.lease_ttl)
                 .await
                 .map_err(RuntimeError::from_store)?
                 .epoch
         };
 
+        // Strict verification never writes, so it holds no lease to renew.
+        let _heartbeat = (mode != Mode::Strict).then(|| self.heartbeat(run, epoch));
         self.execute(
             Execution {
                 run,
@@ -723,7 +1137,12 @@ impl Runtime {
                 input,
                 mode,
                 case: case_ctx,
-                budget: self.budget,
+                budget: {
+                    // The agent recorded at admission, so a replay is bounded by
+                    // the ceilings the run actually had.
+                    let recorded = recorded_agent(&records);
+                    self.budget_for(&recorded)
+                },
                 agent: recorded_agent(&records),
                 // A step-level refusal has no effect key, so it cannot ride the
                 // replay cursor like an effect's does. It is lifted here from
@@ -807,7 +1226,7 @@ impl Runtime {
         };
 
         // The plan in force. Owned rather than borrowed, because a replan
-        // replaces it (§9) and a reference into the version list could not
+        // replaces it and a reference into the version list could not
         // survive that. `recorded_successors` is empty on a live run and seeded
         // from the journal on a replay, so a successor is read back rather than
         // re-synthesised.
@@ -824,7 +1243,7 @@ impl Runtime {
 
         // The same steps as `done`, in the order they finished, **with the
         // capability that actually ran**. Unwinding needs both: a set has no
-        // order to reverse, and after a replan (§9) the current plan may have
+        // order to reverse, and after a replan the current plan may have
         // different work — or nothing at all — at a completed step's id.
         // Resolving the compensation from the live plan then undoes something
         // that never ran, which is a refund for a charge nobody made.
@@ -1004,7 +1423,7 @@ impl Runtime {
         // Read into a value first. A `MutexGuard` built inline as an argument
         // lives until the end of the full expression — which here is *after*
         // the await — so the lock would be held across a suspension. That is
-        // the same shape as the `Span::enter()` bug in §16.6: a guard whose
+        // the same shape as the `Span::enter()` bug: a guard whose
         // scope is wider than it looks, and invisible until something else
         // needs the lock.
         let spend = ledger.lock().expect("budget mutex").consumed().spend;
@@ -1129,7 +1548,7 @@ impl Runtime {
     /// Three gates, and the first is not negotiable.
     ///
     /// **Provenance.** The frozen plan is an authorization graph compiled from
-    /// trusted input only (§9.3). A replan *changes that graph*, so once any
+    /// trusted input only. A replan *changes that graph*, so once any
     /// untrusted value has reached working memory, anything shaping the new plan
     /// may be attacker-chosen — and choosing the authorization graph is the
     /// whole game. `plan-then-execute` is enforced here, structurally. A run
@@ -1142,7 +1561,7 @@ impl Runtime {
     /// **On replay, the successor is read back, never re-synthesised.** A
     /// planner asked twice can answer differently — a changed router, a
     /// different model — and replay would then verify the run against a plan
-    /// that never governed it. Same rule as the first plan (§9.3), for the same
+    /// that never governed it. Same rule as the first plan, for the same
     /// reason.
     async fn successor(
         &self,
@@ -1549,10 +1968,16 @@ impl Runtime {
                 case: cx.case.clone(),
                 timers: self.timers.clone(),
                 blobs: self.blobs.clone(),
+                #[cfg(feature = "keyring")]
+                keyring: self.keyring.clone(),
+                tenant: self.tenant.clone(),
                 ledger: Arc::clone(cx.ledger),
                 policy: self.policy.clone(),
                 identity: self.identity.clone(),
                 agent: cx.agent.to_owned(),
+                plane: self.self_ref.clone(),
+                #[cfg(feature = "manifest")]
+                manifest: self.governing(skill),
                 signer: self.signer.clone(),
             },
         );
@@ -1657,7 +2082,7 @@ impl Runtime {
     async fn run_step(
         &self,
         ctx: StepRun<'_>,
-        run_input: &Value,
+        run_input: &Tainted<Value>,
         outputs: &BTreeMap<StepId, Tainted<Value>>,
         cursor: crate::journal::StepCursor,
     ) -> Result<
@@ -1688,7 +2113,7 @@ impl Runtime {
     async fn run_step_inner(
         &self,
         ctx: StepRun<'_>,
-        run_input: &Value,
+        run_input: &Tainted<Value>,
         outputs: &BTreeMap<StepId, Tainted<Value>>,
         cursor: crate::journal::StepCursor,
     ) -> Result<
@@ -1748,10 +2173,16 @@ impl Runtime {
                 case,
                 timers: self.timers.clone(),
                 blobs: self.blobs.clone(),
+                #[cfg(feature = "keyring")]
+                keyring: self.keyring.clone(),
+                tenant: self.tenant.clone(),
                 ledger: Arc::clone(ledger),
                 policy: self.policy.clone(),
                 identity: self.identity.clone(),
                 agent: agent.to_owned(),
+                plane: self.self_ref.clone(),
+                #[cfg(feature = "manifest")]
+                manifest: self.governing(skill.as_ref()),
                 signer: self.signer.clone(),
             },
         );
@@ -1840,6 +2271,25 @@ impl Runtime {
                 .map_err(RuntimeError::from_store)?
                 .hash
         };
+
+        // Hand the lease back rather than letting it time out.
+        //
+        // Whatever the outcome — sealed, suspended, exhausted — this instance is
+        // finished with the run. Holding the lease until expiry would make every
+        // failover wait out the TTL for nothing, and that wait is precisely the
+        // pressure that tempts a deployment into giving all its replicas one
+        // owner string, which silently disables fencing.
+        //
+        // Best-effort on purpose. A release that fails costs a TTL of patience;
+        // turning it into a run failure would convert a tidiness problem into a
+        // correctness one, after the work is already done and journaled.
+        if let Err(e) = self.store.release_lease(run, epoch).await {
+            tracing::debug!(
+                %run,
+                error = %e,
+                "could not hand back the lease; it will expire on its own"
+            );
+        }
 
         announce(run, &status);
 
@@ -2023,7 +2473,7 @@ struct Batch<'a> {
     ledger: &'a Arc<std::sync::Mutex<Ledger>>,
     writing: bool,
     stamp: &'a (dyn Fn(Append) -> Append + Send + Sync),
-    input: &'a Value,
+    input: &'a Tainted<Value>,
     outputs: &'a BTreeMap<StepId, Tainted<Value>>,
 }
 
@@ -2107,11 +2557,135 @@ fn recorded_step_refusal(records: &[Record]) -> Option<(StepId, String, String)>
 /// principal a run was authorized as is a fact *about that run*, and deriving it
 /// again from a plan that may since have been edited would silently re-attribute
 /// history.
+/// A lease owner that no other process will accidentally share.
+///
+/// The previous default was the constant `"agentplane"`, which every replica and
+/// every restart used. Two consequences, both silent:
+///
+/// * Two replicas each saw the other's lease as their own and renewed it
+///   without bumping the epoch — two writers on one run, which is the exact
+///   situation fencing exists to make impossible.
+/// * A process restarting after a crash "renewed" the dead process's lease
+///   instead of waiting for expiry and fencing it, so a zombie still holding a
+///   socket could keep writing under the same epoch as its replacement.
+///
+/// A per-process random identity turns both into the correct behaviour: a
+/// different owner cannot renew, so it waits for expiry and takes over with
+/// `epoch + 1`.
+///
+/// An agent advertising a capability none of its skills provide is a card that
+/// lies, and the caller who believed it finds out at dispatch — in production —
+/// rather than here at startup.
+#[cfg(feature = "manifest")]
+fn assert_advertises_what_it_provides(
+    m: &crate::manifest::Manifest,
+    by_capability: &HashMap<Capability, String>,
+) {
+    let missing: Vec<&String> = m
+        .spec
+        .capabilities
+        .provides
+        .iter()
+        .filter(|c| !by_capability.contains_key(&Capability::new(c.as_str())))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "agent '{}' advertises capabilities none of its skills provide: {missing:?}",
+        m.metadata.name
+    );
+}
+
+/// Add one skill to the plane's two lookup tables, refusing a collision.
+///
+/// Both maps are plane-wide, and a bare `insert` would take a second
+/// registration silently. That was tolerable when a plane was one agent and is
+/// not now: dispatch resolves a capability to a skill *and to the manifest
+/// governing it*, so a silent overwrite does not merely shadow the loser — it
+/// moves work the loser still advertises out from under the loser's budget,
+/// model grants and egress ceiling. Nothing in the journal would show it,
+/// because the winner looks like the only claimant that ever existed.
+///
+/// Returns the skill's name, which is the key governance is recorded under.
+///
+/// # Panics
+///
+/// If another skill already holds this name, or another skill already claims one
+/// of its capabilities.
+fn register_skill(
+    skill: Arc<dyn Skill>,
+    caps: &mut HashMap<Capability, String>,
+    skills: &mut HashMap<String, Arc<dyn Skill>>,
+) -> String {
+    let d = skill.descriptor();
+    if let Some(existing) = skills.get(&d.name) {
+        // Registering the *same* `Arc` twice is idempotent rather than a
+        // mistake; two distinct skills under one name is the collision.
+        assert!(
+            Arc::ptr_eq(existing, &skill),
+            "two skills on this plane are both named '{}'. A skill name is how a capability \
+             resolves to an implementation and how a run names what it dispatched, so two of \
+             them make both answers arbitrary — rename one",
+            d.name
+        );
+    }
+    for cap in d.provides {
+        assert!(
+            caps.get(&cap).is_none_or(|first| first == &d.name),
+            "capability '{}' is claimed by two agents on this plane: '{}' and '{}'. Dispatch \
+             resolves a capability to one skill and to the manifest governing it, so the second \
+             claim would silently take the first's work out from under the first's budget and \
+             grants. Give them distinct capabilities, or put them on separate planes",
+            cap.0,
+            caps[&cap],
+            d.name,
+        );
+        caps.insert(cap, d.name.clone());
+    }
+    skills.insert(d.name.clone(), skill);
+    d.name
+}
+
+/// Not derived from a hostname or PID: containers reuse both. Randomness is the
+/// property that matters; readability is what the `owner` override is for, and a
+/// deployment with a real instance identity — a pod name — should pass it.
+fn default_owner() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // OS entropy, and deliberately *not* the clock: this crate forbids reading
+    // the wall clock outside a journaled effect, and rightly — a lease owner is
+    // a poor reason to make an exception to a rule that keeps replay honest.
+    // `RandomState` is seeded by the operating system, so two processes differ
+    // even where a container has reused a PID.
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // A counter beside it, so two runtimes built in one process — which tests do
+    // constantly — never alias each other either.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let seed = *SEED.get_or_init(|| RandomState::new().build_hasher().finish());
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("agentplane-{seed:016x}-{n}")
+}
+
+/// The admitted input, label and all.
+///
+/// Read back rather than recomputed: a replay that re-labelled would reach a
+/// different verdict at every taint gate than the run it reproduces.
+fn recorded_input(r: &Record) -> Option<Tainted<Value>> {
+    match r.kind() {
+        RecordKind::RunAdmitted {
+            input, input_label, ..
+        } => Some(Tainted::with_label(input.clone(), input_label.clone())),
+        _ => None,
+    }
+}
+
 fn recorded_agent(records: &[Record]) -> String {
     records
         .iter()
         .find_map(|r| match r.kind() {
-            RecordKind::RunAdmitted { agent, .. } => Some(agent.clone()),
+            RecordKind::RunAdmitted { capability, .. } => Some(capability.clone()),
             _ => None,
         })
         .unwrap_or_default()
@@ -2123,7 +2697,7 @@ fn recorded_agent(records: &[Record]) -> String {
 /// untrusted input without the plan author having to say so.
 fn assemble(
     node: &PlanNode,
-    run_input: &Value,
+    run_input: &Tainted<Value>,
     outputs: &BTreeMap<StepId, Tainted<Value>>,
 ) -> Result<Tainted<Value>, RuntimeError> {
     // The common case — a single argument — passes the value through rather than
@@ -2134,20 +2708,18 @@ fn assemble(
         return resolve_arg(node, only, run_input, outputs);
     }
 
-    let mut label = crate::core::Label::trusted();
-    let mut map = serde_json::Map::new();
+    let mut fields = Vec::with_capacity(node.args.len());
     for (name, source) in &node.args {
         let v = resolve_arg(node, source, run_input, outputs)?;
-        label = label.join(v.label());
-        map.insert(name.clone(), v.peek().clone());
+        fields.push((name.clone(), v));
     }
-    Ok(Tainted::with_label(Value::Object(map), label))
+    Ok(Tainted::object(fields))
 }
 
 fn resolve_arg(
     node: &PlanNode,
     source: &ArgSource,
-    run_input: &Value,
+    run_input: &Tainted<Value>,
     outputs: &BTreeMap<StepId, Tainted<Value>>,
 ) -> Result<Tainted<Value>, RuntimeError> {
     let pick = |v: &Value, field: &Option<String>| match field {
@@ -2156,7 +2728,11 @@ fn resolve_arg(
     };
 
     Ok(match source {
-        ArgSource::RunInput { field } => Tainted::trusted(pick(run_input, field)),
+        // Picking a field inherits the whole value's label: the parts of an
+        // untrusted document are untrusted.
+        ArgSource::RunInput { field } => {
+            Tainted::with_label(pick(run_input.peek(), field), run_input.label().clone())
+        }
         ArgSource::Const { value } => Tainted::trusted(value.clone()),
         ArgSource::Node { step, field } => {
             // The contract already proved this is upstream, so a miss here means
@@ -2168,13 +2744,16 @@ fn resolve_arg(
                     node.id
                 ))
             })?;
-            let picked = pick(upstream.peek(), field);
-            Tainted::with_label(picked, upstream.label().clone())
+            match field {
+                Some(field) => upstream
+                    .project_field(field)
+                    .unwrap_or_else(|| Tainted::with_label(Value::Null, upstream.label().clone())),
+                None => upstream.clone(),
+            }
         }
     })
 }
 
-/// Turn a step's result into a run status.
 /// Turn a step's result into a run status.
 ///
 /// The distinction that matters is between an ordinary failure and a run whose
@@ -2199,13 +2778,6 @@ fn classify(
         // because the answer depends on the run's provenance and budget, which
         // a step cannot see.
         Ok(Outcome::Replan { reason }) => (RunStatus::Replanning(reason), None),
-        Ok(Outcome::Delegate { target, .. }) => (
-            RunStatus::Failed(format!(
-                "delegation to '{target}' requires a collaborative topology, which this \
-                 build does not provide"
-            )),
-            None,
-        ),
         // Suspension is not a failure: the run is healthy and waiting. It
         // reaches here as an error only because that is how control leaves a
         // skill.
@@ -2277,7 +2849,7 @@ struct Execution<'a> {
     run: RunId,
     epoch: u64,
     plan: &'a PlanIR,
-    input: Value,
+    input: Tainted<Value>,
     mode: Mode,
     case: Option<CaseContext>,
     budget: Budget,
@@ -2362,19 +2934,108 @@ fn now_for_admission() -> crate::core::Timestamp {
     crate::core::Timestamp::now_utc()
 }
 
+/// One governed identity: a declaration and the skills that serve it.
+///
+/// A runtime **runs** agents; it is not one. It owns the journal, the stores,
+/// the model drivers and the policy engine — infrastructure, shared. An agent
+/// owns a manifest and its skills — governance, per-identity. Several agents on
+/// one plane share a journal and are still separately declared, separately
+/// bounded, and separately answerable.
+///
+/// Conflating the two forced a runtime per agent, which meant a lease owner per
+/// agent for what is one process, a model driver registered once per agent, and
+/// nowhere in the journal to record *which* agent governed a run.
+#[cfg(feature = "manifest")]
+#[derive(Debug, Default)]
+pub struct Agent {
+    manifest: Option<Arc<crate::manifest::Manifest>>,
+    /// Who vouched for the declaration, when it came from a verified resolution.
+    publisher: Option<crate::core::KeyId>,
+    skills: Vec<Arc<dyn Skill>>,
+}
+
+#[cfg(feature = "manifest")]
+impl Agent {
+    /// An agent governed by this declaration.
+    ///
+    /// Nobody has vouched for it. Prefer [`Agent::published_by`] where the
+    /// manifest came from a verified registry resolution.
+    #[must_use]
+    pub fn new(manifest: &crate::manifest::Manifest) -> Self {
+        Self {
+            manifest: Some(Arc::new(manifest.clone())),
+            publisher: None,
+            skills: Vec::new(),
+        }
+    }
+
+    /// Record who vouched for this declaration.
+    ///
+    /// Takes the [`KeyId`](crate::core::KeyId) that
+    /// [`Registry::resolve_verified`](crate::manifest::Registry::resolve_verified)
+    /// returned beside the manifest — which is otherwise dropped on the floor,
+    /// so a verified resolution and a parsed file become indistinguishable the
+    /// moment they reach the runtime.
+    ///
+    /// # Why this is the grouping a policy wants
+    ///
+    /// A rule has to name *a set of agents*, and the obvious candidates do not
+    /// survive contact with a deployment:
+    ///
+    /// * the **workload identity** is per-instance, so a rule naming one is a
+    ///   rule rewritten on every deploy;
+    /// * the agent **name**, its **role**, or any group label in the manifest is
+    ///   self-asserted — a file claims it, so a rule granting authority to one
+    ///   grants it to any file that types the same string;
+    /// * the **digest** is unforgeable but names exactly one revision, so every
+    ///   edit is a policy change.
+    ///
+    /// A publisher key is the only one that is both a group — many agents, many
+    /// versions — and impossible to claim without holding the key. Bind the rule
+    /// to the publisher, keep the digest for "this exact revision", and leave
+    /// the name for humans reading logs.
+    #[must_use]
+    pub fn published_by(mut self, key_id: impl Into<crate::core::KeyId>) -> Self {
+        self.publisher = Some(key_id.into());
+        self
+    }
+
+    /// Give it a skill.
+    #[must_use]
+    pub fn skill(mut self, skill: impl Skill + 'static) -> Self {
+        self.skills.push(Arc::new(skill));
+        self
+    }
+}
+
 /// Assembles a [`Runtime`].
 #[derive(Debug)]
 pub struct RuntimeBuilder {
     store: Arc<dyn JournalStore>,
     signer: Option<Arc<dyn crate::core::Signer>>,
     skills: Vec<Arc<dyn Skill>>,
+    #[cfg(feature = "manifest")]
+    tools: Option<(
+        Arc<crate::tools::ToolCatalog>,
+        Arc<dyn crate::tools::ToolClient>,
+    )>,
+    tenant: crate::core::TenantId,
     owner: Option<String>,
+    lease_ttl: Duration,
     budget: Budget,
+    /// Agents registered on this plane, each with its own declaration.
+    #[cfg(feature = "manifest")]
+    agents: Vec<Agent>,
+    /// Drivers by the name a manifest calls them.
+    #[cfg(feature = "manifest")]
+    providers: HashMap<String, Arc<dyn crate::model::ModelProvider>>,
     cases: Option<Arc<dyn CaseStore>>,
     events: Option<Arc<dyn EventStore>>,
     tasks: Option<Arc<dyn TaskStore>>,
     timers: Option<Arc<dyn TimerStore>>,
     blobs: Option<Arc<dyn crate::blob::BlobStore>>,
+    #[cfg(feature = "keyring")]
+    keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
     batches: Option<Arc<dyn crate::batch::BatchStore>>,
     policy: Option<Arc<dyn crate::core::PolicyEngine>>,
     identity: Option<crate::core::Delegation>,
@@ -2402,10 +3063,56 @@ impl RuntimeBuilder {
     /// outward claims carry one identity. They are separate settings because a
     /// plane can legitimately have one without the other.
     ///
-    /// [`signing_as`]: crate::store::TursoStore::signing_as
+    /// [`signing_as`]: crate::store::RedbStore::signing_as
     #[must_use]
     pub fn signing_as(mut self, signer: Arc<dyn crate::core::Signer>) -> Self {
         self.signer = Some(signer);
+        self
+    }
+
+    /// This **process instance's** identity, as it appears in run leases.
+    ///
+    /// Not the agent's name, and the distinction is load-bearing. A lease is
+    /// renewed without bumping the epoch when the holder is *the same owner*, so
+    /// two processes sharing an owner string each read the other's lease as
+    /// their own: no fencing, no epoch bump, and two writers on one run. That is
+    /// precisely the failure the epoch exists to prevent.
+    ///
+    /// So it must be unique per running process, which is what the default is —
+    /// override it only if you have a better instance identity than a random
+    /// one, such as a pod name. An agent's *name* is
+    /// [`Manifest::metadata`](crate::manifest::Metadata::name); several
+    /// instances of one agent are normal and must not share this.
+    ///
+    /// The owner lives in the lease table and never in the chain, so it has no
+    /// bearing on replay.
+    /// How long this plane's run leases last.
+    ///
+    /// The trade is recovery speed against tolerance for a slow instance: a
+    /// crashed owner's runs stay unclaimable for this long, and a live owner
+    /// must renew within it. The runtime heartbeats while a run executes, so
+    /// this bounds *crash* detection rather than how long a run may take.
+    ///
+    /// # Panics
+    ///
+    /// Below [`MIN_LEASE_TTL`]. Both stores keep lease expiry in **whole
+    /// seconds** and treat `expires_at <= now` as lapsed, so a one-second lease
+    /// expires the moment the clock ticks past the second it was written in — no
+    /// matter how often it is renewed. Such a lease cannot be held by a live
+    /// run, and a run that cannot hold its lease is one any instance may take
+    /// away mid-flight. Refused here rather than left as a footgun that only
+    /// shows up under load.
+    #[must_use]
+    pub fn lease_ttl(mut self, ttl: Duration) -> Self {
+        assert!(
+            ttl >= MIN_LEASE_TTL,
+            "a lease of {ttl:?} cannot be renewed: the store keeps expiry in \
+             whole seconds and treats `expires_at <= now` as lapsed, so anything \
+             under {MIN_LEASE_TTL:?} expires between renewals however often they \
+             run — and a run that cannot hold its lease can be taken over while \
+             it is still working"
+        );
+        self.lease_ttl = ttl;
         self
     }
 
@@ -2468,6 +3175,63 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Register an agent on this plane.
+    ///
+    /// A runtime runs agents; it is not one. This is where a declaration and
+    /// its skills arrive together, so several agents can share one journal, one
+    /// set of drivers and one process identity while each stays separately
+    /// governed.
+    ///
+    /// The declaration **binds** for that agent's steps: an effect naming a
+    /// model or tool its manifest never listed is refused before dispatch and
+    /// journaled, and the egress and delegation ceilings combine with the sink's
+    /// own — the stricter wins. Its budget bounds its runs. Architectural
+    /// injection patterns are deliberately absent from the schema, because this
+    /// runtime cannot prove that arbitrary skill code follows one.
+    ///
+    /// An agent declaring `spec.execution` needs no skill: the runtime supplies
+    /// the behaviour. See [`provider`](Self::provider) for the driver mapping it
+    /// needs.
+    ///
+    /// It does **not** set the lease owner. That identifies a *process*, and one
+    /// plane running four agents is still one process — see
+    /// [`owner`](Self::owner).
+    ///
+    /// # Panics
+    ///
+    /// If the agent advertises a capability none of its skills provide, or
+    /// declares `spec.execution` naming a provider no driver is registered for.
+    #[cfg(feature = "manifest")]
+    #[must_use]
+    pub fn agent(mut self, agent: Agent) -> Self {
+        self.agents.push(agent);
+        self
+    }
+
+    /// Register a model driver under the name a manifest uses for it.
+    ///
+    /// The seam a declarative agent needs. A manifest says `provider: anthropic`
+    /// — a string a reviewer can read — and something has to map that to a
+    /// driver holding a credential. That mapping is deployment wiring, not a
+    /// property of the agent, which is exactly why it lives here and not in the
+    /// file: an agent's declaration should not change when its API key does.
+    ///
+    /// Required only for [`ExecutionKind::Completion`] and the other declarative
+    /// kinds. A hand-written skill constructs its own `ModelCall` and never
+    /// consults this.
+    ///
+    /// [`ExecutionKind::Completion`]: crate::manifest::ExecutionKind::Completion
+    #[cfg(feature = "manifest")]
+    #[must_use]
+    pub fn provider(
+        mut self,
+        name: impl Into<String>,
+        provider: Arc<dyn crate::model::ModelProvider>,
+    ) -> Self {
+        self.providers.insert(name.into(), provider);
+        self
+    }
+
     /// Supply content-addressed blob storage.
     ///
     /// Needed by `StepCtx::store_blob`, which is how bytes too large for a
@@ -2477,6 +3241,78 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn blobs(mut self, blobs: Arc<dyn crate::blob::BlobStore>) -> Self {
         self.blobs = Some(blobs);
+        self
+    }
+
+    /// The operator's tool catalogue, and the client that reaches those tools.
+    ///
+    /// Required by a `tool-calling` agent and by nothing else: a skill that
+    /// calls tools builds its own [`ToolCall`](crate::tools::ToolCall), because
+    /// it knows which client it means. A declarative agent has no code to make
+    /// that choice, so the plane makes it once.
+    ///
+    /// The catalogue is the authority. A manifest grants a subset of it, the
+    /// model is offered exactly that subset, and a name the model returns is
+    /// matched against it byte for byte.
+    #[cfg(feature = "manifest")]
+    #[must_use]
+    pub fn tools(
+        mut self,
+        catalog: Arc<crate::tools::ToolCatalog>,
+        client: Arc<dyn crate::tools::ToolClient>,
+    ) -> Self {
+        self.tools = Some((catalog, client));
+        self
+    }
+
+    /// Which tenant this plane runs as.
+    ///
+    /// **One plane, one tenant.** A plane serving several would have to pick the
+    /// tenant per request, and nothing here does: no HTTP or A2A surface maps an
+    /// authenticated caller to a tenant. A process per tenant is a boundary that
+    /// can be held up, and it is what this crate offers.
+    ///
+    /// The name scopes **data keys**, so one tenant's cryptographic erasure
+    /// cannot reach another's bytes, and it reaches the **policy request**, so a
+    /// rule can be written per tenant.
+    ///
+    /// It does **not** scope the store — that is a separate handle, scoped by
+    /// `RedbStore::for_tenant` or `PostgresStore::for_tenant`. Two tenants may
+    /// share one store, because the tenant is a key component of every row on
+    /// both backends rather than a filter. Setting one and not the other is
+    /// refused at [`build`](Self::build) rather than discovered later: a plane
+    /// whose store is scoped elsewhere works perfectly and writes its runs into
+    /// somebody else's keyspace.
+    ///
+    /// Defaults to `default`, which is a real tenant rather than an absence: the
+    /// single-tenant path is then the same code as the multi-tenant one, and a
+    /// special "no tenant" case is a second path that would not get tested.
+    #[must_use]
+    pub fn tenant(mut self, tenant: crate::core::TenantId) -> Self {
+        self.tenant = tenant;
+        self
+    }
+
+    /// Seal payload bytes, and make erasure reach copies deletion cannot.
+    ///
+    /// With a key ring configured, everything written through
+    /// [`StepCtx::blobs`](crate::runtime::StepCtx::blobs) — including
+    /// [`store_blob`](crate::runtime::StepCtx::store_blob) and governed media —
+    /// is encrypted under a data key belonging to the run's **case**. Erasing
+    /// that case destroys the key, so every copy of those bytes becomes
+    /// unreadable at once: the live store, the replicas, and every backup ever
+    /// taken. Expiring blobs only reaches the first of those.
+    ///
+    /// The case is the erasure unit because it is already the retention unit —
+    /// bytes are linked to their case at write time, and a second, differently
+    /// shaped unit for keys would let the two disagree about what an erasure
+    /// covered.
+    ///
+    /// Without one, bytes are stored as given and erasure remains deletion.
+    #[cfg(feature = "keyring")]
+    #[must_use]
+    pub fn keyring(mut self, keyring: Arc<dyn crate::keyring::KeyRing>) -> Self {
+        self.keyring = Some(keyring);
         self
     }
 
@@ -2498,9 +3334,10 @@ impl RuntimeBuilder {
     /// deliberate absence rather than a permissive default: see `core::policy`
     /// on why there is no `AllowAll` to configure by mistake.
     ///
-    /// Whether an engine governed a run is recorded at admission, so "was policy
-    /// switched on for this" is answerable from the journal rather than from
-    /// someone's memory of the deployment.
+    /// The engine's complete immutable bundle identity is recorded at admission,
+    /// so both whether policy was on and exactly which executable semantics
+    /// governed the run are answerable from the journal. An open run may resume
+    /// only under that same identity.
     #[must_use]
     pub fn policy(mut self, policy: Arc<dyn crate::core::PolicyEngine>) -> Self {
         self.policy = Some(policy);
@@ -2535,36 +3372,179 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Assemble the runtime.
+    ///
+    /// # Panics
+    ///
+    /// On any of four wiring mistakes. Each is a bug in the embedder's own code
+    /// with no recovery, only a fix, which is why these are panics and not a
+    /// `Result` — and each is caught here at startup rather than at dispatch, in
+    /// production, where the cost is a run that has already begun.
+    ///
+    /// * A manifest declares a capability in `spec.capabilities.provides` that
+    ///   no registered skill provides. **An agent has skills**, so a declaration
+    ///   advertising one it cannot perform is a card that lies.
+    /// * Two agents claim the same capability. Dispatch resolves a capability to
+    ///   one skill *and to the manifest governing it*, so a second claim would
+    ///   silently take the first's work out from under the first's budget,
+    ///   model grants and egress ceiling.
+    /// * Two skills share a name. A name is what a capability resolves to and
+    ///   what governance is keyed on; two of them make both lookups arbitrary.
+    /// * A declarative agent names a provider no driver is registered for, or
+    ///   declares `spec.execution` without a privileged model to call.
+    /// * A plane and its store — or its blob store — are scoped to different
+    ///   tenants. The two are set
+    ///   separately — this builder's tenant scopes data keys and the policy
+    ///   request, `for_tenant` scopes the store's keys — and the mismatch does
+    ///   not show up at runtime. It *works*, and writes this tenant's runs into
+    ///   another's keyspace while every erasure and every policy request names
+    ///   the right one.
     #[must_use]
-    pub fn build(self) -> Runtime {
+    pub fn build(self) -> Arc<Runtime> {
+        assert_same_tenant(self.store.as_ref(), self.blobs.as_ref(), &self.tenant);
+
         let mut skills = HashMap::new();
         let mut by_capability = HashMap::new();
+        #[cfg(feature = "manifest")]
+        let mut governed_by: HashMap<String, Arc<crate::manifest::Manifest>> = HashMap::new();
+        #[cfg(feature = "manifest")]
+        let mut published_by: HashMap<String, crate::core::KeyId> = HashMap::new();
+
+        // Skills registered directly belong to the plane's anonymous agent: no
+        // declaration, so nothing to enforce against them beyond the runtime's
+        // own budget. That is a legitimate shape — not every agent needs a
+        // manifest — and it is why `skill()` still exists beside `agent()`.
         for s in self.skills {
-            let d = s.descriptor();
-            for cap in d.provides {
-                by_capability.insert(cap, d.name.clone());
-            }
-            skills.insert(d.name, s);
+            register_skill(s, &mut by_capability, &mut skills);
         }
-        Runtime {
+
+        #[cfg(feature = "manifest")]
+        for agent in self.agents {
+            if let (Some(m), Some(key)) = (agent.manifest.as_ref(), agent.publisher.clone()) {
+                published_by.insert(m.metadata.name.clone(), key);
+            }
+            let Some(m) = agent.manifest.clone() else {
+                for s in agent.skills {
+                    register_skill(s, &mut by_capability, &mut skills);
+                }
+                continue;
+            };
+
+            for s in agent.skills {
+                let name = register_skill(s, &mut by_capability, &mut skills);
+                governed_by.insert(name, Arc::clone(&m));
+            }
+
+            // A declarative agent needs no skill: the runtime supplies the
+            // behaviour its manifest asked for.
+            if let Some(execution) = &m.spec.execution {
+                let model = m
+                    .spec
+                    .models
+                    .as_ref()
+                    .and_then(|x| x.privileged.as_ref())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "agent '{}' declares execution but no privileged model — a \
+                             declarative agent has nothing to call",
+                            m.metadata.name
+                        )
+                    });
+                let Some(provider) = self.providers.get(&model.provider).map(Arc::clone) else {
+                    // Named rather than defaulted. Falling back to some other
+                    // registered driver would run the agent on a model its own
+                    // declaration does not name.
+                    panic!(
+                        "agent '{}' names provider '{}', which no driver is registered for. \
+                         Call RuntimeBuilder::provider(\"{}\", ..)",
+                        m.metadata.name, model.provider, model.provider
+                    );
+                };
+                assert!(
+                    !m.spec.capabilities.provides.is_empty(),
+                    "agent '{}' declares execution but provides no capability — a \
+                     declarative agent nothing can call is a file that does nothing",
+                    m.metadata.name
+                );
+                for cap in &m.spec.capabilities.provides {
+                    let skill: Arc<dyn Skill> = Arc::new(super::declarative::Declarative::new(
+                        execution.kind,
+                        cap.clone(),
+                        m.metadata.name.clone(),
+                        Arc::clone(&provider),
+                        self.tools.clone(),
+                        execution.max_turns,
+                    ));
+                    let name = register_skill(skill, &mut by_capability, &mut skills);
+                    governed_by.insert(name, Arc::clone(&m));
+                }
+            }
+
+            assert_advertises_what_it_provides(&m, &by_capability);
+        }
+
+        Arc::new_cyclic(|self_ref| Runtime {
+            self_ref: self_ref.clone(),
             signer: self.signer,
             store: self.store,
             skills,
             by_capability,
-            owner: self.owner.unwrap_or_else(|| "agentplane".to_owned()),
+            #[cfg(feature = "manifest")]
+            published_by,
+            tenant: self.tenant,
+            owner: self.owner.unwrap_or_else(default_owner),
+            lease_ttl: self.lease_ttl,
             budget: self.budget,
             cases: self.cases,
             events: self.events,
             tasks: self.tasks,
             timers: self.timers,
             blobs: self.blobs,
+            #[cfg(feature = "keyring")]
+            keyring: self.keyring,
             batches: self.batches,
             policy: self.policy,
             identity: self.identity,
             replanner: self.replanner,
             calendar: self.calendar.unwrap_or_else(|| Arc::new(WallClock)),
-        }
+            #[cfg(feature = "manifest")]
+            governed_by,
+        })
     }
+}
+
+/// Refuse a plane whose store serves a different tenant.
+///
+/// Not a misconfiguration that shows up at runtime — it *works*, and writes this
+/// tenant's runs into another's keyspace while every key-scoped erasure and
+/// every policy request names the right one. The two are set separately, so the
+/// mismatch is easy to make and invisible once made.
+fn assert_same_tenant(
+    store: &dyn JournalStore,
+    blobs: Option<&Arc<dyn crate::blob::BlobStore>>,
+    tenant: &crate::core::TenantId,
+) {
+    if let Some(blobs) = blobs {
+        assert!(
+            blobs.tenant() == tenant.as_str(),
+            "this plane runs as tenant '{}' but its blob store serves '{}'. \
+             Blobs are content-addressed, so a shared store means two tenants' \
+             identical bytes are one object — and erasing it for one destroys \
+             it for the other while reporting both requests discharged",
+            tenant,
+            blobs.tenant(),
+        );
+    }
+    assert!(
+        store.tenant() == tenant.as_str(),
+        "this plane runs as tenant '{}' but its store serves '{}'. The two are \
+         set separately — `RuntimeBuilder::tenant` scopes data keys and the \
+         policy request, and `for_tenant` scopes the store's keys — and a plane \
+         whose store is scoped elsewhere writes its runs into another tenant's \
+         keyspace",
+        tenant,
+        store.tenant(),
+    );
 }
 
 /// Inbound event delivery.
@@ -2615,7 +3595,7 @@ impl Runtime {
         // effect, and none of the suspension machinery exists twice.
         let lease = self
             .store
-            .acquire(sub.run, &self.owner, LEASE_TTL)
+            .acquire(sub.run, &self.owner, self.lease_ttl)
             .await
             .map_err(RuntimeError::from_store)?;
 
@@ -2627,6 +3607,9 @@ impl Runtime {
                         sub.run,
                         RecordKind::EffectDone {
                             output: event.payload.clone(),
+                            // The sender, so a replayed run rebuilds the same
+                            // provenance this delivery gave the value.
+                            source: Some(event.source.clone()),
                             spend: crate::core::Spend::default(),
                         },
                     )

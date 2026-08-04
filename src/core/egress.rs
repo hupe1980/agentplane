@@ -1,6 +1,6 @@
 //! Where this plane is permitted to connect.
 //!
-//! The sensitivity lattice (§12) controls *what* may leave; this controls
+//! The sensitivity lattice controls *what* may leave; this controls
 //! *where it may leave to*. They are different holes. A value can be perfectly
 //! within its ceiling and still be posted to a host nobody granted.
 //!

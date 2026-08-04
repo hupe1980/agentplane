@@ -48,6 +48,8 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(feature = "media")]
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -55,6 +57,80 @@ use crate::core::{
     Disposition, Effect, EffectDescriptor, EffectError, Recovery, RetryPolicy, Sensitivity, Spend,
     Trust,
 };
+
+/// A provider-side media reference hidden inside a provider-native prompt.
+///
+/// Deliberately structural rather than a search for strings that look like
+/// URLs. A user may ask a model to discuss a URL; the dangerous forms are the
+/// content blocks that instruct the provider to dereference one. The built-in
+/// drivers accept provider-native JSON, so both providers' spellings are
+/// recognized here and the runtime applies the same hard cut to custom drivers.
+fn provider_side_media_reference(value: &Value) -> Option<&'static str> {
+    fn remote_url(value: Option<&Value>) -> bool {
+        let url = value.and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("url").and_then(Value::as_str))
+        });
+        url.is_some_and(|url| !url.starts_with("data:"))
+    }
+
+    match value {
+        Value::Array(values) => values.iter().find_map(provider_side_media_reference),
+        Value::Object(object) => {
+            let kind = object.get("type").and_then(Value::as_str);
+
+            // Anthropic Messages: image/document source { type: "url", url: ... }.
+            if matches!(kind, Some("image" | "document"))
+                && object
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .is_some_and(|source| {
+                        source.get("type").and_then(Value::as_str) == Some("url")
+                            && source.get("url").and_then(Value::as_str).is_some()
+                    })
+            {
+                return Some("an Anthropic image/document URL source");
+            }
+
+            // OpenAI Responses, plus the older image_url content-block spelling
+            // accepted by compatible endpoints. A data URL carries bytes in the
+            // request and is not a provider-side network fetch.
+            if matches!(kind, Some("input_image" | "image_url"))
+                && remote_url(object.get("image_url"))
+            {
+                return Some("an OpenAI image URL");
+            }
+            if kind == Some("input_file") && remote_url(object.get("file_url")) {
+                return Some("an OpenAI file URL");
+            }
+
+            object.values().find_map(provider_side_media_reference)
+        }
+        _ => None,
+    }
+}
+
+fn provider_side_media_refusal(kind: &str) -> String {
+    format!(
+        "{kind} was refused before dispatch: the model provider would fetch it outside \
+         this plane's egress policy and journal; inline the media bytes, or fetch them \
+         through an explicit governed effect first"
+    )
+}
+
+pub(crate) fn refuse_provider_side_media(
+    prompt: &Value,
+    model: &ModelId,
+) -> Result<(), ModelError> {
+    let Some(kind) = provider_side_media_reference(prompt) else {
+        return Ok(());
+    };
+    Err(ModelError::Refused {
+        model: model.clone(),
+        detail: provider_side_media_refusal(kind),
+    })
+}
 
 /// Which model, from which provider.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -150,10 +226,51 @@ impl Usage {
     }
 }
 
+/// A tool the model asked to call.
+///
+/// A **request, never an instruction**. Each one still has to pass the gate: the
+/// agent's manifest must grant the tool, policy must allow the call, and the
+/// budget must have room. Model output is a proposal, and this is the most
+/// literal case of that rule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// The provider's own identifier for this call.
+    ///
+    /// Load-bearing in a loop: each result must go back under the id the model
+    /// used, or the model cannot tell which answer belongs to which question —
+    /// and providers reject a result carrying an id they never issued.
+    pub id: String,
+    /// The tool's name, as the model wrote it.
+    ///
+    /// Untrusted like everything else a model emits. A name matching no grant is
+    /// refused, never resolved to a near neighbour.
+    pub name: String,
+    /// The arguments, decoded.
+    ///
+    /// Normalised across providers — Anthropic sends an object, `OpenAI` a JSON
+    /// string — so a caller need not know which driver answered in order to read
+    /// them.
+    pub arguments: Value,
+}
+
 /// What came back.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Completion {
     pub text: String,
+    /// Tools the model asked to call.
+    ///
+    /// Empty for an ordinary answer, and empty for the forced-tool path used to
+    /// obtain structured output: that tool is this crate's mechanism for "answer
+    /// in this shape", not a request for the runtime to *do* anything, and
+    /// surfacing it would make every schema-shaped completion look like a tool
+    /// invocation.
+    ///
+    /// Filled identically by the buffered and streaming paths. Streaming is the
+    /// default, so a field populated only when buffering would be silently empty
+    /// in most deployments — which is worse than absent, because callers would
+    /// build loops on it and see them never fire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
     /// Why generation stopped, in the provider's words.
     ///
@@ -341,6 +458,14 @@ pub struct Request<'a> {
     /// afterwards. That is the whole reason to use it: a schema applied after
     /// the fact rejects a bad answer you have already paid for.
     pub schema: Option<&'a Value>,
+    /// The tools the model may ask for.
+    ///
+    /// Empty means the model is told of none, which is not the same as being
+    /// forbidden: authorization happens when a call comes back, against the
+    /// operator's grants. Declaring nothing simply gives it nothing to choose.
+    pub tools: &'a [ToolDeclaration],
+    /// Tools already run this turn, and what they returned.
+    pub exchanges: &'a [ToolExchange],
 }
 
 /// How a driver should obtain a schema-conforming answer.
@@ -393,16 +518,125 @@ pub trait ModelProvider: Send + Sync + Debug {
     async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError>;
 }
 
+/// A tool the model may ask for, as the request declares it.
+///
+/// Provider-neutral, because the two shapes differ in ways that are easy to get
+/// subtly wrong: Anthropic takes `{name, description, input_schema}` at the top
+/// level, while `OpenAI` wraps it as `{type: "function", function: {name,
+/// description, parameters}}`. A driver renders this into whichever it speaks,
+/// so a caller writes the declaration once.
+///
+/// # What a declaration is *not*
+///
+/// It is not a grant. Declaring a tool tells the model the tool exists; it does
+/// not authorize the call. The model's choice of tool and its arguments come
+/// back **untrusted**, are matched against the operator's grants exactly, and
+/// are dispatched through `cx.sink` where field provenance and the egress
+/// ceiling apply. A framework that executes what the model asked for has
+/// authorized the model; this one authorizes the operator's declaration and
+/// treats the model's request as a suggestion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDeclaration {
+    /// The name the model will use when it asks for this tool.
+    pub name: String,
+    /// What it does, for the model's benefit.
+    pub description: String,
+    /// JSON Schema for the arguments.
+    ///
+    /// Sent to `OpenAI` with `strict: true`, which enforces exact conformance
+    /// during generation rather than checking afterwards. That is worth having
+    /// even though it is not a security control: a well-formed argument is still
+    /// an untrusted one, and the field-provenance check is what refuses it.
+    pub parameters: Value,
+}
+
+impl ToolDeclaration {
+    /// Declare a tool.
+    #[must_use]
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
+    }
+}
+
+/// A tool the model asked for, and what came back.
+///
+/// Handed to the next request so the model can see the result of what it asked
+/// for. Provider-neutral because the continuation shapes differ more than the
+/// declarations do, and in ways that fail loudly at the API rather than quietly
+/// in the answer.
+///
+/// # Both halves travel, not just the result
+///
+/// The **call** is echoed back alongside its output. That is not redundancy: a
+/// provider matches a result to the request that produced it by id, and one sent
+/// without its call is rejected — `OpenAI` answers *"No tool call found for
+/// function call output with `call_id`"*. Carrying the pair makes that
+/// unrepresentable.
+///
+/// # Why the transcript is passed rather than referenced
+///
+/// `OpenAI` will hold the conversation for you behind `previous_response_id`.
+/// This crate does not use it, and will not: replay would then depend on state
+/// a provider holds, expires and can lose — so a run that replayed correctly
+/// today would diverge when that state aged out, for a reason nothing in the
+/// journal could explain. Everything needed to continue is in the request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolExchange {
+    /// What the model asked for, including the id it issued.
+    pub call: ToolCall,
+    /// What came back, as the tool produced it.
+    pub output: Value,
+    /// Whether the tool failed.
+    ///
+    /// Sent as Anthropic's `is_error`, so the model is told the difference
+    /// between a tool that answered and one that could not. A failure rendered
+    /// as an ordinary result teaches it that the operation succeeded and
+    /// returned something strange.
+    pub failed: bool,
+}
+
+impl ToolExchange {
+    /// A tool that answered.
+    #[must_use]
+    pub fn ok(call: ToolCall, output: Value) -> Self {
+        Self {
+            call,
+            output,
+            failed: false,
+        }
+    }
+
+    /// A tool that failed, with what to tell the model.
+    #[must_use]
+    pub fn failed(call: ToolCall, detail: impl Into<String>) -> Self {
+        Self {
+            call,
+            output: Value::String(detail.into()),
+            failed: true,
+        }
+    }
+}
+
 /// One completion.
 #[derive(Debug)]
 pub struct ModelCall {
     model: ModelId,
     prompt: Value,
     schema: Option<Value>,
+    tools: Vec<ToolDeclaration>,
+    exchanges: Vec<ToolExchange>,
     provider: Arc<dyn ModelProvider>,
     max_sensitivity: Sensitivity,
     output_sensitivity: Sensitivity,
     retry: RetryPolicy,
+    #[cfg(feature = "media")]
+    media: Option<Arc<dyn crate::blob::BlobStore>>,
+    #[cfg(feature = "media")]
+    media_grants: std::collections::BTreeSet<(crate::core::Digest, String)>,
 }
 
 impl ModelCall {
@@ -413,11 +647,47 @@ impl ModelCall {
             model,
             prompt,
             schema: None,
+            tools: Vec::new(),
+            exchanges: Vec::new(),
             provider,
             max_sensitivity: Sensitivity::Public,
             output_sensitivity: Sensitivity::Public,
             retry: RetryPolicy::never(),
+            #[cfg(feature = "media")]
+            media: None,
+            #[cfg(feature = "media")]
+            media_grants: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// Tell the model which tools it may ask for.
+    ///
+    /// What comes back is a *request*, not an action: the chosen name is matched
+    /// against the operator's grants exactly — never resolved to a near
+    /// neighbour — and the arguments stay untrusted until they pass the sink's
+    /// field-provenance rules. Declaring is telling; authorizing is separate.
+    ///
+    /// Declare only what is granted. Offering the model a tool the manifest does
+    /// not grant produces a call that is refused after the model has been paid
+    /// for choosing it, and teaches nobody anything.
+    #[must_use]
+    pub fn with_tools(mut self, tools: impl IntoIterator<Item = ToolDeclaration>) -> Self {
+        self.tools = tools.into_iter().collect();
+        self
+    }
+
+    /// Continue after tools ran, showing the model what came back.
+    ///
+    /// Each exchange carries the call *and* its output: a provider matches them
+    /// by the id it issued, and an output without its call is rejected.
+    ///
+    /// The prompt stays what it was. A continuation is the same question with
+    /// more known, so re-stating it would change the effect key and make each
+    /// turn of a loop a different call for replay purposes.
+    #[must_use]
+    pub fn continuing(mut self, exchanges: impl IntoIterator<Item = ToolExchange>) -> Self {
+        self.exchanges = exchanges.into_iter().collect();
+        self
     }
 
     /// The highest sensitivity this model may be shown.
@@ -439,6 +709,30 @@ impl ModelCall {
     #[must_use]
     pub const fn with_retry(mut self, r: RetryPolicy) -> Self {
         self.retry = r;
+        self
+    }
+
+    /// Permit these exact [`FetchedMedia`](crate::media::FetchedMedia) artifacts
+    /// to materialize from this blob store immediately before live dispatch.
+    ///
+    /// The prompt and effect key contain only media digests. Strict replay does
+    /// not execute `perform`, so it reads neither blob storage nor the network.
+    /// A prompt marker without a matching digest/type grant is refused;
+    /// knowing another case's digest is not authority to read that blob.
+    /// Model output remains journaled for replay and may itself reproduce media
+    /// content; digest-only input storage is not an output-redaction promise.
+    #[cfg(feature = "media")]
+    #[must_use]
+    pub fn with_media<'a>(
+        mut self,
+        media: Arc<dyn crate::blob::BlobStore>,
+        artifacts: impl IntoIterator<Item = &'a crate::media::FetchedMedia>,
+    ) -> Self {
+        self.media = Some(media);
+        for artifact in artifacts {
+            self.media_grants
+                .insert((artifact.digest, artifact.media_type.clone()));
+        }
         self
     }
 
@@ -513,6 +807,10 @@ impl Effect for ModelCall {
         self.output_sensitivity
     }
 
+    fn sink_arguments(&self) -> Option<&Value> {
+        Some(&self.prompt)
+    }
+
     /// Model output is untrusted, and this is the case the rule was written for.
     ///
     /// A completion is a plausible-sounding string produced from whatever was in
@@ -527,11 +825,26 @@ impl Effect for ModelCall {
     }
 
     async fn perform(&self) -> Result<Completion, EffectError> {
+        #[cfg(feature = "media")]
+        let prompt =
+            materialize_media(&self.prompt, self.media.as_ref(), &self.media_grants).await?;
+        #[cfg(not(feature = "media"))]
+        let prompt = self.prompt.clone();
+
+        // The trait is public, so an embedder may supply a provider whose wire
+        // implementation this crate cannot inspect. Apply the hard cut at the
+        // effect boundary as well as inside the built-in drivers: no provider
+        // reached through the runtime receives a remote media URL.
+        refuse_provider_side_media(&prompt, &self.model)
+            .map_err(|error| EffectError::Rejected(error.to_string()))?;
+
         self.provider
             .complete(Request {
                 model: &self.model,
-                prompt: &self.prompt,
+                prompt: &prompt,
                 schema: self.schema.as_ref(),
+                tools: &self.tools,
+                exchanges: &self.exchanges,
             })
             .await
             .map_err(|e| {
@@ -557,5 +870,366 @@ impl Effect for ModelCall {
                     }
                 }
             })
+    }
+}
+
+#[cfg(feature = "media")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MediaMaterialization {
+    digest: crate::core::Digest,
+    media_type: String,
+    encoding: String,
+}
+
+#[cfg(feature = "media")]
+async fn materialize_media(
+    prompt: &Value,
+    store: Option<&Arc<dyn crate::blob::BlobStore>>,
+    grants: &std::collections::BTreeSet<(crate::core::Digest, String)>,
+) -> Result<Value, EffectError> {
+    let mut references = Vec::new();
+    collect_media_references(prompt, &mut references)?;
+    if references.is_empty() {
+        return Ok(prompt.clone());
+    }
+    let store = store.ok_or_else(|| {
+        EffectError::Rejected(
+            "the prompt contains governed-media references but ModelCall has no media store"
+                .to_owned(),
+        )
+    })?;
+    references.sort();
+    references.dedup();
+
+    let mut replacements = std::collections::BTreeMap::new();
+    for reference in references {
+        if !grants.contains(&(reference.digest, reference.media_type.clone())) {
+            return Err(EffectError::Rejected(format!(
+                "governed media {} with type '{}' is not explicitly granted to this model call",
+                reference.digest, reference.media_type
+            )));
+        }
+        let bytes = store.get(reference.digest).await.map_err(|error| {
+            EffectError::Rejected(format!(
+                "governed media {} could not be materialized: {error}",
+                reference.digest
+            ))
+        })?;
+        crate::media::verify_materialized(&reference.media_type, &bytes)
+            .map_err(EffectError::Rejected)?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let value = match reference.encoding.as_str() {
+            "base64" => encoded,
+            "data_url" => format!("data:{};base64,{encoded}", reference.media_type),
+            other => {
+                return Err(EffectError::Rejected(format!(
+                    "unknown governed-media encoding '{other}'"
+                )));
+            }
+        };
+        replacements.insert(reference, Value::String(value));
+    }
+
+    replace_media_references(prompt, &replacements)
+}
+
+#[cfg(feature = "media")]
+fn collect_media_references(
+    value: &Value,
+    out: &mut Vec<MediaMaterialization>,
+) -> Result<(), EffectError> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_media_references(value, out)?;
+            }
+        }
+        Value::Object(object) => {
+            if object.contains_key("$agentplane_media") {
+                out.push(parse_media_reference(value)?);
+            } else {
+                for value in object.values() {
+                    collect_media_references(value, out)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(feature = "media")]
+fn replace_media_references(
+    value: &Value,
+    replacements: &std::collections::BTreeMap<MediaMaterialization, Value>,
+) -> Result<Value, EffectError> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(|value| replace_media_references(value, replacements))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::Object(object) if object.contains_key("$agentplane_media") => replacements
+            .get(&parse_media_reference(value)?)
+            .cloned()
+            .ok_or_else(|| {
+                EffectError::Rejected("governed-media replacement is missing".to_owned())
+            }),
+        Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), replace_media_references(value, replacements)?)))
+            .collect::<Result<serde_json::Map<_, _>, EffectError>>()
+            .map(Value::Object),
+        _ => Ok(value.clone()),
+    }
+}
+
+#[cfg(feature = "media")]
+fn parse_media_reference(value: &Value) -> Result<MediaMaterialization, EffectError> {
+    let outer = value.as_object().ok_or_else(|| {
+        EffectError::Rejected("governed-media marker must be an object".to_owned())
+    })?;
+    if outer.len() != 1 {
+        return Err(EffectError::Rejected(
+            "governed-media marker may not contain sibling fields".to_owned(),
+        ));
+    }
+    let marker = outer
+        .get("$agentplane_media")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            EffectError::Rejected("governed-media marker body must be an object".to_owned())
+        })?;
+    if marker.len() != 3 {
+        return Err(EffectError::Rejected(
+            "governed-media marker must contain exactly digest, media_type, and encoding"
+                .to_owned(),
+        ));
+    }
+    let digest = marker
+        .get("digest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| EffectError::Rejected("governed-media digest is missing".to_owned()))?;
+    let digest = crate::core::Digest::from_hex(digest).map_err(|error| {
+        EffectError::Rejected(format!("invalid governed-media digest: {error}"))
+    })?;
+    let media_type = marker
+        .get("media_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| EffectError::Rejected("governed-media media_type is missing".to_owned()))?
+        .to_owned();
+    let encoding = marker
+        .get("encoding")
+        .and_then(Value::as_str)
+        .ok_or_else(|| EffectError::Rejected("governed-media encoding is missing".to_owned()))?
+        .to_owned();
+    Ok(MediaMaterialization {
+        digest,
+        media_type,
+        encoding,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "media")]
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct RecordingProvider(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl ModelProvider for RecordingProvider {
+        async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(ModelError::Unavailable {
+                model: request.model.clone(),
+                detail: "recording provider was called".to_owned(),
+            })
+        }
+    }
+
+    /// The effect boundary protects custom providers, not only the built-ins.
+    #[tokio::test]
+    async fn a_model_call_refuses_provider_side_media_before_any_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call = ModelCall::new(
+            Arc::new(RecordingProvider(Arc::clone(&calls))),
+            ModelId::new("custom", "vision"),
+            json!({
+                "input": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_image",
+                        "image_url": "https://media.example/private.png"
+                    }]
+                }]
+            }),
+        );
+
+        let error = call
+            .perform()
+            .await
+            .expect_err("remote media must be refused");
+        assert!(matches!(error, EffectError::Rejected(_)), "{error}");
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "the provider was called");
+    }
+
+    #[cfg(feature = "media")]
+    #[derive(Debug, Default)]
+    struct CapturingProvider(Mutex<Option<Value>>);
+
+    #[cfg(feature = "media")]
+    #[async_trait]
+    impl ModelProvider for CapturingProvider {
+        async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
+            *self.0.lock().unwrap() = Some(request.prompt.clone());
+            Ok(Completion {
+                tool_calls: Vec::new(),
+                text: "described".to_owned(),
+                usage: Usage::default(),
+                stop_reason: Some("stop".to_owned()),
+                truncated: false,
+                structured: None,
+            })
+        }
+    }
+
+    #[cfg(feature = "media")]
+    #[tokio::test]
+    async fn governed_media_is_digest_only_until_live_model_dispatch() {
+        use crate::blob::{BlobStore, MemoryBlobs};
+        use crate::media::{FetchedMedia, MediaRetention};
+
+        let blobs = Arc::new(MemoryBlobs::new());
+        let bytes = b"\x89PNG\r\n\x1a\nbody";
+        let digest = blobs.put(bytes).await.unwrap();
+        let fetched = FetchedMedia {
+            digest,
+            media_type: "image/png".to_owned(),
+            bytes: bytes.len(),
+            source_url: "https://media.example/a.png".to_owned(),
+            final_url: "https://media.example/a.png".to_owned(),
+            redirects: 0,
+            validated_by: Vec::new(),
+            hops: Vec::new(),
+            retention: MediaRetention::External {
+                policy: "test".to_owned(),
+            },
+        };
+        let provider = Arc::new(CapturingProvider::default());
+        let call = ModelCall::new(
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+            ModelId::new("openai", "vision"),
+            json!({ "input": [{ "content": [fetched.openai_image()] }] }),
+        )
+        .with_media(blobs as Arc<dyn BlobStore>, [&fetched]);
+
+        let identity = serde_json::to_string(&call.descriptor()).unwrap();
+        assert!(identity.contains(&digest.to_hex()));
+        assert!(
+            !identity.contains("iVBOR"),
+            "media bytes entered the effect key"
+        );
+
+        call.perform().await.unwrap();
+        let prompt = provider.0.lock().unwrap().clone().unwrap();
+        let data_url = prompt["input"][0]["content"][0]["image_url"]
+            .as_str()
+            .unwrap();
+        assert!(data_url.starts_with("data:image/png;base64,iVBOR"));
+    }
+
+    #[cfg(feature = "media")]
+    #[tokio::test]
+    async fn knowing_a_media_digest_is_not_authority_to_materialize_its_blob() {
+        use crate::blob::{BlobStore, MemoryBlobs};
+        use crate::media::FetchedMedia;
+
+        let blobs = Arc::new(MemoryBlobs::new());
+        let bytes = b"\x89PNG\r\n\x1a\nprivate";
+        let digest = blobs.put(bytes).await.unwrap();
+        let provider = Arc::new(RecordingProvider(Arc::new(AtomicUsize::new(0))));
+        let calls = Arc::clone(&provider.0);
+        let call = ModelCall::new(
+            provider as Arc<dyn ModelProvider>,
+            ModelId::new("openai", "vision"),
+            json!({
+                "input": [{
+                    "content": [{
+                        "type": "input_image",
+                        "image_url": {
+                            "$agentplane_media": {
+                                "digest": digest,
+                                "media_type": "image/png",
+                                "encoding": "data_url"
+                            }
+                        }
+                    }]
+                }]
+            }),
+        )
+        .with_media(
+            blobs as Arc<dyn BlobStore>,
+            std::iter::empty::<&FetchedMedia>(),
+        );
+
+        let error = call.perform().await.expect_err("ungranted digest");
+        assert!(
+            error.to_string().contains("not explicitly granted"),
+            "{error}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "the provider was called");
+    }
+
+    #[test]
+    fn provider_side_media_url_shapes_are_classified_structurally() {
+        for remote in [
+            json!({
+                "type": "image",
+                "source": { "type": "url", "url": "https://media.example/image.png" }
+            }),
+            json!({
+                "type": "document",
+                "source": { "type": "url", "url": "https://media.example/document.pdf" }
+            }),
+            json!({ "type": "input_image", "image_url": "https://media.example/image.png" }),
+            json!({ "type": "image_url", "image_url": { "url": "https://media.example/image.png" } }),
+            json!({ "type": "input_file", "file_url": "https://media.example/document.pdf" }),
+        ] {
+            assert!(provider_side_media_reference(&remote).is_some(), "{remote}");
+        }
+
+        for inline_or_text in [
+            json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=" }
+            }),
+            json!({
+                "type": "document",
+                "source": { "type": "base64", "media_type": "application/pdf", "data": "JVBERi0=" }
+            }),
+            json!({
+                "type": "input_image",
+                "image_url": "data:image/png;base64,iVBORw0KGgo="
+            }),
+            json!({
+                "type": "input_file",
+                "filename": "document.pdf",
+                "file_data": "data:application/pdf;base64,JVBERi0="
+            }),
+            json!({ "type": "input_text", "text": "Discuss https://example.com/image.png" }),
+            json!("https://example.com/image.png"),
+        ] {
+            assert!(
+                provider_side_media_reference(&inline_or_text).is_none(),
+                "{inline_or_text}"
+            );
+        }
     }
 }

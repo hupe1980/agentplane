@@ -16,10 +16,13 @@
 //! into the other.
 
 mod conformance;
+mod docs;
 mod interactions;
 mod layering;
+mod media;
 mod metrics;
 mod postgres;
+mod vault;
 
 /// Serialises tests that install an ambient `tracing` subscriber.
 ///

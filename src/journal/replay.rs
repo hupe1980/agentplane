@@ -45,6 +45,12 @@ pub enum EffectReplay {
     /// the same budget verdict at the same point as the original.
     Done {
         output: serde_json::Value,
+        /// Who sent it, when the effect was an awaited inbound event.
+        ///
+        /// Carried so a replayed run rebuilds the same provenance the live one
+        /// had. Without it the two label the same value differently, and every
+        /// taint gate downstream may reach a different verdict.
+        source: Option<String>,
         spend: crate::core::Spend,
     },
     /// It failed, and the failure is part of history — including what that
@@ -94,6 +100,18 @@ pub struct StepCursor {
 }
 
 impl StepCursor {
+    fn record_release(&mut self, key: EffectKey, seq: Seq) {
+        self.effects.push((
+            key,
+            seq,
+            EffectReplay::Done {
+                output: serde_json::Value::Null,
+                source: None,
+                spend: crate::core::Spend::default(),
+            },
+        ));
+    }
+
     /// Whether this step's history is used up.
     ///
     /// Once it is, the step continues live — which is exactly how a crashed run
@@ -186,11 +204,16 @@ impl ReplayCursor {
                         },
                     ));
                 }
-                RecordKind::EffectDone { output, spend } => {
+                RecordKind::EffectDone {
+                    output,
+                    source,
+                    spend,
+                } => {
                     if let Some(slot) = cursor.effects.iter_mut().rev().find(|(k, _, _)| *k == key)
                     {
                         slot.2 = EffectReplay::Done {
                             output: output.clone(),
+                            source: source.clone(),
                             spend: *spend,
                         };
                     }
@@ -216,6 +239,7 @@ impl ReplayCursor {
                         slot.2 = match (disposition, output) {
                             (Disposition::Landed, Some(output)) => EffectReplay::Done {
                                 output: output.clone(),
+                                source: None,
                                 spend: *spend,
                             },
                             (d, _) => EffectReplay::Failed {
@@ -254,6 +278,7 @@ impl ReplayCursor {
                         },
                     ));
                 }
+                RecordKind::Released { .. } => cursor.record_release(key, r.seq()),
                 RecordKind::EffectFailed {
                     error,
                     disposition,
@@ -407,6 +432,7 @@ mod tests {
                 key(1),
                 RecordKind::EffectDone {
                     output: json!("recorded"),
+                    source: None,
                     spend: crate::core::Spend::default(),
                 },
             ),
@@ -416,6 +442,7 @@ mod tests {
             cur.next(S0, Phase::Forward, key(1)).unwrap(),
             Some(EffectReplay::Done {
                 output: json!("recorded"),
+                source: None,
                 spend: crate::core::Spend::default()
             })
         );
@@ -433,6 +460,7 @@ mod tests {
                 key(1),
                 RecordKind::EffectDone {
                     output: json!(1),
+                    source: None,
                     spend: crate::core::Spend::default(),
                 },
             ),
@@ -454,6 +482,7 @@ mod tests {
                 key(1),
                 RecordKind::EffectDone {
                     output: json!(1),
+                    source: None,
                     spend: crate::core::Spend::default(),
                 },
             ),
@@ -463,6 +492,7 @@ mod tests {
                 key(2),
                 RecordKind::EffectDone {
                     output: json!(2),
+                    source: None,
                     spend: crate::core::Spend::default(),
                 },
             ),
@@ -489,6 +519,7 @@ mod tests {
                 key(10),
                 RecordKind::EffectDone {
                     output: json!("b"),
+                    source: None,
                     spend: crate::core::Spend::default(),
                 },
             ),
@@ -497,6 +528,7 @@ mod tests {
                 key(1),
                 RecordKind::EffectDone {
                     output: json!("a"),
+                    source: None,
                     spend: crate::core::Spend::default(),
                 },
             ),
@@ -508,6 +540,7 @@ mod tests {
             cur.next(S0, Phase::Forward, key(1)).unwrap(),
             Some(EffectReplay::Done {
                 output: json!("a"),
+                source: None,
                 spend: crate::core::Spend::default()
             })
         );
@@ -515,6 +548,7 @@ mod tests {
             cur.next(S1, Phase::Forward, key(10)).unwrap(),
             Some(EffectReplay::Done {
                 output: json!("b"),
+                source: None,
                 spend: crate::core::Spend::default()
             })
         );
@@ -532,6 +566,7 @@ mod tests {
                 key(1),
                 RecordKind::EffectDone {
                     output: json!(1),
+                    source: None,
                     spend: crate::core::Spend::default(),
                 },
             ),
@@ -541,6 +576,7 @@ mod tests {
                 key(10),
                 RecordKind::EffectDone {
                     output: json!(2),
+                    source: None,
                     spend: crate::core::Spend::default(),
                 },
             ),
@@ -572,6 +608,7 @@ mod tests {
                 key(1),
                 RecordKind::EffectDone {
                     output: json!(1),
+                    source: None,
                     spend: crate::core::Spend::default(),
                 },
             ),

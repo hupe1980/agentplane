@@ -422,6 +422,7 @@ pub async fn check_events(store: &Arc<dyn EventStore>, r: &mut Report) {
 async fn a_claimed_event_is_never_retired(store: &Arc<dyn EventStore>, r: &mut Report) {
     r.checked += 1;
     let event = InboundEvent {
+        source: "urn:conformance".to_owned(),
         id: "evt-swept".into(),
         kind: "ack".into(),
         correlation: keys("E-9"),
@@ -467,6 +468,7 @@ async fn a_claimed_event_is_never_retired(store: &Arc<dyn EventStore>, r: &mut R
 async fn a_repeated_event_id_is_not_buffered_twice(store: &Arc<dyn EventStore>, r: &mut Report) {
     r.checked += 1;
     let event = InboundEvent {
+        source: "urn:conformance".to_owned(),
         id: "evt-dup".into(),
         kind: "ack".into(),
         correlation: keys("E-1"),
@@ -492,6 +494,7 @@ async fn a_repeated_event_id_is_not_buffered_twice(store: &Arc<dyn EventStore>, 
 async fn an_event_is_claimed_by_one_waiter_only(store: &Arc<dyn EventStore>, r: &mut Report) {
     r.checked += 1;
     let event = InboundEvent {
+        source: "urn:conformance".to_owned(),
         id: "evt-claim".into(),
         kind: "ack".into(),
         correlation: keys("E-2"),
@@ -544,6 +547,7 @@ async fn a_waiter_is_matched_by_one_event_only(store: &Arc<dyn EventStore>, r: &
     let _ = store.subscribe(&sub, ts(1_000)).await;
 
     let event = InboundEvent {
+        source: "urn:conformance".to_owned(),
         id: "evt-match".into(),
         kind: "ack".into(),
         correlation: keys("E-3"),

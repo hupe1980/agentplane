@@ -15,8 +15,11 @@
 //! times. Five groups keep both costs reasonable rather than optimising one
 //! into the other.
 
+mod a2a_server;
 mod api;
 mod drivers;
 mod mcp;
+mod media;
 mod model;
 mod tools;
+mod witness_http;

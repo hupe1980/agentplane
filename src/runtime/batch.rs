@@ -159,8 +159,13 @@ impl Runtime {
         let outcome = if reserved.outcome.is_some() || self.has_journal(reserved.run).await? {
             self.replay(reserved.run, Mode::Resume).await
         } else {
-            self.admit_plan_as(reserved.run, spec.plan.clone(), item.input.clone(), None)
-                .await
+            self.admit_plan_as(
+                reserved.run,
+                spec.plan.clone(),
+                crate::core::Tainted::trusted(item.input.clone()),
+                None,
+            )
+            .await
         };
 
         let (result, spend) = classify_item(outcome);

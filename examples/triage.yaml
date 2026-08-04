@@ -1,0 +1,50 @@
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+
+metadata:
+  name: support-triage
+  version: "2.0.0"
+
+spec:
+  # The prompt lives here, not in Rust, so rewording it is a version bump
+  # instead of a deploy nothing records.
+  identity:
+    role: "Support ticket triage"
+    constraints: "Classify severity. Never promise a refund."
+
+  # A lone specialist: one agent, one context, many tools. The only shape with
+  # no inter-agent failure surface, which is why it is the default.
+  topology:
+    mode: single
+    role: specialist
+
+  security:
+    max_sensitivity_egress: internal
+    max_delegation_depth: 0
+
+  capabilities:
+    provides: [support.triage]
+
+  # A model id is a behaviour change, so it is versioned like one.
+  models:
+    privileged: { provider: fake, model: triage-1 }
+
+  # The result contract. Narrowing it is a breaking change to every consumer,
+  # which is why it belongs in the digest rather than in a deploy.
+  output:
+    schema:
+      type: object
+      additionalProperties: false
+      required: [severity, summary]
+      properties:
+        severity: { type: string }
+        summary: { type: string }
+
+  budgets:
+    max_tokens: 120000
+    max_steps: 5
+
+  tools:
+    - ref: "mcp://tickets/read"
+      mutates: false
+      max_sensitivity: internal

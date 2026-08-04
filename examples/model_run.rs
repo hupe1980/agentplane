@@ -74,14 +74,15 @@ impl Skill for Triage {
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
+        let prompt = input.map(|input| json!({ "task": "triage this ticket", "ticket": input }));
         let call = ModelCall::new(
             Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
             model(),
-            json!({ "task": "triage this ticket", "ticket": input.peek() }),
+            prompt.peek().clone(),
         )
         .expecting(schema());
 
-        let completion = cx.effect(call).await?;
+        let completion = cx.sink(call, &prompt).await?;
 
         // Whatever came back is a plausible string produced from a context
         // window that held the ticket, and the ticket arrived from outside. The
@@ -216,14 +217,17 @@ impl Skill for Retries {
         };
 
         // Swallowed, as an agent rewording its prompt would.
+        let first_prompt = input
+            .clone()
+            .map(|ticket| json!({ "task": "triage", "ticket": ticket }));
         let _ = cx
-            .effect(ask(json!({ "task": "triage", "ticket": input.peek() })))
+            .sink(ask(first_prompt.peek().clone()), &first_prompt)
             .await;
 
+        let second_prompt =
+            input.map(|ticket| json!({ "task": "triage, briefly", "ticket": ticket }));
         let completion = cx
-            .effect(ask(
-                json!({ "task": "triage, briefly", "ticket": input.peek() }),
-            ))
+            .sink(ask(second_prompt.peek().clone()), &second_prompt)
             .await?;
         Ok(Outcome::done(completion.map(|c| json!({ "text": c.text }))))
     }

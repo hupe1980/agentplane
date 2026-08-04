@@ -1,7 +1,7 @@
 +++
 title = "Operations"
 description = "Deploying, high availability, retention, observability, and a runbook for every state a run can get stuck in."
-weight = 6
+weight = 7
 +++
 
 Running this for real: topologies, the store contract, the background sweep,
@@ -29,6 +29,61 @@ Two failure modes, deliberately distinct because they need opposite responses:
 Failover is not a special code path — it is the crash-recovery path. Lease
 expires, another instance claims at `epoch + 1`, resumes via replay. That is the
 payoff of building on replay: HA costs one lease table and an epoch column.
+
+### A live run renews; only a dead owner's lease expires
+
+Expiry answers *is this owner dead?* Without renewal it also answers a question
+nobody asked — a healthy run that outlives its TTL looks exactly like a crashed
+one, and agent runs routinely outlive a lease because one model call can. The
+run would be taken over and the original fenced mid-flight, having already done
+real work.
+
+So the runtime renews while a run executes, at a third of the TTL, and stops the
+moment execution returns. Set the TTL with `RuntimeBuilder::lease_ttl`: it bounds
+how long a **crashed** owner strands its runs, not how long a run may take.
+
+Anything under two seconds is refused at build. Both stores keep expiry in whole
+seconds and lapse on `expires_at <= now`, so a one-second lease is expired for
+part of every second it exists and no renewal frequency saves it — a plane
+configured that way would lose runs under load and nowhere else.
+
+### The owner string identifies a *process*, not an agent
+
+This is the one piece of the mechanism you can defeat by accident. A lease is
+renewed **without bumping the epoch** when the claimant is the same owner —
+that is what lets a live instance keep its own run. So two instances sharing an
+owner string each read the other's lease as their own, renew it, and both write
+under one epoch. Fencing is gone, and nothing reports an error.
+
+`Runtime::owner_id()` therefore defaults to a value that is unique per process
+and per runtime instance. Override it with a real instance identity — a pod name
+— never with the agent's name:
+
+```rust
+Runtime::builder(store).owner(std::env::var("POD_NAME")?).build()
+```
+
+Several instances of one agent are the normal way to run one, so the agent's
+name is exactly the wrong choice. The agent is named by its manifest; the
+process is named here, and the two are different questions.
+
+The owner lives in the lease table and never in the chain, so changing it has no
+bearing on replay.
+
+### Releasing frees the lease without forgetting the epoch
+
+A graceful shutdown hands the lease back so the next instance need not wait out
+the TTL. What it must **not** do is delete the row: the epoch lives there, and
+without it `append` has nothing to fence against while the next `acquire` starts
+again at 1 — so a writer already fenced at 2 outranks the new owner and the
+mechanism inverts. Releasing marks the row expired instead, and the next
+takeover advances the epoch as any takeover does.
+
+That last part is worth stating because the intuition runs the other way:
+releasing says the owner *intends* to stop, not that it already has. An
+un-awaited task or a crash between release and exit leaves an append in flight,
+and only a bump stops it. Takeover is immediate either way, which was the point
+of releasing.
 
 ## Two backends, one contract
 
@@ -292,14 +347,29 @@ surfaces at an audit months later. A `422` says so at the first call instead.
 
 Authentication says *who*; it does not say *what they may do*. An operator
 surface that stops there hands every authenticated caller the whole plane. So
-every route runs `gate()`, which authenticates and then authorizes through the
-runtime's own `PolicyEngine` under an `api:` action — and `Api::new` returns an
-error against a runtime that has none.
+every route runs `gate()`, which authenticates, resolves the caller's tenant to
+a plane, and then authorizes through **that plane's** `PolicyEngine` under an
+`api:` action — and `Api::new` returns an error if any registered plane has
+none, or if none was registered at all.
 
 That refusal is deliberate. In-process an absent engine is a choice; on a socket
 it is a hole, and a permissive default is one nobody discovers until the port is
 reachable. `DenyAll` exists for wiring the surface up before the rules are
-written.
+written. One ungoverned tenant among governed ones is the one an attacker looks
+for, which is why the check is over every plane rather than the first.
+
+### One surface, many tenants
+
+`Api::new` takes `Planes`, a registry keyed by tenant, so one process can serve
+several — a single-tenant deployment passes its runtime and reads as before.
+Which plane answers comes from the caller's tenant, which the `Authenticator`
+derives from the credential exactly as it derives `actor` and `roles`.
+
+The gate hands each route its resolved plane, and `Api` holds no runtime of its
+own, so a handler cannot read a store without having established whose it is. A
+caller whose tenant has no plane is refused rather than served by a default: a
+fallback would turn an unregistered tenant into somebody else's data while
+looking like working software.
 
 The gate runs *before* the path is parsed, so a denied caller cannot learn
 whether a run id exists by comparing a `400` against a `404`.

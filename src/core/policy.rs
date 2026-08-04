@@ -47,16 +47,126 @@
 //! recorded one". That is precisely why `BudgetRefused` exists, and
 //! `PolicyDenied` is its twin.
 //!
-//! What is journaled once, at admission, is the **policy digest** — which rules
-//! governed this run. That is an audit question (§17), not a replay one, and it
-//! makes "the policy changed" visible without making it fatal.
+//! What is journaled once, at admission, is the complete immutable
+//! [`PolicyBundleIdentity`]: rules, schema, static entities, adapter
+//! configuration/extensions, and evaluator semantics. Per-call facts remain in
+//! [`PolicyRequest::context`]; treating live identity or request data as static
+//! policy would freeze the world at admission.
+//!
+//! Strict replay performs nothing, so it neither loads nor compares policy. An
+//! open run resumed past its recorded prefix may dispatch new effects and must
+//! therefore present the exact bundle recorded at admission. Bundle drift is a
+//! loud refusal, never a warning followed by mixed policy semantics.
 
 use std::fmt::Debug;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::core::Digest;
+use crate::core::{Digest, canon};
+
+/// The complete immutable identity of an executable policy bundle.
+///
+/// A rules digest alone is insufficient: changing the schema, static entities,
+/// enabled extensions, adapter configuration, or evaluator semantics can change
+/// the answer without changing one rule. Each optional component is explicit,
+/// and [`digest`](Self::digest) domain-separates the resulting structure for
+/// compact indexing and comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyBundleIdentity {
+    rules: Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schema: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entities: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    configuration: Option<Digest>,
+    evaluator: String,
+}
+
+impl PolicyBundleIdentity {
+    /// Start an identity with the rule artifact and evaluator semantics.
+    ///
+    /// The evaluator string is a stable semantic identifier, not a display
+    /// version: it must change when an evaluator upgrade, adapter change, or
+    /// extension-set change can alter decisions.
+    ///
+    /// # Panics
+    ///
+    /// If `evaluator` is empty. An unnamed evaluator makes a bundle identity
+    /// incomplete and is a startup defect, not a recoverable runtime condition.
+    #[must_use]
+    pub fn new(rules: Digest, evaluator: impl Into<String>) -> Self {
+        let evaluator = evaluator.into();
+        assert!(
+            !evaluator.trim().is_empty(),
+            "a policy bundle must identify its evaluator semantics"
+        );
+        Self {
+            rules,
+            schema: None,
+            entities: None,
+            configuration: None,
+            evaluator,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_schema(mut self, schema: Digest) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_entities(mut self, entities: Digest) -> Self {
+        self.entities = Some(entities);
+        self
+    }
+
+    /// Bind templates, extensions, adapter options, and other evaluator input
+    /// not already represented by rules/schema/entities.
+    #[must_use]
+    pub const fn with_configuration(mut self, configuration: Digest) -> Self {
+        self.configuration = Some(configuration);
+        self
+    }
+
+    #[must_use]
+    pub const fn rules(&self) -> Digest {
+        self.rules
+    }
+
+    #[must_use]
+    pub const fn schema(&self) -> Option<Digest> {
+        self.schema
+    }
+
+    #[must_use]
+    pub const fn entities(&self) -> Option<Digest> {
+        self.entities
+    }
+
+    #[must_use]
+    pub const fn configuration(&self) -> Option<Digest> {
+        self.configuration
+    }
+
+    #[must_use]
+    pub fn evaluator(&self) -> &str {
+        &self.evaluator
+    }
+
+    /// Compact identity over the complete structured bundle.
+    #[must_use]
+    pub fn digest(&self) -> Digest {
+        let value = serde_json::to_value(self)
+            .expect("PolicyBundleIdentity contains only infallibly serializable fields");
+        let mut framed = b"agentplane.policy.bundle.v1\0".to_vec();
+        framed.extend_from_slice(&canon::value_bytes(&value));
+        Digest::of(&framed)
+    }
+}
 
 /// What is being asked.
 ///
@@ -118,13 +228,17 @@ impl PolicyDecision {
 pub trait PolicyEngine: Send + Sync + Debug {
     fn authorize(&self, request: &PolicyRequest<'_>) -> PolicyDecision;
 
-    /// Identifies the policy set in force.
+    /// Identifies every static input that can affect evaluation.
     ///
-    /// Journaled at admission, so "which rules governed this run" is answerable
-    /// years later against a rule set that has since changed a hundred times.
-    /// Without it a run's authorization history is only as good as whatever the
-    /// policy repository happens to still contain.
-    fn digest(&self) -> Digest;
+    /// Journaled at admission, so the rules, schema, static entities,
+    /// configuration/extensions, and evaluator semantics that governed a run
+    /// remain answerable after any of them change.
+    fn bundle(&self) -> PolicyBundleIdentity;
+
+    /// Compact digest of [`bundle`](Self::bundle).
+    fn digest(&self) -> Digest {
+        self.bundle().digest()
+    }
 }
 
 /// Refuses everything, naming itself.
@@ -146,8 +260,11 @@ impl PolicyEngine for DenyAll {
         ))
     }
 
-    fn digest(&self) -> Digest {
-        Digest::of(b"agentplane.policy.deny-all")
+    fn bundle(&self) -> PolicyBundleIdentity {
+        PolicyBundleIdentity::new(
+            Digest::of(b"agentplane.policy.deny-all"),
+            "agentplane/deny-all-v1",
+        )
     }
 }
 
@@ -155,3 +272,18 @@ impl PolicyEngine for DenyAll {
 pub const ACTION_PERFORM: &str = "effect:perform";
 /// The action string for starting a run.
 pub const ACTION_ADMIT: &str = "run:admit";
+/// The action string for removing an information-flow label.
+///
+/// A release changes what data may influence and where it may flow. Treating it
+/// as a logging helper would let any skill erase the lattice immediately before
+/// a privileged sink, so deployments with policy must authorize it explicitly.
+pub const ACTION_RELEASE: &str = "data:release";
+/// The action string for an effect refused by the agent's own manifest.
+///
+/// Distinct from [`ACTION_PERFORM`] so an auditor can tell the two refusals
+/// apart, because they mean different things and call for different responses.
+/// A policy denial is the deployment's rules saying no to something the agent
+/// was built to do; a manifest refusal is the agent doing something its own
+/// reviewed declaration never mentioned — which is a defect in the code, not a
+/// tightening of the rules.
+pub const ACTION_DECLARED: &str = "effect:declared";

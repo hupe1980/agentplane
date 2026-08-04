@@ -210,6 +210,49 @@ pub trait JournalStore: Send + Sync + Debug {
     /// owner. Renewing an owned lease keeps it.
     async fn acquire(&self, run: RunId, owner: &str, ttl: Duration) -> Result<Lease, StoreError>;
 
+    /// Hand a lease back, so the next instance need not wait out the TTL.
+    ///
+    /// The counterpart to [`acquire`](Self::acquire), and the difference between
+    /// a graceful shutdown and a crash. Without it every restart waits for
+    /// expiry, and the temptation is to make the owner string constant so that
+    /// the replacement "renews" instead — which quietly disables fencing,
+    /// because two live instances then read each other's lease as their own.
+    /// A release primitive is what lets the owner stay unique per process.
+    ///
+    /// Takes the caller's `epoch` and releases only if it is the one holding the
+    /// lease. A fenced caller must not be able to free the lease of the instance
+    /// that took over from it — that would hand the run to a third party while
+    /// the rightful owner is mid-write.
+    ///
+    /// Releasing a lease you do not hold is **not an error**. A process shutting
+    /// down after being fenced is in exactly that position, and making it fail
+    /// would turn an orderly exit into a log full of alarms about a run that is
+    /// already somebody else's problem.
+    ///
+    /// Idempotent: releasing twice is releasing once.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn release_lease(&self, run: RunId, epoch: Epoch) -> Result<(), StoreError>;
+
+    /// Whose rows this handle can reach.
+    ///
+    /// The default is `default`, which is the tenant a store serves until told
+    /// otherwise — a real tenant rather than an absence, so the single-tenant
+    /// path is the same code as the multi-tenant one.
+    ///
+    /// This exists so a mismatch is a **startup refusal** rather than a silent
+    /// leak. A plane's tenant scopes its data keys and reaches its policy
+    /// requests, but the store handle is built separately and has to be scoped
+    /// separately. Nothing about `RuntimeBuilder::tenant(acme)` over a store
+    /// left on `default` looks wrong at runtime: it works, and it writes acme's
+    /// runs into everybody's keyspace. Asking the store who it serves lets
+    /// `build()` catch that before the first run.
+    fn tenant(&self) -> &str {
+        crate::core::TenantId::DEFAULT
+    }
+
     /// Close the chain and return its terminal hash — what a signature covers.
     async fn seal(&self, run: RunId, epoch: Epoch, outcome: &str) -> Result<Digest, StoreError>;
 

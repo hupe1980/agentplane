@@ -148,6 +148,13 @@ while IFS=$'\t' read -r name file test desc; do
     # The full run is never skipped where it matters. PASS is the only verdict
     # the fast path may produce, and it is the verdict that needs no knowledge of
     # any other test.
+    # `- should panic` is optional in the pattern because cargo prints it for a
+    # `#[should_panic]` test — `test foo - should panic ... FAILED`. Without it
+    # the classifier cannot see those failing at all, and reports every mutation
+    # whose named test is a `should_panic` as a guarantee nothing can falsify.
+    # That is the worst possible direction for this harness to be wrong in: it
+    # would send somebody hunting for a missing test that exists and works.
+    #
     # No `--exact`: a unit test's real name is module-qualified
     # (`core::merkle::tests::foo`), so an exact filter on the leaf name matches
     # nothing and reports `0 passed` — which the classifier below would read as
@@ -155,7 +162,7 @@ while IFS=$'\t' read -r name file test desc; do
     # what makes one name work for both trees.
     target="$(binary_for "$test")"
     out="$(cargo test --all-features $target "$test" 2>&1)"
-    if ! grep -qE "^test .*${test} \.\.\. FAILED" <<<"$out"; then
+    if ! grep -qE "^test .*${test}( - should panic)? \.\.\. FAILED" <<<"$out"; then
         out="$(cargo test --all-features --no-fail-fast 2>&1)"
     fi
     python3 tools/mutants.py "$name" --revert
@@ -165,7 +172,7 @@ while IFS=$'\t' read -r name file test desc; do
     # rerun pass ...`, so a naive `^error:` check reads every successful
     # mutation as a compile failure — which is exactly what the first run of
     # this script did, reporting all twenty as broken.
-    if grep -qE "^test .*${test} \.\.\. FAILED" <<<"$out"; then
+    if grep -qE "^test .*${test}( - should panic)? \.\.\. FAILED" <<<"$out"; then
         printf '  %sPASS%s  %s\n        %scaught by %s%s\n' \
             "$GREEN" "$OFF" "$desc" "$DIM" "$test" "$OFF"
     elif grep -qE "^error\[|could not compile" <<<"$out"; then

@@ -189,7 +189,7 @@ impl Skill for One {
     }
 }
 
-fn runtime(effect: Scripted) -> (Arc<RedbStore>, Runtime) {
+fn runtime(effect: Scripted) -> (Arc<RedbStore>, Arc<Runtime>) {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .owner("test")
@@ -458,12 +458,13 @@ impl Skill for Asks {
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
+        let prompt = Tainted::trusted(json!("hello"));
         let call = agentplane::model::ModelCall::new(
             Arc::clone(&self.0) as Arc<dyn agentplane::model::ModelProvider>,
             agentplane::model::ModelId::new("fake", "m"),
-            json!("hello"),
+            prompt.peek().clone(),
         );
-        cx.effect(call).await?;
+        cx.sink(call, &prompt).await?;
         Ok(Outcome::done(input))
     }
 }

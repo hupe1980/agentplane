@@ -385,7 +385,7 @@ seq | kind              | effect_key | prev_hash | hash
   3 | StepStarted       | –          | 41b…      | e07…
   4 | EffectStarted     | ek:3f9…    | e07…      | 55a…
   5 | EffectDone        | ek:3f9…    | 55a…      | d13…
-  6 | Declassified      | –          | d13…      | 7f2…
+  6 | Released          | –          | d13…      | 7f2…
   7 | StepFinished      | –          | 7f2…      | 8b6…
 ```
 
@@ -663,7 +663,6 @@ for risk they never took on.
 - `ParallelDisjoint` — sub-tasks must read genuinely disjoint sources.
   Overlapping ones are **false parallelism**: coordination cost paid, no
   parallelism obtained.
-- `ContextOverflow` — the work exceeds one context window.
 - `DistinctAuthority` — sub-tasks need strictly different capabilities. The best
   reason to split agents and the least often named: it buys least privilege
   rather than hypothetical speed.
@@ -767,6 +766,22 @@ whatever the case holds *now* and the run reaches a different answer from the
 same journal — and writes to the store on the way through, against a runtime
 whose replay is supposed to perform nothing. `cx.case_state()` and
 `cx.put_case_state()` are journaled effects for the same reason `cx.now()` is.
+
+**A case-state read comes back untrusted.** Case state is shared mutable state:
+several runs write it over a process that may last months, and the engine never
+interprets a byte of it, so a read is only as trustworthy as the least
+trustworthy thing anybody ever wrote — and nothing in the runtime knows what that
+was. Handing it back trusted made it an exit from the lattice: a skill holding a
+model completion could put it into case state and read it back clean in a later
+step, or a later *run*, having passed none of `cx.release`'s policy check and
+leaving no record that a declassification happened.
+
+Storing the writing step's label instead would be no better, because it describes
+one write out of many while reading as authoritative. The join of every writer is
+the only honest label; it decays to untrusted the moment anything untrusted lands
+and never recovers on its own — so untrusted *is* that answer, without the
+machinery needed to arrive at it. A caller who genuinely needs it trusted asks
+for a release, which is journaled, policy-checked, and names who decided.
 
 **A write names the version it read.** A run is owned — one writer per journal,
 arbitrated by the lease. A case is the opposite: it is what several runs share,
@@ -1029,6 +1044,14 @@ advance.
 a *prefix* of what the current code does. A journal written by a different
 program is divergence, and the run is quarantined rather than continued.
 
+The same hard boundary applies to authorization. Admission records a structured
+policy-bundle identity covering rules, schema, static entities, adapter
+configuration/extensions, and evaluator semantics. An open run may resume only
+under that exact bundle because resume can dispatch past the recorded prefix.
+Dynamic request facts are not bundle inputs; they stay in each policy request.
+`Strict` performs nothing and therefore neither loads nor compares policy, which
+keeps offline verification independent of historical evaluator availability.
+
 **A succeeded or quarantined run is closed to resume.** Succeeded means nothing
 is outstanding, and re-executing would repeat work that is not an effect — a
 case-state write, say — which is the same class of bug the effect protocol
@@ -1058,12 +1081,26 @@ compile times *worse*, not better.
 src/
   core/      types, traits, labels, calendar, case model, errors
              — NO I/O (enforced by tests/guards/layering.rs)
-  journal/   records, hash chain, replay cursor, upcasters
+  journal/   records, hash chain, replay cursor, upcasters, the Merkle log
+             and the witness seam
   case/      CaseStore, EventStore, TaskStore contracts
   plan/      the plan contract: what a plan must satisfy to run at all
+  policy/    authorization-engine adapters; the seam itself is core::policy
   store/     redb and Postgres backends, journal and cases alike
+  blob/      content-addressed bytes kept out of the chain, and the erasure
+             that retention needs
+  keyring/   envelope encryption for those bytes, and the cryptographic
+             erasure that reaches copies deletion cannot (feature `keyring`)
+  media/     governed URL dereferencing, DNS pinning, bounded validation and
+             digest-only model materialization (feature `media`, off by default)
   runtime/   StepCtx, effect protocol, executor, sweeper, built-in effects
   batch/     batch runs: item source, outcomes, the BatchStore contract
+  tools/     calling tools on other people's servers, and the annotation
+             trust decision that implies
+  peers/     calling other agents: identity, audience, narrowing authority
+  audit      the outsider's verification pass over a journal
+  manifest/  the declaration an agent is built from, and the registry it is
+             pinned in (feature `manifest`, off by default)
   api/       the HTTP surface for operators (feature `http`, off by default)
   model/     the ModelProvider seam, the metering rules, and two streaming
              drivers (feature `providers`, off by default)
@@ -1238,7 +1275,13 @@ Two drivers ship, both off by default and both thin. What each carries is a
 commodity, the mapping decides whether a request may be sent again and whether
 the budget is telling the truth.
 
-### A2A (`a2a`)
+### A2A, calling out (`a2a`)
+
+The built surface is deliberately exact: an A2A 1.0 JSON-RPC `SendMessage`
+client to an operator-pinned endpoint. It sends `A2A-Version: 1.0`, declares its
+extension in `A2A-Extensions`, uses ProtoJSON enum/part forms, and validates that
+the response contains exactly one `task` or `message`. Agent Card discovery and
+verification, interface selection, and polling are not built.
 
 A2A tasks are long-running and stateful, so "did the peer act?" is not a detail.
 
@@ -1246,20 +1289,88 @@ A2A tasks are long-running and stateful, so "did the peer act?" is not a detail.
 |---|---|---|
 | DNS, TLS, connection refused | nothing was written | `DidNotHappen` |
 | timeout, or the connection died after the write | it may have arrived | `InDoubt` |
-| HTTP 401/403/404; JSON-RPC parse/method/params; A2A `-32006..=-32001` | read and declined | `DidNotHappen` |
-| HTTP 5xx; JSON-RPC `-32603` | arrived; whether it acted is unknown | `InDoubt` |
-| a `Task` in state `failed` | it acted and says so | `Landed` |
+| HTTP 401/403/404; JSON-RPC parse/method/params; A2A failed-precondition/input errors | read and declined | `DidNotHappen` |
+| HTTP 5xx; JSON-RPC `-32603`; A2A `-32006`; malformed success envelope | arrived; whether it acted is unknown | `InDoubt` |
+| a `Task` in state `TASK_STATE_FAILED`, `TASK_STATE_CANCELED`, or `TASK_STATE_REJECTED` | a task exists and may have acted | `Landed` |
 
 The two expensive rows are the last two. `-32603` can be raised *after* a peer
-has started work, so treating it as a clean decline is how a half-finished
-transfer gets sent twice. Symmetrically, a task that comes back `failed` is not
-in doubt — the peer has said it acted, so `Recovery` has nothing to resolve.
+has started work. A2A 1.0's `-32006` is `InvalidAgentResponseError`, mapped to
+`INTERNAL`/HTTP 500 — not a clean decline. Treating either as proof that nothing
+happened is how a half-finished transfer gets sent twice. Symmetrically, a task
+in a terminal unsuccessful state is not in doubt: the peer created a task and
+reported its outcome, so `Recovery` has nothing left to discover.
 
-The delegation chain travels under a declared extension URI rather than being
-smuggled into a free-form field, so a peer that does not understand it still
-receives a well-formed message. It is a **claim, not an attestation**: a peer
-authorizing on it is trusting whatever the last hop wrote. Signing it is designed
-and not built.
+The delegation chain and provenance travel under a declared extension URI rather
+than being smuggled into a free-form field, so a peer that does not understand it
+still receives a well-formed message. The delegation chain remains a claim. The
+provenance block is separately attested and bound to the call, so a peer with the
+workload verifier can check who made that exact request; neither substitutes for
+the peer's own authorization decision.
+
+### A2A, being called (`a2a-server`)
+
+The other half, and a different problem: everything arriving here was written by
+somebody else.
+
+It is a **separate router**, not routes on the operator API. That surface's
+invariant is that every route authenticates, and an Agent Card is public by
+definition — it is what a caller reads *before* it has credentials. Adding one
+unauthenticated path to a surface built on "every route authenticates" deletes
+the invariant for the one route nobody would think to check.
+
+| Method | Behaviour |
+|---|---|
+| `SendMessage` | admits a run and returns the `Task`; honours `returnImmediately` |
+| `GetTask` | the run's state, read from its **last** record |
+| `CancelTask` | a durable stop request; the task stays `WORKING` |
+| `GetExtendedAgentCard` | the authenticated card |
+| `SendStreamingMessage`, `SubscribeToTask`, `ListTasks` | `-32004`, unsupported |
+| the push-notification configs | `-32003`, not supported |
+| anything else | `-32601`, method not found |
+
+**Blocking is the default, and unset means blocking** — the spec's rule.
+`configuration.returnImmediately` switches to returning as soon as the task
+exists, leaving the caller to poll `GetTask`. Admission still happens before
+either returns: the policy gate, the lease and the admission records are written
+first, so the id handed back is one `GetTask` can already answer for. Spawning
+first and admitting later would hand out ids for runs the gate went on to
+refuse, turning a decline into a task that never appears.
+
+Four further decisions are load-bearing.
+
+**The 1.0 method names only.** 1.0 renamed every method; `message/send` was 0.3.
+A server that answers both accepts clients which have silently lost half the
+protocol, and they never find out, because the call works.
+
+**A missing `A2A-Version` is a refusal.** The spec reads an empty value as 0.3,
+so an absent header is a 0.3 client — and answering it with 1.0 semantics hands
+it a response shape it will mis-parse field by field.
+
+**The capability is named, never inferred.** A2A has no "call this skill" field;
+the protocol assumes the agent works out what is being asked. This plane will
+not. The skill comes from `message.metadata.skill`, matched against the card's
+advertised ids; with exactly one skill there is nothing to infer, and with
+several and none named the call is refused. Choosing what to run by reading
+untrusted prose would let the sender pick the capability.
+
+**A peer's message is untrusted.** It is admitted as `Tainted` with provenance
+`peer:<caller>` — never as trusted input — so a protected sink field can name
+the one counterparty it will accept an amount from. Admitting it as trusted
+would let a value that arrived over the network wear the runtime's own
+authority.
+
+Refusals carry the spec's codes rather than a generic error, because a caller
+has to tell *this agent cannot do that* from *you spelled it wrong*: one is
+worth reporting, the other worth retrying differently. For the same reason a
+policy denial comes back as a `Message` decline rather than `-32603` — an
+internal error reads as a transient fault, and the caller retries a decision
+that will never change. The decline says only that it was declined: the
+runtime's own denial names the action and resource the gate keyed on, which is
+enough to map this plane's authorization vocabulary by probing it.
+
+Streaming and push stay advertised `false` on the card, because a card is a
+promise a caller plans against and an unimplemented transport does not degrade
+gracefully — it produces a caller waiting for events nobody will send.
 
 ### Model providers (`providers`)
 
@@ -1338,6 +1449,35 @@ interrupting between "announced" and "recorded" manufactures exactly the
 in-doubt case the effect protocol exists to avoid. A suspended run has no thread
 to notice anything, so `request_cancel` resumes it itself; a run executing
 elsewhere sees the request at its own next boundary.
+
+### A lease answers "is the owner dead?", and nothing else
+
+Ownership is a lease with a TTL, and the epoch it carries is what fences a
+displaced writer. The trap is that expiry answers a second question nobody
+asked: **a healthy run that outlives its TTL looks exactly like a crashed one**.
+Agent runs routinely outlive a lease, because a single model call can. Another
+instance then acquires the run, bumps the epoch, and the original is fenced on
+its next append — killed mid-flight, having already done real work, for being
+slow.
+
+So the runtime **renews while it executes**, on a task that is aborted the moment
+execution returns by any path. The TTL then bounds how long a *crashed* owner
+strands its runs, which is what it is for, and stops bounding how long a run may
+take, which it should never have bounded. Strict verification renews nothing,
+because it never writes and holds no lease.
+
+Renewal runs at a third of the TTL, so two renewals can be lost to a slow store
+before the lease lapses. Renewing *at* the TTL would make any hesitation fatal,
+and a lapsed lease is one anybody may take — including, per `acquire`'s own
+rule, the caller that let it lapse, which would fence a run with its own
+heartbeat.
+
+`RuntimeBuilder::lease_ttl` sets it, and **refuses anything under two seconds**.
+Both stores keep expiry in whole seconds and lapse on `expires_at <= now`, so a
+one-second lease is expired for part of every second it exists and no renewal
+frequency saves it. A plane configured that way would have runs taken from it
+under load and nowhere else — so it is refused at build rather than left to be
+discovered.
 
 ### The request lives beside the chain, not in it
 
@@ -1438,6 +1578,386 @@ halted after 10,000 of 100,000 items has no unfinished item anywhere in its
 store. Whether the source was read to the end is recorded durably, because a
 resumed batch has to know whether it ever reached the end.
 
+## The manifest, and the registry it is pinned in
+
+Everything security-relevant about an agent can be expressed as a builder call.
+The problem is not that builder calls are wrong — it is that **a builder call is
+invisible in review and a file is not.** A tool grant added by editing three
+lines of Rust is a grant nobody notices; the same grant added to a manifest is a
+diff with a reviewer's name on it.
+
+```yaml
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata:
+  name: pattern-compliance-auditor
+  version: "2.0.0"
+spec:
+  topology:
+    mode: single
+    role: specialist
+  identity:
+    role: "Automated data invariant auditor"
+    constraints: "Isolate structural failures. Enforce semantic rule-packs strictly."
+  security:
+    max_sensitivity_egress: internal
+    max_delegation_depth: 2
+  budgets:
+    max_tokens: 120000
+    max_minor_units: 250
+  models:
+    privileged:  { provider: anthropic, model: claude-sonnet-5 }
+    quarantined: { provider: anthropic, model: claude-haiku-4-5-20251001 }
+  output:
+    schema:
+      type: object
+      required: [finding, severity]
+  tools:
+    - ref: "mcp://validator/apply_correction"
+      mutates: true
+      max_sensitivity: internal
+```
+
+### An agent that is only a file
+
+Everywhere else in this crate, behaviour is a `Skill` somebody wrote. That is the
+right answer when an agent does real work — a solver, a database, a calculation a
+model cannot be trusted with. It is the wrong answer for the large class of
+agents that are *a prompt, a model, and a result shape*, because the code adds
+nothing a reviewer can check while removing something they could: **the digest
+then covers only part of the agent.**
+
+`spec.execution.kind` closes that gap. It names a behaviour this crate
+implements, the runtime registers it, and nothing else is written:
+
+```yaml
+spec:
+  execution:
+    kind: completion        # one model call, answered in the declared shape
+```
+
+```rust
+// The only Rust. Which driver answers to the name `fake` is deployment wiring —
+// an agent's declaration must not change when its API key does.
+let rt = Runtime::builder(store)
+    .provider("fake", provider)
+    .agent(Agent::new(&m))
+    .build();
+```
+
+The claim this unlocks is worth stating precisely, and as a **conjunction**
+rather than as a boast about what nobody else has — a negative about every
+product in a field moving this fast is not a claim anyone can check. A
+declarative agent here is content-addressed **in its entirety**, *and* every step
+it takes is journaled, *and* the run replays deterministically.
+
+Each half exists elsewhere; the pairing is the point. Declarative agent formats
+(`agent.yaml`, CrewAI, ADK) give you the first — a reviewable, versioned file.
+Durable-execution platforms give you the second and third, and as of Dapr 1.18
+they sign and attest that history too. What is hard to assemble from either side
+is a file that is *both* the whole definition of the agent and the thing whose
+execution replays: a signed history of a program you cannot fully see is
+evidence about a black box, and a reviewable file with no execution record is a
+description of intentions.
+
+Two refusals keep it honest. A manifest declaring `execution` with no capability
+is refused — an agent nothing can call is a file that does nothing. And a
+provider the manifest names but no driver is registered for is refused rather
+than defaulted to whatever driver happens to be present, because falling back
+would run the agent on a model its own declaration does not name, which is the
+exact substitution this layer exists to prevent.
+
+`kind` is an enum, deliberately short, and every variant is a behaviour that is
+implemented and tested. A config format whose behaviours are open-ended is one
+nobody can review, because the reviewer would have to know what the string does.
+A tool-calling loop is the obvious next kind and is **not** built: the model
+layer does not yet surface tool calls from a completion, so a manifest asking for
+one would be a promise the crate cannot keep.
+
+### Oversight, declared without a predicate
+
+The Article 14 half. It is declarable *because* the machinery already exists —
+durable worklists, four-eyes, declared expiry — so it lands on the binding side
+of the rule rather than the intent side:
+
+```yaml
+spec:
+  execution: { kind: completion }
+  oversight:
+    approval: required
+    approvers: [role:compliance-officer]
+    deadline: klaerung          # resolved by your Calendar
+    on_expiry: deny             # the default
+```
+
+The declarative agent then opens a task with the answer as the proposal — the
+answer itself, not a description of it, because a reviewer who cannot see what
+will happen is not reviewing — and returns only on approval. A refusal names who
+refused and why, since "the agent failed" is not something an operator can act
+on.
+
+Three refusals:
+
+* **`oversight` without `execution` is rejected.** A hand-written skill picks its
+  own moment to ask, so there is nothing here for the runtime to apply. Allowing
+  it would let a file claim a human is in the loop when no human ever is — the
+  precise decoration the binding rule exists to prevent.
+* **`on_expiry: proceed` needs `allow_unattended: true`.** The runtime already
+  demands that; the file demands it too, so the decision is greppable in the
+  document a reviewer reads rather than only in code they do not.
+* **An unstated `on_expiry` denies.** The safe direction is the one nobody has to
+  remember to choose.
+
+**What you will not find is a condition.** "Require approval when severity is
+high" is a predicate, and a predicate is one step from an `if` — the point where
+config stops being config. An agent whose oversight depends on what it found is a
+skill, written in a language built for decisions. This is the field flagged in
+advance as most likely to break that line.
+
+### What a manifest is worth: it binds
+
+A field read by convention is two independent copies of one decision. The
+reviewer approves `model: haiku`, the code calls opus, and nothing anywhere
+disagrees — worse than useless, because it manufactures confidence. So the rule
+is: **a field either has an enforcement point, or it is marked as intent.**
+
+What enforces today, before dispatch:
+
+| Field | Refused when | Reported as |
+|---|---|---|
+| `spec.models` | a completion names an undeclared provider/model | `effect:declared`, journaled |
+| `spec.tools` | a call names an ungranted `mcp://server/tool` | `effect:declared`, journaled |
+| `spec.budgets` | the ledger reaches a ceiling | `Exhausted` |
+| `spec.capabilities.provides` | no registered skill provides it | panic at `build()` |
+| `security.max_sensitivity_egress` | a labeled value exceeds the stricter of manifest and sink ceilings | `EgressCeiling` |
+| `security.max_delegation_depth` | the configured identity or a handoff chain exceeds the reviewed ceiling | build refusal or `DelegationDepth` |
+
+The refusal carries a **distinct action** from a Cedar denial, because the two
+accuse different parties: a policy denial is the deployment's rules saying no to
+something the agent was built to do; a manifest refusal is the agent doing
+something its own reviewed declaration never mentioned, which is a defect in the
+code rather than a tightening of the rules.
+
+There are no review-only security fields. Architectural injection-pattern labels
+were removed because arbitrary native skill code cannot be proven to follow one;
+keeping the label would manufacture confidence. `spec.output.schema` is carried
+to the provider and into the effect key, but is not validated a second time
+against a result.
+
+### The prompt is part of the declaration
+
+`spec.identity` is the field that makes the digest worth having. A system prompt
+composed in the embedder's Rust has **no version**: it changes in a deploy, the
+journal faithfully records every run it affected, and nothing connects the two.
+Inside the manifest it is covered by the digest, so a reworded instruction is a
+version bump — a diff with a reviewer on it, and something a consumer can pin.
+
+`Identity::system_prompt` renders it with the dullest template that could work:
+the role, a blank line, the constraints. Anything cleverer would be agentplane
+putting words in an agent's mouth that no reviewer of the manifest ever saw. Its
+exact layout is pinned by a test, because changing it would alter every
+embedder's prompt without changing a single manifest or moving a single digest —
+the one edit in this crate that could silently change model behaviour everywhere.
+
+The field is optional. An embedder composing its prompt in code is a legitimate
+choice, and requiring the field would mostly produce manifests with a
+placeholder in it. A *declared* identity with a blank role is refused, though:
+that is a digest covering a prompt that says nothing, under a field that looks
+answered.
+
+### What this agent is in a multi-agent arrangement
+
+MAST measures **inter-agent misalignment at 36.9 % of observed multi-agent
+failures** — the one large failure class that exists only because somebody chose
+an arrangement. So the arrangement is declared rather than emergent.
+
+`mode` is *how many agents and why*; `role` is *what this one is*. They are
+separate because one shape supports several roles, and each agent has its own
+manifest:
+
+| `mode` | shape | inter-agent failure surface |
+|---|---|---|
+| `single` *(default)* | one agent, one context, many tools | structurally absent |
+| `routed` | a deterministic router picks exactly **one** agent per trigger | absent — still one agent per task |
+| `collaborative` | several agents contribute to one task | the full surface |
+
+| `role` | may delegate | |
+|---|---|---|
+| `specialist` *(default)* | **no** | does one thing, hands off to nobody |
+| `orchestrator` | yes | decomposes, delegates, assembles |
+| `router` | no | one dispatch decision, then it steps out |
+
+**Routing is not collaboration.** Picking one specialist out of twenty-nine by
+event type is a dispatch table, and carries none of the coordination risk — which
+is what most "we run multi-agent" deployments actually are.
+
+Three combinations are refused, because the fields are individually fine and it
+is the combination that describes nothing:
+
+* **`specialist` with `max_delegation_depth` above zero.** The consistently
+  reported top failure mode of handoff architectures is the infinite loop — A
+  hands to B, B to C, C back to A. The structural answer is that most agents in
+  an arrangement have no authority to hand off at all, and a specialist that may
+  delegate is an orchestrator nobody reviewed as one.
+* **`single` with a coordinating role.** There is nobody to orchestrate or route
+  to.
+* **`collaborative` with no `reason`, or a `reason` without `collaborative`.**
+  Collaboration costs roughly an order of magnitude more tokens and opens the
+  whole failure surface, so why it is warranted belongs in the file. The
+  justifications are enumerated rather than free text so each is checkable in
+  principle: `parallel-disjoint` (overlapping inputs are *false parallelism* —
+  paying the coordination cost and gaining nothing) and `distinct-authority`.
+  There is deliberately no `context-overflow`: whether work exceeds a context
+  window is not a property of the graph, so the contract could not check it —
+  and an unchecked justification is not a weak control but an escape hatch,
+  since a plan refused as false parallelism was approved by editing one word.
+
+`distinct-authority` deserves emphasis because neither side of the public
+multi-agent debate raises it: **the best reason to split agents is often
+security, not capability.** If a sub-task needs credentials the parent should not
+hold, delegating to a narrower agent is least privilege, and the coordination
+cost buys a real security property rather than hypothetical speed.
+
+### A model id is a behaviour change, so it is versioned like one
+
+Swapping a model alters what an agent does more than most code edits, and a swap
+made in a deploy has no version, no diff, and nothing connecting it to the runs
+whose outputs changed. `spec.models` puts the provider and model in the digest.
+
+The role names remain part of the allowlist and digest: a hand-written skill can
+route untrusted material to a separately declared quarantined model. The
+manifest does not claim that this architecture occurred. That would require
+proving the conduct of arbitrary native code, so the former `security.pattern`
+label was removed instead of being left as review-only intent.
+
+`models: {}` declares **no inference at all** — a rules-only agent is a
+legitimate design, and saying so out loud distinguishes it from one whose model
+wiring somebody forgot. Absent `models` is not refused, unlike an absent budget:
+an unstated budget is unbounded spend, an unstated model is a wiring decision.
+Refuse the silence that costs money, not the silence that costs nothing.
+
+### The result shape is a contract with a version
+
+`capabilities.provides` names a capability; `spec.output.schema` says what comes
+back. Narrowing a field is a breaking change to every consumer, so it belongs in
+the digest rather than in a deploy.
+
+The crate does **not** validate results against it — the same decision
+`Completion::structured` documents, because a second JSON Schema implementation
+here could disagree with the one that did the enforcing, and the disagreement
+would surface as a run refusing an answer that is in fact conformant.
+Enforcement belongs at the provider, during generation, where a constraint
+prevents a malformed answer rather than rejecting one already paid for.
+
+That does not make it inert. Handed to `ModelCall::expecting`, the schema goes
+into the **effect key** — so editing it makes a replay report divergence instead
+of quietly reinterpreting last year's stored answer under today's rules.
+
+`schema: {}` is refused. It is a *valid* JSON Schema meaning "anything", so it
+parses, looks answered in review, and promises nothing; an agent with no
+machine-readable result omits `output` entirely.
+
+### Unknown fields are refused, never ignored
+
+The single most dangerous property a config format can have is tolerance. In a
+permissive parser `max_tokns: 100` does not mean "a token ceiling of 100 with a
+typo" — it means **no token ceiling at all**, silently, in the one document
+whose purpose was to make the ceiling reviewable. Every struct in the manifest
+is `deny_unknown_fields`, so that is a parse error instead.
+
+The same reasoning drives two smaller refusals:
+
+* **The document says what it is.** A foreign `apiVersion` or `kind` is refused
+  rather than best-effort parsed, because a format that guesses is a format
+  whose meaning changes under you.
+* **Unbounded is a decision, so it has to be stated.** A manifest with no
+  `budgets` section is refused. Writing `budgets: {}` means it on purpose, and
+  that is a line a reviewer can object to.
+
+`ToolGrant.mutates` defaults to **true** for the matching reason: a tool nobody
+thought about should get the treatment that makes the runtime cautious, not the
+one that makes it fast.
+
+### What a manifest does and does not do
+
+`RuntimeBuilder::agent` binds the document to one agent on the plane: it applies
+that agent's budget, carries the declaration into every step it governs, and
+registers the behaviour when `spec.execution` is declared. Several agents may be
+registered on one plane, each governed by its own manifest. Models and tools are
+enforced at dispatch, as the table above says.
+
+The egress ceiling and delegation depth bind at the sink boundary. Each is
+combined with the sink's own limit and the stricter value wins. A configured
+identity already deeper than the manifest permits is refused at build; a peer
+handoff that would cross the ceiling is refused before dispatch.
+
+Because a plane holds several agents, two of them can collide — and a collision
+is not merely shadowing. Dispatch resolves a capability to one skill *and to the
+manifest governing it*, so a silent overwrite would move work an agent still
+advertises out from under that agent's budget, model grants and egress ceiling,
+with nothing in the journal to show it. `build` therefore refuses two agents
+claiming one capability, and two skills sharing one name. Both are wiring
+mistakes with no recovery, so both are refused at startup rather than discovered
+at dispatch.
+
+The manifest does **not** describe an injection architecture. The former pattern
+field was removed because arbitrary native skill code cannot be proven to follow
+it; a security label without an enforcement point is worse than no label.
+
+It also does not set the lease **owner**. That identifies a process, and several
+instances of one agent are normal — see [operations](@/docs/operations.md).
+
+### A version is an artifact, not a moment
+
+A manifest has a content digest over [canonical bytes](#canonical-bytes), so two
+files that declare the same thing share a digest and a file that declares
+something different cannot.
+
+That digest is what makes "which declaration governed this run" answerable after
+the file has moved on — but only because the run **records it**. `RunAdmitted`
+carries `governed_by`: the agent's name, its version, and the digest of the
+manifest that governed it. Name and version say what to look for; only the digest
+says what it actually said, including the system prompt, which is inside it. A
+run served by a skill registered directly on the plane records `None`, which is a
+different answer from "governed by something nobody wrote down".
+
+The record names the capability separately, in a field called `capability`. It
+previously held one under the name `agent`, which read as an identity and was
+not — the stringly-typed mistake, in the one record where *who did this* is the
+question being asked.
+
+The registry is built around three no-rewrite guarantees, and they are not
+redundant:
+
+| | catches | at | trusting |
+|---|---|---|---|
+| **Immutability** | a version republished with different content | write time | the registry |
+| **A pin** | a resolve that returns content the caller never reviewed | read time | nothing |
+| **Publisher immutability** | identical bytes attributed to a different signer | write time | the registry |
+
+Immutability is what makes "we reviewed 2.0.0" a statement about an artifact
+rather than about a Tuesday — the property Go's module proxy and crates.io both
+arrived at, and the one whose absence produced the npm and PyPI incidents.
+Re-publishing *identical* content still succeeds, because a retried deploy is
+not an attack and treating it as one teaches people to force.
+
+A pin is the caller declining to need that promise. It is the only one of the
+two that survives the registry itself being the compromised party, which is why
+`resolve_pinned` exists beside `resolve` rather than as a flag on it: the safe
+call should be the one you can see at the call site.
+
+`publish_signed` supplies the half a digest cannot: *who* approved the artifact.
+The signature covers a domain-separated manifest hash, so it cannot be replayed
+as a journal-record attestation. An identical unsigned artifact may adopt its
+first attestation later without changing its digest; once publisher evidence
+exists, another signer is refused rather than silently replacing it. Supporting
+several publishers requires an explicit attestation set and is not built.
+
+`MemoryRegistry` is process-local. The trait leaves room for a durable or remote
+registry, but none ships today. Key creation, rotation, revocation, and the
+decision to trust the identity returned by `resolve_verified` remain deployment
+responsibilities.
+
 ## Testing
 
 | File | Guards |
@@ -1469,6 +1989,23 @@ resumed batch has to know whether it ever reached the end.
 | `tests/wire/drivers.rs` | The two wire drivers' failure mappings — whether a peer acted, and whether a model call was billed |
 | `tests/guards/layering.rs` | Architectural invariants — core purity, lint config, canonical JSON, spec/code correspondence |
 | `spec/` | TLA+ models of the effect protocol, retry safety, sagas, and fencing, plus the mutants that prove those models constrain anything |
+
+### The size a proof starts from is stated, never inferred
+
+`Witness::cosign` takes `old_size` from the caller. That looks like ceremony and
+is not: an RFC 6962 consistency proof is **O(log n) hashes, not one per new
+entry**, so nothing about a proof reveals which size it starts from. A 50→100
+proof carries seven hashes, and an implementation computing `size - proof.len()`
+claims to start at 93 — which every witness refuses.
+
+Only the holder of the log knows. `MemoryWitness` checks the caller's claim
+against what it remembers and reports a mismatch as `Stale`, exactly as a remote
+witness's `409` does, so the in-process model stays a faithful stand-in rather
+than a friendlier one.
+
+This shipped as a real defect and survived its first test, because that test used
+a four-entry log with a two-hash proof — the one size where the wrong arithmetic
+gives the right answer. The regression test uses fifty and a hundred.
 
 ### The specs are mutation-tested
 
@@ -1553,7 +2090,7 @@ The test must assert which layer held.
 ### Every guarantee is broken on purpose, in CI
 
 The specs are mutation-tested; so is the code. `tools/verify-mutants.sh` walks a
-checked-in table of 20 mutations — one per load-bearing guarantee — applies each,
+checked-in table of mutations — one per load-bearing guarantee — applies each,
 runs the suite, and requires **the test written for that guarantee** to fail.
 
 The distinction between "some test failed" and "the named test failed" is the

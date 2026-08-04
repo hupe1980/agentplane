@@ -37,8 +37,13 @@ use crate::core::{
 use super::postgres::PostgresStore;
 
 pub(super) const CASE_SCHEMA: &str = "
+-- Every table here leads with the tenant, for the reason the journal schema
+-- gives: a key component turns a forgotten predicate into an empty result
+-- instead of another tenant's row. The foreign keys carry it too, so a child
+-- row cannot reference a parent in a different tenant.
 CREATE TABLE IF NOT EXISTS cases (
-    case_id   TEXT PRIMARY KEY,
+    tenant    TEXT   NOT NULL,
+    case_id   TEXT   NOT NULL,
     kind      TEXT   NOT NULL,
     status    TEXT   NOT NULL,
     state     TEXT   NOT NULL,
@@ -47,71 +52,105 @@ CREATE TABLE IF NOT EXISTS cases (
     -- store, so the overlapping read-modify-write is not a corner case here —
     -- it is the normal operating condition.
     version   BIGINT NOT NULL DEFAULT 0,
-    opened_at BIGINT NOT NULL
+    opened_at BIGINT NOT NULL,
+    PRIMARY KEY (tenant, case_id)
 );
 
 CREATE TABLE IF NOT EXISTS case_correlation (
-    case_id   TEXT    NOT NULL REFERENCES cases (case_id) ON DELETE CASCADE,
+    tenant    TEXT    NOT NULL,
+    case_id   TEXT    NOT NULL,
     namespace TEXT    NOT NULL,
     value     TEXT    NOT NULL,
     open      BOOLEAN NOT NULL DEFAULT TRUE,
-    PRIMARY KEY (case_id, namespace, value)
+    PRIMARY KEY (tenant, case_id, namespace, value),
+    FOREIGN KEY (tenant, case_id) REFERENCES cases (tenant, case_id) ON DELETE CASCADE
 );
 
 -- One open case per business key. This is the arbiter, not a hint: two inbound
 -- messages racing to open the same matter both attempt the insert, and exactly
 -- one succeeds. The loser re-reads and attaches.
+-- Scoped to the tenant, because a correlation key is a *business* value:
+-- `document`/`DOC-1` means something different to every tenant, and two of them
+-- using it is ordinary rather than a collision. Globally unique, one tenant's
+-- run would attach to another's case and the two would share a history, a
+-- deadline set and an erasure unit.
 CREATE UNIQUE INDEX IF NOT EXISTS case_correlation_open
-    ON case_correlation (namespace, value) WHERE open;
+    ON case_correlation (tenant, namespace, value) WHERE open;
 
 CREATE TABLE IF NOT EXISTS case_runs (
-    case_id TEXT   NOT NULL REFERENCES cases (case_id) ON DELETE CASCADE,
+    tenant  TEXT   NOT NULL,
+    case_id TEXT   NOT NULL,
     run_id  TEXT   NOT NULL,
     seq     BIGINT NOT NULL,
-    PRIMARY KEY (case_id, run_id)
+    PRIMARY KEY (tenant, case_id, run_id),
+    FOREIGN KEY (tenant, case_id) REFERENCES cases (tenant, case_id) ON DELETE CASCADE
 );
 
 -- The blobs a case produced. The case is what an erasure request names, and a
 -- digest cannot be reversed to find its case, so the link has to be recorded
 -- when the bytes are written or it cannot be recovered at all.
 CREATE TABLE IF NOT EXISTS case_blobs (
-    case_id    TEXT   NOT NULL REFERENCES cases (case_id) ON DELETE CASCADE,
+    tenant     TEXT   NOT NULL,
+    case_id    TEXT   NOT NULL,
     digest     BYTEA  NOT NULL,
     written_at BIGINT NOT NULL,
-    PRIMARY KEY (case_id, digest)
+    PRIMARY KEY (tenant, case_id, digest),
+    FOREIGN KEY (tenant, case_id) REFERENCES cases (tenant, case_id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS case_blobs_time ON case_blobs (case_id, written_at);
+CREATE INDEX IF NOT EXISTS case_blobs_time
+    ON case_blobs (tenant, case_id, written_at);
 
 CREATE TABLE IF NOT EXISTS case_deadlines (
-    case_id         TEXT   NOT NULL REFERENCES cases (case_id) ON DELETE CASCADE,
+    tenant          TEXT   NOT NULL,
+    case_id         TEXT   NOT NULL,
     name            TEXT   NOT NULL,
     resolved_at     BIGINT NOT NULL,
     calendar_digest BYTEA  NOT NULL,
     warn_at         BIGINT,
     state           TEXT   NOT NULL,
-    PRIMARY KEY (case_id, name)
+    PRIMARY KEY (tenant, case_id, name),
+    FOREIGN KEY (tenant, case_id) REFERENCES cases (tenant, case_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS inbound_events (
-    event_id    TEXT PRIMARY KEY,
+    -- The dedup identity is (source, id), CloudEvents' uniqueness pair. Keying
+    -- on id alone deduplicates two producers into each other: id is unique
+    -- within a producer, and the collision is silent because the second message
+    -- looks exactly like a retry of the first.
+    tenant      TEXT    NOT NULL,
+    event_id    TEXT    NOT NULL,
+    source      TEXT    NOT NULL,
+    -- The producer's own id, stored rather than split back out of the key: a
+    -- reconstructed event must be the event that arrived, and parsing the key
+    -- apart would be a second place that has to agree about the separator.
+    bare_id     TEXT    NOT NULL,
     kind        TEXT    NOT NULL,
     payload     TEXT    NOT NULL,
     received_at BIGINT  NOT NULL,
     claimed_by  TEXT,
     claimed_at  BIGINT,
     dead        BOOLEAN NOT NULL DEFAULT FALSE,
-    dead_reason TEXT
+    dead_reason TEXT,
+    PRIMARY KEY (tenant, event_id)
 );
 
 CREATE TABLE IF NOT EXISTS inbound_correlation (
-    event_id  TEXT NOT NULL REFERENCES inbound_events (event_id) ON DELETE CASCADE,
+    tenant    TEXT NOT NULL,
+    event_id  TEXT NOT NULL,
     namespace TEXT NOT NULL,
     value     TEXT NOT NULL,
-    PRIMARY KEY (event_id, namespace, value)
+    PRIMARY KEY (tenant, event_id, namespace, value),
+    FOREIGN KEY (tenant, event_id)
+        REFERENCES inbound_events (tenant, event_id) ON DELETE CASCADE
 );
 
+-- The match path: an arriving event finds the runs waiting for it here. The
+-- tenant leads for the same reason it leads `case_correlation_open`, and this
+-- is the worse of the two failures — one tenant's message resuming another
+-- tenant's run hands it a payload it was never sent.
 CREATE TABLE IF NOT EXISTS subscriptions (
+    tenant     TEXT   NOT NULL,
     run_id     TEXT   NOT NULL,
     effect_key TEXT   NOT NULL,
     case_id    TEXT,
@@ -121,10 +160,11 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     namespace  TEXT   NOT NULL,
     value      TEXT   NOT NULL,
     created_at BIGINT NOT NULL,
-    PRIMARY KEY (run_id, effect_key, namespace, value)
+    PRIMARY KEY (tenant, run_id, effect_key, namespace, value)
 );
 
 CREATE TABLE IF NOT EXISTS timers (
+    tenant     TEXT   NOT NULL,
     run_id     TEXT   NOT NULL,
     effect_key TEXT   NOT NULL,
     case_id    TEXT,
@@ -132,11 +172,12 @@ CREATE TABLE IF NOT EXISTS timers (
     phase      TEXT   NOT NULL,
     fire_at    BIGINT NOT NULL,
     claimed_at BIGINT,
-    PRIMARY KEY (run_id, effect_key)
+    PRIMARY KEY (tenant, run_id, effect_key)
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
-    task_id         TEXT PRIMARY KEY,
+    tenant          TEXT   NOT NULL,
+    task_id         TEXT   NOT NULL,
     run_id          TEXT   NOT NULL,
     case_id         TEXT,
     kind            TEXT   NOT NULL,
@@ -148,24 +189,29 @@ CREATE TABLE IF NOT EXISTS tasks (
     state           TEXT   NOT NULL,
     on_expiry       TEXT   NOT NULL,
     created_at      BIGINT NOT NULL,
-    due_at          BIGINT
+    due_at          BIGINT,
+    PRIMARY KEY (tenant, task_id)
 );
 
 CREATE TABLE IF NOT EXISTS batches (
-    batch_id    TEXT PRIMARY KEY,
+    tenant      TEXT    NOT NULL,
+    batch_id    TEXT    NOT NULL,
     plan_digest TEXT    NOT NULL,
-    exhausted   BOOLEAN NOT NULL DEFAULT FALSE
+    exhausted   BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (tenant, batch_id)
 );
 
 CREATE TABLE IF NOT EXISTS batch_items (
-    batch_id TEXT   NOT NULL REFERENCES batches (batch_id) ON DELETE CASCADE,
+    tenant   TEXT   NOT NULL,
+    batch_id TEXT   NOT NULL,
     item_key TEXT   NOT NULL,
     run_id   TEXT   NOT NULL,
     outcome  TEXT,
     detail   TEXT,
     tokens   BIGINT NOT NULL DEFAULT 0,
     minor    BIGINT NOT NULL DEFAULT 0,
-    PRIMARY KEY (batch_id, item_key)
+    PRIMARY KEY (tenant, batch_id, item_key),
+    FOREIGN KEY (tenant, batch_id) REFERENCES batches (tenant, batch_id) ON DELETE CASCADE
 );
 ";
 
@@ -270,8 +316,8 @@ impl CaseStore for PostgresStore {
             let row = client
                 .query_opt(
                     "SELECT case_id FROM case_correlation
-                      WHERE namespace = $1 AND value = $2 AND open",
-                    &[&k.namespace, &k.value],
+                      WHERE tenant = $3 AND namespace = $1 AND value = $2 AND open",
+                    &[&k.namespace, &k.value, &self.tenant_name()],
                 )
                 .await
                 .map_err(|e| be(&e))?;
@@ -305,14 +351,15 @@ impl CaseStore for PostgresStore {
             let tx = client.transaction().await.map_err(|e| be(&e))?;
             let id = CaseId::generate();
             tx.execute(
-                "INSERT INTO cases (case_id, kind, status, state, opened_at)
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO cases (case_id, kind, status, state, opened_at, tenant)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
                 &[
                     &id.to_string(),
                     &kind.to_owned(),
                     &CaseStatus::Open.as_str(),
                     &"null".to_owned(),
                     &at.unix_timestamp(),
+                    &self.tenant_name(),
                 ],
             )
             .await
@@ -322,9 +369,9 @@ impl CaseStore for PostgresStore {
             for k in keys {
                 let r = tx
                     .execute(
-                        "INSERT INTO case_correlation (case_id, namespace, value, open)
-                         VALUES ($1, $2, $3, TRUE)",
-                        &[&id.to_string(), &k.namespace, &k.value],
+                        "INSERT INTO case_correlation (case_id, namespace, value, open, tenant)
+                         VALUES ($1, $2, $3, TRUE, $4)",
+                        &[&id.to_string(), &k.namespace, &k.value, &self.tenant_name()],
                     )
                     .await;
                 if let Err(e) = r {
@@ -364,8 +411,9 @@ impl CaseStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let Some(row) = client
             .query_opt(
-                "SELECT kind, status, state, opened_at, version FROM cases WHERE case_id = $1",
-                &[&id.to_string()],
+                "SELECT kind, status, state, opened_at, version FROM cases
+                  WHERE case_id = $1 AND tenant = $2",
+                &[&id.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?
@@ -380,15 +428,17 @@ impl CaseStore for PostgresStore {
 
         let corr = client
             .query(
-                "SELECT namespace, value FROM case_correlation WHERE case_id = $1",
-                &[&id.to_string()],
+                "SELECT namespace, value FROM case_correlation
+                  WHERE case_id = $1 AND tenant = $2",
+                &[&id.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
         let runs = client
             .query(
-                "SELECT run_id FROM case_runs WHERE case_id = $1 ORDER BY seq ASC",
-                &[&id.to_string()],
+                "SELECT run_id FROM case_runs
+                  WHERE case_id = $1 AND tenant = $2 ORDER BY seq ASC",
+                &[&id.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -417,10 +467,13 @@ impl CaseStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client
             .execute(
-                "INSERT INTO case_runs (case_id, run_id, seq)
-                 VALUES ($1, $2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM case_runs WHERE case_id = $1))
-                 ON CONFLICT (case_id, run_id) DO NOTHING",
-                &[&case.to_string(), &run.to_string()],
+                "INSERT INTO case_runs (case_id, run_id, seq, tenant)
+                 VALUES ($1, $2,
+                         (SELECT COALESCE(MAX(seq), 0) + 1 FROM case_runs
+                           WHERE case_id = $1 AND tenant = $3),
+                         $3)
+                 ON CONFLICT (tenant, case_id, run_id) DO NOTHING",
+                &[&case.to_string(), &run.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -439,13 +492,14 @@ impl CaseStore for PostgresStore {
         // construction, and that is one artifact.
         client
             .execute(
-                "INSERT INTO case_blobs (case_id, digest, written_at)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (case_id, digest) DO NOTHING",
+                "INSERT INTO case_blobs (case_id, digest, written_at, tenant)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (tenant, case_id, digest) DO NOTHING",
                 &[
                     &case.to_string(),
                     &digest.as_bytes().as_slice(),
                     &at.unix_timestamp(),
+                    &self.tenant_name(),
                 ],
             )
             .await
@@ -457,8 +511,9 @@ impl CaseStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
-                "SELECT digest FROM case_blobs WHERE case_id = $1 ORDER BY written_at, digest",
-                &[&case.to_string()],
+                "SELECT digest FROM case_blobs
+                  WHERE case_id = $1 AND tenant = $2 ORDER BY written_at, digest",
+                &[&case.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -488,12 +543,14 @@ impl CaseStore for PostgresStore {
         // backend. A guard whose result nobody reads is not a guard.
         let n = client
             .execute(
-                "UPDATE cases SET state = $2, version = $3 WHERE case_id = $1 AND version = $4",
+                "UPDATE cases SET state = $2, version = $3
+                  WHERE case_id = $1 AND version = $4 AND tenant = $5",
                 &[
                     &case.to_string(),
                     &state.to_string(),
                     &i64::try_from(next.0).unwrap_or(i64::MAX),
                     &i64::try_from(expected.0).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
                 ],
             )
             .await
@@ -505,8 +562,8 @@ impl CaseStore for PostgresStore {
         // conflict sends the caller into a re-read loop against nothing.
         let current = client
             .query_opt(
-                "SELECT version FROM cases WHERE case_id = $1",
-                &[&case.to_string()],
+                "SELECT version FROM cases WHERE case_id = $1 AND tenant = $2",
+                &[&case.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -524,8 +581,8 @@ impl CaseStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client
             .execute(
-                "UPDATE cases SET status = $2 WHERE case_id = $1",
-                &[&case.to_string(), &status.as_str()],
+                "UPDATE cases SET status = $2 WHERE case_id = $1 AND tenant = $3",
+                &[&case.to_string(), &status.as_str(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -541,8 +598,8 @@ impl CaseStore for PostgresStore {
         let open: i64 = tx
             .query_one(
                 "SELECT COUNT(*) FROM case_deadlines
-                  WHERE case_id = $1 AND state IN ('pending', 'warned')",
-                &[&case.to_string()],
+                  WHERE case_id = $1 AND tenant = $2 AND state IN ('pending', 'warned')",
+                &[&case.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?
@@ -554,16 +611,20 @@ impl CaseStore for PostgresStore {
         }
 
         tx.execute(
-            "UPDATE cases SET status = $2 WHERE case_id = $1",
-            &[&case.to_string(), &CaseStatus::Closed.as_str()],
+            "UPDATE cases SET status = $2 WHERE case_id = $1 AND tenant = $3",
+            &[
+                &case.to_string(),
+                &CaseStatus::Closed.as_str(),
+                &self.tenant_name(),
+            ],
         )
         .await
         .map_err(|e| be(&e))?;
         // Releasing the keys is what lets a later message open a *new* matter
         // rather than reanimating an audited one.
         tx.execute(
-            "UPDATE case_correlation SET open = FALSE WHERE case_id = $1",
-            &[&case.to_string()],
+            "UPDATE case_correlation SET open = FALSE WHERE case_id = $1 AND tenant = $2",
+            &[&case.to_string(), &self.tenant_name()],
         )
         .await
         .map_err(|e| be(&e))?;
@@ -576,9 +637,9 @@ impl CaseStore for PostgresStore {
         client
             .execute(
                 "INSERT INTO case_deadlines
-                   (case_id, name, resolved_at, calendar_digest, warn_at, state)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (case_id, name) DO NOTHING",
+                   (case_id, name, resolved_at, calendar_digest, warn_at, state, tenant)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (tenant, case_id, name) DO NOTHING",
                 &[
                     &d.case.to_string(),
                     &d.name,
@@ -586,6 +647,7 @@ impl CaseStore for PostgresStore {
                     &d.calendar_digest.as_bytes().to_vec(),
                     &d.warn_at.map(Timestamp::unix_timestamp),
                     &d.state.as_str(),
+                    &self.tenant_name(),
                 ],
             )
             .await
@@ -598,8 +660,9 @@ impl CaseStore for PostgresStore {
         let rows = client
             .query(
                 "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state
-                   FROM case_deadlines WHERE case_id = $1 ORDER BY resolved_at ASC",
-                &[&case.to_string()],
+                   FROM case_deadlines
+                  WHERE case_id = $1 AND tenant = $2 ORDER BY resolved_at ASC",
+                &[&case.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -615,8 +678,14 @@ impl CaseStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client
             .execute(
-                "UPDATE case_deadlines SET state = $3 WHERE case_id = $1 AND name = $2",
-                &[&case.to_string(), &name.to_owned(), &state.as_str()],
+                "UPDATE case_deadlines SET state = $3
+                  WHERE case_id = $1 AND name = $2 AND tenant = $4",
+                &[
+                    &case.to_string(),
+                    &name.to_owned(),
+                    &state.as_str(),
+                    &self.tenant_name(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -629,12 +698,13 @@ impl CaseStore for PostgresStore {
             .query(
                 "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state
                    FROM case_deadlines
-                  WHERE state IN ('pending', 'warned')
+                  WHERE tenant = $3 AND state IN ('pending', 'warned')
                     AND (resolved_at <= $1 OR (warn_at IS NOT NULL AND warn_at <= $1))
                   ORDER BY resolved_at ASC LIMIT $2",
                 &[
                     &now.unix_timestamp(),
                     &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
                 ],
             )
             .await
@@ -646,8 +716,13 @@ impl CaseStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
-                "SELECT case_id FROM cases WHERE status = $1 ORDER BY opened_at DESC LIMIT $2",
-                &[&status.as_str(), &i64::try_from(limit).unwrap_or(i64::MAX)],
+                "SELECT case_id FROM cases
+                  WHERE status = $1 AND tenant = $3 ORDER BY opened_at DESC LIMIT $2",
+                &[
+                    &status.as_str(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -666,8 +741,9 @@ impl CaseStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let row = client
             .query_one(
-                "SELECT COUNT(*), MIN(opened_at) FROM cases WHERE status <> 'closed'",
-                &[],
+                "SELECT COUNT(*), MIN(opened_at) FROM cases
+                  WHERE tenant = $1 AND status <> 'closed'",
+                &[&self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -676,8 +752,8 @@ impl CaseStore for PostgresStore {
         let due: i64 = client
             .query_one(
                 "SELECT COUNT(*) FROM case_deadlines
-                  WHERE state IN ('pending', 'warned') AND resolved_at <= $1",
-                &[&now.unix_timestamp()],
+                  WHERE tenant = $2 AND state IN ('pending', 'warned') AND resolved_at <= $1",
+                &[&now.unix_timestamp(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?
@@ -725,13 +801,18 @@ impl EventStore for PostgresStore {
         let tx = client.transaction().await.map_err(|e| be(&e))?;
         let inserted = tx
             .execute(
-                "INSERT INTO inbound_events (event_id, kind, payload, received_at)
-                 VALUES ($1, $2, $3, $4) ON CONFLICT (event_id) DO NOTHING",
+                "INSERT INTO inbound_events
+                   (event_id, source, bare_id, kind, payload, received_at, tenant)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (tenant, event_id) DO NOTHING",
                 &[
+                    &event.dedup_key(),
+                    &event.source,
                     &event.id,
                     &event.kind,
                     &event.payload.to_string(),
                     &at.unix_timestamp(),
+                    &self.tenant_name(),
                 ],
             )
             .await
@@ -742,9 +823,16 @@ impl EventStore for PostgresStore {
         }
         for k in &event.correlation {
             tx.execute(
-                "INSERT INTO inbound_correlation (event_id, namespace, value)
-                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                &[&event.id, &k.namespace, &k.value],
+                "INSERT INTO inbound_correlation (event_id, namespace, value, tenant)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                // The dedup key throughout: correlation rows reference the row
+                // `buffer` wrote, and that is keyed by `(source, id)`.
+                &[
+                    &event.dedup_key(),
+                    &k.namespace,
+                    &k.value,
+                    &self.tenant_name(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -760,8 +848,8 @@ impl EventStore for PostgresStore {
                 .execute(
                     "INSERT INTO subscriptions
                        (run_id, effect_key, case_id, step, phase, event_kind,
-                        namespace, value, created_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        namespace, value, created_at, tenant)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                      ON CONFLICT DO NOTHING",
                     &[
                         &sub.run.to_string(),
@@ -773,6 +861,7 @@ impl EventStore for PostgresStore {
                         &k.namespace,
                         &k.value,
                         &at.unix_timestamp(),
+                        &self.tenant_name(),
                     ],
                 )
                 .await
@@ -794,27 +883,32 @@ impl EventStore for PostgresStore {
             let row = client
                 .query_opt(
                     "UPDATE inbound_events SET claimed_by = $1, claimed_at = $2
-                      WHERE event_id = (
+                      WHERE tenant = $6 AND event_id = (
                           SELECT e.event_id FROM inbound_events e
-                            JOIN inbound_correlation c ON c.event_id = e.event_id
-                           WHERE e.kind = $3 AND c.namespace = $4 AND c.value = $5
+                            JOIN inbound_correlation c
+                              ON c.tenant = e.tenant AND c.event_id = e.event_id
+                           WHERE e.tenant = $6 AND e.kind = $3
+                             AND c.namespace = $4 AND c.value = $5
                              AND e.claimed_by IS NULL AND NOT e.dead
                            ORDER BY e.received_at ASC
                            FOR UPDATE SKIP LOCKED
                            LIMIT 1)
-                  RETURNING event_id, kind, payload, received_at",
+                  RETURNING bare_id, kind, payload, received_at, source, event_id",
                     &[
                         &sub.run.to_string(),
                         &at.unix_timestamp(),
                         &sub.kind,
                         &k.namespace,
                         &k.value,
+                        &self.tenant_name(),
                     ],
                 )
                 .await
                 .map_err(|e| be(&e))?;
             if let Some(row) = row {
-                return Ok(Some(buffered_from(&row, &client).await?));
+                return Ok(Some(
+                    buffered_from(&row, &client, &self.tenant_name()).await?,
+                ));
             }
         }
         Ok(None)
@@ -832,9 +926,10 @@ impl EventStore for PostgresStore {
             let Some(row) = tx
                 .query_opt(
                     "SELECT run_id, effect_key, case_id, step, phase FROM subscriptions
-                      WHERE event_kind = $1 AND namespace = $2 AND value = $3
+                      WHERE tenant = $4 AND event_kind = $1
+                        AND namespace = $2 AND value = $3
                       ORDER BY created_at ASC LIMIT 1",
-                    &[&event.kind, &k.namespace, &k.value],
+                    &[&event.kind, &k.namespace, &k.value, &self.tenant_name()],
                 )
                 .await
                 .map_err(|e| be(&e))?
@@ -848,8 +943,14 @@ impl EventStore for PostgresStore {
             let claimed = tx
                 .execute(
                     "UPDATE inbound_events SET claimed_by = $2, claimed_at = $3
-                      WHERE event_id = $1 AND claimed_by IS NULL AND NOT dead",
-                    &[&event.id, &run, &at.unix_timestamp()],
+                      WHERE tenant = $4 AND event_id = $1
+                        AND claimed_by IS NULL AND NOT dead",
+                    &[
+                        &event.dedup_key(),
+                        &run,
+                        &at.unix_timestamp(),
+                        &self.tenant_name(),
+                    ],
                 )
                 .await
                 .map_err(|e| be(&e))?;
@@ -885,8 +986,9 @@ impl EventStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client
             .execute(
-                "DELETE FROM subscriptions WHERE run_id = $1 AND effect_key = $2",
-                &[&run.to_string(), &effect.to_hex()],
+                "DELETE FROM subscriptions
+                  WHERE tenant = $3 AND run_id = $1 AND effect_key = $2",
+                &[&run.to_string(), &effect.to_hex(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -902,8 +1004,13 @@ impl EventStore for PostgresStore {
         let n = client
             .execute(
                 "UPDATE inbound_events SET dead = TRUE, dead_reason = $2
-                  WHERE claimed_by IS NULL AND NOT dead AND received_at < $1",
-                &[&older_than.unix_timestamp(), &reason.to_owned()],
+                  WHERE tenant = $3 AND claimed_by IS NULL AND NOT dead
+                    AND received_at < $1",
+                &[
+                    &older_than.unix_timestamp(),
+                    &reason.to_owned(),
+                    &self.tenant_name(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -914,10 +1021,13 @@ impl EventStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
-                "SELECT event_id, kind, payload, received_at, dead_reason
-                   FROM inbound_events WHERE dead
+                "SELECT bare_id, kind, payload, received_at, dead_reason, source
+                   FROM inbound_events WHERE tenant = $2 AND dead
                   ORDER BY received_at DESC LIMIT $1",
-                &[&i64::try_from(limit).unwrap_or(i64::MAX)],
+                &[
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -926,6 +1036,7 @@ impl EventStore for PostgresStore {
             let payload: String = row.get(2);
             out.push(DeadLetter {
                 event: InboundEvent {
+                    source: row.get(5),
                     id: row.get(0),
                     kind: row.get(1),
                     correlation: Vec::new(),
@@ -944,8 +1055,12 @@ impl EventStore for PostgresStore {
         let rows = client
             .query(
                 "SELECT run_id, effect_key, case_id, step, phase, event_kind, namespace, value
-                   FROM subscriptions ORDER BY created_at ASC LIMIT $1",
-                &[&i64::try_from(limit).unwrap_or(i64::MAX)],
+                   FROM subscriptions WHERE tenant = $2
+                  ORDER BY created_at ASC LIMIT $1",
+                &[
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -979,18 +1094,26 @@ impl EventStore for PostgresStore {
 async fn buffered_from(
     row: &tokio_postgres::Row,
     client: &deadpool_postgres::Client,
+    tenant: &str,
 ) -> Result<BufferedEvent, StoreError> {
     let id: String = row.get(0);
     let payload: String = row.get(2);
+    // Correlation is keyed by the dedup key, which is what `buffer` wrote — not
+    // by `bare_id`, the producer's own id. Reading it back under the wrong one
+    // returns nothing, and a claimed event would arrive with no keys at all:
+    // valid-looking, silently stripped of what it was routed on.
+    let event_id: String = row.get(5);
     let corr = client
         .query(
-            "SELECT namespace, value FROM inbound_correlation WHERE event_id = $1",
-            &[&id],
+            "SELECT namespace, value FROM inbound_correlation
+              WHERE tenant = $2 AND event_id = $1",
+            &[&event_id, &tenant],
         )
         .await
         .map_err(|e| be(&e))?;
     Ok(BufferedEvent {
         event: InboundEvent {
+            source: row.get(4),
             id: id.clone(),
             kind: row.get(1),
             correlation: corr
@@ -1013,9 +1136,10 @@ impl TimerStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client
             .execute(
-                "INSERT INTO timers (run_id, effect_key, case_id, step, phase, fire_at)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (run_id, effect_key) DO NOTHING",
+                "INSERT INTO timers
+                   (run_id, effect_key, case_id, step, phase, fire_at, tenant)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (tenant, run_id, effect_key) DO NOTHING",
                 &[
                     &timer.run.to_string(),
                     &timer.effect.to_hex(),
@@ -1023,6 +1147,7 @@ impl TimerStore for PostgresStore {
                     &i64::from(timer.step.0),
                     &phase_str(timer.phase),
                     &timer.fire_at.unix_timestamp(),
+                    &self.tenant_name(),
                 ],
             )
             .await
@@ -1037,9 +1162,10 @@ impl TimerStore for PostgresStore {
         let rows = client
             .query(
                 "UPDATE timers SET claimed_at = $1
-                  WHERE (run_id, effect_key) IN (
+                  WHERE tenant = $4 AND (run_id, effect_key) IN (
                       SELECT run_id, effect_key FROM timers
-                       WHERE fire_at <= $1 AND (claimed_at IS NULL OR claimed_at <= $2)
+                       WHERE tenant = $4 AND fire_at <= $1
+                         AND (claimed_at IS NULL OR claimed_at <= $2)
                        ORDER BY fire_at ASC
                        FOR UPDATE SKIP LOCKED
                        LIMIT $3)
@@ -1048,6 +1174,7 @@ impl TimerStore for PostgresStore {
                     &now.unix_timestamp(),
                     &(now.unix_timestamp() - CLAIM_LEASE),
                     &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
                 ],
             )
             .await
@@ -1058,7 +1185,10 @@ impl TimerStore for PostgresStore {
     async fn pending_count(&self) -> Result<u64, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let n: i64 = client
-            .query_one("SELECT COUNT(*) FROM timers", &[])
+            .query_one(
+                "SELECT COUNT(*) FROM timers WHERE tenant = $1",
+                &[&self.tenant_name()],
+            )
             .await
             .map_err(|e| be(&e))?
             .get(0);
@@ -1069,8 +1199,8 @@ impl TimerStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client
             .execute(
-                "DELETE FROM timers WHERE run_id = $1 AND effect_key = $2",
-                &[&run.to_string(), &effect.to_hex()],
+                "DELETE FROM timers WHERE tenant = $3 AND run_id = $1 AND effect_key = $2",
+                &[&run.to_string(), &effect.to_hex(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -1082,8 +1212,11 @@ impl TimerStore for PostgresStore {
         let rows = client
             .query(
                 "SELECT run_id, effect_key, case_id, step, phase, fire_at
-                   FROM timers ORDER BY fire_at ASC LIMIT $1",
-                &[&i64::try_from(limit).unwrap_or(i64::MAX)],
+                   FROM timers WHERE tenant = $2 ORDER BY fire_at ASC LIMIT $1",
+                &[
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -1119,9 +1252,9 @@ impl TaskStore for PostgresStore {
             .execute(
                 "INSERT INTO tasks (task_id, run_id, case_id, kind, justification,
                                     candidate_roles, excluded_actors, assignee, priority,
-                                    state, on_expiry, created_at, due_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-                 ON CONFLICT (task_id) DO NOTHING",
+                                    state, on_expiry, created_at, due_at, tenant)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                 ON CONFLICT (tenant, task_id) DO NOTHING",
                 &[
                     &task.id.to_hex(),
                     &task.run.to_string(),
@@ -1136,6 +1269,7 @@ impl TaskStore for PostgresStore {
                     &expiry_str(task.on_expiry),
                     &task.created_at.unix_timestamp(),
                     &task.due_at.map(Timestamp::unix_timestamp),
+                    &self.tenant_name(),
                 ],
             )
             .await
@@ -1147,8 +1281,8 @@ impl TaskStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let row = client
             .query_opt(
-                &format!("SELECT {TASK_COLS} FROM tasks WHERE task_id = $1"),
-                &[&id.to_hex()],
+                &format!("SELECT {TASK_COLS} FROM tasks WHERE task_id = $1 AND tenant = $2"),
+                &[&id.to_hex(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -1193,8 +1327,9 @@ impl TaskStore for PostgresStore {
         let updated = client
             .execute(
                 "UPDATE tasks SET assignee = $2, state = 'claimed'
-                  WHERE task_id = $1 AND (assignee IS NULL OR assignee = $2)",
-                &[&id.to_hex(), &actor.to_owned()],
+                  WHERE task_id = $1 AND tenant = $3
+                    AND (assignee IS NULL OR assignee = $2)",
+                &[&id.to_hex(), &actor.to_owned(), &self.tenant_name()],
             )
             .await
             .map_err(|e| ClaimError::Store(be(&e)))?;
@@ -1222,8 +1357,9 @@ impl TaskStore for PostgresStore {
         let freed = client
             .execute(
                 "UPDATE tasks SET assignee = NULL, state = 'open'
-                  WHERE task_id = $1 AND assignee = $2 AND state = 'claimed'",
-                &[&id.to_hex(), &actor.to_owned()],
+                  WHERE task_id = $1 AND tenant = $3
+                    AND assignee = $2 AND state = 'claimed'",
+                &[&id.to_hex(), &actor.to_owned(), &self.tenant_name()],
             )
             .await
             .map_err(|e| ClaimError::Store(be(&e)))?;
@@ -1244,8 +1380,8 @@ impl TaskStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client
             .execute(
-                "UPDATE tasks SET state = $2 WHERE task_id = $1",
-                &[&id.to_hex(), &state.as_str()],
+                "UPDATE tasks SET state = $2 WHERE task_id = $1 AND tenant = $3",
+                &[&id.to_hex(), &state.as_str(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -1258,10 +1394,13 @@ impl TaskStore for PostgresStore {
             .query(
                 &format!(
                     "SELECT {TASK_COLS} FROM tasks
-                      WHERE state IN ('open', 'escalated')
+                      WHERE tenant = $2 AND state IN ('open', 'escalated')
                       ORDER BY created_at ASC LIMIT $1"
                 ),
-                &[&i64::try_from(limit).unwrap_or(i64::MAX)],
+                &[
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -1279,9 +1418,10 @@ impl TaskStore for PostgresStore {
         let rows = client
             .query(
                 &format!(
-                    "SELECT {TASK_COLS} FROM tasks WHERE case_id = $1 ORDER BY created_at ASC"
+                    "SELECT {TASK_COLS} FROM tasks
+                      WHERE case_id = $1 AND tenant = $2 ORDER BY created_at ASC"
                 ),
-                &[&case.to_string()],
+                &[&case.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -1292,8 +1432,9 @@ impl TaskStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let n: i64 = client
             .query_one(
-                "SELECT COUNT(*) FROM tasks WHERE state IN ('open','claimed','escalated')",
-                &[],
+                "SELECT COUNT(*) FROM tasks
+                  WHERE tenant = $1 AND state IN ('open','claimed','escalated')",
+                &[&self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?
@@ -1307,13 +1448,14 @@ impl TaskStore for PostgresStore {
             .query(
                 &format!(
                     "SELECT {TASK_COLS} FROM tasks
-                      WHERE state IN ('open','claimed','escalated')
+                      WHERE tenant = $3 AND state IN ('open','claimed','escalated')
                         AND due_at IS NOT NULL AND due_at <= $1
                       ORDER BY due_at ASC LIMIT $2"
                 ),
                 &[
                     &now.unix_timestamp(),
                     &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
                 ],
             )
             .await
@@ -1375,9 +1517,13 @@ impl BatchStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client
             .execute(
-                "INSERT INTO batches (batch_id, plan_digest) VALUES ($1, $2)
-                 ON CONFLICT (batch_id) DO NOTHING",
-                &[&id.to_string(), &plan_digest.to_owned()],
+                "INSERT INTO batches (batch_id, plan_digest, tenant) VALUES ($1, $2, $3)
+                 ON CONFLICT (tenant, batch_id) DO NOTHING",
+                &[
+                    &id.to_string(),
+                    &plan_digest.to_owned(),
+                    &self.tenant_name(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -1388,8 +1534,8 @@ impl BatchStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client
             .execute(
-                "UPDATE batches SET exhausted = TRUE WHERE batch_id = $1",
-                &[&id.to_string()],
+                "UPDATE batches SET exhausted = TRUE WHERE batch_id = $1 AND tenant = $2",
+                &[&id.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -1400,8 +1546,8 @@ impl BatchStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         Ok(client
             .query_opt(
-                "SELECT exhausted FROM batches WHERE batch_id = $1",
-                &[&id.to_string()],
+                "SELECT exhausted FROM batches WHERE batch_id = $1 AND tenant = $2",
+                &[&id.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?
@@ -1420,17 +1566,23 @@ impl BatchStore for PostgresStore {
         // and they are performed again.
         client
             .execute(
-                "INSERT INTO batch_items (batch_id, item_key, run_id) VALUES ($1, $2, $3)
-                 ON CONFLICT (batch_id, item_key) DO NOTHING",
-                &[&batch.to_string(), &key.to_owned(), &run.to_string()],
+                "INSERT INTO batch_items (batch_id, item_key, run_id, tenant)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (tenant, batch_id, item_key) DO NOTHING",
+                &[
+                    &batch.to_string(),
+                    &key.to_owned(),
+                    &run.to_string(),
+                    &self.tenant_name(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
         let row = client
             .query_one(
                 "SELECT run_id, outcome, detail, tokens, minor FROM batch_items
-                  WHERE batch_id = $1 AND item_key = $2",
-                &[&batch.to_string(), &key.to_owned()],
+                  WHERE batch_id = $1 AND item_key = $2 AND tenant = $3",
+                &[&batch.to_string(), &key.to_owned(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -1454,7 +1606,7 @@ impl BatchStore for PostgresStore {
         client
             .execute(
                 "UPDATE batch_items SET outcome = $3, detail = $4, tokens = $5, minor = $6
-                  WHERE batch_id = $1 AND item_key = $2",
+                  WHERE batch_id = $1 AND item_key = $2 AND tenant = $7",
                 &[
                     &batch.to_string(),
                     &key.to_owned(),
@@ -1462,6 +1614,7 @@ impl BatchStore for PostgresStore {
                     &detail,
                     &i64::try_from(spend.tokens).unwrap_or(i64::MAX),
                     &spend.minor_units,
+                    &self.tenant_name(),
                 ],
             )
             .await
@@ -1476,8 +1629,9 @@ impl BatchStore for PostgresStore {
         let first_open: Option<String> = client
             .query_one(
                 "SELECT MIN(item_key) FROM batch_items
-                  WHERE batch_id = $1 AND (outcome IS NULL OR outcome = 'suspended')",
-                &[&batch.to_string()],
+                  WHERE batch_id = $1 AND tenant = $2
+                    AND (outcome IS NULL OR outcome = 'suspended')",
+                &[&batch.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?
@@ -1487,15 +1641,16 @@ impl BatchStore for PostgresStore {
             Some(open) => client
                 .query_one(
                     "SELECT MAX(item_key) FROM batch_items
-                      WHERE batch_id = $1 AND item_key < $2",
-                    &[&batch.to_string(), &open],
+                      WHERE batch_id = $1 AND item_key < $2 AND tenant = $3",
+                    &[&batch.to_string(), &open, &self.tenant_name()],
                 )
                 .await
                 .map_err(|e| be(&e))?,
             None => client
                 .query_one(
-                    "SELECT MAX(item_key) FROM batch_items WHERE batch_id = $1",
-                    &[&batch.to_string()],
+                    "SELECT MAX(item_key) FROM batch_items
+                      WHERE batch_id = $1 AND tenant = $2",
+                    &[&batch.to_string(), &self.tenant_name()],
                 )
                 .await
                 .map_err(|e| be(&e))?,
@@ -1508,8 +1663,9 @@ impl BatchStore for PostgresStore {
         let rows = client
             .query(
                 "SELECT outcome, COUNT(*), COALESCE(SUM(tokens),0), COALESCE(SUM(minor),0)
-                   FROM batch_items WHERE batch_id = $1 GROUP BY outcome",
-                &[&batch.to_string()],
+                   FROM batch_items WHERE batch_id = $1 AND tenant = $2
+                  GROUP BY outcome",
+                &[&batch.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -1539,10 +1695,11 @@ impl BatchStore for PostgresStore {
         let rows = client
             .query(
                 "SELECT item_key, run_id, outcome, detail, tokens, minor FROM batch_items
-                  WHERE batch_id = $1 ORDER BY item_key ASC LIMIT $2",
+                  WHERE batch_id = $1 AND tenant = $3 ORDER BY item_key ASC LIMIT $2",
                 &[
                     &batch.to_string(),
                     &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
                 ],
             )
             .await

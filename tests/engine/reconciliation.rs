@@ -134,7 +134,7 @@ impl Skill for Pay {
 
 struct Fixture {
     store: Arc<RedbStore>,
-    rt: Runtime,
+    rt: Arc<Runtime>,
     calls: Arc<AtomicUsize>,
     probes: Arc<AtomicUsize>,
 }
@@ -342,9 +342,11 @@ async fn a_crash_orphan_is_resolved_by_the_probe_rather_than_escalated() {
                 Append::new(
                     run,
                     RecordKind::RunAdmitted {
-                        agent: "demo.pay".into(),
+                        capability: "demo.pay".into(),
+                        governed_by: None,
                         input: json!({}),
-                        policy: None,
+                        input_label: agentplane::core::Label::trusted(),
+                        policy_bundle: None,
                     },
                 ),
                 Append::new(
@@ -418,9 +420,11 @@ async fn strict_replay_of_an_orphan_neither_performs_nor_probes_nor_writes() {
                 Append::new(
                     run,
                     RecordKind::RunAdmitted {
-                        agent: "demo.pay".into(),
+                        capability: "demo.pay".into(),
+                        governed_by: None,
                         input: json!({}),
-                        policy: None,
+                        input_label: agentplane::core::Label::trusted(),
+                        policy_bundle: None,
                     },
                 ),
                 Append::new(

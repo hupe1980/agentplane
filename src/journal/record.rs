@@ -12,14 +12,42 @@
 //! records, which is precisely the property the chain exists to provide.
 //! Upcasting is a read-time view; the chain is over history as written.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::core::{
     AttestError, Attestation, CaseId, Compensation, DeadlineState, Digest, Disposition,
-    EffectDescriptor, EffectKey, Epoch, Label, Phase, Principal, Recovery, RunId, Seq, Signer,
-    Spend, StepId, StoreError, Timestamp, Verifier, canon,
+    EffectDescriptor, EffectKey, Epoch, Label, Phase, PolicyBundleIdentity, Principal, Recovery,
+    RunId, Seq, Signer, Spend, StepId, StoreError, Timestamp, Verifier, canon,
 };
+
+/// Which declaration governed a run.
+///
+/// Name and version say *what to look for*; the digest says *what it said*. Only
+/// the last of those survives the file being edited, which is why all three are
+/// recorded rather than a reference that has to be resolved against a registry
+/// that may no longer hold that version — or may be the compromised party.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentIdentity {
+    /// `metadata.name` from the manifest.
+    pub name: String,
+    /// `metadata.version` from the manifest.
+    pub version: String,
+    /// The digest over the manifest's canonical bytes.
+    pub digest: Digest,
+    /// Who vouched for this declaration, when it came from a verified registry
+    /// resolution rather than a parsed file.
+    ///
+    /// The stable, unforgeable grouping. A workload identity is per-instance and
+    /// a digest names one revision, so neither is what a rule about *a set of
+    /// agents* wants; a name or role is a string the manifest author typed.
+    /// `None` means nobody vouched — which is a fact worth recording, not a
+    /// blank to be read as "trusted".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<crate::core::KeyId>,
+}
 
 /// The typed view of a record's `(kind, version, payload)`.
 ///
@@ -31,9 +59,38 @@ use crate::core::{
 pub enum RecordKind {
     /// A run was admitted: identity bound, budget reserved, input labeled.
     RunAdmitted {
-        agent: String,
+        /// The capability this run was asked for.
+        ///
+        /// Named for what it is. It held the plan's first capability under the
+        /// field name `agent`, which read as an identity and was not one — the
+        /// stringly-typed mistake, in the one record where "who did this" is the
+        /// question being asked.
+        capability: String,
+        /// Which declared agent governed this run, if a declared one did.
+        ///
+        /// `None` means the run was served by a skill registered directly on the
+        /// plane, with no manifest — a legitimate shape, and worth telling apart
+        /// from a governed run rather than leaving both blank.
+        ///
+        /// This is what makes *"which declaration governed this run"* answerable
+        /// from the journal years later. The digest is the load-bearing part:
+        /// a name and version identify a file that may since have been edited,
+        /// and only the digest pins what it actually said — including the system
+        /// prompt, which is inside it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        governed_by: Option<AgentIdentity>,
         input: Value,
-        /// Which policy set governed this run, if any.
+        /// What the input's label was at admission.
+        ///
+        /// Journaled because a replay must reproduce it. Recomputing would give
+        /// whatever today's caller would have said, so a run started from a
+        /// specialist's untrusted answer would replay as trusted and every taint
+        /// gate downstream would reach a different verdict than the live run.
+        ///
+        /// Required rather than defaulted: a missing label read as *trusted* is
+        /// the failure this field exists to remove.
+        input_label: crate::core::Label,
+        /// Which complete policy bundle governed this run, if any.
         ///
         /// `None` means no engine was configured — a fact worth recording,
         /// because "was policy switched on for this run" should be answerable
@@ -41,7 +98,7 @@ pub enum RecordKind {
         /// the deployment was wired. Journaled once here rather than per
         /// decision: this is an audit question, not a replay one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        policy: Option<Digest>,
+        policy_bundle: Option<PolicyBundleIdentity>,
     },
 
     /// The plan was compiled from trusted input and frozen.
@@ -144,6 +201,18 @@ pub enum RecordKind {
 
     EffectDone {
         output: Value,
+        /// Who sent it, when this effect was an awaited inbound event.
+        ///
+        /// Journaled because the label must be reproducible: a replayed run
+        /// rebuilds the awaited value's provenance from this record, and a
+        /// source known only to the live delivery would give the two runs
+        /// different labels — divergence at every taint gate downstream.
+        ///
+        /// Absent for every other effect, and absent on records written before
+        /// this existed. Absence fails *closed*: the label simply lacks that
+        /// provenance, so a field requiring it is refused rather than admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
         /// What this effect consumed.
         ///
         /// Recorded so replay adds up the same figures the original run did,
@@ -252,11 +321,17 @@ pub enum RecordKind {
         detail: Option<String>,
     },
 
-    /// A labeled value left the information-flow lattice. Policy approved it and
-    /// the reason is on the record, permanently.
-    Declassified {
-        reason: String,
+    /// Policy approved a typed label improvement. The record binds the decision
+    /// to the exact value digest and prior whole/field labels; the value remains
+    /// inside the information-flow lattice.
+    Released {
+        releaser: String,
+        release: crate::core::Release,
         label: Label,
+        field_labels: BTreeMap<String, Label>,
+        result_label: Label,
+        result_field_labels: BTreeMap<String, Label>,
+        value: Digest,
     },
 
     /// An operator's stop request, observed by the run's owner.
@@ -305,7 +380,7 @@ impl RecordKind {
             Self::BudgetRefused { .. } => "BudgetRefused",
             Self::IdentityBound { .. } => "IdentityBound",
             Self::PolicyDenied { .. } => "PolicyDenied",
-            Self::Declassified { .. } => "Declassified",
+            Self::Released { .. } => "Released",
             Self::RunCancelled { .. } => "RunCancelled",
             Self::RunSealed { .. } => "RunSealed",
         }
@@ -315,9 +390,27 @@ impl RecordKind {
     ///
     /// Bumping it is an RFC-level change: the journal is forever, so every
     /// version ever written must remain readable via an [`Upcaster`](super::Upcaster).
+    ///
+    /// **v4** renames `RunAdmitted.agent` to `capability` — it always held one —
+    /// and adds `governed_by`, so *which declaration governed this run* is
+    /// answerable from the journal rather than only from whoever still has the
+    /// file. A v3 record read as v4 would name a capability in a field about
+    /// identity and report every run as ungoverned, both silently.
+    ///
+    /// **v3** adds the admitted input's label, so a replay reaches the same taint
+    /// verdicts as the run it reproduces. **v2** was the pre-release format cut. `RunAdmitted.policy` became
+    /// `policy_bundle` and `Declassified` became `Released`, and both are
+    /// incompatible in the quietest possible way: a v1 record still
+    /// deserialises, with the policy digest defaulting to `None`. A run resumed
+    /// from such a record would report that no policy governed it, which is a
+    /// false statement about an audit question rather than a parse failure.
+    ///
+    /// Bumping converts that silence into a refusal. Nothing migrates — the
+    /// project is pre-release and the cut is deliberate — but a journal written
+    /// by an older build is now *detected* instead of misread.
     #[must_use]
     pub fn version(&self) -> u16 {
-        1
+        4
     }
 }
 
@@ -665,9 +758,11 @@ mod tests {
             body(
                 1,
                 RecordKind::RunAdmitted {
-                    agent: huge,
+                    capability: huge,
+                    governed_by: None,
                     input: json!(null),
-                    policy: None,
+                    input_label: crate::core::Label::trusted(),
+                    policy_bundle: None,
                 },
             ),
             Digest::ZERO,
@@ -696,9 +791,11 @@ mod tests {
             body(
                 1,
                 RecordKind::RunAdmitted {
-                    agent: "auditor@2.0.0".into(),
+                    capability: "auditor@2.0.0".into(),
+                    governed_by: None,
                     input: json!({ "ticket": "printer on fire" }),
-                    policy: None,
+                    input_label: crate::core::Label::trusted(),
+                    policy_bundle: None,
                 },
             ),
             Digest::ZERO,
@@ -801,6 +898,7 @@ mod tests {
             RunId::generate(),
             RecordKind::EffectDone {
                 output: json!(1),
+                source: None,
                 spend: Spend::default(),
             },
         )

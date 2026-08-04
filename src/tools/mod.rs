@@ -47,7 +47,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::core::{
-    Disposition, Effect, EffectDescriptor, EffectError, Recovery, RetryPolicy, Sensitivity, Trust,
+    Disposition, Effect, EffectDescriptor, EffectError, ProtectedField, Recovery, RetryPolicy,
+    Sensitivity, Trust,
 };
 
 /// Which tool, on which server.
@@ -67,6 +68,32 @@ impl ToolId {
             server: server.into(),
             tool: tool.into(),
         }
+    }
+
+    /// How a **manifest** names this tool: `mcp://server/tool`.
+    ///
+    /// The one spelling a grant is matched against. Built here rather than at
+    /// each call site because it was built at each call site, in two formats,
+    /// and a tool that resolved in the catalogue then failed the manifest gate
+    /// was the result.
+    #[must_use]
+    pub fn reference(&self) -> String {
+        format!("mcp://{}/{}", self.server, self.tool)
+    }
+
+    /// How a **model** names this tool: `server__tool`.
+    ///
+    /// Neither `mcp://server/tool` nor `server/tool` is a legal function name —
+    /// providers restrict them to letters, digits, underscore and hyphen, so a
+    /// `:` or `/` is rejected before the model ever sees the tool. The double
+    /// underscore is the separator because a single one appears inside ordinary
+    /// tool names and would make `a_b/c` and `a/b_c` collide.
+    ///
+    /// This is the name [`ToolCatalog::resolve`] matches, because it is the only
+    /// one a model can actually emit.
+    #[must_use]
+    pub fn wire_name(&self) -> String {
+        format!("{}__{}", self.server, self.tool)
     }
 }
 
@@ -96,6 +123,10 @@ pub struct ToolSafety {
     pub output_sensitivity: Sensitivity,
     /// How many attempts, and how spaced.
     pub retry: RetryPolicy,
+    /// High-risk JSON arguments whose source constraints are stricter than
+    /// ordinary content fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_fields: Vec<ProtectedField>,
 }
 
 impl Default for ToolSafety {
@@ -106,8 +137,19 @@ impl Default for ToolSafety {
             max_sensitivity: Sensitivity::Public,
             output_sensitivity: Sensitivity::Public,
             retry: RetryPolicy::never(),
+            protected_fields: Vec::new(),
         }
     }
+}
+
+/// Protected fields in a canonical order.
+///
+/// Order carries no meaning here — the set is what matters — so anything that
+/// hashes or compares these must not be able to see it.
+pub(crate) fn sorted_fields(fields: &[ProtectedField]) -> Vec<ProtectedField> {
+    let mut out = fields.to_vec();
+    out.sort_by(|left, right| left.path().cmp(right.path()));
+    out
 }
 
 impl ToolSafety {
@@ -144,6 +186,22 @@ impl ToolSafety {
     #[must_use]
     pub fn retry(mut self, r: RetryPolicy) -> Self {
         self.retry = r;
+        self
+    }
+
+    /// Add a field-level information-flow rule.
+    #[must_use]
+    pub fn protect(mut self, field: ProtectedField) -> Self {
+        assert!(
+            !self
+                .protected_fields
+                .iter()
+                .any(|existing| existing.path() == field.path()),
+            "a protected tool argument may be declared only once"
+        );
+        self.protected_fields.push(field);
+        self.protected_fields
+            .sort_by(|left, right| left.path().cmp(right.path()));
         self
     }
 }
@@ -261,6 +319,59 @@ impl ToolCatalog {
         self
     }
 
+    /// Resolve a name a **model** chose to a tool the operator granted.
+    ///
+    /// This is the bridge between a completion and a dispatch, and it is where
+    /// most of the risk in tool-calling lives. A model emits a flat string it
+    /// generated; everything downstream treats the result as authority. So the
+    /// match is exact and total: the name must equal a granted tool's
+    /// `server/tool` rendering, byte for byte.
+    ///
+    /// **Nothing is resolved approximately.** No case folding, no trimming, no
+    /// nearest neighbour, no prefix. A model that writes `ledger/Transfer` or
+    /// `ledger/transfer ` gets a refusal, not the tool it nearly named — because
+    /// the whole point of a catalogue is that authority comes from the
+    /// operator's list rather than from a string a model produced, and a
+    /// resolver that helpfully corrects a near miss has handed the model the
+    /// power to reach a tool by describing it.
+    ///
+    /// The name compared is [`ToolId::wire_name`] — the only spelling a
+    /// provider permits a model to emit.
+    ///
+    /// `None` means refused. The caller must not fall back.
+    #[must_use]
+    pub fn resolve(&self, name: &str) -> Option<ToolId> {
+        self.entries
+            .keys()
+            .find(|id| id.wire_name() == name)
+            .cloned()
+    }
+
+    /// Find a tool by the spelling a **manifest** uses.
+    ///
+    /// The counterpart to [`resolve`](Self::resolve), which takes the spelling a
+    /// *model* uses. Two spellings because a manifest reference is a URI a human
+    /// reviews and a wire name is what a provider permits a model to emit — and
+    /// both are derived in one place each, because they were once derived in
+    /// three places in two formats.
+    #[must_use]
+    pub fn resolve_reference(&self, reference: &str) -> Option<ToolId> {
+        self.entries
+            .keys()
+            .find(|id| id.reference() == reference)
+            .cloned()
+    }
+
+    /// Every granted tool, for declaring to a model.
+    ///
+    /// Declare from here rather than from a hand-written list: offering a model
+    /// a tool the catalogue does not grant produces a call that is refused after
+    /// the tokens are paid for, and offering fewer than are granted hides
+    /// capability for no reason. One source, so the two cannot disagree.
+    pub fn granted(&self) -> impl Iterator<Item = &ToolId> {
+        self.entries.keys()
+    }
+
     /// Record what a server advertised about a tool it offers.
     ///
     /// Changes nothing about how the tool is treated. It exists so the
@@ -375,6 +486,14 @@ impl Effect for ToolCall {
                 "server": self.id.server,
                 "tool": self.id.tool,
                 "arguments": self.arguments,
+                // Sorted here, not merely by the builder. `protect()` sorts,
+                // but a `ToolSafety` built by struct literal or deserialised
+                // from config never passes through it — and declaration order
+                // would then change the **effect key**, so the same call
+                // replayed against a differently-ordered catalogue would report
+                // divergence. Canonicalising at the one place the value is
+                // hashed makes the order unobservable.
+                "protected_fields": sorted_fields(&self.safety.protected_fields),
             }),
         )
     }
@@ -393,6 +512,14 @@ impl Effect for ToolCall {
 
     fn max_sensitivity(&self) -> Sensitivity {
         self.safety.max_sensitivity
+    }
+
+    fn sink_arguments(&self) -> Option<&Value> {
+        Some(&self.arguments)
+    }
+
+    fn protected_fields(&self) -> &[ProtectedField] {
+        &self.safety.protected_fields
     }
 
     fn output_sensitivity(&self) -> Sensitivity {

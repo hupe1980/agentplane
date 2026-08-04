@@ -15,6 +15,7 @@ pub struct MemoryBlobs {
     /// `digest -> (when, why)`. Kept after the bytes go, because "deliberately
     /// expired" and "missing" are different answers to an operator.
     tombstones: Mutex<BTreeMap<[u8; 32], (i64, String)>>,
+    tenant: crate::core::TenantId,
 }
 
 impl MemoryBlobs {
@@ -22,6 +23,17 @@ impl MemoryBlobs {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Serve one tenant.
+    ///
+    /// In-process and per-handle, so two tenants' handles are two maps rather
+    /// than one map with a shared keyspace — the same separation the object
+    /// store gets from its path prefix.
+    #[must_use]
+    pub fn for_tenant(mut self, tenant: crate::core::TenantId) -> Self {
+        self.tenant = tenant;
+        self
     }
 
     /// How many distinct blobs are held.
@@ -65,30 +77,12 @@ impl MemoryBlobs {
     }
 }
 
-#[async_trait]
-impl BlobStore for MemoryBlobs {
-    async fn put(&self, bytes: &[u8]) -> Result<Digest, BlobError> {
-        // The store hashes; the caller does not get to say where its bytes live.
-        let digest = Digest::of(bytes);
-        self.blobs
-            .lock()
-            .map_err(|_| BlobError::Backend("blob mutex poisoned".into()))?
-            .insert(digest.as_bytes().to_owned(), bytes.to_vec());
-        Ok(digest)
-    }
-
-    async fn get(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {
-        let found = self
-            .blobs
-            .lock()
-            .map_err(|_| BlobError::Backend("blob mutex poisoned".into()))?
-            .get(digest.as_bytes())
-            .cloned();
-        if let Some(bytes) = found {
-            return verify(digest, bytes);
-        }
-        // Checked only once the bytes are absent: a tombstone beside live bytes
-        // would be a contradiction, and answering from it would hide them.
+impl MemoryBlobs {
+    /// Why nothing is here: deliberately expired, or simply absent.
+    ///
+    /// Consulted only once the bytes are gone — a tombstone beside live bytes
+    /// would be a contradiction, and answering from it would hide them.
+    fn absent<T>(&self, digest: Digest) -> Result<T, BlobError> {
         let stone = self
             .tombstones
             .lock()
@@ -103,6 +97,59 @@ impl BlobStore for MemoryBlobs {
             }),
             None => Err(BlobError::NotFound(digest.to_hex())),
         }
+    }
+}
+
+#[async_trait]
+impl BlobStore for MemoryBlobs {
+    fn tenant(&self) -> &str {
+        self.tenant.as_str()
+    }
+
+    async fn put(&self, bytes: &[u8]) -> Result<Digest, BlobError> {
+        // The store hashes; the caller does not get to say where its bytes live.
+        let digest = Digest::of(bytes);
+        self.blobs
+            .lock()
+            .map_err(|_| BlobError::Backend("blob mutex poisoned".into()))?
+            .insert(digest.as_bytes().to_owned(), bytes.to_vec());
+        Ok(digest)
+    }
+
+    async fn put_at(&self, digest: Digest, bytes: &[u8]) -> Result<(), BlobError> {
+        self.blobs
+            .lock()
+            .map_err(|_| BlobError::Backend("blob mutex poisoned".into()))?
+            .insert(digest.as_bytes().to_owned(), bytes.to_vec());
+        Ok(())
+    }
+
+    async fn get_raw(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {
+        let found = self
+            .blobs
+            .lock()
+            .map_err(|_| BlobError::Backend("blob mutex poisoned".into()))?
+            .get(digest.as_bytes())
+            .cloned();
+        if let Some(bytes) = found {
+            return Ok(bytes);
+        }
+        self.absent(digest)
+    }
+
+    async fn get(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {
+        let found = self
+            .blobs
+            .lock()
+            .map_err(|_| BlobError::Backend("blob mutex poisoned".into()))?
+            .get(digest.as_bytes())
+            .cloned();
+        if let Some(bytes) = found {
+            return verify(digest, bytes);
+        }
+        // Checked only once the bytes are absent: a tombstone beside live bytes
+        // would be a contradiction, and answering from it would hide them.
+        self.absent(digest)
     }
 
     async fn expire(&self, digest: Digest, at: Timestamp, reason: &str) -> Result<(), BlobError> {

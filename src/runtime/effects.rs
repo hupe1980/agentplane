@@ -130,6 +130,10 @@ impl Effect for Recorded {
         self.max_sensitivity
     }
 
+    fn sink_arguments(&self) -> Option<&serde_json::Value> {
+        Some(&self.payload)
+    }
+
     fn recovery(&self) -> Recovery {
         Recovery::Retry
     }

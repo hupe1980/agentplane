@@ -258,6 +258,12 @@ struct ApiBlock {
     kind: String,
     #[serde(default)]
     text: String,
+    /// A tool call's provider-assigned id.
+    #[serde(default)]
+    id: Option<String>,
+    /// Which tool the model wants called.
+    #[serde(default)]
+    name: Option<String>,
     /// A forced tool call's arguments — already an object, not a JSON string.
     #[serde(default)]
     input: Option<Value>,
@@ -311,12 +317,91 @@ impl ApiResponse {
     /// string, so there is nothing to parse — which is also why the emulated
     /// path cannot produce the "declared a schema and the answer is not JSON"
     /// failure the native path can.
+    /// Tool calls the model asked for, excluding this crate's forced one.
+    ///
+    /// The buffered twin of `Accumulator::tool_calls`, and it must agree with
+    /// it: streaming is the default, so a difference here would show up as a
+    /// loop that fires in tests and never in production.
+    fn tool_calls(&self) -> Vec<super::ToolCall> {
+        self.content
+            .iter()
+            .filter(|b| b.kind == "tool_use")
+            .filter(|b| b.name.as_deref() != Some(RESPOND_TOOL))
+            .filter_map(|b| {
+                Some(super::ToolCall {
+                    id: b.id.clone()?,
+                    name: b.name.clone()?,
+                    // Already decoded here, unlike the streaming path where it
+                    // arrives as JSON fragments.
+                    arguments: b.input.clone().unwrap_or(Value::Null),
+                })
+            })
+            .collect()
+    }
+
+    /// The forced structured-output tool's arguments.
+    ///
+    /// Matched **by name**, not by being the first `tool_use` block. A model may
+    /// emit a caller's tool call before this one, and taking whichever came
+    /// first would hand that call's arguments back as the structured answer —
+    /// a wrong answer that parses, which is the worst kind. The streaming path
+    /// matches by name for the same reason, and the two must agree.
     fn forced_tool_input(&self) -> Option<&Value> {
         self.content
             .iter()
-            .find(|b| b.kind == "tool_use")
+            .find(|b| b.kind == "tool_use" && b.name.as_deref() == Some(RESPOND_TOOL))
             .and_then(|b| b.input.as_ref())
     }
+}
+
+/// Append the turn that already happened: what the model asked, what came back.
+///
+/// Anthropic wants both, as two messages — an `assistant` turn holding the
+/// `tool_use` blocks it emitted, then a `user` turn holding one `tool_result`
+/// per call, matched by `tool_use_id`. Sending only the results is rejected:
+/// there is no request for them to answer.
+///
+/// All results go in **one** user message. A separate message per result is
+/// accepted by the API and reads to the model as several conversational turns,
+/// which is not what happened — the calls were parallel.
+fn continue_with(messages: Value, exchanges: &[super::ToolExchange]) -> Value {
+    if exchanges.is_empty() {
+        return messages;
+    }
+    let mut out = match messages {
+        Value::Array(v) => v,
+        other => vec![json!({ "role": "user", "content": other })],
+    };
+    out.push(json!({
+        "role": "assistant",
+        "content": exchanges
+            .iter()
+            .map(|e| json!({
+                "type": "tool_use",
+                "id": e.call.id,
+                "name": e.call.name,
+                "input": e.call.arguments,
+            }))
+            .collect::<Vec<_>>(),
+    }));
+    out.push(json!({
+        "role": "user",
+        "content": exchanges
+            .iter()
+            .map(|e| json!({
+                "type": "tool_result",
+                "tool_use_id": e.call.id,
+                // Stringified: `content` takes text or blocks, not arbitrary
+                // JSON, and a bare object is rejected.
+                "content": match &e.output {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                },
+                "is_error": e.failed,
+            }))
+            .collect::<Vec<_>>(),
+    }));
+    Value::Array(out)
 }
 
 /// The prompt shape this driver accepts.
@@ -359,15 +444,34 @@ fn system(prompt: &Value) -> Option<Value> {
 /// become an answer and **not at all** in what counts as a usable one — and a
 /// second copy of this reasoning would be the place the two quietly disagreed
 /// about whether an empty response is a failure.
+/// Everything a response yielded, however it arrived.
+///
+/// A struct rather than a parameter list because the buffered and streaming
+/// paths must hand `interpret` the *same* things — and a positional list of
+/// eight is where one path quietly stops supplying one of them.
+struct Assembled {
+    text: String,
+    /// The forced structured-output tool's arguments.
+    forced: Option<Value>,
+    /// Tool calls the caller may act on, forced tool excluded.
+    tool_calls: Vec<super::ToolCall>,
+    usage: Usage,
+    stop_reason: Option<String>,
+}
+
 fn interpret(
     model: &ModelId,
     schema: Option<&Value>,
     emulating: bool,
-    text: String,
-    forced: Option<Value>,
-    usage: Usage,
-    stop_reason: Option<String>,
+    assembled: Assembled,
 ) -> Result<Completion, ModelError> {
+    let Assembled {
+        text,
+        forced,
+        tool_calls,
+        usage,
+        stop_reason,
+    } = assembled;
     // It generated and then declined. Metered, because generation happened —
     // and `Unusable` rather than `Refused` for exactly that reason: a refusal
     // costs nothing, this costs whatever it took to decide.
@@ -408,6 +512,7 @@ fn interpret(
 
     Ok(Completion {
         structured: structured_value,
+        tool_calls,
         text,
         usage,
         // `max_tokens` is the provider saying it stopped because it ran out of
@@ -419,14 +524,38 @@ fn interpret(
 
 impl Anthropic {
     /// The request body, identical either way but for the `stream` flag.
-    fn body(&self, model: &ModelId, prompt: &Value, schema: Option<&Value>) -> Value {
+    fn body(
+        &self,
+        model: &ModelId,
+        prompt: &Value,
+        schema: Option<&Value>,
+        tools: &[super::ToolDeclaration],
+        exchanges: &[super::ToolExchange],
+    ) -> Result<Value, ModelError> {
         let mut body = json!({
             "model": model.model,
             "max_tokens": self.max_tokens,
-            "messages": messages(prompt),
+            "messages": continue_with(messages(prompt), exchanges),
         });
         if let Some(system) = system(prompt) {
             body["system"] = system;
+        }
+        // Anthropic takes declarations at the top level: `name`, `description`,
+        // `input_schema` — no `function` wrapper, and `input_schema` rather than
+        // `parameters`. Rendered here so a caller writes one declaration.
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(
+                tools
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "input_schema": t.parameters,
+                        })
+                    })
+                    .collect(),
+            );
         }
         if let Some(schema) = schema {
             match self.mode_for(model) {
@@ -441,6 +570,26 @@ impl Anthropic {
                 // answer's shape, and a `tool_choice` the model cannot decline.
                 // Older than native support and available on far more models.
                 SchemaMode::ForcedTool => {
+                    // The fallback spends `tools` and `tool_choice` on the
+                    // answer's shape, so it cannot coexist with real tools:
+                    // whichever were written first would be silently replaced,
+                    // and the model would either lose its tools or return prose
+                    // where a schema was promised. Refused rather than merged,
+                    // because merging means guessing which the caller wanted.
+                    if !tools.is_empty() {
+                        return Err(ModelError::Refused {
+                            model: model.clone(),
+                            detail: format!(
+                                "model '{}' has no native structured output here, so a declared \
+                                 response schema is obtained by forcing a synthetic tool — which \
+                                 cannot be combined with the {} tool(s) this request declares. \
+                                 Use a model with native structured output, or drop the schema \
+                                 and validate the answer yourself",
+                                model.model,
+                                tools.len()
+                            ),
+                        });
+                    }
                     body["tools"] = json!([{
                         "name": RESPOND_TOOL,
                         "description": "Return the answer in the required shape.",
@@ -453,7 +602,7 @@ impl Anthropic {
         if self.stream {
             body["stream"] = json!(true);
         }
-        body
+        Ok(body)
     }
 
     /// Read a whole response at once.
@@ -478,10 +627,13 @@ impl Anthropic {
             model,
             schema,
             emulating,
-            parsed.text(),
-            parsed.forced_tool_input().cloned(),
-            parsed.usage(),
-            parsed.stop_reason.clone(),
+            Assembled {
+                text: parsed.text(),
+                forced: parsed.forced_tool_input().cloned(),
+                tool_calls: parsed.tool_calls(),
+                usage: parsed.usage(),
+                stop_reason: parsed.stop_reason.clone(),
+            },
         )
     }
 
@@ -540,10 +692,13 @@ impl Anthropic {
             model,
             schema,
             emulating,
-            acc.text().to_owned(),
-            acc.forced_tool_input(),
-            acc.billed(),
-            acc.stop_reason().map(ToOwned::to_owned),
+            Assembled {
+                text: acc.text().to_owned(),
+                forced: acc.forced_tool_input(),
+                tool_calls: acc.tool_calls(),
+                usage: acc.billed(),
+                stop_reason: acc.stop_reason().map(ToOwned::to_owned),
+            },
         )
     }
 }
@@ -613,7 +768,11 @@ impl ModelProvider for Anthropic {
             model,
             prompt,
             schema,
+            tools,
+            exchanges,
         } = request;
+
+        super::refuse_provider_side_media(prompt, model)?;
 
         // Before the request is built: a refused destination must cost nothing
         // and reach nothing.
@@ -624,7 +783,7 @@ impl ModelProvider for Anthropic {
             .post(format!("{}/v1/messages", self.base))
             .header("x-api-key", self.key.expose())
             .header("anthropic-version", &self.version)
-            .json(&self.body(model, prompt, schema))
+            .json(&self.body(model, prompt, schema, tools, exchanges)?)
             .send()
             .await
             .map_err(|e| classify_transport(model, &e))?;
@@ -654,6 +813,38 @@ mod tests {
         Anthropic::new("test-key").expect("build the driver")
     }
 
+    /// The forced tool is found by name, not by being first.
+    ///
+    /// A model may emit a caller's tool call before the synthetic one this crate
+    /// forces to shape the answer. Taking whichever `tool_use` block arrived
+    /// first hands that call's arguments back as the structured answer — a wrong
+    /// answer that parses cleanly, so nothing downstream catches it. The
+    /// streaming accumulator matches by name; this is the buffered twin, and the
+    /// two must agree or the bug appears only in whichever mode production uses.
+    #[test]
+    fn the_forced_tool_is_found_by_name_not_by_position() {
+        let parsed: ApiResponse = serde_json::from_value(json!({
+            "content": [
+                { "type": "tool_use", "id": "c1", "name": "refund",
+                  "input": { "amount": 999 } },
+                { "type": "tool_use", "id": "c2", "name": RESPOND_TOOL,
+                  "input": { "verdict": "ship" } },
+            ],
+        }))
+        .expect("parse");
+
+        assert_eq!(
+            parsed.forced_tool_input(),
+            Some(&json!({ "verdict": "ship" })),
+            "the structured answer was taken from the caller's tool call"
+        );
+
+        let calls = parsed.tool_calls();
+        assert_eq!(calls.len(), 1, "the forced tool is not a caller tool call");
+        assert_eq!(calls[0].name, "refund");
+        assert_eq!(calls[0].id, "c1");
+    }
+
     /// A system instruction has to leave as a top-level parameter.
     ///
     /// Anthropic rejects `role: "system"` inside `messages`, so this is the only
@@ -665,7 +856,10 @@ mod tests {
             &ModelId::new("anthropic", "claude-x"),
             &json!({ "system": "answer only in French", "messages": [{"role": "user", "content": "hi"}] }),
             None,
-        );
+            &[],
+            &[],
+        )
+        .expect("a body without tools");
         assert_eq!(
             body["system"], "answer only in French",
             "the system instruction must be a top-level parameter: {body}"
@@ -684,11 +878,15 @@ mod tests {
     /// arrived as part of the thing being asked about.
     #[test]
     fn a_system_instruction_is_not_shown_as_the_question() {
-        let body = driver().body(
-            &ModelId::new("anthropic", "claude-x"),
-            &json!({ "system": "be terse", "ticket": "printer on fire" }),
-            None,
-        );
+        let body = driver()
+            .body(
+                &ModelId::new("anthropic", "claude-x"),
+                &json!({ "system": "be terse", "ticket": "printer on fire" }),
+                None,
+                &[],
+                &[],
+            )
+            .expect("a body without tools");
         let asked = body["messages"][0]["content"].as_str().unwrap_or_default();
         assert!(
             !asked.contains("be terse"),
@@ -717,11 +915,15 @@ mod tests {
                     "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=" } }
             ]
         }]);
-        let body = driver().body(
-            &ModelId::new("anthropic", "claude-x"),
-            &json!({ "messages": parts }),
-            None,
-        );
+        let body = driver()
+            .body(
+                &ModelId::new("anthropic", "claude-x"),
+                &json!({ "messages": parts }),
+                None,
+                &[],
+                &[],
+            )
+            .expect("a body without tools");
         assert_eq!(
             body["messages"], parts,
             "content blocks must survive untouched: {body}"
@@ -731,10 +933,231 @@ mod tests {
     /// No instruction, no key — an absent field is not an empty one.
     #[test]
     fn a_prompt_without_a_system_sends_no_system() {
-        let body = driver().body(&ModelId::new("anthropic", "claude-x"), &json!("hi"), None);
+        let body = driver()
+            .body(
+                &ModelId::new("anthropic", "claude-x"),
+                &json!("hi"),
+                None,
+                &[],
+                &[],
+            )
+            .expect("a body without tools");
         assert!(
             body.get("system").is_none(),
             "an unset instruction must not become an empty one: {body}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+    use crate::model::ToolDeclaration;
+
+    fn driver() -> Anthropic {
+        Anthropic::new("test-key").expect("build the driver")
+    }
+
+    fn decl() -> ToolDeclaration {
+        ToolDeclaration::new(
+            "ledger.read",
+            "Read a ledger entry.",
+            json!({ "type": "object", "properties": { "id": { "type": "string" } } }),
+        )
+    }
+
+    /// Anthropic takes the three fields at the top level, under `input_schema`.
+    ///
+    /// The shape differs from `OpenAI`'s in exactly the way that is easy to get
+    /// wrong: no `function` wrapper, and `input_schema` rather than
+    /// `parameters`. A request in the other shape is rejected by the API, so
+    /// this is pinned rather than assumed.
+    #[test]
+    fn a_declared_tool_is_rendered_in_anthropics_shape() {
+        let body = driver()
+            .body(
+                &ModelId::new("anthropic", "claude-x"),
+                &json!({ "messages": [] }),
+                None,
+                &[decl()],
+                &[],
+            )
+            .expect("a body with tools");
+
+        let tool = &body["tools"][0];
+        assert_eq!(tool["name"], "ledger.read");
+        assert_eq!(
+            tool["input_schema"]["type"], "object",
+            "Anthropic names the argument schema `input_schema`; `parameters` is              OpenAI's spelling and this request would be rejected: {body}"
+        );
+        assert!(
+            tool.get("function").is_none(),
+            "the OpenAI `function` wrapper must not appear: {body}"
+        );
+    }
+
+    /// A forced-tool schema and real tools cannot share one request.
+    ///
+    /// The fallback spends `tools` and `tool_choice` on the answer's shape. Left
+    /// to overwrite each other, the model either loses its tools or returns
+    /// prose where a schema was promised — and which happens depends on
+    /// statement order, which is not a thing a caller should have to know.
+    #[test]
+    fn a_forced_schema_and_declared_tools_are_refused_together() {
+        // A deployment that declared this model has no native structured
+        // output, so the answer's shape is obtained by forcing a synthetic tool.
+        let model = ModelId::new("anthropic", "claude-x");
+        let forced = driver().structured_via(SchemaMode::ForcedTool);
+        let schema = json!({ "type": "object" });
+        let out = forced.body(
+            &model,
+            &json!({ "messages": [] }),
+            Some(&schema),
+            &[decl()],
+            &[],
+        );
+
+        match out {
+            Err(ModelError::Refused { detail, .. }) => assert!(
+                detail.contains("structured output") && detail.contains("tool"),
+                "the refusal must say which two things collided: {detail}"
+            ),
+            Err(e) => panic!("wrong refusal: {e}"),
+            Ok(body) => panic!(
+                "a schema and declared tools were combined, so one silently \
+                 replaced the other: {body}"
+            ),
+        }
+
+        // Each alone is fine.
+        assert!(
+            forced
+                .body(&model, &json!({ "messages": [] }), Some(&schema), &[], &[])
+                .is_ok(),
+            "a schema alone must still work"
+        );
+        assert!(
+            forced
+                .body(&model, &json!({ "messages": [] }), None, &[decl()], &[])
+                .is_ok(),
+            "tools alone must still work"
+        );
+        // And a model with native structured output has no conflict at all:
+        // the schema goes in `output_config`, leaving `tools` to the caller.
+        let native = driver()
+            .body(
+                &model,
+                &json!({ "messages": [] }),
+                Some(&schema),
+                &[decl()],
+                &[],
+            )
+            .expect("native structured output coexists with tools");
+        assert_eq!(native["tools"][0]["name"], "ledger.read");
+        assert!(native["output_config"].is_object());
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use crate::model::{ToolCall as ModelToolCall, ToolExchange};
+
+    fn driver() -> Anthropic {
+        Anthropic::new("test-key").expect("build the driver")
+    }
+
+    fn exchange(failed: bool) -> ToolExchange {
+        let call = ModelToolCall {
+            id: "toolu_01".to_owned(),
+            name: "ledger.read".to_owned(),
+            arguments: json!({ "id": "AC-1" }),
+        };
+        if failed {
+            ToolExchange::failed(call, "the ledger was unreachable")
+        } else {
+            ToolExchange::ok(call, json!({ "balance": 42 }))
+        }
+    }
+
+    /// A continuation carries the call *and* its result, as two turns.
+    ///
+    /// Anthropic matches a `tool_result` to the `tool_use` that asked for it by
+    /// id, so sending results alone is rejected: there is no request for them to
+    /// answer. Both turns, and the ids must line up.
+    #[test]
+    fn a_continuation_echoes_the_call_beside_its_result() {
+        let body = driver()
+            .body(
+                &ModelId::new("anthropic", "claude-x"),
+                &json!({ "messages": [{"role": "user", "content": "balance?"}] }),
+                None,
+                &[],
+                &[exchange(false)],
+            )
+            .expect("a continuation body");
+
+        let msgs = body["messages"].as_array().expect("messages");
+        assert_eq!(msgs.len(), 3, "question, the call, the result: {body}");
+
+        let used = &msgs[1];
+        assert_eq!(used["role"], "assistant");
+        assert_eq!(used["content"][0]["type"], "tool_use");
+        assert_eq!(
+            used["content"][0]["input"],
+            json!({ "id": "AC-1" }),
+            "Anthropic takes arguments as an object, not a JSON string: {body}"
+        );
+
+        let result = &msgs[2];
+        assert_eq!(result["role"], "user");
+        assert_eq!(result["content"][0]["type"], "tool_result");
+        assert_eq!(
+            result["content"][0]["tool_use_id"], used["content"][0]["id"],
+            "the result must carry the id of the call it answers, or the API \
+             rejects it: {body}"
+        );
+    }
+
+    /// A failed tool is reported as failed, not as a strange answer.
+    #[test]
+    fn a_failed_tool_is_marked_is_error() {
+        let body = driver()
+            .body(
+                &ModelId::new("anthropic", "claude-x"),
+                &json!({ "messages": [] }),
+                None,
+                &[],
+                &[exchange(true)],
+            )
+            .expect("body");
+        // From the end: the two appended turns, whatever preceded them.
+        let msgs = body["messages"].as_array().expect("messages");
+        let (used, result) = (&msgs[msgs.len() - 2], &msgs[msgs.len() - 1]);
+        assert_eq!(
+            used["content"][0]["type"], "tool_use",
+            "the call is echoed even when it failed: {body}"
+        );
+        assert_eq!(
+            result["content"][0]["is_error"], true,
+            "a failure rendered as an ordinary result teaches the model the \
+             operation succeeded and returned something strange: {body}"
+        );
+    }
+
+    /// No exchanges, no change. A first turn must look exactly as it did.
+    #[test]
+    fn a_first_turn_is_untouched() {
+        let prompt = json!({ "messages": [{"role": "user", "content": "hi"}] });
+        let plain = driver()
+            .body(
+                &ModelId::new("anthropic", "claude-x"),
+                &prompt,
+                None,
+                &[],
+                &[],
+            )
+            .expect("body");
+        assert_eq!(plain["messages"].as_array().expect("messages").len(), 1);
     }
 }

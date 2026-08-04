@@ -283,7 +283,7 @@ fn db() -> Arc<RedbStore> {
     Arc::new(RedbStore::open_in_memory().unwrap())
 }
 
-fn runtime(store: &Arc<RedbStore>, world: &World, chain: Option<Delegation>) -> Runtime {
+fn runtime(store: &Arc<RedbStore>, world: &World, chain: Option<Delegation>) -> Arc<Runtime> {
     let mut b = Runtime::builder(Arc::clone(store) as Arc<dyn JournalStore>)
         .owner("identity")
         .skill(Checker {
@@ -442,7 +442,9 @@ async fn replay_uses_the_recorded_chain_not_the_configured_one() {
 /// The policy engine sees the whole chain, not just the acting workload.
 #[tokio::test]
 async fn the_policy_request_carries_the_owner_and_the_depth() {
-    use agentplane::core::{Digest, PolicyDecision, PolicyEngine, PolicyRequest};
+    use agentplane::core::{
+        Digest, PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest,
+    };
 
     #[derive(Debug, Default)]
     struct Capturing(Mutex<Vec<Value>>);
@@ -452,8 +454,11 @@ async fn the_policy_request_carries_the_owner_and_the_depth() {
             self.0.lock().unwrap().push(r.context.clone());
             PolicyDecision::Permit
         }
-        fn digest(&self) -> Digest {
-            Digest::of(b"capturing")
+        fn bundle(&self) -> PolicyBundleIdentity {
+            PolicyBundleIdentity::new(
+                Digest::of(b"capturing"),
+                "agentplane-test/identity-policy-v1",
+            )
         }
     }
 

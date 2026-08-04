@@ -39,6 +39,10 @@ categories   = ["asynchronous", "data-structures"]
 include = [
     "/src/**/*.rs",
     "/examples/*.rs",
+    # The manifest example `include_str!`s this; without it the packaged
+    # crate does not compile, and `cargo package --list` alone would not say so.
+    "/examples/*.yaml",
+    "/src/bin/*.rs",
     "/README.md",
     "/LICENSE-MIT",
     "/LICENSE-APACHE",
@@ -62,6 +66,12 @@ default = ["redb"]
 # Exactly-once is the table key rather than an index, so a duplicate effect
 # start is inexpressible rather than rejected.
 redb = ["dep:redb"]
+# The agent declaration: tool grants, budgets, egress ceiling, injection
+# pattern. Off by default because the runtime is perfectly usable wired by
+# builder calls; the manifest is what makes those declarations reviewable.
+manifest = ["dep:serde_yaml_ng"]
+# Everything the `agentplane` binary needs to run a declarative agent.
+cli = ["manifest", "redb", "providers", "testkit"]
 # Content-addressed blob storage on any backend OpenDAL reaches — filesystem,
 # S3, GCS, Azure. The other half of the journal's record-size limit: bytes too
 # big for the chain go here, and the chain commits to their digest.
@@ -70,6 +80,17 @@ redb = ["dep:redb"]
 # scan, no multi-key transaction and no unique constraint, which is all the
 # journal needs and none of what a content-addressed write needs.
 opendal = ["dep:opendal"]
+# Envelope encryption for payload bytes, and the erasure it makes provable.
+#
+# Bytes are sealed under a per-scope data key; the data key is wrapped by a key
+# this crate never holds. Erasure destroys the data key, so every copy — live
+# store, replica, and every backup ever taken — becomes unreadable at once,
+# which deleting from the live store cannot do.
+keyring = ["dep:chacha20poly1305"]
+# A key ring that is somebody else: HashiCorp Vault's transit engine, over its
+# documented HTTP API. The wrapping key is created inside Vault and never leaves
+# it, so erasure is something this crate asks for and cannot undo.
+keyring-vault = ["keyring", "dep:reqwest"]
 # Fault injection and other harness pieces, for this crate's assurance layers
 # and for embedders testing their own stores and skills. Never in a production
 # build — nothing in `testkit` is reachable without it.
@@ -90,12 +111,17 @@ mcp = ["dep:rmcp"]
 # default — a library embedded in someone else's process should not open a port
 # unless asked.
 http = ["dep:axum"]
+# Submitting checkpoints to a real witness — the half that makes the split-view
+# guarantee have a counterparty.
+witness-http = ["dep:reqwest"]
 # A2A transport: the wire for peer calls. The peer *seam* — audience-bound
 # credentials, attenuating delegation, the disposition vocabulary — is always
 # available; this is only the JSON-RPC client that carries it. Separate for the
 # same reason `mcp` is: what a peer is allowed to do must not depend on which
 # transport happens to be linked.
 a2a = ["dep:reqwest"]
+# Serve this plane as an A2A agent: the public card plus the JSON-RPC methods.
+a2a-server = ["http", "manifest"]
 # Ed25519 signing for journal records. The *seam* — `Signer`, `Verifier`, the
 # attestation on every record, the verifying read path — is always available;
 # this is one concrete implementation, for deployments that do not already have
@@ -104,9 +130,14 @@ signing = ["dep:ed25519-dalek"]
 # Model provider drivers over HTTP. The `ModelProvider` trait and the metering
 # rules are always available; this is a concrete driver.
 providers = ["dep:reqwest"]
+# Governed remote-media ingestion. Kept separate from model providers because
+# dereferencing an untrusted URL is a security boundary of its own: every DNS
+# answer and redirect is checked and pinned before bytes enter blob storage.
+media = ["dep:base64", "dep:reqwest", "tokio/net"]
 
 [dependencies]
 async-trait = "0.1"
+base64 = { version = "0.22", optional = true }
 serde       = { version = "1", features = ["derive"] }
 # NOTE: this crate must not ask for `preserve_order`, but it can no longer
 # assume nobody does — cargo unifies features across the graph and cedar-policy
@@ -121,7 +152,7 @@ hex         = "0.4"
 # heap — and reallocates copies of them on growth — which no amount of careful
 # `Debug` impl fixes. Small, audited, and unconditional: an API key is not an
 # optional-feature concern.
-zeroize     = { version = "1", features = ["alloc"] }
+zeroize     = { version = "1", features = ["alloc", "derive"] }
 time        = { version = "0.3", features = ["serde-well-known", "macros", "formatting", "parsing"] }
 rand        = "0.9"
 rand_chacha = "0.9"
@@ -131,9 +162,12 @@ tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 tracing     = "0.1"
 redb        = { version = "3", optional = true }
+# The maintained fork of serde_yaml, which is deprecated. Ten crates deep.
+serde_yaml_ng = { version = "0.10", optional = true }
 # `default-features = false`: the defaults pull in a long list of service
 # backends. An embedder picks the one they use; `services-fs` is the only one
 # that makes sense to assume.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"], optional = true }
 opendal     = { version = "0.58", default-features = false, features = ["services-fs"], optional = true }
 cedar-policy = { version = "4.12.0", default-features = false, optional = true }
 tokio-postgres = { version = "0.7.18", optional = true }
@@ -162,6 +196,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # without a real network.
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+http = "1"
 rmcp = { version = "3.1", default-features = false, features = ["server", "transport-io", "macros"] }
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
 tokio = { version = "1", features = ["full"] }
@@ -174,6 +209,16 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # Examples drive the runtime end to end and therefore need a store. Declaring
 # the requirement keeps `--no-default-features` building: an embedder bringing
 # their own backend must not be forced to compile SQLite.
+# The CLI that makes the declarative tier need no Rust at all.
+#
+# Feature-gated and not built by default, because the library is the product and
+# a binary that pulls in HTTP drivers is not something every dependant wants
+# compiled. `cargo install agentplane --features cli` opts in.
+[[bin]]
+name              = "agentplane"
+path              = "src/bin/agentplane.rs"
+required-features = ["cli"]
+
 [[example]]
 name              = "durable_pipeline"
 required-features = ["redb"]
@@ -186,6 +231,14 @@ required-features = ["redb"]
 name              = "plan_graph"
 required-features = ["redb"]
 
+[[example]]
+name              = "governed_transfer"
+required-features = ["redb"]
+
+[[example]]
+name              = "saga_checkout"
+required-features = ["redb"]
+
 # Needs `testkit` for the fake provider. Deliberately: an example that called a
 # real model would need an API key to run, and the claim it demonstrates — that
 # a completion replays from the journal rather than being asked again — would
@@ -193,6 +246,23 @@ required-features = ["redb"]
 [[example]]
 name              = "model_run"
 required-features = ["redb", "testkit"]
+
+# Digest-only multimodal dispatch and strict zero-I/O replay, with a fake model
+# and an in-memory blob store so the security contract is runnable offline.
+[[example]]
+name              = "media_run"
+required-features = ["redb", "testkit", "media"]
+
+# The manifest example reads `examples/agent.yaml` and runs the agent it
+# declares, so it needs the parser as well as the fake provider.
+[[example]]
+name              = "manifest_run"
+required-features = ["redb", "testkit", "manifest"]
+
+# Three agents, three manifests, three runtimes.
+[[example]]
+name              = "blog_room"
+required-features = ["redb", "testkit", "manifest"]
 
 [lints.rust]
 unsafe_code = "forbid"

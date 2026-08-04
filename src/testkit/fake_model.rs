@@ -85,9 +85,34 @@ impl FakeProvider {
         let text = text.into();
         let usage = usage_for(&json!(&text));
         self.will_answer(Completion {
+            tool_calls: Vec::new(),
             text,
             usage,
             stop_reason: Some("end_turn".to_owned()),
+            truncated: false,
+            structured: None,
+        })
+    }
+
+    /// Queue a turn in which the model asks for a tool.
+    ///
+    /// The id is the one a real provider would issue and the loop must echo
+    /// back, so a test exercises the pairing rather than assuming it.
+    pub fn will_call_tool(
+        &self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> &Self {
+        self.will_answer(Completion {
+            tool_calls: vec![crate::model::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments,
+            }],
+            text: String::new(),
+            usage: Usage::default(),
+            stop_reason: Some("tool_use".to_owned()),
             truncated: false,
             structured: None,
         })
@@ -147,6 +172,7 @@ fn echo(request: &Request<'_>) -> Completion {
         Some(schema) => {
             let value = sample(schema);
             Completion {
+                tool_calls: Vec::new(),
                 text: value.to_string(),
                 usage,
                 stop_reason: Some("end_turn".to_owned()),
@@ -155,6 +181,7 @@ fn echo(request: &Request<'_>) -> Completion {
             }
         }
         None => Completion {
+            tool_calls: Vec::new(),
             text: format!("fake answer to {}", request.prompt),
             usage,
             stop_reason: Some("end_turn".to_owned()),
@@ -226,6 +253,8 @@ mod tests {
             model,
             prompt,
             schema: schema.map(|s| &*Box::leak(Box::new(s.clone()))),
+            tools: &[],
+            exchanges: &[],
         }
     }
 
@@ -265,6 +294,8 @@ mod tests {
                 model: &m,
                 prompt: short,
                 schema: None,
+                tools: &[],
+                exchanges: &[],
             })
             .await
             .unwrap();
@@ -273,6 +304,8 @@ mod tests {
                 model: &m,
                 prompt: long,
                 schema: None,
+                tools: &[],
+                exchanges: &[],
             })
             .await
             .unwrap();

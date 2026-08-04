@@ -16,9 +16,11 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
+#[cfg(feature = "media")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentplane::core::{
-    Budget, Disposition, Effect, Outcome, Recovery, Sensitivity, Skill, SkillDescriptor,
+    Budget, Disposition, Effect, Label, Outcome, Recovery, Sensitivity, Skill, SkillDescriptor,
     SkillError, Tainted, Trust,
 };
 use agentplane::journal::{JournalStore, RecordKind};
@@ -144,13 +146,13 @@ impl Skill for Asks {
         cx: &mut StepCtx<'_>,
         _i: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
-        let out = cx
-            .effect(ModelCall::new(
-                Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
-                model(),
-                json!({ "q": "what is the balance" }),
-            ))
-            .await?;
+        let prompt = Tainted::trusted(json!({ "q": "what is the balance" }));
+        let call = ModelCall::new(
+            Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
+            model(),
+            prompt.peek().clone(),
+        );
+        let out = cx.sink(call, &prompt).await?;
         Ok(Outcome::done(out.map(|c| json!({ "text": c.text }))))
     }
 }
@@ -230,20 +232,28 @@ async fn a_failed_completion_spends_the_budget_that_stops_the_next_one() {
         ) -> Result<Outcome, SkillError> {
             // Burns 400 tokens and dies. Swallowed, as an agent retrying with a
             // reworded prompt would.
+            let first = Tainted::trusted(json!({ "q": "first attempt" }));
             let _ = cx
-                .effect(ModelCall::new(
-                    Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
-                    model(),
-                    json!({ "q": "first attempt" }),
-                ))
+                .sink(
+                    ModelCall::new(
+                        Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
+                        model(),
+                        first.peek().clone(),
+                    ),
+                    &first,
+                )
                 .await;
 
+            let second = Tainted::trusted(json!({ "q": "second attempt, reworded" }));
             let out = cx
-                .effect(ModelCall::new(
-                    Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
-                    model(),
-                    json!({ "q": "second attempt, reworded" }),
-                ))
+                .sink(
+                    ModelCall::new(
+                        Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
+                        model(),
+                        second.peek().clone(),
+                    ),
+                    &second,
+                )
                 .await?;
             Ok(Outcome::done(out.map(|c| json!({ "text": c.text }))))
         }
@@ -263,6 +273,7 @@ async fn a_failed_completion_spends_the_budget_that_stops_the_next_one() {
             detail: "connection reset".into(),
         })
         .will_answer(Completion {
+            tool_calls: Vec::new(),
             text: "the second answer".into(),
             usage: Usage {
                 input_tokens: 10,
@@ -370,6 +381,62 @@ fn a_models_sensitivity_ceiling_is_declarable() {
     )
     .with_max_sensitivity(Sensitivity::Internal);
     assert_eq!(Effect::max_sensitivity(&call), Sensitivity::Internal);
+    assert_eq!(
+        call.sink_arguments(),
+        Some(&json!({})),
+        "the ceiling can bind only when the actual prompt is a sink argument"
+    );
+}
+
+#[derive(Debug)]
+struct SendsSecretPrompt {
+    provider: Arc<FakeProvider>,
+}
+
+#[async_trait::async_trait]
+impl Skill for SendsSecretPrompt {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("secret-prompt").provides("secret-prompt")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let prompt = Tainted::with_label(
+            json!({ "q": "secret" }),
+            Label::trusted().with_sensitivity(Sensitivity::Secret),
+        );
+        let call = ModelCall::new(
+            Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
+            model(),
+            prompt.peek().clone(),
+        );
+        let out = cx.sink(call, &prompt).await?;
+        Ok(Outcome::done(out.map(|completion| json!(completion.text))))
+    }
+}
+
+#[tokio::test]
+async fn a_model_prompt_above_its_sensitivity_ceiling_never_leaves() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let provider = FakeProvider::new();
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsSecretPrompt {
+            provider: Arc::clone(&provider),
+        })
+        .build()
+        .run("secret-prompt", json!({}))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+    assert_eq!(provider.calls(), 0, "the model provider was reached");
 }
 
 /// The prompt is part of the effect key.
@@ -402,6 +469,7 @@ fn a_successful_completion_bills_its_usage() {
         json!({}),
     );
     let completion = Completion {
+        tool_calls: Vec::new(),
         text: "hi".into(),
         usage: Usage {
             input_tokens: 7,
@@ -415,4 +483,162 @@ fn a_successful_completion_bills_its_usage() {
     };
     assert_eq!(call.spend(&completion).tokens, 10);
     assert_eq!(call.spend(&completion).minor_units, 5);
+}
+
+#[cfg(feature = "media")]
+#[derive(Debug)]
+struct CountingBlobs {
+    inner: agentplane::blob::MemoryBlobs,
+    gets: AtomicUsize,
+}
+
+#[cfg(feature = "media")]
+impl CountingBlobs {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: agentplane::blob::MemoryBlobs::new(),
+            gets: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[cfg(feature = "media")]
+#[async_trait::async_trait]
+impl agentplane::blob::BlobStore for CountingBlobs {
+    async fn put(
+        &self,
+        bytes: &[u8],
+    ) -> Result<agentplane::core::Digest, agentplane::blob::BlobError> {
+        agentplane::blob::BlobStore::put(&self.inner, bytes).await
+    }
+
+    async fn get(
+        &self,
+        digest: agentplane::core::Digest,
+    ) -> Result<Vec<u8>, agentplane::blob::BlobError> {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        agentplane::blob::BlobStore::get(&self.inner, digest).await
+    }
+
+    async fn put_at(
+        &self,
+        digest: agentplane::core::Digest,
+        bytes: &[u8],
+    ) -> Result<(), agentplane::blob::BlobError> {
+        agentplane::blob::BlobStore::put_at(&self.inner, digest, bytes).await
+    }
+
+    async fn get_raw(
+        &self,
+        digest: agentplane::core::Digest,
+    ) -> Result<Vec<u8>, agentplane::blob::BlobError> {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        agentplane::blob::BlobStore::get_raw(&self.inner, digest).await
+    }
+
+    async fn expire(
+        &self,
+        digest: agentplane::core::Digest,
+        at: agentplane::core::Timestamp,
+        reason: &str,
+    ) -> Result<(), agentplane::blob::BlobError> {
+        agentplane::blob::BlobStore::expire(&self.inner, digest, at, reason).await
+    }
+
+    async fn has(
+        &self,
+        digest: agentplane::core::Digest,
+    ) -> Result<bool, agentplane::blob::BlobError> {
+        agentplane::blob::BlobStore::has(&self.inner, digest).await
+    }
+}
+
+#[cfg(feature = "media")]
+#[derive(Debug)]
+struct DescribesMedia {
+    provider: Arc<FakeProvider>,
+    blobs: Arc<CountingBlobs>,
+    digest: agentplane::core::Digest,
+}
+
+#[cfg(feature = "media")]
+#[async_trait::async_trait]
+impl Skill for DescribesMedia {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("describe-media").provides("describe-media")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let artifact = agentplane::media::FetchedMedia {
+            digest: self.digest,
+            media_type: "image/png".to_owned(),
+            bytes: 12,
+            source_url: "https://media.example/a.png".to_owned(),
+            final_url: "https://media.example/a.png".to_owned(),
+            redirects: 0,
+            validated_by: Vec::new(),
+            hops: Vec::new(),
+            retention: agentplane::media::MediaRetention::External {
+                policy: "test/v1".to_owned(),
+            },
+        };
+        let prompt = Tainted::from_source(
+            artifact.clone(),
+            agentplane::core::SourceId::new("media.fetch"),
+        )
+        .map(|artifact| json!({ "input": [{ "content": [artifact.openai_image()] }] }));
+        let call = ModelCall::new(
+            Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
+            model(),
+            prompt.peek().clone(),
+        )
+        .with_max_sensitivity(Sensitivity::Internal)
+        .with_media(
+            Arc::clone(&self.blobs) as Arc<dyn agentplane::blob::BlobStore>,
+            [&artifact],
+        );
+        let answer = cx.sink(call, &prompt).await?;
+        Ok(Outcome::done(
+            answer.map(|completion| json!(completion.text)),
+        ))
+    }
+}
+
+#[cfg(feature = "media")]
+#[tokio::test]
+async fn strict_replay_does_not_read_media_blobs_or_call_the_model() {
+    use agentplane::blob::BlobStore;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let blobs = CountingBlobs::new();
+    let digest = blobs.put(b"\x89PNG\r\n\x1a\nbody").await.unwrap();
+    let provider = FakeProvider::new();
+    let build = || {
+        Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .skill(DescribesMedia {
+                provider: Arc::clone(&provider),
+                blobs: Arc::clone(&blobs),
+                digest,
+            })
+            .build()
+    };
+
+    let live = build().run("describe-media", json!({})).await.unwrap();
+    assert!(
+        matches!(live.status, RunStatus::Succeeded),
+        "{:?}",
+        live.status
+    );
+    let live_gets = blobs.gets.load(Ordering::Relaxed);
+    let live_calls = provider.calls();
+    assert_eq!(live_gets, 1);
+    assert_eq!(live_calls, 1);
+
+    build().replay(live.run_id, Mode::Strict).await.unwrap();
+    assert_eq!(blobs.gets.load(Ordering::Relaxed), live_gets);
+    assert_eq!(provider.calls(), live_calls);
 }

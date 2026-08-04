@@ -92,6 +92,21 @@ pub enum BlobError {
 /// Bytes addressed by their own hash.
 #[async_trait]
 pub trait BlobStore: Send + Sync + Debug {
+    /// Whose bytes this handle can reach.
+    ///
+    /// Content addressing makes two tenants writing identical bytes land on one
+    /// object, which is a feature within a tenant and a defect across them. The
+    /// severe half is not reading — payloads are sealed under a per-tenant data
+    /// key — it is **erasure**: tombstoning a shared object destroys the other
+    /// tenant's data while discharging one tenant's request, and reports success
+    /// for both.
+    ///
+    /// Reported so a plane can refuse a blob store scoped to a different tenant
+    /// than itself, the same way it refuses a mismatched journal.
+    fn tenant(&self) -> &str {
+        crate::core::TenantId::DEFAULT
+    }
+
     /// Store bytes and return the address they landed at.
     ///
     /// Writing the same bytes twice is the same write.
@@ -100,6 +115,37 @@ pub trait BlobStore: Send + Sync + Debug {
     ///
     /// If the backing store rejects the write.
     async fn put(&self, bytes: &[u8]) -> Result<Digest, BlobError>;
+
+    /// Store bytes at an address that is **not** their own digest.
+    ///
+    /// The one legitimate reason to separate the two: envelope encryption, where
+    /// a payload is addressed by the digest of the plaintext and stored as
+    /// ciphertext. Every digest already written to a journal keeps meaning what
+    /// it meant, and the encryption stays invisible to everything that only ever
+    /// held an address.
+    ///
+    /// Callers other than [`EncryptedBlobs`](crate::keyring::EncryptedBlobs)
+    /// almost certainly want [`put`](Self::put): an address that does not
+    /// describe its contents is a content-addressed store with its defining
+    /// property switched off, and [`get`](Self::get) can no longer verify.
+    ///
+    /// # Errors
+    ///
+    /// If the backing store rejects the write.
+    async fn put_at(&self, digest: Digest, bytes: &[u8]) -> Result<(), BlobError>;
+
+    /// Fetch exactly what is stored, without verifying it against the address.
+    ///
+    /// The counterpart to [`put_at`](Self::put_at): what is stored there is an
+    /// envelope, so it does not hash to the address and the ordinary check would
+    /// reject it. Verification does not disappear — it moves to after the
+    /// envelope is opened, where it is a claim about the payload rather than
+    /// about the envelope.
+    ///
+    /// # Errors
+    ///
+    /// [`BlobError::NotFound`] if nothing is stored there.
+    async fn get_raw(&self, digest: Digest) -> Result<Vec<u8>, BlobError>;
 
     /// Fetch bytes, verifying them against the address before returning.
     ///
@@ -158,6 +204,8 @@ pub trait BlobStore: Send + Sync + Debug {
 pub async fn erase_case(
     blobs: &dyn BlobStore,
     cases: &dyn crate::case::CaseStore,
+    #[cfg(feature = "keyring")] keyring: Option<&dyn crate::keyring::KeyRing>,
+    #[cfg(feature = "keyring")] tenant: &crate::core::TenantId,
     case: crate::core::CaseId,
     at: crate::core::Timestamp,
     reason: &str,
@@ -170,6 +218,28 @@ pub async fn erase_case(
     for digest in digests {
         blobs.expire(digest, at, reason).await?;
         n += 1;
+    }
+
+    // The key last, and only once every tombstone is written.
+    //
+    // Order matters in one direction only. Tombstones first means a crash
+    // between the two leaves bytes that are still there and still readable —
+    // recoverable by running the erasure again. Key first would leave
+    // tombstones unwritten over bytes nobody can read, so a later read reports
+    // *corrupt* instead of *expired* and an operator is paged for an integrity
+    // fault that is really a completed erasure.
+    //
+    // This is the step that makes the erasure reach backups: the tombstones
+    // above only cover the live store.
+    #[cfg(feature = "keyring")]
+    if let Some(keys) = keyring {
+        keys.destroy(
+            &crate::keyring::scope(tenant, &case.to_string()),
+            at,
+            reason,
+        )
+        .await
+        .map_err(|e| BlobError::Backend(e.to_string()))?;
     }
     Ok(n)
 }

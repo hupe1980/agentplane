@@ -27,8 +27,31 @@ use crate::core::{CorrelationKey, EffectKey, RunId, Timestamp};
 /// A message from outside, correlated by business key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InboundEvent {
-    /// Stable identity for deduplication. A counterparty that retries must
-    /// reuse this, or the same message is delivered twice.
+    /// Who sent it, as a URI — [CloudEvents]' `source`.
+    ///
+    /// Load-bearing twice over, and neither use is decoration.
+    ///
+    /// **It completes the dedup identity.** `CloudEvents` defines uniqueness as
+    /// `(source, id)`, and for good reason: `id` alone is unique only within one
+    /// producer. Two counterparties numbering their messages from one — or
+    /// minting ids from different UUID versions — collide, and the collision is
+    /// silent, because the second message looks exactly like a retry of the
+    /// first and is dropped as one.
+    ///
+    /// **It is the payload's provenance.** An inbound message is untrusted
+    /// whoever sent it, but *which* untrusted party matters: a sink may name the
+    /// sources an authority-bearing field may derive from, and `event:kind` says
+    /// what arrived while saying nothing about who sent it.
+    ///
+    /// It is not authority. A producer writes this string; anyone may claim to
+    /// be anyone. What it buys is a label a policy can reason about once the
+    /// transport has authenticated the sender by other means.
+    ///
+    /// [CloudEvents]: https://github.com/cloudevents/spec/blob/main/cloudevents/spec.md
+    pub source: String,
+    /// Stable identity for deduplication, unique **within a source**. A
+    /// counterparty that retries must reuse this, or the same message is
+    /// delivered twice.
     pub id: String,
     /// What kind of message, e.g. `"acknowledgement.received"`.
     pub kind: String,
@@ -39,8 +62,14 @@ pub struct InboundEvent {
 }
 
 impl InboundEvent {
-    pub fn new(id: impl Into<String>, kind: impl Into<String>, payload: Value) -> Self {
+    pub fn new(
+        source: impl Into<String>,
+        id: impl Into<String>,
+        kind: impl Into<String>,
+        payload: Value,
+    ) -> Self {
         Self {
+            source: source.into(),
             id: id.into(),
             kind: kind.into(),
             correlation: Vec::new(),
@@ -52,6 +81,21 @@ impl InboundEvent {
     pub fn correlate(mut self, key: CorrelationKey) -> Self {
         self.correlation.push(key);
         self
+    }
+
+    /// The identity a store deduplicates on: `(source, id)`.
+    ///
+    /// Derived here and nowhere else. Every store has to agree byte for byte
+    /// about which two messages are the same message, and a second place
+    /// building this string is a second answer to that question.
+    ///
+    /// The separator is a unit separator (U+001F) rather than a printable
+    /// character because a `source` is a URI and an `id` is arbitrary: any
+    /// character a producer might reasonably use would let one pair spell
+    /// another, and two distinct messages would deduplicate into one.
+    #[must_use]
+    pub fn dedup_key(&self) -> String {
+        format!("{}\u{1f}{}", self.source, self.id)
     }
 }
 

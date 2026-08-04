@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex};
 use agentplane::api::{Api, ApiSetupError, AuthError, Authenticator, Caller, action};
 use agentplane::case::{CaseStore, EventStore, TaskStore};
 use agentplane::core::{
-    CorrelationKey, DeadlineSpec, Digest, Justification, Outcome, PolicyDecision, PolicyEngine,
-    PolicyRequest, Priority, Skill, SkillDescriptor, SkillError, Tainted, TaskSpec,
+    CorrelationKey, DeadlineSpec, Digest, Justification, Outcome, PolicyBundleIdentity,
+    PolicyDecision, PolicyEngine, PolicyRequest, Priority, Skill, SkillDescriptor, SkillError,
+    Tainted, TaskSpec,
 };
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{Runtime, StepCtx};
@@ -97,6 +98,27 @@ impl Authenticator for HeaderAuth {
     }
 }
 
+/// Authenticates `tenant:actor`, so a test can be several tenants at once.
+///
+/// The tenant comes from the credential, never the request body — the same rule
+/// as `actor` and `roles`, and the one that matters most here, since it decides
+/// which store answers.
+#[derive(Debug)]
+struct TenantAuth;
+
+#[async_trait::async_trait]
+impl Authenticator for TenantAuth {
+    async fn authenticate(&self, headers: &axum::http::HeaderMap) -> Result<Caller, AuthError> {
+        let raw = headers
+            .get("x-actor")
+            .and_then(|v| v.to_str().ok())
+            .ok_or(AuthError::Missing)?;
+        let (tenant, actor) = raw.split_once(':').ok_or(AuthError::Rejected)?;
+        let tenant = agentplane::core::TenantId::new(tenant).map_err(|_| AuthError::Rejected)?;
+        Ok(Caller::new(actor, vec!["compliance-officer".to_owned()]).in_tenant(tenant))
+    }
+}
+
 /// Permits the `api:` actions, recording what it was asked.
 ///
 /// Recording is what lets a test assert that a route asked *at all* — a gate
@@ -137,8 +159,8 @@ impl PolicyEngine for Recording {
         }
     }
 
-    fn digest(&self) -> Digest {
-        Digest::of(b"test-policy")
+    fn bundle(&self) -> PolicyBundleIdentity {
+        PolicyBundleIdentity::new(Digest::of(b"test-policy"), "agentplane-test/api-policy-v1")
     }
 }
 
@@ -156,10 +178,7 @@ fn fixture_with(policy: &Arc<Recording>) -> Fixture {
         .policy(policy.clone() as Arc<dyn PolicyEngine>)
         .skill(ProposesRefund)
         .build();
-    Fixture {
-        store,
-        rt: Arc::new(rt),
-    }
+    Fixture { store, rt }
 }
 
 fn fixture() -> Fixture {
@@ -831,7 +850,7 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
 #[test]
 fn the_surface_refuses_to_build_without_a_policy_engine() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
-    let rt = Arc::new(Runtime::builder(store as Arc<dyn JournalStore>).build());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>).build();
 
     let err = Api::new(rt, Arc::new(HeaderAuth)).unwrap_err();
     assert!(matches!(err, ApiSetupError::NoPolicy));
@@ -1014,14 +1033,226 @@ async fn event_delivery_reports_the_outcome_by_name() {
 #[tokio::test]
 async fn a_missing_store_does_not_describe_the_plane() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
-    let rt = Arc::new(
-        Runtime::builder(store as Arc<dyn JournalStore>)
-            .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
-            .build(),
-    );
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .build();
     let router = Api::new(rt, Arc::new(HeaderAuth)).unwrap().router();
 
     let (status, body) = send(&router, get("/tasks", Some("bob"))).await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(body["error"], "this plane has no task store");
+}
+
+/// A caller cannot choose the source of the event it delivers.
+///
+/// `source` is half the deduplication identity and the sender's name in
+/// provenance. A body that set it would hand a caller both halves of
+/// `(source, id)` — so one counterparty could deduplicate against another's
+/// messages by naming them, or post under a name a policy trusts. It comes from
+/// the transport's authenticated identity instead.
+#[tokio::test]
+async fn a_delivered_events_source_is_the_authenticated_caller() {
+    let f = fixture();
+    let router = f.router();
+
+    // The body claims to be somebody else. The claim is simply not read.
+    let response = send(
+        &router,
+        post(
+            "/events",
+            Some("alice"),
+            &json!({
+                "source": "urn:someone-else",
+                "id": "EV-SRC-1",
+                "kind": "acknowledgement.received",
+                "correlation": [],
+                "payload": {}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.0,
+        StatusCode::OK,
+        "an unknown `source` field must be ignored, not rejected — a caller \
+         sending one is mistaken, not hostile: {:?}",
+        response.1
+    );
+
+    // Same id, same *actual* source, so it deduplicates — proving the source
+    // used was the caller's and not the two different ones in the bodies.
+    let again = send(
+        &router,
+        post(
+            "/events",
+            Some("alice"),
+            &json!({
+                "source": "urn:a-third-name",
+                "id": "EV-SRC-1",
+                "kind": "acknowledgement.received",
+                "correlation": [],
+                "payload": {}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        again.1["delivery"], "duplicate",
+        "the two bodies named different sources and still deduplicated, which \
+         is only true if the body's claim was ignored: {:?}",
+        again.1
+    );
+
+    // And the half that proves the source is the *caller* rather than some
+    // constant: a different caller sending the same id is a different event.
+    // With one fixed source these would collide, which is exactly the
+    // cross-party collision `(source, id)` exists to prevent.
+    let other_caller = send(
+        &router,
+        post(
+            "/events",
+            Some("bob"),
+            &json!({
+                "id": "EV-SRC-1",
+                "kind": "acknowledgement.received",
+                "correlation": [],
+                "payload": {}
+            }),
+        ),
+    )
+    .await;
+    assert_ne!(
+        other_caller.1["delivery"], "duplicate",
+        "a different authenticated caller's message deduplicated against the \
+         first, so every caller shares one source and one party can swallow \
+         another's events: {:?}",
+        other_caller.1
+    );
+}
+
+// ── Serving several tenants from one process ────────────────────────────────
+
+/// An authenticated caller reaches their own tenant's runs and no others.
+///
+/// The whole point of the registry. Both planes share one database, so the
+/// isolation cannot come from having separate files — it comes from the caller's
+/// tenant selecting a store handle whose keys cannot name another tenant's rows.
+///
+/// The attacker here holds a **valid run id** belonging to the other tenant,
+/// which is the realistic leak: not a guessed id, but a real one arriving
+/// through a path that never checked whose it was.
+#[tokio::test]
+async fn a_caller_cannot_read_another_tenants_run() {
+    use agentplane::api::Planes;
+    use agentplane::core::TenantId;
+
+    let acme = TenantId::new("acme").expect("valid");
+    let globex = TenantId::new("globex").expect("valid");
+    let base = RedbStore::open_in_memory().unwrap();
+
+    let plane = |tenant: TenantId| {
+        let store = Arc::new(base.clone().for_tenant(tenant.clone()));
+        Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+            .cases(store.clone() as Arc<dyn CaseStore>)
+            .events(store.clone() as Arc<dyn EventStore>)
+            .tasks(store as Arc<dyn TaskStore>)
+            .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+            .tenant(tenant)
+            .skill(ProposesRefund)
+            .build()
+    };
+    let acme_plane = plane(acme.clone());
+    let globex_plane = plane(globex.clone());
+
+    // A real run in acme, whose id globex will present.
+    let theirs = acme_plane
+        .run_in_case(
+            "demo.refund",
+            json!({}),
+            "dispute",
+            &[CorrelationKey::new("document", "INV-7")],
+        )
+        .await
+        .unwrap()
+        .run_id
+        .to_string();
+
+    let router = Api::new(
+        Planes::one(acme_plane).and(globex_plane),
+        Arc::new(TenantAuth),
+    )
+    .expect("both planes are governed")
+    .router()
+    .clone();
+
+    let (status, body) = send(&router, get(&format!("/runs/{theirs}"), Some("globex:eve"))).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "one tenant read another tenant's run while holding nothing but a \
+         valid id: {body:#}"
+    );
+
+    // And acme still reads its own, so this isolated rather than broke it.
+    let (status, body) = send(&router, get(&format!("/runs/{theirs}"), Some("acme:alice"))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the owning tenant lost access to its own run: {body:#}"
+    );
+    assert_eq!(body["run"], theirs);
+}
+
+/// A caller whose tenant this process does not serve is refused, not defaulted.
+///
+/// A fallback to some default plane would turn an unregistered tenant into
+/// somebody else's data — and it would look exactly like working software.
+#[tokio::test]
+async fn an_unregistered_tenant_is_refused_rather_than_defaulted() {
+    use agentplane::api::Planes;
+    use agentplane::core::TenantId;
+
+    let f = fixture();
+    let tenant = TenantId::new("acme").expect("valid");
+    let acme = Arc::new(
+        RedbStore::open_in_memory()
+            .unwrap()
+            .for_tenant(tenant.clone()),
+    );
+    let acme_plane = Runtime::builder(acme.clone() as Arc<dyn JournalStore>)
+        .cases(acme.clone() as Arc<dyn CaseStore>)
+        .tasks(acme as Arc<dyn TaskStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .tenant(tenant)
+        .build();
+    let _ = &f;
+
+    let router = Api::new(Planes::one(acme_plane), Arc::new(TenantAuth))
+        .expect("governed")
+        .router();
+
+    let (status, _) = send(&router, get("/tasks", Some("globex:eve"))).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a caller from an unserved tenant was answered by some other tenant's \
+         plane"
+    );
+
+    // The served tenant still works.
+    let (status, _) = send(&router, get("/tasks", Some("acme:alice"))).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A surface serving no planes is refused at build.
+#[test]
+fn a_surface_over_no_planes_is_refused() {
+    use agentplane::api::Planes;
+
+    let built = Api::new(Planes::default(), Arc::new(HeaderAuth));
+    assert!(
+        matches!(built, Err(ApiSetupError::NoPlanes)),
+        "a surface that would authenticate every caller and then refuse them \
+         all was accepted as configured"
+    );
 }

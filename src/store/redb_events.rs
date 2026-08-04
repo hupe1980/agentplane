@@ -17,33 +17,63 @@ use crate::core::{
 
 use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
-/// `event_id -> (kind, payload, received_at, claimed_by, claimed_at, has_claim,
-/// dead, dead_reason)`.
-/// `(kind, payload, received_at, claimed_by, claimed_at, has_claim, dead, dead_reason)`.
-type EventRow<'a> = (&'a str, &'a str, i64, &'a str, i64, u8, u8, &'a str);
+/// `(source, id) -> (source, id, kind, payload, received_at, claimed_by,
+/// claimed_at, has_claim, dead, dead_reason)`.
+///
+/// Keyed by the pair, not by `id`: `id` is unique only within one producer, so
+/// two counterparties numbering their messages from one would silently
+/// deduplicate into each other. `source` is stored as well as keyed because a
+/// reconstructed event must be the event that arrived — provenance included,
+/// and with the *bare* id rather than the composite key it is filed under.
+/// Splitting the key back apart on read would be a second place that has to
+/// agree about the separator.
+type EventRow<'a> = (
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a str,
+    i64,
+    &'a str,
+    i64,
+    u8,
+    u8,
+    &'a str,
+);
 
-const EVENTS: TableDefinition<&str, EventRow<'static>> = TableDefinition::new("inbound_events");
+const EVENTS: TableDefinition<(&str, &str), EventRow<'static>> =
+    TableDefinition::new("inbound_events");
 
-/// `(event_id, namespace, value) -> ()`, an event's own keys.
-const EVENT_CORR: TableDefinition<(&str, &str, &str), ()> =
+/// `(tenant, event_id, namespace, value) -> ()`, an event's own keys.
+const EVENT_CORR: TableDefinition<(&str, &str, &str, &str), ()> =
     TableDefinition::new("inbound_correlation");
 
-/// `(namespace, value, received_at, event_id) -> ()`, the match path.
+/// `(tenant, namespace, value, received_at, event_id) -> ()`, the match path.
 ///
 /// Ordered by arrival within a key, so the oldest unclaimed message for a key is
 /// the first entry rather than the result of a scan.
-const EVENT_BY_KEY: TableDefinition<(&str, &str, i64, &str), ()> =
+///
+/// The tenant leads for the same reason it leads the subscription index: a
+/// correlation key is a business value, and two tenants using `order`/`A-1` is
+/// ordinary. The event body is fetched under the tenant afterwards, so a
+/// cross-tenant hit here is discarded rather than delivered — but that leaves
+/// isolation resting on one lookup, and a range that cannot see another
+/// tenant's rows is a constraint rather than a check somebody must remember.
+const EVENT_BY_KEY: TableDefinition<(&str, &str, &str, i64, &str), ()> =
     TableDefinition::new("inbound_by_key");
 
 /// `(run_id, effect_key, namespace, value) -> (case_id, has_case, step, phase, kind, created_at)`.
 /// `(case_id, has_case, step, phase, kind, created_at)`.
 type SubRow<'a> = (&'a str, u8, u32, &'a str, &'a str, i64);
 
-const SUBS: TableDefinition<(&str, &str, &str, &str), SubRow<'static>> =
+const SUBS: TableDefinition<(&str, &str, &str, &str, &str), SubRow<'static>> =
     TableDefinition::new("subscriptions");
 
-/// `(event_kind, namespace, value, created_at, run_id, effect_key)`.
-type SubKey<'a> = (&'a str, &'a str, &'a str, i64, &'a str, &'a str);
+/// `(tenant, event_kind, namespace, value, created_at, run_id, effect_key)`.
+///
+/// The tenant leads because this is the *match* path: a range that did not
+/// bound it could hand one tenant's event to another tenant's waiting run,
+/// which is the worst thing an event store can do.
+type SubKey<'a> = (&'a str, &'a str, &'a str, &'a str, i64, &'a str, &'a str);
 
 /// `(event_kind, namespace, value, created_at, run_id, effect_key) -> ()`.
 const SUBS_BY_KEY: TableDefinition<SubKey<'static>, ()> =
@@ -55,14 +85,14 @@ const SUBS_BY_KEY: TableDefinition<SubKey<'static>, ()> =
 /// Without it the sweep reads every event ever received to find the few that
 /// have expired, which is a scan that quietly stops finishing on time exactly
 /// when the backlog matters most.
-const EVENTS_LIVE: TableDefinition<(i64, &str), ()> = TableDefinition::new("inbound_live");
+const EVENTS_LIVE: TableDefinition<(&str, i64, &str), ()> = TableDefinition::new("inbound_live");
 
 /// `(received_at, event_id) -> ()`, retired events, for the dead-letter view.
-const EVENTS_DEAD: TableDefinition<(i64, &str), ()> = TableDefinition::new("inbound_dead");
+const EVENTS_DEAD: TableDefinition<(&str, i64, &str), ()> = TableDefinition::new("inbound_dead");
 
 /// `(created_at, run_id, effect_key, namespace, value) -> ()`, waits in
 /// registration order.
-const SUBS_BY_TIME: TableDefinition<(i64, &str, &str, &str, &str), ()> =
+const SUBS_BY_TIME: TableDefinition<(&str, i64, &str, &str, &str, &str), ()> =
     TableDefinition::new("subscriptions_by_time");
 
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
@@ -107,16 +137,17 @@ fn from_ts(v: i64) -> Result<Timestamp, StoreError> {
 }
 
 fn load_correlation(
-    t: &impl ReadableTable<(&'static str, &'static str, &'static str), ()>,
+    t: &impl ReadableTable<(&'static str, &'static str, &'static str, &'static str), ()>,
+    tenant: &str,
     event_id: &str,
 ) -> Result<Vec<CorrelationKey>, StoreError> {
     let mut out = Vec::new();
     for e in t
-        .range((event_id, "", "")..=(event_id, MAX_STR, MAX_STR))
+        .range((tenant, event_id, "", "")..=(tenant, event_id, MAX_STR, MAX_STR))
         .map_err(|e| be(&e))?
     {
         let (k, _) = e.map_err(|e| be(&e))?;
-        let (_, ns, v) = k.value();
+        let (_, _, ns, v) = k.value();
         out.push(CorrelationKey::new(ns.to_owned(), v.to_owned()));
     }
     Ok(out)
@@ -132,9 +163,71 @@ type Waiter = (String, String, String, u8, u32, String);
 /// question — *who is waiting* — from the one the caller acts on, which is
 /// *may I claim this for them*. Returns the wait's identity and the fields the
 /// caller needs to rebuild it.
+/// Write an event's correlation rows and its match-path index.
+///
+/// Its own function because `buffer` was over the line limit with it inline, and
+/// because "file the event" and "make it findable" are separate jobs that fail
+/// separately.
+///
+/// No tenant here: these rows point at an event, and the event row they point at
+/// is tenant-keyed — so a lookup that crosses tenants finds a correlation entry
+/// and then no event. The isolation is in `EVENTS`, and adding a second copy of
+/// it here would be a second thing to keep in agreement.
+/// Stamp an event row as claimed by one run.
+///
+/// Extracted because `match_waiter` was over the line limit, and because this is
+/// the one write that decides a message belongs to a run — worth being able to
+/// find on its own.
+fn claim_row(
+    events: &mut redb::Table<'_, (&'static str, &'static str), EventRow<'static>>,
+    key: (&str, &str),
+    row: (&str, &str, &str, &str, i64),
+    claim: (&str, i64),
+) -> Result<(), StoreError> {
+    let (tenant, id) = key;
+    let (src, bare, kind, payload, received) = row;
+    let (run, at) = claim;
+    events
+        .insert(
+            (tenant, id),
+            (src, bare, kind, payload, received, run, at, 1u8, 0u8, ""),
+        )
+        .map_err(|e| be(&e))?;
+    Ok(())
+}
+
+fn index_correlation(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    id: &str,
+    keys: &[CorrelationKey],
+    at: i64,
+) -> Result<(), StoreError> {
+    let mut corr = w.open_table(EVENT_CORR).map_err(|e| be(&e))?;
+    let mut by_key = w.open_table(EVENT_BY_KEY).map_err(|e| be(&e))?;
+    for k in keys {
+        corr.insert((tenant, id, k.namespace.as_str(), k.value.as_str()), ())
+            .map_err(|e| be(&e))?;
+        by_key
+            .insert((tenant, k.namespace.as_str(), k.value.as_str(), at, id), ())
+            .map_err(|e| be(&e))?;
+    }
+    Ok(())
+}
+
 fn oldest_waiter(
+    tenant: &str,
     by_key: &impl ReadableTable<SubKey<'static>, ()>,
-    subs: &impl ReadableTable<(&'static str, &'static str, &'static str, &'static str), SubRow<'static>>,
+    subs: &impl ReadableTable<
+        (
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+        ),
+        SubRow<'static>,
+    >,
     kind: &str,
     keys: &[CorrelationKey],
 ) -> Result<Option<Waiter>, StoreError> {
@@ -142,6 +235,7 @@ fn oldest_waiter(
         for e in by_key
             .range(
                 (
+                    tenant,
                     kind,
                     k.namespace.as_str(),
                     k.value.as_str(),
@@ -150,6 +244,7 @@ fn oldest_waiter(
                     "",
                 )
                     ..=(
+                        tenant,
                         kind,
                         k.namespace.as_str(),
                         k.value.as_str(),
@@ -161,8 +256,11 @@ fn oldest_waiter(
             .map_err(|e| be(&e))?
         {
             let (sk, _) = e.map_err(|e| be(&e))?;
-            let (_, ns, val, _, run, effect) = sk.value();
-            if let Some(v) = subs.get((run, effect, ns, val)).map_err(|e| be(&e))? {
+            let (_, _, ns, val, _, run, effect) = sk.value();
+            if let Some(v) = subs
+                .get((tenant, run, effect, ns, val))
+                .map_err(|e| be(&e))?
+            {
                 let (case, has_case, step, phase, _, _) = v.value();
                 return Ok(Some((
                     run.to_owned(),
@@ -181,7 +279,10 @@ fn oldest_waiter(
 #[async_trait]
 impl EventStore for RedbStore {
     async fn buffer(&self, event: &InboundEvent, at: Timestamp) -> Result<bool, StoreError> {
-        let id = event.id.clone();
+        let tenant = self.tenant_name();
+        let id = event.dedup_key();
+        let bare_id = event.id.clone();
+        let source = event.source.clone();
         let kind = event.kind.clone();
         let payload = serde_json::to_string(&event.payload)?;
         let keys = event.correlation.clone();
@@ -189,12 +290,18 @@ impl EventStore for RedbStore {
             let w = begin_write(db)?;
             let fresh = {
                 let mut ev = w.open_table(EVENTS).map_err(|e| be(&e))?;
-                if ev.get(id.as_str()).map_err(|e| be(&e))?.is_some() {
+                if ev
+                    .get((tenant.as_str(), id.as_str()))
+                    .map_err(|e| be(&e))?
+                    .is_some()
+                {
                     false
                 } else {
                     ev.insert(
-                        id.as_str(),
+                        (tenant.as_str(), id.as_str()),
                         (
+                            source.as_str(),
+                            bare_id.as_str(),
                             kind.as_str(),
                             payload.as_str(),
                             ts(at),
@@ -208,20 +315,9 @@ impl EventStore for RedbStore {
                     .map_err(|e| be(&e))?;
                     w.open_table(EVENTS_LIVE)
                         .map_err(|e| be(&e))?
-                        .insert((ts(at), id.as_str()), ())
+                        .insert((tenant.as_str(), ts(at), id.as_str()), ())
                         .map_err(|e| be(&e))?;
-                    let mut corr = w.open_table(EVENT_CORR).map_err(|e| be(&e))?;
-                    let mut by_key = w.open_table(EVENT_BY_KEY).map_err(|e| be(&e))?;
-                    for k in &keys {
-                        corr.insert((id.as_str(), k.namespace.as_str(), k.value.as_str()), ())
-                            .map_err(|e| be(&e))?;
-                        by_key
-                            .insert(
-                                (k.namespace.as_str(), k.value.as_str(), ts(at), id.as_str()),
-                                (),
-                            )
-                            .map_err(|e| be(&e))?;
-                    }
+                    index_correlation(&w, &tenant, &id, &keys, ts(at))?;
                     true
                 }
             };
@@ -232,6 +328,7 @@ impl EventStore for RedbStore {
     }
 
     async fn subscribe(&self, sub: &Subscription, at: Timestamp) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
         let run = sub.run.to_string();
         let effect = sub.effect.to_hex();
         let case = sub.case.map(|c| c.to_string()).unwrap_or_default();
@@ -248,6 +345,7 @@ impl EventStore for RedbStore {
                 let mut by_time = w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
                 for k in &keys {
                     let key = (
+                        tenant.as_str(),
                         run.as_str(),
                         effect.as_str(),
                         k.namespace.as_str(),
@@ -262,6 +360,7 @@ impl EventStore for RedbStore {
                         by_key
                             .insert(
                                 (
+                                    tenant.as_str(),
                                     kind.as_str(),
                                     k.namespace.as_str(),
                                     k.value.as_str(),
@@ -275,6 +374,7 @@ impl EventStore for RedbStore {
                         by_time
                             .insert(
                                 (
+                                    tenant.as_str(),
                                     ts(at),
                                     run.as_str(),
                                     effect.as_str(),
@@ -298,6 +398,7 @@ impl EventStore for RedbStore {
         sub: &Subscription,
         at: Timestamp,
     ) -> Result<Option<BufferedEvent>, StoreError> {
+        let tenant = self.tenant_name();
         let run = sub.run.to_string();
         let kind = sub.kind.clone();
         let keys = sub.correlation.clone();
@@ -311,17 +412,41 @@ impl EventStore for RedbStore {
                 'outer: for k in &keys {
                     for e in by_key
                         .range(
-                            (k.namespace.as_str(), k.value.as_str(), i64::MIN, "")
-                                ..=(k.namespace.as_str(), k.value.as_str(), i64::MAX, MAX_STR),
+                            (
+                                tenant.as_str(),
+                                k.namespace.as_str(),
+                                k.value.as_str(),
+                                i64::MIN,
+                                "",
+                            )
+                                ..=(
+                                    tenant.as_str(),
+                                    k.namespace.as_str(),
+                                    k.value.as_str(),
+                                    i64::MAX,
+                                    MAX_STR,
+                                ),
                         )
                         .map_err(|e| be(&e))?
                     {
                         let (ek, _) = e.map_err(|e| be(&e))?;
-                        let id = ek.value().3.to_owned();
-                        let Some(row) = events.get(id.as_str()).map_err(|e| be(&e))?.map(|v| {
-                            let (kd, pl, ra, _, _, hc, dead, _) = v.value();
-                            (kd.to_owned(), pl.to_owned(), ra, hc, dead)
-                        }) else {
+                        let id = ek.value().4.to_owned();
+                        let Some(row) = events
+                            .get((tenant.as_str(), id.as_str()))
+                            .map_err(|e| be(&e))?
+                            .map(|v| {
+                                let (src, bid, kd, pl, ra, _, _, hc, dead, _) = v.value();
+                                (
+                                    kd.to_owned(),
+                                    pl.to_owned(),
+                                    ra,
+                                    hc,
+                                    dead,
+                                    src.to_owned(),
+                                    bid.to_owned(),
+                                )
+                            })
+                        else {
                             continue;
                         };
                         if row.0 == kind && row.3 == 0 && row.4 == 0 {
@@ -333,14 +458,16 @@ impl EventStore for RedbStore {
 
                 match hit {
                     None => None,
-                    Some((id, (kd, payload, received, _, _))) => {
+                    Some((id, (kd, payload, received, _, _, src, bid))) => {
                         // Claimed in the same transaction that selected it: two
                         // runs waiting on one key must not both consume a single
                         // message.
                         events
                             .insert(
-                                id.as_str(),
+                                (tenant.as_str(), id.as_str()),
                                 (
+                                    src.as_str(),
+                                    bid.as_str(),
                                     kd.as_str(),
                                     payload.as_str(),
                                     received,
@@ -357,13 +484,14 @@ impl EventStore for RedbStore {
                         // describes, in the row's transaction.
                         w.open_table(EVENTS_LIVE)
                             .map_err(|e| be(&e))?
-                            .remove((received, id.as_str()))
+                            .remove((tenant.as_str(), received, id.as_str()))
                             .map_err(|e| be(&e))?;
                         let corr_t = w.open_table(EVENT_CORR).map_err(|e| be(&e))?;
-                        let correlation = load_correlation(&corr_t, &id)?;
+                        let correlation = load_correlation(&corr_t, &tenant, &id)?;
                         Some(BufferedEvent {
                             event: InboundEvent {
-                                id,
+                                source: src,
+                                id: bid,
                                 kind: kd,
                                 correlation,
                                 payload: serde_json::from_str(&payload)?,
@@ -384,7 +512,11 @@ impl EventStore for RedbStore {
         event: &InboundEvent,
         at: Timestamp,
     ) -> Result<Option<Subscription>, StoreError> {
-        let id = event.id.clone();
+        let tenant = self.tenant_name();
+        // The dedup key, not the bare id: `buffer` stored the row under
+        // `(source, id)`, and looking it up by `id` alone finds nothing — the
+        // event is durable and no waiter ever matches it.
+        let id = event.dedup_key();
         let kind = event.kind.clone();
         let keys = event.correlation.clone();
         self.with_db(move |db| {
@@ -394,7 +526,7 @@ impl EventStore for RedbStore {
             let found = {
                 let by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
                 let subs = w.open_table(SUBS).map_err(|e| be(&e))?;
-                let hit = oldest_waiter(&by_key, &subs, &kind, &keys)?;
+                let hit = oldest_waiter(&tenant, &by_key, &subs, &kind, &keys)?;
                 drop(by_key);
 
                 match hit {
@@ -403,48 +535,57 @@ impl EventStore for RedbStore {
                         // Claim the event for this run in the same transaction,
                         // so one message cannot resume two runs.
                         let mut events = w.open_table(EVENTS).map_err(|e| be(&e))?;
-                        let row = events.get(id.as_str()).map_err(|e| be(&e))?.map(|v| {
-                            let (kd, pl, ra, _, _, hc, dead, _) = v.value();
-                            (kd.to_owned(), pl.to_owned(), ra, hc, dead)
-                        });
+                        let row = events
+                            .get((tenant.as_str(), id.as_str()))
+                            .map_err(|e| be(&e))?
+                            .map(|v| {
+                                let (src, bid, kd, pl, ra, _, _, hc, dead, _) = v.value();
+                                (
+                                    kd.to_owned(),
+                                    pl.to_owned(),
+                                    ra,
+                                    hc,
+                                    dead,
+                                    src.to_owned(),
+                                    bid.to_owned(),
+                                )
+                            });
                         // Absent, already claimed, or dead: somebody else took it
                         // between the select and here.
                         let claimable = row
                             .as_ref()
-                            .is_some_and(|(_, _, _, hc, dead)| *hc == 0 && *dead == 0);
+                            .is_some_and(|(_, _, _, hc, dead, _, _)| *hc == 0 && *dead == 0);
                         if claimable {
-                            let (kd, pl, ra, _, _) = row.expect("claimable implies present");
-                            events
-                                .insert(
-                                    id.as_str(),
-                                    (
-                                        kd.as_str(),
-                                        pl.as_str(),
-                                        ra,
-                                        run.as_str(),
-                                        ts(at),
-                                        1u8,
-                                        0u8,
-                                        "",
-                                    ),
-                                )
-                                .map_err(|e| be(&e))?;
+                            let (kd, pl, ra, _, _, src, bid) =
+                                row.expect("claimable implies present");
+                            claim_row(
+                                &mut events,
+                                (&tenant, &id),
+                                (&src, &bid, &kd, &pl, ra),
+                                (&run, ts(at)),
+                            )?;
                             drop(events);
                             w.open_table(EVENTS_LIVE)
                                 .map_err(|e| be(&e))?
-                                .remove((ra, id.as_str()))
+                                .remove((tenant.as_str(), ra, id.as_str()))
                                 .map_err(|e| be(&e))?;
 
                             let mut correlation = Vec::new();
                             for e in subs
                                 .range(
-                                    (run.as_str(), effect.as_str(), "", "")
-                                        ..=(run.as_str(), effect.as_str(), MAX_STR, MAX_STR),
+                                    (tenant.as_str(), run.as_str(), effect.as_str(), "", "")
+                                        ..=(
+                                            tenant.as_str(),
+                                            run.as_str(),
+                                            effect.as_str(),
+                                            MAX_STR,
+                                            MAX_STR,
+                                        ),
                                 )
                                 .map_err(|e| be(&e))?
                             {
                                 let (k, _) = e.map_err(|e| be(&e))?;
-                                let (_, _, ns, v) = k.value();
+                                let (_, _, _, ns, v) = k.value();
                                 correlation.push(CorrelationKey::new(ns.to_owned(), v.to_owned()));
                             }
 
@@ -485,6 +626,7 @@ impl EventStore for RedbStore {
     }
 
     async fn unsubscribe(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
         let (run, effect) = (run.to_string(), effect.to_hex());
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -493,26 +635,39 @@ impl EventStore for RedbStore {
                 let mut doomed = Vec::new();
                 for e in subs
                     .range(
-                        (run.as_str(), effect.as_str(), "", "")
-                            ..=(run.as_str(), effect.as_str(), MAX_STR, MAX_STR),
+                        (tenant.as_str(), run.as_str(), effect.as_str(), "", "")
+                            ..=(
+                                tenant.as_str(),
+                                run.as_str(),
+                                effect.as_str(),
+                                MAX_STR,
+                                MAX_STR,
+                            ),
                     )
                     .map_err(|e| be(&e))?
                 {
                     let (k, v) = e.map_err(|e| be(&e))?;
-                    let (_, _, ns, val) = k.value();
+                    let (_, _, _, ns, val) = k.value();
                     let (_, _, _, _, kind, created) = v.value();
                     doomed.push((ns.to_owned(), val.to_owned(), kind.to_owned(), created));
                 }
                 let mut by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
                 let mut by_time = w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
                 for (ns, val, kind, created) in doomed {
-                    subs.remove((run.as_str(), effect.as_str(), ns.as_str(), val.as_str()))
-                        .map_err(|e| be(&e))?;
+                    subs.remove((
+                        tenant.as_str(),
+                        run.as_str(),
+                        effect.as_str(),
+                        ns.as_str(),
+                        val.as_str(),
+                    ))
+                    .map_err(|e| be(&e))?;
                     // The index goes with it, in the same transaction: a stale
                     // index entry would hand a message to a run that stopped
                     // waiting.
                     by_key
                         .remove((
+                            tenant.as_str(),
                             kind.as_str(),
                             ns.as_str(),
                             val.as_str(),
@@ -523,6 +678,7 @@ impl EventStore for RedbStore {
                         .map_err(|e| be(&e))?;
                     by_time
                         .remove((
+                            tenant.as_str(),
                             created,
                             run.as_str(),
                             effect.as_str(),
@@ -543,6 +699,7 @@ impl EventStore for RedbStore {
         older_than: Timestamp,
         reason: &str,
     ) -> Result<usize, StoreError> {
+        let tenant = self.tenant_name();
         let cutoff = ts(older_than);
         let reason = reason.to_owned();
         self.with_db(move |db| {
@@ -555,11 +712,11 @@ impl EventStore for RedbStore {
                 let live = w.open_table(EVENTS_LIVE).map_err(|e| be(&e))?;
                 let mut doomed = Vec::new();
                 for e in live
-                    .range((i64::MIN, "")..=(cutoff, MAX_STR))
+                    .range((tenant.as_str(), i64::MIN, "")..=(tenant.as_str(), cutoff, MAX_STR))
                     .map_err(|e| be(&e))?
                 {
                     let (k, _) = e.map_err(|e| be(&e))?;
-                    let (at, id) = k.value();
+                    let (_, at, id) = k.value();
                     doomed.push((at, id.to_owned()));
                 }
                 drop(live);
@@ -569,10 +726,22 @@ impl EventStore for RedbStore {
                 let mut dead = w.open_table(EVENTS_DEAD).map_err(|e| be(&e))?;
                 let mut n = 0usize;
                 for (at, id) in doomed {
-                    let Some(row) = events.get(id.as_str()).map_err(|e| be(&e))?.map(|v| {
-                        let (kd, pl, ra, _, _, hc, d, _) = v.value();
-                        (kd.to_owned(), pl.to_owned(), ra, hc, d)
-                    }) else {
+                    let Some(row) = events
+                        .get((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?
+                        .map(|v| {
+                            let (src, bid, kd, pl, ra, _, _, hc, d, _) = v.value();
+                            (
+                                kd.to_owned(),
+                                pl.to_owned(),
+                                ra,
+                                hc,
+                                d,
+                                src.to_owned(),
+                                bid.to_owned(),
+                            )
+                        })
+                    else {
                         continue;
                     };
                     // The index decides, with no second opinion on top of it.
@@ -584,8 +753,10 @@ impl EventStore for RedbStore {
                     // delivered message in the dead-letter queue.
                     events
                         .insert(
-                            id.as_str(),
+                            (tenant.as_str(), id.as_str()),
                             (
+                                row.5.as_str(),
+                                row.6.as_str(),
                                 row.0.as_str(),
                                 row.1.as_str(),
                                 row.2,
@@ -597,8 +768,10 @@ impl EventStore for RedbStore {
                             ),
                         )
                         .map_err(|e| be(&e))?;
-                    live.remove((at, id.as_str())).map_err(|e| be(&e))?;
-                    dead.insert((row.2, id.as_str()), ()).map_err(|e| be(&e))?;
+                    live.remove((tenant.as_str(), at, id.as_str()))
+                        .map_err(|e| be(&e))?;
+                    dead.insert((tenant.as_str(), row.2, id.as_str()), ())
+                        .map_err(|e| be(&e))?;
                     n += 1;
                 }
                 n
@@ -610,6 +783,7 @@ impl EventStore for RedbStore {
     }
 
     async fn dead_letters(&self, limit: usize) -> Result<Vec<DeadLetter>, StoreError> {
+        let tenant = self.tenant_name();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let dead = r.open_table(EVENTS_DEAD).map_err(|e| be(&e))?;
@@ -618,22 +792,29 @@ impl EventStore for RedbStore {
 
             let mut out = Vec::new();
             // Newest first, taken from the index in reverse rather than by
-            // sorting every retired event.
-            for e in dead.iter().map_err(|e| be(&e))?.rev() {
+            // sorting every retired event — and over this tenant's range, since
+            // a dead-letter view is read by an operator deciding what went
+            // wrong and must not show them another tenant's traffic.
+            for e in dead
+                .range((tenant.as_str(), i64::MIN, "")..=(tenant.as_str(), i64::MAX, MAX_STR))
+                .map_err(|e| be(&e))?
+                .rev()
+            {
                 if out.len() >= limit {
                     break;
                 }
                 let (k, _) = e.map_err(|e| be(&e))?;
-                let id = k.value().1;
-                let Some(v) = events.get(id).map_err(|e| be(&e))? else {
+                let id = k.value().2;
+                let Some(v) = events.get((tenant.as_str(), id)).map_err(|e| be(&e))? else {
                     continue;
                 };
-                let (kind, payload, received, _, _, _, _, reason) = v.value();
+                let (source, bare, kind, payload, received, _, _, _, _, reason) = v.value();
                 out.push(DeadLetter {
                     event: InboundEvent {
-                        id: id.to_owned(),
+                        source: source.to_owned(),
+                        id: bare.to_owned(),
                         kind: kind.to_owned(),
-                        correlation: load_correlation(&corr, id)?,
+                        correlation: load_correlation(&corr, &tenant, id)?,
                         payload: serde_json::from_str(payload)?,
                     },
                     received_at: from_ts(received)?,
@@ -650,6 +831,7 @@ impl EventStore for RedbStore {
     }
 
     async fn waiting(&self, limit: usize) -> Result<Vec<Subscription>, StoreError> {
+        let tenant = self.tenant_name();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let by_time = r.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
@@ -663,8 +845,11 @@ impl EventStore for RedbStore {
                     break;
                 }
                 let (k, _) = e.map_err(|e| be(&e))?;
-                let (_, run, effect, ns, val) = k.value();
-                let Some(v) = subs.get((run, effect, ns, val)).map_err(|e| be(&e))? else {
+                let (_, _, run, effect, ns, val) = k.value();
+                let Some(v) = subs
+                    .get((tenant.as_str(), run, effect, ns, val))
+                    .map_err(|e| be(&e))?
+                else {
                     continue;
                 };
                 let (case, has_case, step, phase, kind, _) = v.value();

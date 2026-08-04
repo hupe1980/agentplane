@@ -52,6 +52,12 @@ use crate::journal::{Append, Cancellation, Head, JournalStore, Lease, Record};
 /// into a failure — which is the normal case for this backend, not an edge one.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS journal (
+    -- The tenant leads every key in this schema. A run id is unique, so a
+    -- filter would do; a key component is what makes a query that forgets the
+    -- predicate return nothing rather than another tenant's row, and what keeps
+    -- every index physically clustered per tenant so a scan cannot walk into
+    -- somebody else's traffic.
+    tenant     TEXT   NOT NULL,
     run_id     TEXT   NOT NULL,
     seq        BIGINT NOT NULL,
     epoch      BIGINT NOT NULL,
@@ -64,21 +70,23 @@ CREATE TABLE IF NOT EXISTS journal (
     -- detects edits, it just cannot say who made them.
     key_id     TEXT,
     signature  BYTEA,
-    PRIMARY KEY (run_id, seq)
+    PRIMARY KEY (tenant, run_id, seq)
 );
 
 -- Exactly-once, as a constraint rather than a code path. A second
 -- `EffectStarted` for one effect key in one run cannot be written, whichever
 -- instance is writing and whatever it believes about the journal.
 CREATE UNIQUE INDEX IF NOT EXISTS journal_effect_started
-    ON journal (run_id, effect_key)
+    ON journal (tenant, run_id, effect_key)
     WHERE kind = 'EffectStarted' AND effect_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS run_lease (
-    run_id     TEXT   PRIMARY KEY,
+    tenant     TEXT   NOT NULL,
+    run_id     TEXT   NOT NULL,
     owner      TEXT   NOT NULL,
     epoch      BIGINT NOT NULL,
-    expires_at BIGINT NOT NULL
+    expires_at BIGINT NOT NULL,
+    PRIMARY KEY (tenant, run_id)
 );
 
 -- An operator's stop request. Beside the chain rather than in it, and
@@ -95,18 +103,27 @@ CREATE TABLE IF NOT EXISTS run_lease (
 -- properties the log needs.
 CREATE SEQUENCE IF NOT EXISTS run_log_position;
 
+-- One log per tenant, so a checkpoint commits to that tenant's runs and no
+-- others. `log_index` is unique *within* a tenant: a shared sequence hands out
+-- distinct numbers globally, and each tenant simply sees gaps, which the dense
+-- rank in `inclusion_proof` removes before anything is proved.
 CREATE TABLE IF NOT EXISTS run_seal (
-    run_id     TEXT   PRIMARY KEY,
+    tenant     TEXT   NOT NULL,
+    run_id     TEXT   NOT NULL,
     chain_head BYTEA  NOT NULL,
-    log_index  BIGINT NOT NULL UNIQUE,
-    sealed_at  BIGINT NOT NULL
+    log_index  BIGINT NOT NULL,
+    sealed_at  BIGINT NOT NULL,
+    PRIMARY KEY (tenant, run_id),
+    UNIQUE (tenant, log_index)
 );
 
 CREATE TABLE IF NOT EXISTS run_cancel (
-    run_id       TEXT   PRIMARY KEY,
+    tenant       TEXT   NOT NULL,
+    run_id       TEXT   NOT NULL,
     actor        TEXT   NOT NULL,
     reason       TEXT   NOT NULL,
-    requested_at BIGINT NOT NULL
+    requested_at BIGINT NOT NULL,
+    PRIMARY KEY (tenant, run_id)
 );
 ";
 
@@ -120,6 +137,8 @@ pub struct PostgresStore {
     signer: Option<Arc<dyn crate::core::Signer>>,
     /// Names this plane's Merkle log in every checkpoint.
     origin: String,
+    /// Whose rows this handle can name. Every statement carries it.
+    tenant: crate::core::TenantId,
 }
 
 impl PostgresStore {
@@ -141,13 +160,26 @@ impl PostgresStore {
         self
     }
 
-    /// The log's leaves, in seal order.
+    /// Serve one tenant.
+    ///
+    /// The handle is the boundary: a store built for `acme` cannot name a
+    /// `globex` run even holding a valid id, because the tenant is part of every
+    /// key rather than a predicate someone remembers to add. The origin moves
+    /// with it, so two tenants' checkpoints are not mistaken for one plane's.
+    #[must_use]
+    pub fn for_tenant(mut self, tenant: crate::core::TenantId) -> Self {
+        self.origin = format!("{}/{}", self.origin, tenant);
+        self.tenant = tenant;
+        self
+    }
+
+    /// This tenant's log leaves, in seal order.
     async fn log_leaves(&self) -> Result<Vec<Digest>, StoreError> {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
-                "SELECT chain_head FROM run_seal ORDER BY log_index ASC",
-                &[],
+                "SELECT chain_head FROM run_seal WHERE tenant = $1 ORDER BY log_index ASC",
+                &[&self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -181,6 +213,10 @@ fn now_secs() -> u64 {
 impl PostgresStore {
     pub(super) fn pool_ref(&self) -> &Pool {
         &self.pool
+    }
+
+    pub(super) fn tenant_name(&self) -> String {
+        self.tenant.to_string()
     }
 
     /// Connect and apply the schema.
@@ -220,12 +256,17 @@ impl PostgresStore {
             pool,
             signer: None,
             origin: "agentplane".to_owned(),
+            tenant: crate::core::TenantId::default(),
         })
     }
 }
 
 #[async_trait]
 impl JournalStore for PostgresStore {
+    fn tenant(&self) -> &str {
+        self.tenant.as_str()
+    }
+
     async fn append(&self, epoch: Epoch, batch: Vec<Append>) -> Result<Vec<Record>, StoreError> {
         if batch.is_empty() {
             return Ok(Vec::new());
@@ -240,8 +281,8 @@ impl JournalStore for PostgresStore {
         // indivisible act — without it the check is advisory.
         let lease = tx
             .query_opt(
-                "SELECT epoch FROM run_lease WHERE run_id = $1 FOR UPDATE",
-                &[&run.to_string()],
+                "SELECT epoch FROM run_lease WHERE tenant = $1 AND run_id = $2 FOR UPDATE",
+                &[&self.tenant_name(), &run.to_string()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -259,8 +300,9 @@ impl JournalStore for PostgresStore {
 
         let head = tx
             .query_opt(
-                "SELECT seq, hash FROM journal WHERE run_id = $1 ORDER BY seq DESC LIMIT 1",
-                &[&run.to_string()],
+                "SELECT seq, hash FROM journal
+                  WHERE tenant = $1 AND run_id = $2 ORDER BY seq DESC LIMIT 1",
+                &[&self.tenant_name(), &run.to_string()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -284,10 +326,11 @@ impl JournalStore for PostgresStore {
             let result = tx
                 .execute(
                     "INSERT INTO journal
-                       (run_id, seq, epoch, kind, effect_key, prev_hash, hash, raw,
-                        key_id, signature)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                       (tenant, run_id, seq, epoch, kind, effect_key, prev_hash, hash,
+                        raw, key_id, signature)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                     &[
+                        &self.tenant_name(),
                         &run.to_string(),
                         &seq.cast_signed(),
                         &epoch.cast_signed(),
@@ -325,8 +368,8 @@ impl JournalStore for PostgresStore {
         let rows = client
             .query(
                 "SELECT seq, prev_hash, hash, raw, key_id, signature FROM journal
-                  WHERE run_id = $1 AND seq >= $2 ORDER BY seq ASC",
-                &[&run.to_string(), &from.cast_signed()],
+                  WHERE tenant = $1 AND run_id = $2 AND seq >= $3 ORDER BY seq ASC",
+                &[&self.tenant_name(), &run.to_string(), &from.cast_signed()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -362,8 +405,9 @@ impl JournalStore for PostgresStore {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
         let row = client
             .query_opt(
-                "SELECT seq, hash FROM journal WHERE run_id = $1 ORDER BY seq DESC LIMIT 1",
-                &[&run.to_string()],
+                "SELECT seq, hash FROM journal
+                  WHERE tenant = $1 AND run_id = $2 ORDER BY seq DESC LIMIT 1",
+                &[&self.tenant_name(), &run.to_string()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -392,8 +436,9 @@ impl JournalStore for PostgresStore {
         // result of that rather than the state before it.
         let existing = tx
             .query_opt(
-                "SELECT owner, epoch, expires_at FROM run_lease WHERE run_id = $1 FOR UPDATE",
-                &[&key],
+                "SELECT owner, epoch, expires_at FROM run_lease
+                  WHERE tenant = $1 AND run_id = $2 FOR UPDATE",
+                &[&self.tenant_name(), &key],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -405,31 +450,36 @@ impl JournalStore for PostgresStore {
                 let epoch: i64 = row.get(1);
                 let expires_at: i64 = row.get(2);
                 let epoch = epoch.cast_unsigned();
-                if held_by == owner {
-                    // Renewal keeps the epoch: bumping it would fence the owner
-                    // against its own in-flight writes.
+                if expires_at.cast_unsigned() <= now {
+                    // Expired or released: take over and fence whoever held it,
+                    // **including this caller**. Checked before ownership on
+                    // purpose — a lapsed lease is not yours to renew, because
+                    // you cannot know whether somebody took over in the gap.
+                    epoch + 1
+                } else if held_by == owner {
+                    // Ours and still live: renewal keeps the epoch, or the owner
+                    // fences its own in-flight writes.
                     epoch
-                } else if expires_at.cast_unsigned() > now {
+                } else {
                     return Err(StoreError::LeaseHeld {
                         run: key,
                         owner: held_by,
                         epoch,
                         remaining_secs: expires_at.cast_unsigned().saturating_sub(now),
                     });
-                } else {
-                    epoch + 1
                 }
             }
         };
 
         tx.execute(
-            "INSERT INTO run_lease (run_id, owner, epoch, expires_at)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (run_id) DO UPDATE SET
+            "INSERT INTO run_lease (tenant, run_id, owner, epoch, expires_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (tenant, run_id) DO UPDATE SET
                owner = EXCLUDED.owner,
                epoch = EXCLUDED.epoch,
                expires_at = EXCLUDED.expires_at",
             &[
+                &self.tenant_name(),
                 &key,
                 &owner.to_owned(),
                 &epoch.cast_signed(),
@@ -447,6 +497,30 @@ impl JournalStore for PostgresStore {
         })
     }
 
+    async fn release_lease(&self, run: RunId, epoch: Epoch) -> Result<(), StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        // Two safety properties in one statement.
+        //
+        // The epoch predicate: a fenced caller shutting down must not free the
+        // lease of the instance that took over from it. In the `WHERE` clause so
+        // it is atomic rather than a read followed by a write somebody can race.
+        //
+        // And an **update, not a delete**. The epoch lives in this row: removing
+        // it leaves `append` nothing to fence against and makes the next
+        // `acquire` restart at 1, so a writer already fenced at 2 would outrank
+        // the new owner. Expiring the row frees the lease while keeping the
+        // history of what has happened to it.
+        client
+            .execute(
+                "UPDATE run_lease SET owner = '', expires_at = 0 \
+                 WHERE tenant = $1 AND run_id = $2 AND epoch = $3",
+                &[&self.tenant_name(), &run.to_string(), &epoch.cast_signed()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
     async fn seal(&self, run: RunId, _epoch: Epoch, _outcome: &str) -> Result<Digest, StoreError> {
         // The conclusion is already *in* the chain — the executor appends
         // `RunSealed` before calling this — so sealing reports the terminal hash
@@ -461,10 +535,11 @@ impl JournalStore for PostgresStore {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
         client
             .execute(
-                "INSERT INTO run_seal (run_id, chain_head, log_index, sealed_at)
-                 VALUES ($1, $2, nextval('run_log_position'), $3)
-                 ON CONFLICT (run_id) DO NOTHING",
+                "INSERT INTO run_seal (tenant, run_id, chain_head, log_index, sealed_at)
+                 VALUES ($1, $2, $3, nextval('run_log_position'), $4)
+                 ON CONFLICT (tenant, run_id) DO NOTHING",
                 &[
+                    &self.tenant_name(),
                     &run.to_string(),
                     &head.as_bytes().to_vec(),
                     &now_secs().cast_signed(),
@@ -513,9 +588,9 @@ impl JournalStore for PostgresStore {
                 "SELECT rank, chain_head FROM (
                      SELECT run_id, chain_head,
                             ROW_NUMBER() OVER (ORDER BY log_index) - 1 AS rank
-                       FROM run_seal
-                 ) ranked WHERE run_id = $1",
-                &[&run.to_string()],
+                       FROM run_seal WHERE tenant = $1
+                 ) ranked WHERE run_id = $2",
+                &[&self.tenant_name(), &run.to_string()],
             )
             .await
             .map_err(|e| be(&e))?
@@ -547,10 +622,11 @@ impl JournalStore for PostgresStore {
         // record, so a retried request cannot rewrite who intervened.
         let n = client
             .execute(
-                "INSERT INTO run_cancel (run_id, actor, reason, requested_at)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (run_id) DO NOTHING",
+                "INSERT INTO run_cancel (tenant, run_id, actor, reason, requested_at)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (tenant, run_id) DO NOTHING",
                 &[
+                    &self.tenant_name(),
                     &run.to_string(),
                     &actor.to_owned(),
                     &reason.to_owned(),
@@ -566,8 +642,8 @@ impl JournalStore for PostgresStore {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
         let row = client
             .query_opt(
-                "SELECT actor, reason FROM run_cancel WHERE run_id = $1",
-                &[&run.to_string()],
+                "SELECT actor, reason FROM run_cancel WHERE tenant = $1 AND run_id = $2",
+                &[&self.tenant_name(), &run.to_string()],
             )
             .await
             .map_err(|e| be(&e))?;

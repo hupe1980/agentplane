@@ -193,7 +193,7 @@ fn store() -> Arc<RedbStore> {
     Arc::new(RedbStore::open_in_memory().unwrap())
 }
 
-fn runtime(s: &Arc<RedbStore>) -> Runtime {
+fn runtime(s: &Arc<RedbStore>) -> Arc<Runtime> {
     Runtime::builder(Arc::clone(s) as Arc<dyn JournalStore>)
         .cases(Arc::clone(s) as Arc<dyn CaseStore>)
         .tasks(Arc::clone(s) as Arc<dyn TaskStore>)

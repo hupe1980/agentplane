@@ -43,18 +43,55 @@
 //! | `request.resource` | `Resource::"…"` — an effect kind or a capability |
 //! | `request.context` | the Cedar context record |
 //!
-//! Entities carry no attributes here. Attributes on a principal (its risk tier,
-//! its group) belong to the deployment's identity system, and inventing them in
-//! the adapter would mean two sources of truth about who an agent is. Everything
-//! a rule needs about *this request* is in the context, including the delegation
-//! chain's owner and depth (§11.1).
+//! A bundle may carry deliberately static Cedar entities and attributes. Live
+//! identity and facts about *this request* remain in context, including the
+//! delegation chain's owner and depth; copying those into static entities
+//! would create a stale second source of truth.
+//!
+//! # The admission context
+//!
+//! A `run:admit` request carries the governing declaration under `agent`, which
+//! a schema for that action must therefore allow:
+//!
+//! ```text
+//! context.agent.name       the declared name — for reading, never for granting
+//! context.agent.version    the declared version
+//! context.agent.digest     hex over the manifest's canonical bytes
+//! context.agent.publisher  the KeyId that vouched for it, or absent
+//! ```
+//!
+//! Bind rules to `publisher` for a set of agents and to `digest` for one exact
+//! revision. Not to `name`: a manifest is a file, and its name is whatever its
+//! author typed, so a rule granting authority to a name grants it to anyone who
+//! types that name.
+//!
+//! A schema declaring `run:admit` with `"additionalAttributes": false` and no
+//! `agent` attribute will reject every admission. That surfaces as a *defect*
+//! rather than an ordinary denial — the adapter says so in the reason, because a
+//! request it cannot express is a wiring bug and not a rule firing.
 
 use std::str::FromStr;
 
-use cedar_policy::{Authorizer, Context, Entities, EntityUid, PolicySet, Request};
+use cedar_policy::{
+    Authorizer, Context, Entities, EntityUid, PolicySet, Request, Schema, ValidationMode, Validator,
+};
 
-use crate::core::{Digest, PolicyDecision, PolicyEngine, PolicyRequest};
+use crate::core::{
+    Digest, PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest, canon,
+};
 use crate::runtime::telemetry;
+
+/// Decision semantics pinned into every Cedar bundle identity.
+///
+/// Cargo cannot expose a dependency's version through `env!`, so this stays
+/// deliberately explicit and is guarded against `Cargo.toml` by a test. The
+/// adapter revision covers entity mapping, schema-aware context parsing, and
+/// the set of Cedar extensions made available by 4.12.
+pub const EVALUATOR_SEMANTICS: &str =
+    "cedar-policy/4.12.0;agentplane-adapter/2;extensions=all-available";
+
+const ADAPTER_CONFIGURATION: &[u8] =
+    b"principal=Agent;action=Action;resource=Resource;context=action-schema";
 
 /// A Cedar policy set, compiled once.
 ///
@@ -65,7 +102,8 @@ use crate::runtime::telemetry;
 pub struct CedarEngine {
     policies: PolicySet,
     entities: Entities,
-    digest: Digest,
+    schema: Option<Schema>,
+    bundle: PolicyBundleIdentity,
 }
 
 /// Why a policy set could not be loaded.
@@ -73,6 +111,12 @@ pub struct CedarEngine {
 pub enum CedarError {
     #[error("policy set does not parse: {0}")]
     Parse(String),
+    #[error("Cedar schema does not parse: {0}")]
+    Schema(String),
+    #[error("policy set does not validate against its schema: {0}")]
+    Validation(String),
+    #[error("static Cedar entities do not parse against the bundle schema: {0}")]
+    Entities(String),
 }
 
 impl CedarEngine {
@@ -84,36 +128,89 @@ impl CedarEngine {
     /// point: a policy set that cannot be compiled must never become a plane
     /// that denies everything for reasons nobody can see.
     pub fn new(source: &str) -> Result<Self, CedarError> {
-        let policies = PolicySet::from_str(source).map_err(|e| CedarError::Parse(e.to_string()))?;
-        let entities = Entities::empty();
+        Self::from_bundle(source, None, None)
+    }
 
-        // Over the source text, so the journal records *which rules* governed a
-        // run rather than which file was on disk. Two deployments with the same
-        // rules produce the same digest; a whitespace change produces a
-        // different one, which is the conservative direction — an audit that
-        // says "the rules may have changed" is recoverable, one that says they
-        // did not when they did is not.
-        let mut framed = Vec::with_capacity(source.len() + 24);
-        framed.extend_from_slice(b"agentplane.cedar.v1\0");
-        framed.extend_from_slice(source.as_bytes());
-        let digest = Digest::of(&framed);
+    /// Compile a complete Cedar policy bundle.
+    ///
+    /// A declared schema is used to validate the policies at startup, parse
+    /// static entities, parse each request context, and construct the request.
+    /// Static entities are the facts intentionally frozen into this bundle;
+    /// per-call facts remain in [`PolicyRequest::context`].
+    ///
+    /// # Errors
+    ///
+    /// If rules/schema/entities do not parse, or the policies do not validate
+    /// strictly against the schema. Every failure is a startup refusal.
+    pub fn from_bundle(
+        source: &str,
+        schema_json: Option<&str>,
+        entities_json: Option<&str>,
+    ) -> Result<Self, CedarError> {
+        let policies = PolicySet::from_str(source).map_err(|e| CedarError::Parse(e.to_string()))?;
+
+        let (schema, schema_digest) = match schema_json {
+            Some(json) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(json).map_err(|e| CedarError::Schema(e.to_string()))?;
+                let schema = Schema::from_json_value(value.clone())
+                    .map_err(|e| CedarError::Schema(e.to_string()))?;
+                let validation =
+                    Validator::new(schema.clone()).validate(&policies, ValidationMode::Strict);
+                if !validation.validation_passed() {
+                    let errors = validation
+                        .validation_errors()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(CedarError::Validation(errors));
+                }
+                (Some(schema), Some(Digest::of(&canon::value_bytes(&value))))
+            }
+            None => (None, None),
+        };
+
+        let (entities, entities_digest) = match entities_json {
+            Some(json) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(json).map_err(|e| CedarError::Entities(e.to_string()))?;
+                let entities = Entities::from_json_value(value.clone(), schema.as_ref())
+                    .map_err(|e| CedarError::Entities(e.to_string()))?;
+                (entities, Some(Digest::of(&canon::value_bytes(&value))))
+            }
+            None => (Entities::empty(), None),
+        };
+
+        let mut bundle =
+            PolicyBundleIdentity::new(Digest::of(source.as_bytes()), EVALUATOR_SEMANTICS)
+                .with_configuration(Digest::of(ADAPTER_CONFIGURATION));
+        if let Some(digest) = schema_digest {
+            bundle = bundle.with_schema(digest);
+        }
+        if let Some(digest) = entities_digest {
+            bundle = bundle.with_entities(digest);
+        }
 
         Ok(Self {
             policies,
             entities,
-            digest,
+            schema,
+            bundle,
         })
     }
 
     /// Build the Cedar request, or say why the runtime's strings could not be
     /// expressed as entities.
-    fn request(r: &PolicyRequest<'_>) -> Result<Request, String> {
+    fn request(&self, r: &PolicyRequest<'_>) -> Result<Request, String> {
         let principal = uid("Agent", r.principal)?;
         let action = uid("Action", r.action)?;
         let resource = uid("Resource", r.resource)?;
-        let context = Context::from_json_value(r.context.clone(), None)
-            .map_err(|e| format!("context is not a Cedar record: {e}"))?;
-        Request::new(principal, action, resource, context, None)
+        let context = Context::from_json_value(
+            r.context.clone(),
+            self.schema.as_ref().map(|schema| (schema, &action)),
+        )
+        .map_err(|e| format!("context is not a Cedar record: {e}"))?;
+        Request::new(principal, action, resource, context, self.schema.as_ref())
             .map_err(|e| format!("request is not well formed: {e}"))
     }
 }
@@ -134,7 +231,7 @@ impl PolicyEngine for CedarEngine {
     fn authorize(&self, request: &PolicyRequest<'_>) -> PolicyDecision {
         // A request the adapter cannot even express is a denial, and a loud one:
         // it is a bug here or in the caller, not a rule firing.
-        let req = match Self::request(request) {
+        let req = match self.request(request) {
             Ok(r) => r,
             Err(why) => {
                 tracing::error!(
@@ -212,7 +309,7 @@ impl PolicyEngine for CedarEngine {
         }
     }
 
-    fn digest(&self) -> Digest {
-        self.digest
+    fn bundle(&self) -> PolicyBundleIdentity {
+        self.bundle.clone()
     }
 }

@@ -110,6 +110,13 @@ impl JournalStore for NoExactlyOnce {
     ) -> Result<agentplane::journal::Lease, agentplane::core::StoreError> {
         self.inner.acquire(run, owner, ttl).await
     }
+    async fn release_lease(
+        &self,
+        run: agentplane::core::RunId,
+        epoch: agentplane::core::Epoch,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.release_lease(run, epoch).await
+    }
     async fn seal(
         &self,
         run: agentplane::core::RunId,

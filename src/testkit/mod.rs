@@ -12,9 +12,15 @@ pub mod backstop;
 pub mod conformance;
 #[cfg(feature = "redb")]
 pub mod conformance_case;
+#[cfg(feature = "keyring")]
+pub mod conformance_keyring;
 mod fake_model;
 pub mod faults;
+#[cfg(feature = "keyring")]
+pub mod memory_keyring;
 mod stub_signer;
+#[cfg(feature = "keyring")]
+pub use memory_keyring::MemoryKeyRing;
 pub use stub_signer::StubSigner;
 
 pub use backstop::assert_replay_was_not_backstopped;

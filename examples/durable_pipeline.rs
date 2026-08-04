@@ -73,8 +73,12 @@ impl Skill for Settlement {
         let crash_at = self.crash_at.load(Ordering::SeqCst);
 
         for i in 0..n {
-            cx.effect(Recorded::new(format!("stage-{i}")).counter(Arc::clone(&self.world.0)))
-                .await?;
+            let arguments = Tainted::trusted(json!(null));
+            cx.sink(
+                Recorded::new(format!("stage-{i}")).counter(Arc::clone(&self.world.0)),
+                &arguments,
+            )
+            .await?;
 
             // Stand-in for the process dying here: the journal keeps everything
             // written so far and nothing after it.
@@ -97,7 +101,7 @@ fn runtime(
     stages: &Arc<AtomicUsize>,
     crash_at: &Arc<AtomicUsize>,
     world: &World,
-) -> Runtime {
+) -> Arc<Runtime> {
     Runtime::builder(Arc::clone(store))
         .owner("example")
         .skill(Settlement {

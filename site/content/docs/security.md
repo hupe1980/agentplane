@@ -37,17 +37,51 @@ escalates to the higher, provenance accumulates. A bounded join-semilattice, and
 the reason derived values inherit untrust automatically.
 
 `Tainted<T>` exposes `peek()` (reading is fine — the enforcement point is at
-*sinks*, not at reads) but no infallible unwrap. Leaving the lattice requires
-`cx.declassify(value, reason)`, which writes a `Declassified` record carrying
-the reason and the label it left with.
+*sinks*, not at reads) but no public unwrap. Structured JSON can additionally
+carry labels at RFC 6901 paths. `Tainted::object` and `Tainted::array` preserve
+that hierarchy; plan field selection projects it rather than flattening it.
+Arbitrary `map` and `zip` operations retain the conservative whole-value label
+but discard field paths, because the runtime cannot prove how an arbitrary
+closure reshaped them.
 
-Two gates run at every sink:
+Three checks run at every sink:
+
+- **Exact argument binding** — the bytes an effect will dispatch must
+  canonically equal the labeled value that was checked. Any effect exposing
+  outbound arguments is refused by `cx.effect`; `cx.sink` is the only dispatch
+  path. Checking one value and sending another is therefore not an API option.
 
 - **Egress ceiling** — a value's sensitivity may not exceed what the sink is
   cleared for. This is the exfiltration path that actually matters: not the
   network, but a legitimate-looking call carrying a secret read three steps ago.
-- **Taint gate** — untrusted data may not reach a *mutating* sink without an
-  explicit, journaled declassification.
+- **Authority-bearing fields** — a mutating sink with no field policy refuses
+  any untrusted argument. A sink can instead protect exact fields such as
+  `/recipient`, `/amount`, `/path`, `/url`, `/tenant`, or `/tool`: each may
+  require trusted data, an allowlist of provenance sources, and its own
+  sensitivity ceiling. Unprotected descriptive content may remain untrusted.
+
+Improving a label is a typed decision, not a reason-string escape hatch:
+
+```rust
+let released = cx.release(
+    arguments,
+    Release::fields(
+        ReleaseScope::trust(),
+        ["/recipient".to_owned()],
+        "operator matched the account to settlement SET-42",
+        "mcp://ledger/transfer",
+        ["approval:SET-42".to_owned()],
+    ),
+).await?;
+```
+
+The runtime validates the field scope, authorizes `data:release`, and journals
+the releaser, value digest, prior and resulting whole/field labels, basis,
+destination, fields and evidence. It returns a still-labeled value. A trust
+release retains provenance and sensitivity; a field release leaves every other
+field unchanged. The decision has an ordered effect key, so changing its scope,
+evidence, value or label semantics is replay divergence. Strict replay reads
+the recorded decision and never re-opens policy.
 
 ### Judging a step more than once
 
@@ -193,11 +227,13 @@ implies, by **maximum**. An effect can raise its output to `Secret`; it cannot
 declare a tool response less sensitive than its provenance implies. An effect
 able to lower its own label would be a laundering primitive with a polite name.
 
-### Leaving the lattice
+### Improving a label without erasing history
 
-`declassify` is the only exit and it returns a bare value, so re-entering as
-trusted is an assertion someone signed for. The reason and the label it left with
-are journaled.
+There is no public exit from the lattice. `release` can improve only the named
+trust and/or sensitivity dimensions, for the whole value or explicitly tracked
+fields. It never removes provenance and never returns a bare value. A selected
+field release is refused if the value no longer has field precision — policy
+cannot authorize evidence the runtime cannot substantiate.
 
 ## Delegation
 
@@ -284,6 +320,136 @@ and having two ways to spell it is how a plane ends up with a policy layer
 everyone believes is on. The default is `DenyAll`, and whether an engine governed
 a run is recorded at admission.
 
+### Identity covers executable policy, not just rules
+
+A rule-source hash cannot answer which policy ran. Schema, static entities,
+enabled extensions, adapter configuration, and evaluator semantics can all
+change the same request's decision without changing one rule. `RunAdmitted`
+therefore carries a structured `PolicyBundleIdentity` with a digest for each
+static component and a semantic evaluator identifier. Cedar JSON components are
+canonicalized before hashing, so whitespace and object-key formatting do not
+manufacture drift.
+
+Live identity, delegation state, labels, amounts, and other per-call facts do
+**not** belong in the static bundle. They remain request context and are recorded
+through the normal effect/journal protocol where applicable.
+
+### An agent binds by digest, never by its name
+
+A policy needs to say *this agent may not run that capability*. The obvious way
+is to make the agent's `metadata.name` the principal, and it is wrong.
+
+A name is **self-asserted**. A manifest is a file, and `metadata.name` is
+whatever its author typed, so a rule granting authority to a name grants it to
+any file claiming that name. A name is only as trustworthy as the resolution path
+that produced it — a verified registry lookup, or a string literal — and at
+admission the runtime cannot tell which. This is the distinction
+[NIST SP 800-207A][nist] draws when it requires authorization to bind to
+application and service *identities*, and the reason [SPIFFE][spiffe] issues a
+cryptographically verifiable ID rather than trusting a workload's own claim about
+who it is.
+
+So the declaration reaches policy as **context** — name, version and digest — and
+the principal stays an authenticated identity: the delegation chain's subject
+where one is configured, and otherwise the capability, which claims nothing. The
+same fallback is used by the scope check, so one refused run gives one answer to
+*who was refused* rather than two.
+
+Rules that need to bind to an exact revision bind to `context.agent.digest`. The
+digest is content-addressed and covers the prompt, the model grants and the
+ceilings, so an edited agent is a different agent — where a name-based rule would
+go on permitting it after its limits were widened.
+
+### Erasure, keys and tenancy
+
+Payload bytes are sealed under a data key wrapped by one this crate never holds,
+so erasure destroys the key rather than chasing copies — and a backup taken
+before the request becomes unreadable without being touched. The tenant is a key
+component of every stored row on both backends, never a filter — so a query that
+forgets it returns nothing rather than somebody else's rows — and one process
+serves many tenants by resolving the plane from the caller's credential.
+
+Both are their own subject: see [erasure and keys](@/docs/erasure.md).
+
+### A peer's message is untrusted, and names its sender
+
+The A2A server (`a2a-server`) admits an inbound message as `Tainted` with
+provenance `peer:<authenticated caller>`, exactly as an event over HTTP takes its
+source from the caller rather than the body. A party describing itself is not
+evidence about itself.
+
+Two consequences worth stating. A protected sink field can name the one
+counterparty it will take an amount from, so a message from the wrong peer is
+refused at the gate rather than in a skill's own logic. And the capability that
+runs is taken from `message.metadata.skill` and matched against the card, never
+inferred from the message — otherwise the sender would choose what runs by
+writing text, which is prompt injection with a dispatch table behind it.
+
+A denial is reported to the peer as a decline with no reason. The runtime's own
+denial names the action and resource the gate keyed on, and a peer that can send
+messages and read refusals could map that vocabulary by probing it — the same
+rule that keeps a diagnostic from describing the classification it protects.
+
+### An event's sender is part of its provenance
+
+An awaited event's label carries two sources: `event:<kind>` and
+`sender:<source>`. The second is what lets a protected field say *this amount may
+come from counterparty A and no one else* — a rule that is inexpressible when
+provenance only records what kind of message arrived.
+
+The sender is **journaled with the await**, not recomputed on replay. A replayed
+run that rebuilt the label from anything the record does not carry would label
+the same value differently from the live run, and every taint gate downstream
+could then reach a different verdict. A record without a sender fails closed: the
+label lacks that provenance, so a field requiring it is refused rather than
+admitted.
+
+### A caller does not name itself
+
+An event delivered over HTTP carries an id, a kind, a correlation and a payload —
+and **not** a source. The source is the authenticated caller.
+
+That is not tidiness. `source` is half the deduplication identity, so a caller
+that supplied its own would hold both halves of `(source, id)` and could
+deduplicate against another party's messages by naming them — making their events
+vanish as apparent retries, with nothing reporting it because dropping a
+duplicate is what the store is for. It is the same rule as the publisher and the
+policy principal: a name a party asserts about itself carries no weight.
+
+### The group is the publisher
+
+A digest names one revision, so a digest-only rule is a policy change on every
+edit. A rule usually wants a *set* of agents, and every obvious candidate fails a
+real deployment:
+
+| Grouping | Scales | Unforgeable |
+|---|---|---|
+| workload identity | ✗ one per instance, so the rule is rewritten each deploy | ✓ |
+| agent name | ✓ | ✗ any file can type it |
+| role, or a group label in the manifest | ✓ | ✗ the author asserts it |
+| manifest digest | ✓ | ✓ but names exactly one revision |
+| **publisher key** | ✓ many agents, many versions | ✓ requires holding the key |
+
+So the grouping is the **publisher**. `context.agent.publisher` carries the
+`KeyId` that
+[`Registry::resolve_verified`](@/docs/architecture.md) returned beside the
+manifest — it arrives *beside* the document rather than inside it, because a
+document cannot state who signed it. `Agent::published_by` carries it into the
+runtime; an agent registered without one reports `None`, which is a recorded fact
+rather than a blank to be read as trusted.
+
+The practical shape of a rule set: permit by publisher, deny by digest for a
+revision you want to stop. The name stays in context for whoever reads the log,
+and authority never depends on it.
+
+[nist]: https://csrc.nist.gov/pubs/sp/800/207/a/final
+[spiffe]: https://spiffe.io/
+
+An open run in `Resume` mode can cross the end of history and dispatch effects.
+It must present exactly the bundle recorded at admission; any difference is a
+loud `PolicyBundleChanged` refusal. `Strict` replay dispatches nothing, so it
+does not need the historical evaluator and does not compare bundles.
+
 ### Replay never re-opens the gate
 
 This is the part that is easy to get wrong, and the failure is silent. A policy
@@ -314,9 +480,9 @@ budget by asking.
 
 `spec/Authorization.tla` models a run, a rule change, and a replay, with
 invariants `NothingForbiddenIsPerformed`, `ReplayNeverConsultsPolicy`,
-`DenialIsDurable`, `ReplayPerformsNothing`, `NoRedundantPermitRecords`. Two
-mutants must trip them: re-evaluating during replay, and stopping on a denial
-without recording it.
+`DenialIsDurable`, `ReplayPerformsNothing`, `NoRedundantPermitRecords`. Runtime
+mutants additionally remove each Cedar bundle component or the resume equality
+check; each must be killed by its named trust test.
 
 In `tests/trust/policy.rs`, every test that replays uses an engine that **panics if
 consulted**. The guarantee is enforced by construction rather than asserted after
@@ -360,6 +526,12 @@ retry policy. Two rules follow:
 What the catalogue cannot do is make a tool's output trusted. It governs
 authority, not provenance — the result is the outside world's data whatever the
 operator thinks of the tool.
+
+The catalogue may protect authority-bearing JSON fields. The same declarations
+can live in a manifest's tool grant; they are canonicalized, covered by the
+manifest digest, and must match the live catalogue exactly before dispatch. A
+reviewer approving `/recipient: require_trusted` is therefore approving the
+policy the runtime applies, not prose beside an independent builder call.
 
 ### MCP is only the wire
 
@@ -464,12 +636,26 @@ refused rather than dropped silently. Neither orders the *external* effects. If
 two of your runs can touch one resource at once, the callee needs to be
 idempotent — which is what `ToolSafety` and the reconciliation path assume.
 
-**Media the provider fetches for you.** A prompt may reference an image or a
-document by URL. That fetch is made by the model provider, from its network, so
-it does not pass this plane's egress allowlist and no journal record describes
-it — the plane cannot say where the bytes came from, because it never saw them
-being fetched. If where data may come from is part of your threat model, fetch it
-inside a skill, where it is an effect: governed, labelled, and recorded.
+**Remote media URLs.** The model effect and both built-in drivers still refuse
+provider-native image/document URL blocks before dispatch. Otherwise the model
+provider would fetch from its own network, outside this plane's controls.
+
+The optional `media` boundary is the only built-in dereference path. Its policy
+is deny-by-default and exact: HTTPS/443 unless separately granted, no URL
+userinfo or fragments, no wildcard hosts. Every A/AAAA answer must be public;
+the validated set is pinned into the actual connection to close DNS rebinding.
+Redirects are manual, bounded and fully revalidated. Proxies, referrers,
+cookies, content coding and automatic retries are off. Total/connect/read time,
+headers, declared length and streamed bytes are bounded. Declared MIME is
+checked against bytes, and other formats require a versioned content validator.
+
+Only the digest and fetch evidence enter the journal. Bytes are
+content-addressed, case-linked by default, and materialized only inside a live
+model effect; strict replay performs no DNS, HTTP or blob read. The result stays
+**untrusted**: SSRF-safe transport does not make an image, document, audio clip
+or screenshot safe instructions. Network-layer egress controls remain required
+defence in depth, as recommended by the
+[OWASP SSRF guidance](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html).
 
 
 Stated plainly, because a reader who assumes otherwise will size their risk
@@ -479,7 +665,7 @@ wrongly:
 |---|---|
 | **The native skill tier is trusted** | A `dyn Skill` compiled into the binary can open its own socket. The gate governs what goes through `cx.effect`, and nothing else. The Wasm tier is the intended answer and is not built |
 | **An operator who holds the signing key** | Signatures bind authorship, not existence. Whoever controls the workload identity can produce a perfectly signed alternative history |
-| **Split views** | Nothing stops a deployer showing one auditor one history and another a different one. Both verify. Closing this needs witness cosigning, which is designed and not built |
+| **Independent split-view detection** | Witness cosigning and consistency-proof verification are built, including refusal of a second history at the same size. Only an in-process `MemoryWitness` ships: no remote C2SP `tlog-witness` client or independent counterparty exists, so a self-hosted witness does not protect auditors from its operator |
 | **Revocation** | A delegation is valid until it expires; there is no revocation list, because checking one means I/O on the authorization path — the exact property removed so a gate cannot fail open under load. Chains are short-lived and audience-bound instead |
 | **Implicit flows** | Labels track explicit data flow. Not side channels, not a model leaking through phrasing |
 | **A compromised allowlisted endpoint** | Egress allowlisting decides *where* traffic may go, not what the far side does with it |

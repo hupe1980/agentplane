@@ -8,14 +8,25 @@ use crate::core::{CaseId, EffectKey, Phase, RunId, StoreError, Timer, Timestamp}
 
 use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
-/// `(run_id, effect_key) -> (case_id, has_case, step, phase, fire_at, claimed_at, has_claim)`.
+/// `(tenant, run_id, effect_key) -> (case_id, has_case, step, phase, fire_at,
+/// claimed_at, has_claim)`.
+///
+/// The tenant is its own key component rather than a prefix glued onto the run
+/// id: the run comes back out of the key already bare, so nothing has to parse
+/// a separator back off to rebuild a `RunId`.
 /// `(case_id, has_case, step, phase, fire_at, claimed_at, has_claim)`.
 type TimerRow<'a> = (&'a str, u8, u32, &'a str, i64, i64, u8);
 
-const TIMERS: TableDefinition<(&str, &str), TimerRow<'static>> = TableDefinition::new("timers");
+const TIMERS: TableDefinition<(&str, &str, &str), TimerRow<'static>> =
+    TableDefinition::new("timers");
 
-/// `(fire_at, run_id, effect_key) -> ()`. The sweep's only access path.
-const TIMERS_DUE: TableDefinition<(i64, &str, &str), ()> = TableDefinition::new("timers_due");
+/// `(tenant, fire_at, run_id, effect_key) -> ()`. The sweep's only access path.
+///
+/// The tenant leads, so a sweep ranges over one tenant's timers rather than
+/// filtering another's out afterwards. Ordering by time first would make every
+/// plane walk every tenant's due set and try to claim what it found — the
+/// isolation hole a `WHERE` clause is supposed to close and eventually does not.
+const TIMERS_DUE: TableDefinition<(&str, i64, &str, &str), ()> = TableDefinition::new("timers_due");
 
 /// How long a claim holds before another sweep may take the timer.
 ///
@@ -88,6 +99,7 @@ fn build(
 #[async_trait]
 impl TimerStore for RedbStore {
     async fn arm(&self, timer: &Timer) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
         let (run, effect) = (timer.run.to_string(), timer.effect.to_hex());
         let case = timer.case.map(|c| c.to_string()).unwrap_or_default();
         let has_case = u8::from(timer.case.is_some());
@@ -100,18 +112,21 @@ impl TimerStore for RedbStore {
                 let mut t = w.open_table(TIMERS).map_err(|e| be(&e))?;
                 // First arming wins: re-arming must not move a timer somebody
                 // may already have claimed.
-                if t.get((run.as_str(), effect.as_str()))
+                if t.get((tenant.as_str(), run.as_str(), effect.as_str()))
                     .map_err(|e| be(&e))?
                     .is_none()
                 {
                     t.insert(
-                        (run.as_str(), effect.as_str()),
+                        (tenant.as_str(), run.as_str(), effect.as_str()),
                         (case.as_str(), has_case, step, phase, fire_at, 0, 0),
                     )
                     .map_err(|e| be(&e))?;
                     w.open_table(TIMERS_DUE)
                         .map_err(|e| be(&e))?
-                        .insert((fire_at, run.as_str(), effect.as_str()), ())
+                        .insert(
+                            (tenant.as_str(), fire_at, run.as_str(), effect.as_str()),
+                            (),
+                        )
                         .map_err(|e| be(&e))?;
                 }
             }
@@ -123,6 +138,7 @@ impl TimerStore for RedbStore {
 
     async fn claim_due(&self, now: Timestamp, limit: usize) -> Result<Vec<Timer>, StoreError> {
         let cutoff = now.unix_timestamp();
+        let tenant = self.tenant_name();
         self.with_db(move |db| {
             let w = begin_write(db)?;
             let out = {
@@ -132,14 +148,17 @@ impl TimerStore for RedbStore {
                 let due = w.open_table(TIMERS_DUE).map_err(|e| be(&e))?;
                 let mut candidates = Vec::new();
                 for e in due
-                    .range((i64::MIN, "", "")..=(cutoff, MAX_STR, MAX_STR))
+                    .range(
+                        (tenant.as_str(), i64::MIN, "", "")
+                            ..=(tenant.as_str(), cutoff, MAX_STR, MAX_STR),
+                    )
                     .map_err(|e| be(&e))?
                 {
                     if candidates.len() >= limit {
                         break;
                     }
                     let (k, _) = e.map_err(|e| be(&e))?;
-                    let (_, run, effect) = k.value();
+                    let (_, _, run, effect) = k.value();
                     candidates.push((run.to_owned(), effect.to_owned()));
                 }
                 drop(due);
@@ -148,7 +167,7 @@ impl TimerStore for RedbStore {
                 let mut out = Vec::new();
                 for (run, effect) in candidates {
                     let Some(row) = timers
-                        .get((run.as_str(), effect.as_str()))
+                        .get((tenant.as_str(), run.as_str(), effect.as_str()))
                         .map_err(|e| be(&e))?
                         .map(|v| {
                             let (c, hc, st, ph, fa, ca, hca) = v.value();
@@ -164,7 +183,7 @@ impl TimerStore for RedbStore {
                     }
                     timers
                         .insert(
-                            (run.as_str(), effect.as_str()),
+                            (tenant.as_str(), run.as_str(), effect.as_str()),
                             (
                                 case.as_str(),
                                 has_case,
@@ -200,13 +219,14 @@ impl TimerStore for RedbStore {
     }
 
     async fn disarm(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
         let (run, effect) = (run.to_string(), effect.to_hex());
         self.with_db(move |db| {
             let w = begin_write(db)?;
             {
                 let mut t = w.open_table(TIMERS).map_err(|e| be(&e))?;
                 if let Some(v) = t
-                    .remove((run.as_str(), effect.as_str()))
+                    .remove((tenant.as_str(), run.as_str(), effect.as_str()))
                     .map_err(|e| be(&e))?
                 {
                     let fire_at = v.value().4;
@@ -215,7 +235,7 @@ impl TimerStore for RedbStore {
                     // disarmed timer cannot be left findable by the sweep.
                     w.open_table(TIMERS_DUE)
                         .map_err(|e| be(&e))?
-                        .remove((fire_at, run.as_str(), effect.as_str()))
+                        .remove((tenant.as_str(), fire_at, run.as_str(), effect.as_str()))
                         .map_err(|e| be(&e))?;
                 }
             }
@@ -226,18 +246,29 @@ impl TimerStore for RedbStore {
     }
 
     async fn pending(&self, limit: usize) -> Result<Vec<Timer>, StoreError> {
+        let tenant = self.tenant_name();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let due = r.open_table(TIMERS_DUE).map_err(|e| be(&e))?;
             let timers = r.open_table(TIMERS).map_err(|e| be(&e))?;
             let mut out = Vec::new();
-            for e in due.iter().map_err(|e| be(&e))? {
+            // This tenant's range, not the whole table.
+            for e in due
+                .range(
+                    (tenant.as_str(), i64::MIN, "", "")
+                        ..=(tenant.as_str(), i64::MAX, MAX_STR, MAX_STR),
+                )
+                .map_err(|e| be(&e))?
+            {
                 if out.len() >= limit {
                     break;
                 }
                 let (k, _) = e.map_err(|e| be(&e))?;
-                let (_, run, effect) = k.value();
-                if let Some(v) = timers.get((run, effect)).map_err(|e| be(&e))? {
+                let (_, _, run, effect) = k.value();
+                if let Some(v) = timers
+                    .get((tenant.as_str(), run, effect))
+                    .map_err(|e| be(&e))?
+                {
                     let (c, hc, st, ph, fa, _, _) = v.value();
                     out.push(build(run, effect, c, hc, st, ph, fa)?);
                 }
@@ -256,12 +287,15 @@ impl RedbStore {
     ///
     /// If the count cannot be read.
     pub async fn armed_timers(&self, run: RunId) -> Result<usize, StoreError> {
+        let tenant = self.tenant_name();
         let run = run.to_string();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(TIMERS).map_err(|e| be(&e))?;
             let n = t
-                .range((run.as_str(), "")..=(run.as_str(), MAX_STR))
+                .range(
+                    (tenant.as_str(), run.as_str(), "")..=(tenant.as_str(), run.as_str(), MAX_STR),
+                )
                 .map_err(|e| be(&e))?
                 .count();
             Ok(n)

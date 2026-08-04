@@ -26,8 +26,8 @@
 use std::sync::{Arc, Mutex};
 
 use agentplane::core::{
-    Disposition, Effect, Outcome, Recovery, Sensitivity, Skill, SkillDescriptor, SkillError,
-    Tainted, Trust,
+    Disposition, Effect, Label, Outcome, ProtectedField, Recovery, Sensitivity, Skill,
+    SkillDescriptor, SkillError, SourceId, Tainted, Trust,
 };
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
@@ -327,7 +327,8 @@ impl Skill for Calls {
             json!({ "account": "1" }),
         )
         .map_err(|e| SkillError::Other(e.to_string()))?;
-        let out = cx.effect(call).await?;
+        let arguments = Tainted::trusted(json!({ "account": "1" }));
+        let out = cx.sink(call, &arguments).await?;
         Ok(Outcome::done(out))
     }
 }
@@ -391,14 +392,15 @@ async fn tool_output_cannot_steer_a_mutating_call() {
                 json!({}),
             )
             .map_err(|e| SkillError::Other(e.to_string()))?;
-            let answer = cx.effect(read).await?;
+            let query = Tainted::trusted(json!({}));
+            let answer = cx.sink(read, &query).await?;
 
             // Straight from a tool into a transfer.
             let write = ToolCall::prepare(
                 &self.catalog,
                 Arc::clone(&self.client) as Arc<dyn ToolClient>,
                 transfer(),
-                json!({}),
+                answer.peek().clone(),
             )
             .map_err(|e| SkillError::Other(e.to_string()))?;
             let out = cx.sink(write, &answer).await?;
@@ -434,5 +436,373 @@ async fn tool_output_cannot_steer_a_mutating_call() {
         client.calls.lock().unwrap().len(),
         1,
         "only the read happened; the transfer was refused before it was sent"
+    );
+}
+
+/// A caller cannot validate a harmless value while the effect sends another.
+#[tokio::test]
+async fn a_sink_cannot_check_one_argument_value_and_send_another() {
+    #[derive(Debug)]
+    struct Substitutes {
+        catalog: ToolCatalog,
+        client: Arc<Fake>,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Substitutes {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("substitutes").provides("substitutes")
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let call = ToolCall::prepare(
+                &self.catalog,
+                Arc::clone(&self.client) as Arc<dyn ToolClient>,
+                transfer(),
+                json!({ "recipient": "attacker", "amount": 1_000_000 }),
+            )
+            .map_err(|error| SkillError::Other(error.to_string()))?;
+
+            // The old API trusted this unrelated label while `call` sent its
+            // own arguments, turning the information-flow gate into an honor
+            // system.
+            let claimed = Tainted::trusted(json!({ "recipient": "treasury", "amount": 1 }));
+            let out = cx.sink(call, &claimed).await?;
+            Ok(Outcome::done(out))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Substitutes {
+            catalog: ToolCatalog::new().allow(
+                transfer(),
+                ToolSafety::default().max_sensitivity(Sensitivity::Secret),
+            ),
+            client: Arc::clone(&client),
+        })
+        .build();
+
+    let out = runtime.run("substitutes", json!({})).await.unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+    assert!(
+        client.calls.lock().unwrap().is_empty(),
+        "the unchecked arguments reached the tool"
+    );
+}
+
+#[derive(Debug)]
+struct BypassesSink {
+    catalog: ToolCatalog,
+    client: Arc<Fake>,
+}
+
+#[async_trait::async_trait]
+impl Skill for BypassesSink {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("bypass-sink").provides("bypass-sink")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let call = ToolCall::prepare(
+            &self.catalog,
+            Arc::clone(&self.client) as Arc<dyn ToolClient>,
+            transfer(),
+            json!({ "recipient": "attacker", "amount": 50_000 }),
+        )
+        .map_err(|error| SkillError::Other(error.to_string()))?;
+        let out = cx.effect(call).await?;
+        Ok(Outcome::done(out))
+    }
+}
+
+/// An effect carrying outbound arguments must be structurally forced through
+/// `sink`; otherwise every field and taint check is an optional convention.
+#[tokio::test]
+async fn a_tool_call_cannot_bypass_sink_gates_through_effect() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let catalog = ToolCatalog::new().allow(
+        transfer(),
+        ToolSafety::default().max_sensitivity(Sensitivity::Secret),
+    );
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(BypassesSink {
+            catalog,
+            client: Arc::clone(&client),
+        })
+        .build()
+        .run("bypass-sink", json!({}))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+    assert!(client.calls.lock().unwrap().is_empty());
+}
+
+#[derive(Debug)]
+struct SendsStructured {
+    catalog: ToolCatalog,
+    client: Arc<Fake>,
+    recipient_label: Label,
+}
+
+#[async_trait::async_trait]
+impl Skill for SendsStructured {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("structured").provides("structured")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let recipient = Tainted::with_label(json!("treasury"), self.recipient_label.clone());
+        let arguments = Tainted::object([
+            ("recipient".to_owned(), recipient),
+            (
+                "memo".to_owned(),
+                Tainted::from_source(
+                    json!("untrusted descriptive text is allowed here"),
+                    SourceId::new("model.complete"),
+                ),
+            ),
+        ]);
+        let call = ToolCall::prepare(
+            &self.catalog,
+            Arc::clone(&self.client) as Arc<dyn ToolClient>,
+            transfer(),
+            arguments.peek().clone(),
+        )
+        .map_err(|error| SkillError::Other(error.to_string()))?;
+        let out = cx.sink(call, &arguments).await?;
+        Ok(Outcome::done(out))
+    }
+}
+
+fn protected_transfer_catalog() -> ToolCatalog {
+    ToolCatalog::new().allow(
+        transfer(),
+        ToolSafety::default()
+            .max_sensitivity(Sensitivity::Secret)
+            .protect(ProtectedField::trusted("/recipient")),
+    )
+}
+
+/// Field-level provenance avoids releasing an entire model-produced body
+/// merely to preserve a trusted high-risk selector beside it.
+#[tokio::test]
+async fn untrusted_content_may_accompany_a_trusted_protected_tool_argument() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsStructured {
+            catalog: protected_transfer_catalog(),
+            client: Arc::clone(&client),
+            recipient_label: Label::trusted(),
+        })
+        .build()
+        .run("structured", json!({}))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "{:?}",
+        out.status
+    );
+    assert_eq!(client.calls.lock().unwrap().as_slice(), ["ledger/transfer"]);
+}
+
+/// The same structure is refused when untrusted data chooses the protected
+/// recipient, even though ordinary content is allowed to remain untrusted.
+#[tokio::test]
+async fn untrusted_data_cannot_select_a_protected_tool_argument() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsStructured {
+            catalog: protected_transfer_catalog(),
+            client: Arc::clone(&client),
+            recipient_label: Label::untrusted(SourceId::new("model.complete")),
+        })
+        .build()
+        .run("structured", json!({}))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+    assert!(client.calls.lock().unwrap().is_empty());
+}
+
+/// Read-only describes world mutation, not authority. An attacker-selected
+/// URL, tenant, path, or account can still expose data or trigger SSRF, so an
+/// explicit protected selector must be checked on reads too.
+#[tokio::test]
+async fn untrusted_data_cannot_select_a_protected_read_only_argument() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let catalog = ToolCatalog::new().allow(
+        transfer(),
+        ToolSafety::read_only()
+            .max_sensitivity(Sensitivity::Secret)
+            .protect(ProtectedField::trusted("/recipient")),
+    );
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsStructured {
+            catalog,
+            client: Arc::clone(&client),
+            recipient_label: Label::untrusted(SourceId::new("model.complete")),
+        })
+        .build()
+        .run("structured", json!({}))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+    assert!(client.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_protected_tool_argument_must_derive_only_from_allowed_sources() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let catalog = ToolCatalog::new().allow(
+        transfer(),
+        ToolSafety::default()
+            .max_sensitivity(Sensitivity::Secret)
+            .protect(ProtectedField::from_sources(
+                "/recipient",
+                [SourceId::new("run.input")],
+            )),
+    );
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsStructured {
+            catalog,
+            client: Arc::clone(&client),
+            recipient_label: Label::untrusted(SourceId::new("model.complete")),
+        })
+        .build()
+        .run("structured", json!({}))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+    assert!(client.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_protected_tool_argument_honours_its_own_sensitivity_ceiling() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let catalog = ToolCatalog::new().allow(
+        transfer(),
+        ToolSafety::default()
+            .max_sensitivity(Sensitivity::Secret)
+            .protect(ProtectedField::trusted("/recipient").max_sensitivity(Sensitivity::Internal)),
+    );
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsStructured {
+            catalog,
+            client: Arc::clone(&client),
+            recipient_label: Label::trusted().with_sensitivity(Sensitivity::Confidential),
+        })
+        .build()
+        .run("structured", json!({}))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+    assert!(client.calls.lock().unwrap().is_empty());
+}
+
+/// A model's chosen tool name resolves exactly, or not at all.
+///
+/// This is the bridge between a completion and a dispatch, and it carries most
+/// of the risk in tool-calling: the string was *generated*, and everything after
+/// it treats the result as authority. A resolver that helpfully corrects a near
+/// miss hands the model the power to reach a tool by describing it — which is
+/// the opposite of a catalogue, whose whole purpose is that authority comes from
+/// the operator's list.
+#[test]
+fn a_model_chosen_tool_name_is_matched_exactly_or_refused() {
+    use agentplane::tools::{ToolCatalog, ToolId, ToolSafety};
+
+    let granted = ToolId::new("ledger", "transfer");
+    let catalog = ToolCatalog::new().allow(granted.clone(), ToolSafety::default());
+
+    assert_eq!(
+        catalog.resolve("ledger__transfer"),
+        Some(granted.clone()),
+        "the exact wire name must resolve, or nothing can be called at all"
+    );
+    assert!(
+        catalog.resolve("ledger/transfer").is_none(),
+        "the manifest spelling is not the wire spelling: a provider rejects a \
+         function name containing '/' before the model ever sees it"
+    );
+
+    // Every one of these is a name a model plausibly emits, and every one must
+    // be a refusal rather than a helpful correction.
+    for near in [
+        "ledger/Transfer",  // case
+        "ledger/transfer ", // trailing space
+        " ledger/transfer", // leading space
+        "ledger/transfe",   // truncated
+        "ledger/transfers", // pluralised
+        "ledger.transfer",  // wrong separator
+        "transfer",         // server dropped
+        "ledger/",          // prefix only
+    ] {
+        assert!(
+            catalog.resolve(near).is_none(),
+            "'{near}' resolved to a granted tool. A near miss must be refused: \
+             correcting it lets a model reach a tool by describing it, which is \
+             the authority the catalogue exists to keep with the operator"
+        );
+    }
+
+    // And what is declared to a model comes from the same list it is checked
+    // against, so the two cannot disagree.
+    let declared: Vec<String> = catalog.granted().map(ToolId::wire_name).collect();
+    assert_eq!(declared, vec!["ledger__transfer".to_owned()]);
+    assert!(
+        declared.iter().all(|d| catalog.resolve(d).is_some()),
+        "a tool declared to the model does not resolve, so the model would be \
+         offered something that is refused after it has been paid for"
     );
 }

@@ -55,13 +55,18 @@ pub enum Topology {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Collaboration {
+    // `ContextOverflow` used to sit here and was removed rather than kept as a
+    // documented no-op. Whether work exceeds a context window is not a property
+    // of the graph, so the contract could not check it — and an unchecked
+    // justification is not a weak control, it is an *escape hatch*: a plan
+    // refused as false parallelism was approved by editing one word, which made
+    // the two real checks optional for anyone who noticed. I12 leaves two
+    // choices for a control nothing enforces, and this is the other one.
     /// Sub-tasks operate on disjoint inputs.
     ///
     /// Checked, not taken on trust: overlapping inputs are *false parallelism*,
     /// where the coordination cost is paid and no parallelism is obtained.
     ParallelDisjoint,
-    /// The work genuinely exceeds one context window.
-    ContextOverflow,
     /// Sub-tasks need strictly different authority.
     ///
     /// The best reason to split agents, and the one least often named: if a
@@ -161,7 +166,7 @@ pub struct PlanNode {
     pub verifies: bool,
     /// Judge this node's work more than once, from declared angles.
     ///
-    /// For steps where a single execution is not adequate evidence — §1.2's
+    /// For steps where a single execution is not adequate evidence — the
     /// pass^k collapse. `None` is one judgement, which is the right default:
     /// a panel on every node would pay the cost everywhere and mean nothing
     /// anywhere.

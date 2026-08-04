@@ -144,7 +144,7 @@ impl Skill for Touch {
     }
 }
 
-fn runtime(store: &Arc<RedbStore>, world: &World, failing: Option<&'static str>) -> Runtime {
+fn runtime(store: &Arc<RedbStore>, world: &World, failing: Option<&'static str>) -> Arc<Runtime> {
     let mut b = Runtime::builder(store.clone() as Arc<dyn JournalStore>).owner("sim");
     for name in ["a", "b", "c"] {
         b = b.skill(Touch {

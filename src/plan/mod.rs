@@ -269,8 +269,6 @@ fn check_topology(plan: &PlanIR) -> Result<(), PlanError> {
                 });
             }
         }
-        // Whether the work exceeds a context window is not a graph property.
-        Collaboration::ContextOverflow => {}
     }
     Ok(())
 }

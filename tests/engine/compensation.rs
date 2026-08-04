@@ -187,7 +187,7 @@ fn chain() -> PlanIR {
     ])
 }
 
-fn runtime(store: &Arc<RedbStore>, steps: Vec<Step>) -> Runtime {
+fn runtime(store: &Arc<RedbStore>, steps: Vec<Step>) -> Arc<Runtime> {
     let mut b = Runtime::builder(store.clone() as Arc<dyn JournalStore>).owner("test");
     for s in steps {
         b = b.skill(s);
@@ -667,8 +667,13 @@ async fn a_compensation_may_wait_for_a_human_and_the_unwind_resumes() {
     // The approval arrives.
     let delivery = rt
         .deliver(
-            &InboundEvent::new("EV-1", "refund.approved", json!({ "by": "auditor" }))
-                .correlate(key),
+            &InboundEvent::new(
+                "urn:test:auditor",
+                "EV-1",
+                "refund.approved",
+                json!({ "by": "auditor" }),
+            )
+            .correlate(key),
         )
         .await
         .unwrap();

@@ -146,7 +146,7 @@ impl Skill for Once {
 
 struct Fixture {
     store: Arc<RedbStore>,
-    rt: Runtime,
+    rt: Arc<Runtime>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -503,9 +503,11 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                 Append::new(
                     run,
                     RecordKind::RunAdmitted {
-                        agent: "demo.once".into(),
+                        capability: "demo.once".into(),
+                        governed_by: None,
                         input: json!({}),
-                        policy: None,
+                        input_label: agentplane::core::Label::trusted(),
+                        policy_bundle: None,
                     },
                 ),
                 Append::new(

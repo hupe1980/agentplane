@@ -55,7 +55,7 @@ impl Skill for Sleeps {
 
 struct Fixture {
     store: Arc<RedbStore>,
-    rt: Runtime,
+    rt: Arc<Runtime>,
     woke: Arc<AtomicUsize>,
 }
 

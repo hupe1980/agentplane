@@ -20,6 +20,16 @@ pub enum RuntimeError {
     #[error("plan contract violation: {0}")]
     PlanContract(String),
 
+    /// An open run would continue under policy semantics other than the bundle
+    /// recorded at admission.
+    #[error(
+        "policy bundle changed while resuming an open run: recorded {recorded:?}, configured {configured:?}"
+    )]
+    PolicyBundleChanged {
+        recorded: Option<crate::core::Digest>,
+        configured: Option<crate::core::Digest>,
+    },
+
     #[error("no skill provides capability '{0}'")]
     NoProvider(String),
 
@@ -350,9 +360,67 @@ pub enum PolicyError {
     },
 
     /// An argument derived from untrusted data reached a mutating sink without
-    /// an explicit, journaled declassification.
-    #[error("untrusted data may not reach mutating sink '{sink}' without declassification")]
+    /// an explicit, policy-authorized release.
+    #[error("untrusted data may not reach mutating sink '{sink}' without an authorized release")]
     TaintGate { sink: String },
+
+    /// A sink did not expose the value it will send, so the runtime cannot bind
+    /// the information-flow decision to the outbound call.
+    #[error("sink '{sink}' does not bind the arguments it sends to the value checked by policy")]
+    UnboundSinkArguments { sink: String },
+
+    /// A caller tried to dispatch an outbound-value effect through the generic
+    /// effect API, bypassing information-flow enforcement.
+    #[error("sink '{sink}' must be dispatched with StepCtx::sink so its outbound value is checked")]
+    SinkGateRequired { sink: String },
+
+    /// The labeled value presented to the gate differs from the value the sink
+    /// will send.
+    #[error(
+        "sink '{sink}' attempted to send arguments other than the labeled value policy checked"
+    )]
+    SinkArgumentsMismatch { sink: String },
+
+    /// A field the sink declares security-sensitive is absent from the value.
+    #[error("sink '{sink}' requires protected field '{path}', but the argument is absent")]
+    ProtectedFieldMissing { sink: String, path: String },
+
+    /// Untrusted data attempted to choose a protected sink argument.
+    #[error("untrusted data may not select protected field '{path}' of sink '{sink}'")]
+    ProtectedFieldTaint { sink: String, path: String },
+
+    /// A protected field derives from a source outside its operator declaration.
+    #[error(
+        "protected field '{path}' of sink '{sink}' derives from undeclared source '{actual_source}'"
+    )]
+    ProtectedFieldSource {
+        sink: String,
+        path: String,
+        actual_source: String,
+    },
+
+    /// A protected field exceeds its own sensitivity ceiling.
+    #[error(
+        "protected field '{path}' sensitivity {actual:?} exceeds sink '{sink}' field ceiling {ceiling:?}"
+    )]
+    ProtectedFieldSensitivity {
+        sink: String,
+        path: String,
+        actual: Sensitivity,
+        ceiling: Sensitivity,
+    },
+
+    /// A field-specific release was requested for a value whose field lineage
+    /// was never tracked.
+    #[error(
+        "release scope contains a missing or untracked field; use Tainted::object/array before releasing selected fields"
+    )]
+    UntrackedReleaseField,
+
+    /// A serialized release bypassed the safe constructors and violated the
+    /// typed-release invariants.
+    #[error("invalid release: {detail}")]
+    InvalidRelease { detail: String },
 
     /// A value's sensitivity exceeds what the sink is allowed to receive. This
     /// is the exfiltration path that matters: not the network, but a
@@ -362,6 +430,15 @@ pub enum PolicyError {
         sink: String,
         actual: Sensitivity,
         ceiling: Sensitivity,
+    },
+
+    /// A handoff would make the authority chain deeper than this agent's
+    /// reviewed declaration permits.
+    #[error("delegation depth {actual} exceeds sink '{sink}' ceiling {ceiling}")]
+    DelegationDepth {
+        sink: String,
+        actual: usize,
+        ceiling: usize,
     },
 }
 

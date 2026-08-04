@@ -313,6 +313,9 @@ struct OutputItem {
     arguments: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    /// The call id a result must be returned under.
+    #[serde(default)]
+    call_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,6 +389,31 @@ impl ApiResponse {
             .and_then(|i| i.arguments.as_deref())
     }
 
+    /// Tool calls the model asked for, excluding this crate's forced one.
+    ///
+    /// Must agree with the streaming path: streaming is the default, so a
+    /// difference here would surface as a loop that fires in tests and never in
+    /// production.
+    ///
+    /// `OpenAI` sends arguments as a JSON **string**, so unlike Anthropic there is
+    /// parsing to do — and a call whose arguments do not parse is dropped rather
+    /// than passed on half-built, since dispatching a real side effect from a
+    /// fragment is worse than reporting nothing.
+    fn tool_calls(&self) -> Vec<super::ToolCall> {
+        self.output
+            .iter()
+            .filter(|i| i.kind == "function_call")
+            .filter(|i| i.name.as_deref() != Some(RESPOND_TOOL))
+            .filter_map(|i| {
+                Some(super::ToolCall {
+                    id: i.call_id.clone()?,
+                    name: i.name.clone()?,
+                    arguments: serde_json::from_str(i.arguments.as_deref()?).ok()?,
+                })
+            })
+            .collect()
+    }
+
     /// The model's own refusal, if it emitted one.
     fn refusal(&self) -> Option<&str> {
         self.output
@@ -419,6 +447,45 @@ fn input(prompt: &Value) -> Value {
     }
 }
 
+/// Append the turn that already happened, as Responses items.
+///
+/// The input array holds typed items, so a continuation is two per call: the
+/// `function_call` the model emitted, then a `function_call_output` carrying the
+/// same `call_id`. Both are required — an output whose call is missing is
+/// rejected with *"No tool call found for function call output with `call_id`"*,
+/// which is the single most common mistake against this API.
+///
+/// A string input becomes a message item first, because items and a bare string
+/// cannot be mixed in one array.
+fn continue_with(input: Value, exchanges: &[super::ToolExchange]) -> Value {
+    if exchanges.is_empty() {
+        return input;
+    }
+    let mut out = match input {
+        Value::Array(v) => v,
+        other => vec![json!({ "role": "user", "content": other })],
+    };
+    for e in exchanges {
+        out.push(json!({
+            "type": "function_call",
+            "call_id": e.call.id,
+            "name": e.call.name,
+            // Responses carries arguments as a JSON *string*, unlike the object
+            // Anthropic takes.
+            "arguments": e.call.arguments.to_string(),
+        }));
+        out.push(json!({
+            "type": "function_call_output",
+            "call_id": e.call.id,
+            "output": match &e.output {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            },
+        }));
+    }
+    Value::Array(out)
+}
+
 /// The system instruction, if the caller set one.
 ///
 /// Spelled `system` by the caller and `instructions` on the wire, because that
@@ -436,11 +503,13 @@ impl OpenAi {
         model: &ModelId,
         prompt: &Value,
         schema: Option<&Value>,
+        tools: &[super::ToolDeclaration],
+        exchanges: &[super::ToolExchange],
     ) -> Result<Value, ModelError> {
         let mut body = json!({
             "model": model.model,
             "max_output_tokens": self.max_output_tokens,
-            "input": input(prompt),
+            "input": continue_with(input(prompt), exchanges),
         });
         if let Some(system) = instructions(prompt) {
             body["instructions"] = system;
@@ -450,6 +519,31 @@ impl OpenAi {
         }
         if self.stream {
             body["stream"] = json!(true);
+        }
+        // Responses wraps each declaration: `{type: "function", function: {name,
+        // description, parameters}}`, where Anthropic takes the three fields at
+        // the top level under `input_schema`. `strict` enforces the argument
+        // schema *during* generation rather than checking afterwards — worth
+        // having, and not a security control: a well-formed argument is still
+        // an untrusted one, and the sink's field-provenance rules are what
+        // refuse it.
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(
+                tools
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": t.parameters,
+                                "strict": true,
+                            }
+                        })
+                    })
+                    .collect(),
+            );
         }
         Ok(body)
     }
@@ -537,6 +631,7 @@ impl OpenAi {
 
         Ok(Completion {
             structured: structured_value,
+            tool_calls: parsed.tool_calls(),
             text,
             usage,
             stop_reason: Some(parsed.incomplete_details.as_ref().map_or_else(
@@ -655,7 +750,11 @@ impl ModelProvider for OpenAi {
             model,
             prompt,
             schema,
+            tools,
+            exchanges,
         } = request;
+
+        super::refuse_provider_side_media(prompt, model)?;
 
         self.check_egress(model)?;
 
@@ -663,7 +762,7 @@ impl ModelProvider for OpenAi {
             .http
             .post(format!("{}/v1/responses", self.base))
             .bearer_auth(self.key.expose())
-            .json(&self.body(model, prompt, schema)?)
+            .json(&self.body(model, prompt, schema, tools, exchanges)?)
             .send()
             .await
             .map_err(|e| classify_transport(model, &e))?;
@@ -701,6 +800,8 @@ mod tests {
                 &ModelId::new("openai", "gpt-x"),
                 &json!({ "system": "answer only in French", "input": "hi" }),
                 None,
+                &[],
+                &[],
             )
             .expect("body");
         assert_eq!(
@@ -717,6 +818,8 @@ mod tests {
                 &ModelId::new("openai", "gpt-x"),
                 &json!({ "system": "be terse", "ticket": "printer on fire" }),
                 None,
+                &[],
+                &[],
             )
             .expect("body");
         let asked = body["input"].as_str().unwrap_or_default();
@@ -733,11 +836,116 @@ mod tests {
     #[test]
     fn a_prompt_without_a_system_sends_no_instructions() {
         let body = driver()
-            .body(&ModelId::new("openai", "gpt-x"), &json!("hi"), None)
+            .body(
+                &ModelId::new("openai", "gpt-x"),
+                &json!("hi"),
+                None,
+                &[],
+                &[],
+            )
             .expect("body");
         assert!(
             body.get("instructions").is_none(),
             "an unset instruction must not become an empty one: {body}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+    use crate::model::ToolDeclaration;
+
+    /// Responses wraps a declaration; Anthropic does not.
+    ///
+    /// `{type: "function", function: {name, description, parameters}}` against
+    /// Anthropic's three top-level fields under `input_schema`. Sending either
+    /// shape to the other provider is rejected, so both are pinned.
+    #[test]
+    fn a_declared_tool_is_rendered_in_openais_shape() {
+        let body = OpenAi::new("test-key")
+            .expect("driver")
+            .body(
+                &ModelId::new("openai", "gpt-x"),
+                &json!({ "input": "hi" }),
+                None,
+                &[ToolDeclaration::new(
+                    "ledger.read",
+                    "Read a ledger entry.",
+                    json!({ "type": "object" }),
+                )],
+                &[],
+            )
+            .expect("a body with tools");
+
+        let f = &body["tools"][0];
+        assert_eq!(
+            f["type"], "function",
+            "Responses requires the wrapper: {body}"
+        );
+        assert_eq!(f["function"]["name"], "ledger.read");
+        assert_eq!(
+            f["function"]["parameters"]["type"], "object",
+            "OpenAI names the argument schema `parameters`; `input_schema` is \
+             Anthropic's spelling: {body}"
+        );
+        assert_eq!(
+            f["function"]["strict"], true,
+            "strict mode enforces the argument schema during generation rather \
+             than checking after the tokens are paid for: {body}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use crate::model::{ToolCall as ModelToolCall, ToolExchange};
+
+    /// Responses pairs a `function_call` with a `function_call_output`.
+    ///
+    /// An output whose call is absent is rejected — *"No tool call found for
+    /// function call output with `call_id`"* — which is the commonest mistake
+    /// against this API, so the pairing is pinned rather than assumed. Note the
+    /// arguments are a JSON **string** here and an object on Anthropic.
+    #[test]
+    fn a_continuation_pairs_the_call_with_its_output() {
+        let body = OpenAi::new("test-key")
+            .expect("driver")
+            .body(
+                &ModelId::new("openai", "gpt-x"),
+                &json!({ "input": "balance?" }),
+                None,
+                &[],
+                &[ToolExchange::ok(
+                    ModelToolCall {
+                        id: "call_01".to_owned(),
+                        name: "ledger.read".to_owned(),
+                        arguments: json!({ "id": "AC-1" }),
+                    },
+                    json!({ "balance": 42 }),
+                )],
+            )
+            .expect("a continuation body");
+
+        let items = body["input"].as_array().expect("input items");
+        let call = items
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .expect("the call");
+        let out = items
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .expect("the output");
+
+        assert_eq!(
+            call["call_id"], out["call_id"],
+            "an output without its call is rejected by the API: {body}"
+        );
+        assert!(
+            call["arguments"].is_string(),
+            "Responses carries arguments as a JSON string, unlike Anthropic's \
+             object: {body}"
         );
     }
 }

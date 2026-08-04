@@ -120,7 +120,7 @@ impl Replanner for Fallback {
 
 struct Fixture {
     store: Arc<RedbStore>,
-    rt: Runtime,
+    rt: Arc<Runtime>,
     replans: Arc<AtomicUsize>,
 }
 
@@ -585,7 +585,7 @@ mod unwinding {
         }
     }
 
-    fn runtime(planner: Arc<dyn Replanner>, log: &Log) -> Runtime {
+    fn runtime(planner: Arc<dyn Replanner>, log: &Log) -> Arc<Runtime> {
         let store = Arc::new(RedbStore::open_in_memory().unwrap());
         Runtime::builder(store as Arc<dyn JournalStore>)
             .owner("test")

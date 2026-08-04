@@ -125,7 +125,7 @@ impl Skill for Spends {
 
 struct Fixture {
     store: Arc<RedbStore>,
-    rt: Runtime,
+    rt: Arc<Runtime>,
     calls: Arc<AtomicUsize>,
 }
 

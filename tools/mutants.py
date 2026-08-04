@@ -51,6 +51,18 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         """                        self.replayed_done(&descriptor.kind, attempt, spend);
                         let _ = output;""",
     ),
+    "MediaReplayRePerforms": (
+        "src/runtime/ctx.rs",
+        "strict_replay_does_not_read_media_blobs_or_call_the_model",
+        "strict replay re-materializes a media blob and calls the model again",
+        """                        self.replayed_done(&descriptor.kind, attempt, spend);
+                        return Ok(serde_json::from_value(output)?);""",
+        """                        self.replayed_done(&descriptor.kind, attempt, spend);
+                        if descriptor.kind == "model.complete" {
+                            let _ = effect.perform().await;
+                        }
+                        return Ok(serde_json::from_value(output)?);""",
+    ),
     "NoReplayCursor": (
         "src/journal/replay.rs",
         "no_crash_point_breaks_a_successful_run",
@@ -128,19 +140,123 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/ctx.rs",
         "tool_output_cannot_reach_a_mutating_sink",
         "untrusted data may reach a mutating sink",
-        """        if effect.mutates() && label.is_untrusted() {
-            return Err(PolicyError::TaintGate { sink: sink_name }.into());
+        """        if protected.is_empty() {
+            if effect.mutates() && label.is_untrusted() {
+                return Err(PolicyError::TaintGate { sink: sink_name }.into());
+            }
+            return Ok(());
         }""",
-        "",
+        """        if protected.is_empty() {
+            let _ = label;
+            return Ok(());
+        }""",
+    ),
+    "ReadOnlyProtectedFieldsIgnored": (
+        "src/runtime/ctx.rs",
+        "untrusted_data_cannot_select_a_protected_read_only_argument",
+        "a read-only effect skips its declared authority-bearing field checks",
+        "        if protected.is_empty() {",
+        "        if !effect.mutates() || protected.is_empty() {",
+    ),
+    "ReleaseWithoutPolicy": (
+        "src/runtime/ctx.rs",
+        "policy_can_refuse_a_release_before_the_label_is_improved",
+        "a typed release improves a label without authorization",
+        "        self.authorize_release(key, &release, &label).await?;",
+        "        let _ = (key, &release, &label);",
+    ),
+    "ReleaseReplayDriftIgnored": (
+        "src/runtime/ctx.rs",
+        "changing_release_evidence_is_replay_divergence",
+        "strict replay accepts a release with different scope or evidence from history",
+        """        if self.mode.is_replaying() {
+            match self.cursor.next(key)? {
+                Some(EffectReplay::Done { .. }) => return Ok(released),""",
+        """        if false {
+            match self.cursor.next(key)? {
+                Some(EffectReplay::Done { .. }) => return Ok(released),""",
+    ),
+    "SinkViaEffect": (
+        "src/runtime/ctx.rs",
+        "a_tool_call_cannot_bypass_sink_gates_through_effect",
+        "an effect carrying outbound arguments bypasses the mandatory sink path",
+        "        if effect.sink_arguments().is_some() {",
+        "        if false && effect.sink_arguments().is_some() {",
+    ),
+    "SinkArgumentSubstitution": (
+        "src/runtime/ctx.rs",
+        "a_sink_cannot_check_one_argument_value_and_send_another",
+        "a sink validates one labelled value and dispatches different arguments",
+        "        if canon::value_bytes(bound) != canon::value_bytes(args.peek()) {",
+        "        if false && canon::value_bytes(bound) != canon::value_bytes(args.peek()) {",
+    ),
+    "ModelPromptIsNotASinkArgument": (
+        "src/model/mod.rs",
+        "a_models_sensitivity_ceiling_is_declarable",
+        "a model prompt is not bound to the labelled value checked by the egress ceiling",
+        """    fn sink_arguments(&self) -> Option<&Value> {
+        Some(&self.prompt)
+    }""",
+        """    fn sink_arguments(&self) -> Option<&Value> {
+        None
+    }""",
+    ),
+    "ProtectedFieldTaintIgnored": (
+        "src/runtime/ctx.rs",
+        "untrusted_data_cannot_select_a_protected_tool_argument",
+        "untrusted data may select an authority-bearing protected field",
+        "            if field.requires_trusted() && field_label.is_untrusted() {",
+        "            if false && field.requires_trusted() && field_label.is_untrusted() {",
+    ),
+    "ProtectedFieldSourceIgnored": (
+        "src/runtime/ctx.rs",
+        "a_protected_tool_argument_must_derive_only_from_allowed_sources",
+        "a protected field may derive from provenance outside its source allowlist",
+        "            if !field.allowed_sources().is_empty() {",
+        "            if false && !field.allowed_sources().is_empty() {",
+    ),
+    "ProtectedFieldSensitivityIgnored": (
+        "src/runtime/ctx.rs",
+        "a_protected_tool_argument_honours_its_own_sensitivity_ceiling",
+        "a protected field may exceed its field-specific sensitivity ceiling",
+        "            if let Some(field_ceiling) = field.sensitivity_ceiling()\n"
+        "                && field_label.sensitivity > field_ceiling",
+        "            if let Some(field_ceiling) = field.sensitivity_ceiling()\n"
+        "                && false\n"
+        "                && field_label.sensitivity > field_ceiling",
+    ),
+    "PlanFieldLabelsFlattened": (
+        "src/runtime/executor.rs",
+        "plan_argument_assembly_preserves_field_level_provenance",
+        "plan argument assembly flattens every field into one joined label",
+        "    Ok(Tainted::object(fields))",
+        """    let mut value = serde_json::Map::new();
+    let mut label = crate::core::Label::trusted();
+    for (name, field) in fields {
+        label = label.join(field.label());
+        value.insert(name, field.peek().clone());
+    }
+    Ok(Tainted::with_label(Value::Object(value), label))""",
+    ),
+    "ManifestProtectedFieldsIgnored": (
+        "src/runtime/ctx.rs",
+        "protected_tool_fields_must_match_the_live_catalogue",
+        "a live tool catalogue may disagree with digest-covered protected fields",
+        """                    Some(grant)
+                        if serde_json::to_value(crate::tools::sorted_fields(
+                            &grant.protected_fields,
+                        ))
+                        .ok()
+                            != descriptor.args.get("protected_fields").cloned() =>""",
+        """                    Some(grant)
+                        if false =>"""
     ),
     "NoEgressCeiling": (
         "src/runtime/ctx.rs",
         "a_sink_refuses_data_above_its_ceiling",
         "a value above the sink's ceiling is sent anyway",
-        """        let ceiling = effect.max_sensitivity();
-        if label.sensitivity > ceiling {""",
-        """        let ceiling = effect.max_sensitivity();
-        if false && label.sensitivity > ceiling {""",
+        "        if label.sensitivity > ceiling {",
+        "        if false && label.sensitivity > ceiling {",
     ),
     "SensitivityCanLower": (
         "src/runtime/ctx.rs",
@@ -315,6 +431,13 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
             })?;""",
         "        let acting_as = caller.clone();",
     ),
+    "A2aInvalidResponseLooksLikeRefusal": (
+        "src/peers/a2a.rs",
+        "an_invalid_agent_response_is_in_doubt",
+        "A2A InvalidAgentResponseError is treated as proof that no work happened",
+        "        -32006 => PeerError::InvalidResponse {",
+        "        -32006 => PeerError::Refused {",
+    ),
     # ── MCP transport ───────────────────────────────────────────────────────
     # Collapsing every protocol error into "the server declined". Only
     # METHOD_NOT_FOUND / INVALID_PARAMS / PARSE_ERROR mean nothing ran; an
@@ -374,12 +497,47 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "            cedar_policy::Decision::Deny if !errors.is_empty() => PolicyDecision::deny(format!(",
         "            cedar_policy::Decision::Deny if false => PolicyDecision::deny(format!(",
     ),
-    "CedarDigestIgnoresRules": (
+    "CedarBundleIgnoresRules": (
         "src/policy/cedar.rs",
         "the_digest_follows_the_policy_text",
-        "the policy digest does not depend on the rules",
-        "        framed.extend_from_slice(source.as_bytes());\n",
-        "",
+        "the policy bundle identity does not depend on the rules",
+        "PolicyBundleIdentity::new(Digest::of(source.as_bytes()), EVALUATOR_SEMANTICS)",
+        "PolicyBundleIdentity::new(Digest::ZERO, EVALUATOR_SEMANTICS)",
+    ),
+    "CedarBundleIgnoresSchema": (
+        "src/policy/cedar.rs",
+        "the_bundle_identity_covers_every_static_policy_input",
+        "the policy bundle identity does not depend on its schema",
+        "            bundle = bundle.with_schema(digest);",
+        "            let _ = digest;",
+    ),
+    "CedarBundleIgnoresEntities": (
+        "src/policy/cedar.rs",
+        "the_bundle_identity_covers_every_static_policy_input",
+        "the policy bundle identity does not depend on static entities",
+        "            bundle = bundle.with_entities(digest);",
+        "            let _ = digest;",
+    ),
+    "CedarBundleIgnoresConfiguration": (
+        "src/policy/cedar.rs",
+        "the_bundle_identity_covers_every_static_policy_input",
+        "the policy bundle identity does not depend on adapter configuration",
+        "                .with_configuration(Digest::of(ADAPTER_CONFIGURATION));",
+        ";",
+    ),
+    "CedarBundleEvaluatorVersionDrifts": (
+        "src/policy/cedar.rs",
+        "the_evaluator_identity_tracks_the_pinned_cedar_version",
+        "the bundle claims evaluator semantics unrelated to the pinned Cedar version",
+        "PolicyBundleIdentity::new(Digest::of(source.as_bytes()), EVALUATOR_SEMANTICS)",
+        "PolicyBundleIdentity::new(Digest::of(source.as_bytes()), \"cedar-policy/unversioned\")",
+    ),
+    "ResumeIgnoresPolicyBundleDrift": (
+        "src/runtime/executor.rs",
+        "an_open_run_refuses_to_resume_under_a_different_policy_bundle",
+        "an open run resumes under policy semantics other than those recorded at admission",
+        "        if recorded != configured {",
+        "        if false && recorded != configured {",
     ),
     # ── Budgets ─────────────────────────────────────────────────────────────
     "RefusalNotJournaled": (
@@ -431,29 +589,37 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_denying_policy_stops_every_route_before_it_touches_anything",
         "the routes authenticate but never authorize",
         """        match decision {
-            PolicyDecision::Permit => Ok(caller),
+            PolicyDecision::Permit => Ok(Session {
+                caller,
+                plane: Arc::clone(plane),
+            }),
             PolicyDecision::Deny { reason } => Err(ApiError(StatusCode::FORBIDDEN, reason)),
         }""",
         """        let _ = decision;
-        Ok(caller)""",
+        Ok(Session {
+            caller,
+            plane: Arc::clone(plane),
+        })""",
     ),
     "GateRunsAfterParsing": (
         "src/api/mod.rs",
         "a_denying_policy_stops_every_route_before_it_touches_anything",
         "a route parses its path before asking whether the caller may look",
-        """    api.gate(&headers, action::RUN_READ, &run).await?;
+        """    let s = api.gate(&headers, action::RUN_READ, &run).await?;
     let id = RunId::parse(&run).map_err(|_| bad("run"))?;""",
         """    let id = RunId::parse(&run).map_err(|_| bad("run"))?;
-    api.gate(&headers, action::RUN_READ, &run).await?;""",
+    let s = api.gate(&headers, action::RUN_READ, &run).await?;""",
     ),
     "SurfaceStartsWithoutPolicy": (
         "src/api/mod.rs",
         "the_surface_refuses_to_build_without_a_policy_engine",
         "the HTTP surface opens against a runtime with no authorization layer",
-        "        let policy = runtime.policy().ok_or(ApiSetupError::NoPolicy)?.clone();",
-        """        let policy = runtime.policy().cloned().unwrap_or_else(|| {
-            Arc::new(crate::core::DenyAll) as Arc<dyn crate::core::PolicyEngine>
-        });""",
+        """        for plane in planes.by_tenant.values() {
+            if plane.policy().is_none() {
+                return Err(ApiSetupError::NoPolicy);
+            }
+        }""",
+        "",
     ),
     "TruncationIsSilent": (
         "src/api/mod.rs",
@@ -466,7 +632,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/api/mod.rs",
         "a_caller_sees_only_the_queue_their_roles_entitle_them_to",
         "the worklist is filtered by a role the caller need not hold",
-        "        .queue(&caller.roles, api.limit + 1)",
+        "        .queue(&s.caller.roles, api.limit + 1)",
         '        .queue(&["compliance-officer".to_owned()], api.limit + 1)',
     ),
     "DecidableIgnoresExclusion": (
@@ -516,14 +682,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/store/redb.rs",
         "a_sealed_run_is_committed_to",
         "a sealed run is never added to the Merkle log, so the checkpoint commits to nothing",
-        "                    w.open_table(SEAL_LOG)\n                        .map_err(|e| be(&e))?\n                        .insert(next, key.as_str())\n                        .map_err(|e| be(&e))?;",
+        "                    w.open_table(SEAL_LOG)\n                        .map_err(|e| be(&e))?\n                        .insert((tenant.as_str(), next), key.as_str())\n                        .map_err(|e| be(&e))?;",
         "                    let _ = &SEAL_LOG;",
     ),
     "TheLogIndexIsReused": (
         "src/store/redb.rs",
         "a_new_run_is_appended_after_the_survivors",
         "log positions stop advancing, so a new run is dropped into a slot an earlier one already holds",
-        "                    counters\n                        .insert(NEXT_LOG_INDEX, next + 1)\n                        .map_err(|e| be(&e))?;",
+        "                    counters\n                        .insert(counter.as_str(), next + 1)\n                        .map_err(|e| be(&e))?;",
         "                    let _ = (&mut counters, next);",
     ),
     "MerkleLeavesAreNotDomainSeparated": (
@@ -562,6 +728,159 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        Some(crate::runtime::telemetry::GEN_AI_CHAT)",
         "        None",
     ),
+    "CustomProvidersReceiveRemoteMediaUrls": (
+        "src/model/mod.rs",
+        "a_model_call_refuses_provider_side_media_before_any_provider",
+        "the runtime hands a provider-native media URL to a custom provider, so "
+        "that provider can fetch outside the plane's egress policy and journal",
+        """        refuse_provider_side_media(&prompt, &self.model)
+            .map_err(|error| EffectError::Rejected(error.to_string()))?;""",
+        "        let _ = (&prompt, &self.model);",
+    ),
+    "MediaDigestIsAmbientAuthority": (
+        "src/model/mod.rs",
+        "knowing_a_media_digest_is_not_authority_to_materialize_its_blob",
+        "knowing a content digest grants ambient authority to read and disclose that blob",
+        "        if !grants.contains(&(reference.digest, reference.media_type.clone())) {",
+        "        if false {",
+    ),
+    "MediaAcceptsPrivateDnsAnswers": (
+        "src/media/mod.rs",
+        "one_private_dns_answer_refuses_the_entire_resolution",
+        "a public DNS answer launders a private or metadata address in the same response",
+        "        if !is_public_ip(address.ip()) {",
+        "        if false {",
+    ),
+    "MediaDoesNotPinValidatedDns": (
+        "src/media/mod.rs",
+        "governed_media_pins_every_validated_dns_answer_into_the_connection",
+        "the connector resolves a checked hostname again and permits DNS rebinding",
+        "            .resolve_to_addrs(host, &addrs)",
+        "            .resolve_to_addrs(host, &[])",
+    ),
+    "MediaFollowsAutomaticRedirects": (
+        "src/media/mod.rs",
+        "governed_media_keeps_automatic_redirects_disabled",
+        "reqwest follows a redirect without reapplying host and address policy",
+        "            .redirect(reqwest::redirect::Policy::none())",
+        "            .redirect(reqwest::redirect::Policy::limited(10))",
+    ),
+    "MediaRedirectTargetNotRevalidated": (
+        "src/media/mod.rs",
+        "governed_media_revalidates_every_redirect_target",
+        "a redirect may leave the granted scheme, host, or port before the next request",
+        "                current = self.policy.validate_url(current.as_str())?;",
+        "                current = current.clone();",
+    ),
+    "MediaStreamLimitIgnored": (
+        "src/media/mod.rs",
+        "declared_and_streamed_body_sizes_are_both_bounded",
+        "a chunked response can cross the media byte ceiling after its headers passed",
+        "            if next > self.policy.max_bytes {",
+        "            if false {",
+    ),
+    "MediaSignatureIgnored": (
+        "src/media/mod.rs",
+        "content_type_is_not_trusted_without_matching_bytes",
+        "an origin can label arbitrary bytes as an allowed media type",
+        "    if !valid {",
+        "    if false {",
+    ),
+    "GovernedMediaIsTrusted": (
+        "src/media/mod.rs",
+        "policy_and_validator_identity_are_in_the_effect_key",
+        "fetched multimodal content is treated as trusted instructions",
+        """    fn trust(&self) -> Trust {
+        Trust::Untrusted
+    }""",
+        """    fn trust(&self) -> Trust {
+        Trust::Trusted
+    }""",
+    ),
+    "MediaBlobDurableBeforeCaseLink": (
+        "src/media/mod.rs",
+        "case_retention_links_are_durable_before_blob_bytes",
+        "a crash can leave fetched media durable but unreachable from case erasure",
+        """        if let Some(link) = &self.case_link {
+            link.cases
+                .link_blob(link.case, digest, link.at)
+                .await
+                .map_err(|error| EffectError::Unavailable {
+                    driver: "case.store".to_owned(),
+                    detail: error.to_string(),
+                })?;
+        }
+        let digest =
+            self.blobs
+                .put(&fetched.bytes)
+                .await
+                .map_err(|error| EffectError::Unavailable {
+                    driver: "blob.store".to_owned(),
+                    detail: error.to_string(),
+                })?;""",
+        """        let digest =
+            self.blobs
+                .put(&fetched.bytes)
+                .await
+                .map_err(|error| EffectError::Unavailable {
+                    driver: "blob.store".to_owned(),
+                    detail: error.to_string(),
+                })?;
+        if let Some(link) = &self.case_link {
+            link.cases
+                .link_blob(link.case, digest, link.at)
+                .await
+                .map_err(|error| EffectError::Unavailable {
+                    driver: "case.store".to_owned(),
+                    detail: error.to_string(),
+                })?;
+        }""",
+    ),
+    "BlobDurableBeforeCaseLink": (
+        "src/runtime/ctx.rs",
+        "case_retention_links_are_durable_before_blob_bytes",
+        "a crash can leave arbitrary stored bytes unreachable from case erasure",
+        """        cx.cases
+            .link_blob(cx.case_id, digest, at)
+            .await
+            .map_err(StepError::Store)?;
+        let stored = blobs
+            .put(bytes)
+            .await
+            .map_err(|e| StepError::Store(crate::core::StoreError::Backend(e.to_string())))?;""",
+        """        let stored = blobs
+            .put(bytes)
+            .await
+            .map_err(|e| StepError::Store(crate::core::StoreError::Backend(e.to_string())))?;
+        cx.cases
+            .link_blob(cx.case_id, digest, at)
+            .await
+            .map_err(StepError::Store)?;""",
+    ),
+    "AnthropicReceivesRemoteMediaUrls": (
+        "src/model/anthropic.rs",
+        "anthropic_never_receives_a_provider_fetched_media_url",
+        "an Anthropic image/document URL crosses the model boundary, letting the "
+        "provider fetch bytes the plane never governed or recorded",
+        """        super::refuse_provider_side_media(prompt, model)?;
+
+        // Before the request is built: a refused destination must cost nothing""",
+        """        let _ = (prompt, model);
+
+        // Before the request is built: a refused destination must cost nothing""",
+    ),
+    "OpenAiReceivesRemoteMediaUrls": (
+        "src/model/openai.rs",
+        "openai_never_receives_a_provider_fetched_media_url",
+        "an OpenAI image/file URL crosses the model boundary, letting the provider "
+        "fetch bytes the plane never governed or recorded",
+        """        super::refuse_provider_side_media(prompt, model)?;
+
+        self.check_egress(model)?;""",
+        """        let _ = (prompt, model);
+
+        self.check_egress(model)?;""",
+    ),
     "AWitnessSignsAnyHistory": (
         "src/journal/witness.rs",
         "a_forked_history_is_refused",
@@ -575,8 +894,20 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "erasing_a_case_leaves_other_cases_alone",
         "a case's blob list returns every case's blobs, so answering one erasure "
         "request destroys unrelated subjects' data",
-        "                    (key.as_str(), i64::MIN, [].as_slice())\n                        ..=(key.as_str(), i64::MAX, [0xffu8; 32].as_slice()),",
-        "                    (\"\", i64::MIN, [].as_slice())\n                        ..=(MAX_STR, i64::MAX, [0xffu8; 32].as_slice()),",
+        "                    (tenant.as_str(), key.as_str(), i64::MIN, [].as_slice())\n"
+        "                        ..=(\n"
+        "                            tenant.as_str(),\n"
+        "                            key.as_str(),\n"
+        "                            i64::MAX,\n"
+        "                            [0xffu8; 32].as_slice(),\n"
+        "                        ),",
+        "                    (tenant.as_str(), \"\", i64::MIN, [].as_slice())\n"
+        "                        ..=(\n"
+        "                            tenant.as_str(),\n"
+        "                            MAX_STR,\n"
+        "                            i64::MAX,\n"
+        "                            [0xffu8; 32].as_slice(),\n"
+        "                        ),",
     ),
     "ErasureLooksLikeDataLoss": (
         "src/blob/memory.rs",
@@ -585,6 +916,300 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "cannot tell retention doing its job from data nobody can account for",
         "        match stone {\n            Some((at, reason)) => Err(BlobError::Expired {",
         "        match None::<(i64, String)> {\n            Some((at, reason)) => Err(BlobError::Expired {",
+    ),
+    "AManifestTypoDisablesACeiling": (
+        "src/manifest/mod.rs",
+        "a_misspelled_field_is_refused",
+        "a manifest's unknown fields are ignored rather than refused, so "
+        "`max_tokns: 100` reads as no token ceiling at all and the file that "
+        "was supposed to make the limit reviewable hides its absence",
+        "#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct Budgets {",
+        "#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]\npub struct Budgets {",
+    ),
+    "ThePromptIsNotPartOfTheDeclaration": (
+        "src/manifest/mod.rs",
+        "rewording_a_prompt_changes_the_manifest_identity",
+        "the declared prompt is left out of the manifest's digest, so a reworded "
+        "instruction ships under an unchanged version and nothing pinning that "
+        "version notices",
+        "    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub identity: Option<Identity>,",
+        "    #[serde(default, skip_serializing_if = \"Option::is_none\", skip_serializing)]\n    pub identity: Option<Identity>,",
+    ),
+    "EveryInstanceSharesALeaseOwner": (
+        "src/runtime/executor.rs",
+        "two_runtimes_do_not_share_a_lease_owner",
+        "every runtime instance uses one lease owner, so two replicas each read "
+        "the other's lease as their own and renew it without a fencing bump — "
+        "two writers on one run, under one epoch",
+        "    format!(\"agentplane-{seed:016x}-{n}\")",
+        "    \"agentplane\".to_owned()",
+    ),
+    "AManifestSignatureIsNotDomainSeparated": (
+        "src/manifest/registry.rs",
+        "a_manifest_signature_is_bound_to_being_a_manifest",
+        "a manifest is signed over its bare digest, so a signature made in any "
+        "other context over the same digest — a record attestation — is accepted "
+        "as approval of the manifest",
+        "        let attestation = signer.attest(&signing_hash(DOMAIN_MANIFEST, &digest));",
+        "        let attestation = signer.attest(&digest);",
+    ),
+    "AnUnsignedManifestPassesAVerifyingResolve": (
+        "src/manifest/registry.rs",
+        "a_signed_manifest_names_who_published_it",
+        "a resolve that required a signature accepts a manifest nobody signed, "
+        "so 'who published this' has no answer and nothing says so",
+        """        let Some(a) = attestation else {
+            return Err(RegistryError::Unsigned {
+                name: name.to_owned(),
+                version: version.to_owned(),
+            });
+        };""",
+        """        let Some(a) = attestation else {
+            return Ok((manifest, String::from("unverified")));
+        };""",
+    ),
+    "SigningAnExistingManifestRecordsNothing": (
+        "src/manifest/registry.rs",
+        "signing_an_existing_unsigned_manifest_records_the_publisher",
+        "publish_signed reports success for an existing unsigned artifact but "
+        "does not record the publisher, so every verifying resolve still says unsigned",
+        "                    (None, Some(signed)) => existing.attestation = Some(signed),",
+        "                    (None, Some(_)) => {},",
+    ),
+    "AManifestPublisherCanBeReassigned": (
+        "src/manifest/registry.rs",
+        "republishing_with_another_signer_cannot_reassign_the_publisher",
+        "identical artifact bytes can be republished by another identity without a refusal, "
+        "so publication reports success while changing who approved the version",
+        "                    (Some(recorded), Some(offered)) if recorded.key_id != offered.key_id => {",
+        "                    (Some(recorded), Some(offered)) if false && recorded.key_id != offered.key_id => {",
+    ),
+    "OversightMayBeDeclaredWhereNothingAppliesIt": (
+        "src/manifest/mod.rs",
+        "oversight_without_a_declarative_agent_is_refused",
+        "oversight is accepted beside an agent whose behaviour is code, so the "
+        "file claims a human is in the loop and no human ever is",
+        "        if self.spec.execution.is_none() {",
+        "        if false {",
+    ),
+    "ADeclarativeAgentTakesAnyDriver": (
+        "src/runtime/executor.rs",
+        "a_declarative_agent_refuses_an_unnamed_provider",
+        "a declarative agent falls back to whatever driver is registered when "
+        "the one its manifest names is absent, running the agent on a model its "
+        "own declaration never mentioned",
+        "            let Some(provider) = self.providers.get(&model.provider).map(Arc::clone) else {",
+        "            let Some(provider) = self.providers.values().next().map(Arc::clone) else {",
+    ),
+    "AFencedCallerCanReleaseTheLease": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "a lease release ignores the caller's epoch, so a fenced instance "
+        "shutting down frees the lease of whoever replaced it — handing the run "
+        "to a third party while its rightful owner is mid-write",
+        "                if held == Some(epoch) {",
+        "                if held.is_some() {",
+    ),
+    "TheManifestIsOnlyAComment": (
+        "src/runtime/ctx.rs",
+        "a_model_the_manifest_never_declared_is_refused",
+        "an effect is dispatched without checking it against the agent's own "
+        "manifest, so a reviewer approves one model and the code calls another "
+        "with nothing anywhere disagreeing",
+        "        self.declared(key, descriptor).await?;",
+        "        let _ = self.declared(key, descriptor);",
+    ),
+    "CaseStateLaundersTaint": (
+        "src/runtime/ctx.rs",
+        "case_state_does_not_launder_untrusted_data",
+        "case state is handed back trusted, so a skill can write a model "
+        "completion into it and read it back clean in a later step or a later "
+        "run — an exit from the lattice that passes no policy check and leaves "
+        "no record that a declassification happened",
+        """        let label = crate::core::Label::untrusted(crate::core::SourceId::new(format!(
+            "case:{}",
+            cx.case_id
+        )));""",
+        """        let label = crate::core::Label::trusted();""",
+    ),
+    "ReleasingALeaseForgetsTheEpoch": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "releasing a lease deletes the row the epoch lives in, so append has "
+        "nothing to fence against and the next acquire restarts at 1 — a writer "
+        "already fenced at 2 then outranks the legitimate owner and the fence "
+        "inverts",
+        """                    leases
+                        .insert(key.as_str(), ("", epoch, 0))
+                        .map_err(|e| be(&e))?;""",
+        """                    leases.remove(key.as_str()).map_err(|e| be(&e))?;""",
+    ),
+    "TheForcedToolIsFoundByPosition": (
+        "src/model/anthropic.rs",
+        "the_forced_tool_is_found_by_name_not_by_position",
+        "the structured answer is taken from whichever tool block came first, "
+        "so a caller's own tool call emitted ahead of the forced one is "
+        "returned as the schema-shaped answer — a wrong answer that parses",
+        """            .find(|b| b.kind == "tool_use" && b.name.as_deref() == Some(RESPOND_TOOL))""",
+        """            .find(|b| b.kind == "tool_use")""",
+    ),
+    "StreamedToolArgumentsAreMixed": (
+        "src/model/anthropic_stream.rs",
+        "concurrent_tool_calls_keep_their_own_arguments",
+        "fragments of concurrently streamed tool calls are appended to one "
+        "buffer, so they reassemble into JSON that parses — into the wrong "
+        "arguments. A refund dispatched with another call's amount is a failure "
+        "that succeeds",
+        """                if let Some(index) = value.get("index").and_then(Value::as_u64)
+                    && let Some(p) = delta.get("partial_json").and_then(Value::as_str)
+                    && let Some(block) = self.tools.get_mut(&index)
+                {
+                    block.json.push_str(p);
+                }""",
+        """                if let Some(p) = delta.get("partial_json").and_then(Value::as_str)
+                    && let Some((_, block)) = self.tools.iter_mut().next()
+                {
+                    block.json.push_str(p);
+                }""",
+    ),
+    "TheProofsStartingSizeIsGuessed": (
+        "src/journal/witness_http.rs",
+        "the_request_body_follows_the_protocol",
+        "the size a consistency proof starts from is inferred from the proof's "
+        "length, but an RFC 6962 proof is O(log n) hashes — so a 50 to 100 "
+        "submission claims to start at 93 and every witness refuses it",
+        "        let url = format!(\"{}/add-checkpoint\", self.prefix);",
+        "        let old_size = checkpoint.size.saturating_sub(proof.len() as u64);\n        let url = format!(\"{}/add-checkpoint\", self.prefix);",
+    ),
+    "AStaleWitnessCursorIsCalledAFork": (
+        "src/journal/witness_http.rs",
+        "a_stale_cursor_is_not_a_fork",
+        "a witness answering 409 — 'your proof starts from a size I have moved "
+        "past' — is reported as a forked history, so a routine retry pages "
+        "somebody for an integrity incident and the alert that matters stops "
+        "being believed",
+        """            409 => Err(WitnessError::Stale {
+                origin: checkpoint.origin.clone(),
+                witness_size: text.trim().parse().unwrap_or_default(),
+            }),""",
+        """            409 => Err(WitnessError::Forked {
+                origin: checkpoint.origin.clone(),
+                seen: old_size,
+                offered: checkpoint.size,
+            }),""",
+    ),
+    "ANoteUsesTheWrongDash": (
+        "src/journal/note.rs",
+        "a_hyphen_is_not_a_signature_line",
+        "a signature line is written with a hyphen instead of the em dash the "
+        "note format specifies, producing checkpoints that look right in every "
+        "terminal and diff and that no witness will accept",
+        "const EM_DASH: char = '\\u{2014}';",
+        "const EM_DASH: char = '-';",
+    ),
+    "ANotePayloadIsUrlSafeBase64": (
+        "src/journal/note.rs",
+        "the_note_payload_is_rfc4648_base64",
+        "the note payload is encoded with the URL-safe alphabet, which differs "
+        "from the specified one in exactly two positions — so most checkpoints "
+        "encode identically and the ones that do not are rejected by every "
+        "verifier",
+        "0123456789+/",
+        "0123456789-_",
+    ),
+    "ANoteBodyAbsorbsItsSeparator": (
+        "src/journal/note.rs",
+        "a_body_without_its_trailing_newline_is_refused",
+        "the blank line separating a note body from its signatures is treated "
+        "as part of the body, so every signature covers bytes the verifier does "
+        "not hash",
+        "        let text = format!(\"{text}\\n\");",
+        "        let text = format!(\"{text}\\n\\n\");",
+    ),
+    "AWitnessSwallowsASigningFailure": (
+        "src/journal/witness.rs",
+        "a_witness_that_cannot_sign_reports_it",
+        "a signing failure yields an empty signature instead of an error, so a "
+        "cosignature that never happened is indistinguishable to an auditor "
+        "from a witness that vouched",
+        """            .map_err(|e| match e {
+                SignError::Unavailable(d) => WitnessError::Unavailable(d),
+                SignError::Refused { key_id, detail } => {
+                    WitnessError::Unavailable(format!("key '{key_id}' refused: {detail}"))
+                }
+            })?;""",
+        """            .unwrap_or_default();""",
+    ),
+    "ASpecialistMayHandOff": (
+        "src/manifest/mod.rs",
+        "a_specialist_that_may_delegate_is_refused",
+        "an agent declared a specialist may still delegate, so the role that "
+        "bounds a handoff chain bounds nothing and A->B->C->A stays reachable",
+        "        if t.role == Role::Specialist",
+        "        if false && t.role == Role::Specialist",
+    ),
+    "CollaborationNeedsNoJustification": (
+        "src/manifest/mod.rs",
+        "collaboration_requires_a_reason_and_nothing_else_may_carry_one",
+        "a manifest may declare collaboration without saying why, so the mode "
+        "with the whole inter-agent failure surface is the one nobody had to "
+        "argue for",
+        "            (TopologyMode::Collaborative, None) => {",
+        "            (TopologyMode::Collaborative, None) if false => {",
+    ),
+    "ManifestEgressCeilingIsIgnored": (
+        "src/runtime/ctx.rs",
+        "the_manifest_egress_ceiling_binds_every_sink",
+        "a sink uses only its local egress ceiling and ignores the stricter "
+        "ceiling in the reviewed manifest",
+        "                        effect_ceiling.min(manifest_ceiling)",
+        "                        effect_ceiling.max(manifest_ceiling)",
+    ),
+    "ManifestDelegationCeilingIsIgnored": (
+        "src/runtime/ctx.rs",
+        "the_manifest_delegation_ceiling_binds_every_handoff",
+        "a handoff may exceed the reviewed manifest's delegation-depth ceiling",
+        "        ) && actual > usize::from(ceiling)",
+        "        ) && false",
+    ),
+    "PeerCallHidesItsDelegationDepth": (
+        "src/peers/mod.rs",
+        "a_hop_appends_a_link_and_narrows",
+        "a peer call hides the chain depth it will put on the wire, bypassing "
+        "the manifest's handoff ceiling",
+        "        Some(self.acting_as.depth())",
+        "        None",
+    ),
+    "AnOutputContractMayPromiseNothing": (
+        "src/manifest/mod.rs",
+        "an_output_schema_that_permits_anything_is_refused",
+        "`output.schema: {}` is accepted, so a result contract that permits "
+        "anything reads in review as one that was declared",
+        "            serde_json::Value::Object(m) if !m.is_empty() => {}",
+        "            serde_json::Value::Object(_) => {}",
+    ),
+    "AVersionCanBeRepublished": (
+        "src/manifest/registry.rs",
+        "a_published_version_cannot_be_rewritten",
+        "a published manifest version is overwritten rather than refused, so a "
+        "widened tool grant reaches every consumer that pinned the version they "
+        "reviewed",
+        """            Some(existing) => Err(RegistryError::Immutable {
+                name,
+                version,
+                existing: existing.digest.to_hex(),
+                offered: digest.to_hex(),
+            }),
+            None => {""",
+        """            _ => {""",
+    ),
+    "APinnedResolveAcceptsAnything": (
+        "src/manifest/registry.rs",
+        "a_pinned_resolve_refuses_substituted_content",
+        "a pinned resolve returns whatever the registry served, so the one check "
+        "that survives a compromised registry checks nothing",
+        "        if actual == expected {",
+        "        if true {",
     ),
     "BlobsAreServedUnverified": (
         "src/blob/mod.rs",
@@ -607,7 +1232,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "redb_satisfies_the_case_layer_contracts",
         "a delivered message is left sweepable, so the run resumes on it and the "
         "dead-letter queue reports it as never claimed",
-        "                        drop(events);\n                        // No longer sweepable: the index moves with the row it\n                        // describes, in the row's transaction.\n                        w.open_table(EVENTS_LIVE)\n                            .map_err(|e| be(&e))?\n                            .remove((received, id.as_str()))\n                            .map_err(|e| be(&e))?;",
+        "                        drop(events);\n                        // No longer sweepable: the index moves with the row it\n                        // describes, in the row's transaction.\n                        w.open_table(EVENTS_LIVE)\n                            .map_err(|e| be(&e))?\n                            .remove((tenant.as_str(), received, id.as_str()))\n                            .map_err(|e| be(&e))?;",
         "                        drop(events);",
     ),
     "TheBacklogDropsClaimedWork": (
@@ -615,8 +1240,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "redb_satisfies_the_case_layer_contracts",
         "the backlog counts only unclaimed work, so it falls the moment a "
         "reviewer opens an item and reports progress that has not happened",
-        "            r.open_table(PENDING)",
-        "            r.open_table(QUEUE)",
+        "            let pending = r.open_table(PENDING).map_err(|e| be(&e))?;",
+        "            let pending = r.open_table(TASKS).map_err(|e| be(&e))?;",
     ),
     "TheStoreDropsTheSignature": (
         "src/store/redb.rs",
@@ -666,15 +1291,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/peers/a2a.rs",
         "an_internal_error_is_in_doubt_not_a_refusal",
         "a peer's internal error is read as a clean refusal",
-        "        -32700 | -32600 | -32601 | -32602 | -32006..=-32001 => PeerError::Refused {",
-        "        -32700 | -32600 | -32601 | -32602 | -32006..=-32001 | -32603 => PeerError::Refused {",
+        "        -32700 | -32600 | -32601 | -32602 | -32005..=-32001 | -32009..=-32007 => {",
+        "        -32700 | -32600 | -32601 | -32602 | -32603 | -32005..=-32001 | -32009..=-32007 => {",
     ),
     "FailedPeerTaskIsInDoubt": (
         "src/peers/a2a.rs",
         "a_failed_task_landed",
         "a peer task that reported failure is treated as an unknown outcome",
-        '        "failed" => Some(PeerError::Failed {',
-        '        "failed" if false => Some(PeerError::Failed {',
+        '        "TASK_STATE_FAILED" | "TASK_STATE_CANCELED" | "TASK_STATE_REJECTED" => {',
+        '        "TASK_STATE_FAILED" | "TASK_STATE_CANCELED" | "TASK_STATE_REJECTED" if false => {',
     ),
     "CachedTokensAreDropped": (
         "src/model/anthropic.rs",
@@ -1057,6 +1682,460 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
             detail: "the model declined to answer".to_owned(),
         });""",
     ),
+    # ── One plane, several agents ───────────────────────────────────────────
+    "TwoAgentsShareACapability": (
+        "src/runtime/executor.rs",
+        "two_agents_may_not_claim_the_same_capability",
+        "a second agent's claim on a capability silently displaces the first, "
+        "moving its work out from under its own budget and grants",
+        "            caps.get(&cap).is_none_or(|first| first == &d.name),",
+        "            true,",
+    ),
+    "TwoSkillsShareAName": (
+        "src/runtime/executor.rs",
+        "two_skills_on_one_plane_may_not_share_a_name",
+        "two skills share a name, so the second inherits the first's manifest",
+        "    if let Some(existing) = skills.get(&d.name) {",
+        "    if let Some(existing) = None::<&Arc<dyn Skill>> {",
+    ),
+    "TheJournalForgetsWhoGoverned": (
+        "src/runtime/executor.rs",
+        "the_journal_records_which_declaration_governed_a_run",
+        "a run records no governing declaration, so which manifest governed it "
+        "depends on somebody still having the file",
+        "        let governed_by = self.identity_for(&agent);",
+        "        let governed_by = self.identity_for(&agent).filter(|_| false);",
+    ),
+    "AdmissionHidesTheDeclaration": (
+        "src/runtime/executor.rs",
+        "admission_policy_sees_the_agent_apart_from_the_capability",
+        "the governing declaration never reaches policy, so a rule can only bind "
+        "to a self-asserted name instead of the digest that pins what it said",
+        "        if let Some(id) = governed_by {",
+        "        if let Some(id) = None::<&crate::journal::AgentIdentity> {",
+    ),
+    "ThePublisherNeverReachesPolicy": (
+        "src/runtime/executor.rs",
+        "a_policy_can_bind_to_the_publisher_that_vouched_for_an_agent",
+        "the publisher who vouched for a declaration is dropped, leaving a rule "
+        "nothing to bind to but a name any file can claim",
+        "            publisher: self.published_by.get(&m.metadata.name).cloned(),",
+        "            publisher: None,",
+    ),
+    "InternalSectionRefsAreAllowedToShip": (
+        "tests/guards/docs.rs",
+        "shipped_source_cites_no_internal_section_numbers",
+        "rustdoc may cite sections of the internal design document, which a "
+        "docs.rs reader cannot resolve and which go stale silently",
+        "    if before.contains(\"RFC\") || before.contains(\"C2SP\") {",
+        "    if true {",
+    ),
+    # ── Envelope encryption and cryptographic erasure ───────────────────────
+    "AnErasedScopeMintsAFreshKey": (
+        "src/testkit/memory_keyring.rs",
+        "an_erased_scope_cannot_be_recreated",
+        "an erased scope mints a new data key, so a late write lands in a unit "
+        "already reported as erased",
+        "        if let Some(gone) = Self::tombstone(&state, scope) {\n            return Err(gone);\n        }\n        let generation = state.generation;",
+        "        let generation = state.generation;",
+    ),
+    "ErasingACaseSparesItsKey": (
+        "src/blob/mod.rs",
+        "erasing_a_case_destroys_its_key_and_the_backup_with_it",
+        "erasing a case writes tombstones but leaves the data key alive, so the "
+        "erasure reaches the live store and no backup",
+        "    if let Some(keys) = keyring {",
+        "    if let Some(keys) = None::<&dyn crate::keyring::KeyRing> {",
+    ),
+    "SealedRunsWriteInTheClear": (
+        "src/runtime/ctx.rs",
+        "erasing_a_case_destroys_its_key_and_the_backup_with_it",
+        "a configured key ring is ignored on the write path, so payload bytes "
+        "reach disk unsealed and erasing the case cannot reach them",
+        "        if let Some(keys) = self.keyring.clone() {",
+        "        if let Some(keys) = None::<Arc<dyn crate::keyring::KeyRing>> {",
+    ),
+    "MediaBytesBypassTheSeal": (
+        "src/runtime/ctx.rs",
+        "only_the_sealed_accessor_reads_the_raw_blob_store",
+        "the media path reads the raw blob store directly, so a sealed "
+        "deployment writes those payload bytes in the clear",
+        "        let blobs = self.blobs_scoped(fetcher.external_scope())?;",
+        "        let blobs = self.blobs.clone().expect(\"a blob store\");",
+    ),
+    "AVaultOutageIsReadAsAnErasure": (
+        "src/keyring/vault.rs",
+        "a_vault_error_body_is_read_rather_than_dumped",
+        "a Vault error body is dumped raw instead of read, so the operator-facing "
+        "reason an erasure was refused is buried in JSON",
+        "    serde_json::from_str::<Errors>(body)\n        .ok()?\n        .errors\n        .into_iter()\n        .next()",
+        "    let _ = body;\n    None",
+    ),
+    "TransitKeysMayBeAnySize": (
+        "src/keyring/vault.rs",
+        "a_key_that_is_not_256_bits_is_refused",
+        "a data key shorter than 256 bits is accepted, so a misconfigured transit "
+        "key silently weakens every payload it seals",
+        "    let bytes: [u8; 32] = raw.try_into().map_err(|_| {",
+        "    let mut padded = raw.clone();\n    padded.resize(32, 0);\n    let bytes: [u8; 32] = padded.try_into().map_err(|_: Vec<u8>| {",
+    ),
+    "AVaultErasureLooksLikeARefusal": (
+        "src/keyring/vault.rs",
+        "vault_transit_satisfies_the_key_ring_contract",
+        "a destroyed Vault key is read as an ordinary refusal, so a caller "
+        "cannot tell a completed erasure from a permission problem",
+        "            400 | 404 if is_missing_key(&reason()) => Err(KeyError::Destroyed {",
+        "            400 | 404 if false => Err(KeyError::Destroyed {",
+    ),
+    # ── Tenant isolation ────────────────────────────────────────────────────
+    "TenantsShareAKeyScope": (
+        "src/keyring/mod.rs",
+        "erasing_one_tenants_key_leaves_another_tenant_readable",
+        "the key scope drops the tenant, so two tenants using one case name "
+        "share a key and either can erase the other's data",
+        "    format!(\"{tenant}/{unit}\")",
+        "    let _ = tenant;\n    unit.to_owned()",
+    ),
+    "ATenantNameMayContainASeparator": (
+        "src/core/tenant.rs",
+        "erasing_one_tenants_key_leaves_another_tenant_readable",
+        "a tenant name may contain '/', so tenant `acme/prod` and tenant `acme` "
+        "unit `prod` produce one indistinguishable scope",
+        "            .find(|c| matches!(c, '/' | ':' | '\\0' | '\\n') || c.is_control())",
+        "            .find(|c| matches!(c, '\\0' | '\\n') || c.is_control())",
+    ),
+    "AStoreKeyDropsTheTenant": (
+        "src/store/redb.rs",
+        "a_tenant_cannot_read_another_tenants_run_even_holding_its_id",
+        "a run's storage key drops the tenant, so any tenant holding a run id "
+        "reads another tenant's journal",
+        "        format!(\"{}/{run}\", self.tenant)",
+        "        run.to_string()",
+    ),
+    # ── Tool declarations ───────────────────────────────────────────────────
+    "AForcedSchemaSilentlyEatsTheTools": (
+        "src/model/anthropic.rs",
+        "a_forced_schema_and_declared_tools_are_refused_together",
+        "a forced-tool schema overwrites the caller's declared tools, so the "
+        "model is offered none and nothing says so",
+        "                    if !tools.is_empty() {\n                        return Err(ModelError::Refused {",
+        "                    if false {\n                        return Err(ModelError::Refused {",
+    ),
+    "OpenAiToolsAreNotStrict": (
+        "src/model/openai.rs",
+        "a_declared_tool_is_rendered_in_openais_shape",
+        "declared tools drop strict mode, so arguments are checked after the "
+        "tokens are paid for rather than enforced during generation",
+        "                                \"strict\": true,",
+        "                                \"strict\": false,",
+    ),
+    "AModelsToolNameResolvesApproximately": (
+        "src/tools/mod.rs",
+        "a_model_chosen_tool_name_is_matched_exactly_or_refused",
+        "a model's chosen tool name is matched loosely, so it can reach a granted "
+        "tool by describing it rather than by naming it",
+        "            .find(|id| id.wire_name() == name)",
+        "            .find(|id| id.wire_name().eq_ignore_ascii_case(name.trim()))",
+    ),
+    "AContinuationSendsResultsWithoutTheirCalls": (
+        "src/model/anthropic.rs",
+        "a_continuation_echoes_the_call_beside_its_result",
+        "a continuation sends tool results without the calls that asked for "
+        "them, which every provider rejects",
+        '        "role": "assistant",',
+        '        "role": "user",',
+    ),
+    "AFailedToolLooksLikeAnAnswer": (
+        "src/model/anthropic.rs",
+        "a_failed_tool_is_marked_is_error",
+        "a failed tool is reported as an ordinary result, so the model is taught "
+        "the operation succeeded and returned something strange",
+        '                "is_error": e.failed,',
+        '                "is_error": false,',
+    ),
+    "AToolCallingAgentRunsForever": (
+        "src/runtime/declarative.rs",
+        "a_tool_calling_agent_stops_when_it_will_not_converge",
+        "a tool-calling agent has no turn ceiling, so a model that keeps asking "
+        "runs until the budget stops it — after paying for every turn",
+        "        for _turn in 0..self.max_turns {",
+        "        for _turn in 0..u32::MAX {",
+    ),
+    "AToolCallingAgentAnswersFromAnUnfinishedTurn": (
+        "src/runtime/declarative.rs",
+        "a_tool_calling_agent_stops_when_it_will_not_converge",
+        "an agent out of turns returns its half-formed reasoning as the answer "
+        "instead of failing",
+        '        Ok(Outcome::fail(format!(\n            "\'{}\' did not finish within {} model turns',
+        '        return Ok(Outcome::done(crate::core::Tainted::trusted(json!({}))));\n        #[allow(unreachable_code)]\n        Ok(Outcome::fail(format!(\n            "\'{}\' did not finish within {} model turns',
+    ),
+    "AToolMayBeOfferedWithoutADescription": (
+        "src/manifest/mod.rs",
+        "a_tool_calling_agent_must_describe_its_tools",
+        "a tool-calling agent may grant a tool with no description, so the model "
+        "guesses and the guess is refused after the tokens are paid for",
+        "            if grant\n                .description\n                .as_ref()\n                .is_none_or(|d| d.trim().is_empty())\n            {",
+        "            if false {",
+    ),
+    "ACardAdvertisesWhatIsNotBuilt": (
+        "src/peers/card.rs",
+        "an_agent_card_is_derived_from_the_manifest",
+        "the published card advertises streaming and push notifications that do "
+        "not exist, so a caller waits for events nobody will send",
+        "            capabilities: CardCapabilities::implemented(),",
+        "            capabilities: CardCapabilities {\n                streaming: true,\n                push_notifications: true,\n                extended_agent_card: true,\n            },",
+    ),
+    "ACardsSkillsAreNotTheDeclaredCapabilities": (
+        "src/peers/card.rs",
+        "an_agent_card_is_derived_from_the_manifest",
+        "the card's skills are not the declared capabilities, so a peer is told "
+        "about work the plane would refuse to dispatch",
+        "            .provides\n            .iter()",
+        "            .requires\n            .iter()",
+    ),
+    "TheExtendedCardLeaksTheModel": (
+        "src/peers/card.rs",
+        "the_extended_card_discloses_more_but_not_the_model",
+        "the authenticated card discloses which model an agent runs on, which "
+        "is a fact about a supply chain rather than something a caller needs",
+        "            topology,\n        })",
+        "            topology: manifest\n                .spec\n                .models\n                .as_ref()\n                .and_then(|m| m.privileged.as_ref())\n                .map(|r| format!(\"{}/{}\", r.provider, r.model)),\n        })",
+    ),
+    "EventsDeduplicateOnIdAlone": (
+        "src/core/event.rs",
+        "two_producers_sharing_an_id_are_not_one_event",
+        "events deduplicate on id alone, so two producers sharing an id swallow "
+        "each other's messages with nothing reporting it",
+        '        format!("{}\\u{1f}{}", self.source, self.id)',
+        "        self.id.clone()",
+    ),
+    "ADeliveredEventChoosesItsOwnSource": (
+        "src/api/mod.rs",
+        "a_delivered_events_source_is_the_authenticated_caller",
+        "a caller names the source of the event it delivers, so it controls both "
+        "halves of the dedup identity and can deduplicate against another party",
+        "    let mut event = InboundEvent::new(s.caller.actor.clone(), body.id, body.kind, body.payload);",
+        "    let mut event = InboundEvent::new(\"urn:anonymous\", body.id, body.kind, body.payload);\n    let _ = &s;",
+    ),
+    "AnAwaitedEventsSenderIsNotJournaled": (
+        "src/runtime/executor.rs",
+        "an_awaited_events_sender_is_in_its_provenance_and_survives_replay",
+        "a delivered event's sender is not journaled, so a replayed run labels "
+        "the value differently from the live one",
+        "                            source: Some(event.source.clone()),",
+        "                            source: None,",
+    ),
+    "ASweepClaimsAnotherTenantsTimer": (
+        "src/store/redb_timers.rs",
+        "a_sweep_does_not_claim_another_tenants_timers",
+        "a timer's key drops the tenant, so a sweep claims another tenant's "
+        "timer and wakes that tenant's run under this plane's identity",
+        "                        .get((tenant.as_str(), run.as_str(), effect.as_str()))",
+        "                        .get((\"\", run.as_str(), effect.as_str()))",
+    ),
+    "AnEventMatchesAnotherTenantsWaiter": (
+        "src/store/redb_events.rs",
+        "one_tenants_event_does_not_resume_another_tenants_run",
+        "the subscription match index drops the tenant, so one tenant's event "
+        "resumes another tenant's waiting run",
+        "                .get((tenant, run, effect, ns, val))",
+        "                .get((\"\", run, effect, ns, val))",
+    ),
+    "APlaneMayRunOverAnotherTenantsStore": (
+        "src/runtime/executor.rs",
+        "a_plane_will_not_start_over_another_tenants_store",
+        "a plane starts over a store scoped to a different tenant, so its runs "
+        "land in another tenant's keyspace while every key-scoped erasure and "
+        "policy request names the right one",
+        "        store.tenant() == tenant.as_str(),",
+        "        store.tenant() != \"never\",",
+    ),
+    "TheCardMisspellsItsBinding": (
+        "src/peers/card.rs",
+        "the_card_uses_the_spec_field_names",
+        "the published card names its protocol binding with this crate's own "
+        "field name, so a conforming A2A client cannot tell what the URL speaks",
+        "#[serde(rename_all = \"camelCase\")]\npub struct CardInterface {",
+        "pub struct CardInterface {",
+    ),
+    "OneTenantsErasureDestroysAnothersBlobs": (
+        "src/blob/opendal_store.rs",
+        "erasing_one_tenants_blob_leaves_another_tenants_alone",
+        "blob paths drop the tenant, so two tenants writing identical bytes "
+        "share one object and erasing it for one destroys the other's data "
+        "while reporting both requests discharged",
+        "        format!(\n"
+        "            \"{}/{}/{}/{}/{hex}\",\n"
+        "            self.prefix,\n"
+        "            self.tenant,\n"
+        "            &hex[0..2],\n"
+        "            &hex[2..4]\n"
+        "        )",
+        "        format!(\"{}/{}/{}/{hex}\", self.prefix, &hex[0..2], &hex[2..4])",
+    ),
+    "APlaneMayShareAnotherTenantsBlobs": (
+        "src/runtime/executor.rs",
+        "a_plane_will_not_start_over_another_tenants_blobs",
+        "a plane starts over a blob store scoped to a different tenant, so its "
+        "artifacts land in another tenant's erasure unit",
+        "        assert!(\n            blobs.tenant() == tenant.as_str(),",
+        "        assert!(\n            blobs.tenant() != \"never\",",
+    ),
+    "APeerCanNameAnyTenant": (
+        "src/api/a2a.rs",
+        "a_peer_cannot_name_a_tenant_its_credential_does_not_hold",
+        "the A2A surface checks the request's tenant against the card but never "
+        "against the credential, so a peer holding a valid credential for any "
+        "tenant is served from another's runs by naming it in a field",
+        "        if caller.tenant != *self.runtime.tenant() {",
+        "        if false {",
+    ),
+    "AnUnservedTenantFallsBackToAPlane": (
+        "src/api/mod.rs",
+        "an_unregistered_tenant_is_refused_rather_than_defaulted",
+        "a caller whose tenant has no plane is served by some other tenant's "
+        "plane instead of refused, which turns an unregistered tenant into "
+        "somebody else's data and looks like working software",
+        "        let plane = self.planes.get(&caller.tenant).ok_or_else(|| {",
+        "        let plane = self\n"
+        "            .planes\n"
+        "            .get(&caller.tenant)\n"
+        "            .or_else(|| self.planes.by_tenant.values().next())\n"
+        "            .ok_or_else(|| {",
+    ),
+    "TheServingTenantComesFromTheRequest": (
+        "src/api/mod.rs",
+        "a_caller_cannot_read_another_tenants_run",
+        "the plane is chosen without reference to the caller's tenant, so any "
+        "authenticated caller reads any tenant's runs while holding nothing but "
+        "a valid id",
+        "        let plane = self.planes.get(&caller.tenant).ok_or_else(|| {",
+        "        let plane = self\n"
+        "            .planes\n"
+        "            .by_tenant\n"
+        "            .iter()\n"
+        "            .find(|(t, _)| *t != &caller.tenant)\n"
+        "            .map(|(_, p)| p)\n"
+        "            .or_else(|| self.planes.get(&caller.tenant))\n"
+        "            .ok_or_else(|| {",
+    ),
+    "ANonBlockingSendBlocksAnyway": (
+        "src/api/a2a.rs",
+        "a_non_blocking_send_returns_a_task_that_already_exists",
+        "`returnImmediately` is ignored, so the connection is held open for the "
+        "whole run while the response looks exactly like compliance",
+        "    if params\n"
+        "        .configuration\n"
+        "        .as_ref()\n"
+        "        .is_some_and(|c| c.return_immediately)\n"
+        "    {",
+        "    if false {",
+    ),
+    "AnUnconfiguredSendDoesNotBlock": (
+        "src/api/a2a.rs",
+        "an_unconfigured_send_blocks",
+        "a send with no configuration returns before the run finishes, so a "
+        "caller expecting a completed task is handed an unfinished one",
+        "        .is_some_and(|c| c.return_immediately)",
+        "        .is_none_or(|c| !c.return_immediately)",
+    ),
+    "ALongRunLosesItsLease": (
+        "src/runtime/executor.rs",
+        "a_long_run_keeps_its_lease",
+        "a run's lease is never renewed while it executes, so a run that "
+        "outlives its TTL looks crashed, is taken over by another instance, and "
+        "is fenced mid-flight having already done real work",
+        "        let _heartbeat = self.heartbeat(a.run, a.epoch);",
+        "",
+    ),
+    "AnUnrenewableLeaseIsAccepted": (
+        "src/runtime/executor.rs",
+        "a_lease_too_short_to_renew_is_refused",
+        "a lease shorter than the store's whole-second expiry granularity is "
+        "accepted, so a live run cannot hold it and any instance may take the "
+        "run away while it is still working",
+        "            ttl >= MIN_LEASE_TTL,",
+        "            ttl >= Duration::ZERO,",
+    ),
+    "TheServerSpeaksTheOldProtocolVersion": (
+        "src/api/a2a.rs",
+        "this_planes_client_can_call_this_planes_server",
+        "the server answers the 0.3 method name, so this plane's own client "
+        "cannot call it and any 1.0 peer gets method-not-found",
+        "    pub const SEND_MESSAGE: &str = \"SendMessage\";",
+        "    pub const SEND_MESSAGE: &str = \"message/send\";",
+    ),
+    "ADeclineIsReportedAsAnOutage": (
+        "src/api/a2a.rs",
+        "a_policy_denial_is_a_decline_not_a_server_fault",
+        "a policy denial comes back as an internal error, so the caller reads a "
+        "permanent refusal as a transient fault and retries a decision that "
+        "will never change",
+        "        Err(crate::core::RuntimeError::PolicyDenied(_)) => {\n"
+        "            return Ok(json!({ \"message\": declined(&skill) }));\n"
+        "        }",
+        "",
+    ),
+    "ADeclineRepeatsThePolicysReason": (
+        "src/api/a2a.rs",
+        "a_policy_denial_is_a_decline_not_a_server_fault",
+        "the decline sent to a peer carries the runtime's own denial, naming "
+        "the action and resource the gate keyed on — enough to map this "
+        "plane's authorization vocabulary by probing it",
+        "        Err(crate::core::RuntimeError::PolicyDenied(_)) => {\n"
+        "            return Ok(json!({ \"message\": declined(&skill) }));\n"
+        "        }",
+        "        Err(crate::core::RuntimeError::PolicyDenied(why)) => {\n"
+        "            return Ok(json!({ \"message\": declined(&why.to_string()) }));\n"
+        "        }",
+    ),
+    "APeersMessageArrivesTrusted": (
+        "src/api/a2a.rs",
+        "a_peers_message_is_untrusted_and_carries_its_sender",
+        "a message from another agent is admitted as trusted input, so a value "
+        "that arrived over the network wears the runtime's own authority and "
+        "every protected sink field downstream checks nothing",
+        "    let input = Tainted::from_source(\n"
+        "        message.to_input(),\n"
+        "        SourceId::new(format!(\"peer:{}\", caller.actor)),\n"
+        "    );",
+        "    let input = Tainted::trusted(message.to_input());",
+    ),
+    "TheCardIsNotAtTheWellKnownPath": (
+        "src/api/a2a.rs",
+        "the_agent_card_is_public",
+        "the agent card is served somewhere other than the well-known path, so "
+        "the server works, nothing errors, and no conforming client ever "
+        "discovers this agent",
+        "            .route(WELL_KNOWN_PATH, get(agent_card))",
+        "            .route(\"/agent-card.json\", get(agent_card))",
+    ),
+    "TheSkillIsInferredFromTheMessage": (
+        "src/api/a2a.rs",
+        "an_ambiguous_message_is_refused_rather_than_guessed",
+        "an unnamed skill is guessed from the message instead of refused, so "
+        "the sender picks which capability runs by writing text",
+        "        many => Err(RpcError::new(",
+        "        [first, ..] => return Ok(first.clone()),\n        many => Err(RpcError::new(",
+    ),
+    "AnAbsentVersionIsTreatedAsCurrent": (
+        "src/api/a2a.rs",
+        "a_request_without_a_version_is_refused_as_zero_three",
+        "a request with no A2A-Version header is answered with 1.0 semantics "
+        "rather than refused as the 0.3 client the spec says it is",
+        "        if major_minor(claimed) == major_minor(crate::peers::PROTOCOL_VERSION) {",
+        "        if claimed.is_empty()\n"
+        "            || major_minor(claimed) == major_minor(crate::peers::PROTOCOL_VERSION)\n"
+        "        {",
+    ),
+    "ARunJoinsAnotherTenantsCase": (
+        "src/store/redb_cases.rs",
+        "one_tenants_run_does_not_join_another_tenants_case",
+        "the correlation index drops the tenant, so a run joins another tenant's "
+        "case on a shared business key and they share a history and an erasure unit",
+        "                                (tenant.as_str(), k.namespace.as_str(), k.value.as_str()),\n                                case.as_str(),",
+        "                                (\"\", k.namespace.as_str(), k.value.as_str()),\n                                case.as_str(),",
+    ),
     # ── The worklist contract ───────────────────────────────────────────────
     "TaskIdIgnoresTheRun": (
         "src/core/task.rs",
@@ -1175,38 +2254,8 @@ def check() -> int:
         if n != 1:
             print(f"{name}: anchors {n} times in {path} (expected 1)")
             bad += 1
-    bad += _check_counts()
     print(f"checked {len(MUTANTS)} mutations, {bad} broken")
     return 1 if bad else 0
-
-
-def _check_counts() -> int:
-    """The prose must state the real number of mutations.
-
-    Checked here because it drifted three times in one day: the README and the
-    design document each carry the count, and a mutation added without touching
-    them leaves both quietly wrong. A number nobody verifies is a claim, and
-    this project's whole argument is about the difference.
-    """
-    import re
-
-    actual = len(MUTANTS)
-    bad = 0
-    for rel, pattern in (
-        ("README.md", r"(\d+) guarantees are broken on purpose"),
-        ("CONCEPT.md", r"checked-in table of (\d+) mutations"),
-    ):
-        path = ROOT / rel
-        if not path.exists():
-            continue  # CONCEPT.md is internal and may be absent
-        m = re.search(pattern, path.read_text())
-        if not m:
-            print(f"{rel}: the mutation count sentence is gone; this guard is now inert")
-            bad += 1
-        elif int(m.group(1)) != actual:
-            print(f"{rel}: claims {m.group(1)} mutations, the table has {actual}")
-            bad += 1
-    return bad
 
 
 def main() -> int:

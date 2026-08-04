@@ -36,7 +36,7 @@
 //!
 //! Not authorization. A verified attestation says *who is calling and what they
 //! asked for*; whether they may is the callee's decision, made against its own
-//! policy and the delegation chain (§11.1). Provenance that authorizes by
+//! policy and the delegation chain. Provenance that authorizes by
 //! existing is a bearer token with extra steps.
 
 use serde::{Deserialize, Serialize};
@@ -74,9 +74,21 @@ pub struct Provenance {
     pub run: RunId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub case: Option<CaseId>,
-    /// Which effect within the run — unique per run, and the natural
-    /// idempotency key for a callee that wants one.
+    /// Which effect within the run — unique per run *and per attempt*.
     pub effect: EffectKey,
+    /// The logical dispatch, stable across retries of the same call.
+    ///
+    /// [`effect`](Self::effect) hashes the attempt number, and it must: without
+    /// it a retry would collide with the recorded failure of the attempt before
+    /// it, and replay would read back the failure instead of the retry.
+    ///
+    /// That makes it the wrong thing to hand a callee for **duplicate
+    /// detection**, which is the opposite question — "have I already done this
+    /// work?" — and must answer *yes* for a retry. A peer given the effect key
+    /// sees two unrelated messages and may act twice, which is precisely the
+    /// outcome deduplication exists to prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<EffectKey>,
     /// The agent, as the deployment names it.
     pub agent: String,
     /// The signature over [`payload`](Self::payload), if the plane has a signer.
@@ -96,9 +108,29 @@ impl Provenance {
             run,
             case: None,
             effect,
+            dispatch: None,
             agent: agent.into(),
             attestation: None,
         }
+    }
+
+    /// Name the logical dispatch this call belongs to.
+    ///
+    /// See [`Provenance::dispatch`] for why it is not the effect key.
+    #[must_use]
+    pub const fn dispatching(mut self, dispatch: EffectKey) -> Self {
+        self.dispatch = Some(dispatch);
+        self
+    }
+
+    /// The identity a callee should deduplicate on.
+    ///
+    /// Falls back to the effect key when no dispatch id was supplied, which is
+    /// wrong across retries and right for everything else — and is what a
+    /// transport gets if the runtime did not set one.
+    #[must_use]
+    pub fn dedupe_key(&self) -> EffectKey {
+        self.dispatch.unwrap_or(self.effect)
     }
 
     #[must_use]
@@ -181,6 +213,10 @@ impl Provenance {
         let s = |k: &str| meta.get(&format!("{NS}{k}"))?.as_str().map(str::to_owned);
         Some(Self {
             run: RunId::parse(&s("run_id")?).ok()?,
+            // Not carried on the wire yet: a callee deduplicates on the id the
+            // transport hands it, and this block is the *caller's* record of
+            // what it sent.
+            dispatch: None,
             case: match s("case_id") {
                 Some(c) => Some(CaseId::parse(&c).ok()?),
                 None => None,

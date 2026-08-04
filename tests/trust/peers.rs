@@ -192,6 +192,11 @@ fn a_hop_appends_a_link_and_narrows() {
 
     let chain = call.acting_as();
     assert_eq!(chain.depth(), 2, "owner → auditor → peer");
+    assert_eq!(
+        Effect::delegation_depth(&call),
+        Some(2),
+        "the runtime must see the depth that will go on the wire"
+    );
     assert_eq!(chain.subject().id, "reviewer.example");
     assert_eq!(chain.owner().id, "user:hupe", "the human survives the hop");
     assert!(chain.effective_scope().permits(&"audit.check".into()));

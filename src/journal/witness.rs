@@ -28,7 +28,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::core::{Digest, KeyId, Signer, merkle};
+use crate::core::{CheckpointSigner, Digest, KeyId, SignError, merkle};
 
 use super::Checkpoint;
 
@@ -61,6 +61,22 @@ pub enum WitnessError {
         offered: u64,
     },
 
+    /// The witness is at a different size than the proof starts from.
+    ///
+    /// A **stale client**, not an integrity event, and the distinction is the
+    /// whole reason this is its own variant. The witness has simply moved past
+    /// the checkpoint this proof was built from, and it says where it is, so the
+    /// fix is to build a proof from there and retry.
+    ///
+    /// Collapsing it into [`Forked`](Self::Forked) would report a routine
+    /// cursor mismatch as a history that does not extend — and a team paged
+    /// twice for that stops believing the alert that matters.
+    #[error(
+        "log '{origin}': the witness is at size {witness_size}; build a consistency proof \
+         from there and resubmit"
+    )]
+    Stale { origin: String, witness_size: u64 },
+
     /// A proof was required and none was usable.
     #[error("log '{origin}': a consistency proof is required to extend size {seen}")]
     ProofMissing { origin: String, seen: u64 },
@@ -84,8 +100,14 @@ pub struct Cosignature {
 /// Something that will vouch for having seen a log grow.
 #[async_trait]
 pub trait Witness: Send + Sync + Debug {
-    /// Cosign `checkpoint`, given a consistency proof from what the witness
-    /// last saw.
+    /// Cosign `checkpoint`, given a consistency proof from `old_size`.
+    ///
+    /// `old_size` is stated by the caller rather than inferred, and that is not
+    /// ceremony. A consistency proof is RFC 6962 `SUBPROOF` — **O(log n)
+    /// hashes, not one per new entry** — so nothing about the proof reveals
+    /// which size it starts from. A 50→100 proof carries seven hashes, and an
+    /// implementation that guessed `size - proof.len()` would claim 93 and be
+    /// rejected by every witness. Only the caller holds the log and knows.
     ///
     /// The proof is supplied by the operator because only the operator has the
     /// log. That is not a weakness: the witness verifies it against a root it
@@ -99,25 +121,32 @@ pub trait Witness: Send + Sync + Debug {
     async fn cosign(
         &self,
         checkpoint: &Checkpoint,
+        old_size: u64,
         proof: &[Digest],
     ) -> Result<Cosignature, WitnessError>;
 }
 
 /// A witness that remembers, in this process.
 ///
+/// Its signer is a [`CheckpointSigner`], so the key may live in a KMS or an HSM
+/// rather than in this process's memory. That matters more here than anywhere
+/// else in the crate: a witness key is the trust anchor, and an anchor whose key
+/// sits beside the history it vouches for is an anchor a single compromise
+/// removes.
+///
 /// Useful for tests and for proving the *logic*; useless as a trust anchor in
 /// production, where the point is that the witness is somebody else. Named to
 /// make that obvious at the call site.
 #[derive(Debug)]
 pub struct MemoryWitness {
-    signer: std::sync::Arc<dyn Signer>,
+    signer: std::sync::Arc<dyn CheckpointSigner>,
     seen: Mutex<BTreeMap<String, (u64, Digest)>>,
 }
 
 impl MemoryWitness {
     /// A witness signing as this identity.
     #[must_use]
-    pub fn new(signer: std::sync::Arc<dyn Signer>) -> Self {
+    pub fn new(signer: std::sync::Arc<dyn CheckpointSigner>) -> Self {
         Self {
             signer,
             seen: Mutex::new(BTreeMap::new()),
@@ -144,69 +173,119 @@ impl Witness for MemoryWitness {
     async fn cosign(
         &self,
         checkpoint: &Checkpoint,
+        old_size: u64,
         proof: &[Digest],
     ) -> Result<Cosignature, WitnessError> {
-        let mut seen = self
-            .seen
-            .lock()
-            .map_err(|_| WitnessError::Unavailable("witness mutex poisoned".into()))?;
+        // Scoped, so the guard cannot reach the signing await below. Signing may
+        // now be a network call, and a lock held across it would serialise every
+        // observation behind the slowest one — as well as making this future
+        // non-`Send`, which is how the compiler found it.
+        {
+            let mut seen = self
+                .seen
+                .lock()
+                .map_err(|_| WitnessError::Unavailable("witness mutex poisoned".into()))?;
 
-        if let Some((old_size, old_root)) = seen.get(&checkpoint.origin).copied() {
-            if checkpoint.size < old_size {
-                return Err(WitnessError::Shrank {
+            // An origin this witness has never seen is at size zero, and a caller
+            // claiming to extend from anywhere else is as stale as one that
+            // disagrees about a remembered size. Treating "unknown" as "whatever you
+            // say" made this model *more permissive* than the remote witness it
+            // stands in for — so a test could pass here and the same submission be
+            // refused with a 409 in production.
+            let remembered_size = seen.get(&checkpoint.origin).map_or(0, |(size, _)| *size);
+            if old_size != remembered_size {
+                return Err(WitnessError::Stale {
                     origin: checkpoint.origin.clone(),
-                    seen: old_size,
-                    offered: checkpoint.size,
+                    witness_size: remembered_size,
                 });
             }
-            // Same size and same root is a re-submission, which is fine and
-            // needs no proof — an operator polling a witness must not be
-            // punished for it.
-            let unchanged = checkpoint.size == old_size && checkpoint.root == old_root;
-            if !unchanged {
-                // Distinguished from a proof that fails to verify, because the
-                // two mean different things to whoever is called at 3am: an
-                // absent proof is a caller that forgot, a failing one is a
-                // history that does not extend. Collapsing them would make
-                // every client bug look like an integrity event.
-                // Only growth needs proving. A checkpoint of the *same* size
-                // with a different root is a fork whatever it carries — there
-                // is no extension to demonstrate — so asking for a proof there
-                // would report a contradiction as a caller error.
-                if proof.is_empty() && old_size > 0 && checkpoint.size > old_size {
-                    return Err(WitnessError::ProofMissing {
+            if let Some((remembered, old_root)) = seen.get(&checkpoint.origin).copied() {
+                // The caller says which size its proof starts from; this witness
+                // knows where it actually is. Disagreement is the 409 case, and
+                // reporting it the same way here is what makes this a faithful
+                // model of the remote one rather than a friendlier variant.
+                if old_size != remembered {
+                    return Err(WitnessError::Stale {
                         origin: checkpoint.origin.clone(),
-                        seen: old_size,
+                        witness_size: remembered,
                     });
                 }
-                let old = usize::try_from(old_size).unwrap_or(usize::MAX);
-                let new = usize::try_from(checkpoint.size).unwrap_or(usize::MAX);
-                if !merkle::verify_consistency(old, &old_root, new, &checkpoint.root, proof) {
-                    // One error for "rewritten" and "forked" on purpose: the
-                    // witness cannot distinguish them and should not pretend
-                    // to. Both mean *do not sign this*.
-                    return Err(WitnessError::Forked {
+                let old_size = remembered;
+                if checkpoint.size < old_size {
+                    return Err(WitnessError::Shrank {
                         origin: checkpoint.origin.clone(),
                         seen: old_size,
                         offered: checkpoint.size,
                     });
                 }
+                // Same size and same root is a re-submission, which is fine and
+                // needs no proof — an operator polling a witness must not be
+                // punished for it.
+                let unchanged = checkpoint.size == old_size && checkpoint.root == old_root;
+                if !unchanged {
+                    // Distinguished from a proof that fails to verify, because the
+                    // two mean different things to whoever is called at 3am: an
+                    // absent proof is a caller that forgot, a failing one is a
+                    // history that does not extend. Collapsing them would make
+                    // every client bug look like an integrity event.
+                    // Only growth needs proving. A checkpoint of the *same* size
+                    // with a different root is a fork whatever it carries — there
+                    // is no extension to demonstrate — so asking for a proof there
+                    // would report a contradiction as a caller error.
+                    if proof.is_empty() && old_size > 0 && checkpoint.size > old_size {
+                        return Err(WitnessError::ProofMissing {
+                            origin: checkpoint.origin.clone(),
+                            seen: old_size,
+                        });
+                    }
+                    let old = usize::try_from(old_size).unwrap_or(usize::MAX);
+                    let new = usize::try_from(checkpoint.size).unwrap_or(usize::MAX);
+                    if !merkle::verify_consistency(old, &old_root, new, &checkpoint.root, proof) {
+                        // One error for "rewritten" and "forked" on purpose: the
+                        // witness cannot distinguish them and should not pretend
+                        // to. Both mean *do not sign this*.
+                        return Err(WitnessError::Forked {
+                            origin: checkpoint.origin.clone(),
+                            seen: old_size,
+                            offered: checkpoint.size,
+                        });
+                    }
+                }
             }
-        }
 
-        seen.insert(
-            checkpoint.origin.clone(),
-            (checkpoint.size, checkpoint.root),
-        );
-        drop(seen);
+            // Recorded *before* signing, and the order is the safe one. A witness
+            // that signed and then failed to record would forget it had vouched,
+            // and could later cosign a divergent history at the same size — the
+            // exact equivocation it exists to prevent. Remembering something it
+            // might not have signed only ever refuses more.
+            seen.insert(
+                checkpoint.origin.clone(),
+                (checkpoint.size, checkpoint.root),
+            );
+        }
 
         // Signed over the note text — the artifact that actually leaves the
         // operator's control — so a verifier checks the bytes it was handed
         // rather than a re-serialization it has to trust.
         let note = checkpoint.to_note();
+        // Awaited, because this signer is permitted to be a KMS or an HSM —
+        // which is where the trust anchor's key belongs. A failure here is
+        // reported, never swallowed: a cosignature that silently did not happen
+        // is indistinguishable to an auditor from a witness that was never
+        // asked, and the second is the thing witnessing exists to rule out.
+        let signature = self
+            .signer
+            .sign(&Digest::of(note.as_bytes()))
+            .await
+            .map_err(|e| match e {
+                SignError::Unavailable(d) => WitnessError::Unavailable(d),
+                SignError::Refused { key_id, detail } => {
+                    WitnessError::Unavailable(format!("key '{key_id}' refused: {detail}"))
+                }
+            })?;
         Ok(Cosignature {
             key_id: self.signer.key_id(),
-            signature: self.signer.sign(&Digest::of(note.as_bytes())),
+            signature,
         })
     }
 }

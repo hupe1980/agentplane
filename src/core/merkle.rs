@@ -15,7 +15,7 @@
 //! What closes it is committing to the **set** of runs: a Merkle tree whose
 //! leaves are sealed-run digests. Remove a leaf and the root changes, so a root
 //! published earlier no longer matches the store — and "published earlier" is
-//! the part that has to leave the operator's control (§7.2's checkpoint work).
+//! the part that has to leave the operator's control — the checkpoint's job.
 //!
 //! # RFC 6962, not a hand-rolled tree
 //!

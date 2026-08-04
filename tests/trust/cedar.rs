@@ -19,11 +19,11 @@ use std::sync::{Arc, Mutex};
 
 use agentplane::core::{
     ACTION_ADMIT, ACTION_PERFORM, Delegation, Effect, EffectDescriptor, EffectError, Outcome,
-    PolicyDecision, PolicyEngine, PolicyRequest, Principal, Recovery, RetryPolicy, Scope, Skill,
-    SkillDescriptor, SkillError, Tainted,
+    PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest, Principal, Recovery,
+    RetryPolicy, Scope, Skill, SkillDescriptor, SkillError, Tainted,
 };
 use agentplane::journal::JournalStore;
-use agentplane::policy::CedarEngine;
+use agentplane::policy::{CedarEngine, CedarError};
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
@@ -121,19 +121,19 @@ fn a_permit_allows_exactly_what_it_names() {
 /// The runtime enforces this too — untrusted data cannot reach a mutating sink —
 /// and the two are not redundant: the runtime's gate is structural and always
 /// on, while a policy can express *conditions* the lattice has no vocabulary
-/// for, such as which declassifications a given agent may rely on.
+/// for, such as which authorized releases a given agent may rely on.
 const TAINT_GATE: &str = r#"
 permit(principal, action == Action::"effect:perform", resource);
 
 forbid(principal, action == Action::"effect:perform", resource)
-when { context.mutates && context.args_trust == "untrusted" && !context.declassified };
+when { context.mutates && context.args_trust == "untrusted" && !context.released };
 "#;
 
 #[test]
 fn a_forbid_beats_a_permit_and_reads_the_context() {
     let engine = CedarEngine::new(TAINT_GATE).unwrap();
 
-    let clean = json!({ "mutates": true, "args_trust": "trusted", "declassified": false });
+    let clean = json!({ "mutates": true, "args_trust": "trusted", "released": false });
     assert!(
         ask(
             &engine,
@@ -146,7 +146,7 @@ fn a_forbid_beats_a_permit_and_reads_the_context() {
         "trusted arguments reach a mutating tool"
     );
 
-    let tainted = json!({ "mutates": true, "args_trust": "untrusted", "declassified": false });
+    let tainted = json!({ "mutates": true, "args_trust": "untrusted", "released": false });
     let d = ask(
         &engine,
         "agent:a",
@@ -164,7 +164,7 @@ fn a_forbid_beats_a_permit_and_reads_the_context() {
         "the refusal names the rule that fired: {reason}"
     );
 
-    let cleared = json!({ "mutates": true, "args_trust": "untrusted", "declassified": true });
+    let cleared = json!({ "mutates": true, "args_trust": "untrusted", "released": true });
     assert!(
         ask(
             &engine,
@@ -174,7 +174,7 @@ fn a_forbid_beats_a_permit_and_reads_the_context() {
             &cleared
         )
         .is_permit(),
-        "a journaled declassification lifts it"
+        "a journaled release lifts it"
     );
 }
 
@@ -319,6 +319,163 @@ fn the_digest_follows_the_policy_text() {
     );
 }
 
+const REQUEST_SCHEMA: &str = r#"
+{
+    "": {
+        "entityTypes": {
+            "Agent": {},
+            "Resource": {}
+        },
+        "actions": {
+            "effect:perform": {
+                "appliesTo": {
+                    "principalTypes": ["Agent"],
+                    "resourceTypes": ["Resource"],
+                    "context": {
+                        "type": "Record",
+                        "attributes": {
+                            "risk_tier": { "type": "Long", "required": true }
+                        },
+                        "additionalAttributes": false
+                    }
+                }
+            }
+        }
+    }
+}
+"#;
+
+/// Rules are only one input to an authorization decision. The bundle identity
+/// must move when schema, static entities, evaluator, or adapter configuration
+/// moves even if the Cedar source does not.
+#[test]
+fn the_bundle_identity_covers_every_static_policy_input() {
+    let plain = CedarEngine::new("").unwrap().bundle();
+    let with_schema = CedarEngine::from_bundle("", Some(REQUEST_SCHEMA), None)
+        .unwrap()
+        .bundle();
+    let with_entities = CedarEngine::from_bundle(
+        "",
+        None,
+        Some(r#"[{"uid":{"type":"Agent","id":"agent:a"},"attrs":{"risk":"low"},"parents":[]}]"#),
+    )
+    .unwrap()
+    .bundle();
+
+    assert_ne!(plain.digest(), with_schema.digest());
+    assert_ne!(plain.digest(), with_entities.digest());
+    assert!(with_schema.schema().is_some());
+    assert!(with_entities.entities().is_some());
+    assert!(plain.configuration().is_some());
+
+    let other_evaluator = PolicyBundleIdentity::new(
+        plain.rules(),
+        "cedar-policy/next;agentplane-adapter/2;extensions=all-available",
+    )
+    .with_configuration(plain.configuration().expect("adapter configuration"));
+    assert_ne!(
+        plain.digest(),
+        other_evaluator.digest(),
+        "an evaluator semantic change must change the bundle identity"
+    );
+}
+
+/// Formatting a JSON component is not a policy change. Canonical component
+/// digests avoid false bundle drift while preserving every semantic field.
+#[test]
+fn schema_identity_uses_canonical_json_not_file_formatting() {
+    let compact = serde_json::to_string(
+        &serde_json::from_str::<Value>(REQUEST_SCHEMA).expect("schema fixture"),
+    )
+    .unwrap();
+    let a = CedarEngine::from_bundle("", Some(REQUEST_SCHEMA), None).unwrap();
+    let b = CedarEngine::from_bundle("", Some(&compact), None).unwrap();
+    assert_eq!(a.bundle(), b.bundle());
+}
+
+/// A declared schema is executable configuration: it validates policies at
+/// startup and request context at evaluation, rather than merely entering a
+/// digest.
+#[test]
+fn the_declared_schema_is_enforced() {
+    let source = r#"permit(principal, action == Action::"effect:perform", resource);"#;
+    let engine = CedarEngine::from_bundle(source, Some(REQUEST_SCHEMA), None).unwrap();
+
+    assert!(
+        ask(
+            &engine,
+            "agent:a",
+            ACTION_PERFORM,
+            "ledger.read",
+            &json!({ "risk_tier": 2 })
+        )
+        .is_permit()
+    );
+    let denied = ask(
+        &engine,
+        "agent:a",
+        ACTION_PERFORM,
+        "ledger.read",
+        &json!({ "risk_tier": "two" }),
+    );
+    let PolicyDecision::Deny { reason } = denied else {
+        panic!("a context violating the declared schema was accepted")
+    };
+    assert!(reason.contains("defect"), "wrong refusal: {reason}");
+}
+
+/// Static entities are part of both evaluation and identity.
+#[test]
+fn static_entities_are_used_by_authorization() {
+    let source = r#"
+                permit(principal, action, resource)
+                when { principal.risk == "low" };
+        "#;
+    let entities = r#"
+            [{"uid":{"type":"Agent","id":"agent:a"},
+                "attrs":{"risk":"low"},"parents":[]}]
+        "#;
+    let engine = CedarEngine::from_bundle(source, None, Some(entities)).unwrap();
+    assert!(ask(&engine, "agent:a", ACTION_PERFORM, "x", &json!({})).is_permit());
+    assert!(!ask(&engine, "agent:b", ACTION_PERFORM, "x", &json!({})).is_permit());
+}
+
+#[test]
+fn malformed_bundle_components_are_refused_at_startup() {
+    assert!(CedarEngine::from_bundle("", Some("{"), None).is_err());
+    assert!(CedarEngine::from_bundle("", None, Some("{"),).is_err());
+
+    let unknown_action = r#"
+        permit(principal, action == Action::"not-declared", resource);
+    "#;
+    assert!(matches!(
+        CedarEngine::from_bundle(unknown_action, Some(REQUEST_SCHEMA), None),
+        Err(CedarError::Validation(_))
+    ));
+
+    let unknown_entity_type = r#"[{"uid":{"type":"Unknown","id":"a"},"attrs":{},"parents":[]}]"#;
+    assert!(matches!(
+        CedarEngine::from_bundle("", Some(REQUEST_SCHEMA), Some(unknown_entity_type)),
+        Err(CedarError::Entities(_))
+    ));
+}
+
+/// The evaluator tag is deliberately hard-coded because Cargo exposes this
+/// crate's version, not a dependency's. This guard makes a dependency bump that
+/// forgot the semantic identity fail in the same change.
+#[test]
+fn the_evaluator_identity_tracks_the_pinned_cedar_version() {
+    let cargo = include_str!("../../Cargo.toml");
+    assert!(cargo.contains("cedar-policy = { version = \"4.12.0\""));
+    assert!(
+        CedarEngine::new("")
+            .unwrap()
+            .bundle()
+            .evaluator()
+            .contains("cedar-policy/4.12.0")
+    );
+}
+
 // ── End to end ──────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -386,7 +543,7 @@ async fn cedar_governs_a_run_and_the_digest_lands_in_the_journal() {
         )
         .unwrap(),
     );
-    let expected = engine.digest();
+    let expected = engine.bundle();
 
     let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .policy(engine)
@@ -412,14 +569,16 @@ async fn cedar_governs_a_run_and_the_digest_lands_in_the_journal() {
     let recorded = records
         .iter()
         .find_map(|r| match r.kind() {
-            agentplane::journal::RecordKind::RunAdmitted { policy, .. } => Some(*policy),
+            agentplane::journal::RecordKind::RunAdmitted { policy_bundle, .. } => {
+                Some(policy_bundle.clone())
+            }
             _ => None,
         })
         .expect("RunAdmitted");
     assert_eq!(
         recorded,
         Some(expected),
-        "the journal must name the rule set that governed this run"
+        "the journal must name the complete policy bundle that governed this run"
     );
 }
 

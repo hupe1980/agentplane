@@ -231,7 +231,8 @@ pub struct Delegation {
 
 /// How deep a chain may go before nobody can reason about it.
 ///
-/// Three is the shape §11.1 describes: owner → agent → sub-agent → peer. A
+/// Three is the shape the research converges on: owner → agent → sub-agent →
+/// peer. A
 /// deployment can lower it; raising it is a decision someone should have to make
 /// deliberately, which is why it is a constant here rather than a default that
 /// quietly grows.
@@ -335,7 +336,7 @@ impl Delegation {
 impl Delegation {
     /// The chain as policy context.
     ///
-    /// §11.1 caps delegation depth "by manifest and by Cedar" — and a rule can
+    /// Depth is capped both by manifest and by policy — and a rule can
     /// only say `context.delegation_depth >= 3` if depth is actually in the
     /// context. Likewise a rule keyed on the human owner needs the owner, not
     /// just the workload that happens to be acting.

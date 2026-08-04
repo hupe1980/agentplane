@@ -1,0 +1,43 @@
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+
+metadata:
+  name: blog-editor
+  version: "1.0.0"
+
+spec:
+  identity:
+    role: "Managing editor for a technical blog"
+    constraints: "Commission, then assemble. Never write the copy yourself."
+
+  # The only agent here permitted to delegate — and it has to say why.
+  # `distinct-authority` is the honest reason: the publisher holds a credential
+  # the researcher must never see, so splitting is least privilege rather than
+  # hypothetical parallelism.
+  topology:
+    mode: collaborative
+    role: orchestrator
+    reason: distinct-authority
+
+  security:
+    max_sensitivity_egress: internal
+    max_delegation_depth: 1
+
+  capabilities:
+    provides: [blog.commission]
+    requires: [blog.research, blog.draft]
+
+  models:
+    privileged: { provider: fake, model: editor-1 }
+
+  budgets:
+    # `max_tokens` bounds the whole room, not just this run's own idling: a
+    # delegation is an effect, and `Delegate::spend` reports what the specialist
+    # consumed, so the commission is billed here.
+    #
+    # `max_effects` bounds the overshoot. Spend is billed after the fact, like
+    # any metered effect, so the room can exceed the token ceiling by at most
+    # one commission — this caps how many there can be.
+    max_effects: 4
+    max_tokens: 200000
+    max_steps: 10

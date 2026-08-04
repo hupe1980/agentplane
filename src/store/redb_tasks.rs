@@ -6,7 +6,7 @@
 //! separate write has exactly that window.
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::case::{ClaimError, TaskStore};
 use crate::core::{CaseId, StoreError, Task, TaskId, TaskState, Timestamp};
@@ -19,15 +19,15 @@ use super::redb::{MAX_STR, RedbStore, be, begin_write};
 /// through serde, and redb has no column concept to gain from splitting it.
 /// Everything the indexes below need is derived from the parsed task, so the row
 /// and its indexes cannot disagree about a field that exists in only one of them.
-const TASKS: TableDefinition<&str, &str> = TableDefinition::new("tasks");
+const TASKS: TableDefinition<(&str, &str), &str> = TableDefinition::new("tasks");
 
-const QUEUE: TableDefinition<(u8, i64, &str), ()> = TableDefinition::new("tasks_queue");
+const QUEUE: TableDefinition<(&str, u8, i64, &str), ()> = TableDefinition::new("tasks_queue");
 
 /// `(due_at, task_id) -> ()`, pending work with a window that can close.
-const OVERDUE: TableDefinition<(i64, &str), ()> = TableDefinition::new("tasks_overdue");
+const OVERDUE: TableDefinition<(&str, i64, &str), ()> = TableDefinition::new("tasks_overdue");
 
 /// `(case_id, created_at, task_id) -> ()`.
-const BY_CASE: TableDefinition<(&str, i64, &str), ()> = TableDefinition::new("tasks_by_case");
+const BY_CASE: TableDefinition<(&str, &str, i64, &str), ()> = TableDefinition::new("tasks_by_case");
 
 /// `task_id -> ()`, every task still waiting on somebody.
 ///
@@ -39,7 +39,7 @@ const BY_CASE: TableDefinition<(&str, i64, &str), ()> = TableDefinition::new("ta
 /// still a decision the plane is waiting on, and a backlog that shrank the
 /// moment a reviewer opened something would report progress that had not
 /// happened.
-const PENDING: TableDefinition<&str, ()> = TableDefinition::new("tasks_pending");
+const PENDING: TableDefinition<(&str, &str), ()> = TableDefinition::new("tasks_pending");
 
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
     w.open_table(TASKS).map_err(|e| be(&e))?;
@@ -76,6 +76,7 @@ fn is_pending(state: &str) -> bool {
 /// Move a task between the derived indexes, in the transaction that writes it.
 fn reindex(
     w: &redb::WriteTransaction,
+    tenant: &str,
     id: &str,
     was: &Task,
     now_state: TaskState,
@@ -89,10 +90,14 @@ fn reindex(
     let mut queue = w.open_table(QUEUE).map_err(|e| be(&e))?;
     match (is_queued(before), is_queued(after)) {
         (true, false) => {
-            queue.remove((rank, created, id)).map_err(|e| be(&e))?;
+            queue
+                .remove((tenant, rank, created, id))
+                .map_err(|e| be(&e))?;
         }
         (false, true) => {
-            queue.insert((rank, created, id), ()).map_err(|e| be(&e))?;
+            queue
+                .insert((tenant, rank, created, id), ())
+                .map_err(|e| be(&e))?;
         }
         _ => {}
     }
@@ -101,10 +106,10 @@ fn reindex(
     let mut pending = w.open_table(PENDING).map_err(|e| be(&e))?;
     match (is_pending(before), is_pending(after)) {
         (true, false) => {
-            pending.remove(id).map_err(|e| be(&e))?;
+            pending.remove((tenant, id)).map_err(|e| be(&e))?;
         }
         (false, true) => {
-            pending.insert(id, ()).map_err(|e| be(&e))?;
+            pending.insert((tenant, id), ()).map_err(|e| be(&e))?;
         }
         _ => {}
     }
@@ -114,10 +119,12 @@ fn reindex(
         let mut overdue = w.open_table(OVERDUE).map_err(|e| be(&e))?;
         match (is_pending(before), is_pending(after)) {
             (true, false) => {
-                overdue.remove((ts(due), id)).map_err(|e| be(&e))?;
+                overdue.remove((tenant, ts(due), id)).map_err(|e| be(&e))?;
             }
             (false, true) => {
-                overdue.insert((ts(due), id), ()).map_err(|e| be(&e))?;
+                overdue
+                    .insert((tenant, ts(due), id), ())
+                    .map_err(|e| be(&e))?;
             }
             _ => {}
         }
@@ -127,10 +134,11 @@ fn reindex(
 
 /// Read a task back out of the store.
 fn load(
-    t: &impl ReadableTable<&'static str, &'static str>,
+    t: &impl ReadableTable<(&'static str, &'static str), &'static str>,
+    tenant: &str,
     id: &str,
 ) -> Result<Option<Task>, StoreError> {
-    match t.get(id).map_err(|e| be(&e))? {
+    match t.get((tenant, id)).map_err(|e| be(&e))? {
         None => Ok(None),
         Some(v) => Ok(Some(serde_json::from_str(v.value())?)),
     }
@@ -139,6 +147,7 @@ fn load(
 #[async_trait]
 impl TaskStore for RedbStore {
     async fn open(&self, task: &Task) -> Result<Task, StoreError> {
+        let tenant = self.tenant_name();
         let id = task.id.to_hex();
         let encoded = serde_json::to_string(task)?;
         let (rank, created) = (priority_rank(task.priority.as_str()), ts(task.created_at));
@@ -154,18 +163,18 @@ impl TaskStore for RedbStore {
                 let mut tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
                 // First open wins, by id: reopening must not rewrite a task
                 // somebody may already hold.
-                if let Some(found) = load(&tasks, &id)? {
+                if let Some(found) = load(&tasks, &tenant, &id)? {
                     found
                 } else {
                     {
                         tasks
-                            .insert(id.as_str(), encoded.as_str())
+                            .insert((tenant.as_str(), id.as_str()), encoded.as_str())
                             .map_err(|e| be(&e))?;
                         drop(tasks);
                         if queued {
                             w.open_table(QUEUE)
                                 .map_err(|e| be(&e))?
-                                .insert((rank, created, id.as_str()), ())
+                                .insert((tenant.as_str(), rank, created, id.as_str()), ())
                                 .map_err(|e| be(&e))?;
                         }
                         if let Some(d) = due
@@ -173,19 +182,19 @@ impl TaskStore for RedbStore {
                         {
                             w.open_table(OVERDUE)
                                 .map_err(|e| be(&e))?
-                                .insert((d, id.as_str()), ())
+                                .insert((tenant.as_str(), d, id.as_str()), ())
                                 .map_err(|e| be(&e))?;
                         }
                         if pending {
                             w.open_table(PENDING)
                                 .map_err(|e| be(&e))?
-                                .insert(id.as_str(), ())
+                                .insert((tenant.as_str(), id.as_str()), ())
                                 .map_err(|e| be(&e))?;
                         }
                         if let Some(c) = &case {
                             w.open_table(BY_CASE)
                                 .map_err(|e| be(&e))?
-                                .insert((c.as_str(), created, id.as_str()), ())
+                                .insert((tenant.as_str(), c.as_str(), created, id.as_str()), ())
                                 .map_err(|e| be(&e))?;
                         }
                         serde_json::from_str(&encoded)?
@@ -199,16 +208,18 @@ impl TaskStore for RedbStore {
     }
 
     async fn task(&self, id: TaskId) -> Result<Option<Task>, StoreError> {
+        let tenant = self.tenant_name();
         let key = id.to_hex();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(TASKS).map_err(|e| be(&e))?;
-            load(&t, &key)
+            load(&t, &tenant, &key)
         })
         .await
     }
 
     async fn claim(&self, id: TaskId, actor: &str, roles: &[String]) -> Result<Task, ClaimError> {
+        let tenant = self.tenant_name();
         let key = id.to_hex();
         let actor = actor.to_owned();
         let roles = roles.to_vec();
@@ -216,7 +227,7 @@ impl TaskStore for RedbStore {
             let w = begin_write(db)?;
             let out = {
                 let mut tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
-                match load(&tasks, &key)? {
+                match load(&tasks, &tenant, &key)? {
                     None => Err(ClaimError::NotFound(id)),
                     Some(task) => {
                         // Eligibility before availability, and the order is
@@ -246,10 +257,13 @@ impl TaskStore for RedbStore {
                             updated.assignee = Some(actor);
                             updated.state = TaskState::Claimed;
                             tasks
-                                .insert(key.as_str(), serde_json::to_string(&updated)?.as_str())
+                                .insert(
+                                    (tenant.as_str(), key.as_str()),
+                                    serde_json::to_string(&updated)?.as_str(),
+                                )
                                 .map_err(|e| be(&e))?;
                             drop(tasks);
-                            reindex(&w, &key, &task, TaskState::Claimed)?;
+                            reindex(&w, &tenant, &key, &task, TaskState::Claimed)?;
                             Ok(updated)
                         }
                     }
@@ -262,13 +276,14 @@ impl TaskStore for RedbStore {
     }
 
     async fn release(&self, id: TaskId, actor: &str) -> Result<(), ClaimError> {
+        let tenant = self.tenant_name();
         let key = id.to_hex();
         let actor = actor.to_owned();
         self.with_db(move |db| {
             let w = begin_write(db)?;
             let out = {
                 let mut tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
-                let found = load(&tasks, &key)?;
+                let found = load(&tasks, &tenant, &key)?;
                 // Not "no such task": the row may exist and be held by somebody
                 // else. Reporting success here would tell a caller they released
                 // work they never held.
@@ -281,10 +296,13 @@ impl TaskStore for RedbStore {
                     updated.assignee = None;
                     updated.state = TaskState::Open;
                     tasks
-                        .insert(key.as_str(), serde_json::to_string(&updated)?.as_str())
+                        .insert(
+                            (tenant.as_str(), key.as_str()),
+                            serde_json::to_string(&updated)?.as_str(),
+                        )
                         .map_err(|e| be(&e))?;
                     drop(tasks);
-                    reindex(&w, &key, &task, TaskState::Open)?;
+                    reindex(&w, &tenant, &key, &task, TaskState::Open)?;
                     Ok(())
                 } else {
                     Err(ClaimError::NotHeld { task: id, actor })
@@ -297,21 +315,25 @@ impl TaskStore for RedbStore {
     }
 
     async fn set_state(&self, id: TaskId, state: TaskState) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
         let key = id.to_hex();
         self.with_db(move |db| {
             let w = begin_write(db)?;
             {
                 let mut tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
-                let Some(task) = load(&tasks, &key)? else {
+                let Some(task) = load(&tasks, &tenant, &key)? else {
                     return Err(StoreError::NotFound(id.to_string()));
                 };
                 let mut updated = task.clone();
                 updated.state = state;
                 tasks
-                    .insert(key.as_str(), serde_json::to_string(&updated)?.as_str())
+                    .insert(
+                        (tenant.as_str(), key.as_str()),
+                        serde_json::to_string(&updated)?.as_str(),
+                    )
                     .map_err(|e| be(&e))?;
                 drop(tasks);
-                reindex(&w, &key, &task, state)?;
+                reindex(&w, &tenant, &key, &task, state)?;
             }
             w.commit().map_err(|e| be(&e))?;
             Ok(())
@@ -320,6 +342,7 @@ impl TaskStore for RedbStore {
     }
 
     async fn queue(&self, roles: &[String], limit: usize) -> Result<Vec<Task>, StoreError> {
+        let tenant = self.tenant_name();
         let roles = roles.to_vec();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
@@ -333,7 +356,7 @@ impl TaskStore for RedbStore {
                     break;
                 }
                 let (k, _) = e.map_err(|e| be(&e))?;
-                if let Some(t) = load(&tasks, k.value().2)? {
+                if let Some(t) = load(&tasks, &tenant, k.value().3)? {
                     // Filtered here rather than in the index, so role semantics
                     // live in one place: the queue can never show work the claim
                     // path would refuse.
@@ -350,6 +373,7 @@ impl TaskStore for RedbStore {
     }
 
     async fn for_case(&self, case: CaseId) -> Result<Vec<Task>, StoreError> {
+        let tenant = self.tenant_name();
         let key = case.to_string();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
@@ -357,11 +381,14 @@ impl TaskStore for RedbStore {
             let tasks = r.open_table(TASKS).map_err(|e| be(&e))?;
             let mut out = Vec::new();
             for e in by_case
-                .range((key.as_str(), i64::MIN, "")..=(key.as_str(), i64::MAX, MAX_STR))
+                .range(
+                    (tenant.as_str(), key.as_str(), i64::MIN, "")
+                        ..=(tenant.as_str(), key.as_str(), i64::MAX, MAX_STR),
+                )
                 .map_err(|e| be(&e))?
             {
                 let (k, _) = e.map_err(|e| be(&e))?;
-                if let Some(t) = load(&tasks, k.value().2)? {
+                if let Some(t) = load(&tasks, &tenant, k.value().3)? {
                     out.push(t);
                 }
             }
@@ -371,17 +398,28 @@ impl TaskStore for RedbStore {
     }
 
     async fn open_count(&self) -> Result<u64, StoreError> {
-        self.with_db(|db| {
+        let tenant = self.tenant_name();
+        self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
-            r.open_table(PENDING)
+            // Counted over this tenant's range rather than `len()` on the
+            // table: a whole-table count reports every tenant's open tasks as
+            // this one's, which is a metric that reads plausibly and is wrong.
+            let pending = r.open_table(PENDING).map_err(|e| be(&e))?;
+            let mut n = 0u64;
+            for e in pending
+                .range((tenant.as_str(), "")..=(tenant.as_str(), MAX_STR))
                 .map_err(|e| be(&e))?
-                .len()
-                .map_err(|e| be(&e))
+            {
+                e.map_err(|e| be(&e))?;
+                n += 1;
+            }
+            Ok(n)
         })
         .await
     }
 
     async fn overdue(&self, now: Timestamp, limit: usize) -> Result<Vec<Task>, StoreError> {
+        let tenant = self.tenant_name();
         let cutoff = ts(now);
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
@@ -389,14 +427,14 @@ impl TaskStore for RedbStore {
             let tasks = r.open_table(TASKS).map_err(|e| be(&e))?;
             let mut out = Vec::new();
             for e in od
-                .range((i64::MIN, "")..=(cutoff, MAX_STR))
+                .range((tenant.as_str(), i64::MIN, "")..=(tenant.as_str(), cutoff, MAX_STR))
                 .map_err(|e| be(&e))?
             {
                 if out.len() >= limit {
                     break;
                 }
                 let (k, _) = e.map_err(|e| be(&e))?;
-                if let Some(t) = load(&tasks, k.value().1)? {
+                if let Some(t) = load(&tasks, &tenant, k.value().2)? {
                     out.push(t);
                 }
             }

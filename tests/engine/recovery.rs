@@ -55,9 +55,13 @@ impl Skill for Pipeline {
         for i in 0..STAGES {
             // Each stage is a distinct effect: distinct kind, distinct ordinal.
             let counter = Arc::new(AtomicUsize::new(0));
-            cx.effect(Recorded::new(format!("stage-{i}")).counter(Arc::clone(&counter)))
-                .await
-                .map_err(agentplane::core::SkillError::Step)?;
+            let arguments = Tainted::trusted(Value::Null);
+            cx.sink(
+                Recorded::new(format!("stage-{i}")).counter(Arc::clone(&counter)),
+                &arguments,
+            )
+            .await
+            .map_err(agentplane::core::SkillError::Step)?;
             // Count only genuine invocations — a replayed effect never calls
             // `perform`, which is exactly the property under test.
             if counter.load(Ordering::SeqCst) > 0 {
@@ -206,9 +210,13 @@ async fn resume_handles_a_crash_before_a_trailing_effect() {
             let crash_at = self.crash_at.load(Ordering::SeqCst);
             for i in 0..3 {
                 let counter = Arc::new(AtomicUsize::new(0));
-                cx.effect(Recorded::new(format!("stage-{i}")).counter(Arc::clone(&counter)))
-                    .await
-                    .map_err(agentplane::core::SkillError::Step)?;
+                let arguments = Tainted::trusted(Value::Null);
+                cx.sink(
+                    Recorded::new(format!("stage-{i}")).counter(Arc::clone(&counter)),
+                    &arguments,
+                )
+                .await
+                .map_err(agentplane::core::SkillError::Step)?;
                 if counter.load(Ordering::SeqCst) > 0 {
                     self.calls[i].fetch_add(1, Ordering::SeqCst);
                 }
@@ -264,7 +272,8 @@ impl Skill for Rewritten {
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
     ) -> Result<Outcome, agentplane::core::SkillError> {
-        cx.effect(Recorded::new("completely-different"))
+        let arguments = Tainted::trusted(Value::Null);
+        cx.sink(Recorded::new("completely-different"), &arguments)
             .await
             .map_err(agentplane::core::SkillError::Step)?;
         Ok(Outcome::done(input))
@@ -276,14 +285,22 @@ impl Skill for Rewritten {
 async fn resume_refuses_a_journal_written_by_different_code() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let crash_at = Arc::new(AtomicUsize::new(0));
+    // Both runtimes share an owner on purpose: this models **one deployment
+    // slot** being redeployed, not two live instances racing. The lease owner
+    // identifies a process, so leaving it to the default would make this a test
+    // about lease expiry instead of about divergence.
     let rt = Runtime::builder(store.clone())
+        .owner("slot-a")
         .skill(pipeline(&crash_at, &tally()))
         .build();
 
     let recorded = rt.run("pipeline", json!({})).await.unwrap();
 
     // Not a crash — a rewrite. Stage 0 now does something else entirely.
-    let changed = Runtime::builder(store.clone()).skill(Rewritten).build();
+    let changed = Runtime::builder(store.clone())
+        .owner("slot-a")
+        .skill(Rewritten)
+        .build();
     let out = changed.replay(recorded.run_id, Mode::Resume).await.unwrap();
 
     match out.status {
@@ -377,9 +394,11 @@ async fn an_orphaned_mutating_effect_is_quarantined_not_retried() {
                 Append::new(
                     run,
                     RecordKind::RunAdmitted {
-                        agent: "demo.pipeline".into(),
+                        capability: "demo.pipeline".into(),
+                        governed_by: None,
                         input: json!({}),
-                        policy: None,
+                        input_label: agentplane::core::Label::trusted(),
+                        policy_bundle: None,
                     },
                 ),
                 // Replay reads the plan back from history rather than
@@ -477,4 +496,185 @@ async fn resuming_a_finished_run_does_not_re_execute_it() {
     for c in calls.iter().take(STAGES) {
         assert_eq!(c.load(Ordering::SeqCst), 1);
     }
+}
+
+/// Two runtimes never share a lease owner.
+///
+/// The owner is a **process-instance** identity, and the store renews a lease
+/// *without bumping the epoch* when the holder is the same owner. So two
+/// instances sharing an owner string each read the other's lease as their own:
+/// no fencing, no epoch bump, two writers on one run — the exact situation the
+/// epoch exists to make impossible.
+///
+/// This was real twice over. The default was the constant `"agentplane"`, which
+/// every replica and every restart used; and wiring a manifest set the owner to
+/// the *agent's name*, which every replica of that agent would then share.
+/// Neither showed up in any test, because nothing had ever asked.
+#[tokio::test]
+async fn two_runtimes_do_not_share_a_lease_owner() {
+    use agentplane::core::{RunId, StoreError};
+    use agentplane::journal::JournalStore;
+    use agentplane::runtime::Runtime;
+    use std::sync::Arc;
+
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().unwrap());
+    let a = Runtime::builder(Arc::clone(&store)).build();
+    let b = Runtime::builder(Arc::clone(&store)).build();
+
+    // A run held by one instance must be *refused* to the other while live,
+    // rather than silently renewed as if it were the same process.
+    let run = RunId::generate();
+    store
+        .acquire(run, a.owner_id(), std::time::Duration::from_mins(1))
+        .await
+        .expect("first instance takes the lease");
+
+    match store
+        .acquire(run, b.owner_id(), std::time::Duration::from_mins(1))
+        .await
+    {
+        Err(StoreError::LeaseHeld { owner, .. }) => {
+            assert_eq!(owner, a.owner_id(), "the wrong instance is named as holder");
+        }
+        Err(other) => panic!("expected a lease conflict: {other:?}"),
+        Ok(_) => panic!(
+            "a second runtime renewed the first one's lease without fencing it — \
+             both would now write to this run under one epoch"
+        ),
+    }
+}
+
+/// Wiring a manifest does not make replicas of one agent share an owner.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn a_manifest_does_not_become_the_lease_owner() {
+    use agentplane::journal::JournalStore;
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Runtime;
+    use std::sync::Arc;
+
+    const AGENT: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: shared-agent, version: "1.0.0" }
+spec:
+  budgets: {}
+"#;
+    let m = Manifest::parse(AGENT).expect("parse");
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().unwrap());
+
+    let a = Runtime::builder(Arc::clone(&store))
+        .agent(agentplane::runtime::Agent::new(&m))
+        .build();
+    let b = Runtime::builder(Arc::clone(&store))
+        .agent(agentplane::runtime::Agent::new(&m))
+        .build();
+
+    assert_ne!(
+        a.owner_id(),
+        b.owner_id(),
+        "two replicas of one agent share a lease owner, so each would renew the \
+         other's lease without bumping the epoch"
+    );
+    assert_ne!(
+        a.owner_id(),
+        "shared-agent",
+        "the agent's name became the instance identity — an agent's name is not \
+         a process, and several instances of one agent are normal"
+    );
+}
+
+/// A run that takes longer than its lease is not taken away from it.
+///
+/// The lease exists to answer "is this owner dead?", and it answers it by
+/// expiry. A live run that never renews therefore looks dead the moment its TTL
+/// passes — and agent runs routinely take longer than a lease does, since a
+/// single model call can. Another instance then acquires the run, bumps the
+/// epoch, and the healthy original is fenced on its next append: killed mid
+/// flight, having done real work, for the crime of being slow.
+///
+/// So the runtime heartbeats while it executes. The TTL then bounds how long a
+/// *crashed* owner strands its runs, which is what it is for, rather than how
+/// long a run may take, which it should never have bounded.
+#[tokio::test]
+async fn a_long_run_keeps_its_lease() {
+    use std::time::Duration;
+
+    use agentplane::core::StoreError;
+
+    /// Sleeps past the lease, recording its run id so the test can race it.
+    #[derive(Debug)]
+    struct Slow {
+        run: Arc<std::sync::Mutex<Option<agentplane::core::RunId>>>,
+        naps: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Slow {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("slow").provides("slow")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, agentplane::core::SkillError> {
+            *self.run.lock().unwrap() = Some(cx.run_id());
+            tokio::time::sleep(self.naps).await;
+            Ok(Outcome::done(Tainted::trusted(json!({"ok": true}))))
+        }
+    }
+
+    let ttl = Duration::from_secs(2);
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("instance-a")
+        .lease_ttl(ttl)
+        .skill(Slow {
+            run: seen.clone(),
+            naps: ttl * 3,
+        })
+        .build();
+
+    let running = tokio::spawn(async move { rt.run("slow", json!({})).await });
+
+    // Wait until the skill is in flight and its lease has had time to lapse,
+    // then do what a recovering instance does: try to take the run over.
+    tokio::time::sleep(ttl + ttl / 2).await;
+    let run = seen.lock().unwrap().expect("the skill did not start");
+    let stolen = (store as Arc<dyn JournalStore>)
+        .acquire(run, "instance-b", ttl)
+        .await;
+
+    assert!(
+        matches!(stolen, Err(StoreError::LeaseHeld { .. })),
+        "another instance took over a run that is still executing — the \
+         original is now fenced and dies on its next append, having already \
+         done the work: {stolen:?}"
+    );
+
+    let outcome = running.await.expect("the run task panicked").expect("run");
+    assert_eq!(
+        outcome.status,
+        RunStatus::Succeeded,
+        "the run did not survive its own lease"
+    );
+}
+
+/// A lease too short to be renewed is refused when the plane is built.
+///
+/// Both stores keep expiry in whole seconds and lapse on `expires_at <= now`, so
+/// a one-second lease is expired for part of every second it exists — no
+/// renewal frequency saves it. Accepting one would produce a plane whose runs
+/// can be taken over while working, and it would only show up under load.
+#[test]
+#[should_panic(expected = "cannot be renewed")]
+fn a_lease_too_short_to_renew_is_refused() {
+    use std::time::Duration;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let _ = Runtime::builder(store as Arc<dyn JournalStore>)
+        .lease_ttl(Duration::from_secs(1))
+        .build();
 }

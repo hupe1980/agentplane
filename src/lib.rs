@@ -71,7 +71,7 @@
 //! }
 //!
 //! # async fn run(store: Arc<dyn JournalStore>) -> Result<(), Box<dyn std::error::Error>> {
-//! // With the default features, `agentplane::store::TursoStore` is one.
+//! // With the default features, `agentplane::store::RedbStore` is one.
 //! let runtime = Runtime::builder(store).skill(Greet).build();
 //! let outcome = runtime.run("greet", serde_json::json!({"name": "world"})).await?;
 //!
@@ -91,6 +91,12 @@ pub mod blob;
 pub mod case;
 pub mod core;
 pub mod journal;
+#[cfg(feature = "keyring")]
+pub mod keyring;
+#[cfg(feature = "manifest")]
+pub mod manifest;
+#[cfg(feature = "media")]
+pub mod media;
 pub mod model;
 pub mod peers;
 pub mod plan;

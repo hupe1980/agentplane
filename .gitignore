@@ -27,6 +27,7 @@ spec/*.out
 #.idea/
 
 # Custom
+.env
 CONCEPT.md
 # Backups written by tools/mutants.py while a mutation is applied. Present only
 # between apply and revert; an interrupted sweep leaves one behind, and it must

@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentplane::core::{
-    Digest, Outcome, Sensitivity, Skill, SkillDescriptor, SourceId, StepError, Tainted,
+    Digest, Outcome, Release, ReleaseScope, Sensitivity, Skill, SkillDescriptor, SourceId,
+    StepError, Tainted,
 };
 use agentplane::journal::{JournalStore, Record, RecordKind};
 use agentplane::runtime::effects::Recorded;
@@ -40,8 +41,12 @@ impl Skill for CallsTool {
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
     ) -> Result<Outcome, agentplane::core::SkillError> {
+        let arguments = Tainted::trusted(Value::Null);
         let out = cx
-            .effect(Recorded::new("post").counter(Arc::clone(&self.calls)))
+            .sink(
+                Recorded::new("post").counter(Arc::clone(&self.calls)),
+                &arguments,
+            )
             .await
             .map_err(agentplane::core::SkillError::Step)?;
         // The label joins: this step's output derives from its input *and*
@@ -71,9 +76,13 @@ impl Skill for VariableEffects {
     ) -> Result<Outcome, agentplane::core::SkillError> {
         let n = self.count.load(Ordering::SeqCst);
         for i in 0..n {
-            cx.effect(Recorded::new(format!("step-{i}")).counter(Arc::clone(&self.calls)))
-                .await
-                .map_err(agentplane::core::SkillError::Step)?;
+            let arguments = Tainted::trusted(Value::Null);
+            cx.sink(
+                Recorded::new(format!("step-{i}")).counter(Arc::clone(&self.calls)),
+                &arguments,
+            )
+            .await
+            .map_err(agentplane::core::SkillError::Step)?;
         }
         Ok(Outcome::done(input))
     }
@@ -133,7 +142,9 @@ impl Skill for SinksLabeled {
             .with_sensitivity(self.label_sensitivity);
         let value = Tainted::with_label(value.peek().clone(), label);
 
-        let mut sink = Recorded::new("sink").ceiling(self.ceiling);
+        let mut sink = Recorded::new("sink")
+            .payload(value.peek().clone())
+            .ceiling(self.ceiling);
         if !self.mutating {
             sink = sink.read_only();
         }
@@ -471,7 +482,7 @@ async fn a_sink_refuses_data_above_its_ceiling() {
     }
 }
 
-/// **Taint gate.** Untrusted data may not reach a mutating sink undeclassified.
+/// **Taint gate.** Untrusted data may not reach a mutating sink without release.
 #[tokio::test]
 async fn untrusted_data_cannot_reach_a_mutating_sink() {
     let rt = Runtime::builder(store())
@@ -509,16 +520,16 @@ async fn untrusted_data_may_reach_a_read_only_sink() {
     assert_eq!(out.status, RunStatus::Succeeded);
 }
 
-/// Declassification is never silent: it lands in the journal with its reason.
+/// Release is never silent: it lands in the journal with typed evidence.
 #[tokio::test]
-async fn declassification_is_journaled_with_its_reason() {
+async fn release_is_journaled_with_its_evidence() {
     #[derive(Debug)]
-    struct Declassifies;
+    struct Releases;
 
     #[async_trait::async_trait]
-    impl Skill for Declassifies {
+    impl Skill for Releases {
         fn descriptor(&self) -> SkillDescriptor {
-            SkillDescriptor::new("declassifies").provides("demo.declassify")
+            SkillDescriptor::new("releases").provides("demo.release")
         }
         async fn invoke(
             &self,
@@ -527,27 +538,44 @@ async fn declassification_is_journaled_with_its_reason() {
         ) -> Result<Outcome, agentplane::core::SkillError> {
             let secret = Tainted::from_source(json!("s"), SourceId::new("vault"));
             let plain = cx
-                .declassify(secret, "operator approved for settlement export")
+                .release(
+                    secret,
+                    Release::whole(
+                        ReleaseScope::trust(),
+                        "operator approved for settlement export",
+                        "run.output",
+                        ["approval:SET-42".to_owned()],
+                    ),
+                )
                 .await
                 .map_err(agentplane::core::SkillError::Step)?;
-            Ok(Outcome::done(Tainted::trusted(plain)))
+            Ok(Outcome::done(plain))
         }
     }
 
-    let rt = Runtime::builder(store()).skill(Declassifies).build();
-    let out = rt.run("declassifies", json!({})).await.unwrap();
+    let rt = Runtime::builder(store()).skill(Releases).build();
+    let out = rt.run("demo.release", json!({})).await.unwrap();
     let records = rt.store().read(out.run_id, 1).await.unwrap();
 
     let found = records.iter().any(|r| match r.kind() {
-        RecordKind::Declassified { reason, label } => {
-            reason.contains("operator approved") && label.is_untrusted()
+        RecordKind::Released {
+            release,
+            label,
+            result_label,
+            value,
+            ..
+        } => {
+            release.basis().contains("operator approved")
+                && label.is_untrusted()
+                && !result_label.is_untrusted()
+                && *value
+                    == agentplane::core::Digest::of(
+                        &serde_json::to_vec(&json!("s")).expect("serialize fixture"),
+                    )
         }
         _ => false,
     });
-    assert!(
-        found,
-        "declassification must leave a permanent, reasoned record"
-    );
+    assert!(found, "release must leave a permanent, evidenced record");
 }
 
 /// Completion is decided by the runtime, not claimed by the workload.
@@ -619,28 +647,38 @@ fn divergence_errors_are_diagnosable() {
 #[tokio::test]
 async fn strict_replay_writes_nothing() {
     #[derive(Debug)]
-    struct Declassifies;
+    struct Releases;
 
     #[async_trait::async_trait]
-    impl Skill for Declassifies {
+    impl Skill for Releases {
         fn descriptor(&self) -> SkillDescriptor {
-            SkillDescriptor::new("declassifies").provides("demo.declassify")
+            SkillDescriptor::new("releases").provides("demo.release")
         }
         async fn invoke(
             &self,
             cx: &mut StepCtx<'_>,
             _input: Tainted<Value>,
         ) -> Result<Outcome, agentplane::core::SkillError> {
-            cx.note("about to declassify").await?;
+            cx.note("about to release").await?;
             let secret = Tainted::from_source(json!("s"), SourceId::new("vault"));
-            let plain = cx.declassify(secret, "approved").await?;
-            Ok(Outcome::done(Tainted::trusted(plain)))
+            let plain = cx
+                .release(
+                    secret,
+                    Release::whole(
+                        ReleaseScope::trust(),
+                        "approved",
+                        "run.output",
+                        ["approval:test".to_owned()],
+                    ),
+                )
+                .await?;
+            Ok(Outcome::done(plain))
         }
     }
 
     let s = Arc::new(RedbStore::open_in_memory().unwrap());
-    let rt = Runtime::builder(s.clone()).skill(Declassifies).build();
-    let out = rt.run("declassifies", json!({})).await.unwrap();
+    let rt = Runtime::builder(s.clone()).skill(Releases).build();
+    let out = rt.run("demo.release", json!({})).await.unwrap();
 
     let before = s.read(out.run_id, 1).await.unwrap();
     for _ in 0..3 {
@@ -677,7 +715,8 @@ async fn notes_are_journaled_next_to_their_effects() {
             input: Tainted<Value>,
         ) -> Result<Outcome, agentplane::core::SkillError> {
             cx.note("deviation exceeds threshold; escalating").await?;
-            cx.effect(Recorded::new("escalate")).await?;
+            let arguments = Tainted::trusted(Value::Null);
+            cx.sink(Recorded::new("escalate"), &arguments).await?;
             Ok(Outcome::done(input))
         }
     }

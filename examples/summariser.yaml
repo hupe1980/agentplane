@@ -1,0 +1,17 @@
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: summariser, version: "1.0.0" }
+spec:
+  execution: { kind: completion }
+  identity:
+    role: "Summarise a support ticket"
+    constraints: "One sentence. No speculation."
+  capabilities: { provides: [support.summarise] }
+  models:
+    privileged: { provider: fake, model: sum-1 }
+  output:
+    schema:
+      type: object
+      required: [summary]
+      properties: { summary: { type: string } }
+  budgets: { max_tokens: 10000 }

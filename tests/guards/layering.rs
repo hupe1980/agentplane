@@ -495,13 +495,22 @@ fn no_public_enum_variant_is_dead() {
         .collect::<Vec<_>>()
         .join("\n");
 
+    // Match arms are stripped too, and for the same reason comments are:
+    // *destructuring* a variant is not *constructing* one. A variant that only
+    // ever appears on the left of a `=>` is reachable from nowhere — the code
+    // that mentions it is the code refusing it — which is precisely the dead
+    // declaration this guard exists to find. It hid `Outcome::Delegate`, a
+    // public variant whose only mention was the arm that turned it into a
+    // failure, so no caller could ever use it successfully.
+    let constructed = strip_match_patterns(&everything);
+
     let mut dead = Vec::new();
     for (path, text) in &sources {
         for (name, body) in enums(text) {
             for variant in variants(&body) {
                 let v = &variant.name;
-                let referenced = everything.contains(&format!("{name}::{v}"))
-                    || everything.contains(&format!("Self::{v}"));
+                let referenced = constructed.contains(&format!("{name}::{v}"))
+                    || constructed.contains(&format!("Self::{v}"));
                 if !variant.from && !referenced {
                     dead.push(format!("{path}: {name}::{v}"));
                 }
@@ -515,6 +524,18 @@ fn no_public_enum_variant_is_dead() {
          exercise them from a test if they are for callers:\n  {}",
         dead.join("\n  ")
     );
+}
+
+/// Drop everything to the left of a `=>`, which is where patterns live.
+///
+/// Deliberately a heuristic rather than a parser: it can only ever make the
+/// guard *stricter*, because it removes text rather than adding it. A variant
+/// that survives this is one somebody actually builds.
+fn strip_match_patterns(src: &str) -> String {
+    src.lines()
+        .map(|l| l.split_once("=>").map_or(l, |(_, rhs)| rhs))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Drop comment lines, so prose mentioning a name is not mistaken for using it.
@@ -1270,5 +1291,92 @@ fn every_mutation_still_anchors_in_the_code() {
         report.contains("0 broken"),
         "a mutation no longer matches the code it names, so the guarantee it \
          pins is unverified and looks verified:\n{report}"
+    );
+}
+
+/// Only the sealed accessor may read the raw blob store.
+///
+/// `StepCtx::blobs_scoped` decides whether payload bytes are encrypted. Any
+/// other path reaching `self.blobs` directly writes them in the clear, so a
+/// deployment with a key ring gets one route that seals and one that does not —
+/// and erasing a case silently misses whatever took the second. The governed
+/// media path did exactly that, and nothing failed: the bytes were written, the
+/// run succeeded, and the erasure was quietly partial.
+///
+/// A count rather than a name, because the next bypass will not be called
+/// `fetch_media`.
+#[test]
+fn only_the_sealed_accessor_reads_the_raw_blob_store() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime/ctx.rs"),
+    )
+    .expect("the context module");
+    assert!(
+        src.contains("fn blobs_scoped"),
+        "the sealed accessor is gone or renamed — this guard now proves nothing"
+    );
+
+    let direct = src.matches("self.blobs.clone()").count();
+    assert_eq!(
+        direct, 1,
+        "the raw blob store is read {direct} times; exactly one — inside \
+         `blobs_scoped` — may. Every other caller must go through it, or a \
+         sealed deployment has a write path that stores payload bytes in the \
+         clear and an erasure that cannot reach them"
+    );
+}
+
+/// Every declared route appears in the unauthenticated-request test.
+///
+/// That test is the one saying "no credentials, no answer — on every route", and
+/// it is a **hand-written list**: it enumerates requests rather than asking the
+/// router what it serves. So a route added to the router and forgotten here is
+/// silently unguarded, and the claim keeps reading as though it were checked.
+///
+/// This closes that by comparing the two: each route's literal path segments
+/// must appear in the test's source. It is a coarse match on purpose — the test
+/// substitutes real ids for `{run}` and builds some paths with `format!`, so
+/// matching whole paths would fail for reasons that are not defects.
+#[test]
+fn every_api_route_is_covered_by_the_unauthenticated_test() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let router = std::fs::read_to_string(root.join("src/api/mod.rs")).expect("the api module");
+    let guard = std::fs::read_to_string(root.join("tests/wire/api.rs")).expect("the api tests");
+
+    let start = guard
+        .find("async fn an_unauthenticated_request_is_refused_everywhere")
+        .expect("the unauthenticated-request test is gone, so this guard is inert");
+    let body = &guard[start..];
+
+    let paths: Vec<&str> = router
+        .match_indices(".route(\"")
+        .filter_map(|(i, _)| {
+            let rest = &router[i + ".route(\"".len()..];
+            rest.find('"').map(|end| &rest[..end])
+        })
+        .collect();
+    assert!(
+        paths.len() > 5,
+        "found only {} routes; the extraction broke and this guard now proves \
+         nothing",
+        paths.len()
+    );
+
+    let mut uncovered = Vec::new();
+    for path in &paths {
+        let literal: Vec<&str> = path
+            .split('/')
+            .filter(|s| !s.is_empty() && !s.starts_with('{'))
+            .collect();
+        if !literal.iter().all(|seg| body.contains(seg)) {
+            uncovered.push(*path);
+        }
+    }
+    assert!(
+        uncovered.is_empty(),
+        "these routes are served but absent from the unauthenticated-request \
+         test, so nothing checks that they refuse a caller with no \
+         credentials:\n  {}",
+        uncovered.join("\n  ")
     );
 }

@@ -38,8 +38,24 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The A2A protocol version this crate speaks, as client and as server.
+///
+/// One definition because it is one fact. The client sends it in `A2A-Version`,
+/// the published card names it on every interface, and the server refuses a
+/// request that asks for something else — three places that must agree, and a
+/// version that disagrees with the card is the kind of drift a caller finds
+/// before we do.
+pub const PROTOCOL_VERSION: &str = "1.0";
+
 #[cfg(feature = "a2a")]
 pub mod a2a;
+#[cfg(feature = "manifest")]
+mod card;
+#[cfg(feature = "manifest")]
+pub use card::{
+    AgentCard, CardCapabilities, CardInterface, CardSkill, ExtendedAgentCard, ExtendedBudget,
+    ExtendedTool, WELL_KNOWN_PATH,
+};
 mod credentials;
 pub use credentials::{Cached, CredentialError, CredentialSource, Fixed, TokenExchange};
 
@@ -267,6 +283,13 @@ pub enum PeerError {
     #[error("'{peer}' did not answer in time: {detail}")]
     TimedOut { peer: PeerId, detail: String },
 
+    /// Sent, but the peer's response did not conform to the negotiated protocol.
+    ///
+    /// The request may already have caused work, so this is in doubt rather
+    /// than a clean refusal.
+    #[error("'{peer}' returned an invalid response: {detail}")]
+    InvalidResponse { peer: PeerId, detail: String },
+
     /// The peer acted and reported failure.
     #[error("'{peer}' reported a failure: {detail}")]
     Failed { peer: PeerId, detail: String },
@@ -284,7 +307,7 @@ impl PeerError {
             | Self::WrongAudience { .. }
             | Self::Unreachable { .. }
             | Self::Refused { .. } => Disposition::DidNotHappen,
-            Self::TimedOut { .. } => Disposition::InDoubt,
+            Self::TimedOut { .. } | Self::InvalidResponse { .. } => Disposition::InDoubt,
             Self::Failed { .. } => Disposition::Landed,
         }
     }
@@ -502,6 +525,10 @@ impl Effect for PeerCall {
 
     fn max_sensitivity(&self) -> Sensitivity {
         self.grant.max_sensitivity
+    }
+
+    fn delegation_depth(&self) -> Option<usize> {
+        Some(self.acting_as.depth())
     }
 
     fn output_sensitivity(&self) -> Sensitivity {

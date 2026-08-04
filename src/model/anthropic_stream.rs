@@ -28,18 +28,32 @@ use serde_json::Value;
 
 use super::Usage;
 
+/// One tool block, reassembled across deltas.
+#[derive(Debug, Default, Clone)]
+struct ToolBlock {
+    id: String,
+    name: String,
+    /// Fragments of the argument object, in arrival order.
+    json: String,
+}
+
 /// A message being rebuilt from events.
 #[derive(Debug, Default)]
 pub struct Accumulator {
     text: String,
-    /// Partial JSON for the forced-tool block, accumulated across deltas.
+    /// Every tool block being reassembled, keyed by content-block index.
     ///
     /// Anthropic hands tool input over as *fragments of a JSON string* when
     /// streaming, unlike the non-streaming path where it arrives already
     /// decoded. So the emulated structured-output mode can fail here in a way it
     /// cannot there: the fragments may not reassemble into valid JSON.
-    tool_json: String,
-    /// Which content block index is the forced tool call.
+    ///
+    /// Keyed by index rather than accumulated into one buffer because a model
+    /// may emit several tool calls at once, and their fragments interleave.
+    /// Concatenating them yields JSON that parses into the wrong arguments —
+    /// worse than failing, because it succeeds.
+    tools: std::collections::BTreeMap<u64, ToolBlock>,
+    /// Which content block index is the forced structured-output tool.
     tool_index: Option<u64>,
     usage: Usage,
     /// Whether `message_start` arrived — i.e. whether generation began.
@@ -119,8 +133,29 @@ impl Accumulator {
     /// reports `Unusable` either way — the call generated regardless.
     #[must_use]
     pub fn forced_tool_input(&self) -> Option<Value> {
-        self.tool_index?;
-        serde_json::from_str(&self.tool_json).ok()
+        let index = self.tool_index?;
+        serde_json::from_str(&self.tools.get(&index)?.json).ok()
+    }
+
+    /// Tool calls the model asked for, excluding this crate's forced one.
+    ///
+    /// A block whose fragments did not reassemble into JSON is **dropped rather
+    /// than guessed at**. Handing a caller a tool call with partial arguments
+    /// would dispatch a real side effect built from half a request, which is the
+    /// one outcome worse than reporting nothing.
+    #[must_use]
+    pub fn tool_calls(&self) -> Vec<super::ToolCall> {
+        self.tools
+            .iter()
+            .filter(|(index, _)| Some(**index) != self.tool_index)
+            .filter_map(|(_, b)| {
+                Some(super::ToolCall {
+                    id: b.id.clone(),
+                    name: b.name.clone(),
+                    arguments: serde_json::from_str(&b.json).ok()?,
+                })
+            })
+            .collect()
     }
 
     /// Absorb one event.
@@ -154,13 +189,32 @@ impl Accumulator {
                 }
             }
             "content_block_start" => {
-                let is_tool = value
-                    .get("content_block")
-                    .and_then(|b| b.get("type"))
-                    .and_then(Value::as_str)
-                    == Some("tool_use");
-                if is_tool {
-                    self.tool_index = value.get("index").and_then(Value::as_u64);
+                let block = value.get("content_block");
+                let is_tool =
+                    block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use");
+                if is_tool && let Some(index) = value.get("index").and_then(Value::as_u64) {
+                    let str_of = |k: &str| {
+                        block
+                            .and_then(|b| b.get(k))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned()
+                    };
+                    let name = str_of("name");
+                    // The forced tool is remembered separately: it is this
+                    // crate's own mechanism for getting a schema-shaped answer,
+                    // not something the caller asked the model to invoke.
+                    if name == crate::model::wire::RESPOND_TOOL {
+                        self.tool_index = Some(index);
+                    }
+                    self.tools.insert(
+                        index,
+                        ToolBlock {
+                            id: str_of("id"),
+                            name,
+                            json: String::new(),
+                        },
+                    );
                 }
             }
             "content_block_delta" => self.delta(&value),
@@ -208,14 +262,15 @@ impl Accumulator {
                 }
             }
             Some("input_json_delta") => {
-                // Only the forced tool's block. A model may emit other tool
-                // calls, and mixing their fragments into one buffer produces
-                // JSON that parses into the wrong answer — which is worse than
+                // Routed to the block it belongs to. Fragments from concurrent
+                // tool calls interleave, so one shared buffer would reassemble
+                // into JSON that parses into the wrong arguments — worse than
                 // failing, because it succeeds.
-                if value.get("index").and_then(Value::as_u64) == self.tool_index
+                if let Some(index) = value.get("index").and_then(Value::as_u64)
                     && let Some(p) = delta.get("partial_json").and_then(Value::as_str)
+                    && let Some(block) = self.tools.get_mut(&index)
                 {
-                    self.tool_json.push_str(p);
+                    block.json.push_str(p);
                 }
             }
             // `thinking_delta` and `signature_delta` are deliberately dropped.
@@ -424,6 +479,108 @@ mod tests {
         );
         assert_eq!(billed.cache_write_tokens, 40);
         assert_eq!(billed.cache_read_tokens, 60);
+    }
+
+    /// Build events with `json!` rather than by hand.
+    ///
+    /// Tool fragments are JSON *inside* a JSON string, so hand-written fixtures
+    /// need two levels of escaping. The first version of these tests got that
+    /// wrong, the events failed to parse, the accumulator ignored them exactly
+    /// as it ignores any malformed event — and the test reported the feature
+    /// broken when the fixture was.
+    fn tool_start(index: u64, id: &str, name: &str) -> String {
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": { "type": "tool_use", "id": id, "name": name },
+        })
+        .to_string()
+    }
+
+    fn tool_fragment(index: u64, partial: &str) -> String {
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": { "type": "input_json_delta", "partial_json": partial },
+        })
+        .to_string()
+    }
+
+    /// Two tool calls streamed at once do not contaminate each other.
+    ///
+    /// Anthropic sends arguments as JSON *fragments*, and fragments from
+    /// concurrent blocks interleave. A single shared buffer reassembles them
+    /// into JSON that parses — into the wrong arguments. That failure succeeds,
+    /// which is why it earns its own test: a tool dispatched with another
+    /// call's arguments is a real side effect on the wrong thing.
+    #[test]
+    fn concurrent_tool_calls_keep_their_own_arguments() {
+        let mut acc = Accumulator::new();
+        feed(&mut acc, &[START]);
+        acc.event("content_block_start", &tool_start(0, "call_a", "refund"));
+        acc.event("content_block_start", &tool_start(1, "call_b", "notify"));
+
+        // Interleaved on purpose: block 1's fragment lands between block 0's.
+        acc.event("content_block_delta", &tool_fragment(0, r#"{"amount":"#));
+        acc.event("content_block_delta", &tool_fragment(1, r#"{"to":"#));
+        acc.event("content_block_delta", &tool_fragment(0, "250}"));
+        acc.event("content_block_delta", &tool_fragment(1, r#""ops"}"#));
+
+        let calls = acc.tool_calls();
+        assert_eq!(calls.len(), 2, "both tool calls must survive");
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].name, "refund");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({ "amount": 250 }),
+            "block 0 picked up block 1's fragments"
+        );
+        assert_eq!(calls[1].id, "call_b");
+        assert_eq!(calls[1].arguments, serde_json::json!({ "to": "ops" }));
+    }
+
+    /// The forced structured-output tool is not a tool call.
+    ///
+    /// It is this crate's own mechanism for obtaining a schema-shaped answer. A
+    /// caller looping over `tool_calls` would try to dispatch a tool that exists
+    /// nowhere, and refuse the run for a grant nobody could have written.
+    #[test]
+    fn the_forced_tool_is_not_reported_as_a_tool_call() {
+        let mut acc = Accumulator::new();
+        feed(&mut acc, &[START]);
+        acc.event(
+            "content_block_start",
+            &tool_start(0, "t1", crate::model::wire::RESPOND_TOOL),
+        );
+        acc.event(
+            "content_block_delta",
+            &tool_fragment(0, r#"{"verdict":"ship"}"#),
+        );
+
+        assert!(
+            acc.tool_calls().is_empty(),
+            "the schema-shaping tool must not look like a request to act"
+        );
+        assert_eq!(
+            acc.forced_tool_input(),
+            Some(serde_json::json!({ "verdict": "ship" })),
+            "and it must still be readable as the structured answer"
+        );
+    }
+
+    /// Arguments that never reassemble are dropped, not passed on half-built.
+    #[test]
+    fn a_truncated_tool_call_is_dropped_rather_than_guessed() {
+        let mut acc = Accumulator::new();
+        feed(&mut acc, &[START]);
+        acc.event("content_block_start", &tool_start(0, "t1", "refund"));
+        acc.event("content_block_delta", &tool_fragment(0, r#"{"amount":25"#));
+
+        assert!(
+            acc.tool_calls().is_empty(),
+            "a refund whose amount the stream never finished sending must not be \
+             dispatched — half a request is worse than none"
+        );
     }
 
     #[test]

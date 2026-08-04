@@ -20,6 +20,9 @@ mod boundary;
 mod budgets;
 mod cedar;
 mod identity;
+#[cfg(feature = "keyring")]
+mod keyring;
+mod manifest;
 mod peers;
 mod policy;
 mod witness;

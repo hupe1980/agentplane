@@ -30,6 +30,13 @@ use super::ctx::Mode;
 use super::executor::{LEASE_TTL, Runtime};
 use super::metrics::{self, Census};
 
+/// The source a human decision arrives under.
+///
+/// This plane's own worklist, not an outside party — and named so a counterparty
+/// cannot mint an event that deduplicates against a real decision or that a
+/// policy would mistake for one.
+pub const SOURCE_WORKLIST: &str = "agentplane://worklist";
+
 /// What one tick found and did.
 ///
 /// Every field is a number worth alerting on. `breached` above zero means a
@@ -165,7 +172,7 @@ impl Runtime {
         for timer in due {
             let lease = self
                 .store()
-                .acquire(timer.run, self.owner(), LEASE_TTL)
+                .acquire(timer.run, self.owner_id(), LEASE_TTL)
                 .await
                 .map_err(RuntimeError::from_store)?;
 
@@ -178,6 +185,8 @@ impl Runtime {
                     // replayed run would compute different downstream deadlines
                     // than the original.
                     output: serde_json::json!({ "fired_at": timer.fire_at.unix_timestamp() }),
+                    // A timer has no sender.
+                    source: None,
                     spend: crate::core::Spend::default(),
                 },
             )
@@ -313,6 +322,10 @@ impl Runtime {
         decision: &Decision,
     ) -> Result<crate::core::Delivery, RuntimeError> {
         let event = InboundEvent::new(
+            // The plane itself, not an outside party: a decision comes from the
+            // worklist this runtime owns, and naming it as such keeps a
+            // counterparty from minting an event that looks like one.
+            SOURCE_WORKLIST,
             // One decision per task: the event id makes a double submit a
             // duplicate rather than a second answer.
             format!("task-decision:{}", id.to_hex()),

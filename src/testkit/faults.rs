@@ -304,6 +304,10 @@ impl JournalStore for Faulty {
         self.inner.acquire(run, owner, ttl).await
     }
 
+    async fn release_lease(&self, run: RunId, epoch: Epoch) -> Result<(), StoreError> {
+        self.inner.release_lease(run, epoch).await
+    }
+
     async fn seal(&self, run: RunId, epoch: Epoch, outcome: &str) -> Result<Digest, StoreError> {
         self.inner.seal(run, epoch, outcome).await
     }

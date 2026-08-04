@@ -88,7 +88,7 @@ impl Skill for ProposesRefund {
 
 struct Fixture {
     store: Arc<RedbStore>,
-    rt: Runtime,
+    rt: Arc<Runtime>,
 }
 
 fn fixture(skill: ProposesRefund) -> Fixture {

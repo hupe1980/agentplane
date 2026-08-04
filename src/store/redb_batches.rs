@@ -9,7 +9,7 @@ use crate::core::{BatchId, RunId, Spend, StoreError};
 use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
 /// `batch_id -> (plan_digest, exhausted)`.
-const BATCHES: TableDefinition<&str, (&str, u8)> = TableDefinition::new("batches");
+const BATCHES: TableDefinition<(&str, &str), (&str, u8)> = TableDefinition::new("batches");
 
 /// `(batch_id, item_key) -> (run_id, outcome, has_outcome, detail, tokens, minor)`.
 ///
@@ -19,7 +19,8 @@ const BATCHES: TableDefinition<&str, (&str, u8)> = TableDefinition::new("batches
 /// `(run_id, outcome, has_outcome, detail, tokens, minor)`.
 type ItemRow<'a> = (&'a str, &'a str, u8, &'a str, i64, i64);
 
-const ITEMS: TableDefinition<(&str, &str), ItemRow<'static>> = TableDefinition::new("batch_items");
+const ITEMS: TableDefinition<(&str, &str, &str), ItemRow<'static>> =
+    TableDefinition::new("batch_items");
 
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
     w.open_table(BATCHES).map_err(|e| be(&e))?;
@@ -60,13 +61,17 @@ fn is_open(has_outcome: u8, outcome: &str) -> bool {
 #[async_trait]
 impl BatchStore for RedbStore {
     async fn open(&self, id: BatchId, plan_digest: &str) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
         let (key, digest) = (id.to_string(), plan_digest.to_owned());
         self.with_db(move |db| {
             let w = begin_write(db)?;
             {
                 let mut t = w.open_table(BATCHES).map_err(|e| be(&e))?;
-                if t.get(key.as_str()).map_err(|e| be(&e))?.is_none() {
-                    t.insert(key.as_str(), (digest.as_str(), 0u8))
+                if t.get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .is_none()
+                {
+                    t.insert((tenant.as_str(), key.as_str()), (digest.as_str(), 0u8))
                         .map_err(|e| be(&e))?;
                 }
             }
@@ -77,17 +82,18 @@ impl BatchStore for RedbStore {
     }
 
     async fn mark_exhausted(&self, id: BatchId) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
         let key = id.to_string();
         self.with_db(move |db| {
             let w = begin_write(db)?;
             {
                 let mut t = w.open_table(BATCHES).map_err(|e| be(&e))?;
                 let digest = t
-                    .get(key.as_str())
+                    .get((tenant.as_str(), key.as_str()))
                     .map_err(|e| be(&e))?
                     .map(|v| v.value().0.to_owned());
                 if let Some(digest) = digest {
-                    t.insert(key.as_str(), (digest.as_str(), 1u8))
+                    t.insert((tenant.as_str(), key.as_str()), (digest.as_str(), 1u8))
                         .map_err(|e| be(&e))?;
                 }
             }
@@ -98,11 +104,12 @@ impl BatchStore for RedbStore {
     }
 
     async fn is_exhausted(&self, id: BatchId) -> Result<bool, StoreError> {
+        let tenant = self.tenant_name();
         let key = id.to_string();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(BATCHES).map_err(|e| be(&e))?;
-            Ok(t.get(key.as_str())
+            Ok(t.get((tenant.as_str(), key.as_str()))
                 .map_err(|e| be(&e))?
                 .is_some_and(|v| v.value().1 == 1))
         })
@@ -115,6 +122,7 @@ impl BatchStore for RedbStore {
         key: &str,
         run: RunId,
     ) -> Result<ItemRecord, StoreError> {
+        let tenant = self.tenant_name();
         let (batch_key, item, run_id) = (batch.to_string(), key.to_owned(), run.to_string());
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -124,18 +132,18 @@ impl BatchStore for RedbStore {
                 // already reserved the caller must get the *original* run id.
                 // Overwriting would orphan the first run's journal and re-perform
                 // its effects, which is the one thing this row exists to prevent.
-                if t.get((batch_key.as_str(), item.as_str()))
+                if t.get((tenant.as_str(), batch_key.as_str(), item.as_str()))
                     .map_err(|e| be(&e))?
                     .is_none()
                 {
                     t.insert(
-                        (batch_key.as_str(), item.as_str()),
+                        (tenant.as_str(), batch_key.as_str(), item.as_str()),
                         (run_id.as_str(), "", 0u8, "", 0i64, 0i64),
                     )
                     .map_err(|e| be(&e))?;
                 }
                 let row = t
-                    .get((batch_key.as_str(), item.as_str()))
+                    .get((tenant.as_str(), batch_key.as_str(), item.as_str()))
                     .map_err(|e| be(&e))?
                     .map(|v| {
                         let (run, oc, has, detail, tokens, minor) = v.value();
@@ -177,6 +185,7 @@ impl BatchStore for RedbStore {
         outcome: &ItemOutcome,
         spend: Spend,
     ) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
         let (batch_key, item) = (batch.to_string(), key.to_owned());
         let (state, detail) = outcome_to_row(outcome);
         let tokens = i64::try_from(spend.tokens).unwrap_or(i64::MAX);
@@ -186,12 +195,12 @@ impl BatchStore for RedbStore {
             {
                 let mut t = w.open_table(ITEMS).map_err(|e| be(&e))?;
                 let run = t
-                    .get((batch_key.as_str(), item.as_str()))
+                    .get((tenant.as_str(), batch_key.as_str(), item.as_str()))
                     .map_err(|e| be(&e))?
                     .map(|v| v.value().0.to_owned());
                 if let Some(run) = run {
                     t.insert(
-                        (batch_key.as_str(), item.as_str()),
+                        (tenant.as_str(), batch_key.as_str(), item.as_str()),
                         (run.as_str(), state, 1u8, detail.as_str(), tokens, minor),
                     )
                     .map_err(|e| be(&e))?;
@@ -204,6 +213,7 @@ impl BatchStore for RedbStore {
     }
 
     async fn cursor(&self, batch: BatchId) -> Result<Option<String>, StoreError> {
+        let tenant = self.tenant_name();
         let batch_key = batch.to_string();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
@@ -215,7 +225,10 @@ impl BatchStore for RedbStore {
             // complete while it is not.
             let mut last_terminal: Option<String> = None;
             for e in t
-                .range((batch_key.as_str(), "")..=(batch_key.as_str(), MAX_STR))
+                .range(
+                    (tenant.as_str(), batch_key.as_str(), "")
+                        ..=(tenant.as_str(), batch_key.as_str(), MAX_STR),
+                )
                 .map_err(|e| be(&e))?
             {
                 let (k, v) = e.map_err(|e| be(&e))?;
@@ -223,7 +236,7 @@ impl BatchStore for RedbStore {
                 if is_open(has, outcome) {
                     break;
                 }
-                last_terminal = Some(k.value().1.to_owned());
+                last_terminal = Some(k.value().2.to_owned());
             }
             Ok(last_terminal)
         })
@@ -231,13 +244,17 @@ impl BatchStore for RedbStore {
     }
 
     async fn census(&self, batch: BatchId) -> Result<BatchCensus, StoreError> {
+        let tenant = self.tenant_name();
         let batch_key = batch.to_string();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(ITEMS).map_err(|e| be(&e))?;
             let mut c = BatchCensus::default();
             for e in t
-                .range((batch_key.as_str(), "")..=(batch_key.as_str(), MAX_STR))
+                .range(
+                    (tenant.as_str(), batch_key.as_str(), "")
+                        ..=(tenant.as_str(), batch_key.as_str(), MAX_STR),
+                )
                 .map_err(|e| be(&e))?
             {
                 let (_, v) = e.map_err(|e| be(&e))?;
@@ -263,13 +280,17 @@ impl BatchStore for RedbStore {
     }
 
     async fn items(&self, batch: BatchId, limit: usize) -> Result<Vec<ItemRecord>, StoreError> {
+        let tenant = self.tenant_name();
         let batch_key = batch.to_string();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(ITEMS).map_err(|e| be(&e))?;
             let mut out = Vec::new();
             for e in t
-                .range((batch_key.as_str(), "")..=(batch_key.as_str(), MAX_STR))
+                .range(
+                    (tenant.as_str(), batch_key.as_str(), "")
+                        ..=(tenant.as_str(), batch_key.as_str(), MAX_STR),
+                )
                 .map_err(|e| be(&e))?
             {
                 if out.len() >= limit {
@@ -278,7 +299,7 @@ impl BatchStore for RedbStore {
                 let (k, v) = e.map_err(|e| be(&e))?;
                 let (run_s, outcome, has, detail, tokens, minor) = v.value();
                 out.push(ItemRecord {
-                    key: k.value().1.to_owned(),
+                    key: k.value().2.to_owned(),
                     run: RunId::parse(run_s).map_err(|e| StoreError::Corrupt {
                         seq: 0,
                         detail: format!("bad run id '{run_s}': {e}"),

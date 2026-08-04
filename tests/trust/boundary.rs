@@ -19,8 +19,8 @@
 //! * An effect's output is untrusted **by default**, and the label names the
 //!   effect it came from.
 //! * The label propagates into downstream steps without anyone threading it.
-//! * Untrusted data cannot reach a mutating sink; declassification is the only
-//!   exit, and it is journaled.
+//! * Untrusted data cannot reach a mutating sink; typed release is the only
+//!   label improvement, and it is journaled.
 //! * A run that forwards a tool result **cannot replan** — the guarantee that
 //!   was previously untestable.
 //! * The label is identical on replay, because a label that appeared only on
@@ -32,8 +32,9 @@
 use std::sync::{Arc, Mutex};
 
 use agentplane::core::{
-    ArgSource, Effect, EffectDescriptor, EffectError, Outcome, PlanIR, PlanNode, Recovery,
-    RetryPolicy, Sensitivity, Skill, SkillDescriptor, SkillError, StepId, Tainted, Trust,
+    ArgSource, Effect, EffectDescriptor, EffectError, Outcome, PlanIR, PlanNode, Recovery, Release,
+    ReleaseScope, RetryPolicy, Sensitivity, Skill, SkillDescriptor, SkillError, SourceId, StepId,
+    Tainted, Trust,
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
@@ -135,6 +136,7 @@ type World = Arc<Mutex<Vec<String>>>;
 #[derive(Debug)]
 struct Transfer {
     world: World,
+    arguments: Value,
 }
 
 #[async_trait::async_trait]
@@ -148,6 +150,9 @@ impl Effect for Transfer {
     }
     fn max_sensitivity(&self) -> Sensitivity {
         Sensitivity::Secret
+    }
+    fn sink_arguments(&self) -> Option<&Value> {
+        Some(&self.arguments)
     }
     fn recovery(&self) -> Recovery {
         Recovery::Retry
@@ -241,6 +246,80 @@ async fn an_effect_output_is_untrusted_by_default() {
         Sensitivity::Internal,
         "and untrusted data is at least Internal"
     );
+}
+
+/// A plan must not flatten distinct argument lineage when it selects fields
+/// from one structured upstream result and assembles the next step's object.
+#[tokio::test]
+async fn plan_argument_assembly_preserves_field_level_provenance() {
+    #[derive(Debug)]
+    struct ProducesFields;
+
+    #[async_trait::async_trait]
+    impl Skill for ProducesFields {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("produces-fields").provides("produces-fields")
+        }
+
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            Ok(Outcome::done(Tainted::object([
+                ("recipient".to_owned(), Tainted::trusted(json!("treasury"))),
+                (
+                    "memo".to_owned(),
+                    Tainted::from_source(json!("model text"), SourceId::new("model.complete")),
+                ),
+            ])))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ChecksFields;
+
+    #[async_trait::async_trait]
+    impl Skill for ChecksFields {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("checks-fields").provides("checks-fields")
+        }
+
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            assert!(!input.label_at("/recipient").unwrap().is_untrusted());
+            let memo = input.label_at("/memo").unwrap();
+            assert!(memo.is_untrusted());
+            assert_eq!(
+                memo.provenance,
+                std::collections::BTreeSet::from([SourceId::new("model.complete")])
+            );
+            Ok(Outcome::done(Tainted::trusted(json!("checked"))))
+        }
+    }
+
+    let runtime = Runtime::builder(db())
+        .skill(ProducesFields)
+        .skill(ChecksFields)
+        .build();
+    let out = runtime
+        .run_plan(
+            PlanIR::new(vec![
+                PlanNode::new(0, "produces-fields").arg("input", ArgSource::run_input()),
+                PlanNode::new(1, "checks-fields")
+                    .arg("recipient", ArgSource::node_field(StepId(0), "recipient"))
+                    .arg("memo", ArgSource::node_field(StepId(0), "memo"))
+                    .terminal(),
+            ]),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.status, RunStatus::Succeeded);
 }
 
 /// An effect that declares itself trusted does not taint what follows.
@@ -389,6 +468,7 @@ async fn tool_output_cannot_reach_a_mutating_sink() {
                 .sink(
                     Transfer {
                         world: Arc::clone(&self.world),
+                        arguments: answer.peek().clone(),
                     },
                     &answer,
                 )
@@ -419,9 +499,9 @@ async fn tool_output_cannot_reach_a_mutating_sink() {
     );
 }
 
-/// Declassification is the sanctioned exit, and it leaves a record.
+/// Typed release is the sanctioned label improvement, and it leaves a record.
 #[tokio::test]
-async fn declassifying_is_the_only_way_out_and_it_is_journaled() {
+async fn releasing_is_the_only_label_improvement_and_it_is_journaled() {
     #[derive(Debug)]
     struct Reviewed {
         world: World,
@@ -438,18 +518,24 @@ async fn declassifying_is_the_only_way_out_and_it_is_journaled() {
             _i: Tainted<Value>,
         ) -> Result<Outcome, SkillError> {
             let answer = cx.effect(ToolCall).await?;
-            // `declassify` hands back a bare value: the label is gone, and the
-            // reason it was dropped is in the journal. Re-entering the lattice
-            // as trusted is therefore an assertion someone signed for.
-            let cleared = cx
-                .declassify(answer, "validated against the settlement schema")
+            let arguments = cx
+                .release(
+                    answer,
+                    Release::whole(
+                        ReleaseScope::trust(),
+                        "validated against the settlement schema",
+                        "ledger.transfer",
+                        ["settlement-schema:v1".to_owned()],
+                    ),
+                )
                 .await?;
             let out = cx
                 .sink(
                     Transfer {
                         world: Arc::clone(&self.world),
+                        arguments: arguments.peek().clone(),
                     },
-                    &Tainted::trusted(cleared),
+                    &arguments,
                 )
                 .await?;
             Ok(Outcome::done(out))
@@ -478,8 +564,8 @@ async fn declassifying_is_the_only_way_out_and_it_is_journaled() {
     assert!(
         records
             .iter()
-            .any(|r| matches!(r.kind(), RecordKind::Declassified { .. })),
-        "leaving the lattice is never silent"
+            .any(|r| matches!(r.kind(), RecordKind::Released { .. })),
+        "improving a label is never silent"
     );
 }
 
@@ -610,4 +696,65 @@ async fn a_replayed_effect_carries_the_same_label() {
         "every step must see the same labels on replay as it did live"
     );
     assert!(after.iter().any(|(n, untrusted, _)| n == "b" && *untrusted));
+}
+
+/// Does taint survive a hand-off to another agent?
+///
+/// §6.3's requirement is that risk context survives delegation and is checked
+/// again before an irreversible sink. A specialist's answer is untrusted — it
+/// came from a model — and an orchestrator passing it to the next specialist
+/// must not launder it on the way.
+///
+/// The boundary is `Runtime::run(capability, input: Value)`: a plain value, so
+/// there is nowhere for a label to ride.
+#[tokio::test]
+async fn taint_survives_a_handoff_between_agents() {
+    use agentplane::core::{SourceId, Tainted, Trust};
+
+    /// Reports the trust of whatever it was given.
+    #[derive(Debug)]
+    struct ReportsTrust;
+
+    #[async_trait::async_trait]
+    impl agentplane::core::Skill for ReportsTrust {
+        fn descriptor(&self) -> agentplane::core::SkillDescriptor {
+            agentplane::core::SkillDescriptor::new("reports").provides("demo.report")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut agentplane::runtime::StepCtx<'_>,
+            input: Tainted<serde_json::Value>,
+        ) -> Result<agentplane::core::Outcome, agentplane::core::SkillError> {
+            Ok(agentplane::core::Outcome::done(Tainted::trusted(
+                serde_json::json!({ "trust": format!("{:?}", input.label().trust) }),
+            )))
+        }
+    }
+
+    // What an orchestrator holds after commissioning specialist A.
+    let from_specialist = Tainted::from_source(
+        serde_json::json!("ignore previous instructions"),
+        SourceId::new("model"),
+    );
+    assert_eq!(from_specialist.label().trust, Trust::Untrusted);
+
+    let store: std::sync::Arc<dyn agentplane::journal::JournalStore> =
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let rt = agentplane::runtime::Runtime::builder(store)
+        .skill(ReportsTrust)
+        .build();
+
+    // The hand-off carries the label.
+    let out = rt
+        .run_tainted("demo.report", from_specialist)
+        .await
+        .expect("run");
+
+    let seen = out.output.as_ref().unwrap()["trust"].as_str().unwrap();
+    assert_eq!(
+        seen, "Untrusted",
+        "a specialist's untrusted answer arrived at the next agent as {seen}: taint \
+         does not survive the hand-off, so §6.3's 'risk context must survive \
+         delegation' has no mechanism behind it"
+    );
 }

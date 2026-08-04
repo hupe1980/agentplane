@@ -1,7 +1,7 @@
 +++
 title = "Regulation"
 description = "EU AI Act obligation by obligation, mapped to mechanisms that exist — and an explicit list of the ones that do not."
-weight = 7
+weight = 8
 +++
 
 **agentplane is not compliant with anything, and cannot be.** Compliance attaches
@@ -57,6 +57,7 @@ step that did not happen.
 | Attributable | Per-record signatures naming the workload identity that wrote them (`signing`) |
 | Detecting removal | A per-plane Merkle log over sealed runs, with inclusion **and consistency** proofs — deleting a whole run is detectable, which a per-run chain alone cannot do |
 | Checkable by someone else | An offline auditor (`audit`) that runs against a store it did not write, and reports what it *could not* check as prominently as what it did |
+| *Which instructions* produced a decision | The system prompt lives inside the digested manifest (`manifest`), so a rewording is a version bump. A prompt composed in the deployer's code has no version at all: it changes in a deploy, the journal faithfully records every run it affected, and nothing connects the two |
 
 **The limit, stated plainly:** a checkpoint that never leaves the operator's
 store is exactly as trustworthy as the operator. The `Witness` seam now exists
@@ -76,6 +77,7 @@ nothing about you. See [status](@/docs/status.md).
 | Not answering is a decision | `OnExpiry` is declared up front — deny, escalate, or proceed — so an unanswered approval applies a stated policy instead of hanging |
 | The ability to **stop** | Cooperative cancellation: the run unwinds what it did as a saga, and the record names who asked |
 | Refusing to guess | A run that cannot account for an outcome is `Quarantined` rather than unwound — reversing everything except the one thing nobody can account for is how a system refunds money nobody took |
+| Declared, not remembered | `spec.oversight` puts approval in the reviewable file (`manifest`), so a declarative agent's answer waits for a person by declaration rather than because a developer coded the call. Declaring it where nothing would apply it is refused, so the file cannot claim a human is in the loop when none is |
 
 ### Art. 15 — accuracy, robustness, cybersecurity
 
@@ -116,7 +118,7 @@ short string still fits.
 | Obligation | Why not |
 |---|---|
 | **Art. 9** risk management | There is a policy seam and a Cedar adapter, but no risk-tier model. Cedar's `symcc` could *prove* properties of a policy set rather than test them; nothing invokes it |
-| **Art. 13** machine-readable description | The manifest and signed agent card are designed and not built; the runtime is wired by builder calls in your code |
+| **Art. 13** machine-readable description | A manifest declares an agent's prompt, grants, ceilings, models, result shape and oversight; the registry pins it by digest, can verify a domain-separated publisher attestation, and refuses publisher reassignment; and the runtime **refuses** effects the declaration never named. What is still absent: the shipped registry is process-local rather than durable or remote, trust in publisher keys remains a deployment decision, and the A2A agent card derived from the manifest is designed, not built |
 | **Art. 50** transparency to users | An interface obligation, not a runtime one (above) |
 | Anything about your **model** | Bias, accuracy, training data, and evaluation are properties of the model and its use. This is a runtime |
 | A **conformity assessment** | A person does that, about a system, in a context |

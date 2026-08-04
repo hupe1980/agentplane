@@ -124,7 +124,7 @@ fn world_of(_cx: &StepCtx<'_>) -> World {
 
 struct Fixture {
     store: Arc<RedbStore>,
-    rt: Runtime,
+    rt: Arc<Runtime>,
     world: World,
 }
 
@@ -312,7 +312,11 @@ async fn a_stop_will_not_unwind_around_an_unknown_outcome() {
         Arc::clone(&db) as Arc<dyn JournalStore>,
         Schedule::healthy().on_kind("EffectDone", Fault::FailedClean),
     ));
+    // One deployment slot, restarted below against a healthy store — so both
+    // runtimes carry the same owner. The default is unique per instance, which
+    // would make this a test about waiting for a lease to expire.
     let rt = Runtime::builder(Arc::clone(&faulty) as Arc<dyn JournalStore>)
+        .owner("slot-a")
         .cases(db.clone() as Arc<dyn CaseStore>)
         .events(db.clone() as Arc<dyn EventStore>)
         .tasks(db.clone() as Arc<dyn TaskStore>)
@@ -334,6 +338,7 @@ async fn a_stop_will_not_unwind_around_an_unknown_outcome() {
 
     // Against a healthy store now: an operator asks for the stuck run to stop.
     let rt = Runtime::builder(db.clone() as Arc<dyn JournalStore>)
+        .owner("slot-a")
         .cases(db.clone() as Arc<dyn CaseStore>)
         .events(db.clone() as Arc<dyn EventStore>)
         .tasks(db.clone() as Arc<dyn TaskStore>)

@@ -18,6 +18,7 @@ use crate::core::{Digest, Timestamp};
 pub struct OpenDalBlobs {
     op: Operator,
     prefix: String,
+    tenant: crate::core::TenantId,
 }
 
 impl OpenDalBlobs {
@@ -27,15 +28,22 @@ impl OpenDalBlobs {
         Self {
             op,
             prefix: prefix.into(),
+            tenant: crate::core::TenantId::default(),
         }
     }
 
-    /// Where a digest lives.
+    /// Serve one tenant.
     ///
-    /// Fanned out over two leading bytes, because object stores and filesystems
-    /// alike degrade when a single directory holds millions of siblings — and
-    /// the hex of a hash is uniformly distributed, so the fan-out is even
-    /// without anything having to balance it.
+    /// Blobs are content-addressed, so without this two tenants writing the same
+    /// bytes share one object — and erasing it for one destroys it for the
+    /// other while reporting both requests discharged. The tenant leads the
+    /// path, so the sharing cannot happen.
+    #[must_use]
+    pub fn for_tenant(mut self, tenant: crate::core::TenantId) -> Self {
+        self.tenant = tenant;
+        self
+    }
+
     /// Where a blob's tombstone lives.
     ///
     /// Beside the blob rather than inside it, because the whole point is that
@@ -46,9 +54,24 @@ impl OpenDalBlobs {
         format!("{}.tomb", self.path(digest))
     }
 
+    /// Where a digest lives.
+    ///
+    /// Fanned out over two leading bytes, because object stores and filesystems
+    /// alike degrade when a single directory holds millions of siblings — and
+    /// the hex of a hash is uniformly distributed, so the fan-out is even
+    /// without anything having to balance it.
+    ///
+    /// The tenant leads the fan-out rather than following it, so one tenant's
+    /// bytes are a subtree: listable, countable, and removable as a unit.
     fn path(&self, digest: Digest) -> String {
         let hex = digest.to_hex();
-        format!("{}/{}/{}/{hex}", self.prefix, &hex[0..2], &hex[2..4])
+        format!(
+            "{}/{}/{}/{}/{hex}",
+            self.prefix,
+            self.tenant,
+            &hex[0..2],
+            &hex[2..4]
+        )
     }
 }
 
@@ -58,6 +81,10 @@ fn backend(e: &opendal::Error) -> BlobError {
 
 #[async_trait]
 impl BlobStore for OpenDalBlobs {
+    fn tenant(&self) -> &str {
+        self.tenant.as_str()
+    }
+
     async fn put(&self, bytes: &[u8]) -> Result<Digest, BlobError> {
         let digest = Digest::of(bytes);
         // No read-before-write: the address is the content, so re-writing is
@@ -68,6 +95,38 @@ impl BlobStore for OpenDalBlobs {
             .await
             .map_err(|e| backend(&e))?;
         Ok(digest)
+    }
+
+    async fn put_at(&self, digest: Digest, bytes: &[u8]) -> Result<(), BlobError> {
+        self.op
+            .write(&self.path(digest), bytes.to_vec())
+            .await
+            .map_err(|e| backend(&e))?;
+        Ok(())
+    }
+
+    async fn get_raw(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {
+        match self.op.read(&self.path(digest)).await {
+            Ok(buf) => Ok(buf.to_vec()),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                match self.op.read(&self.tomb(digest)).await {
+                    Ok(raw) => {
+                        let text = String::from_utf8_lossy(&raw.to_vec()).into_owned();
+                        let (at, reason) = text.split_once(' ').unwrap_or(("0", "expired"));
+                        Err(BlobError::Expired {
+                            digest: digest.to_hex(),
+                            at: at.parse().unwrap_or(0),
+                            reason: reason.to_owned(),
+                        })
+                    }
+                    Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                        Err(BlobError::NotFound(digest.to_hex()))
+                    }
+                    Err(e) => Err(backend(&e)),
+                }
+            }
+            Err(e) => Err(backend(&e)),
+        }
     }
 
     async fn get(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {

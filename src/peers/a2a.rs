@@ -21,8 +21,8 @@
 //! | DNS, TLS, connect refused | nothing was written | `DidNotHappen` |
 //! | request timed out, or the connection died after the write | it may have arrived | `InDoubt` |
 //! | HTTP 401/403/404, JSON-RPC parse/method/params errors | the peer read it and declined | `DidNotHappen` |
-//! | HTTP 5xx, JSON-RPC internal error | it arrived; whether it acted is unknown | `InDoubt` |
-//! | a `Task` came back in state `failed` | it acted and says so | `Landed` |
+//! | HTTP 5xx, JSON-RPC internal/invalid-agent-response error | it arrived; whether it acted is unknown | `InDoubt` |
+//! | a `Task` came back failed, canceled, or rejected | it created a task and may have acted | `Landed` |
 //!
 //! The two rows that are easy to get wrong are the last two, and they are the
 //! expensive ones. `-32603 Internal error` after a task has been created is not
@@ -31,14 +31,13 @@
 //! `failed` is *not* in doubt: the peer has told us it acted and the action did
 //! not succeed, so `Recovery` has nothing left to resolve.
 //!
-//! # The Agent Card is not trusted
+//! # The endpoint is operator-pinned
 //!
-//! A card is fetched to find the endpoint, and it is a document served by the
-//! peer about itself. Nothing in it may widen what the peer is allowed to do:
-//! the grant in [`PeerRegistry`](super::PeerRegistry) is the operator's, and a
-//! card that advertises more skills than were granted changes nothing. This is
-//! the same rule the tool catalogue applies to MCP annotations — a server does
-//! not get to declare its own authority.
+//! This client intentionally takes a configured JSON-RPC endpoint. Agent Card
+//! discovery, signature verification, and interface negotiation are separate
+//! capabilities and are not implemented here. A document served by the peer
+//! must never widen the grant in [`PeerRegistry`](super::PeerRegistry): a party
+//! describing its own capabilities is not a source of truth about its authority.
 
 use std::time::Duration;
 
@@ -46,7 +45,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::core::Delegation;
+use crate::core::{Delegation, Digest, canon};
 
 use super::{PeerClient, PeerCredential, PeerError, PeerId};
 
@@ -95,6 +94,13 @@ impl Endpoint {
 /// unregistered domain is both a collision risk and a broken link.
 pub const EXTENSION_URI: &str = "https://hupe1980.github.io/agentplane/a2a/delegation/v1";
 
+/// The protocol version this client speaks.
+///
+/// Re-exported rather than redefined: the card publishes this same value and the
+/// server refuses anything else, so a second definition here would be a second
+/// place to forget when the version moves.
+pub use super::PROTOCOL_VERSION;
+
 /// Talks A2A to peers.
 #[derive(Debug)]
 pub struct A2aClient {
@@ -105,9 +111,6 @@ pub struct A2aClient {
 }
 
 impl A2aClient {
-    /// # Errors
-    ///
-    /// If the HTTP client cannot be built.
     /// Restrict where this client may connect.
     ///
     /// Deny-by-default once set: an endpoint whose host is not granted is
@@ -119,6 +122,9 @@ impl A2aClient {
         self
     }
 
+    /// # Errors
+    ///
+    /// If the HTTP client cannot be built.
     pub fn new(endpoint: Endpoint) -> Result<Self, PeerError> {
         let http = reqwest::Client::builder()
             .timeout(endpoint.timeout)
@@ -134,7 +140,7 @@ impl A2aClient {
         })
     }
 
-    /// Build the JSON-RPC body for `message/send`.
+    /// Build the A2A 1.0 JSON-RPC body for `SendMessage`.
     ///
     /// The delegation chain rides in the message metadata under
     /// [`EXTENSION_URI`]. It is a *claim* today, not an attestation: a peer that
@@ -150,15 +156,37 @@ impl A2aClient {
         // a peer that does not implement the extension ignores both together
         // rather than half-understanding the message.
         let attested = provenance.map(|p| Value::Object(p.to_meta()));
+        // A2A uses `messageId` as its duplicate-detection key, so it must be
+        // stable across retries of one logical call. A runtime call carries a
+        // dispatch id that is exactly that; direct transport users have no
+        // provenance, so their deterministic fallback hashes the request and
+        // arrives at the same property.
+        let message_id = provenance.map_or_else(
+            || {
+                let claim = json!({
+                    "capability": capability,
+                    "payload": payload,
+                    "chain": acting_as,
+                });
+                format!("msg-{}", Digest::of(&canon::value_bytes(&claim)))
+            },
+            // The *dispatch*, not the effect key. The effect key hashes the
+            // attempt number — it must, so a retry does not collide with the
+            // recorded failure before it — which makes it the wrong answer to
+            // "have I already done this work?". A peer given a fresh id per
+            // attempt sees unrelated messages and may act twice, defeating the
+            // very deduplication this field exists for.
+            |p| p.dedupe_key().to_string(),
+        );
         json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "message/send",
+            "method": "SendMessage",
             "params": {
                 "message": {
-                    "role": "user",
-                    "messageId": capability,
-                    "parts": [{ "kind": "data", "data": payload }],
+                    "role": "ROLE_USER",
+                    "messageId": message_id,
+                    "parts": [{ "data": payload, "mediaType": "application/json" }],
                     "extensions": [EXTENSION_URI],
                     "metadata": {
                         EXTENSION_URI: {
@@ -183,6 +211,10 @@ struct RpcError {
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
     #[serde(default)]
+    jsonrpc: Option<String>,
+    #[serde(default)]
+    id: Option<Value>,
+    #[serde(default)]
     result: Option<Value>,
     #[serde(default)]
     error: Option<RpcError>,
@@ -196,14 +228,19 @@ struct RpcResponse {
 fn classify_rpc(peer: &PeerId, e: &RpcError) -> PeerError {
     let detail = format!("{} (code {})", e.message, e.code);
     match e.code {
-        // Two groups, one meaning. JSON-RPC's malformed/unknown codes and A2A's
-        // own declines (`-32006..=-32001`: task not found, not cancelable, push
-        // notifications unsupported, unsupported operation, content type,
-        // version) all say the same thing — the peer read the request and
-        // declined without acting on it.
-        -32700 | -32600 | -32601 | -32602 | -32006..=-32001 => PeerError::Refused {
+        // JSON-RPC validation failures and A2A failed-precondition/input errors
+        // say the peer declined before this operation could act. `-32006` is
+        // deliberately absent: A2A 1.0 maps InvalidAgentResponseError to
+        // INTERNAL/HTTP 500, so it cannot prove that no work happened.
+        -32700 | -32600 | -32601 | -32602 | -32005..=-32001 | -32009..=-32007 => {
+            PeerError::Refused {
+                peer: peer.clone(),
+                detail,
+            }
+        }
+        -32006 => PeerError::InvalidResponse {
             peer: peer.clone(),
-            detail,
+            detail: format!("{detail} — the peer did not say whether it acted"),
         },
         // `-32603 Internal error` and anything unrecognised. The request
         // arrived; whether the peer acted is exactly what it is not saying.
@@ -212,6 +249,31 @@ fn classify_rpc(peer: &PeerId, e: &RpcError) -> PeerError {
             peer: peer.clone(),
             detail: format!("{detail} — the peer did not say whether it acted"),
         },
+    }
+}
+
+fn invalid_response(peer: &PeerId, detail: impl Into<String>) -> PeerError {
+    PeerError::InvalidResponse {
+        peer: peer.clone(),
+        detail: detail.into(),
+    }
+}
+
+/// Validate the A2A 1.0 `SendMessageResponse` oneof and return its member.
+fn send_message_result(peer: &PeerId, result: &Value) -> Result<Value, PeerError> {
+    let Some(object) = result.as_object() else {
+        return Err(invalid_response(
+            peer,
+            "SendMessage result is not an object containing exactly one of 'task' or 'message'",
+        ));
+    };
+    match (object.get("task"), object.get("message")) {
+        (Some(task), None) if task.is_object() => Ok(task.clone()),
+        (None, Some(message)) if message.is_object() => Ok(message.clone()),
+        _ => Err(invalid_response(
+            peer,
+            "SendMessage result must contain exactly one object member named 'task' or 'message'",
+        )),
     }
 }
 
@@ -273,31 +335,28 @@ fn classify_transport(peer: &PeerId, e: &reqwest::Error) -> PeerError {
 
 /// A task's terminal state, if it reached one.
 ///
-/// A2A tasks are stateful; `message/send` may answer with a task rather than a
+/// A2A tasks are stateful; `SendMessage` may answer with a task rather than a
 /// result. A task in `failed` state is the peer telling us it acted and the work
 /// did not succeed — which is `Landed`, not in doubt, and therefore not
 /// something `Recovery` should try to resolve.
 fn task_failure(peer: &PeerId, result: &Value) -> Option<PeerError> {
     let state = result.get("status")?.get("state")?.as_str()?;
     match state {
-        "failed" => Some(PeerError::Failed {
-            peer: peer.clone(),
-            detail: result
-                .get("status")
-                .and_then(|s| s.get("message"))
-                .map_or_else(
-                    || "the peer reported the task failed".to_owned(),
-                    std::string::ToString::to_string,
-                ),
-        }),
-        // A peer that rejected the task without starting it.
-        "rejected" => Some(PeerError::Refused {
-            peer: peer.clone(),
-            detail: "the peer rejected the task".to_owned(),
-        }),
-        // `submitted`, `working`, `input-required`, `completed`, `canceled`:
+        "TASK_STATE_FAILED" | "TASK_STATE_CANCELED" | "TASK_STATE_REJECTED" => {
+            Some(PeerError::Failed {
+                peer: peer.clone(),
+                detail: result
+                    .get("status")
+                    .and_then(|s| s.get("message"))
+                    .map_or_else(
+                        || format!("the peer returned task state {state}"),
+                        std::string::ToString::to_string,
+                    ),
+            })
+        }
+        // Submitted, working, input/auth-required, and completed:
         // either finished or legitimately in progress. A run that needs to wait
-        // for `working` to finish does so through `cx.await_event`, not by
+        // for working to finish does so through `cx.await_event`, not by
         // holding this connection.
         _ => None,
     }
@@ -331,6 +390,8 @@ impl PeerClient for A2aClient {
         let mut req = self
             .http
             .post(&self.endpoint.url)
+            .header("A2A-Version", PROTOCOL_VERSION)
+            .header("A2A-Extensions", EXTENSION_URI)
             .json(&Self::body(capability, payload, acting_as, provenance));
 
         // The credential is audience-bound before it reaches here — the registry
@@ -350,14 +411,32 @@ impl PeerClient for A2aClient {
         let Ok(rpc) = body else {
             return Err(classify_status(peer, status));
         };
-        if let Some(e) = rpc.error {
-            return Err(classify_rpc(peer, &e));
+        // Ordinary HTTP errors are not JSON-RPC envelopes. Do not reinterpret
+        // a 401/404 as a malformed agent response merely because serde can
+        // deserialize an unrelated JSON object into an all-optional struct.
+        if !status.is_success() && rpc.jsonrpc.is_none() {
+            return Err(classify_status(peer, status));
         }
+        if rpc.jsonrpc.as_deref() != Some("2.0") || rpc.id.as_ref() != Some(&json!(1)) {
+            return Err(invalid_response(
+                peer,
+                "JSON-RPC response has the wrong version or does not correlate to request id 1",
+            ));
+        }
+        let result = match (rpc.result, rpc.error) {
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(invalid_response(
+                    peer,
+                    "JSON-RPC response must contain exactly one of 'result' or 'error'",
+                ));
+            }
+            (None, Some(e)) => return Err(classify_rpc(peer, &e)),
+            (Some(result), None) => result,
+        };
         if !status.is_success() {
             return Err(classify_status(peer, status));
         }
-
-        let result = rpc.result.unwrap_or(Value::Null);
+        let result = send_message_result(peer, &result)?;
         if let Some(failure) = task_failure(peer, &result) {
             return Err(failure);
         }
