@@ -353,6 +353,8 @@ pub struct Worklist {
 
 #[cfg(feature = "a2a-server")]
 pub mod a2a;
+#[cfg(feature = "a2a-server")]
+mod a2a_stream;
 
 /// The tenants this process serves, one plane each.
 ///

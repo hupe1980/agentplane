@@ -766,6 +766,17 @@ Your `Authenticator` sets `Caller::tenant` — that is the whole wiring. The gat
 resolves the plane from it and hands it to the route, so a handler has no way to
 reach a store it did not resolve.
 
+Give each tenant a ceiling while you are there — the plane's store already
+implements the accounting:
+
+```rust
+.quota(store.clone() as Arc<dyn QuotaStore>, TenantQuota {
+    max_concurrent_runs: Some(50),
+    max_tokens_per_period: Some(20_000_000),
+    ..Default::default()
+})
+```
+
 **The trap:** deriving the tenant from anything the caller sent. A header, a path
 segment or a body field is a value the caller controls, and this one selects a
 *store* — so reading it from the request is a cross-tenant read with an
@@ -775,6 +786,10 @@ and the roles.
 Two mistakes are refused rather than discovered: a plane whose store or blob
 store is scoped to a different tenant fails at `build()`, and a caller whose
 tenant has no plane is refused rather than served by a default.
+
+**The second trap:** counting concurrency in memory. That ceiling doubles the
+moment a second instance starts — and it fails open, so nothing tells you. The
+accounting belongs in the store, which is why `quota` takes one.
 
 ## 🔎 Audit a store you do not trust
 

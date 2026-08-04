@@ -1086,6 +1086,8 @@ src/
   case/      CaseStore, EventStore, TaskStore contracts
   plan/      the plan contract: what a plan must satisfy to run at all
   policy/    authorization-engine adapters; the seam itself is core::policy
+  quota/     per-tenant ceilings on concurrent work and spend, accounted in
+             the store so they survive a second instance
   store/     redb and Postgres backends, journal and cases alike
   blob/      content-addressed bytes kept out of the chain, and the erasure
              that retention needs
@@ -1324,7 +1326,8 @@ the invariant for the one route nobody would think to check.
 | `GetTask` | the run's state, read from its **last** record |
 | `CancelTask` | a durable stop request; the task stays `WORKING` |
 | `GetExtendedAgentCard` | the authenticated card |
-| `SendStreamingMessage`, `SubscribeToTask`, `ListTasks` | `-32004`, unsupported |
+| `SendStreamingMessage`, `SubscribeToTask` | SSE, read from the journal |
+| `ListTasks` | `-32004`, unsupported |
 | the push-notification configs | `-32003`, not supported |
 | anything else | `-32601`, method not found |
 
@@ -1368,9 +1371,77 @@ that will never change. The decline says only that it was declined: the
 runtime's own denial names the action and resource the gate keyed on, which is
 enough to map this plane's authorization vocabulary by probing it.
 
-Streaming and push stay advertised `false` on the card, because a card is a
+Push notifications stay advertised `false` on the card, because a card is a
 promise a caller plans against and an unimplemented transport does not degrade
-gracefully — it produces a caller waiting for events nobody will send.
+gracefully — it produces a caller waiting for events nobody will send. Streaming
+is advertised `true`, because it exists.
+
+#### A signed card says who published it
+
+A card is fetched unauthenticated from a host a caller may not control. TLS says
+the bytes came from that host; it says nothing about whether the host is the
+party whose capabilities the card describes — and it says nothing at all once
+the card has been copied into a registry, a cache, or a repository.
+`A2aServer::signing_cards_with` attaches a detached JWS (RFC 7515) over the card
+canonicalized per RFC 8785.
+
+Four decisions carry it.
+
+**It is a real JWS.** Everywhere else in this crate a signature covers a digest,
+because everywhere else the input is already a hash. Here the signature is over
+the standard signing input itself — `BASE64URL(protected).BASE64URL(payload)` —
+because a card is verified by software nobody here wrote. Signing `H(m)` instead
+produces a perfectly valid signature over the wrong message: it verifies against
+our own verifier and is rejected by every conforming one. That is why card
+signing has its own seam rather than reusing the record `Signer`.
+
+**The algorithm comes from a constant.** The verifier never reads `alg` from the
+card it is checking — that is the oldest JWS attack, and a card is precisely the
+attacker-supplied document it was invented for.
+
+**Signed at publish, not at derivation.** The signature covers the card as
+*served*, interface URL and tenant included. Those are deployment facts; a
+signature taken before they were set would cover a document nobody serves.
+
+**Several signatures coexist**, so a publisher rotates keys without a window in
+which nobody can verify the card.
+
+Canonicalization is [`core::canon`](#canonical-bytes), which orders keys by
+UTF-16 code unit exactly as RFC 8785 requires. The one JCS rule it does not
+implement is ECMAScript number formatting — and a guard asserts the card carries
+no numbers, so the day somebody adds an integer field that is a failing test
+rather than a signature two implementations disagree about.
+
+#### The stream is a view of the journal, not an event bus
+
+The obvious way to stream progress is an in-process broadcast channel: a step
+finishes, it publishes, subscribers receive. It is wrong here in three ways that
+only appear in production.
+
+A channel's events live in memory, so a subscriber that reconnects has **missed**
+whatever happened while it was away and nothing can tell it what. A channel is
+per process, so a subscriber attached to the instance that is *not* running the
+work receives nothing — and which instance that is changes after every failover.
+And a channel is a second record of what happened, which can disagree with the
+first.
+
+Reading updates from the journal instead makes the stream exactly as durable as
+the run: a client that drops and re-subscribes picks up the current state and
+continues, any instance can serve it, and the events cannot disagree with history
+because they *are* history. The cost is a poll rather than a push — one indexed
+read per subscriber per interval — and it is stated rather than hidden.
+
+Two endings, not one. The spec requires closing on a terminal state; this also
+closes on `INPUT_REQUIRED`, because a suspended run may be waiting on a person
+for a week and holding a connection open for that is a leak with a spec
+reference. Reconnecting costs the client nothing, since the stream is rebuilt
+from history rather than resumed from memory.
+
+There is deliberately **no SSE keep-alive**. It was tried: with it the response
+body did not end when the stream did, so the connection outlived the task — the
+exact failure the design is shaped to avoid. An idle stream may now be reaped by
+an intermediary, which is the better failure, because a client can recover from a
+closed connection and cannot recover from one that never ends.
 
 ### Model providers (`providers`)
 

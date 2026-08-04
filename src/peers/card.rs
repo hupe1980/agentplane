@@ -20,14 +20,14 @@
 //!
 //! # What it will not claim
 //!
-//! Streaming and push notifications are advertised as **false**, because both
-//! need an A2A *server* and there is not one. A card is a promise a caller plans
-//! against: advertising an unimplemented transport does not degrade gracefully,
-//! it produces a caller that hangs waiting for events nobody will send.
+//! Every capability flag is true only when the thing behind it exists. Push
+//! notifications are advertised as **false** because there is no callback store
+//! and no governed outbound delivery — and a card is a promise a caller plans
+//! against, so advertising an unimplemented transport does not degrade
+//! gracefully: it produces a caller waiting for events nobody will send.
 //!
-//! The extended card **is** implemented — see [`ExtendedAgentCard`] — so that
-//! flag is true, and it is true because the thing exists rather than because it
-//! sounded good on a card.
+//! Streaming and the extended card are true because both are implemented, not
+//! because they sounded good on a card.
 //!
 //! [A2A]: https://a2a-protocol.org/latest/specification/
 
@@ -61,7 +61,7 @@ pub struct CardSkill {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CardCapabilities {
-    /// Server-sent events for incremental results. Not implemented.
+    /// Server-sent events for incremental results.
     pub streaming: bool,
     /// Webhook callbacks for long tasks. Not implemented.
     pub push_notifications: bool,
@@ -73,10 +73,12 @@ impl CardCapabilities {
     /// What this crate can actually do.
     const fn implemented() -> Self {
         Self {
-            // Both need an A2A server, and there is not one.
-            streaming: false,
+            // `SendStreamingMessage` and `SubscribeToTask`, served from the
+            // journal — see `api::a2a_stream`.
+            streaming: true,
+            // Needs a callback store and governed outbound delivery. Absent, so
+            // it says absent.
             push_notifications: false,
-            // This one exists.
             extended_agent_card: true,
         }
     }
@@ -120,6 +122,12 @@ pub struct AgentCard {
     pub default_input_modes: Vec<String>,
     pub default_output_modes: Vec<String>,
     pub skills: Vec<CardSkill>,
+    /// Detached JWS signatures over this card.
+    ///
+    /// Several are allowed so a publisher can rotate keys without a window in
+    /// which nobody can verify the card.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<super::card_sig::CardSignature>,
     /// The digest of the manifest this card was derived from.
     ///
     /// Not part of the A2A schema, and carried anyway: it is what lets a caller
@@ -181,6 +189,10 @@ impl AgentCard {
             default_input_modes: vec!["text/plain".to_owned()],
             default_output_modes: vec!["text/plain".to_owned()],
             skills,
+            // Unsigned until somebody signs it. An empty list serializes as an
+            // absent field, so an unsigned card is not a card with an empty
+            // promise on it.
+            signatures: Vec::new(),
             manifest_digest: manifest.digest()?.to_hex(),
         })
     }

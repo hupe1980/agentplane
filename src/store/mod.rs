@@ -12,6 +12,8 @@
 mod postgres;
 #[cfg(feature = "postgres")]
 mod postgres_cases;
+#[cfg(feature = "postgres")]
+mod postgres_quota;
 #[cfg(feature = "redb")]
 mod redb;
 #[cfg(feature = "redb")]
@@ -20,6 +22,8 @@ mod redb_batches;
 mod redb_cases;
 #[cfg(feature = "redb")]
 mod redb_events;
+#[cfg(feature = "redb")]
+mod redb_quota;
 #[cfg(feature = "redb")]
 mod redb_tasks;
 #[cfg(feature = "redb")]

@@ -209,6 +209,9 @@ pub struct Runtime {
     /// How long a run's lease lasts, and how long a crashed owner's runs stay
     /// unclaimable.
     lease_ttl: Duration,
+    /// Durable per-tenant ceilings, when a deployment wires them.
+    quotas: Option<Arc<dyn crate::quota::QuotaStore>>,
+    quota: crate::quota::TenantQuota,
     budget: Budget,
 
     cases: Option<Arc<dyn CaseStore>>,
@@ -236,6 +239,8 @@ impl Runtime {
             skills: Vec::new(),
             owner: None,
             lease_ttl: LEASE_TTL,
+            quotas: None,
+            quota: crate::quota::TenantQuota::default(),
             budget: Budget::unlimited(),
             cases: None,
             events: None,
@@ -471,6 +476,65 @@ impl Runtime {
                 }
             }
         }))
+    }
+
+    /// Refuse a run whose tenant is at a ceiling.
+    ///
+    /// Fails **closed**: an unreachable quota store refuses rather than admits,
+    /// because a ceiling that yields when its accounting is down is a ceiling an
+    /// attacker removes by taking the accounting down.
+    ///
+    /// Live admission only. Replay and resume never come through here, which is
+    /// deliberate — re-checking a quota during replay would let a run that
+    /// happened produce a different history when it is re-read, and a ceiling
+    /// crossed since admission would rewrite the past into a refusal.
+    async fn check_quota(&self, run: RunId) -> Result<(), RuntimeError> {
+        let Some(quotas) = self.quotas.as_ref() else {
+            return Ok(());
+        };
+        if self.quota.is_unlimited() {
+            return Ok(());
+        }
+
+        if self.quota.bounds_spend() {
+            let period = self.quota.period.key_for(now_for_admission());
+            let spent = quotas.spent(&period).await.map_err(|e| {
+                RuntimeError::QuotaExceeded(crate::quota::QuotaError::Unavailable(e.to_string()))
+            })?;
+            crate::quota::check_spend(self.tenant.as_str(), &period, &self.quota, spent)
+                .map_err(RuntimeError::QuotaExceeded)?;
+        }
+
+        quotas
+            .reserve(run, self.quota.max_concurrent_runs, now_for_admission())
+            .await
+            .map_err(RuntimeError::QuotaExceeded)
+    }
+
+    /// Give back the slot and record what the run spent.
+    ///
+    /// Best-effort, and deliberately so: the work is done and journaled by the
+    /// time this runs, and turning a bookkeeping failure into a run failure
+    /// would convert a tidiness problem into a correctness one. A slot that is
+    /// not released is attributable — the table names the run — so an operator
+    /// can see a stranded one rather than a counter that has silently drifted.
+    async fn settle_quota(&self, run: RunId, spend: Spend) {
+        let Some(quotas) = self.quotas.as_ref() else {
+            return;
+        };
+        if let Err(e) = quotas.release(run).await {
+            tracing::debug!(%run, error = %e, "could not release the quota slot");
+        }
+        if self.quota.bounds_spend() {
+            let period = self.quota.period.key_for(now_for_admission());
+            if let Err(e) = quotas.accrue(&period, spend).await {
+                tracing::warn!(
+                    %run, error = %e,
+                    "could not record this run's spend against the tenant ceiling — \
+                     the period will under-count"
+                );
+            }
+        }
     }
 
     fn budget_for(&self, target: &str) -> Budget {
@@ -862,6 +926,11 @@ impl Runtime {
 
         self.authorize_scope(&plan)?;
         self.authorize_admission(&agent, governed_by.as_ref(), input.peek())?;
+
+        // Before the lease and before any record: a run refused on quota must
+        // leave nothing behind, or a throttled tenant accumulates half-open runs
+        // that its next request has to step over.
+        self.check_quota(run).await?;
 
         // Admission: take ownership, then record what we are about to do —
         // before doing any of it.
@@ -2291,6 +2360,12 @@ impl Runtime {
             );
         }
 
+        // Beside the lease, and for the same reason: this instance is finished
+        // with the run whatever the outcome. A **suspended** run gives its slot
+        // back too — it costs a row, not a thread, and holding the slot would
+        // mean a tenant waiting on a hundred approvals could start nothing.
+        self.settle_quota(run, spend).await;
+
         announce(run, &status);
 
         Ok(RunOutcome {
@@ -3022,6 +3097,8 @@ pub struct RuntimeBuilder {
     tenant: crate::core::TenantId,
     owner: Option<String>,
     lease_ttl: Duration,
+    quotas: Option<Arc<dyn crate::quota::QuotaStore>>,
+    quota: crate::quota::TenantQuota,
     budget: Budget,
     /// Agents registered on this plane, each with its own declaration.
     #[cfg(feature = "manifest")]
@@ -3113,6 +3190,28 @@ impl RuntimeBuilder {
              it is still working"
         );
         self.lease_ttl = ttl;
+        self
+    }
+
+    /// Bound what this tenant may consume, durably.
+    ///
+    /// Budgets bound one run; this bounds the tenant. Both are needed: a caller
+    /// that can start runs can start a thousand, each within its own ceiling.
+    ///
+    /// The accounting lives in the store, so the ceiling survives a second
+    /// instance — an in-process counter would silently double the moment
+    /// somebody scales out, which is exactly when it was needed.
+    ///
+    /// Read [`crate::quota`] for what each ceiling does and does not bound; a
+    /// limit believed to bound something it does not is worse than none.
+    #[must_use]
+    pub fn quota(
+        mut self,
+        quotas: Arc<dyn crate::quota::QuotaStore>,
+        quota: crate::quota::TenantQuota,
+    ) -> Self {
+        self.quotas = Some(quotas);
+        self.quota = quota;
         self
     }
 
@@ -3494,6 +3593,8 @@ impl RuntimeBuilder {
             tenant: self.tenant,
             owner: self.owner.unwrap_or_else(default_owner),
             lease_ttl: self.lease_ttl,
+            quotas: self.quotas,
+            quota: self.quota,
             budget: self.budget,
             cases: self.cases,
             events: self.events,

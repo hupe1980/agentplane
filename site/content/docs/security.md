@@ -371,6 +371,20 @@ serves many tenants by resolving the plane from the caller's credential.
 
 Both are their own subject: see [erasure and keys](@/docs/erasure.md).
 
+### A published card is signed; a fetched one is not yet checked
+
+This plane signs the Agent Cards it publishes, over the standard JWS signing
+input and with the algorithm taken from a constant rather than from the document
+being verified. What it does **not** do is verify the cards it reads — client
+side discovery and signature checking are not built.
+
+That gap costs less than it appears to, and the reason is worth stating: peer
+grants come from the **operator's registry**, never from a peer's card. A party
+describing its own privileges is not a source of truth about them, so a forged
+card cannot widen what this plane will send a peer or accept from one. What
+verification would add is confidence about *who* is on the other end, which the
+audience-bound credential already constrains.
+
 ### A peer's message is untrusted, and names its sender
 
 The A2A server (`a2a-server`) admits an inbound message as `Tainted` with

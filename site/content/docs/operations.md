@@ -358,6 +358,54 @@ reachable. `DenyAll` exists for wiring the surface up before the rules are
 written. One ungoverned tenant among governed ones is the one an attacker looks
 for, which is why the check is over every plane rather than the first.
 
+### Per-tenant ceilings
+
+Budgets bound one run. They do not bound a tenant: a caller that can start runs
+can start a thousand, each perfectly within its own ceiling, and the compute and
+the model bill are somebody else's problem. `RuntimeBuilder::quota` sets a
+tenant's limits and points at the store that accounts them.
+
+```rust
+.quota(store.clone() as Arc<dyn QuotaStore>, TenantQuota {
+    max_concurrent_runs: Some(50),
+    max_tokens_per_period: Some(20_000_000),
+    period: Period::Monthly,
+    ..Default::default()
+})
+```
+
+**The accounting is durable, and that is the whole point.** An in-process
+counter is a ceiling that vanishes the moment a second instance starts — and it
+fails *open*, silently doubling when somebody scales out, which is exactly when
+it was needed. The reservation is one transaction that counts and inserts, so
+two instances racing for the last slot serialise and one loses.
+
+What each ceiling bounds, stated precisely, because a limit believed to bound
+something it does not is worse than none:
+
+**Concurrency** bounds runs *executing*. A slot is taken at admission and given
+back when the instance finishes with the run — including when it **suspends**, since
+a suspended run costs a row and not a thread, and holding its slot would mean a
+tenant waiting on a hundred approvals could start nothing. It follows that a
+resume is not gated: that work was admitted already, and refusing it would
+strand a run waiting on something that has now happened.
+
+**Spend** bounds a period and is checked at admission. A run already executing
+when the ceiling is crossed finishes, so the overshoot is bounded and
+computable — at most the concurrency ceiling times the per-run budget, both of
+which you set — rather than unknown.
+
+A refusal is `RuntimeError::QuotaExceeded`, deliberately not a policy denial: a
+denial means *you may not* and retrying is pointless; a ceiling means *not right
+now*. Over A2A it comes back as `-32004` rather than an internal error, so a
+peer backs off instead of retrying a "fault" immediately.
+
+Two failure choices worth knowing. An unreachable quota store **refuses** rather
+than admits — a ceiling that yields when its accounting is down is one an
+attacker removes by taking the accounting down. And concurrency is tracked as a
+*set of runs*, not a counter, so a process that dies mid-run strands a slot an
+operator can name and release, rather than a number nobody can audit.
+
 ### One surface, many tenants
 
 `Api::new` takes `Planes`, a registry keyed by tenant, so one process can serve

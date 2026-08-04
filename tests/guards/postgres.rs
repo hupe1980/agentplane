@@ -79,6 +79,7 @@ async fn postgres_satisfies_the_case_layer_contracts() {
     let store = Arc::new(PostgresStore::connect(&url).await.expect("connect"));
 
     let mut report = agentplane::testkit::conformance::Report::default();
+    agentplane::testkit::conformance_quota::check(store.as_ref(), &mut report).await;
     cc::check_cases(&(Arc::clone(&store) as Arc<dyn CaseStore>), &mut report).await;
     cc::check_events(&(Arc::clone(&store) as Arc<dyn EventStore>), &mut report).await;
     cc::check_timers(&(Arc::clone(&store) as Arc<dyn TimerStore>), &mut report).await;

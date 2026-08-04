@@ -101,6 +101,7 @@ pub mod model;
 pub mod peers;
 pub mod plan;
 pub mod policy;
+pub mod quota;
 pub mod runtime;
 pub mod tools;
 

@@ -16,6 +16,7 @@ dependencies = [
 name = "agentplane"
 version = "0.2.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "axum",
  "base64 0.22.1",

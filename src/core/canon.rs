@@ -66,6 +66,16 @@ pub fn value_bytes(value: &Value) -> Vec<u8> {
     out
 }
 
+/// RFC 8785 key ordering: lexicographic by UTF-16 code unit.
+///
+/// Not `str`'s own ordering, which compares UTF-8 bytes. The two agree for
+/// everything in the Basic Multilingual Plane and disagree above it, because
+/// UTF-16 encodes those as surrogate pairs beginning `0xD800..=0xDBFF` — below
+/// `0xE000..=0xFFFF`, which UTF-8 sorts *before* them.
+fn utf16_order(a: &str, b: &str) -> std::cmp::Ordering {
+    a.encode_utf16().cmp(b.encode_utf16())
+}
+
 /// Write a value in canonical form: sorted keys, no insignificant whitespace.
 ///
 /// Scalars are delegated to `serde_json`, whose escaping and number formatting
@@ -76,7 +86,7 @@ fn write_canonical(value: &Value, out: &mut Vec<u8>) {
         Value::Object(map) => {
             out.push(b'{');
             let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
-            keys.sort_unstable();
+            keys.sort_unstable_by(|a, b| utf16_order(a, b));
             for (i, key) in keys.iter().enumerate() {
                 if i > 0 {
                     out.push(b',');
@@ -134,6 +144,37 @@ mod tests {
         assert_eq!(
             String::from_utf8(value_bytes(&a)).unwrap(),
             r#"{"a":2,"m":3,"z":1}"#
+        );
+    }
+
+    /// Keys sort by UTF-16 code unit, which is what RFC 8785 requires.
+    ///
+    /// The case that distinguishes the two orderings: a non-BMP character is one
+    /// UTF-16 surrogate pair starting at `0xD800`, which is **below** a BMP
+    /// character like `\u{ffff}` — while in UTF-8 bytes the same non-BMP
+    /// character sorts *above* it. Sorting by `str`'s natural order passes every
+    /// ASCII test and produces bytes a conforming verifier rejects.
+    #[test]
+    fn keys_sort_by_utf16_code_unit_not_utf8_byte() {
+        let bmp = "\u{ffff}";
+        let astral = "\u{10000}";
+        // The two orderings genuinely disagree here, which is what makes this a
+        // test rather than a restatement: in UTF-8 bytes `\u{ffff}` is EF BF BF
+        // and `\u{10000}` is F0 90 80 80, so the BMP one sorts first. In UTF-16
+        // the astral one is the surrogate pair D800 DC00, which sorts *below*
+        // FFFF — the opposite answer.
+        assert!(
+            bmp < astral,
+            "the fixture no longer distinguishes the orderings"
+        );
+
+        let bytes = value_bytes(&json!({ astral: 1, bmp: 2 }));
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.find(astral) < text.find(bmp),
+            "keys came out in UTF-8 byte order, not UTF-16 — so a signed Agent \
+             Card canonicalized here is rejected by any conforming verifier, and \
+             every ASCII test still passes: {text}"
         );
     }
 

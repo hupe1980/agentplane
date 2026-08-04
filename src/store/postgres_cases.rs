@@ -213,6 +213,28 @@ CREATE TABLE IF NOT EXISTS batch_items (
     PRIMARY KEY (tenant, batch_id, item_key),
     FOREIGN KEY (tenant, batch_id) REFERENCES batches (tenant, batch_id) ON DELETE CASCADE
 );
+
+-- The runs a tenant currently has executing.
+--
+-- A set rather than a counter, and the difference is recovery: a counter that is
+-- incremented on admission leaks a slot every time a process dies before the
+-- decrement, and nothing can say which increments were real. A set names its
+-- members, so a stranded slot is attributable to a run an operator can look up,
+-- and releasing it is idempotent by construction.
+CREATE TABLE IF NOT EXISTS quota_running (
+    tenant      TEXT   NOT NULL,
+    run_id      TEXT   NOT NULL,
+    admitted_at BIGINT NOT NULL,
+    PRIMARY KEY (tenant, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS quota_spent (
+    tenant      TEXT   NOT NULL,
+    period      TEXT   NOT NULL,
+    tokens      BIGINT NOT NULL DEFAULT 0,
+    minor_units BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (tenant, period)
+);
 ";
 
 fn be(e: &tokio_postgres::Error) -> StoreError {

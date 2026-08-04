@@ -52,9 +52,15 @@ pub mod a2a;
 #[cfg(feature = "manifest")]
 mod card;
 #[cfg(feature = "manifest")]
+mod card_sig;
+#[cfg(feature = "manifest")]
 pub use card::{
     AgentCard, CardCapabilities, CardInterface, CardSkill, ExtendedAgentCard, ExtendedBudget,
     ExtendedTool, WELL_KNOWN_PATH,
+};
+#[cfg(feature = "manifest")]
+pub use card_sig::{
+    ALG, CardSignature, CardSignatureError, CardSigner, CardVerifier, signing_input,
 };
 mod credentials;
 pub use credentials::{Cached, CredentialError, CredentialSource, Fixed, TokenExchange};

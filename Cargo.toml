@@ -69,7 +69,7 @@ redb = ["dep:redb"]
 # The agent declaration: tool grants, budgets, egress ceiling, injection
 # pattern. Off by default because the runtime is perfectly usable wired by
 # builder calls; the manifest is what makes those declarations reviewable.
-manifest = ["dep:serde_yaml_ng"]
+manifest = ["dep:serde_yaml_ng", "dep:base64"]
 # Everything the `agentplane` binary needs to run a declarative agent.
 cli = ["manifest", "redb", "providers", "testkit"]
 # Content-addressed blob storage on any backend OpenDAL reaches — filesystem,
@@ -121,7 +121,7 @@ witness-http = ["dep:reqwest"]
 # transport happens to be linked.
 a2a = ["dep:reqwest"]
 # Serve this plane as an A2A agent: the public card plus the JSON-RPC methods.
-a2a-server = ["http", "manifest"]
+a2a-server = ["http", "manifest", "dep:async-stream"]
 # Ed25519 signing for journal records. The *seam* — `Signer`, `Verifier`, the
 # attestation on every record, the verifying read path — is always available;
 # this is one concrete implementation, for deployments that do not already have
@@ -160,6 +160,7 @@ tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
 # Only `join_all` is used, to dispatch a ready set concurrently. Deliberately
 # not `futures` proper: the executor needs one combinator, not an ecosystem.
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+async-stream = { version = "0.3", optional = true }
 tracing     = "0.1"
 redb        = { version = "3", optional = true }
 # The maintained fork of serde_yaml, which is deprecated. Ten crates deep.

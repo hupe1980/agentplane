@@ -33,6 +33,16 @@ pub enum RuntimeError {
     #[error("no skill provides capability '{0}'")]
     NoProvider(String),
 
+    /// The tenant is at a ceiling, so nothing was admitted.
+    ///
+    /// Distinct from a policy denial, because they call for opposite responses.
+    /// A denial says *you may not*, and retrying is pointless. A quota refusal
+    /// says *not right now*, and the caller should come back — a concurrency
+    /// ceiling clears when a run finishes. Collapsing them would teach callers
+    /// to retry denials or to give up on back-pressure.
+    #[error("quota: {0}")]
+    QuotaExceeded(#[from] crate::quota::QuotaError),
+
     /// Replay recomputed a different effect key than the journal holds — the
     /// deterministic zone took a different path than the recorded run.
     ///

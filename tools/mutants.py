@@ -486,7 +486,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/core/canon.rs",
         "sorted_keys_guard",
         "canonical form follows insertion order instead of sorting keys",
-        "            keys.sort_unstable();\n",
+        "            keys.sort_unstable_by(|a, b| utf16_order(a, b));\n",
         "",
     ),
     # ── Cedar adapter ───────────────────────────────────────────────────────
@@ -1980,6 +1980,114 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "artifacts land in another tenant's erasure unit",
         "        assert!(\n            blobs.tenant() == tenant.as_str(),",
         "        assert!(\n            blobs.tenant() != \"never\",",
+    ),
+    "ACardSignatureCoversItself": (
+        "src/peers/card_sig.rs",
+        "a_signed_card_verifies_and_a_changed_one_does_not",
+        "the signed payload keeps the signatures field, so signing twice signs a "
+        "different document each time and no verifier can reproduce the bytes",
+        "    if let Some(obj) = value.as_object_mut() {\n        obj.remove(\"signatures\");\n    }",
+        "",
+    ),
+    "ACardVerifierBelievesTheHeader": (
+        "src/peers/card_sig.rs",
+        "a_card_naming_its_own_algorithm_is_refused",
+        "the verifier takes the algorithm from the card it is checking, so a "
+        "card naming `none` is accepted without a key",
+        "            if alg != ALG {\n                wrong_alg = Some(alg.to_owned());\n                continue;\n            }",
+        "",
+    ),
+    "ACardIsSignedOverItsHash": (
+        "src/peers/card_sig.rs",
+        "a_signed_card_verifies_and_a_changed_one_does_not",
+        "the signature is made over a hash of the JWS signing input rather than "
+        "the input itself, which verifies here and nowhere else — every "
+        "conforming verifier rejects it",
+        "        let signature = B64.encode(signer.sign_bytes(&input));",
+        "        let signature =\n            B64.encode(signer.sign_bytes(crate::core::Digest::of(&input).as_bytes()));",
+    ),
+    "CanonicalOrderIsUtf8NotUtf16": (
+        "src/core/canon.rs",
+        "keys_sort_by_utf16_code_unit_not_utf8_byte",
+        "object keys sort by UTF-8 byte order instead of RFC 8785's UTF-16 code "
+        "unit order, so canonical bytes are rejected by any conforming verifier "
+        "while every ASCII test still passes",
+        "            keys.sort_unstable_by(|a, b| utf16_order(a, b));",
+        "            keys.sort_unstable();",
+    ),
+    "AStreamNeverClosesOnAFinishedTask": (
+        "src/api/a2a_stream.rs",
+        "subscribing_to_a_finished_task_still_reports_it",
+        "a stream opened on an already-finished task polls forever: the record "
+        "that ended the run was consumed before the subscriber existed, so the "
+        "loop never sees it — which is every client reconnecting after a drop",
+        "        if already_over {\n            return;\n        }",
+        "",
+    ),
+    "AStreamRunsPastItsTerminalState": (
+        "src/api/a2a_stream.rs",
+        "a_streaming_send_opens_with_the_task_and_closes_when_it_finishes",
+        "the stream does not close when the task reaches a terminal state, so a "
+        "client waits on a connection that will never say anything again",
+        "            if done {\n                return;\n            }",
+        "",
+    ),
+    "AStreamDoesNotOpenWithTheTask": (
+        "src/api/a2a_stream.rs",
+        "a_streaming_send_opens_with_the_task_and_closes_when_it_finishes",
+        "the stream omits the opening Task, so a subscriber that was not present "
+        "when the run started cannot learn its current state",
+        "        yield Ok(stream_response(&id, &json!({ \"task\": first })));",
+        "        let _ = &first;",
+    ),
+    "AZeroCeilingAdmitsEverything": (
+        "src/store/redb_quota.rs",
+        "redb_satisfies_the_quota_store_contract",
+        "the concurrency ceiling is compared inside the counting loop, so a "
+        "ceiling of zero never compares anything and admits every run — the "
+        "value an operator sets to stop a tenant dead",
+        "                        if n >= limit {\n                            refused = Some(n);\n                        }",
+        "                        if n > limit {\n                            refused = Some(n);\n                        }",
+    ),
+    "AQuotaCeilingIsSharedAcrossTenants": (
+        "src/store/redb_quota.rs",
+        "one_tenants_ceiling_does_not_throttle_another",
+        "the running-run count spans every tenant, so one busy tenant throttles "
+        "everybody — a shared ceiling wearing a per-tenant name",
+        "                            .range((tenant.as_str(), \"\")..=(tenant.as_str(), MAX_STR))\n"
+        "                            .map_err(|e| be(&e))?\n"
+        "                            .take(limit as usize)",
+        "                            .range((\"\", \"\")..=(MAX_STR, MAX_STR))\n"
+        "                            .map_err(|e| be(&e))?\n"
+        "                            .take(limit as usize)",
+    ),
+    "AnAdmittedRunSkipsItsQuota": (
+        "src/runtime/executor.rs",
+        "a_refused_run_writes_nothing",
+        "admission never consults the tenant's ceiling, so a caller that can "
+        "start runs can start a thousand of them, each within its own budget",
+        "        self.check_quota(run).await?;",
+        "",
+    ),
+    "AFinishedRunKeepsItsSlot": (
+        "src/runtime/executor.rs",
+        "a_finished_run_frees_its_slot",
+        "a run never gives its concurrency slot back, so a ceiling of N permits "
+        "N runs per process lifetime rather than N at a time",
+        "        self.settle_quota(run, spend).await;",
+        "",
+    ),
+    "ReplayReChecksTheQuota": (
+        "src/runtime/executor.rs",
+        "replay_does_not_consult_the_quota",
+        "replay consults the tenant's live ceiling, so re-reading a run that "
+        "genuinely happened can refuse — history says something different on "
+        "the second reading",
+        "        // Strict verification never writes, so it holds no lease to renew.\n"
+        "        let _heartbeat = (mode != Mode::Strict).then(|| self.heartbeat(run, epoch));",
+        "        self.check_quota(run).await?;\n"
+        "        // Strict verification never writes, so it holds no lease to renew.\n"
+        "        let _heartbeat = (mode != Mode::Strict).then(|| self.heartbeat(run, epoch));",
     ),
     "APeerCanNameAnyTenant": (
         "src/api/a2a.rs",

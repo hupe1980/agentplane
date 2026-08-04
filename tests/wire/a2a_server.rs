@@ -558,7 +558,9 @@ async fn unimplemented_operations_are_refused_as_unsupported() {
     let f = fixture();
     let router = f.router();
 
-    for method in ["SendStreamingMessage", "SubscribeToTask", "ListTasks"] {
+    // Streaming is implemented and is *not* in this list — see the streaming
+    // tests. What remains unimplemented says so with the spec's own code.
+    for method in ["ListTasks"] {
         let (_, body) = send(&router, rpc(method, &json!({}), Some("peer-a"))).await;
         assert_eq!(
             err_code(&body),
@@ -1024,4 +1026,288 @@ async fn an_unconfigured_send_blocks() {
              expecting a finished task got an unfinished one: {body:#}"
         );
     }
+}
+
+// ── Streaming ───────────────────────────────────────────────────────────────
+
+/// Read an SSE body into its `data:` payloads.
+///
+/// Parsed from the raw bytes rather than trusted: the framing *is* the contract
+/// here, and a test that deserialises straight into a struct would pass with a
+/// body no `EventSource` on earth can read.
+async fn sse_frames(router: &axum::Router, req: Request<Body>) -> (StatusCode, String, Vec<Value>) {
+    let res = router.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let content_type = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    // Bounded, because the failure this guards against is a stream that never
+    // closes — and an unbounded read turns that into a hung test rather than a
+    // failed one. A hang stalls CI and the mutation sweep and tells nobody what
+    // broke; this says exactly what broke.
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        axum::body::to_bytes(res.into_body(), 1024 * 1024),
+    )
+    .await
+    .expect(
+        "the stream never closed. A2A requires closing when the task reaches a \
+         terminal state; a client left holding this connection waits forever for \
+         a run that already finished",
+    )
+    .unwrap();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let frames = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str(d).ok())
+        .collect();
+    (status, content_type, frames)
+}
+
+/// `SendStreamingMessage` answers with an SSE stream that opens with the task.
+///
+/// The spec requires the stream to begin with the `Task` and to close when it
+/// reaches a terminal state, so a subscriber can learn the current state without
+/// having been present for the events that produced it.
+#[tokio::test]
+async fn a_streaming_send_opens_with_the_task_and_closes_when_it_finishes() {
+    let f = fixture();
+    let (status, content_type, frames) = sse_frames(
+        &f.router(),
+        rpc(
+            "SendStreamingMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "a streaming response must be an event stream; a client picks its parser \
+         from this header: {content_type}"
+    );
+    assert!(
+        !frames.is_empty(),
+        "the stream carried no `data:` frames at all"
+    );
+
+    // Every frame is a JSON-RPC envelope echoing the request id, and carries a
+    // StreamResponse — a oneof, so exactly one member.
+    for frame in &frames {
+        assert_eq!(frame["jsonrpc"], "2.0", "not a JSON-RPC frame: {frame:#}");
+        assert_eq!(frame["id"], 1, "a frame did not echo the request id");
+        let result = &frame["result"];
+        let members = ["task", "message", "statusUpdate", "artifactUpdate"]
+            .iter()
+            .filter(|m| result.get(*m).is_some())
+            .count();
+        assert_eq!(
+            members, 1,
+            "a StreamResponse is a oneof and this frame has {members} members: {frame:#}"
+        );
+    }
+
+    assert!(
+        frames[0]["result"]["task"].is_object(),
+        "the stream must open with the Task: {:#}",
+        frames[0]
+    );
+
+    let last = frames.last().expect("frames");
+    let state = last["result"]["statusUpdate"]["status"]["state"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(
+        state, "TASK_STATE_COMPLETED",
+        "the stream must close on a terminal state, and its last word is what a \
+         client records as the outcome: {last:#}"
+    );
+}
+
+/// A status update carries the ids a client needs to correlate it.
+///
+/// `taskId` and `contextId` are both required by the schema. A run with no case
+/// has no case id, and this carries the run's own — a standalone run genuinely
+/// is its whole context, so it is a true statement about grouping rather than a
+/// placeholder every client has to special-case.
+#[tokio::test]
+async fn a_status_update_carries_its_task_and_context() {
+    let f = fixture();
+    let (_, _, frames) = sse_frames(
+        &f.router(),
+        rpc(
+            "SendStreamingMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+
+    let task_id = frames[0]["result"]["task"]["id"].as_str().expect("id");
+    let update = frames
+        .iter()
+        .find(|f| f["result"].get("statusUpdate").is_some())
+        .expect("no status update was emitted, so the stream reports no progress");
+
+    assert_eq!(update["result"]["statusUpdate"]["taskId"], task_id);
+    assert!(
+        update["result"]["statusUpdate"]["contextId"]
+            .as_str()
+            .is_some_and(|c| !c.is_empty()),
+        "contextId is required and must not be empty: {update:#}"
+    );
+}
+
+/// `SubscribeToTask` streams a run this call did not start.
+///
+/// The property that makes the stream durable rather than a channel: a
+/// subscriber that was not present when the run started — or that reconnects
+/// after dropping — is told the current state and continues from it.
+#[tokio::test]
+async fn subscribing_to_a_finished_task_still_reports_it() {
+    let f = fixture();
+    let router = f.router();
+
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let id = sent["result"]["task"]["id"].as_str().unwrap().to_owned();
+
+    let (status, content_type, frames) = sse_frames(
+        &router,
+        rpc("SubscribeToTask", &json!({"id": id}), Some("peer-a")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("text/event-stream"));
+    assert_eq!(
+        frames[0]["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "a subscriber that arrived after the run finished must still be told \
+         what happened, not left waiting: {:#}",
+        frames[0]
+    );
+}
+
+/// Subscribing to a task that does not exist is not found, not an empty stream.
+#[tokio::test]
+async fn subscribing_to_an_unknown_task_is_refused() {
+    let f = fixture();
+    let (_, body) = send(
+        &f.router(),
+        rpc(
+            "SubscribeToTask",
+            &json!({"id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        err_code(&body),
+        i64::from(code::TASK_NOT_FOUND),
+        "an unknown task opened a stream that would never produce anything: {body:#}"
+    );
+}
+
+/// Streaming authenticates and authorizes exactly as the rest does.
+#[tokio::test]
+async fn streaming_is_gated_too() {
+    let f = fixture_from(
+        ONE_SKILL,
+        Arc::new(Recording {
+            seen: Mutex::new(Vec::new()),
+            deny: true,
+            deny_runs: false,
+        }),
+    );
+    let (_, body) = send(
+        &f.router(),
+        rpc(
+            "SendStreamingMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert!(
+        body.get("error").is_some(),
+        "a refused caller opened a stream: {body:#}"
+    );
+    assert_eq!(
+        f.seen.lock().unwrap().len(),
+        0,
+        "the skill ran for a caller the policy refused"
+    );
+}
+
+/// The served card carries a signature a peer can verify.
+///
+/// Signed at publish rather than at derivation, because the signature must cover
+/// the card as *served* — interface URL and tenant included. A signature taken
+/// before those were set would cover a document nobody serves.
+#[cfg(feature = "signing")]
+#[tokio::test]
+async fn a_published_card_can_be_signed_and_verified() {
+    use agentplane::peers::{AgentCard, CardSigner, CardVerifier};
+    use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
+
+    let signer = Ed25519Signer::new("did:example:plane", &[3u8; 32]);
+    let verifier = Ed25519Verifier::new()
+        .trust("did:example:plane", &signer.verifying_key())
+        .expect("a valid key");
+
+    let f = fixture();
+    let router = A2aServer::new(
+        f.rt.clone(),
+        Arc::new(HeaderAuth),
+        &f.manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("wired")
+    .signing_cards_with(&signer as &dyn CardSigner)
+    .expect("sign")
+    .router();
+
+    let req = Request::builder()
+        .uri("/.well-known/agent-card.json")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.get("signatures").is_some(),
+        "the served card carries no signature: {body:#}"
+    );
+
+    // Round-tripped through the wire, which is the only form a peer ever sees.
+    let card: AgentCard = serde_json::from_value(body.clone()).expect("parse the served card");
+    assert_eq!(
+        card.verify(&verifier as &dyn CardVerifier)
+            .expect("the served card did not verify")
+            .as_str(),
+        "did:example:plane"
+    );
+
+    // And the signature is about *this* deployment: change the URL a caller
+    // would connect to and it stops verifying.
+    let mut moved = card;
+    moved.supported_interfaces[0].url = "https://attacker.example/a2a".to_owned();
+    assert!(
+        moved.verify(&verifier as &dyn CardVerifier).is_err(),
+        "a card whose interface URL was rewritten still verified — a peer would \
+         connect to an address the publisher never named"
+    );
 }

@@ -2357,13 +2357,18 @@ fn an_agent_card_is_derived_from_the_manifest() {
          behind them changed"
     );
 
-    // **Nothing unimplemented is advertised.** A card is a promise a caller
-    // plans against, and an unimplemented transport does not degrade
-    // gracefully — it produces a caller waiting for events nobody will send.
-    assert!(!card.capabilities.streaming, "streaming is not implemented");
+    // **Nothing unimplemented is advertised, and nothing implemented is
+    // hidden.** A card is a promise a caller plans against: an unimplemented
+    // transport produces a caller waiting for events nobody will send, and an
+    // unadvertised one produces a caller that polls what it could have streamed.
+    assert!(
+        card.capabilities.streaming,
+        "streaming is implemented — `SendStreamingMessage` and `SubscribeToTask` \
+         are served from the journal — so the flag must say so"
+    );
     assert!(
         !card.capabilities.push_notifications,
-        "push notifications are not implemented"
+        "push notifications have no callback store behind them"
     );
     assert!(
         card.capabilities.extended_agent_card,
@@ -2446,9 +2451,13 @@ fn the_extended_card_discloses_more_but_not_the_model() {
         "the extended card is implemented, so the flag must say so"
     );
     assert!(
-        !public.capabilities.streaming && !public.capabilities.push_notifications,
-        "neither has a server behind it, and a card is a promise a caller plans \
-         against"
+        public.capabilities.streaming,
+        "the extended card must agree with the public one about streaming"
+    );
+    assert!(
+        !public.capabilities.push_notifications,
+        "push notifications have no callback store behind them, and a card is a \
+         promise a caller plans against"
     );
 
     // What it still will not say. The model is a fact about a supply chain, and
@@ -2526,6 +2535,200 @@ fn the_card_uses_the_spec_field_names() {
     // The capabilities block says false for what does not exist, and the flags
     // are spelled the spec's way too.
     let caps = &json["capabilities"];
-    assert_eq!(caps["streaming"], false);
+    assert_eq!(caps["streaming"], true);
     assert_eq!(caps["pushNotifications"], false);
+}
+
+// ── Card signing ────────────────────────────────────────────────────────────
+
+/// A signed card verifies, and any edit to it stops verifying.
+///
+/// The property a signature exists for. TLS says the bytes came from that host;
+/// it says nothing about whether the host is the party whose capabilities the
+/// card describes. This does — and only if a changed card fails, which is the
+/// half a test can accidentally skip.
+#[cfg(feature = "signing")]
+#[test]
+fn a_signed_card_verifies_and_a_changed_one_does_not() {
+    use agentplane::peers::{AgentCard, CardSignatureError, CardSigner, CardVerifier};
+    use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
+
+    let signer = Ed25519Signer::new("did:example:publisher", &[7u8; 32]);
+    let verifier = Ed25519Verifier::new()
+        .trust("did:example:publisher", &signer.verifying_key())
+        .expect("a valid key");
+
+    let m = Manifest::parse(GOOD).expect("parse");
+    let mut card = AgentCard::derive(&m, "https://plane.internal/a2a").expect("derive");
+    assert!(
+        card.verify(&verifier as &dyn CardVerifier).is_err(),
+        "an unsigned card verified, so the check passes on anything"
+    );
+
+    card.sign(&signer as &dyn CardSigner).expect("sign");
+    assert_eq!(
+        card.verify(&verifier as &dyn CardVerifier)
+            .expect("verify")
+            .as_str(),
+        "did:example:publisher",
+        "a card signed by a trusted key did not verify"
+    );
+
+    // The signature covers what the card *says*. Change any of it and the
+    // signature must stop being about this document.
+    let mut tampered = card.clone();
+    tampered.skills[0].id = "payments.transfer".to_owned();
+    assert!(
+        matches!(
+            tampered.verify(&verifier as &dyn CardVerifier),
+            Err(CardSignatureError::Untrusted)
+        ),
+        "a card whose advertised capability was rewritten still verified — which \
+         is the whole attack: a peer plans against a capability the publisher \
+         never claimed"
+    );
+}
+
+/// A signature made by a key the verifier does not trust is refused.
+#[cfg(feature = "signing")]
+#[test]
+fn a_card_signed_by_a_stranger_is_refused() {
+    use agentplane::peers::{AgentCard, CardSigner, CardVerifier};
+    use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
+
+    let stranger = Ed25519Signer::new("did:example:stranger", &[9u8; 32]);
+    let known = Ed25519Signer::new("did:example:publisher", &[7u8; 32]);
+    let verifier = Ed25519Verifier::new()
+        .trust("did:example:publisher", &known.verifying_key())
+        .expect("a valid key");
+
+    let m = Manifest::parse(GOOD).expect("parse");
+    let mut card = AgentCard::derive(&m, "https://plane.internal/a2a").expect("derive");
+    card.sign(&stranger as &dyn CardSigner).expect("sign");
+
+    assert!(
+        card.verify(&verifier as &dyn CardVerifier).is_err(),
+        "a card signed by an unknown key verified"
+    );
+}
+
+/// Two signatures coexist, so a publisher can rotate keys without a gap.
+#[cfg(feature = "signing")]
+#[test]
+fn a_card_can_carry_two_signatures() {
+    use agentplane::peers::{AgentCard, CardSigner, CardVerifier};
+    use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
+
+    let old = Ed25519Signer::new("key-2025", &[1u8; 32]);
+    let new = Ed25519Signer::new("key-2026", &[2u8; 32]);
+
+    let m = Manifest::parse(GOOD).expect("parse");
+    let mut card = AgentCard::derive(&m, "https://plane.internal/a2a").expect("derive");
+    card.sign(&old as &dyn CardSigner).expect("sign with old");
+    card.sign(&new as &dyn CardSigner).expect("sign with new");
+    assert_eq!(card.signatures.len(), 2);
+
+    // A verifier that knows only one of them is satisfied, which is what makes
+    // rotation gapless: neither side has to cut over at the same instant.
+    for (id, signer) in [("key-2025", &old), ("key-2026", &new)] {
+        let v = Ed25519Verifier::new()
+            .trust(id, &signer.verifying_key())
+            .expect("a valid key");
+        assert_eq!(
+            card.verify(&v as &dyn CardVerifier)
+                .expect("verify")
+                .as_str(),
+            id,
+            "a verifier holding only {id} could not verify a card carrying both"
+        );
+    }
+}
+
+/// The algorithm is read from a constant, never from the card.
+///
+/// The oldest JWS attack: the document being checked names the algorithm, so an
+/// attacker names one the verifier will accept without a key. A card is exactly
+/// the attacker-supplied document that was invented for.
+#[cfg(feature = "signing")]
+#[test]
+fn a_card_naming_its_own_algorithm_is_refused() {
+    use agentplane::peers::{AgentCard, CardSignature, CardSignatureError, CardVerifier};
+    use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
+    use base64::Engine as _;
+
+    let signer = Ed25519Signer::new("did:example:publisher", &[7u8; 32]);
+    let verifier = Ed25519Verifier::new()
+        .trust("did:example:publisher", &signer.verifying_key())
+        .expect("a valid key");
+
+    let m = Manifest::parse(GOOD).expect("parse");
+    let mut card = AgentCard::derive(&m, "https://plane.internal/a2a").expect("derive");
+
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    card.signatures.push(CardSignature {
+        protected: b64.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "alg": "none",
+                "kid": "did:example:publisher"
+            }))
+            .unwrap(),
+        ),
+        signature: b64.encode([0u8; 64]),
+        header: None,
+    });
+
+    assert!(
+        matches!(
+            card.verify(&verifier as &dyn CardVerifier),
+            Err(CardSignatureError::WrongAlgorithm(_))
+        ),
+        "a card that named its own algorithm was accepted — the `alg: none` \
+         attack, on the one document an attacker fully controls"
+    );
+}
+
+/// The signed payload contains no numbers.
+///
+/// RFC 8785's hardest requirement is ECMAScript number formatting, and a card of
+/// strings, booleans, arrays and objects never reaches it. That is why this
+/// crate can canonicalize a card correctly without a full JCS implementation —
+/// so the constraint is asserted rather than assumed, and the day somebody adds
+/// an integer field this fails instead of two implementations disagreeing about
+/// a signature.
+#[test]
+fn a_card_carries_no_numbers_to_canonicalize() {
+    use agentplane::peers::AgentCard;
+
+    fn numbers(value: &serde_json::Value, path: &str, found: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Number(_) => found.push(path.to_owned()),
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    numbers(v, &format!("{path}/{k}"), found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    numbers(v, &format!("{path}/{i}"), found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let m = Manifest::parse(GOOD).expect("parse");
+    let card = AgentCard::derive(&m, "https://plane.internal/a2a").expect("derive");
+    let mut found = Vec::new();
+    numbers(
+        &serde_json::to_value(&card).expect("serialize"),
+        "",
+        &mut found,
+    );
+    assert!(
+        found.is_empty(),
+        "the card now contains numbers at {found:?}. RFC 8785 mandates \
+         ECMAScript number formatting, which this crate's canonicalizer does not \
+         implement — so a signature over this card may not verify elsewhere. \
+         Either format the value as a string or implement JCS numbers."
+    );
 }

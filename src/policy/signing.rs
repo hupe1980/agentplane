@@ -128,3 +128,32 @@ impl Verifier for Ed25519Verifier {
             .is_ok()
     }
 }
+
+/// Signing a card is signing **bytes**, not a digest.
+///
+/// The same key as the record signer, a different message shape: RFC 7515 says
+/// the signature covers the JWS signing input itself. Signing its hash instead
+/// would verify perfectly here and nowhere else.
+#[cfg(feature = "manifest")]
+impl crate::peers::CardSigner for Ed25519Signer {
+    fn key_id(&self) -> KeyId {
+        self.key_id.clone()
+    }
+
+    fn sign_bytes(&self, message: &[u8]) -> Vec<u8> {
+        self.key.sign(message).to_bytes().to_vec()
+    }
+}
+
+#[cfg(feature = "manifest")]
+impl crate::peers::CardVerifier for Ed25519Verifier {
+    fn verify_bytes(&self, key_id: &str, message: &[u8], signature: &[u8]) -> bool {
+        let Some(key) = self.keys.get(key_id) else {
+            return false;
+        };
+        let Ok(bytes) = <[u8; 64]>::try_from(signature) else {
+            return false;
+        };
+        key.verify(message, &Signature::from_bytes(&bytes)).is_ok()
+    }
+}

@@ -186,7 +186,9 @@ against the credential. Those are different questions — what the request asked
 for, and what the caller holds — and a peer with a valid credential for one
 tenant naming another is precisely the case where they disagree.
 
-What remains: **per-tenant quotas**. Budgets are per agent and per run, and a
-tenant ceiling on spend or concurrency needs durable accounting — an in-process
-counter is a limit that vanishes the moment a second instance starts, which is
-the topology the Postgres backend exists for.
+**Quotas** are per tenant too, and durable for the same reason the keys are: an
+in-process ceiling vanishes the moment a second instance starts, and it fails
+*open*. Concurrent runs and spend per billing period are both bounded, refused at
+admission, and never consulted on replay — a ceiling crossed since a run happened
+must not turn its history into a refusal. See
+[operations](@/docs/operations.md).

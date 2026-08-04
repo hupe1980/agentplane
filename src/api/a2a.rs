@@ -415,6 +415,31 @@ impl A2aServer {
         })
     }
 
+    /// Publish a **signed** card.
+    ///
+    /// The card is served unauthenticated from a host a caller may not control.
+    /// TLS says the bytes came from that host; it says nothing about whether the
+    /// host is the party whose capabilities the card describes. A signature says
+    /// that, and it keeps saying it after the card has been copied into a
+    /// registry, a cache, or somebody's repository.
+    ///
+    /// Signed here rather than at derivation because the signature covers the
+    /// **published** card, interface URL and tenant included — those are
+    /// deployment facts, and a signature taken before they were set would cover
+    /// a document nobody serves.
+    ///
+    /// # Errors
+    ///
+    /// If the card cannot be canonicalized.
+    pub fn signing_cards_with(
+        mut self,
+        signer: &dyn crate::peers::CardSigner,
+    ) -> Result<Self, crate::peers::CardSignatureError> {
+        self.card.sign(signer)?;
+        self.extended.public.sign(signer)?;
+        Ok(self)
+    }
+
     /// The router.
     ///
     /// The card path is unauthenticated by design and everything else is not.
@@ -563,10 +588,106 @@ async fn rpc(
         return e.with_id(id).into_response();
     }
 
+    // Streaming methods are dispatched first because they answer with a
+    // different *kind* of response: an SSE body, not a JSON-RPC envelope. Folding
+    // them into `dispatch` would mean a function whose return type is "a value
+    // or an entire HTTP response", which is how one of the two paths quietly
+    // stops setting its content type.
+    if matches!(
+        req.method.as_str(),
+        method::SEND_STREAMING | method::SUBSCRIBE
+    ) {
+        return match stream_method(server, headers, req).await {
+            Ok(sse) => sse.into_response(),
+            Err(e) => e.with_id(id).into_response(),
+        };
+    }
+
     match dispatch(&server, &headers, &req).await {
         Ok(result) => Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response(),
         Err(e) => e.with_id(id).into_response(),
     }
+}
+
+/// `SendStreamingMessage` and `SubscribeToTask`.
+///
+/// Both are the same thing once the run exists: a view of the journal from a
+/// point onward. The only difference is whether this call is what created it.
+async fn stream_method(
+    server: A2aServer,
+    headers: HeaderMap,
+    req: RpcRequest,
+) -> Result<
+    axum::response::sse::Sse<
+        impl futures_util::stream::Stream<
+            Item = Result<axum::response::sse::Event, std::convert::Infallible>,
+        >,
+    >,
+    RpcError,
+> {
+    let params: CommonParams = serde_json::from_value(req.params.clone()).unwrap_or_default();
+    server.check_tenant(&params)?;
+
+    let run = if req.method == method::SUBSCRIBE {
+        let id = task_id(&params)?;
+        server
+            .gate(&headers, action::TASK_READ, &id.to_string())
+            .await?;
+        id
+    } else {
+        let Some(message) = params.message.clone() else {
+            return Err(RpcError::new(
+                code::INVALID_PARAMS,
+                "`message` is required by SendStreamingMessage",
+            ));
+        };
+        let skill = resolve_skill(&server, &message)?;
+        let caller = server.gate(&headers, action::MESSAGE_SEND, &skill).await?;
+        if message.parts.is_empty() {
+            return Err(RpcError::new(
+                code::CONTENT_TYPE_NOT_SUPPORTED,
+                "the message has no parts this agent can read",
+            ));
+        }
+
+        // Admitted before the stream opens. A stream that begins and *then*
+        // reports a refusal has already told the client the work started —
+        // and an SSE body cannot carry a JSON-RPC error the client is looking
+        // for at that point.
+        let input = Tainted::from_source(
+            message.to_input(),
+            SourceId::new(format!("peer:{}", caller.actor)),
+        );
+        match server.runtime.spawn(&skill, input).await {
+            Ok(run) => run,
+            Err(crate::core::RuntimeError::PolicyDenied(_)) => {
+                return Err(RpcError::new(
+                    code::UNSUPPORTED_OPERATION,
+                    "this agent declined the request",
+                ));
+            }
+            Err(crate::core::RuntimeError::QuotaExceeded(why)) => {
+                return Err(RpcError::new(code::UNSUPPORTED_OPERATION, why.to_string()));
+            }
+            Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
+        }
+    };
+
+    let Some((task, case, from)) = super::a2a_stream::current(&server.runtime, run).await else {
+        return Err(RpcError::new(
+            code::TASK_NOT_FOUND,
+            format!("no such task: {run}"),
+        ));
+    };
+
+    Ok(super::a2a_stream::tail(
+        Arc::clone(&server.runtime),
+        run,
+        case,
+        req.id,
+        task,
+        from,
+    ))
 }
 
 async fn dispatch(
@@ -586,13 +707,15 @@ async fn dispatch(
         // Defined by the protocol and not implemented. The spec's own codes,
         // so a caller can tell "this agent cannot" from "you spelled it wrong"
         // — and these are exactly the operations the card advertises as false.
-        method::SEND_STREAMING | method::SUBSCRIBE | method::LIST_TASKS => Err(RpcError::new(
+        // Streaming is handled before dispatch; reaching here means the router
+        // changed and this arm did not.
+        method::SEND_STREAMING | method::SUBSCRIBE => Err(RpcError::new(
+            code::INTERNAL_ERROR,
+            "a streaming method reached the non-streaming dispatcher",
+        )),
+        method::LIST_TASKS => Err(RpcError::new(
             code::UNSUPPORTED_OPERATION,
-            format!(
-                "this agent does not implement {}; its card advertises \
-                 streaming as false",
-                req.method
-            ),
+            "this agent does not implement ListTasks",
         )),
         method::CREATE_PUSH | method::GET_PUSH | method::LIST_PUSH | method::DELETE_PUSH => {
             Err(RpcError::new(
@@ -655,6 +778,9 @@ async fn send_message(
             Err(crate::core::RuntimeError::PolicyDenied(_)) => {
                 Ok(json!({ "message": declined(&skill) }))
             }
+            Err(crate::core::RuntimeError::QuotaExceeded(why)) => {
+                Err(RpcError::new(code::UNSUPPORTED_OPERATION, why.to_string()))
+            }
             Err(e) => Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
         };
     }
@@ -671,6 +797,13 @@ async fn send_message(
         // history to fetch. A2A's response is a oneof for exactly this.
         Err(crate::core::RuntimeError::PolicyDenied(_)) => {
             return Ok(json!({ "message": declined(&skill) }));
+        }
+        // Back-pressure, not a fault. `-32603` reads as "the far side is
+        // broken, retry later" and a caller may well retry the same second;
+        // this says *the agent cannot take this on right now*, which is what a
+        // ceiling means and what a caller should back off from.
+        Err(crate::core::RuntimeError::QuotaExceeded(why)) => {
+            return Err(RpcError::new(code::UNSUPPORTED_OPERATION, why.to_string()));
         }
         Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
     };
@@ -766,7 +899,7 @@ async fn get_task(
 ///
 /// The outcome is the same string [`RunStatus::as_str`](crate::runtime::RunStatus::as_str)
 /// produces, which is what the executor seals with.
-fn sealed_state(outcome: &str) -> TaskState {
+pub(super) fn sealed_state(outcome: &str) -> TaskState {
     match outcome {
         "succeeded" => TaskState::Completed,
         "cancelled" => TaskState::Canceled,
@@ -862,7 +995,7 @@ fn declined(skill: &str) -> A2aMessage {
     }
 }
 
-fn task_of(run: RunId, state: TaskState, detail: &str, case: Option<String>) -> A2aTask {
+pub(super) fn task_of(run: RunId, state: TaskState, detail: &str, case: Option<String>) -> A2aTask {
     A2aTask {
         id: run.to_string(),
         context_id: case,
