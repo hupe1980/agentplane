@@ -690,3 +690,97 @@ fn the_signing_key_is_not_printable() {
     assert!(!printed.contains("77777"), "{printed}");
     assert!(printed.contains("redacted"), "{printed}");
 }
+
+/// The audit surfaces every decision to raise a label.
+///
+/// Chains, signatures and inclusion proofs all answer *is this history intact*.
+/// None of them answers *who decided untrusted data could be treated as
+/// trusted*, which is the only discretionary act in the system — and the offline
+/// audit did not report it at all. An auditor verifying integrity while never
+/// seeing a release is checking the envelope and not the letter.
+///
+/// The accessors this reads had **no caller anywhere**, in src, tests or
+/// examples: a mutation sweep replaced each of `destination`, `fields_scope` and
+/// `evidence` with garbage and nothing failed. They are the read path for
+/// exactly this, and nothing had ever walked it.
+#[tokio::test]
+async fn the_audit_reports_who_raised_a_label_and_on_what_evidence() {
+    use agentplane::core::{
+        Outcome, Release, ReleaseScope, Skill, SkillDescriptor, SourceId, Tainted,
+    };
+    use agentplane::runtime::{Runtime, StepCtx};
+
+    #[derive(Debug)]
+    struct Releases;
+
+    #[async_trait::async_trait]
+    impl Skill for Releases {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("releases").provides("demo.release")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<serde_json::Value>,
+        ) -> Result<Outcome, agentplane::core::SkillError> {
+            // `Tainted::object`, not a flattened value: a field release needs
+            // per-field labels, and the runtime refuses to invent precision
+            // after provenance was flattened.
+            let secret = Tainted::object([(
+                "iban".to_owned(),
+                Tainted::from_source(serde_json::json!("DE00"), SourceId::new("vault")),
+            )]);
+            let plain = cx
+                .release(
+                    secret,
+                    Release::fields(
+                        ReleaseScope::trust(),
+                        ["/iban".to_owned()],
+                        "operator matched the account to settlement SET-42",
+                        "tool://ledger/transfer",
+                        ["approval:SET-42".to_owned()],
+                    ),
+                )
+                .await
+                .map_err(agentplane::core::SkillError::Step)?;
+            Ok(Outcome::done(plain))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Releases)
+        .build();
+    let out = rt.run("demo.release", serde_json::json!({})).await.unwrap();
+
+    let s = Arc::clone(&store) as Arc<dyn JournalStore>;
+    let report =
+        agentplane::audit::audit(&s, &[out.run_id], &agentplane::audit::Evidence::default())
+            .await
+            .unwrap();
+
+    assert_eq!(
+        report.releases.len(),
+        1,
+        "the audit did not surface the release at all; run status: {:?}",
+        out.status
+    );
+    let r = &report.releases[0];
+    assert_eq!(r.run, out.run_id);
+    assert_eq!(r.destination, "tool://ledger/transfer");
+    assert_eq!(r.fields, vec!["/iban".to_owned()]);
+    assert_eq!(r.evidence, vec!["approval:SET-42".to_owned()]);
+    assert!(
+        r.basis.contains("SET-42"),
+        "the basis did not survive into the report: {}",
+        r.basis
+    );
+
+    // A release is not a finding. Reporting it as one would train a reader to
+    // ignore the list, which is how the interesting entry gets missed.
+    assert!(
+        report.is_sound(),
+        "an authorized release was reported as a problem: {:?}",
+        report.findings
+    );
+}

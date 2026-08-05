@@ -723,6 +723,54 @@ async fn a_protected_tool_argument_must_derive_only_from_allowed_sources() {
     assert!(client.calls.lock().unwrap().is_empty());
 }
 
+/// Untrusted data from an **allowed** source reaches a protected field.
+///
+/// The positive half of the test above, and the one that was missing. That one
+/// asserts a refusal, so it passes just as happily when the gate refuses for the
+/// wrong reason — a mutation making *every* protected field demand trusted data
+/// survived the whole suite, because nothing anywhere passed untrusted data
+/// through a field protected by something other than trust.
+///
+/// What that mutation would have shipped is the worse kind of failure: not a
+/// hole, but a runtime where `from_sources` silently means `trusted`, every
+/// field-protected mutating tool refuses every model-chosen argument, and the
+/// feature whose entire purpose is to let ordinary untrusted content sit beside
+/// an authority-bearing selector permits nothing at all.
+#[tokio::test]
+async fn untrusted_data_from_an_allowed_source_may_select_a_protected_argument() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let catalog = ToolCatalog::new().allow(
+        transfer(),
+        ToolSafety::default()
+            .max_sensitivity(Sensitivity::Secret)
+            // Protected by **provenance**, not by trust: the value may be
+            // untrusted so long as every source it drew from is named here.
+            .protect(ProtectedField::from_sources(
+                "/recipient",
+                [SourceId::new("run.input")],
+            )),
+    );
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsStructured {
+            catalog,
+            client: Arc::clone(&client),
+            recipient_label: Label::untrusted(SourceId::new("run.input")),
+        })
+        .build()
+        .run("structured", json!({}))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "untrusted data from an allowed source was refused, so a field protected \
+         by provenance behaves as though it were protected by trust: {:?}",
+        out.status
+    );
+    assert_eq!(client.calls.lock().unwrap().as_slice(), ["ledger/transfer"]);
+}
+
 #[tokio::test]
 async fn a_protected_tool_argument_honours_its_own_sensitivity_ceiling() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
@@ -1940,8 +1988,9 @@ spec:
     let plane = |manifest: &Manifest, wire_tickets: bool| {
         let store = Arc::new(RedbStore::open_in_memory().expect("store"));
         let mut builder = Runtime::builder(store as Arc<dyn JournalStore>)
-            .agent(agentplane::runtime::Agent::new(manifest))
-            .skill(Asks)
+            // On the agent, not the builder: a builder-registered skill is
+            // governed by no manifest, which the plane now refuses.
+            .agent(agentplane::runtime::Agent::new(manifest).skill(Asks))
             .toolbox(ToolBox::new().with::<ReadBalance>());
         if wire_tickets {
             builder = builder.tool_server("tickets", Arc::new(Remote) as Arc<dyn ToolClient>);

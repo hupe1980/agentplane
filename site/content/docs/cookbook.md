@@ -310,7 +310,7 @@ For real deployments, `OpenDalBlobs` puts them on anything
 [OpenDAL](https://opendal.apache.org) reaches — filesystem, S3, GCS, Azure:
 
 ```toml
-agentplane = { version = "0.2", features = ["opendal"] }
+agentplane = { version = "0.3", features = ["opendal"] }
 ```
 
 ```rust
@@ -453,7 +453,7 @@ model cannot be — the behaviour is a `Skill`, and the manifest governs its
 **boundary**: which model, which tools, what it may spend.
 
 ```toml
-agentplane = { version = "0.2", features = ["manifest"] }
+agentplane = { version = "0.3", features = ["manifest"] }
 ```
 
 Everything in the zero-Rust manifest above applies; drop `spec.execution` and add what a coded agent needs:

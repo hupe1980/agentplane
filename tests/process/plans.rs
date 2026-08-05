@@ -896,3 +896,111 @@ fn every_collaboration_justification_rejects_some_plan() {
         );
     }
 }
+
+/// **Fan out to several specialists concurrently, inside one run.**
+///
+/// A reasonable reading of the API is that in-run fan-out is impossible:
+/// `StepCtx::commission` takes `&mut self`, is singular, and there is no
+/// `join`/`select` helper anywhere. Each of those is true, and the conclusion
+/// does not follow — because the unit of concurrency is not the *call*, it is
+/// the **plan node**. Independent nodes are one ready set and are dispatched
+/// together, each with its own journal slice.
+///
+/// So "run every matching specialist and combine what they say" is one plan, and
+/// `PlanIR::fan_out` writes it: no wrapper skill per branch, no hand-numbered
+/// `StepId`s, and the aggregator's arguments are named for the capability that
+/// produced each one, so adding a specialist cannot silently renumber what the
+/// aggregator reads.
+///
+/// Concurrency is proven by a rendezvous rather than by timing: each specialist
+/// waits for the other to arrive. Sequential dispatch would deadlock, so passing
+/// *is* the evidence and it cannot pass by accident on a fast machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fan_out_dispatches_every_branch_concurrently_within_one_run() {
+    use tokio::sync::Barrier;
+
+    #[derive(Debug)]
+    struct Specialist {
+        capability: &'static str,
+        gate: Arc<Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Specialist {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new(self.capability).provides(self.capability)
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            // Only reachable if both branches are in flight at once.
+            self.gate.wait().await;
+            Ok(Outcome::done(Tainted::trusted(
+                json!({ "from": self.capability }),
+            )))
+        }
+    }
+
+    /// Receives one argument per branch, keyed by capability.
+    #[derive(Debug)]
+    struct Decide;
+
+    #[async_trait::async_trait]
+    impl Skill for Decide {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("billing.decide").provides("billing.decide")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let seen = input.peek();
+            assert_eq!(seen["billing.anomaly"]["from"], "billing.anomaly");
+            assert_eq!(seen["billing.regulatory"]["from"], "billing.regulatory");
+            Ok(Outcome::done(input))
+        }
+    }
+
+    let gate = Arc::new(Barrier::new(2));
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Specialist {
+            capability: "billing.anomaly",
+            gate: Arc::clone(&gate),
+        })
+        .skill(Specialist {
+            capability: "billing.regulatory",
+            gate: Arc::clone(&gate),
+        })
+        .skill(Decide)
+        .build();
+
+    // The whole fan-out, written once.
+    let plan = PlanIR::fan_out(["billing.anomaly", "billing.regulatory"], "billing.decide");
+
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        rt.run_plan(plan, json!({ "doc": "de.billing.rechnung.erstellt" })),
+    )
+    .await
+    .expect("sequential dispatch would deadlock on the rendezvous")
+    .expect("the run completes");
+
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    // One run, one journal, every branch on it — and it replays without waking
+    // a single specialist.
+    let replayed = rt.replay(out.run_id, Mode::Strict).await.expect("replay");
+    assert_eq!(replayed.status, RunStatus::Succeeded);
+    store.verify(out.run_id).await.expect("chain verifies");
+}
+
+/// A fan-out with no branches is refused at construction.
+#[test]
+#[should_panic(expected = "at least one branch")]
+fn a_fan_out_with_no_branches_is_refused() {
+    let _ = PlanIR::fan_out(Vec::<Capability>::new(), "billing.decide");
+}

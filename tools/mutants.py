@@ -2576,6 +2576,37 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                if grant.requires_approval {",
         "                if false && grant.requires_approval {",
     ),
+    "TheAuditIsSilentAboutReleases": (
+        "src/audit.rs",
+        "the_audit_reports_who_raised_a_label_and_on_what_evidence",
+        "the offline audit reports no label-raising decision, so an auditor "
+        "verifies that history is intact while never seeing the only "
+        "discretionary act in it — who decided untrusted data could be treated "
+        "as trusted, toward what destination, on what evidence",
+        "        releases.extend(releases_in(run, &records));",
+        "",
+    ),
+    "AReleaseValidatorThatAcceptsAnything": (
+        "src/core/label.rs",
+        "a_release_with_no_usable_evidence_is_refused",
+        "the gate on a request to raise a label accepts every request, so an "
+        "evidence-free, destination-free, no-op release is journaled as a "
+        "decision — the one operation that turns untrusted data into trusted "
+        "data, unchecked",
+        "        if !self.scope.trust && self.scope.sensitivity.is_none() {",
+        "        return Ok(());\n        #[allow(unreachable_code)]\n        if !self.scope.trust && self.scope.sensitivity.is_none() {",
+    ),
+    "AnUngovernedSkillSatisfiesADeclaration": (
+        "src/runtime/executor.rs",
+        "a_coded_skill_reads_its_prompt_from_the_digested_manifest",
+        "an agent's declaration is checked against every skill on the plane "
+        "rather than its own, so a skill wired with `RuntimeBuilder::skill` "
+        "satisfies the check while being governed by no manifest — it runs "
+        "under the plane's default budget and no manifest gate, and the plane "
+        "builds cleanly",
+        "                mine.extend(s.descriptor().provides);",
+        "",
+    ),
     "McpDispatchesAnyServersTool": (
         "src/tools/mcp.rs",
         "a_tool_from_another_server_is_refused_rather_than_run_here",

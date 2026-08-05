@@ -2,6 +2,7 @@
 title = "Manifest reference"
 description = "Every field an agent declaration may carry, what enforces it, and what an absent value means."
 weight = 4
+aliases = ["/reference/manifest/", "/docs/reference/manifest/"]
 +++
 
 An agent declaration is a YAML file. It is **content-addressed**, so editing it
@@ -111,6 +112,18 @@ a bare name makes the model guess, and the guess is refused at the field check
 The prompt lives here so that rewording it is a **version bump** rather than a
 deploy nothing records. A prompt composed in Rust has no version at all: it
 changes, the journal records the run, and nothing connects the two.
+
+**Where a long procedure goes: `constraints`.** There is no separate
+`instructions` field, and adding one would be surface without semantics — the
+prompt is exactly `role`, a blank line, then `constraints`, so a third field
+would concatenate the same way while giving a reviewer one more place to look.
+
+`role` is one line because it answers *what is this agent*; `constraints` is
+unbounded and is where a hundred-line numbered procedure belongs. That it lives
+in the digest is the point rather than a cost: in a regulated domain, editing
+step 7 of a procedure **should** change the identity consumers pin, and should
+show up as a diff with a reviewer on it. A procedure held in code has no version
+at all.
 
 The block is optional because an embedder may compose its prompt in code — in
 which case the digest simply does not cover it, and the page says so rather than

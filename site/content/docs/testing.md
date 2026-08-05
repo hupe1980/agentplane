@@ -19,7 +19,7 @@ should never be in a production build.
 
 ```toml
 [dev-dependencies]
-agentplane = { version = "0.2", features = ["redb", "testkit", "manifest"] }
+agentplane = { version = "0.3", features = ["redb", "testkit", "manifest"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

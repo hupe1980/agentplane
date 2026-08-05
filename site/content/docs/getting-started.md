@@ -123,7 +123,7 @@ tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
 Everything beyond a single-node runtime is opt-in:
 
 ```toml
-agentplane = { version = "0.2", features = ["postgres", "http", "mcp", "providers", "bedrock", "media", "cedar", "signing"] }
+agentplane = { version = "0.3", features = ["postgres", "http", "mcp", "providers", "bedrock", "media", "cedar", "signing"] }
 ```
 
 | feature | gives you |

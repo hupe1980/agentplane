@@ -5,6 +5,8 @@
 //! which is the point of putting the determinism boundary at the effect rather
 //! than at the plan.
 
+#[cfg(feature = "manifest")]
+use std::collections::HashSet;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -2874,20 +2876,35 @@ fn recorded_step_refusal(records: &[Record]) -> Option<(StepId, String, String)>
 /// lies, and the caller who believed it finds out at dispatch — in production —
 /// rather than here at startup.
 #[cfg(feature = "manifest")]
-fn assert_advertises_what_it_provides(
-    m: &crate::manifest::Manifest,
-    by_capability: &HashMap<Capability, String>,
-) {
+/// Every capability an agent advertises is provided by one of **its own**
+/// skills.
+///
+/// This checked a plane-wide map, and the difference is not pedantry. A skill
+/// registered on the *builder* rather than on the agent — `.agent(Agent::new(&m))`
+/// followed by `.skill(s)` — satisfied a plane-wide check while being
+/// **ungoverned**: `governed_by` is keyed from the agent's own skills, so that
+/// skill gets no manifest. It runs under the plane's default budget instead of
+/// the declared one, and `StepCtx::gate` never refuses a model or tool the file
+/// did not list, because there is no file.
+///
+/// The plane built cleanly and the assertion's own message said "its skills",
+/// so the only signal was a `None` from `cx.manifest()` that a skill has no
+/// reason to check. That is a declaration reading as a control while governing
+/// nothing, which is the one shape this codebase refuses everywhere.
+fn assert_advertises_what_it_provides(m: &crate::manifest::Manifest, mine: &HashSet<Capability>) {
     let missing: Vec<&String> = m
         .spec
         .capabilities
         .provides
         .iter()
-        .filter(|c| !by_capability.contains_key(&Capability::new(c.as_str())))
+        .filter(|c| !mine.contains(&Capability::new(c.as_str())))
         .collect();
     assert!(
         missing.is_empty(),
-        "agent '{}' advertises capabilities none of its skills provide: {missing:?}",
+        "agent '{}' advertises capabilities none of its own skills provide: {missing:?}. \
+         A skill wired with `RuntimeBuilder::skill` is not governed by any agent — it runs \
+         under the plane's budget and no manifest gate. Register it on the agent instead: \
+         `.agent(Agent::new(&manifest).skill(MySkill))`",
         m.metadata.name
     );
 }
@@ -4095,6 +4112,7 @@ impl RuntimeBuilder {
     #[must_use]
     // `mut` is for `settle_toolbox`, which only exists when manifests do.
     #[cfg_attr(not(feature = "manifest"), allow(unused_mut))]
+    #[allow(clippy::too_many_lines)]
     pub fn build(mut self) -> Arc<Runtime> {
         assert_same_tenant(self.store.as_ref(), self.blobs.as_ref(), &self.tenant);
         #[cfg(feature = "manifest")]
@@ -4127,7 +4145,11 @@ impl RuntimeBuilder {
                 continue;
             };
 
+            // The capabilities this agent's *own* skills provide, which is what
+            // its declaration is checked against below.
+            let mut mine: HashSet<Capability> = HashSet::new();
             for s in agent.skills {
+                mine.extend(s.descriptor().provides);
                 let name = register_skill(s, &mut by_capability, &mut skills);
                 governed_by.insert(name, Arc::clone(&m));
             }
@@ -4172,12 +4194,13 @@ impl RuntimeBuilder {
                         self.tools.clone(),
                         execution.max_turns,
                     ));
+                    mine.insert(Capability::new(cap.as_str()));
                     let name = register_skill(skill, &mut by_capability, &mut skills);
                     governed_by.insert(name, Arc::clone(&m));
                 }
             }
 
-            assert_advertises_what_it_provides(&m, &by_capability);
+            assert_advertises_what_it_provides(&m, &mine);
         }
 
         Arc::new_cyclic(|self_ref| Runtime {

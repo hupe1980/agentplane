@@ -362,6 +362,82 @@ and having two ways to spell it is how a plane ends up with a policy layer
 everyone believes is on. The default is `DenyAll`, and whether an engine governed
 a run is recorded at admission.
 
+### May a tool declare its output trusted? {#tool-trusted-output}
+
+**No, and there is no flag for it.** A tool's result comes back
+`Tainted<Value>` and untrusted, and nothing in the catalogue changes that:
+`max_sensitivity` is operator-declarable because sensitivity is a statement about
+*what may be sent where*, and the operator owns that. Trust is a statement about
+*where a value came from*, and a tool asserting its own output is trustworthy is
+the far side of the boundary grading its own homework — the same reason
+`readOnlyHint` is recorded and disobeyed.
+
+That answer usually arrives with a real problem behind it, so here is the
+problem and its actual solution.
+
+**The case.** An operator ingests reference material — regulatory extracts,
+product documentation, standards text — that nobody's agent authored. It is
+genuinely authoritative, and if retrieval of it is permanently untrusted then a
+citation from it can never inform a privileged step, and the agent has to reason
+about statutory text through the quarantined model alone. That is a real loss,
+and routing around it with a `trusted: true` flag on a tool would be exactly the
+lever an attacker wants.
+
+**The resolution is that this is not tool output.** Trust is conferred at
+**write time, by an authority**, not at read time by whatever fetched it:
+
+```rust
+// The deployment's import path — a store-seam authority, not a skill.
+// `MemoryItem` carries its own trust, so an operator ingesting a corpus is
+// making the trust decision at the point where they actually have the standing
+// to make it.
+memories.remember(&MemoryItem {
+    id: "ahb-2024-06/clause-12".to_owned(),
+    subject: "corpus/market-rules".to_owned(),
+    purpose: "reference".to_owned(),
+    content: json!({ "text": clause, "cite": "AHB 2024-06, clause 12" }),
+    provenance: vec![SourceId::new("operator:regulatory-ingest")],
+    trust: Trust::Trusted,
+    sensitivity: Sensitivity::Public,
+    expires_at: None,          // regulation has no retention window
+    ..
+}).await?;
+```
+
+Recall then returns it **trusted**, because `MemoryItem::label()` derives the
+label from what was stored rather than from who read it. Two consequences worth
+having:
+
+* the retrieval is `cx.semantic_recall`, not a tool — so the selection is
+  journaled with ids, versions and content digests, and a replay
+  re-materialises exactly those versions;
+* trusted corpus items **outrank** untrusted ones in a bounded recall, so an
+  attacker who can write untrusted memories cannot crowd the regulation out of
+  the window.
+
+So the trust decision lands with whoever curates the corpus, which is where it
+belongs — and it lands at ingest, in a code path an operator controls, rather
+than in a tool a model chose to call.
+
+### Is a reference corpus in scope for `SemanticRetriever`? {#corpus-retrieval}
+
+Yes. `SemanticRetriever` is described as *"a derived semantic index, never
+durable memory truth"*, and the word **memory** there names the store the
+selections resolve against, not the provenance of what is in it. A corpus that no
+agent authored and that has no retention policy is a legitimate inhabitant: it is
+just memory whose writer is an operator and whose `expires_at` is `None`.
+
+What the trait is deliberately *not* is a second retrieval mechanism sitting
+beside the memory model. Its hits are `(id, version, digest)` commitments that
+`MemoryStore` must be able to materialise — that is what makes retrieval
+replayable at all — so a corpus reached this way gets the journaled selection,
+the digest re-check and the scope check for free. A bespoke retrieval tool gets
+none of them.
+
+`spec.memory_formation` is about what an agent *learns*, which is a different
+question and correctly narrower. Nothing requires an item to have been formed to
+be recalled.
+
 ### Retrieval ranks by trust, not only by recency
 
 A memory recall is bounded — a caller asks for ten — and what fills that window

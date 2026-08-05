@@ -51,6 +51,41 @@ pub struct AuditReport {
     /// verification because no key was supplied, and then said "verified", is
     /// exactly the reassuring-but-empty artifact this crate exists to avoid.
     pub not_checked: Vec<String>,
+    /// Every point at which a label was raised, in the order found.
+    ///
+    /// Not a finding — a release is a legitimate, authorized decision, and
+    /// flagging it as a problem would train a reader to ignore the list. It is
+    /// reported because it is the **only discretionary act in the system**: the
+    /// chain, the signatures and the inclusion proofs all verify that history is
+    /// intact, and none of them surfaces the moment somebody decided untrusted
+    /// data could be treated as trusted. An auditor verifying integrity while
+    /// never seeing that is checking the envelope and not the letter.
+    ///
+    /// Each entry answers the questions the decision was required to record:
+    /// who, on what basis, toward what destination, over which fields, on what
+    /// evidence.
+    pub releases: Vec<ReleaseRecord>,
+}
+
+/// One journaled decision to improve a label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseRecord {
+    pub run: RunId,
+    /// The agent or operator the decision was recorded against.
+    pub releaser: String,
+    /// Why, in the releaser's own words.
+    pub basis: String,
+    /// Where the value was being released *to*. A release is always toward
+    /// something; one with no destination is a permission with no boundary.
+    pub destination: String,
+    /// Which fields moved — `""` for the whole value.
+    pub fields: Vec<String>,
+    /// What was cited. An empty set is impossible: `Release::validate` refuses
+    /// it, and this being non-empty is that rule observed from the outside.
+    pub evidence: Vec<String>,
+    /// The digest of the value that was released, so a reader can tie the
+    /// decision to the bytes rather than to a description of them.
+    pub value: Digest,
 }
 
 impl AuditReport {
@@ -159,6 +194,30 @@ impl std::fmt::Debug for Evidence<'_> {
 /// [`StoreError`] only when the store cannot be read at all. A *finding* is a
 /// result, not an error: an audit that stopped at the first problem would report
 /// one defect in a store with forty.
+/// Every label-raising decision in one run's history.
+fn releases_in(run: RunId, records: &[Record]) -> Vec<ReleaseRecord> {
+    records
+        .iter()
+        .filter_map(|record| match record.kind() {
+            crate::journal::RecordKind::Released {
+                releaser,
+                release,
+                value,
+                ..
+            } => Some(ReleaseRecord {
+                run,
+                releaser: releaser.clone(),
+                basis: release.basis().to_owned(),
+                destination: release.destination().to_owned(),
+                fields: release.fields_scope().iter().cloned().collect(),
+                evidence: release.evidence().iter().cloned().collect(),
+                value: *value,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 pub async fn audit(
     store: &Arc<dyn JournalStore>,
     runs: &[RunId],
@@ -168,6 +227,7 @@ pub async fn audit(
     let mut findings = Vec::new();
     let mut not_checked = Vec::new();
     let mut sound = Vec::new();
+    let mut releases = Vec::new();
 
     if evidence.verifier.is_none() {
         not_checked.push(
@@ -201,6 +261,10 @@ pub async fn audit(
             });
             continue;
         }
+
+        // Collected after the chain verified, so a reader is never shown a
+        // decision drawn from records whose integrity did not hold.
+        releases.extend(releases_in(run, &records));
 
         match store.inclusion_proof(run).await? {
             Some(inc) => {
@@ -260,5 +324,6 @@ pub async fn audit(
         sound,
         findings,
         not_checked,
+        releases,
     })
 }

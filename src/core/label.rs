@@ -832,3 +832,151 @@ mod tests {
         );
     }
 }
+
+/// Every rule `Release::validate` enforces, each with the case it rejects.
+///
+/// It had none. A mutation sweep replaced the whole function with `Ok(())` and
+/// the suite stayed green — so all five rules were, as far as any check knew,
+/// decoration. That matters more here than in most validators: this is the gate
+/// on a request to **raise a label**, the one operation that turns untrusted
+/// data into trusted data, and the constructors are not the only way in. A
+/// `Release` deserialized from a config or a request body reaches `validate`
+/// and nothing else.
+#[cfg(test)]
+mod release_validation_tests {
+    use super::{Release, ReleaseScope, Sensitivity};
+
+    /// A release that the rules accept, which each case below then breaks in
+    /// exactly one way. Without this baseline a rejection proves nothing — it
+    /// could be failing for a reason the case did not intend.
+    fn sound() -> Release {
+        Release::fields(
+            ReleaseScope::trust(),
+            ["/recipient".to_owned()],
+            "operator matched the account to settlement SET-42",
+            "tool://ledger/transfer",
+            ["approval:SET-42".to_owned()],
+        )
+    }
+
+    #[test]
+    fn the_baseline_is_accepted() {
+        sound()
+            .validate()
+            .expect("the baseline must pass, or every case below rejects for the wrong reason");
+    }
+
+    /// A release that improves nothing is a decision record for a non-decision.
+    #[test]
+    fn a_scope_that_improves_nothing_is_refused() {
+        let mut r = sound();
+        r.scope = ReleaseScope {
+            trust: false,
+            sensitivity: None,
+        };
+        assert!(r.validate().is_err(), "a no-op release was accepted");
+    }
+
+    /// Basis and destination are what make the record answerable later.
+    #[test]
+    fn an_unexplained_or_undirected_release_is_refused() {
+        for (field, broken) in [
+            ("basis", {
+                let mut r = sound();
+                r.basis = "   ".to_owned();
+                r
+            }),
+            ("destination", {
+                let mut r = sound();
+                r.destination = String::new();
+                r
+            }),
+        ] {
+            assert!(
+                broken.validate().is_err(),
+                "a release with an empty {field} was accepted, so the journal \
+                 would record a decision that answers nothing"
+            );
+        }
+    }
+
+    /// Whole-value and field selection are alternatives, not a mixture.
+    ///
+    /// `""` means the whole value. Listing it *beside* paths asks for both at
+    /// once, and the wider one silently wins — which is a broad release wearing
+    /// a narrow one's declaration.
+    #[test]
+    fn a_field_scope_that_is_neither_whole_nor_valid_pointers_is_refused() {
+        let empty = {
+            let mut r = sound();
+            r.fields.clear();
+            r
+        };
+        assert!(
+            empty.validate().is_err(),
+            "a release selecting nothing was accepted"
+        );
+
+        let both = {
+            let mut r = sound();
+            r.fields.insert(String::new());
+            r
+        };
+        assert!(
+            both.validate().is_err(),
+            "whole-value and field selection were accepted together, so the \
+             broader one applies while the declaration reads narrow"
+        );
+
+        let malformed = {
+            let mut r = sound();
+            r.fields.clear();
+            r.fields.insert("recipient".to_owned()); // no leading slash
+            r
+        };
+        assert!(
+            malformed.validate().is_err(),
+            "a path that is not a JSON Pointer was accepted, so it would match \
+             no field and release nothing while reading as a release"
+        );
+    }
+
+    /// Evidence is the difference between a decision and an assertion.
+    #[test]
+    fn a_release_with_no_usable_evidence_is_refused() {
+        let none = {
+            let mut r = sound();
+            r.evidence.clear();
+            r
+        };
+        assert!(
+            none.validate().is_err(),
+            "an evidence-free release was accepted"
+        );
+
+        let blank = {
+            let mut r = sound();
+            r.evidence.clear();
+            r.evidence.insert("  ".to_owned());
+            r
+        };
+        assert!(
+            blank.validate().is_err(),
+            "blank evidence was accepted, which passes the count and says nothing"
+        );
+    }
+
+    /// A sensitivity-only release is legitimate, so the first rule must not
+    /// over-reject. The negative cases above would all still pass if `validate`
+    /// simply refused everything.
+    #[test]
+    fn improving_sensitivity_alone_is_accepted() {
+        let mut r = sound();
+        r.scope = ReleaseScope {
+            trust: false,
+            sensitivity: Some(Sensitivity::Internal),
+        };
+        r.validate()
+            .expect("a sensitivity-only release is a legitimate decision");
+    }
+}

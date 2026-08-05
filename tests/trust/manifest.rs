@@ -285,7 +285,7 @@ async fn each_agents_budget_bounds_only_its_own_runs() {
 /// card that lies, and the caller who believed it finds out at dispatch, in
 /// production, rather than at startup where the mistake was made.
 #[test]
-#[should_panic(expected = "advertises capabilities none of its skills provide")]
+#[should_panic(expected = "advertises capabilities none of its own skills provide")]
 fn a_manifest_may_not_advertise_a_skill_it_lacks() {
     use agentplane::journal::JournalStore;
     use agentplane::runtime::{Agent, Runtime};
@@ -3418,5 +3418,104 @@ spec:
     assert!(
         catalog.safety(&ToolId::new("ledger", "delete")).is_none(),
         "the derivation invented a grant"
+    );
+}
+
+/// A hand-written skill can run the manifest's procedure, and it is covered.
+///
+/// The trade this refutes: *"either put the procedure in `constraints` and get
+/// digest coverage, or keep the behaviour as a Rust `Skill` and lose it."* Those
+/// are not alternatives. `cx.manifest()` hands a coded skill its own
+/// declaration, so the procedure lives in the digested file **and** the
+/// behaviour stays in Rust with its structure and its tests.
+///
+/// What a coded agent gives up is coverage of its *conduct* — the code is not in
+/// the digest — not coverage of its prompt. The distinction matters for anyone
+/// choosing between the two tiers, because the usual reason to want a `Skill` is
+/// structure around the model call, not a desire to compose prompts in Rust.
+#[tokio::test]
+async fn a_coded_skill_reads_its_prompt_from_the_digested_manifest() {
+    use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted};
+    use agentplane::runtime::{Agent, Runtime, StepCtx};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct Coded;
+
+    #[async_trait::async_trait]
+    impl Skill for Coded {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("coded").provides("billing.check")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<serde_json::Value>,
+        ) -> Result<Outcome, SkillError> {
+            // The procedure comes from the reviewed file, not from this binary.
+            let prompt = cx
+                .manifest()
+                .and_then(|m| m.spec.identity.as_ref())
+                .map(agentplane::manifest::Identity::system_prompt)
+                .ok_or_else(|| SkillError::Other("no declared identity".into()))?;
+            Ok(Outcome::done(Tainted::trusted(json!({ "prompt": prompt }))))
+        }
+    }
+
+    // No `spec.execution`: the behaviour is the Rust skill above.
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: biller, version: "1.0.0" }
+spec:
+  identity:
+    role: "Check a billing document against the market rules"
+    constraints: |
+      1. Read the document header and identify the message type.
+      2. Reject anything whose sender is not the contracted party.
+      3. For each position, compare the meter reading to the twelve-month mean.
+  capabilities: { provides: [billing.check] }
+  budgets: {}
+"#,
+    )
+    .expect("manifest");
+    let digest_before = manifest.digest().expect("digest");
+
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>)
+        // On the **agent**, not the builder: a skill wired with
+        // `RuntimeBuilder::skill` is governed by no manifest at all.
+        .agent(Agent::new(&manifest).skill(Coded))
+        .build()
+        .run("billing.check", json!({}))
+        .await
+        .expect("run");
+
+    let answer = out
+        .output
+        .clone()
+        .unwrap_or_else(|| panic!("no answer; status {:?}", out.status));
+    let prompt = answer["prompt"].as_str().expect("a prompt");
+    assert!(
+        prompt.contains("twelve-month mean"),
+        "the coded skill did not receive the manifest's procedure: {prompt}"
+    );
+    assert!(
+        prompt.starts_with("Check a billing document"),
+        "role must lead the prompt, then the procedure: {prompt}"
+    );
+
+    // Editing the procedure changes the identity consumers pin — which is the
+    // whole reason for putting it in the file rather than in this test.
+    let mut edited = manifest.clone();
+    edited.spec.identity.as_mut().expect("identity").constraints =
+        "1. Read the document header and identify the message type.".to_owned();
+    assert_ne!(
+        digest_before,
+        edited.digest().expect("digest"),
+        "a procedure edit did not change the manifest digest, so a coded agent's \
+         prompt would be uncovered after all"
     );
 }

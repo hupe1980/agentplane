@@ -265,6 +265,76 @@ impl PlanIR {
         ])
     }
 
+    /// Run several capabilities on the same input, concurrently, then feed
+    /// every result to one aggregator.
+    ///
+    /// The shape people mean by "fan out to all the matching specialists and
+    /// combine what they say", written once instead of by hand. The branches
+    /// have no edge between them, so they are one ready set and are dispatched
+    /// **concurrently**; the aggregator depends on all of them, so it runs when
+    /// the last finishes.
+    ///
+    /// ```
+    /// # use agentplane::core::PlanIR;
+    /// let plan = PlanIR::fan_out(
+    ///     ["billing.anomaly", "billing.regulatory"],
+    ///     "billing.decide",
+    /// );
+    /// assert_eq!(plan.nodes.len(), 3);
+    /// ```
+    ///
+    /// The aggregator receives one argument per branch, named for the
+    /// capability that produced it — so adding a specialist does not silently
+    /// renumber what the aggregator reads, which hand-wiring by `StepId` does.
+    ///
+    /// # Why this is a plan rather than an effect
+    ///
+    /// A `race`-style primitive — dispatch N, take the first, abandon the rest —
+    /// is deliberately **not** offered. Abandoning an in-flight branch
+    /// manufactures exactly the unknown outcome the effect protocol exists to
+    /// prevent: the loser was announced, it may have reached a model or a tool,
+    /// and cancelling it mid-flight leaves a started effect with no terminal
+    /// record. Every branch here therefore runs to completion and every outcome
+    /// is on the record, which costs more and is the only version that can be
+    /// replayed or recovered from a crash.
+    ///
+    /// # Panics
+    ///
+    /// If `branches` is empty. A fan-out with nothing to fan out to is a
+    /// one-node plan written the long way, and accepting it would produce an
+    /// aggregator with no subject — the shape [`validate`](crate::plan::validate)
+    /// refuses for verifiers, for the same reason.
+    #[must_use]
+    pub fn fan_out(
+        branches: impl IntoIterator<Item = impl Into<Capability>>,
+        aggregate: impl Into<Capability>,
+    ) -> Self {
+        let branches: Vec<Capability> = branches.into_iter().map(Into::into).collect();
+        assert!(
+            !branches.is_empty(),
+            "a fan-out needs at least one branch; with none the aggregator has \
+             nothing to aggregate"
+        );
+
+        let mut nodes: Vec<PlanNode> = branches
+            .iter()
+            .enumerate()
+            .map(|(i, capability)| {
+                PlanNode::new(u32::try_from(i).unwrap_or(u32::MAX), capability.clone())
+                    .arg("input", ArgSource::run_input())
+            })
+            .collect();
+
+        let join_id = u32::try_from(branches.len()).unwrap_or(u32::MAX);
+        let mut join = PlanNode::new(join_id, aggregate).terminal();
+        for (i, capability) in branches.iter().enumerate() {
+            let step = StepId(u32::try_from(i).unwrap_or(u32::MAX));
+            join = join.arg(&capability.0, ArgSource::node(step));
+        }
+        nodes.push(join);
+        Self::new(nodes)
+    }
+
     #[must_use]
     pub fn topology(mut self, t: Topology) -> Self {
         self.topology = t;
