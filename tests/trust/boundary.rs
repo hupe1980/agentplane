@@ -2,7 +2,7 @@
 //!
 //! An effect is how the deterministic zone reaches the outside world, so its
 //! result *is* the outside world's data — a tool response, a peer's answer, a
-//! model completion. Those are the three inputs §12's whole architecture is
+//! model completion. Those are the three inputs the whole architecture is
 //! about, and the architecture only holds if they are labelled **at the source**
 //! rather than remembered about later.
 //!
@@ -51,7 +51,7 @@ struct ToolCall;
 impl Effect for ToolCall {
     type Output = Value;
     fn descriptor(&self) -> EffectDescriptor {
-        EffectDescriptor::new("mcp.tools/call", json!({ "tool": "lookup" }))
+        EffectDescriptor::new("tool.call", json!({ "tool": "lookup" }))
     }
     /// A read. `mutates` defaults to *true*, which is the safe default for
     /// recovery — but a lookup that claimed to mutate would drag every refusal
@@ -643,7 +643,7 @@ async fn a_run_holding_tool_output_may_not_replan() {
         )
     };
     assert!(
-        why.contains("untrusted") && why.contains("mcp.tools/call"),
+        why.contains("untrusted") && why.contains("tool.call"),
         "and the refusal must name the source, or nobody can find it: {why}"
     );
 }
@@ -700,7 +700,7 @@ async fn a_replayed_effect_carries_the_same_label() {
 
 /// Does taint survive a hand-off to another agent?
 ///
-/// §6.3's requirement is that risk context survives delegation and is checked
+/// The requirement is that risk context survives delegation and is checked
 /// again before an irreversible sink. A specialist's answer is untrusted — it
 /// came from a model — and an orchestrator passing it to the next specialist
 /// must not launder it on the way.
@@ -754,7 +754,7 @@ async fn taint_survives_a_handoff_between_agents() {
     assert_eq!(
         seen, "Untrusted",
         "a specialist's untrusted answer arrived at the next agent as {seen}: taint \
-         does not survive the hand-off, so §6.3's 'risk context must survive \
+         does not survive the hand-off, so 'risk context must survive \
          delegation' has no mechanism behind it"
     );
 }

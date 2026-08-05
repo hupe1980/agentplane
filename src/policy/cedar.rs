@@ -217,7 +217,7 @@ impl CedarEngine {
 
 /// `Type::"id"`, with the id quoted so a name containing `.` or `/` survives.
 ///
-/// Effect kinds look like `mcp.tools/call`, which is not a bare Cedar
+/// Effect kinds look like `tool.call`, which is not a bare Cedar
 /// identifier. Quoting is not cosmetic: without it the parse fails and every
 /// request involving that effect would be denied for a reason that reads like a
 /// policy decision.

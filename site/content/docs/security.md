@@ -1,7 +1,7 @@
 +++
 title = "Security model"
 description = "The trust boundary, information-flow labels, delegation and egress — with an explicit account of what is not covered."
-weight = 5
+weight = 6
 +++
 
 What this runtime defends, how, and — the part most security documents omit —
@@ -69,7 +69,7 @@ let released = cx.release(
         ReleaseScope::trust(),
         ["/recipient".to_owned()],
         "operator matched the account to settlement SET-42",
-        "mcp://ledger/transfer",
+        "tool://ledger/transfer",
         ["approval:SET-42".to_owned()],
     ),
 ).await?;
@@ -361,6 +361,136 @@ There is no `AllowAll`. A permissive engine and no engine are the same behaviour
 and having two ways to spell it is how a plane ends up with a policy layer
 everyone believes is on. The default is `DenyAll`, and whether an engine governed
 a run is recorded at admission.
+
+### The authorization context {#the-authorization-context}
+
+Cedar's entity model is the part that has to be learned, and prose about it does
+not help. Here is what a request actually looks like.
+
+| | |
+|---|---|
+| principal | `Agent::"<the acting agent>"` |
+| action | `Action::"effect:perform"`, `Action::"run:admit"`, `Action::"data:release"` |
+| resource | `Resource::"<effect kind>"` — `tool.call`, `model.complete`, `clock.now`, `memory.recall`… |
+| context | the record below |
+
+At **`effect:perform`**:
+
+```text
+context.run                 string    the run id
+context.step                long
+context.tenant              string
+context.mutates             bool      whether this effect changes the world
+context.args                record    the effect's own descriptor arguments
+context.label               record    present only for `sink` — see below
+context.owner               string    with a delegation chain
+context.subject             string
+context.delegation_depth    long
+context.scope               list      the chain's effective scope patterns
+```
+
+`context.label` is the one that makes this different from ordinary
+identity-based authorization, because it says **where the value came from**:
+
+```text
+context.label.provenance    list of strings   e.g. ["tool:ledger", "sender:acme"]
+context.label.trust         "trusted" | "untrusted"
+context.label.sensitivity   "public" | "internal" | "confidential" | "secret"
+```
+
+It is present only on `sink`, the only call that has a labelled value to bind.
+**Absent is not "trusted"**: a rule requiring a source simply does not match, so
+it fails closed.
+
+For `tool.call`, `context.args` carries `{ server, tool, arguments }` — which is
+what lets a rule speak about one server without speaking about every tool on it.
+
+At **`run:admit`**, the governing declaration arrives under `context.agent`:
+
+```text
+context.agent.name       the declared name — for reading, never for granting
+context.agent.version
+context.agent.digest     hex over the manifest's canonical bytes
+context.agent.publisher  the KeyId that vouched for it, or absent
+```
+
+### Worked policies
+
+Bind to `publisher` for a set of agents and to `digest` for one exact revision —
+never to `name`, for the reason in the section below.
+
+```cedar
+// A read-only auditor. Nothing else, and nobody else.
+permit(
+    principal == Agent::"agent:auditor",
+    action == Action::"effect:perform",
+    resource == Resource::"tool.call"
+) when { !context.mutates };
+```
+
+```cedar
+// The taint gate, as a rule. The runtime enforces this structurally too; the
+// two are not redundant, because a policy can express conditions the lattice
+// has no vocabulary for.
+permit(principal, action == Action::"effect:perform", resource);
+
+forbid(principal, action == Action::"effect:perform", resource)
+when { context.mutates && context.label.trust == "untrusted" };
+```
+
+```cedar
+// Mutating tools on one server only. `context.args.server` is what makes this
+// expressible without enumerating every tool.
+permit(principal, action == Action::"effect:perform", resource);
+
+forbid(principal, action == Action::"effect:perform",
+       resource == Resource::"tool.call")
+when { context.mutates && context.args.server != "ledger" };
+```
+
+```cedar
+// Nothing confidential may leave with data a named peer touched.
+permit(principal, action == Action::"effect:perform", resource);
+
+forbid(principal, action == Action::"effect:perform", resource)
+when {
+    context.label.sensitivity == "confidential" &&
+    context.label.provenance.contains("peer:broker")
+};
+```
+
+```cedar
+// A depth cap, expressible only because the runtime puts depth in the context.
+permit(principal, action == Action::"effect:perform", resource);
+
+forbid(principal, action, resource) when { context.delegation_depth >= 3 };
+```
+
+**Why each of those carries a `permit`.** Cedar denies unless some `permit`
+matches, so a policy set containing only `forbid` rules denies *everything* — a
+snippet copied on its own would look like a targeted restriction and behave like
+an outage. The permissive baseline above makes each example runnable in
+isolation; a real deployment narrows it, and the narrowing is the interesting
+part of the file.
+
+That is the same hazard from the other direction, and it is worth naming because
+it is easy to hit: a catch-all `permit(principal, action, resource)` left in a
+policy set makes every later `permit` redundant, and no least-privilege rule can
+narrow it — because Cedar allows on **any** matching permit. A baseline is
+something to remove deliberately, not something to inherit.
+
+**The failure mode to know about.** Cedar is *total*: a `when` clause reading an
+attribute that is not in the context does not raise — the policy is simply
+unsatisfied. So a `forbid` keyed on a misspelled attribute **disappears**, and
+whatever `permit` accompanies it decides. A taint gate in this repository read
+`context.args_trust`, which the runtime has never sent, and it failed open while
+every test around it passed. Check a policy against the shape above, or against a
+real run; never against a context assembled to suit the rule.
+
+The adapter reports an evaluation *error* distinctly from an ordinary denial, in
+the reason string and as its own `tracing` event, because both reach an operator
+as "denied" while one means *the rules say no* and the other means *the rules are
+broken and the plane has been enforcing nothing anyone intended*.
 
 ### Identity covers executable policy, not just rules
 

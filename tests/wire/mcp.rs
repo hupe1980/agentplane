@@ -344,7 +344,7 @@ fn block(effect_args: &serde_json::Value) -> agentplane::core::Provenance {
         agentplane::core::Phase::Forward,
         0,
         1,
-        &agentplane::core::EffectDescriptor::new("mcp.tools/call", effect_args.clone()),
+        &agentplane::core::EffectDescriptor::new("tool.call", effect_args.clone()),
     );
     agentplane::core::Provenance::new(agentplane::RunId::generate(), key, "auditor@2.0.0")
 }
@@ -355,7 +355,7 @@ async fn a_tool_call_carries_signed_provenance() {
     let (client, seen) = watching().await;
     let args = json!({ "target_id": "ID-88219-A" });
     let signer = agentplane::testkit::StubSigner::default();
-    let p = block(&args).seal(&signer, "mcp.tools/call", &args);
+    let p = block(&args).seal(&signer, "tool.call", &args);
 
     client
         .call(&ToolId::new("ledger", "transfer"), &args, Some(&p))
@@ -380,7 +380,7 @@ async fn a_tool_call_carries_signed_provenance() {
     // And the server can check it rather than believe it.
     let back = agentplane::core::Provenance::from_meta(&meta).expect("parses server-side");
     assert!(
-        back.verify(&signer, "mcp.tools/call", &args),
+        back.verify(&signer, "tool.call", &args),
         "the block did not verify against the plane's key"
     );
     assert_eq!(back.run, p.run);
@@ -394,7 +394,7 @@ async fn a_block_from_another_call_does_not_verify_here() {
     let mine = json!({ "amount": 1 });
 
     // Sealed for a *different* set of arguments, then sent with these.
-    let p = block(&mine).seal(&signer, "mcp.tools/call", &json!({ "amount": 999 }));
+    let p = block(&mine).seal(&signer, "tool.call", &json!({ "amount": 999 }));
     client
         .call(&ToolId::new("ledger", "transfer"), &mine, Some(&p))
         .await
@@ -403,7 +403,7 @@ async fn a_block_from_another_call_does_not_verify_here() {
     let meta = seen.0.lock().unwrap().clone().expect("_meta");
     let back = agentplane::core::Provenance::from_meta(&meta).expect("parses");
     assert!(
-        !back.verify(&signer, "mcp.tools/call", &mine),
+        !back.verify(&signer, "tool.call", &mine),
         "a block sealed for other arguments verified here — provenance that \
          travels between calls proves nothing about the one carrying it"
     );
@@ -446,4 +446,102 @@ async fn no_provenance_means_no_meta() {
         .filter(|k| k.starts_with("io.github.hupe1980.agentplane/"))
         .count();
     assert_eq!(ours, 0, "the client fabricated provenance nobody gave it");
+}
+
+/// A tool belonging to another server is not this client's to run.
+///
+/// The realistic shape is two servers that both offer a tool of the same name —
+/// a `ledger` and a `tickets`, each with `read`. This client holds exactly one
+/// connection, and until it checked the server component it executed whatever
+/// name it was handed against whatever it happened to be connected to. The call
+/// then *succeeded*, under the operator safety declared for a different tool, so
+/// nothing downstream could tell that the wrong server had answered.
+///
+/// `Unreachable` rather than a softer error: nothing was attempted, and nothing
+/// could have been.
+#[tokio::test]
+async fn a_tool_from_another_server_is_refused_rather_than_run_here() {
+    let client = connect().await; // connected to the server named `ledger`
+
+    // The positive half: this client's own tool still works, so a refusal below
+    // is about the server component and not about the client being broken.
+    client
+        .call(&ToolId::new("ledger", "transfer"), &json!({}), None)
+        .await
+        .expect("the client's own server still answers");
+
+    let foreign = ToolId::new("tickets", "transfer");
+    match client.call(&foreign, &json!({}), None).await {
+        Err(agentplane::tools::ToolError::Unreachable { tool, detail }) => {
+            assert_eq!(tool, foreign);
+            assert!(
+                detail.contains("tickets") && detail.contains("ledger"),
+                "the refusal must name both servers so an operator can see the \
+                 mis-wiring: {detail}"
+            );
+        }
+        other => panic!("a tool from another server was dispatched to this connection: {other:?}"),
+    }
+}
+
+/// One plane, two transports: typed tools and an MCP server at once.
+///
+/// This was unrepresentable. A plane held a single [`ToolClient`] and handed it
+/// every id, so a deployment could have in-process tools or a server, never
+/// both — and the id's server component, which exists precisely to tell them
+/// apart, was never read.
+#[tokio::test]
+async fn a_router_sends_each_server_to_its_own_transport() {
+    use agentplane::tools::{Tool, ToolBox, ToolRouter};
+
+    /// Look something up, in process.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct Lookup {
+        /// What to look up.
+        key: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Lookup {
+        const SERVER: &'static str = "local";
+        const NAME: &'static str = "transfer";
+        fn mutates() -> bool {
+            false
+        }
+        async fn call(self) -> Result<serde_json::Value, agentplane::tools::ToolFailure> {
+            Ok(json!({ "looked_up": self.key }))
+        }
+    }
+
+    let router = ToolRouter::new()
+        .toolbox(&Arc::new(ToolBox::new().with::<Lookup>()))
+        .server("ledger", Arc::new(connect().await) as Arc<dyn ToolClient>);
+
+    // Same tool *name* on both servers. Only the server component distinguishes
+    // them, which is the case a single client cannot represent at all.
+    let remote = router
+        .call(&ToolId::new("ledger", "transfer"), &json!({}), None)
+        .await
+        .expect("the MCP server answers its own tool");
+    assert_eq!(remote[0]["text"], "moved");
+
+    let local = router
+        .call(
+            &ToolId::new("local", "transfer"),
+            &json!({ "key": "k" }),
+            None,
+        )
+        .await
+        .expect("the typed tool answers its own");
+    assert_eq!(local["looked_up"], "k");
+
+    // A server nobody wired is unreachable, not silently sent somewhere.
+    let unrouted = ToolId::new("nowhere", "transfer");
+    assert!(
+        matches!(
+            router.call(&unrouted, &json!({}), None).await,
+            Err(agentplane::tools::ToolError::Unreachable { .. })
+        ),
+        "an unrouted server must not fall through to some other transport"
+    );
 }

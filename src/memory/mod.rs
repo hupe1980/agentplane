@@ -290,8 +290,16 @@ pub struct SemanticQuery {
     pub purpose: Option<String>,
     /// Human-readable query used to produce `embedding`.
     pub text: String,
-    /// Exact query vector. Embedding generation is a separate effect; carrying
-    /// the vector here prevents a replay from silently using a changed model.
+    /// Exact query vector, obtained through
+    /// [`StepCtx::embed`](crate::runtime::StepCtx::embed).
+    ///
+    /// It is in the retrieval effect's key, so a replay must reproduce it
+    /// exactly — which is why producing it is itself a journaled effect rather
+    /// than a call a skill makes on its own. An embedding API is a network
+    /// observation: two calls with the same text are not obliged to return the
+    /// same floats, and a model revision guarantees they will not. Computing one
+    /// inside the deterministic zone therefore quarantines a healthy run at the
+    /// next replay, for a reason nothing on the record explains.
     pub embedding: Vec<f32>,
     /// Stable embedding model and revision.
     pub embedding_model: String,
@@ -316,6 +324,45 @@ pub trait SemanticRetriever: Send + Sync + Debug {
     fn profile(&self) -> Value;
 
     async fn search(&self, query: &SemanticQuery) -> Result<Vec<SemanticHit>, StoreError>;
+}
+
+/// Turns text into a vector.
+///
+/// # Why this is a seam and not a helper
+///
+/// [`SemanticQuery::embedding`] enters the retrieval effect's key, so a strict
+/// replay has to arrive at the same floats. An embedding service is a network
+/// call: batching, hardware and a silent model revision all move the last bits,
+/// and nothing about *the same text* obliges the same answer. A skill that
+/// computed its own vector would therefore be making a nondeterministic
+/// observation inside the deterministic zone, which is the one thing the effect
+/// protocol exists to forbid — and the symptom would be a quarantine on replay
+/// with nothing on the record to explain it.
+///
+/// So embedding crosses the effect protocol like every other observation:
+/// [`StepCtx::embed`](crate::runtime::StepCtx::embed) journals the vector, and a
+/// replay reads it back rather than asking again. That also makes the cost
+/// visible — an embedding call is metered like any other effect — and puts the
+/// model revision on the record beside the vector it produced.
+///
+/// The crate ships no driver, for the reason it ships no policy evaluator:
+/// picking one for the embedder is not its call.
+#[async_trait]
+pub trait Embedder: Send + Sync + Debug {
+    /// Stable, non-secret identity of the model and revision producing vectors.
+    ///
+    /// It goes in the effect key beside the text, so a revision change is
+    /// replay divergence rather than a silently different vector. Secrets never
+    /// belong here.
+    fn revision(&self) -> String;
+
+    /// Embed one text.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] when the service cannot be reached or answers
+    /// with something that is not a vector.
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, StoreError>;
 }
 
 /// One immutable vector record for [`InMemorySemanticRetriever`].

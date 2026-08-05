@@ -60,7 +60,7 @@ impl EffectKey {
 /// call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct EffectDescriptor {
-    /// Stable, low-cardinality family — `"clock.now"`, `"mcp.tools/call"`,
+    /// Stable, low-cardinality family — `"clock.now"`, `"tool.call"`,
     /// `"model.complete"`. Appears in journal listings and traces.
     pub kind: String,
     /// Canonical arguments. Hashed into the key and recorded verbatim.
@@ -553,8 +553,8 @@ mod tests {
 
     #[test]
     fn descriptors_with_reordered_args_are_equal_after_canonicalization() {
-        let a = EffectDescriptor::new("mcp.tools/call", json!({"b": 2, "a": 1}));
-        let b = EffectDescriptor::new("mcp.tools/call", json!({"a": 1, "b": 2}));
+        let a = EffectDescriptor::new("tool.call", json!({"b": 2, "a": 1}));
+        let b = EffectDescriptor::new("tool.call", json!({"a": 1, "b": 2}));
         assert_eq!(
             crate::core::canon::value_bytes(&a.args),
             crate::core::canon::value_bytes(&b.args),

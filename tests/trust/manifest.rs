@@ -26,7 +26,7 @@ spec:
     max_minor_units: 250
     max_steps: 25
   tools:
-    - ref: "mcp://validator/apply_correction"
+    - ref: "tool://validator/apply_correction"
       mutates: true
       max_sensitivity: internal
 "#;
@@ -46,7 +46,7 @@ spec:
   tools:
     - max_sensitivity: internal
       mutates: true
-      ref: mcp://validator/apply_correction
+      ref: tool://validator/apply_correction
   capabilities: { requires: ["data.fetch"], provides: ["audit.anomaly-detection"] }
   security:
     max_delegation_depth: 2
@@ -132,8 +132,8 @@ fn an_absent_budget_is_refused_but_an_empty_one_is_not() {
 #[test]
 fn a_tool_grant_defaults_to_mutating() {
     let terse = GOOD.replace(
-        "    - ref: \"mcp://validator/apply_correction\"\n      mutates: true\n      max_sensitivity: internal",
-        "    - ref: \"mcp://validator/apply_correction\"",
+        "    - ref: \"tool://validator/apply_correction\"\n      mutates: true\n      max_sensitivity: internal",
+        "    - ref: \"tool://validator/apply_correction\"",
     );
     let m = Manifest::parse(&terse).expect("a terse grant is still a grant");
     assert!(
@@ -142,16 +142,16 @@ fn a_tool_grant_defaults_to_mutating() {
     );
 }
 
-/// A grant must name something the transport and catalogue can resolve.
+/// A grant must name something the catalogue and router can resolve.
 #[test]
 fn a_malformed_tool_reference_is_refused_at_parse_time() {
     let malformed = GOOD.replace(
-        "mcp://validator/apply_correction",
+        "tool://validator/apply_correction",
         "validator/apply_correction",
     );
     match Manifest::parse(&malformed) {
         Err(ManifestError::Syntax(detail)) => assert!(
-            detail.contains("mcp://server/tool"),
+            detail.contains("tool://server/name"),
             "the refusal did not explain the required reference shape: {detail}"
         ),
         Err(other) => panic!("wrong refusal: {other}"),
@@ -163,8 +163,8 @@ fn a_malformed_tool_reference_is_refused_at_parse_time() {
 #[test]
 fn duplicate_tool_grants_are_refused() {
     let duplicate = GOOD.replace(
-        "    - ref: \"mcp://validator/apply_correction\"",
-        "    - ref: \"mcp://validator/apply_correction\"\n      mutates: false\n    - ref: \"mcp://validator/apply_correction\"",
+        "    - ref: \"tool://validator/apply_correction\"",
+        "    - ref: \"tool://validator/apply_correction\"\n      mutates: false\n    - ref: \"tool://validator/apply_correction\"",
     );
     assert!(
         matches!(Manifest::parse(&duplicate), Err(ManifestError::Syntax(detail)) if detail.contains("more than once")),
@@ -693,7 +693,7 @@ async fn a_published_version_cannot_be_rewritten() {
     // Same name, same version, one more tool. This is the supply-chain shape:
     // nothing a version-pinned consumer would notice.
     let widened =
-        Manifest::parse(&GOOD.replace("  tools:", "  tools:\n    - ref: \"mcp://shell/exec\"\n"))
+        Manifest::parse(&GOOD.replace("  tools:", "  tools:\n    - ref: \"tool://shell/exec\"\n"))
             .expect("parse");
 
     match reg.publish(&widened).await {
@@ -1524,7 +1524,7 @@ async fn protected_tool_fields_must_match_the_live_catalogue() {
 
     let source = BOUND.replace(
         "  budgets: {}",
-        "  budgets: {}\n  tools:\n    - ref: mcp://ledger/transfer\n      protected_fields:\n        - path: /recipient\n          require_trusted: true",
+        "  budgets: {}\n  tools:\n    - ref: tool://ledger/transfer\n      protected_fields:\n        - path: /recipient\n          require_trusted: true",
     );
     let manifest = Manifest::parse(&source).expect("parse");
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1976,7 +1976,7 @@ async fn a_manifest_whose_signature_does_not_check_out_is_refused() {
 fn a_reviewed_tool_grant_can_only_tighten() {
     let m = Manifest::parse(GOOD).expect("parse");
     let grant = m
-        .tool_grant("mcp://validator/apply_correction")
+        .tool_grant("tool://validator/apply_correction")
         .expect("the fixture grants this tool");
 
     assert!(grant.mutates, "the fixture declares a mutating tool");
@@ -1990,11 +1990,11 @@ fn a_reviewed_tool_grant_can_only_tighten() {
     // reference: a near miss is not a match, because resolving a tool name
     // approximately is how authority leaks to a neighbour.
     assert!(
-        m.tool_grant("mcp://validator/apply_correction ").is_none(),
+        m.tool_grant("tool://validator/apply_correction ").is_none(),
         "a trailing space must not resolve to the granted tool"
     );
     assert!(
-        m.tool_grant("mcp://validator/apply").is_none(),
+        m.tool_grant("tool://validator/apply").is_none(),
         "a prefix must not resolve to the granted tool"
     );
 }
@@ -2040,7 +2040,7 @@ spec:
   models:
     privileged: { provider: fake, model: declared-1 }
   tools:
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
       description: Read a ledger account's balance.
       arguments:
@@ -2161,7 +2161,7 @@ spec:
   capabilities: { provides: [guarded.ask] }
   models: { privileged: { provider: fake, model: declared-1 } }
   tools:
-    - ref: mcp://vault/read
+    - ref: tool://vault/read
       mutates: false
       description: Read a value.
       arguments: { type: object }
@@ -2236,7 +2236,7 @@ spec:
   models:
     privileged: { provider: fake, model: declared-1 }
   tools:
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
       description: Read a ledger account's balance.
   execution: { kind: tool-calling, max_turns: 3 }
@@ -2404,7 +2404,7 @@ spec:
   models:
     privileged: {{ provider: fake, model: m }}
   tools:
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
 {extra}
   execution: {{ kind: tool-calling }}
@@ -2438,7 +2438,7 @@ metadata: { name: coded, version: "1.0.0" }
 spec:
   capabilities: { provides: [x.y] }
   tools:
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
   budgets: {}
 "#
@@ -2470,7 +2470,7 @@ metadata: { name: thinker, version: "1.0.0" }
 spec:
   capabilities: { provides: [think] }
   models: { privileged: { provider: fake, model: loop-1, reasoning_effort: high } }
-  tools: [{ ref: "mcp://ledger/read", description: "Read a ledger account." }]
+  tools: [{ ref: "tool://ledger/read", description: "Read a ledger account." }]
   execution: { kind: tool-calling }
   budgets: {}
 "#;
@@ -3186,7 +3186,7 @@ spec:
   security:
     max_sensitivity_egress: internal
   tools:
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
       description: Read a ledger account's balance.
       arguments:
@@ -3379,11 +3379,11 @@ spec:
   capabilities:
     provides: [ledger.ask]
   tools:
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
       max_sensitivity: internal
       description: Read a balance.
-    - ref: mcp://ledger/post
+    - ref: tool://ledger/post
       mutates: true
       max_sensitivity: confidential
       description: Post an amount.

@@ -1,9 +1,16 @@
 //! Cedar as the authorization engine.
 //!
-//! The policies here are the ones §11.2 specifies — a read-only tool set, a
-//! risk-tier ceiling, a taint gate, an egress gate, a quarantined role with no
-//! authority, and a delegation-depth cap. If the adapter cannot express those,
-//! the design's authorization story does not hold and the seam was shaped wrong.
+//! The policies here are the ones the authorization design calls for — a
+//! read-only tool set, a risk-tier ceiling, a taint gate, an egress gate, a
+//! quarantined role with no authority, and a delegation-depth cap. If the
+//! adapter cannot express those, the authorization story does not hold and the
+//! seam was shaped wrong.
+//!
+//! Every context in this file is built by `sink_context`, which mirrors what
+//! `StepCtx::authorize` actually sends. That is not tidiness: a policy checked
+//! only against a context the test invented is a policy checked against itself,
+//! and one in this file was — it read `context.args_trust`, a key the runtime
+//! has never sent, so the taint gate it demonstrated failed open.
 //!
 //! One test matters more than the rest: **a policy that fails to evaluate must
 //! not read as an ordinary refusal.** Cedar is total, so a broken rule simply
@@ -27,6 +34,9 @@ use agentplane::policy::{CedarEngine, CedarError};
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
+
+/// The effect kind a tool call authorizes under.
+const TOOL_CALL: &str = "tool.call";
 
 fn ask<'a>(
     engine: &CedarEngine,
@@ -73,7 +83,7 @@ fn a_policy_set_that_does_not_parse_is_refused_at_startup() {
     assert!(err.to_string().contains("does not parse"), "{err}");
 }
 
-// ── §11.2's shapes ──────────────────────────────────────────────────────────
+// ── The shapes the authorization design calls for ─────────────────────────
 
 const READ_ONLY: &str = r#"
 permit(
@@ -122,38 +132,93 @@ fn a_permit_allows_exactly_what_it_names() {
 /// and the two are not redundant: the runtime's gate is structural and always
 /// on, while a policy can express *conditions* the lattice has no vocabulary
 /// for, such as which authorized releases a given agent may rely on.
+/// The **real** context key, not an invented one.
+///
+/// This policy used to read `context.args_trust` and `context.released`, and
+/// the test that exercised it built a context containing them. Neither key is
+/// anything the runtime sends: a sink authorization carries `context.label`,
+/// whose fields are `provenance`, `trust` and `sensitivity`.
+///
+/// The consequence is the reason this comment exists. Cedar is *total*, so a
+/// `when` clause reading a missing attribute does not raise — the policy is
+/// simply not satisfied. The `forbid` therefore never matched, the blanket
+/// `permit` stood, and the taint gate an adopter copied out of this file
+/// **failed open** against the runtime it was written for, while every
+/// assertion below passed. A policy tested only against a hand-built context is
+/// a policy tested against itself.
 const TAINT_GATE: &str = r#"
 permit(principal, action == Action::"effect:perform", resource);
 
 forbid(principal, action == Action::"effect:perform", resource)
-when { context.mutates && context.args_trust == "untrusted" && !context.released };
+when { context.mutates && context.label.trust == "untrusted" };
 "#;
+
+/// The context a `sink` authorization actually carries.
+///
+/// Built here rather than per test so every policy in this file is exercised
+/// against one shape, and so that shape has a single place to be corrected when
+/// the runtime's changes.
+fn sink_context(trust: &str, sensitivity: &str, provenance: &[&str]) -> Value {
+    request_context(trust, sensitivity, provenance, "ledger", 0)
+}
+
+/// The same shape with every attribute a published policy reads varied.
+fn request_context(
+    trust: &str,
+    sensitivity: &str,
+    provenance: &[&str],
+    server: &str,
+    delegation_depth: u32,
+) -> Value {
+    request_with(
+        trust,
+        sensitivity,
+        provenance,
+        server,
+        delegation_depth,
+        true,
+    )
+}
+
+fn request_with(
+    trust: &str,
+    sensitivity: &str,
+    provenance: &[&str],
+    server: &str,
+    delegation_depth: u32,
+    mutates: bool,
+) -> Value {
+    json!({
+        "run": "run_01KZ0000000000000000000000",
+        "step": 0,
+        "tenant": "default",
+        "mutates": mutates,
+        "delegation_depth": delegation_depth,
+        "args": {
+            "server": server,
+            "tool": "transfer",
+            "arguments": { "recipient": "AC-1", "amount": 2500 }
+        },
+        "label": {
+            "provenance": provenance,
+            "trust": trust,
+            "sensitivity": sensitivity
+        }
+    })
+}
 
 #[test]
 fn a_forbid_beats_a_permit_and_reads_the_context() {
     let engine = CedarEngine::new(TAINT_GATE).unwrap();
 
-    let clean = json!({ "mutates": true, "args_trust": "trusted", "released": false });
+    let clean = sink_context("trusted", "internal", &["operator:ops"]);
     assert!(
-        ask(
-            &engine,
-            "agent:a",
-            ACTION_PERFORM,
-            "ledger.transfer",
-            &clean
-        )
-        .is_permit(),
+        ask(&engine, "agent:a", ACTION_PERFORM, TOOL_CALL, &clean).is_permit(),
         "trusted arguments reach a mutating tool"
     );
 
-    let tainted = json!({ "mutates": true, "args_trust": "untrusted", "released": false });
-    let d = ask(
-        &engine,
-        "agent:a",
-        ACTION_PERFORM,
-        "ledger.transfer",
-        &tainted,
-    );
+    let tainted = sink_context("untrusted", "internal", &["tool:ledger"]);
+    let d = ask(&engine, "agent:a", ACTION_PERFORM, TOOL_CALL, &tainted);
     assert!(!d.is_permit(), "untrusted arguments do not");
 
     let PolicyDecision::Deny { reason } = d else {
@@ -163,22 +228,35 @@ fn a_forbid_beats_a_permit_and_reads_the_context() {
         reason.contains("policy"),
         "the refusal names the rule that fired: {reason}"
     );
+}
 
-    let cleared = json!({ "mutates": true, "args_trust": "untrusted", "released": true });
+/// A missing attribute denies nothing, which is why the key has to be right.
+///
+/// The positive half of the correction above. Cedar's totality means a rule
+/// reading an attribute the runtime does not send is *unsatisfied*, not
+/// erroring — so a `forbid` written against a misspelled key disappears and
+/// whatever `permit` accompanies it decides. Pinning that here means the next
+/// person to invent a context key finds out from a test rather than from an
+/// incident.
+#[test]
+fn a_forbid_on_an_attribute_the_runtime_never_sends_fails_open() {
+    let engine = CedarEngine::new(
+        r#"
+        permit(principal, action == Action::"effect:perform", resource);
+        forbid(principal, action == Action::"effect:perform", resource)
+        when { context.mutates && context.args_trust == "untrusted" };
+        "#,
+    )
+    .unwrap();
+
+    let tainted = sink_context("untrusted", "internal", &["tool:ledger"]);
     assert!(
-        ask(
-            &engine,
-            "agent:a",
-            ACTION_PERFORM,
-            "ledger.transfer",
-            &cleared
-        )
-        .is_permit(),
-        "a journaled release lifts it"
+        ask(&engine, "agent:a", ACTION_PERFORM, TOOL_CALL, &tainted).is_permit(),
+        "a forbid keyed on a nonexistent attribute must be shown to permit — if          this ever denies, Cedar's totality changed and the warning above is stale"
     );
 }
 
-/// §11.1's depth cap, which is expressible only because the runtime puts the
+/// A delegation-depth cap, expressible only because the runtime puts the
 /// delegation depth in the context.
 const DEPTH_CAP: &str = r"
 permit(principal, action, resource);
@@ -199,7 +277,7 @@ fn a_rule_can_cap_delegation_depth() {
     }
 }
 
-/// A role that holds no authority at all — §12's quarantined model.
+/// A role that holds no authority at all — the quarantined model.
 #[test]
 fn a_forbidden_principal_holds_no_authority() {
     let engine = CedarEngine::new(
@@ -224,18 +302,18 @@ fn a_forbidden_principal_holds_no_authority() {
 
 /// Effect kinds are not bare identifiers, and must survive anyway.
 ///
-/// `mcp.tools/call` contains a `.` and a `/`. If the adapter did not quote entity
+/// `tool.call` contains a `.` and a `/`. If the adapter did not quote entity
 /// ids, this request would fail to parse and be denied — reported as a policy
 /// decision, when in fact no rule was ever consulted.
 #[test]
 fn an_effect_kind_with_punctuation_is_a_usable_entity_id() {
     let engine =
-        CedarEngine::new(r#"permit(principal, action, resource == Resource::"mcp.tools/call");"#)
+        CedarEngine::new(r#"permit(principal, action, resource == Resource::"tool.call");"#)
             .unwrap();
     let ctx = json!({});
 
     assert!(
-        ask(&engine, "agent:a", ACTION_PERFORM, "mcp.tools/call", &ctx).is_permit(),
+        ask(&engine, "agent:a", ACTION_PERFORM, "tool.call", &ctx).is_permit(),
         "an effect kind with a dot and a slash must reach the rules intact"
     );
 }
@@ -620,4 +698,99 @@ async fn cedar_can_key_on_the_delegation_chain() {
         out.status
     );
     assert_eq!(world.lock().unwrap().len(), 1);
+}
+
+/// Every Cedar policy published on the documentation site compiles and decides.
+///
+/// This guard exists because its absence produced a real defect. The only
+/// worked taint gate in this repository read `context.args_trust`, an attribute
+/// the runtime has never sent. Cedar is total, so the `when` clause did not
+/// raise — the `forbid` was simply unsatisfied, the accompanying `permit` stood,
+/// and the gate an adopter would have copied **failed open**. Every test around
+/// it passed, because every one of them built a context containing the invented
+/// key.
+///
+/// So the site's policies are executed here against contexts the runtime
+/// actually produces, and each must produce **more than one decision** across
+/// them. Compiling is not enough: a rule keyed on an attribute nobody sends
+/// parses perfectly and decides nothing, which is precisely the shape being
+/// guarded against.
+///
+/// The matrix varies every attribute the published policies read — trust,
+/// sensitivity, provenance, the tool's server, delegation depth and the
+/// principal — because a matrix that varied fewer would report a working policy
+/// as inert. That happened while writing this: a two-row matrix held `server`
+/// fixed and flagged the one policy that keys on it.
+#[test]
+fn every_documented_cedar_policy_decides_against_the_real_context() {
+    let page = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("site/content/docs/security.md"),
+    )
+    .expect("the security page is readable");
+
+    let matrix: Vec<(&str, Value)> = vec![
+        (
+            "trusted, public, own server",
+            request_context("trusted", "public", &["operator:ops"], "ledger", 0),
+        ),
+        (
+            "untrusted, internal, own server",
+            request_context("untrusted", "internal", &["tool:ledger"], "ledger", 0),
+        ),
+        (
+            "trusted, confidential, via a peer",
+            request_context("trusted", "confidential", &["peer:broker"], "ledger", 0),
+        ),
+        (
+            "trusted, public, another server",
+            request_context("trusted", "public", &["operator:ops"], "tickets", 0),
+        ),
+        (
+            "trusted, public, deeply delegated",
+            request_context("trusted", "public", &["operator:ops"], "ledger", 4),
+        ),
+        (
+            "a read, not a mutation",
+            request_with("trusted", "public", &["operator:ops"], "ledger", 0, false),
+        ),
+    ];
+
+    let mut checked = 0usize;
+    for (index, block) in page.split("```").enumerate() {
+        if index % 2 == 0 || !block.starts_with("cedar") {
+            continue;
+        }
+        let source = block.split_once('\n').map_or("", |(_, rest)| rest);
+        checked += 1;
+
+        let engine = CedarEngine::new(source).unwrap_or_else(|e| {
+            panic!("a policy published on the security page does not compile: {e}\n{source}")
+        });
+
+        let decisions: Vec<(&str, bool)> = matrix
+            .iter()
+            .flat_map(|(name, context)| {
+                ["agent:auditor", "agent:other"].map(|principal| {
+                    (
+                        *name,
+                        ask(&engine, principal, ACTION_PERFORM, TOOL_CALL, context).is_permit(),
+                    )
+                })
+            })
+            .collect();
+
+        assert!(
+            decisions.iter().any(|(_, d)| *d) && decisions.iter().any(|(_, d)| !*d),
+            "this published policy returns the same decision for every request \
+             in the matrix, so it distinguishes nothing a reader could rely on — \
+             which is exactly how a rule keyed on an attribute the runtime never \
+             sends reads:\n{source}\ndecisions: {decisions:?}"
+        );
+    }
+
+    assert!(
+        checked >= 4,
+        "only {checked} cedar blocks were found on the security page — the fence \
+         scan stopped matching them and this guard is now inert"
+    );
 }

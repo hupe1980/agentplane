@@ -1,7 +1,7 @@
 +++
 title = "Architecture"
 description = "How the journal, effect protocol, replay, sagas and the Merkle log actually work — mechanism by mechanism."
-weight = 4
+weight = 5
 +++
 
 How the runtime works, and why each piece is shaped the way it is.
@@ -2238,7 +2238,10 @@ spec:
     constraints: "Isolate structural failures. Enforce semantic rule-packs strictly."
   security:
     max_sensitivity_egress: internal
-    max_delegation_depth: 2
+    # Zero, because the role above is `specialist`. A specialist that may hand
+    # off is an orchestrator nobody reviewed as one, so the pair is refused at
+    # parse rather than accepted and quietly ignored.
+    max_delegation_depth: 0
   budgets:
     max_tokens: 120000
     max_minor_units: 250
@@ -2250,7 +2253,7 @@ spec:
       type: object
       required: [finding, severity]
   tools:
-    - ref: "mcp://validator/apply_correction"
+    - ref: "tool://validator/apply_correction"
       mutates: true
       max_sensitivity: internal
 ```
@@ -2363,7 +2366,7 @@ What enforces today, before dispatch:
 | Field | Refused when | Reported as |
 |---|---|---|
 | `spec.models` | a completion names an undeclared provider/model | `effect:declared`, journaled |
-| `spec.tools` | a call names an ungranted `mcp://server/tool` | `effect:declared`, journaled |
+| `spec.tools` | a call names an ungranted `tool://server/tool` | `effect:declared`, journaled |
 | `spec.budgets` | the ledger reaches a ceiling | `Exhausted` |
 | `spec.capabilities.provides` | no registered skill provides it | panic at `build()` |
 | `security.max_sensitivity_egress` | a labeled value exceeds the stricter of manifest and sink ceilings | `EgressCeiling` |

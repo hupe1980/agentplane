@@ -23,6 +23,8 @@
 #![cfg(feature = "redb")]
 #![allow(clippy::disallowed_methods)]
 
+#[cfg(feature = "manifest")]
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use agentplane::core::{
@@ -33,7 +35,7 @@ use agentplane::journal::JournalStore;
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use agentplane::tools::{
-    Advertised, ToolCall, ToolCatalog, ToolClient, ToolError, ToolId, ToolSafety,
+    Advertised, ToolCall, ToolCatalog, ToolClient, ToolError, ToolFailure, ToolId, ToolSafety,
 };
 use serde_json::{Value, json};
 
@@ -829,7 +831,7 @@ impl agentplane::tools::Tool for ReadBalance {
         false
     }
 
-    async fn call(self) -> Result<Value, ToolError> {
+    async fn call(self) -> Result<Value, ToolFailure> {
         Ok(json!({ "account": self.account, "balance": 42 }))
     }
 }
@@ -955,16 +957,16 @@ spec:
 
     // They agree.
     let ok = granted(
-        "    - ref: mcp://ledger/read\n      mutates: false\n      description: Read a ledger account's balance.",
+        "    - ref: tool://ledger/read\n      mutates: false\n      description: Read a ledger account's balance.",
     );
-    assert!(tools.check_against(&ok).is_ok());
+    assert!(tools.check_against(&ok, &BTreeSet::new()).is_ok());
 
     // Implemented, never granted: the binary can do something its declaration
     // does not admit.
     let ungranted =
-        granted("    - ref: mcp://ledger/post\n      mutates: true\n      description: Post.");
+        granted("    - ref: tool://ledger/post\n      mutates: true\n      description: Post.");
     let problems = tools
-        .check_against(&ungranted)
+        .check_against(&ungranted, &BTreeSet::new())
         .expect_err("a tool nobody granted was accepted");
     assert!(
         problems
@@ -997,7 +999,7 @@ impl agentplane::tools::Tool for PostsMoney {
     const NAME: &'static str = "post";
 
     // The author's claim about their own code: this changes the world.
-    async fn call(self) -> Result<Value, ToolError> {
+    async fn call(self) -> Result<Value, ToolFailure> {
         Ok(json!({ "posted": self.account }))
     }
 }
@@ -1030,7 +1032,7 @@ spec:
   capabilities:
     provides: [ledger.ask]
   tools:
-    - ref: mcp://ledger/post
+    - ref: tool://ledger/post
       mutates: {mutates}
       description: Post an amount.
   budgets: {{}}
@@ -1042,11 +1044,15 @@ spec:
     let tools = ToolBox::new().with::<PostsMoney>();
 
     // Agreement.
-    assert!(tools.check_against(&manifest("true")).is_ok());
+    assert!(
+        tools
+            .check_against(&manifest("true"), &BTreeSet::new())
+            .is_ok()
+    );
 
     // The manifest is laxer than the code claims about itself.
     let problems = tools
-        .check_against(&manifest("false"))
+        .check_against(&manifest("false"), &BTreeSet::new())
         .expect_err("a manifest relaxed a tool's own claim that it mutates");
     assert!(
         problems
@@ -1070,7 +1076,7 @@ fn a_manifest_may_be_stricter_than_a_tool_claims() {
     apiVersion: agentplane.hupe1980.github.io/v1alpha1
     kind: Agent
     metadata: { name: teller, version: "1.0.0" }
-    spec: { capabilities: { provides: [ledger.ask] }, tools: [{ ref: "mcp://ledger/read", mutates: true, description: "Read a ledger account's balance." }], budgets: {} }
+    spec: { capabilities: { provides: [ledger.ask] }, tools: [{ ref: "tool://ledger/read", mutates: true, description: "Read a ledger account's balance." }], budgets: {} }
     "#,
         )
         .expect("parse");
@@ -1078,7 +1084,7 @@ fn a_manifest_may_be_stricter_than_a_tool_claims() {
     assert!(
         ToolBox::new()
             .with::<ReadBalance>()
-            .check_against(&m)
+            .check_against(&m, &BTreeSet::new())
             .is_ok(),
         "an operator being more cautious than the author was refused"
     );
@@ -1100,7 +1106,7 @@ metadata: { name: teller, version: "1.0.0" }
 spec:
   capabilities: { provides: [ledger.ask] }
   tools:
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
       description: Read a ledger account's balance.
       arguments: { type: object, properties: { wrong: { type: string } } }
@@ -1111,7 +1117,7 @@ spec:
 
     let problems = ToolBox::new()
         .with::<ReadBalance>()
-        .check_against(&manifest)
+        .check_against(&manifest, &BTreeSet::new())
         .expect_err("a second schema was accepted");
     assert!(
         problems.iter().any(|p| p.contains("remove `arguments`")),
@@ -1146,7 +1152,7 @@ spec:
   capabilities:
     provides: [ledger.ask]
   tools:
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
       description: Read.
   budgets: {}
@@ -1195,7 +1201,7 @@ spec:
   models:
     privileged: { provider: fake, model: teller-1 }
   tools:
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
       max_sensitivity: internal
       description: Read.
@@ -1251,13 +1257,13 @@ spec:
         // Agrees with the box.
         .agent(Agent::new(&agent(
             "teller",
-            "    - ref: mcp://ledger/read\n      mutates: false\n      description: Read.",
+            "    - ref: tool://ledger/read\n      mutates: false\n      description: Read.",
         )))
         // Does not: it grants a tool nothing implements.
         .agent(Agent::new(&agent(
             "cashier",
-            "    - ref: mcp://ledger/read\n      mutates: false\n      description: Read.\n\
-             \x20   - ref: mcp://ledger/settle\n      mutates: true\n      description: Settle.",
+            "    - ref: tool://ledger/read\n      mutates: false\n      description: Read.\n\
+             \x20   - ref: tool://ledger/settle\n      mutates: true\n      description: Settle.",
         )))
         .toolbox(ToolBox::new().with::<ReadBalance>())
         .build();
@@ -1286,7 +1292,7 @@ spec:
   capabilities:
     provides: [ledger.ask]
   tools:
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
       description: Read.
   budgets: {}
@@ -1354,7 +1360,7 @@ spec:
   capabilities:
     provides: [ledger.ask]
   tools:
-    - ref: mcp://ledger/post
+    - ref: tool://ledger/post
       mutates: true
       description: Post an amount.
   budgets: {}
@@ -1435,7 +1441,7 @@ spec:
   capabilities:
     provides: [ledger.ask]
   tools:
-    - ref: mcp://ledger/post
+    - ref: tool://ledger/post
       mutates: true
       description: Post an amount.
   budgets: {}
@@ -1474,7 +1480,7 @@ spec:
 /// Two agents may share a tool, and must not disagree about it.
 ///
 /// A plane has one catalogue and its agents have one manifest each, so two
-/// agents granting `mcp://ledger/read` with different protected fields cannot
+/// agents granting `tool://ledger/read` with different protected fields cannot
 /// both be satisfied. Merging by last-writer would resolve that by
 /// **registration order**, which is exactly what `toolbox` already refuses to
 /// let enforcement depend on — and it fails at a distance rather than here: the
@@ -1509,7 +1515,7 @@ fn two_agents_agreeing_about_one_tool_build() {
     let _ = shared_tool_plane(store, "", "");
 }
 
-/// Two agents on one plane, each granting `mcp://ledger/read` with whatever
+/// Two agents on one plane, each granting `tool://ledger/read` with whatever
 /// extra declaration the caller appends.
 #[cfg(feature = "manifest")]
 fn shared_tool_plane(
@@ -1547,7 +1553,7 @@ spec:
   capabilities:
     provides: [{name}]
   tools:
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
       description: Read.
 {extra}
@@ -1585,7 +1591,7 @@ spec:
   models:
     privileged: {{ provider: fake, model: teller-1 }}
   tools:
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
 {ceiling}
       description: Read a balance.
@@ -1612,12 +1618,9 @@ impl agentplane::tools::Tool for TimesOut {
     fn mutates() -> bool {
         false
     }
-    async fn call(self) -> Result<Value, ToolError> {
+    async fn call(self) -> Result<Value, ToolFailure> {
         let _ = self.account;
-        Err(ToolError::TimedOut {
-            tool: ToolId::new("ledger", "read"),
-            detail: "no answer in 30s".into(),
-        })
+        Err(ToolFailure::InDoubt("no answer in 30s".into()))
     }
 }
 
@@ -1639,12 +1642,9 @@ impl agentplane::tools::Tool for Declines {
     fn mutates() -> bool {
         false
     }
-    async fn call(self) -> Result<Value, ToolError> {
+    async fn call(self) -> Result<Value, ToolFailure> {
         let _ = self.account;
-        Err(ToolError::ToolFailed {
-            tool: ToolId::new("ledger", "read"),
-            detail: "account AC-1 is closed".into(),
-        })
+        Err(ToolFailure::Landed("account AC-1 is closed".into()))
     }
 }
 
@@ -1747,7 +1747,7 @@ async fn a_refusal_tells_the_model_nothing_it_can_differentiate() {
         "the model was told something it can differentiate"
     );
     for text in &told {
-        for leak in ["Internal", "Public", "ceiling", "sensitivity", "mcp.tools"] {
+        for leak in ["Internal", "Public", "ceiling", "sensitivity", "tool.call"] {
             assert!(
                 !text.contains(leak),
                 "the model-facing refusal carries '{leak}': {text}"
@@ -1861,5 +1861,108 @@ async fn an_in_doubt_tool_call_does_not_become_a_chat_message() {
         provider.calls(),
         1,
         "the model was asked again after an in-doubt outcome"
+    );
+}
+
+/// A plane may grant typed tools and a remote server's tools to one agent.
+///
+/// This was unrepresentable, and the reason was structural rather than a
+/// missing convenience. A plane held one [`ToolClient`] for every tool, so the
+/// coherence check read every grant on a server the box did not implement as
+/// "granted but nothing implements it" — which is correct when the box is the
+/// only transport and wrong the moment a second one exists. Mixing local tools
+/// with an MCP server is the ordinary shape, and it could not be wired at all.
+///
+/// The two halves are checked together on purpose: a grant whose server *is*
+/// wired must build, and one whose server is **not** must still be refused.
+/// Only accepting the first would replace one wrong answer with a laxer one.
+#[cfg(feature = "manifest")]
+#[test]
+fn a_plane_may_wire_typed_tools_and_a_remote_server_at_once() {
+    use agentplane::manifest::Manifest;
+    use agentplane::tools::{ToolBox, ToolClient, ToolError, ToolId};
+
+    #[derive(Debug)]
+    struct Asks;
+
+    #[async_trait::async_trait]
+    impl Skill for Asks {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("ask").provides("ledger.ask")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            input: Tainted<Value>,
+        ) -> Result<Outcome, agentplane::core::SkillError> {
+            Ok(Outcome::done(input))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Remote;
+
+    #[async_trait::async_trait]
+    impl ToolClient for Remote {
+        async fn call(
+            &self,
+            _tool: &ToolId,
+            _arguments: &Value,
+            _provenance: Option<&agentplane::core::Provenance>,
+        ) -> Result<Value, ToolError> {
+            Ok(json!({ "remote": true }))
+        }
+    }
+
+    let agent = |tools: &str| {
+        Manifest::parse(&format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: teller, version: "1.0.0" }}
+spec:
+  capabilities: {{ provides: [ledger.ask] }}
+  tools:
+{tools}
+  budgets: {{}}
+"#
+        ))
+        .expect("parse")
+    };
+
+    let both = agent(
+        "    - ref: tool://ledger/read\n      mutates: false\n\
+         \x20     description: Read a ledger account's balance.\n\
+         \x20   - ref: tool://tickets/read\n      mutates: false\n\
+         \x20     description: Read a ticket.",
+    );
+
+    let plane = |manifest: &Manifest, wire_tickets: bool| {
+        let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+        let mut builder = Runtime::builder(store as Arc<dyn JournalStore>)
+            .agent(agentplane::runtime::Agent::new(manifest))
+            .skill(Asks)
+            .toolbox(ToolBox::new().with::<ReadBalance>());
+        if wire_tickets {
+            builder = builder.tool_server("tickets", Arc::new(Remote) as Arc<dyn ToolClient>);
+        }
+        builder.build()
+    };
+
+    // Wired: the box answers for `ledger`, the remote client for `tickets`.
+    plane(&both, true);
+
+    // Not wired: the same manifest must still be refused, or the check above
+    // proves only that the refusal was removed.
+    let refused = std::panic::catch_unwind(|| {
+        plane(&both, false);
+    });
+    let message = *refused
+        .expect_err("a grant on a server nobody wired was accepted")
+        .downcast::<String>()
+        .expect("a string panic message");
+    assert!(
+        message.contains("tickets"),
+        "the refusal did not name the unwired server: {message}"
     );
 }

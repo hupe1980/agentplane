@@ -30,7 +30,7 @@
 //!    model is told a tool does must change that artifact's identity.
 //!
 //! ```no_run
-//! # use agentplane::tools::{Tool, ToolError};
+//! # use agentplane::tools::{Tool, ToolFailure};
 //! # use serde::Deserialize;
 //! # use serde_json::{Value, json};
 //! /// Read a ledger account's balance.
@@ -45,7 +45,7 @@
 //!     const SERVER: &'static str = "ledger";
 //!     const NAME: &'static str = "read";
 //!
-//!     async fn call(self) -> Result<Value, ToolError> {
+//!     async fn call(self) -> Result<Value, ToolFailure> {
 //!         Ok(json!({ "account": self.account, "balance": 42 }))
 //!     }
 //! }
@@ -69,7 +69,77 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::{ToolClient, ToolError, ToolId};
+use super::{Disposition, ToolClient, ToolError, ToolId};
+
+/// What a tool body knows about whether the world changed.
+///
+/// Named by **disposition** rather than by transport, because that is the only
+/// thing the runtime does anything with — it decides whether a retry is a
+/// correction or a second real invocation. A body writing its own logic has no
+/// `TimedOut` to report; it has an answer, a refusal, or a genuine uncertainty,
+/// and asking it to translate that into a wire vocabulary is asking it to guess
+/// at a mapping it cannot see.
+///
+/// The [`ToolId`] is attached by the box that dispatched the call, so a body
+/// cannot name a tool other than itself, and there is no boilerplate identity to
+/// repeat on every error path.
+///
+/// There is deliberately no `Default` and no catch-all constructor: every
+/// variant is a claim about the outside world, and the one that is safe to
+/// assume does not exist.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ToolFailure {
+    /// Nothing was done and nothing will have been. Safe to repeat.
+    ///
+    /// The right answer for a validation refusal, an unknown identifier, or any
+    /// path that returns before touching anything. **Not** the right answer for
+    /// "the call I made returned an error", because the far side may have acted
+    /// before it failed.
+    #[error("did not happen: {0}")]
+    DidNotHappen(String),
+
+    /// It may or may not have happened, and this code cannot tell.
+    ///
+    /// The honest answer whenever a request left this process and no
+    /// acknowledgement came back. Repeating it is a coin flip with the outside
+    /// world, so the runtime escalates instead — which is the point.
+    #[error("outcome unknown: {0}")]
+    InDoubt(String),
+
+    /// It happened, and it failed.
+    ///
+    /// Distinct from [`DidNotHappen`](Self::DidNotHappen) because the work was
+    /// done: repeating it would be a second real invocation, whatever it did
+    /// before reporting failure.
+    #[error("landed and failed: {0}")]
+    Landed(String),
+}
+
+impl ToolFailure {
+    /// What this says about whether the call reached the world.
+    #[must_use]
+    pub const fn disposition(&self) -> Disposition {
+        match self {
+            Self::DidNotHappen(_) => Disposition::DidNotHappen,
+            Self::InDoubt(_) => Disposition::InDoubt,
+            Self::Landed(_) => Disposition::Landed,
+        }
+    }
+
+    /// Attach the identity of the tool that produced it.
+    fn at(self, tool: ToolId) -> ToolError {
+        let detail = match &self {
+            Self::DidNotHappen(d) | Self::InDoubt(d) | Self::Landed(d) => d.clone(),
+        };
+        match self {
+            // `Refused` rather than `Unreachable`: the tool ran its own logic
+            // and declined. Both are `DidNotHappen`, and this one is true.
+            Self::DidNotHappen(_) => ToolError::Refused { tool, detail },
+            Self::InDoubt(_) => ToolError::TimedOut { tool, detail },
+            Self::Landed(_) => ToolError::ToolFailed { tool, detail },
+        }
+    }
+}
 
 /// One tool: its name, its arguments, and what it does.
 ///
@@ -107,9 +177,19 @@ pub trait Tool: DeserializeOwned + schemars::JsonSchema + Send + Sync + 'static 
     ///
     /// # Errors
     ///
-    /// A [`ToolError`] whose variant states what is known about whether the call
-    /// reached the far side.
-    async fn call(self) -> Result<Value, ToolError>;
+    /// A [`ToolFailure`], which asks the author the **one** question that
+    /// decides what the runtime may safely do next: did the world change?
+    ///
+    /// This used to be [`ToolError`], the transport vocabulary, and that was
+    /// the wrong shape for a body. It made the author name their own
+    /// [`ToolId`] on every error — boilerplate, and a foot-gun, since nothing
+    /// stopped them naming a *different* tool. Worse, it asked them to pick
+    /// between `Unreachable`, `Refused`, `TimedOut`, `ToolFailed` and
+    /// `Malformed`, which are facts about a wire that a body implementing its
+    /// own logic does not have. The mapping from those to a disposition lives
+    /// in this crate's head, and getting it wrong in the `DidNotHappen`
+    /// direction is how a payment happens twice.
+    async fn call(self) -> Result<Value, ToolFailure>;
 }
 
 /// Everything a registered tool exposes without being instantiated.
@@ -201,7 +281,14 @@ impl ToolBox {
                                 tool: ToolId::new(T::SERVER, T::NAME),
                                 detail: format!("arguments do not match the declared shape: {e}"),
                             })?;
-                        parsed.call().await
+                        // The id is attached here, where it is known for
+                        // certain, rather than repeated in every error path of
+                        // every body — which is also what stops a body naming
+                        // some other tool.
+                        parsed
+                            .call()
+                            .await
+                            .map_err(|failure| failure.at(ToolId::new(T::SERVER, T::NAME)))
                     })
                 }),
             },
@@ -213,6 +300,25 @@ impl ToolBox {
     /// against.
     pub fn ids(&self) -> impl Iterator<Item = &ToolId> {
         self.tools.keys()
+    }
+
+    /// The distinct servers these tools name.
+    ///
+    /// What [`ToolRouter::toolbox`](super::ToolRouter::toolbox) registers the
+    /// box under, so the servers a box answers for are stated once — by the
+    /// tools themselves — rather than repeated at the wiring call.
+    pub fn servers(&self) -> impl Iterator<Item = &str> {
+        // `BTreeMap` iterates in key order and `ToolId` orders by server first,
+        // so equal servers are adjacent and skipping repeats is enough.
+        let mut seen: Option<&str> = None;
+        self.tools.keys().filter_map(move |id| {
+            let server = id.server.as_str();
+            if seen == Some(server) {
+                return None;
+            }
+            seen = Some(server);
+            Some(server)
+        })
     }
 
     /// Refuse a deployment where the code and the reviewed declaration disagree.
@@ -234,12 +340,22 @@ impl ToolBox {
     /// Neither is caught by the dispatch gates: those refuse a *call*, and by
     /// then the disagreement has already shaped what the model was offered.
     ///
+    /// `remote_servers` names the tool servers reached by some *other*
+    /// transport on the same plane. A grant on one of those is somebody else's
+    /// to implement, so this box neither claims it nor reports it missing —
+    /// without that, a plane could never mix typed tools with an MCP server,
+    /// because every MCP grant read as "granted but nothing implements it".
+    ///
     /// # Errors
     ///
     /// Every disagreement found, so one run of this fixes all of them rather
     /// than the first.
     #[cfg(feature = "manifest")]
-    pub fn check_against(&self, manifest: &crate::manifest::Manifest) -> Result<(), Vec<String>> {
+    pub fn check_against(
+        &self,
+        manifest: &crate::manifest::Manifest,
+        remote_servers: &std::collections::BTreeSet<String>,
+    ) -> Result<(), Vec<String>> {
         let granted: BTreeMap<ToolId, &crate::manifest::ToolGrant> = manifest
             .spec
             .tools
@@ -284,10 +400,12 @@ impl ToolBox {
             }
         }
         for id in granted.keys() {
-            if !self.tools.contains_key(id) {
+            if !self.tools.contains_key(id) && !remote_servers.contains(&id.server) {
                 problems.push(format!(
-                    "'{id}' is granted but nothing implements it — the model will \
-                     be offered a tool that fails when chosen"
+                    "'{id}' is granted but nothing implements it and no transport is \
+                     wired for server '{}' — the model will be offered a tool that \
+                     fails when chosen",
+                    id.server
                 ));
             }
         }
@@ -326,5 +444,82 @@ impl ToolClient for ToolBox {
             });
         };
         (registered.invoke)(arguments.clone()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Disposition, Tool, ToolBox, ToolClient, ToolFailure, ToolId};
+    use serde_json::{Value, json};
+
+    /// Refuses on its own terms, before touching anything.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    /// Read a ledger account's balance.
+    struct Refuses {
+        /// The account to read.
+        account: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Refuses {
+        const SERVER: &'static str = "ledger";
+        const NAME: &'static str = "read";
+        fn mutates() -> bool {
+            false
+        }
+        async fn call(self) -> Result<Value, ToolFailure> {
+            Err(ToolFailure::DidNotHappen(format!(
+                "no account {}",
+                self.account
+            )))
+        }
+    }
+
+    /// Each failure keeps its disposition, and gains the right identity.
+    ///
+    /// Both halves matter. The disposition is what the retry gate reads, so a
+    /// mapping that collapsed `InDoubt` into `DidNotHappen` would make a
+    /// timed-out mutating call retryable — the one direction nobody can be right
+    /// about. And the id is attached by the box rather than repeated in the
+    /// body, so a body physically cannot name a tool other than itself.
+    #[test]
+    fn a_failure_keeps_its_disposition_and_gains_the_calling_tools_identity() {
+        for (failure, expected) in [
+            (
+                ToolFailure::DidNotHappen("nope".into()),
+                Disposition::DidNotHappen,
+            ),
+            (ToolFailure::InDoubt("unknown".into()), Disposition::InDoubt),
+            (ToolFailure::Landed("failed".into()), Disposition::Landed),
+        ] {
+            assert_eq!(failure.disposition(), expected);
+            let id = ToolId::new("ledger", "read");
+            let error = failure.clone().at(id.clone());
+            assert_eq!(
+                error.disposition(),
+                expected,
+                "attaching an identity changed what the runtime concludes about \
+                 {failure:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_that_refuses_is_reported_as_not_having_happened() {
+        let box_ = ToolBox::new().with::<Refuses>();
+        let error = box_
+            .call(
+                &ToolId::new("ledger", "read"),
+                &json!({ "account": "AC-9" }),
+                None,
+            )
+            .await
+            .expect_err("the body refused");
+
+        assert_eq!(error.disposition(), Disposition::DidNotHappen);
+        assert!(
+            error.to_string().contains("AC-9"),
+            "the body's own detail did not survive: {error}"
+        );
     }
 }

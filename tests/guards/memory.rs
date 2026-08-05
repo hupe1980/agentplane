@@ -1495,3 +1495,92 @@ async fn compaction_cannot_exceed_the_sensitivity_ceiling() {
     );
     assert!(memories.version("summary-1", 1).await.expect("v").is_some());
 }
+
+/// An embedder that answers differently every time, which real ones may.
+///
+/// The fixture is the whole point: an embedding service does not promise the
+/// same floats for the same text — batching, hardware and an unannounced model
+/// revision each move the last bits. A stable stub would make this test pass
+/// under a runtime that recomputed the vector on replay, which is exactly the
+/// bug it exists to catch.
+#[derive(Debug)]
+struct DriftingEmbedder(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl agentplane::memory::Embedder for DriftingEmbedder {
+    fn revision(&self) -> String {
+        "stub-embed@1".to_owned()
+    }
+
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>, agentplane::core::StoreError> {
+        let nth = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        #[allow(clippy::cast_precision_loss)]
+        Ok(vec![1.0, nth as f32])
+    }
+}
+
+#[derive(Debug)]
+struct Embeds(Arc<DriftingEmbedder>);
+
+#[async_trait::async_trait]
+impl Skill for Embeds {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("embeds").provides("embeds")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let vector = cx
+            .embed(
+                Arc::clone(&self.0) as Arc<dyn agentplane::memory::Embedder>,
+                Tainted::trusted("what is the refund policy?".to_owned()),
+            )
+            .await?;
+        Ok(Outcome::done(vector.map(|v| json!({ "embedding": v }))))
+    }
+}
+
+/// A replayed run reads its vector back rather than embedding again.
+///
+/// The vector is in the semantic-retrieval effect's key, so a run that asked an
+/// embedding service again on replay would derive a different key from the same
+/// text and quarantine itself — for a reason nothing on the record explains.
+/// That is what makes embedding an observation rather than a computation, and
+/// this is the test that says so.
+#[tokio::test]
+async fn a_replayed_run_reads_its_embedding_back_rather_than_asking_again() {
+    use std::sync::atomic::Ordering;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let embedder = Arc::new(DriftingEmbedder(std::sync::atomic::AtomicUsize::new(0)));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Embeds(Arc::clone(&embedder)))
+        .build();
+
+    let live = rt.run("embeds", json!({})).await.expect("live embed");
+    assert_eq!(live.status, RunStatus::Succeeded);
+    assert_eq!(embedder.0.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        live.output.as_ref().expect("an answer")["embedding"],
+        json!([1.0, 0.0]),
+    );
+
+    let replay = rt
+        .replay(live.run_id, Mode::Strict)
+        .await
+        .expect("strict replay");
+    assert_eq!(replay.status, RunStatus::Succeeded);
+    assert_eq!(
+        embedder.0.load(Ordering::SeqCst),
+        1,
+        "strict replay asked the embedding service again"
+    );
+    assert_eq!(
+        replay.output, live.output,
+        "the replayed vector is not the one that was journaled — a second call \
+         drifted and the run would derive a different retrieval key"
+    );
+}

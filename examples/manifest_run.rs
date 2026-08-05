@@ -295,7 +295,7 @@ async fn registry_refusals(manifest: &Manifest) -> Result<(), Box<dyn std::error
     // The supply-chain shape: same name, same version, one more tool. Nothing a
     // version-pinned consumer would notice.
     let widened = Manifest::parse(
-        &AGENT.replace("  tools:\n", "  tools:\n    - ref: \"mcp://shell/exec\"\n"),
+        &AGENT.replace("  tools:\n", "  tools:\n    - ref: \"tool://shell/exec\"\n"),
     )?;
     match registry.publish(&widened).await {
         Err(RegistryError::Immutable { .. }) => {

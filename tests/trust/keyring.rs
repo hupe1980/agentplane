@@ -424,7 +424,7 @@ async fn erasing_a_case_destroys_its_key_and_the_backup_with_it() {
 
 /// **Erasing one tenant does not reach another's bytes.**
 ///
-/// The adversarial swap §9 asks for, at the only layer that currently has a
+/// The adversarial swap the threat model asks for, at the only layer that has a
 /// tenant boundary. Two tenants using the *same* case name is the interesting
 /// case, because that is where a missing prefix collides: without one, both
 /// seal under `case-1`, and the first erasure destroys the second tenant's data

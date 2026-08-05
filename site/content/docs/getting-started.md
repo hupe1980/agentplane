@@ -269,7 +269,7 @@ let args = cx.release(
     ReleaseScope::trust(),
     ["/account".to_owned()],
     "operator matched the account to settlement SET-42",
-    "mcp://ledger/post_entry",
+    "tool://ledger/post_entry",
     ["approval:SET-42".to_owned()],
   ),
 ).await?;

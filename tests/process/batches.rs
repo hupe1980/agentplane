@@ -1,6 +1,6 @@
 //! Batch runs: one act, many items, and what happens when it dies at item 3.
 //!
-//! The claims under test are the ones §8.4 exists for, and each has a failure
+//! The claims under test are the ones batches exist for, and each has a failure
 //! mode that looks like success:
 //!
 //! * **Failure isolation** — one bad item must not stop 99,999 good ones. The

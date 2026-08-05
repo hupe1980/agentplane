@@ -37,7 +37,7 @@ use agentplane::model::ModelProvider;
 use agentplane::runtime::{Agent, Mode, RunStatus, Runtime};
 use agentplane::store::RedbStore;
 use agentplane::testkit::FakeProvider;
-use agentplane::tools::{Tool, ToolBox, ToolError};
+use agentplane::tools::{Tool, ToolBox, ToolFailure};
 use serde_json::{Value, json};
 
 /// The agent is a file. The only Rust below is deployment wiring.
@@ -59,11 +59,11 @@ spec:
     # Exactly what this agent may reach. A tool absent from here cannot be
     # called however the model spells it — the grant is the operator's decision
     # and the model's suggestion is only a suggestion.
-    - ref: mcp://ledger/read
+    - ref: tool://ledger/read
       mutates: false
       max_sensitivity: internal
       description: Read a ledger account's balance.
-    - ref: mcp://ledger/post
+    - ref: tool://ledger/post
       # Declared mutating, and with **no protected fields**. That pair is what
       # makes the refusal below structural rather than a matter of the model
       # behaving: a mutating tool that has not been told which fields a model
@@ -112,7 +112,7 @@ impl Tool for ReadBalance {
         false
     }
 
-    async fn call(self) -> Result<Value, ToolError> {
+    async fn call(self) -> Result<Value, ToolFailure> {
         READS.fetch_add(1, Ordering::Relaxed);
         println!("      → read {}", self.account);
         Ok(json!({ "account": self.account, "balance": 42 }))
@@ -141,7 +141,7 @@ impl Tool for PostEntry {
     // Mutating, and the manifest declares no protected fields for it. That pair
     // is what makes the refusal in step 3 structural rather than a matter of the
     // model behaving.
-    async fn call(self) -> Result<Value, ToolError> {
+    async fn call(self) -> Result<Value, ToolFailure> {
         POSTS.fetch_add(1, Ordering::Relaxed);
         Ok(json!({ "posted": self.amount }))
     }

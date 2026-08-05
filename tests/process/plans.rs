@@ -786,7 +786,7 @@ async fn a_concurrently_dispatched_run_replays_strictly() {
 
 // ── Quorum ──────────────────────────────────────────────────────────────────
 //
-// §1.2 is the argument: an agent at 61 % pass^1 is around 25 % at pass^8, so a
+// The argument: an agent at 61 % pass^1 is around 25 % at pass^8, so a
 // single execution of a high-stakes judgement is not adequate evidence. What a
 // panel must never do is resolve its own disagreement.
 

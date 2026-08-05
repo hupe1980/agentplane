@@ -571,7 +571,11 @@ pub struct Budgets {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolGrant {
-    /// How the transport names it, e.g. `mcp://server/tool`.
+    /// Which tool, as `tool://server/name`.
+    ///
+    /// Transport-neutral on purpose: the deployment's router decides whether
+    /// `server` is an MCP connection or tools compiled into the binary, so this
+    /// document states only what a reviewer can actually check.
     #[serde(rename = "ref")]
     pub reference: String,
     /// Whether calling it changes the world.
@@ -714,7 +718,7 @@ impl Manifest {
             }
             let Some(id) = crate::tools::ToolId::parse(&grant.reference) else {
                 return Err(ManifestError::Syntax(format!(
-                    "spec.tools: '{}' is not an exact mcp://server/tool reference",
+                    "spec.tools: '{}' is not an exact tool://server/name reference",
                     grant.reference
                 )));
             };

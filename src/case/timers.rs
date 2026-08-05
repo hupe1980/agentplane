@@ -14,7 +14,7 @@
 //! # Why the instant is journaled
 //!
 //! The wake instant is resolved once and recorded, exactly as an obligation's
-//! deadline is (§ the `Calendar` seam). Recomputing `now + duration` on replay
+//! deadline is, through the `Calendar` seam. Recomputing `now + duration` on replay
 //! would move the instant every time the run was replayed, and a run that slept
 //! until Tuesday would sleep until a different Tuesday on every audit.
 

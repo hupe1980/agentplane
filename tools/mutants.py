@@ -1834,7 +1834,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     "InternalSectionRefsAreAllowedToShip": (
         "tests/guards/docs.rs",
-        "shipped_source_cites_no_internal_section_numbers",
+        "nothing_a_reader_sees_cites_an_internal_section_number",
         "rustdoc may cite sections of the internal design document, which a "
         "docs.rs reader cannot resolve and which go stale silently",
         "    if before.contains(\"RFC\") || before.contains(\"C2SP\") {",
@@ -2481,9 +2481,41 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a plane hosting several agents enforces one declaration and ignores the "
         "rest — and the ignored ones are exactly where a second team's manifest "
         "drifts unnoticed",
-        "            if let Err(problems) = tools.check_against(manifest) {",
+        "            if let Err(problems) = tools.check_against(manifest, &remote_servers) {",
         "            if declared > 1 {\n                continue;\n            }\n"
-        "            if let Err(problems) = tools.check_against(manifest) {",
+        "            if let Err(problems) = tools.check_against(manifest, &remote_servers) {",
+    ),
+    "EmbeddingIsComputedNotObserved": (
+        "src/runtime/ctx.rs",
+        "a_replayed_run_reads_its_embedding_back_rather_than_asking_again",
+        "the embedding service is called directly instead of through the effect "
+        "protocol, so a replay asks again and gets different floats — and since "
+        "the query vector is in the semantic-retrieval effect key, the run "
+        "quarantines itself with nothing on the record explaining why",
+        "        self.sink(\n            crate::runtime::effects::Embed {",
+        "        if true {\n            let v = embedder.embed(&plain).await"
+        ".map_err(StepError::Store)?;\n            return Ok(crate::core::Tainted"
+        "::trusted(v));\n        }\n"
+        "        self.sink(\n            crate::runtime::effects::Embed {",
+    ),
+    "McpDispatchesAnyServersTool": (
+        "src/tools/mcp.rs",
+        "a_tool_from_another_server_is_refused_rather_than_run_here",
+        "an MCP client runs a tool id belonging to a different server against "
+        "its own connection, so a plane granting one server's tool and wiring "
+        "another's gets a successful answer from the wrong server under the "
+        "first one's operator safety",
+        "        if tool.server != self.server {",
+        "        if false && tool.server != self.server {",
+    ),
+    "TheRouterIgnoresTheServer": (
+        "src/tools/mod.rs",
+        "a_router_sends_each_server_to_its_own_transport",
+        "the router hands every tool id to whichever transport it holds first, "
+        "so the server component that exists to tell two servers' identically "
+        "named tools apart decides nothing",
+        "        let Some(client) = self.routes.get(&tool.server) else {",
+        "        let Some(client) = self.routes.values().next() else {",
     ),
     "TwoCataloguesSilentlyMerge": (
         "src/runtime/executor.rs",

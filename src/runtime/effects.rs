@@ -373,6 +373,57 @@ pub struct RecallMemory {
     pub(crate) query: crate::memory::Recall,
 }
 
+/// Turning text into a vector, as an observation rather than a computation.
+///
+/// An embedding service does not promise the same floats for the same text —
+/// batching, hardware and an unannounced model revision each move the last bits.
+/// The vector then enters [`SemanticRecall`]'s key, so a run that computed one
+/// outside the protocol would derive a different key on replay and quarantine
+/// itself, with nothing on the record saying why.
+///
+/// Journaling it makes the vector history rather than a recomputation, puts the
+/// revision that produced it beside it, and meters the call like any other.
+#[derive(Debug, Clone)]
+pub struct Embed {
+    pub(crate) embedder: std::sync::Arc<dyn crate::memory::Embedder>,
+    pub(crate) text: String,
+    pub(crate) arguments: serde_json::Value,
+}
+
+#[async_trait]
+impl Effect for Embed {
+    type Output = Vec<f32>;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "memory.embed",
+            json!({
+                "revision": self.embedder.revision(),
+                "text": self.text,
+            }),
+        )
+    }
+
+    fn mutates(&self) -> bool {
+        false
+    }
+
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    fn sink_arguments(&self) -> Option<&serde_json::Value> {
+        Some(&self.arguments)
+    }
+
+    async fn perform(&self) -> Result<Self::Output, EffectError> {
+        self.embedder
+            .embed(&self.text)
+            .await
+            .map_err(|error| EffectError::Other(error.to_string()))
+    }
+}
+
 /// Semantic ranking is an effect because an index and embedding implementation
 /// can change independently of durable memory truth.
 #[derive(Debug, Clone)]

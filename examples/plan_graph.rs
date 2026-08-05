@@ -50,7 +50,7 @@ impl Skill for Fetch {
         // Whatever a counterparty sends is external data, whoever they are.
         Ok(Outcome::done(Tainted::from_source(
             json!({ "meter": meter, "kwh": 4210, "quality": "estimated" }),
-            SourceId::new("mcp://metering"),
+            SourceId::new("tool://metering"),
         )))
     }
 }

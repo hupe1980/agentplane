@@ -132,7 +132,7 @@ impl Skill for SinksLabeled {
         _input: Tainted<Value>,
     ) -> Result<Outcome, agentplane::core::SkillError> {
         let value = if self.untrusted {
-            Tainted::from_source(json!("payload"), SourceId::new("mcp://external"))
+            Tainted::from_source(json!("payload"), SourceId::new("tool://external"))
         } else {
             Tainted::trusted(json!("payload"))
         };

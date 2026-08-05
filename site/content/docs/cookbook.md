@@ -469,7 +469,7 @@ spec:
     privileged:  { provider: anthropic, model: claude-sonnet-5 }
     quarantined: { provider: anthropic, model: claude-haiku-4-5-20251001 }
   tools:
-    - ref: "mcp://validator/apply_correction"
+    - ref: "tool://validator/apply_correction"
       mutates: true
       max_sensitivity: internal
             protected_fields:
@@ -639,7 +639,7 @@ let args = cx.release(
         ReleaseScope::trust(),
         ["/recipient".to_owned()],
         "operator matched settlement SET-42",
-        "mcp://ledger/transfer",
+        "tool://ledger/transfer",
         ["approval:SET-42".to_owned()],
     ),
 ).await?;
@@ -879,7 +879,7 @@ impl Tool for ReadBalance {
     const NAME: &'static str = "read";
     fn mutates() -> bool { false }
 
-    async fn call(self) -> Result<Value, ToolError> {
+    async fn call(self) -> Result<Value, ToolFailure> {
         Ok(json!({ "account": self.account, "balance": 42 }))
     }
 }
@@ -893,6 +893,49 @@ let rt = Runtime::builder(store)
 `call` takes `self` because **the arguments are the tool**: by the time it runs,
 the model's JSON is this type or the call was refused. There is no `Value` left
 to index and no field name to misspell.
+
+### What a failure has to say
+
+`ToolFailure` names the **disposition**, not a transport error, because that is
+the only thing the runtime does anything with — it decides whether a retry is a
+correction or a second real invocation:
+
+```rust
+async fn call(self) -> Result<Value, ToolFailure> {
+    if !self.account.starts_with("AC-") {
+        // Nothing was attempted. Safe to repeat.
+        return Err(ToolFailure::DidNotHappen(format!("not an account: {}", self.account)));
+    }
+    match self.post().await {
+        Ok(receipt)              => Ok(json!({ "receipt": receipt })),
+        Err(e) if e.is_timeout() => Err(ToolFailure::InDoubt(e.to_string())),
+        Err(e)                   => Err(ToolFailure::Landed(e.to_string())),
+    }
+}
+```
+
+The `ToolId` is attached by the box that dispatched the call, so a body cannot
+name a tool other than itself and there is no identity to repeat on every error
+path. Getting the choice wrong in the `DidNotHappen` direction is how a payment
+happens twice, so **`InDoubt` is the honest answer whenever a request left this
+process and no acknowledgement came back**. `RequiresOperator` on the grant then
+escalates it rather than guessing.
+
+### What the output is labelled
+
+You do not label it, and you cannot. A tool's result comes back
+`Tainted<Value>` and **untrusted**, because it is the outside world's data — and
+nothing in the catalogue can change that, since the catalogue governs authority
+and not provenance. `ToolSafety::output_sensitivity` sets the *sensitivity* floor
+its results carry; there is no corresponding knob for trust.
+
+That is deliberate even for the case that feels wrong — an internal registry
+lookup whose answer really is reliable. Trust is not a property of where a value
+came from in the deployer's head; it is a claim that has to be journaled, and the
+way to make it is `cx.release`, which names the destination, basis and evidence
+and asks policy under `data:release`. A `trusted: true` field on a tool
+declaration would be the same claim with no record, no authorization and no
+reviewer.
 
 This is the shape Python's `@tool`, Pydantic AI, the OpenAI Agents SDK and Rig
 all arrived at, and the reasons are the same: a schema written twice is a schema
@@ -918,6 +961,91 @@ the first.
 
 **The trap:** believing the type is the security boundary. It is not — it is the
 *shape*. The manifest still declares what this deployment permits.
+
+## 🔌 Call tools on an MCP server you already run
+
+The tool tier is not "your tools, MCP-shaped". `tools::McpClient` is a real MCP
+client: point it at a running server and its tools become callable under the
+ordinary governed path — declaration, protected fields, egress ceiling, budget,
+disposition and all.
+
+Wiring is two lines. `McpClient::new` takes an already-initialised `rmcp` client,
+so the transport — stdio, a child process, streamable HTTP — stays your choice:
+
+```rust
+use agentplane::tools::{McpClient, ToolBox};
+
+// One name per server. It is *your* name for it, not one the server chose:
+// the catalogue keys on it, and a server able to rename itself could step
+// into another server's entry.
+let tickets = Arc::new(McpClient::new("tickets", Arc::new(service)));
+
+let rt = Runtime::builder(store)
+    .agent(Agent::new(&manifest))
+    .toolbox(ToolBox::new().with::<ReadBalance>())   // tools in this binary
+    .tool_server("tickets", tickets)                 // tools on that server
+    .build();
+```
+
+The manifest grants both the same way, because a reference names *which tool*
+and never which wire carries it:
+
+```yaml
+tools:
+  - ref: tool://ledger/read      # a typed Rust tool in this binary
+    mutates: false
+    description: Read a ledger account's balance.
+  - ref: tool://tickets/read     # a tool on the MCP server above
+    mutates: false
+    description: Read a support ticket.
+```
+
+That is also why one manifest can run against an in-process double in a test and
+a real server in production: the transport is a deployment decision, not
+something the reviewed file claims.
+
+One client per server, resolved by name. A `ToolRouter` does the resolving, and
+it matters more than it looks: a single client handed every tool id cannot tell
+`tool://ledger/read` from `tool://tickets/read`, so a plane that granted one and
+wired the other got a **successful answer from the wrong server** under the first
+one's operator safety. A server nobody wired is `Unreachable`, and a grant naming
+one is refused at build rather than at the first call.
+
+### `discover()` is a diff, not a source
+
+An MCP server advertises its tools with annotations — `readOnlyHint`,
+`destructiveHint`, `idempotentHint` — and the obvious convenience is to import
+that list and build a catalogue from it. **That is the one thing this client will
+not do**, and the specification agrees: clients *must* consider annotations
+untrusted.
+
+The composition is what makes it dangerous here rather than merely untidy.
+`readOnlyHint: true` would mean the effect does not mutate; a non-mutating effect
+defaults to `Recovery::Retry`; and a retried call is a second real call. So a
+server that marked its own money-moving tool read-only would be choosing, from
+the far side of the trust boundary, the one condition under which this runtime
+does something twice.
+
+So `discover()` returns what the server says **for comparison**:
+
+```rust
+for (id, advertised) in tickets.discover().await? {
+    if let Some(safety) = catalog.safety(&id) {
+        // Not an error — a server is entitled to describe itself and an
+        // operator is entitled to disagree. It is worth an alert because a
+        // server that *starts* claiming to be read-only after an update is
+        // what a swapped-out or compromised server looks like from here.
+        if advertised.overclaims(safety) {
+            tracing::warn!(%id, "server claims more safety than the operator granted");
+        }
+    }
+}
+```
+
+**The trap:** treating discovery as configuration. A tool absent from the
+operator's catalogue cannot be called however the server advertises it, and that
+is the property. Auto-import would let a server widen its own authority — which
+is exactly what `Advertised` versus `ToolSafety` exists to prevent.
 
 ## 🧾 When the two parties really do differ
 

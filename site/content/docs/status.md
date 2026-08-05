@@ -1,7 +1,7 @@
 +++
 title = "Status"
 description = "What is built, what is deliberately deferred, and how to check this page is telling the truth."
-weight = 9
+weight = 10
 +++
 
 `agentplane` is pre-alpha. The first table is the honest inventory: every row is
@@ -71,6 +71,12 @@ feature, it is an intention — the mechanisms that make that checkable are in
 | ✅ | **Model calls** — usage journaled, and a completion that dies partway is billed for what it generated |
 | ✅ | **Peer calls** — audience-bound credentials obtained by token exchange, refreshed before expiry, and never written to the journal |
 | ✅ | **MCP** — real round trips over `rmcp`, behind the `mcp` feature; every transport failure states whether the call reached the server. Structured content is preferred, while text/image/audio/resource blocks are preserved as typed JSON rather than flattened to text and silently discarded |
+| ✅ | **A tool reference names the tool, never the transport** — grants are `tool://server/name`, and which transport reaches a server is wired at deployment. The old `mcp://` spelling was a supply-chain claim in a review artifact, asserted for tools compiled into the binary and republished to peers on an Agent Card. It also made one manifest untestable against an in-process double. The server component is now load-bearing: `ToolRouter` gives each server its own client, so two servers offering `read` stay two tools, and a plane may use typed in-process tools **and** MCP at once — which a single client handed every id could not express |
+| ✅ | **An MCP client refuses another server's tool** — it dispatched anything it was handed against whatever connection it held, so a plane granting one server's tool and wiring another's got a **successful answer from the wrong server**, under the first one's operator safety. Nothing downstream could see it. Now `Unreachable`, naming both servers, because nothing was attempted and nothing could have been |
+| ✅ | **Embedding is a journaled effect** — `StepCtx::embed` records the query vector beside the model revision that produced it. The vector is inside the semantic-retrieval effect's identity and an embedding service does not promise the same floats twice, so a skill computing its own would quarantine a healthy run on the next replay with nothing on the record to explain it. Held by a test whose embedder deliberately drifts, because a stable stub would pass under a runtime that recomputed |
+| ✅ | **Every published manifest parses** — a YAML snippet in a document is a thing a reader copies and nothing in the toolchain reads it: doc tests compile Rust under `src/`, never markdown. The architecture page's flagship agent declared `role: specialist` beside `max_delegation_depth: 2`, which this crate's own parser refuses, so the first command a reader ran failed. A guard now parses every manifest on the site and in the README with `Manifest::parse` itself rather than a second copy of the rules |
+| ✅ | **A tool body reports a disposition, not a transport error** — `Tool::call` returns `ToolFailure::{DidNotHappen, InDoubt, Landed}`. It used to return the wire vocabulary, which asked an author writing their own logic to translate into facts about a connection they do not have — and to name their own `ToolId` on every error path, with nothing stopping them naming a different tool. The id is attached by the box that dispatched the call, and the mapping to `Disposition` is pinned by a test, because getting it wrong in the `DidNotHappen` direction is how a payment happens twice |
+| ✅ | **Every published Cedar policy is executed** — the site's only worked taint gate read `context.args_trust`, an attribute the runtime has never sent. Cedar is *total*, so the `when` clause did not raise: the `forbid` was unsatisfied, the accompanying `permit` stood, and the gate an adopter would have copied **failed open** while every test around it passed — each one having built a context containing the invented key. Documented policies now run against a matrix of real request contexts and must produce more than one decision, because a rule that parses and distinguishes nothing is the exact shape being guarded against |
 | ✅ | **Cedar** — the policy seam's first adapter, behind the `cedar` feature; strict startup validation, schema-aware request context, static entities, and policy evaluation failures reported as broken rather than ordinary refusals |
 | ✅ | **Authorization** — a total, fail-closed policy seam; denials journaled, complete immutable policy-bundle identity recorded, open-run resume refused on drift, and strict replay never re-opens the gate |
 | ✅ | **OpenTelemetry GenAI conventions** — the run span carries `gen_ai.operation.name = invoke_agent`; tool calls carry `execute_tool` and model calls `chat`, declared by the effect itself rather than sniffed from its name. Effects that are *not* GenAI operations carry no such attribute, which is what keeps it meaningful. The conventions are pre-1.0, so the version targeted is pinned rather than tracked |
@@ -147,6 +153,29 @@ distinction a status page exists to make.
 | ✅ | **Agent Cards derived, not written** — an A2A v1.0 card built from the manifest, so what an agent advertises and what it is permitted cannot drift. Unimplemented transports are advertised as **absent**. `ExtendedAgentCard` is the authenticated variant and a **separate type**, so serving it publicly is a compile error; it withholds the model and the protected-field rules |
 | ✅ | **Signed Agent Cards** — a detached JWS (RFC 7515) over the card canonicalized per RFC 8785, so a peer can check *who published it* rather than only which host served it — and it keeps checking after the card is copied into a registry or a cache. A real JWS, signed over the standard signing input rather than its hash: signing `H(m)` verifies against our own code and nothing else. The algorithm is read from a **constant**, never from the card being checked, which is the `alg: none` attack on the one document an attacker fully controls. Signed at publish so the signature covers the interface URL and tenant as served. Several signatures coexist, so key rotation has no window. Canonicalization is UTF-16-ordered per the RFC, and a guard asserts the card carries no numbers — the one JCS rule this crate does not implement |
 | ✅ | **Client-side card discovery, verification and interface selection** — `CardClient` fetches an agent's card from the well-known path under an **egress allowlist**, because dereferencing a URL from a config or a registry entry is how a plane is made to probe its own network. Verification is opt-in and, once on, **mandatory**: an unsigned card is refused, since the downgrade is removing the signature rather than forging one. Interface selection matches binding *and* `Major.Minor` version in card order, and carries the interface's `tenant` into the endpoint — without it a client can only ever reach an agent serving the default tenant. A card still grants **nothing**: peer authority comes from the operator registry, so a forged card can waste a request and cannot widen one |
+
+## 📌 What to pin, and what will move
+
+Pre-alpha means every one of these can change. It does not mean they are all
+equally likely to, and an adopter deciding what to build against deserves the
+difference rather than one blanket warning.
+
+Nothing here is a compatibility promise. It is a statement about where the
+remaining design pressure is.
+
+| Surface | Expect | Why |
+|---|---|---|
+| **Effect / disposition / recovery vocabulary** | stable | `DidNotHappen`/`InDoubt`/`Landed` and the recovery classes are the load-bearing idea; changing them would be a different system |
+| **`Skill`, `StepCtx` core methods** | stable in shape, additive | new capabilities arrive as new methods; existing ones are not expected to change signature |
+| **Journal record format** | **will change** | not frozen. Upcasters exist, but a format-freeze milestone has not happened and hard cuts are preferred until it does |
+| **Effect keys** | **will change** | any change to a descriptor's arguments moves every key for that effect kind. `tool.call` was `mcp.tools/call` until the reference scheme stopped naming a transport |
+| **Manifest schema** | additive, with hard cuts | `deny_unknown_fields` means an added field is safe and a *removed* one is a hard failure. Fields have been removed when they could not be enforced — see the design decisions above |
+| **`Tool` / `ToolFailure`** | recently changed | `Tool::call` returns `ToolFailure` (disposition-named) rather than `ToolError` (transport-named); references are `tool://server/name` |
+| **Policy seam (`PolicyEngine`, request context)** | stable seam, growing context | the trait is settled. `context` gains attributes as the runtime learns to say more, and a policy reading one that does not exist **fails open** — see [security](@/docs/security.md#the-authorization-context) |
+| **Store traits** | stable seam, growing contract | the conformance battery is the contract; it gains cases faster than the traits gain methods |
+| **SQL schema** | **will change without migration** | pre-alpha, and there is no migration tooling. Recreate rather than migrate |
+| **A2A / MCP wire behaviour** | tracks the specs | exact released versions, not a compatibility range — see the open protocol-support question in the design decisions above |
+| **`testkit`** | stable, additive | it is how embedders test their own stores and skills, so churn here costs more than it saves |
 
 ## 🔍 How to check this page is honest
 

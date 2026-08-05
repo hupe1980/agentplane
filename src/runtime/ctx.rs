@@ -929,7 +929,7 @@ impl<'a> StepCtx<'a> {
     /// failure the binding rule exists to prevent.
     #[cfg(feature = "manifest")]
     fn tool_grant_for(&self, descriptor: &EffectDescriptor) -> Option<&crate::manifest::ToolGrant> {
-        if descriptor.kind != "mcp.tools/call" {
+        if descriptor.kind != "tool.call" {
             return None;
         }
         let server = descriptor.args["server"].as_str()?;
@@ -1006,7 +1006,7 @@ impl<'a> StepCtx<'a> {
                     )
                 })
             }
-            "mcp.tools/call" => {
+            "tool.call" => {
                 let server = descriptor.args["server"].as_str().unwrap_or_default();
                 let tool = descriptor.args["tool"].as_str().unwrap_or_default();
                 let reference = crate::tools::ToolId::new(server, tool).reference();
@@ -2298,6 +2298,45 @@ impl StepCtx<'_> {
             out.push(Tainted::with_label(item, label));
         }
         Ok(out)
+    }
+
+    /// Turn text into a vector, on the record.
+    ///
+    /// The vector this returns is what [`SemanticQuery::embedding`] wants, and
+    /// going through here rather than calling an embedding client directly is
+    /// what makes semantic retrieval replayable at all: the query vector is in
+    /// the retrieval effect's key, and an embedding service is under no
+    /// obligation to return the same floats twice. Journaled, so a strict replay
+    /// reads the vector back instead of asking again — and so the call is
+    /// metered and the model revision that produced it is on the record beside
+    /// the numbers.
+    ///
+    /// The text carries its own label, and the returned vector carries it too: a
+    /// vector derived from an untrusted document is untrusted, and sending
+    /// confidential text to an embedding service is an egress like any other.
+    ///
+    /// [`SemanticQuery::embedding`]: crate::memory::SemanticQuery::embedding
+    ///
+    /// # Errors
+    ///
+    /// Whatever the effect protocol reports — a refused sink, an exhausted
+    /// budget, or the embedder's own failure.
+    pub async fn embed(
+        &mut self,
+        embedder: Arc<dyn crate::memory::Embedder>,
+        text: Tainted<String>,
+    ) -> Result<Tainted<Vec<f32>>, StepError> {
+        let plain = text.peek().clone();
+        let arguments = text.map(serde_json::Value::String);
+        self.sink(
+            crate::runtime::effects::Embed {
+                embedder,
+                text: plain,
+                arguments: arguments.peek().clone(),
+            },
+            &arguments,
+        )
+        .await
     }
 
     /// Rank governed memories through a derived semantic index.

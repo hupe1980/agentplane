@@ -208,7 +208,7 @@ fn healthy() -> Scripted {
 
 // ── Spans ───────────────────────────────────────────────────────────────────
 
-/// A run produces the three-level trace §16.6 promises: one span per run, one
+/// A run produces the three-level trace the design promises: one span per run, one
 /// per step, one per effect attempt.
 #[tokio::test]
 async fn a_run_produces_run_step_and_effect_spans() {

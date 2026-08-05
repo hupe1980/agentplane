@@ -1,7 +1,7 @@
 +++
 title = "Operations"
 description = "Deploying, high availability, retention, observability, and a runbook for every state a run can get stuck in."
-weight = 7
+weight = 8
 +++
 
 Running this for real: topologies, the store contract, the background sweep,

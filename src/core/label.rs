@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn trust_join_degrades() {
         let t = Label::trusted();
-        let u = Label::untrusted(src("mcp://tool"));
+        let u = Label::untrusted(src("tool://tool"));
         assert_eq!(t.join(&u).trust, Trust::Untrusted);
         assert_eq!(u.join(&t).trust, Trust::Untrusted, "join is commutative");
     }
@@ -760,7 +760,7 @@ mod tests {
     #[test]
     fn zip_propagates_untrust_to_derived_values() {
         let trusted = Tainted::trusted(1);
-        let untrusted = Tainted::from_source(2, src("mcp://tool"));
+        let untrusted = Tainted::from_source(2, src("tool://tool"));
         let combined = trusted.zip(untrusted).map(|(a, b)| a + b);
         assert!(combined.label().is_untrusted());
         assert_eq!(*combined.peek(), 3);

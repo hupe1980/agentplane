@@ -45,6 +45,6 @@ spec:
     max_steps: 5
 
   tools:
-    - ref: "mcp://tickets/read"
+    - ref: "tool://tickets/read"
       mutates: false
       max_sensitivity: internal

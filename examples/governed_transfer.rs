@@ -89,7 +89,7 @@ impl Skill for Transfer {
                     ReleaseScope::trust(),
                     ["/recipient".to_owned()],
                     "operator matched the account to settlement SET-42",
-                    "mcp://ledger/transfer",
+                    "tool://ledger/transfer",
                     ["approval:SET-42".to_owned()],
                 ),
             )

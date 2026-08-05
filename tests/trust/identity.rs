@@ -489,7 +489,7 @@ async fn the_policy_request_carries_the_owner_and_the_depth() {
     );
     assert!(
         seen.iter().any(|c| c["delegation_depth"] == 1),
-        "and §11.1's depth cap is expressible in Cedar only if depth is in the \
+        "and a depth cap is expressible in Cedar only if depth is in the \
          context: {seen:?}"
     );
 }

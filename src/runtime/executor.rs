@@ -201,11 +201,11 @@ pub struct Runtime {
     governed_by: HashMap<String, Arc<crate::manifest::Manifest>>,
     /// Which tenant this plane runs as.
     ///
-    /// One plane serves one tenant. A plane serving several would need every
-    /// key, lease, correlation and blob path to carry the tenant, and a single
-    /// place that forgot would be an isolation hole indistinguishable from
-    /// working software. A process per tenant is the boundary this crate can
-    /// actually hold up.
+    /// One plane serves one tenant; a **process** may run several and serve
+    /// them all, because `api::Planes` resolves a plane from the authenticated
+    /// caller's tenant. That is what the composite keys on both backends bought:
+    /// the tenant leads every key, lease, correlation and blob path, so a query
+    /// that forgets it misses rather than returning somebody else's rows.
     tenant: crate::core::TenantId,
     /// Who vouched for each declaration, by agent name.
     ///
@@ -274,6 +274,8 @@ impl Runtime {
             calendar: None,
             #[cfg(feature = "manifest")]
             toolbox: None,
+            #[cfg(feature = "manifest")]
+            tool_servers: Vec::new(),
             #[cfg(feature = "manifest")]
             agents: Vec::new(),
             #[cfg(feature = "manifest")]
@@ -3330,6 +3332,9 @@ pub struct RuntimeBuilder {
     /// Typed tools whose coherence with every agent is checked at `build`.
     #[cfg(feature = "manifest")]
     toolbox: Option<crate::tools::ToolBox>,
+    /// Tool servers reached by some transport other than the box, by name.
+    #[cfg(feature = "manifest")]
+    tool_servers: Vec<(String, Arc<dyn crate::tools::ToolClient>)>,
     /// Agents registered on this plane, each with its own declaration.
     #[cfg(feature = "manifest")]
     agents: Vec<Agent>,
@@ -3651,12 +3656,44 @@ impl RuntimeBuilder {
         self
     }
 
+    /// A tool server this plane reaches over some transport of its own.
+    ///
+    /// An MCP connection is the usual one. Registering it does three things that
+    /// were previously impossible together:
+    ///
+    /// * a plane may reach **several** servers, because the router resolves the
+    ///   `tool://server/name` a grant carries rather than handing every id to one
+    ///   client;
+    /// * typed in-process tools and remote servers can be used by the *same*
+    ///   agent, which is the ordinary shape and used to be unrepresentable;
+    /// * a grant naming a server nobody wired is refused at build, in the same
+    ///   breath as a grant nothing implements — both mean the model would be
+    ///   offered a tool that fails when chosen.
+    ///
+    /// Composes with [`toolbox`](Self::toolbox); the box answers for the servers
+    /// its own tools name and these answer for theirs. A server claimed twice is
+    /// a panic, because registration order deciding which transport carries a
+    /// call is the defect [`ToolRouter`](crate::tools::ToolRouter) exists to
+    /// remove.
+    #[cfg(feature = "manifest")]
+    #[must_use]
+    pub fn tool_server(
+        mut self,
+        name: impl Into<String>,
+        client: Arc<dyn crate::tools::ToolClient>,
+    ) -> Self {
+        self.tool_servers.push((name.into(), client));
+        self
+    }
+
     /// Which tenant this plane runs as.
     ///
-    /// **One plane, one tenant.** A plane serving several would have to pick the
-    /// tenant per request, and nothing here does: no HTTP or A2A surface maps an
-    /// authenticated caller to a tenant. A process per tenant is a boundary that
-    /// can be held up, and it is what this crate offers.
+    /// **One plane, one tenant — but one process, many planes.** A plane is the
+    /// unit that is bound to a tenant; serving several is
+    /// [`Planes`](crate::api::Planes)' job, and it resolves the plane from the
+    /// authenticated caller's tenant rather than from the request, so a handler
+    /// cannot reach a store it did not resolve. An unregistered tenant is
+    /// refused rather than defaulted.
     ///
     /// The name scopes **data keys**, so one tenant's cryptographic erasure
     /// cannot reach another's bytes, and it reaches the **policy request**, so a
@@ -3770,9 +3807,19 @@ impl RuntimeBuilder {
     /// tenant mismatch beside it is: loudly, before anything runs.
     #[cfg(feature = "manifest")]
     fn settle_toolbox(&mut self) {
-        let Some(tools) = self.toolbox.take() else {
+        let servers = std::mem::take(&mut self.tool_servers);
+        let tools = self.toolbox.take();
+        if tools.is_none() && servers.is_empty() {
             return;
-        };
+        }
+        let tools = tools.unwrap_or_default();
+        let remote_servers: std::collections::BTreeSet<String> =
+            servers.iter().map(|(name, _)| name.clone()).collect();
+        assert!(
+            remote_servers.len() == servers.len(),
+            "a tool server is registered twice — registration order would decide \
+             which transport carries a call"
+        );
         // Both forms wired is not a merge and must not silently be one. The
         // hand-built catalogue is the operator saying something deliberate; the
         // derived one is the agent's declaration. Overwriting either with the
@@ -3790,7 +3837,7 @@ impl RuntimeBuilder {
         // refusal rather than a silent overwrite.
         //
         // A plane has one catalogue and its agents have one manifest each, so
-        // two agents granting `mcp://ledger/read` with different protected
+        // two agents granting `tool://ledger/read` with different protected
         // fields cannot both be satisfied. Merging by last-writer would resolve
         // it by **registration order** — the one thing this builder already
         // says an enforcement must never depend on — and it fails at a
@@ -3805,7 +3852,7 @@ impl RuntimeBuilder {
                 continue;
             };
             declared += 1;
-            if let Err(problems) = tools.check_against(manifest) {
+            if let Err(problems) = tools.check_against(manifest, &remote_servers) {
                 panic!(
                     "the tools this binary implements and the manifest of agent \
                      '{}' disagree — the declaration a reviewer approved no longer \
@@ -3851,9 +3898,17 @@ impl RuntimeBuilder {
                 .map_or_else(|| description.to_owned(), |(text, _)| text.to_owned());
             catalog = catalog.declare(id.clone(), reviewed_description, schema.clone());
         }
+        // One client per server, resolved by the name a grant carries. A single
+        // client handed every id could not tell `tool://ledger/read` from
+        // `tool://tickets/read`, and a transport that never reads the server
+        // component answers both — from whichever server it happens to hold.
+        let router = servers.into_iter().fold(
+            crate::tools::ToolRouter::new().toolbox(&Arc::new(tools)),
+            |router, (name, client)| router.server(name, client),
+        );
         self.tools = Some((
             Arc::new(catalog),
-            Arc::new(tools) as Arc<dyn crate::tools::ToolClient>,
+            Arc::new(router) as Arc<dyn crate::tools::ToolClient>,
         ));
     }
 

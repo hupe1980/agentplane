@@ -42,10 +42,11 @@ mod typed;
 
 #[cfg(feature = "mcp")]
 pub use mcp::McpClient;
-pub use typed::{Tool, ToolBox};
+pub use typed::{Tool, ToolBox, ToolFailure};
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -61,11 +62,30 @@ use crate::core::{
 /// The server is part of the identity because two servers may both offer
 /// `transfer`, and they are not the same tool — the catalogue must be able to
 /// permit one and refuse the other.
+///
+/// The server name is the **operator's local name for a provider**, not
+/// anything the far side chose, and it is what [`ToolRouter`] dispatches on.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ToolId {
     pub server: String,
     pub tool: String,
 }
+
+/// The scheme a manifest grant is written in.
+///
+/// Deliberately transport-neutral, and it did not start that way. Grants were
+/// spelled `mcp://server/tool` — including for tools compiled into this binary,
+/// which never touch MCP. A manifest is a **review artifact** and an Agent Card
+/// republishes its tool references, so that scheme was asserting a supply-chain
+/// fact the document cannot know, to readers who have no way to check it. A
+/// false statement in a reviewed file is the defect this crate refuses
+/// everywhere else.
+///
+/// A reference names *which tool*. Which transport reaches its server is a
+/// **deployment** decision, made by [`ToolRouter`] — and keeping it there is
+/// also what lets one manifest run against an in-process double in a test and a
+/// real MCP server in production, which a transport-bearing reference forbids.
+pub const TOOL_SCHEME: &str = "tool://";
 
 impl ToolId {
     pub fn new(server: impl Into<String>, tool: impl Into<String>) -> Self {
@@ -75,7 +95,7 @@ impl ToolId {
         }
     }
 
-    /// How a **manifest** names this tool: `mcp://server/tool`.
+    /// How a **manifest** names this tool: `tool://server/name`.
     ///
     /// The one spelling a grant is matched against. Built here rather than at
     /// each call site because it was built at each call site, in two formats,
@@ -83,18 +103,17 @@ impl ToolId {
     /// was the result.
     #[must_use]
     pub fn reference(&self) -> String {
-        format!("mcp://{}/{}", self.server, self.tool)
+        format!("{TOOL_SCHEME}{}/{}", self.server, self.tool)
     }
 
     /// The inverse of [`reference`](Self::reference).
     ///
-    /// `None` for anything that is not `mcp://server/tool`. Refusing rather
-    /// than guessing: a reference this cannot parse is one the transport cannot
-    /// dial either, and inventing an id from it would grant a tool nobody
-    /// wrote down.
+    /// `None` for anything that is not `tool://server/name`. Refusing rather
+    /// than guessing: a reference this cannot parse is one no router can dial,
+    /// and inventing an id from it would grant a tool nobody wrote down.
     #[must_use]
     pub fn parse(reference: &str) -> Option<Self> {
-        let rest = reference.strip_prefix("mcp://")?;
+        let rest = reference.strip_prefix(TOOL_SCHEME)?;
         let (server, tool) = rest.split_once('/')?;
         (!server.is_empty() && !tool.is_empty() && !tool.contains('/'))
             .then(|| Self::new(server, tool))
@@ -102,7 +121,7 @@ impl ToolId {
 
     /// How a **model** names this tool: `server__tool`.
     ///
-    /// Neither `mcp://server/tool` nor `server/tool` is a legal function name —
+    /// Neither `tool://server/tool` nor `server/tool` is a legal function name —
     /// providers restrict them to letters, digits, underscore and hyphen, so a
     /// `:` or `/` is rejected before the model ever sees the tool. The double
     /// underscore is the separator because a single one appears inside ordinary
@@ -543,6 +562,96 @@ impl ToolCatalog {
     }
 }
 
+/// Which client reaches which server.
+///
+/// # Why a plane needs one at all
+///
+/// A [`ToolId`] carries a server because two servers may both offer `transfer`
+/// and they are not the same tool. Nothing enforced that: a plane held exactly
+/// one [`ToolClient`] and handed it every id, so a deployment could grant
+/// `tool://ledger/read` and wire a client connected to a *different* server —
+/// which then answered, because a transport that never reads the server
+/// component cannot tell the difference. The realistic shape is two servers with
+/// a tool of the same name, where the wrong one runs and reports success.
+///
+/// One client per server, resolved by name, makes that unspellable. A server
+/// nobody registered is [`ToolError::Unreachable`] — the honest answer, since
+/// there is no transport that could carry the call.
+///
+/// It is also what lets a plane use more than one kind of tool at once. A
+/// [`ToolBox`] of typed in-process tools and an MCP server are two transports,
+/// and before this a plane could have exactly one of them.
+#[derive(Debug, Default)]
+pub struct ToolRouter {
+    routes: BTreeMap<String, Arc<dyn ToolClient>>,
+}
+
+impl ToolRouter {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Route one server's tools to one client.
+    ///
+    /// # Panics
+    ///
+    /// If the server is already routed. Silently replacing would make
+    /// registration order decide which transport carries a call, which is the
+    /// same defect this type exists to remove.
+    #[must_use]
+    pub fn server(mut self, name: impl Into<String>, client: Arc<dyn ToolClient>) -> Self {
+        let name = name.into();
+        assert!(
+            !self.routes.contains_key(&name),
+            "tool server '{name}' is routed twice — one of the two transports would \
+             silently never be called"
+        );
+        self.routes.insert(name, client);
+        self
+    }
+
+    /// Route every server the box implements to the box.
+    ///
+    /// A typed tool names its own server, so the box already knows which ones it
+    /// answers for; asking a caller to repeat them would be one decision written
+    /// twice.
+    #[must_use]
+    pub fn toolbox(self, tools: &Arc<ToolBox>) -> Self {
+        let servers: Vec<String> = tools.servers().map(ToOwned::to_owned).collect();
+        servers.into_iter().fold(self, |router, name| {
+            router.server(name, Arc::clone(tools) as Arc<dyn ToolClient>)
+        })
+    }
+
+    /// The servers this router can reach.
+    pub fn servers(&self) -> impl Iterator<Item = &str> {
+        self.routes.keys().map(String::as_str)
+    }
+}
+
+#[async_trait]
+impl ToolClient for ToolRouter {
+    async fn call(
+        &self,
+        tool: &ToolId,
+        arguments: &Value,
+        provenance: Option<&crate::core::Provenance>,
+    ) -> Result<Value, ToolError> {
+        let Some(client) = self.routes.get(&tool.server) else {
+            return Err(ToolError::Unreachable {
+                tool: tool.clone(),
+                detail: format!(
+                    "no transport is wired for tool server '{}'; this plane routes {:?}",
+                    tool.server,
+                    self.routes.keys().collect::<Vec<_>>()
+                ),
+            });
+        };
+        client.call(tool, arguments, provenance).await
+    }
+}
+
 /// One call to one tool.
 ///
 /// Built through [`ToolCatalog`], so a tool nobody declared cannot be
@@ -606,7 +715,7 @@ impl Effect for ToolCall {
         // same tool name are two different effects and cannot replay into each
         // other.
         EffectDescriptor::new(
-            "mcp.tools/call",
+            "tool.call",
             serde_json::json!({
                 "server": self.id.server,
                 "tool": self.id.tool,

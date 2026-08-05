@@ -4,9 +4,9 @@ description = "Runs and cases, effects and dispositions, labels and typed releas
 weight = 2
 +++
 
-The vocabulary. Eight ideas; everything else in the crate is a consequence of
-one of them. Read this once and the rest of the documentation stops needing
-footnotes.
+The vocabulary. Nine ideas, then the two surfaces you program against —
+everything else in the crate is a consequence of one of them. Read this once and
+the rest of the documentation stops needing footnotes.
 
 ---
 
@@ -266,6 +266,84 @@ already in the journal.
 
 ---
 
+## 10. ⏳ Human oversight and obligations {#oversight}
+
+An **obligation** is a named deadline attached to a case. It is the primitive for
+work that is due rather than work that is slow, and the distinction is the whole
+point: a missed retry is an inconvenience, a missed regulatory window is a
+breach. The two must not share a mechanism.
+
+```rust,ignore
+// Resolved once against the deployment's Calendar and journaled, so a replay
+// never recomputes "five working days" under a changed holiday table.
+let due = cx.deadline("aperak", &DeadlineSpec::working_days(1), Some(Duration::hours(1))).await?;
+
+cx.meet_deadline("aperak").await?;    // discharged
+cx.cancel_deadline("aperak").await?;  // no longer applicable
+```
+
+Four properties carry it:
+
+* **The instant is journaled, not recomputed.** A business calendar changes;
+  history does not. Replaying last quarter under this quarter's holiday table
+  would produce a different due date for the same run.
+* **A case cannot close while an obligation is open.** Closure is a structural
+  check, not a convention somebody remembers.
+* **`warn_before` is separate from the deadline**, so *approaching* and *breached*
+  are different events reaching different people.
+* **The sweep that breaches one writes its own history.** Breaching an obligation
+  is the most consequential thing the plane does *without being asked*, and there
+  is no run to explain it — so a tick that decides anything writes into a sealed
+  run of its own. State alone cannot tell *the sweep breached this at 02:00* from
+  *somebody set it*.
+
+**Human tasks** are the other half. `oversight.approval: required` in a manifest
+makes a declarative agent open a worklist task carrying its **actual answer** and
+return only once a person decides. `TaskStore::claim` enforces four-eyes, and the
+wire types deliberately carry **no actor field** — who is acting comes from the
+request's identity, never from its body, so an approval cannot be forged by the
+thing being approved.
+
+Unattended expiry needs two explicit opt-ins: a declared `on_expiry: proceed`
+*and* `allow_unattended: true`. Acting with no human is a greppable decision
+somebody made rather than an enum variant they picked off a list.
+
+See the [manifest reference](@/docs/manifest.md#spec-oversight) for the
+declaration, and `api::{Worklist, TaskView, DecisionRequest}` for the HTTP
+surface.
+
+## 11. 🧵 `StepCtx` — the surface you program against {#step-context}
+
+Everything above reaches your code through one type. A skill receives a
+`StepCtx`, and **every method on it that touches the world is a journaled
+effect** — which is why the list is worth reading as a whole rather than
+discovering one call at a time.
+
+| | |
+|---|---|
+| `now()`, `random()` | the clock and RNG, journaled and reproduced on replay |
+| `effect(e)` | any effect with no labelled value to bind |
+| `sink(e, &value)` | an outbound effect **with** its labelled arguments — the only path that can carry protected fields |
+| `release(request)` | typed, policy-authorized improvement of a label |
+| `deadline`, `meet_deadline`, `cancel_deadline` | obligations |
+| `sleep(d)`, `await_event(&spec)` | durable suspension — a waiting run is a row, not a thread |
+| `case_state()`, `write_case_state()` | shared state across runs, version-checked |
+| `remember`, `recall`, `compact`, `form_memories` | governed memory |
+| `embed`, `semantic_recall` | vectors and ranking, both journaled |
+| `store_blob`, `read_blob` | content-addressed payloads |
+| `commission(capability, input)` | hand work to another agent on this plane |
+| `group()` | a transactional effect group |
+
+Two things about `commission` are worth stating because every multi-agent
+adopter asks: it takes `&mut self` and is **singular**, so a step delegates to
+one peer at a time. That is deliberate rather than unfinished. `StepCtx` is the
+deterministic admission boundary — journal position, policy and budget decisions
+all pass through it — and handing out concurrent borrows would move those
+decisions outside it. **Fan out above the runtime**: independent opinions are
+better as independent runs with their own journals, which is also what makes each
+one separately replayable. There is no `join`/`select` helper and there
+deliberately will not be one.
+
 ## The pattern underneath all of them 🔍
 
 Nearly every decision here has the same shape: **make the dangerous thing
@@ -289,4 +367,6 @@ usually why.
 |---|---|
 | 🏗️ | [Architecture](@/docs/architecture.md) — how each of these is implemented |
 | 🍳 | [Cookbook](@/docs/cookbook.md) — using them |
-| 🔐 | [Security model](@/docs/security.md) — the trust boundary and its limits |
+| 🔐 | [Security model](@/docs/security.md) — the trust boundary, its limits, and worked Cedar policies |
+| 📄 | [Manifest reference](@/docs/manifest.md) — every field an agent declaration may carry |
+| 🧪 | [Testing agents](@/docs/testing.md) — a fake provider, fault injection, and the replay assertion |

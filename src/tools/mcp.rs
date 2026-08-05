@@ -173,6 +173,22 @@ impl ToolClient for McpClient {
         arguments: &Value,
         provenance: Option<&crate::core::Provenance>,
     ) -> Result<Value, ToolError> {
+        // A `ToolId` names a server precisely so two servers offering
+        // `transfer` stay two tools. This client speaks to exactly one, and
+        // until it checked, it executed whatever name it was handed against
+        // whatever it was connected to — so a plane granting `tool://ledger/read`
+        // and wiring the `tickets` connection got an answer, from the wrong
+        // server, under the ledger's operator safety. `Unreachable`, because
+        // nothing was attempted and nothing could have been.
+        if tool.server != self.server {
+            return Err(ToolError::Unreachable {
+                tool: tool.clone(),
+                detail: format!(
+                    "this client is connected to MCP server '{}', not '{}'",
+                    self.server, tool.server
+                ),
+            });
+        }
         let object = match arguments {
             Value::Object(map) => Some(map.clone()),
             Value::Null => None,

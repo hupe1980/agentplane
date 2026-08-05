@@ -257,7 +257,7 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
         let p = e.path();
         if p.is_dir() {
             out.extend(walk(&p));
-        } else if p.extension().is_some_and(|x| x == "rs") {
+        } else if p.extension().is_some_and(|x| x == "rs" || x == "md") {
             out.push(p);
         }
     }
@@ -268,6 +268,12 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
 ///
 /// A named specification before the section is a citation a reader can follow;
 /// a bare one is a pointer into an internal document.
+///
+/// The internal document numbers two things, and for a while this saw only one:
+/// sections are `§9.1` and invariants are `§I1`, so a reference to an invariant
+/// went straight past a detector that required a digit after the sign. It slipped
+/// a fresh leak into shipped rustdoc while the guard reported clean — the shape
+/// this project keeps a second check for, arriving in the check itself.
 fn cites_internal_section(line: &str) -> bool {
     let Some(at) = line.find('§') else {
         return false;
@@ -276,10 +282,13 @@ fn cites_internal_section(line: &str) -> bool {
     if before.contains("RFC") || before.contains("C2SP") {
         return false;
     }
-    line[at..]
-        .chars()
-        .nth(1)
-        .is_some_and(|c| c.is_ascii_digit())
+    let mut after = line[at..].chars().skip(1);
+    match after.next() {
+        Some(c) if c.is_ascii_digit() => true,
+        // `§I1`, an invariant rather than a section: the sign, `I`, a digit.
+        Some('I') => after.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
+    }
 }
 
 /// Shipped source must not cite sections of the internal design document.
@@ -298,7 +307,7 @@ fn cites_internal_section(line: &str) -> bool {
 /// tree a working detector and a disabled one both report nothing, so deleting
 /// the rule would leave a green test guarding an empty set.
 #[test]
-fn shipped_source_cites_no_internal_section_numbers() {
+fn nothing_a_reader_sees_cites_an_internal_section_number() {
     assert!(
         cites_internal_section("//! The sensitivity lattice (§12) controls what may leave"),
         "the detector does not recognise the very thing it exists to find"
@@ -306,6 +315,15 @@ fn shipped_source_cites_no_internal_section_numbers() {
     assert!(
         cites_internal_section("/// Three is the shape §11.1 describes"),
         "the detector misses a subsection reference"
+    );
+    assert!(
+        cites_internal_section("/// a nondeterministic read — §I1's exact prohibition"),
+        "the detector misses an *invariant* reference, which is how a leak got \
+         into shipped rustdoc while this guard reported clean"
+    );
+    assert!(
+        !cites_internal_section("/// the § sign used as ordinary punctuation"),
+        "the detector fires on a sign that cites nothing"
     );
     assert!(
         !cites_internal_section("/// RFC 4648 §4, the encoding the note format specifies."),
@@ -317,22 +335,41 @@ fn shipped_source_cites_no_internal_section_numbers() {
         "the detector fires on a line containing no section reference"
     );
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let files = walk(&root);
+    // `src` is what reaches docs.rs, but the repository is public and an
+    // evaluator reads `tests` and `examples` to see what the crate can do. A
+    // pointer into a document they do not have is the same dead reference
+    // wherever it sits, so all three are scanned. Markdown is covered too: the
+    // site and the README are the first thing anyone reads.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for dir in ["src", "tests", "examples", "site/content"] {
+        files.extend(walk(&root.join(dir)));
+    }
+    files.push(root.join("README.md"));
+    files.push(root.join("CONTRIBUTING.md"));
     assert!(
-        files.len() > 20,
-        "the source scan found only {} files — this guard is now inert",
+        files.len() > 60,
+        "the scan found only {} files — this guard is now inert",
         files.len()
     );
 
     let mut offenders = Vec::new();
     for path in &files {
-        let text = std::fs::read_to_string(path).expect("a source file this crate owns");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        // This file defines the detector, so it necessarily contains examples
+        // of what it detects. Excluding it by name rather than by pattern: a
+        // pattern that skipped "lines that look like fixtures" would also skip
+        // a real leak that happened to look like one.
+        if path.file_name().is_some_and(|n| n == "docs.rs") {
+            continue;
+        }
         for (n, line) in text.lines().enumerate() {
             if cites_internal_section(line) {
                 offenders.push(format!(
                     "{}:{}: {}",
-                    path.strip_prefix(&root).unwrap_or(path).display(),
+                    path.strip_prefix(root).unwrap_or(path).display(),
                     n + 1,
                     line.trim()
                 ));
@@ -342,9 +379,82 @@ fn shipped_source_cites_no_internal_section_numbers() {
 
     assert!(
         offenders.is_empty(),
-        "shipped source cites internal design-document sections, which a docs.rs \
-         reader cannot resolve and which go stale silently when the document is \
-         renumbered — state the reasoning instead:\n{}",
+        "an artifact a reader can see cites internal design-document sections, \
+         which they cannot resolve and which go stale silently when the document \
+         is renumbered — state the reasoning instead:\n{}",
         offenders.join("\n")
+    );
+}
+
+/// Every manifest published anywhere is one the crate's own parser accepts.
+///
+/// A manifest in a document is a snippet a reader copies, and nothing in the
+/// toolchain reads it: doc tests compile Rust under `src/`, never the YAML in a
+/// markdown page. So an example could contradict a validation rule the same
+/// repository enforces, and did — the architecture page's flagship agent
+/// declared `role: specialist` beside `max_delegation_depth: 2`, a pair
+/// [`Manifest::validate`](agentplane::manifest::Manifest::validate) refuses.
+/// A reader following the page got a parse error from the first command.
+///
+/// The parser is the authority here, deliberately: a guard that re-implemented
+/// the rules would be a second copy of them, agreeing everywhere except the
+/// boundary that matters.
+#[test]
+#[cfg(feature = "manifest")]
+fn every_documented_manifest_parses() {
+    use agentplane::manifest::{API_VERSION, Manifest};
+
+    let mut checked = 0usize;
+    let mut pages = 0usize;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<std::path::PathBuf> = vec![root.join("README.md")];
+    let mut stack = vec![root.join("site/content")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("the site content tree is readable") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                files.push(path);
+            }
+        }
+    }
+
+    for file in &files {
+        pages += 1;
+        let text = std::fs::read_to_string(file).expect("a readable page");
+        // Fenced blocks, in order; every other segment is inside a fence.
+        for (index, block) in text.split("```").enumerate() {
+            if index % 2 == 0 {
+                continue;
+            }
+            let body = block.split_once('\n').map_or("", |(_, rest)| rest);
+            if !body.contains(API_VERSION) {
+                continue;
+            }
+            checked += 1;
+            if let Err(error) = Manifest::parse(body) {
+                panic!(
+                    "the manifest published in {} is refused by this crate's own \
+                     parser, so a reader copying it gets an error rather than an \
+                     agent: {error}\n---\n{body}",
+                    file.strip_prefix(root).unwrap_or(file).display()
+                );
+            }
+        }
+    }
+
+    // A walk that read nothing satisfies every assertion above by having
+    // nothing to assert on, which is the silent failure this project keeps a
+    // second check for.
+    assert!(
+        pages > 5,
+        "the documentation walk found only {pages} pages — the site moved and \
+         this guard is now inert"
+    );
+    assert!(
+        checked > 0,
+        "no published manifest was found to check across {pages} pages — either \
+         the examples were removed or the fence scan stopped matching them"
     );
 }
