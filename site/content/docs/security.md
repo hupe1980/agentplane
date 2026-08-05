@@ -494,9 +494,12 @@ version from `MemoryStore` and verifies subject, purpose and digest. A poisoned
 or stale ANN index can cause a loud refusal or rank legitimate in-scope records
 badly; it cannot substitute another subject's content or rewrite a version.
 
-The residual lifecycle gap is cryptographic deletion: memory rows are not yet
-sealed under subject/case data keys. Erasing the live store therefore does not
-make old backup copies unreadable, unlike keyring-backed payload erasure.
+`EncryptedMemoryStore` seals each item's content under a fresh data key wrapped
+by a tenant/subject scope. Legal hold is checked before scope destruction;
+afterwards live rows, replicas and backup ciphertext are unreadable. The shipped
+coordinator is explicitly single-node: active-active deployments must coordinate
+the database lifecycle lock with KMS destruction across instances rather than
+mistaking a process mutex for a distributed erasure barrier.
 
 `subject` and `purpose` organize private-agent or shared-team memory; they are
 not ACLs. `memory.recall` and `memory.remember` go through policy with the acting

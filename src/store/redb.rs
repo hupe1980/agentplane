@@ -88,6 +88,12 @@ const RUN_SEAL: TableDefinition<&str, (&str, &[u8], u64)> = TableDefinition::new
 const RUN_BY_OUTCOME: TableDefinition<(&str, &str, u64), &str> =
     TableDefinition::new("run_by_outcome");
 
+/// `(tenant, updated_at, run_id) -> ()`, every run by last durable append.
+const RUN_ACTIVITY: TableDefinition<(&str, u64, &str), ()> = TableDefinition::new("run_activity");
+/// `(tenant, run_id) -> updated_at`, for replacing the activity index row.
+const RUN_LAST_ACTIVITY: TableDefinition<(&str, &str), u64> =
+    TableDefinition::new("run_last_activity");
+
 /// `log_index -> run_id`, the plane's Merkle log in seal order.
 ///
 /// Positions are never reissued, so this table keeps gaps when a run is removed
@@ -580,6 +586,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl JournalStore for RedbStore {
     fn tenant(&self) -> &str {
@@ -681,6 +688,23 @@ impl JournalStore for RedbStore {
                     };
                     sealed.push(record);
                 }
+                let updated = now_secs();
+                let mut activity = w.open_table(RUN_ACTIVITY).map_err(|e| be(&e))?;
+                let mut last = w.open_table(RUN_LAST_ACTIVITY).map_err(|e| be(&e))?;
+                if let Some(previous) = last
+                    .get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|value| value.value())
+                {
+                    activity
+                        .remove((tenant.as_str(), previous, key.as_str()))
+                        .map_err(|e| be(&e))?;
+                }
+                activity
+                    .insert((tenant.as_str(), updated, key.as_str()), ())
+                    .map_err(|e| be(&e))?;
+                last.insert((tenant.as_str(), key.as_str()), updated)
+                    .map_err(|e| be(&e))?;
                 sealed
             };
             w.commit().map_err(|e| be(&e))?;
@@ -952,6 +976,33 @@ impl JournalStore for RedbStore {
                 }
             }
             Ok(out)
+        })
+        .await
+    }
+
+    async fn recent_runs(&self) -> Result<Vec<(RunId, u64)>, StoreError> {
+        let tenant = self.tenant_name();
+        let prefix = format!("{tenant}/");
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(activity) = r.open_table(RUN_ACTIVITY) else {
+                return Ok(Vec::new());
+            };
+            activity
+                .range((tenant.as_str(), 0, "")..=(tenant.as_str(), u64::MAX, MAX_STR))
+                .map_err(|e| be(&e))?
+                .rev()
+                .filter_map(|entry| match entry {
+                    Ok((key, _)) => {
+                        let (_, updated, stored) = key.value();
+                        stored
+                            .strip_prefix(prefix.as_str())
+                            .and_then(|id| RunId::parse(id).ok())
+                            .map(|run| Ok((run, updated)))
+                    }
+                    Err(error) => Some(Err(be(&error))),
+                })
+                .collect()
         })
         .await
     }

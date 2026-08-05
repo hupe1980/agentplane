@@ -213,6 +213,9 @@ pub fn scope(tenant: &crate::core::TenantId, unit: &str) -> String {
 mod sealed;
 pub use sealed::EncryptedBlobs;
 
+mod memory;
+pub use memory::EncryptedMemoryStore;
+
 #[cfg(feature = "keyring-vault")]
 mod vault;
 #[cfg(feature = "keyring-vault")]

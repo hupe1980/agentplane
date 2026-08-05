@@ -49,6 +49,10 @@ const FORGOTTEN: TableDefinition<(&str, &str), ()> = TableDefinition::new("memor
 /// `(tenant, id) -> ()`, legal holds that block every erasure path.
 const HOLDS: TableDefinition<(&str, &str), ()> = TableDefinition::new("memory_legal_holds");
 
+/// `(tenant, id) -> effective access expiry`, separate from immutable items.
+const ACCESS_EXPIRY: TableDefinition<(&str, &str), i64> =
+    TableDefinition::new("memory_access_expiry");
+
 #[async_trait]
 impl MemoryStore for RedbStore {
     #[allow(clippy::too_many_lines)]
@@ -233,6 +237,7 @@ impl MemoryStore for RedbStore {
             let Ok(items) = r.open_table(ITEMS) else {
                 return Ok(Vec::new());
             };
+            let access = r.open_table(ACCESS_EXPIRY).ok();
 
             // Ranged within one tenant and one subject. A purpose narrows the
             // range further rather than filtering afterwards, so a memory kept
@@ -276,7 +281,17 @@ impl MemoryStore for RedbStore {
                 };
                 let item: MemoryItem = serde_json::from_str(raw.value())
                     .map_err(|e| StoreError::Backend(e.to_string()))?;
-                if as_of.is_some_and(|at| item.expires_at.is_some_and(|expires| expires <= at)) {
+                let access_expiry = access
+                    .as_ref()
+                    .and_then(|table| table.get((tenant.as_str(), id)).ok().flatten())
+                    .and_then(|value| {
+                        crate::core::Timestamp::from_unix_timestamp(value.value()).ok()
+                    });
+                let effective = match (item.expires_at, access_expiry) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (left, right) => left.or(right),
+                };
+                if as_of.is_some_and(|at| effective.is_some_and(|expires| expires <= at)) {
                     continue;
                 }
                 out.push(item);
@@ -403,6 +418,7 @@ impl MemoryStore for RedbStore {
                 }
 
                 let holds = w.open_table(HOLDS).map_err(|e| be(&e))?;
+                let mut access = w.open_table(ACCESS_EXPIRY).map_err(|e| be(&e))?;
                 for memory_id in &doomed {
                     if holds
                         .get((tenant.as_str(), memory_id.as_str()))
@@ -439,6 +455,9 @@ impl MemoryStore for RedbStore {
                         .map_err(|e| be(&e))?;
                     forgotten
                         .insert((tenant.as_str(), memory_id.as_str()), ())
+                        .map_err(|e| be(&e))?;
+                    access
+                        .remove((tenant.as_str(), memory_id.as_str()))
                         .map_err(|e| be(&e))?;
 
                     let versions: Vec<u64> = items
@@ -752,6 +771,7 @@ impl MemoryStore for RedbStore {
                 let mut forgotten = w.open_table(FORGOTTEN).map_err(|e| be(&e))?;
                 let mut edges = w.open_table(DERIVED).map_err(|e| be(&e))?;
                 let holds = w.open_table(HOLDS).map_err(|e| be(&e))?;
+                let access = w.open_table(ACCESS_EXPIRY).map_err(|e| be(&e))?;
                 let entries: Vec<(String, String, String, i64, u64)> = current
                     .range((tenant.as_str(), "")..=(tenant.as_str(), MAX_STR))
                     .map_err(|e| be(&e))?
@@ -788,7 +808,17 @@ impl MemoryStore for RedbStore {
                     };
                     let item: MemoryItem = serde_json::from_str(raw.value())
                         .map_err(|e| StoreError::Backend(e.to_string()))?;
-                    if item.expires_at.is_some_and(|expires| expires <= at) {
+                    let access_expiry = access
+                        .get((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?
+                        .and_then(|value| {
+                            crate::core::Timestamp::from_unix_timestamp(value.value()).ok()
+                        });
+                    let effective = match (item.expires_at, access_expiry) {
+                        (Some(left), Some(right)) => Some(left.max(right)),
+                        (left, right) => left.or(right),
+                    };
+                    if effective.is_some_and(|expires| expires <= at) {
                         expired.push((id, subject, purpose, created));
                     }
                 }
@@ -846,6 +876,52 @@ impl MemoryStore for RedbStore {
             };
             w.commit().map_err(|e| be(&e))?;
             Ok(removed)
+        })
+        .await
+    }
+
+    async fn touch(&self, ids: &[String], at: crate::core::Timestamp) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
+        let ids = ids.to_vec();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            {
+                let current = w.open_table(CURRENT).map_err(|e| be(&e))?;
+                let items = w.open_table(ITEMS).map_err(|e| be(&e))?;
+                let mut access = w.open_table(ACCESS_EXPIRY).map_err(|e| be(&e))?;
+                for id in &ids {
+                    let Some(pointer) = current
+                        .get((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?
+                    else {
+                        continue;
+                    };
+                    let version = pointer.value().3;
+                    let Some(raw) = items
+                        .get((tenant.as_str(), id.as_str(), version))
+                        .map_err(|e| be(&e))?
+                    else {
+                        continue;
+                    };
+                    let item: MemoryItem = serde_json::from_str(raw.value())
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    let Some(window) = item.access_retention_seconds else {
+                        continue;
+                    };
+                    let window = i64::try_from(window).unwrap_or(i64::MAX);
+                    let expiry = at.unix_timestamp().saturating_add(window);
+                    let prior = access
+                        .get((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?
+                        .map_or(i64::MIN, |value| value.value());
+                    if expiry > prior {
+                        access
+                            .insert((tenant.as_str(), id.as_str()), expiry)
+                            .map_err(|e| be(&e))?;
+                    }
+                }
+            }
+            w.commit().map_err(|e| be(&e))
         })
         .await
     }

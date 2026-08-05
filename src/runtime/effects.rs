@@ -379,6 +379,7 @@ pub struct RecallMemory {
 pub struct SemanticRecall {
     pub(crate) retriever: std::sync::Arc<dyn crate::memory::SemanticRetriever>,
     pub(crate) query: crate::memory::SemanticQuery,
+    pub(crate) arguments: serde_json::Value,
 }
 
 #[async_trait]
@@ -401,6 +402,14 @@ impl Effect for SemanticRecall {
 
     fn recovery(&self) -> Recovery {
         Recovery::Retry
+    }
+
+    fn max_sensitivity(&self) -> crate::core::Sensitivity {
+        self.query.max_sensitivity
+    }
+
+    fn sink_arguments(&self) -> Option<&serde_json::Value> {
+        Some(&self.arguments)
     }
 
     async fn perform(&self) -> Result<Self::Output, EffectError> {
@@ -453,6 +462,34 @@ impl Effect for RecallMemory {
                 digest: item.selection_digest(),
             })
             .collect())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TouchMemory {
+    pub(crate) memories: std::sync::Arc<dyn crate::memory::MemoryStore>,
+    pub(crate) ids: Vec<String>,
+    pub(crate) at: crate::core::Timestamp,
+}
+
+#[async_trait]
+impl Effect for TouchMemory {
+    type Output = ();
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new("memory.touch", json!({ "ids": self.ids, "at": self.at }))
+    }
+
+    fn recovery(&self) -> Recovery {
+        // Stores take max(existing, at + window), so repeating is idempotent.
+        Recovery::Retry
+    }
+
+    async fn perform(&self) -> Result<Self::Output, EffectError> {
+        self.memories
+            .touch(&self.ids, self.at)
+            .await
+            .map_err(|error| EffectError::Other(error.to_string()))
     }
 }
 

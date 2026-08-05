@@ -1577,7 +1577,7 @@ the invariant for the one route nobody would think to check.
 | `CancelTask` | a durable stop request; the task stays `WORKING` |
 | `GetExtendedAgentCard` | the authenticated card |
 | `SendStreamingMessage`, `SubscribeToTask` | SSE, read from the journal |
-| `ListTasks` | `-32004`, unsupported |
+| `ListTasks` | newest-first, cursor-paginated current tasks with context/status/time filters and bounded history |
 | the push-notification configs | registrations, behind `push` |
 | anything else | `-32601`, method not found |
 
@@ -1605,11 +1605,11 @@ This server advertises text and JSON data; raw and URL file parts are refused as
 unsupported before a skill runs. Previously unknown file fields were ignored,
 turning a valid image request into an empty input dispatched to a skill.
 
-**Unsupported continuation is refused, not restarted.** `taskId`/`contextId`
-multi-turn continuation is not implemented yet. Ignoring those identifiers and
-starting an unrelated run gives the caller a successful response in the wrong
-conversation, so the server returns `UnsupportedOperation` until it can bind
-them to durable case/task history.
+**A context continues; a task does not mutate.** `contextId` maps to a durable
+case. Each follow-up is a new immutable task/run attached to that case, so
+history remains deploy-safe and auditable. `taskId` continuation is refused with
+guidance to use the task's context: extending a sealed run would contradict the
+runtime's chain and Merkle commitments.
 
 **The 1.0 method names only.** 1.0 renamed every method; `message/send` was 0.3.
 A server that answers both accepts clients which have silently lost half the
@@ -1775,7 +1775,7 @@ Details worth stating:
   per-model schema mode, streaming mode and timeout. Strict replay therefore
   cannot reuse a completion produced under a different provider request shape.
   API keys are transport credentials and never enter the profile or journal.
-* **Every call is time-bounded.** Both drivers apply a configurable whole-request
+* **Every call is time-bounded.** All drivers apply a configurable whole-request
   timeout, five minutes by default, across connection, generation and stream.
   A timeout after streamed output uses the same partial-generation accounting as
   any other severed stream.
@@ -1794,14 +1794,21 @@ Details worth stating:
   A missing or wrong-provider state fails closed. No `previous_response_id` or
   provider-held conversation is replay truth.
 
-* **Bedrock is intentionally buffered and conservative.** Converse text,
-  tools/results, signed or redacted reasoning continuation, usage, truncation
-  and forced-tool structured output are supported. Region, buffering, timeout
-  and schema mode enter the provider profile. Access, validation and not-found
-  errors are refusals; throttling and model-not-ready are retryable. Buffered
-  model timeout/model/service errors expose no partial usage and are therefore
-  `Unavailable`, never guessed free or landed. Streaming and a universal
-  reasoning-effort mapping are refused until those semantics are provable.
+* **Bedrock streams conservatively.** Converse text, tools/results, signed or
+  redacted reasoning continuation, usage, truncation, native JSON Schema and
+  forced-tool fallback are supported. `ConverseStream` is the default;
+  `.buffered()` opts out. Region, stream mode, timeout and schema mode enter the
+  provider profile. Access, validation and not-found errors are refusals;
+  throttling and model-not-ready are retryable. Stream failures are
+  `Unavailable` before generation, `Unaccounted` after generation without usage,
+  and `Interrupted` once usage is known. A universal reasoning-effort mapping
+  remains refused rather than guessed across model families.
+
+* **Live deltas are labelled projections, not replay truth.** An optional
+  `ModelStreamObserver` receives visible text and terminal usage while the
+  provider still produces one canonical completion. Events inherit untrusted
+  trust and the call's output sensitivity; opaque reasoning is never exposed.
+  Observer delivery is advisory and strict replay emits no live events.
 
 * **Structured output has two modes, because native support is not universal.**
   `SchemaMode::Native` uses the provider's constrained decoding, where a
@@ -1825,6 +1832,11 @@ Details worth stating:
   with a 400 that does not say which rule broke. The driver names the rule, and
   does not rewrite the schema: that would make the effect key record one shape
   while the wire carried another.
+* **Provider enforcement is not blindly trusted.** Returned structured output is
+  parsed and validated locally against the exact requested schema. External
+  schema reference resolution is disabled, so validation cannot become hidden
+  network or file I/O. Parseable but non-conforming output is a metered unusable
+  result.
 * **Reasoning tokens are billed and invisible.** A driver reporting only readable
   output would tell a reasoning-heavy run's budget it cost a fraction of what it
   did.
@@ -1915,10 +1927,10 @@ versions remain available for replay until `sweep_expired` atomically erases all
 versions and reserves the id. `StepCtx::sweep_expired_memories` wraps that
 operation as an effect with a journaled cutoff/count; unknown crash recovery
 requires an operator because repeating can delete idempotently but cannot
-reproduce the first removed count. Legal hold blocks ordinary, subject, cascading
-and expiry erasure atomically on both backends. There is no access-time expiry:
-making recall update hidden state would make retention depend on retries and
-replay.
+reproduce the first removed count. Legal hold blocks ordinary, subject,
+cascading and expiry erasure atomically on both backends. Sliding retention is
+opt-in: `refresh_access` adds a separate journaled, idempotent touch effect, so
+ordinary reads remain pure and strict replay does not refresh twice.
 
 ### Memory is delayed code
 
@@ -1997,11 +2009,14 @@ over `derivatives` and `forget`: that loop had a gap in which another writer
 could add a summary after traversal. redb uses one write transaction;
 PostgreSQL excludes derivative creation for the complete traversal and deletion.
 
-What is not built is equally important: no automatic memory formation,
-access-time retention or cryptographic deletion of memory content. Applications
-explicitly decide what becomes durable. Live-store erasure does not yet make
-memory copies in backups unreadable. Provider conversations and compaction
-remain projections, never the source of durable memory truth.
+Formation is explicit despite being automatic: a digest-covered manifest field
+or `StepCtx::form_memories` invokes a constrained extraction call and bounded
+governed writes. There is no generic hook that persists arbitrary conversations.
+`EncryptedMemoryStore` makes a tenant/subject wrapping scope the erasure unit,
+so destroying it makes backup ciphertext unreadable. Its concrete lifecycle
+coordinator is single-node; active-active deployments still need a distributed
+database/KMS ceremony. Provider conversations and compaction remain projections,
+never durable memory truth.
 
 ### Every case mutation is an effect
 

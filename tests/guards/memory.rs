@@ -46,6 +46,7 @@ fn item(id: &str, subject: &str, content: Value, trust: Trust) -> MemoryItem {
         version: 0,
         created_at: at(1_760_000_000),
         expires_at: None,
+        access_retention_seconds: None,
         superseded_at: None,
         derived_from: Vec::new(),
     }
@@ -56,6 +57,124 @@ fn item(id: &str, subject: &str, content: Value, trust: Trust) -> MemoryItem {
 async fn redb_satisfies_the_memory_store_contract() {
     let store = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn MemoryStore>;
     agentplane::testkit::conformance::memory(store).await;
+}
+
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn memory_subject_erasure_makes_backup_ciphertext_unreadable() {
+    use agentplane::keyring::EncryptedMemoryStore;
+    use agentplane::testkit::MemoryKeyRing;
+
+    let tenant = TenantId::new("crypto-memory").expect("tenant");
+    let inner = Arc::new(RedbStore::open_in_memory().expect("live store"));
+    let backup = Arc::new(RedbStore::open_in_memory().expect("backup store"));
+    let keys = Arc::new(MemoryKeyRing::new());
+    let encrypted = Arc::new(EncryptedMemoryStore::new_single_node(
+        Arc::clone(&inner) as Arc<dyn MemoryStore>,
+        Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
+        tenant.clone(),
+    ));
+    let plain = item(
+        "crypto-1",
+        "person-7",
+        json!({"secret": "backup must forget this"}),
+        Trust::Untrusted,
+    );
+    encrypted.remember(&plain).await.expect("encrypted write");
+    let raw = inner
+        .version("crypto-1", 1)
+        .await
+        .expect("raw read")
+        .expect("raw row");
+    assert_ne!(
+        raw.content, plain.content,
+        "plaintext reached the backing store"
+    );
+    backup.remember(&raw).await.expect("snapshot backup");
+
+    encrypted
+        .set_legal_hold("crypto-1", true)
+        .await
+        .expect("hold");
+    assert!(
+        encrypted
+            .erase_subject("person-7", at(1_760_000_500), "erasure request")
+            .await
+            .is_err(),
+        "legal hold did not block cryptographic erasure"
+    );
+    encrypted
+        .set_legal_hold("crypto-1", false)
+        .await
+        .expect("release hold");
+    encrypted
+        .erase_subject("person-7", at(1_760_000_500), "erasure request")
+        .await
+        .expect("destroy subject key");
+
+    let restored = EncryptedMemoryStore::new_single_node(
+        Arc::clone(&backup) as Arc<dyn MemoryStore>,
+        keys as Arc<dyn agentplane::keyring::KeyRing>,
+        tenant,
+    );
+    assert!(
+        restored.version("crypto-1", 1).await.is_err(),
+        "a pre-erasure backup remained decryptable after key destruction"
+    );
+}
+
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn encrypted_memory_preserves_plaintext_derivation_commitments() {
+    use agentplane::keyring::EncryptedMemoryStore;
+    use agentplane::memory::Selected;
+    use agentplane::testkit::MemoryKeyRing;
+
+    let inner = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let encrypted = EncryptedMemoryStore::new_single_node(
+        Arc::clone(&inner) as Arc<dyn MemoryStore>,
+        Arc::new(MemoryKeyRing::new()),
+        TenantId::new("derived-memory").expect("tenant"),
+    );
+    let source = item(
+        "source",
+        "person-7",
+        json!({"fact": "source"}),
+        Trust::Untrusted,
+    );
+    encrypted.remember(&source).await.expect("source write");
+    let opened_source = encrypted
+        .version("source", 1)
+        .await
+        .expect("source read")
+        .expect("source");
+    let selected = Selected {
+        id: "source".to_owned(),
+        version: 1,
+        digest: opened_source.selection_digest(),
+    };
+    let mut derived = item(
+        "summary",
+        "person-7",
+        json!({"fact": "summary"}),
+        Trust::Untrusted,
+    );
+    derived.derived_from.push(selected.clone());
+
+    encrypted.remember(&derived).await.expect("derived write");
+    let opened = encrypted
+        .version("summary", 1)
+        .await
+        .expect("derived read")
+        .expect("summary");
+    assert_eq!(opened.content, derived.content);
+    assert_eq!(opened.derived_from, vec![selected.clone()]);
+    let raw = inner
+        .version("summary", 1)
+        .await
+        .expect("raw read")
+        .expect("raw summary");
+    assert_ne!(raw.derived_from, vec![selected]);
 }
 
 // ── Trust comes from provenance, not content ────────────────────────────────
@@ -138,6 +257,7 @@ struct Counted {
     inner: Arc<dyn MemoryStore>,
     searches: Arc<std::sync::atomic::AtomicUsize>,
     sweeps: Arc<std::sync::atomic::AtomicUsize>,
+    touches: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -186,6 +306,15 @@ impl MemoryStore for Counted {
         self.sweeps
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.sweep_expired(at).await
+    }
+    async fn touch(
+        &self,
+        ids: &[String],
+        at: Timestamp,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.touches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.touch(ids, at).await
     }
 }
 
@@ -245,6 +374,13 @@ impl MemoryStore for RejectsComposedCascade {
     }
     async fn sweep_expired(&self, at: Timestamp) -> Result<usize, agentplane::core::StoreError> {
         self.inner.sweep_expired(at).await
+    }
+    async fn touch(
+        &self,
+        ids: &[String],
+        at: Timestamp,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.touch(ids, at).await
     }
 }
 
@@ -309,6 +445,29 @@ impl Skill for Recalls {
 }
 
 #[derive(Debug)]
+struct RecallsAndRefreshes;
+
+#[async_trait::async_trait]
+impl Skill for RecallsAndRefreshes {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("recalls-refreshes").provides("recalls-refreshes")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let found = cx
+            .recall(Recall::about("acct-retention").refresh_access())
+            .await?;
+        Ok(Outcome::done(Tainted::trusted(
+            json!({"count": found.len()}),
+        )))
+    }
+}
+
+#[derive(Debug)]
 struct CountedRetriever {
     inner: InMemorySemanticRetriever,
     searches: Arc<std::sync::atomic::AtomicUsize>,
@@ -347,7 +506,7 @@ impl Skill for SemanticRecalls {
         let found = cx
             .semantic_recall(
                 Arc::clone(&self.0),
-                SemanticQuery {
+                Tainted::trusted(SemanticQuery {
                     subject: "acct-semantic".to_owned(),
                     purpose: Some("support".to_owned()),
                     text: "refund".to_owned(),
@@ -355,7 +514,8 @@ impl Skill for SemanticRecalls {
                     embedding_model: "test-embedding@1".to_owned(),
                     index_snapshot: "snapshot-1".to_owned(),
                     limit: 1,
-                },
+                    max_sensitivity: Sensitivity::Internal,
+                }),
             )
             .await
             .map_err(SkillError::Step)?;
@@ -461,6 +621,7 @@ async fn a_replayed_recall_does_not_search_again() {
         inner: Arc::clone(&store) as Arc<dyn MemoryStore>,
         searches: Arc::clone(&searches),
         sweeps,
+        touches: Arc::new(AtomicUsize::new(0)),
     }) as Arc<dyn MemoryStore>;
 
     memories
@@ -620,6 +781,7 @@ async fn a_replayed_expiry_sweep_does_not_erase_again() {
         inner: Arc::clone(&store) as Arc<dyn MemoryStore>,
         searches: Arc::new(AtomicUsize::new(0)),
         sweeps: Arc::clone(&sweeps),
+        touches: Arc::new(AtomicUsize::new(0)),
     }) as Arc<dyn MemoryStore>;
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .memory(memories)
@@ -642,6 +804,47 @@ async fn a_replayed_expiry_sweep_does_not_erase_again() {
         sweeps.load(Ordering::SeqCst),
         1,
         "strict replay performed the expiry mutation again"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_recall_does_not_refresh_access_retention_again() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let mut sliding = item(
+        "sliding-runtime",
+        "acct-retention",
+        json!({"value": true}),
+        Trust::Untrusted,
+    );
+    sliding.access_retention_seconds = Some(60);
+    store.remember(&sliding).await.expect("remember sliding");
+    let touches = Arc::new(AtomicUsize::new(0));
+    let memories = Arc::new(Counted {
+        inner: Arc::clone(&store) as Arc<dyn MemoryStore>,
+        searches: Arc::new(AtomicUsize::new(0)),
+        sweeps: Arc::new(AtomicUsize::new(0)),
+        touches: Arc::clone(&touches),
+    }) as Arc<dyn MemoryStore>;
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(memories)
+        .skill(RecallsAndRefreshes)
+        .build();
+    let live = rt
+        .run("recalls-refreshes", json!({}))
+        .await
+        .expect("live recall");
+    assert_eq!(touches.load(Ordering::SeqCst), 1);
+    let replay = rt
+        .replay(live.run_id, Mode::Strict)
+        .await
+        .expect("strict replay");
+    assert_eq!(replay.output, live.output);
+    assert_eq!(
+        touches.load(Ordering::SeqCst),
+        1,
+        "strict replay refreshed mutable access retention"
     );
 }
 

@@ -171,6 +171,7 @@ fn fixture_from(yaml: &str, policy: Arc<Recording>) -> Fixture {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));
     let mut builder = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>)
         .policy(policy.clone() as Arc<dyn PolicyEngine>);
     for cap in &manifest.spec.capabilities.provides {
         // Leaked so the descriptor can hold a `&'static str`; these live for the
@@ -619,6 +620,25 @@ async fn unsupported_and_ambiguous_parts_are_refused_before_dispatch() {
     .await;
     assert_eq!(err_code(&raw), i64::from(code::CONTENT_TYPE_NOT_SUPPORTED));
 
+    let (_, mixed_file) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": {
+                "messageId": "m-mixed-file",
+                "role": "ROLE_USER",
+                "parts": [{"text": "one", "raw": "aGVsbG8=", "mediaType": "image/png"}]
+            }}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        err_code(&mixed_file),
+        i64::from(code::CONTENT_TYPE_NOT_SUPPORTED),
+        "adding text did not make unsupported file content a generic shape error"
+    );
+
     let (_, ambiguous) = send(
         &router,
         rpc(
@@ -637,6 +657,92 @@ async fn unsupported_and_ambiguous_parts_are_refused_before_dispatch() {
         f.seen.lock().unwrap().is_empty(),
         "invalid parts reached a skill"
     );
+}
+
+#[tokio::test]
+async fn context_id_groups_new_immutable_tasks_across_turns() {
+    let f = fixture();
+    let first = json!({"message": {
+        "messageId": "turn-1",
+        "role": "ROLE_USER",
+        "parts": [{"text": "first"}]
+    }});
+    let (_, first_response) = send(&f.router(), rpc("SendMessage", &first, Some("peer-a"))).await;
+    let context = first_response["result"]["task"]["contextId"]
+        .as_str()
+        .expect("server-generated context")
+        .to_owned();
+    let first_task = first_response["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let second = json!({"message": {
+        "messageId": "turn-2",
+        "contextId": context,
+        "role": "ROLE_USER",
+        "parts": [{"text": "second"}]
+    }});
+    let (_, second_response) = send(&f.router(), rpc("SendMessage", &second, Some("peer-a"))).await;
+    assert_eq!(second_response["result"]["task"]["contextId"], context);
+    assert_ne!(
+        second_response["result"]["task"]["id"], first_task,
+        "a new turn mutated the prior immutable run instead of creating a task in its context"
+    );
+
+    let task_continuation = json!({"message": {
+        "messageId": "turn-bad",
+        "taskId": first_task,
+        "role": "ROLE_USER",
+        "parts": [{"text": "mutate prior task"}]
+    }});
+    let (_, refused) = send(
+        &f.router(),
+        rpc("SendMessage", &task_continuation, Some("peer-a")),
+    )
+    .await;
+    assert_eq!(err_code(&refused), i64::from(code::UNSUPPORTED_OPERATION));
+}
+
+#[tokio::test]
+async fn list_tasks_filters_context_and_uses_opaque_cursor_pages() {
+    let f = fixture();
+    let first = json!({"message": {
+        "messageId": "list-turn-1",
+        "role": "ROLE_USER",
+        "parts": [{"text": "first"}]
+    }});
+    let (_, response) = send(&f.router(), rpc("SendMessage", &first, Some("peer-a"))).await;
+    let context = response["result"]["task"]["contextId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second = json!({"message": {
+        "messageId": "list-turn-2",
+        "contextId": context,
+        "role": "ROLE_USER",
+        "parts": [{"text": "second"}]
+    }});
+    send(&f.router(), rpc("SendMessage", &second, Some("peer-a"))).await;
+
+    let list = json!({
+        "contextId": context,
+        "status": "TASK_STATE_COMPLETED",
+        "pageSize": 1,
+        "historyLength": 1
+    });
+    let (_, page_one) = send(&f.router(), rpc("ListTasks", &list, Some("peer-a"))).await;
+    assert_eq!(page_one["result"]["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(page_one["result"]["totalSize"], 2);
+    assert!(page_one["result"]["tasks"][0]["history"].is_array());
+    let token = page_one["result"]["nextPageToken"].as_str().unwrap();
+    assert!(!token.is_empty());
+
+    let mut next = list;
+    next["pageToken"] = json!(token);
+    let (_, page_two) = send(&f.router(), rpc("ListTasks", &next, Some("peer-a"))).await;
+    assert_eq!(page_two["result"]["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(page_two["result"]["nextPageToken"], "");
 }
 
 #[tokio::test]
@@ -688,27 +794,11 @@ async fn a_blocking_call_returns_the_agents_answer() {
 
 // ── Refusals say which kind they are ────────────────────────────────────────
 
-/// Unimplemented operations are refused as unsupported, not as unknown.
-///
-/// A caller that reads `-32601 Method not found` concludes it spelled the method
-/// wrong and retries; one that reads `-32004` concludes this agent cannot do it
-/// and stops. Both are refusals, and only one is correct here — the card
-/// already advertises these as false.
+/// Unwired push and genuinely unknown methods use distinct protocol errors.
 #[tokio::test]
-async fn unimplemented_operations_are_refused_as_unsupported() {
+async fn unwired_push_and_unknown_methods_are_told_apart() {
     let f = fixture();
     let router = f.router();
-
-    // Streaming is implemented and is *not* in this list — see the streaming
-    // tests. What remains unimplemented says so with the spec's own code.
-    for method in ["ListTasks"] {
-        let (_, body) = send(&router, rpc(method, &json!({}), Some("peer-a"))).await;
-        assert_eq!(
-            err_code(&body),
-            i64::from(code::UNSUPPORTED_OPERATION),
-            "{method} was refused as something other than unsupported: {body:#}"
-        );
-    }
 
     for method in [
         "CreateTaskPushNotificationConfig",

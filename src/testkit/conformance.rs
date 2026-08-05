@@ -125,6 +125,7 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
         version: 0,
         created_at: at(1_760_000_000),
         expires_at: None,
+        access_retention_seconds: None,
         superseded_at: None,
         derived_from: Vec::new(),
     };
@@ -299,6 +300,36 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
             .await
             .expect("swept version")
             .is_none()
+    );
+
+    let mut sliding = make(
+        "memory-sliding",
+        "team-retention",
+        "support",
+        json!({"sliding": true}),
+    );
+    sliding.expires_at = Some(at(1_760_000_200));
+    sliding.access_retention_seconds = Some(60);
+    store.remember(&sliding).await.expect("sliding memory");
+    store
+        .touch(&["memory-sliding".to_owned()], at(1_760_000_190))
+        .await
+        .expect("touch sliding retention");
+    assert_eq!(
+        store
+            .recall(&Recall::about("team-retention").at(at(1_760_000_240)))
+            .await
+            .expect("extended recall")
+            .len(),
+        1,
+        "journaled access did not extend retention past the fixed expiry"
+    );
+    assert!(
+        store
+            .recall(&Recall::about("team-retention").at(at(1_760_000_250)))
+            .await
+            .expect("after sliding expiry")
+            .is_empty()
     );
 }
 

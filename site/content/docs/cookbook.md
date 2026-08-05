@@ -457,7 +457,7 @@ because a field read by convention is two copies of one decision:
 | `capabilities.provides` | **enforced** — `build()` panics if no skill provides it |
 | `max_sensitivity_egress` | **enforced** — every sink uses the stricter of its own ceiling and the manifest ceiling |
 | `max_delegation_depth` | **enforced** — checked against the configured identity and every delegating sink before dispatch |
-| `output.schema` | carried to the provider and into the effect key, never validated against a result |
+| `output.schema` | carried to the provider and effect key, then validated locally without external-reference I/O |
 
 There is no `security.pattern` field. Native skill code cannot be proven to
 follow an architectural injection pattern, so the schema refuses to imply that
@@ -1018,12 +1018,17 @@ reserves the id. `set_legal_hold(id, true)`
 blocks ordinary, subject, cascading and expiry erasure atomically. A hold is
 privileged lifecycle administration, not something model output should request.
 
+Use `MemoryWrite::retain_after_access(seconds)` with
+`Recall::refresh_access()` only when policy genuinely says “retain after use”.
+The refresh is a separate journaled, idempotent touch effect; ordinary recall
+remains read-only and strict replay never extends retention twice.
+
 Semantic ranking stays outside `MemoryStore` and inside the journal:
 
 ```rust
 let hits = cx.semantic_recall(
     retriever, // Arc<dyn SemanticRetriever>
-    SemanticQuery {
+    Tainted::trusted(SemanticQuery {
         subject: account.clone(),
         purpose: Some("support".into()),
         text: "refund policy".into(),
@@ -1031,7 +1036,8 @@ let hits = cx.semantic_recall(
         embedding_model: "embed-v3@2026-07-01".into(),
         index_snapshot: "support-2026-08-05".into(),
         limit: 5,
-    },
+        max_sensitivity: Sensitivity::Internal,
+    }),
 ).await?;
 ```
 
@@ -1046,6 +1052,20 @@ the obvious laundering path by accepting `MemoryWrite` plus `Tainted<Value>` and
 deriving all security metadata. If a memory genuinely needs improved trust or
 sensitivity, call `cx.release` first so policy and the journal record the
 decision; then store the released value.
+
+For governed automatic formation, declare `spec.memory_formation` on a
+declarative agent. It requires a reviewed subject, purpose, extraction
+instruction, item bound and retention. The model proposes only `key/content`;
+runtime derives stable ids and security labels. Coded skills invoke
+`cx.form_memories` explicitly. There is intentionally no generic post-model hook
+that silently stores every conversation.
+
+With feature `keyring`, wrap a single-node memory backend in
+`EncryptedMemoryStore::new_single_node`. Content is ciphertext in the backing
+store. `erase_subject(subject, at, reason)` checks legal holds, destroys the
+tenant/subject wrapping scope, then cleans rows, leaving pre-erasure backups
+undecryptable. This process-local lifecycle coordinator is not an active-active
+erasure barrier.
 
 **The second trap:** expecting `forget` to be enough for an erasure request. It
 removes one memory and every version of it, which is what selective repair
@@ -1065,12 +1085,20 @@ let provider: Arc<dyn ModelProvider> = Arc::new(
 );
 ```
 
-The buffered driver supports Converse text, tools/results, usage, truncation,
-forced-tool structured output and exact reasoning-content continuation. Region,
-buffering, timeout and schema mode are in effect identity. Explicit
-`reasoning_effort` is refused because Converse has no portable mapping across
-its model families; streaming is not claimed until partial-failure usage can be
-accounted honestly.
+The driver supports Converse text, tools/results, usage, truncation, native JSON
+Schema output with forced-tool fallback and exact reasoning-content
+continuation. It streams through `ConverseStream` by default and classifies
+partial failures according to whether generation and usage were observed;
+`.buffered()` is explicit. Region, stream mode, timeout and schema mode are in
+effect identity. Explicit `reasoning_effort` is refused because Converse has no
+portable mapping across its model families.
+
+Attach an `Arc<dyn ModelStreamObserver>` with
+`ModelCall::streaming_to(observer)` to expose live visible text while retaining
+one canonical journaled completion. Events are labelled untrusted at the call's
+output sensitivity; opaque reasoning is never emitted and strict replay emits
+nothing live. Observers should enqueue quickly and enforce network backpressure
+outside the provider callback.
 
 OpenAI and Anthropic declarative tool loops preserve reasoning automatically.
 `Completion::continuation` carries opaque OpenAI output items or Anthropic

@@ -80,7 +80,7 @@ impl Skill for SemanticMemory {
         let found = cx
             .semantic_recall(
                 Arc::clone(&self.0),
-                SemanticQuery {
+                Tainted::trusted(SemanticQuery {
                     subject: "team/support".to_owned(),
                     purpose: Some("customer-preferences".to_owned()),
                     text: "preferred language".to_owned(),
@@ -88,7 +88,8 @@ impl Skill for SemanticMemory {
                     embedding_model: "example-embedding@1".to_owned(),
                     index_snapshot: "example-snapshot-1".to_owned(),
                     limit: 1,
-                },
+                    max_sensitivity: agentplane::core::Sensitivity::Internal,
+                }),
             )
             .await?;
         Ok(Outcome::done(

@@ -1094,8 +1094,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "oversight_without_a_declarative_agent_is_refused",
         "oversight is accepted beside an agent whose behaviour is code, so the "
         "file claims a human is in the loop and no human ever is",
-        "        if self.spec.execution.is_none() {",
-        "        if false {",
+        "        // the decoration the binding rule exists to refuse.\n        if self.spec.execution.is_none() {",
+        "        // the decoration the binding rule exists to refuse.\n        if false {",
     ),
     "ADeclarativeAgentTakesAnyDriver": (
         "src/runtime/executor.rs",
@@ -1477,8 +1477,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/model/wire.rs",
         "an_unparseable_structured_answer_is_billed_and_loud",
         "an answer that broke its own schema is billed as free",
-        "        .map_err(|e| ModelError::Unusable {\n            model: model.clone(),\n            usage,",
-        "        .map_err(|e| ModelError::Unusable {\n            model: model.clone(),\n            usage: super::Usage::default(),",
+        "        serde_json::from_str(text).map_err(|e| ModelError::Unusable {\n            model: model.clone(),\n            usage,",
+        "        serde_json::from_str(text).map_err(|e| ModelError::Unusable {\n            model: model.clone(),\n            usage: super::Usage::default(),",
     ),
     "TruncationIsNotReported": (
         "src/model/openai.rs",

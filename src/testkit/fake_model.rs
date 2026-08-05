@@ -281,6 +281,7 @@ mod tests {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         }
     }
 
@@ -325,6 +326,7 @@ mod tests {
                 tools: &[],
                 exchanges: &[],
                 continuation: None,
+                stream: None,
             })
             .await
             .unwrap();
@@ -338,6 +340,7 @@ mod tests {
                 tools: &[],
                 exchanges: &[],
                 continuation: None,
+                stream: None,
             })
             .await
             .unwrap();

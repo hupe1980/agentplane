@@ -25,8 +25,8 @@ use agentplane::core::{
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::model::{
-    Completion, ModelCall, ModelError, ModelId, ModelProvider, ToolCall, ToolDeclaration,
-    ToolExchange, Usage,
+    Completion, ModelCall, ModelError, ModelId, ModelProvider, ModelStreamEvent,
+    ModelStreamObserver, ToolCall, ToolDeclaration, ToolExchange, Usage,
 };
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
@@ -35,6 +35,104 @@ use serde_json::{Value, json};
 
 fn model() -> ModelId {
     ModelId::new("anthropic", "claude-opus-5")
+}
+
+#[derive(Debug, Default)]
+struct StreamCapture(std::sync::Mutex<Vec<Tainted<ModelStreamEvent>>>);
+
+impl ModelStreamObserver for StreamCapture {
+    fn event(&self, event: Tainted<ModelStreamEvent>) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+#[derive(Debug)]
+struct EmitsStream;
+
+#[async_trait::async_trait]
+impl ModelProvider for EmitsStream {
+    async fn complete(
+        &self,
+        request: agentplane::model::Request<'_>,
+    ) -> Result<Completion, ModelError> {
+        if let Some((observer, label)) = request.stream {
+            observer.event(Tainted::with_label(
+                ModelStreamEvent::TextDelta("hel".to_owned()),
+                label.clone(),
+            ));
+            observer.event(Tainted::with_label(
+                ModelStreamEvent::TextDelta("lo".to_owned()),
+                label.clone(),
+            ));
+        }
+        Ok(Completion {
+            text: "hello".to_owned(),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                output_tokens: 2,
+                ..Default::default()
+            },
+            stop_reason: Some("stop".to_owned()),
+            truncated: false,
+            structured: None,
+            continuation: None,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct Streams(Arc<StreamCapture>);
+
+#[async_trait::async_trait]
+impl Skill for Streams {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("streams-model").provides("streams-model")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let call = ModelCall::new(Arc::new(EmitsStream), model(), input.peek().clone())
+            .with_output_sensitivity(Sensitivity::Confidential)
+            .streaming_to(Arc::clone(&self.0) as Arc<dyn ModelStreamObserver>);
+        let completion = cx.sink(call, &input).await?;
+        Ok(Outcome::done(
+            completion.map(|completion| json!(completion.text)),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn live_model_stream_is_labelled_and_strict_replay_is_silent() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let capture = Arc::new(StreamCapture::default());
+    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Streams(Arc::clone(&capture)))
+        .build();
+    let live = runtime.run("streams-model", json!("hi")).await.unwrap();
+    {
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.label().trust == Trust::Untrusted)
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.label().sensitivity == Sensitivity::Confidential)
+        );
+    }
+    let replay = runtime.replay(live.run_id, Mode::Strict).await.unwrap();
+    assert_eq!(replay.output, live.output);
+    assert_eq!(
+        capture.0.lock().unwrap().len(),
+        2,
+        "strict replay emitted live provider deltas"
+    );
 }
 
 // ── The meter ───────────────────────────────────────────────────────────────

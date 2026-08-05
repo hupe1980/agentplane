@@ -801,6 +801,7 @@ impl OpenAi {
         response: reqwest::Response,
         model: &ModelId,
         schema: Option<&Value>,
+        observer: Option<(&dyn super::ModelStreamObserver, &crate::core::Label)>,
     ) -> Result<Completion, ModelError> {
         use futures_util::StreamExt;
 
@@ -820,6 +821,16 @@ impl OpenAi {
                     detail: error.to_string(),
                 })?;
             for event in events {
+                if event.name == "response.output_text.delta"
+                    && let Ok(value) = serde_json::from_str::<Value>(&event.data)
+                    && let Some(delta) = value.get("delta").and_then(Value::as_str)
+                    && let Some((observer, label)) = observer
+                {
+                    observer.event(crate::core::Tainted::with_label(
+                        super::ModelStreamEvent::TextDelta(delta.to_owned()),
+                        label.clone(),
+                    ));
+                }
                 acc.event(&event.name, &event.data);
             }
             if let Some(message) = acc.error() {
@@ -848,7 +859,14 @@ impl OpenAi {
                 usage: Usage::default(),
                 detail: format!("the terminal stream event did not parse: {e}"),
             })?;
-        self.interpret(&parsed, model, schema)
+        let completion = self.interpret(&parsed, model, schema)?;
+        if let Some((observer, label)) = observer {
+            observer.event(crate::core::Tainted::with_label(
+                super::ModelStreamEvent::Usage(completion.usage),
+                label.clone(),
+            ));
+        }
+        Ok(completion)
     }
 }
 
@@ -902,6 +920,7 @@ impl ModelProvider for OpenAi {
             tools,
             exchanges,
             continuation,
+            stream,
         } = request;
 
         super::refuse_provider_side_media(prompt, model)?;
@@ -934,10 +953,18 @@ impl ModelProvider for OpenAi {
         }
 
         let mut completion = if self.stream {
-            self.read_streamed(response, model, schema).await?
+            self.read_streamed(response, model, schema, stream).await?
         } else {
             self.read_buffered(response, model, schema).await?
         };
+        if !self.stream
+            && let Some((observer, label)) = stream
+        {
+            observer.event(crate::core::Tainted::with_label(
+                super::ModelStreamEvent::Usage(completion.usage),
+                label.clone(),
+            ));
+        }
         accumulate_continuation(&mut completion, continuation, exchanges);
         Ok(completion)
     }

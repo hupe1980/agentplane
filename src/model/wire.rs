@@ -67,15 +67,11 @@ pub fn classify_transport(model: &ModelId, e: &reqwest::Error) -> ModelError {
 
 /// Parse the answer when a schema was declared.
 ///
-/// The provider enforced the shape *during generation*, which is the whole point
-/// of asking for a schema — a constraint applied afterwards rejects an answer you
-/// have already paid for. What this adds is the parse, so a provider bug becomes
-/// a loud, metered `Unusable` rather than a panic three steps downstream.
-///
-/// **The schema is deliberately not re-validated here.** A second JSON Schema
-/// implementation could disagree with the one that did the enforcing, and the
-/// disagreement would surface as a run refusing an answer that is in fact
-/// conformant. A caller who needs certainty beyond "it parsed" validates it.
+/// Provider constrained generation is the first line of defence. This also
+/// parses and locally validates the answer against the exact requested schema,
+/// so a provider bug or ignored constraint becomes a loud, metered `Unusable`
+/// rather than invalid data reaching a later step. External schema reference
+/// resolution is disabled, so validation cannot introduce hidden I/O.
 ///
 /// # Errors
 ///
@@ -87,14 +83,21 @@ pub fn structured(
     model: &ModelId,
     usage: super::Usage,
 ) -> Result<Option<serde_json::Value>, ModelError> {
-    let Some(_) = schema else { return Ok(None) };
-    serde_json::from_str(text)
-        .map(Some)
-        .map_err(|e| ModelError::Unusable {
+    let Some(schema) = schema else {
+        return Ok(None);
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| ModelError::Unusable {
             model: model.clone(),
             usage,
             detail: format!("a schema was required and the answer is not JSON: {e}"),
-        })
+        })?;
+    super::validate_schema(schema, &value).map_err(|detail| ModelError::Unusable {
+        model: model.clone(),
+        usage,
+        detail,
+    })?;
+    Ok(Some(value))
 }
 
 /// The name of the single tool used when emulating structured output.
@@ -252,5 +255,33 @@ mod tests {
     fn trimming_respects_character_boundaries() {
         let body = "ü".repeat(1_000);
         let _ = trim(&body);
+    }
+}
+
+#[cfg(test)]
+mod schema_validation_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn parseable_but_nonconforming_structured_output_is_unusable() {
+        let model = ModelId::new("test", "structured");
+        let usage = super::super::Usage {
+            output_tokens: 5,
+            ..Default::default()
+        };
+        let error = structured(
+            Some(&json!({
+                "type": "object",
+                "properties": {"id": {"type": "string", "minLength": 5}},
+                "required": ["id"]
+            })),
+            r#"{"id":"abc"}"#,
+            &model,
+            usage,
+        )
+        .expect_err("provider-constrained output still needs defense-in-depth validation");
+        assert!(matches!(error, ModelError::Unusable { usage: u, .. } if u == usage));
     }
 }

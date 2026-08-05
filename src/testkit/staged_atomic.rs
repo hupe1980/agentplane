@@ -147,6 +147,10 @@ impl JournalStore for StagedAtomic {
         self.inner.runs_by_outcome(outcome, limit).await
     }
 
+    async fn recent_runs(&self) -> Result<Vec<(RunId, u64)>, StoreError> {
+        self.inner.recent_runs().await
+    }
+
     async fn case_history(
         &self,
         case: crate::core::CaseId,

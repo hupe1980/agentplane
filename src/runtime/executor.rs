@@ -24,6 +24,15 @@ use super::metrics;
 use super::telemetry;
 use tracing::Instrument;
 
+#[derive(Debug, Clone)]
+pub(crate) enum CaseBinding {
+    Correlate {
+        kind: String,
+        keys: Vec<CorrelationKey>,
+    },
+    Existing(crate::core::CaseId),
+}
+
 /// Default lease duration. A crashed owner's runs become claimable this long
 /// after its last heartbeat.
 ///
@@ -630,6 +639,15 @@ impl Runtime {
         target: &str,
         input: Tainted<Value>,
     ) -> Result<RunId, RuntimeError> {
+        self.spawn_bound(target, input, None).await
+    }
+
+    async fn spawn_bound(
+        self: &Arc<Self>,
+        target: &str,
+        input: Tainted<Value>,
+        case: Option<CaseBinding>,
+    ) -> Result<RunId, RuntimeError> {
         // Resolved before the id is minted: an unknown capability is the
         // caller's mistake and must be an error, not a run that exists and
         // immediately fails.
@@ -643,12 +661,40 @@ impl Runtime {
 
         let run = RunId::generate();
         let admitted = self
-            .admit_only(run, PlanIR::single(capability), input, None)
+            .admit_only(run, PlanIR::single(capability), input, case)
             .await?;
 
         let plane = Arc::clone(self);
         tokio::spawn(async move { plane.execute_admitted(admitted).await });
         Ok(run)
+    }
+
+    pub async fn spawn_tainted_in_case(
+        self: &Arc<Self>,
+        target: &str,
+        input: Tainted<Value>,
+        case: crate::core::CaseId,
+    ) -> Result<RunId, RuntimeError> {
+        self.spawn_bound(target, input, Some(CaseBinding::Existing(case)))
+            .await
+    }
+
+    pub async fn spawn_tainted_correlated(
+        self: &Arc<Self>,
+        target: &str,
+        input: Tainted<Value>,
+        case_kind: &str,
+        keys: &[CorrelationKey],
+    ) -> Result<RunId, RuntimeError> {
+        self.spawn_bound(
+            target,
+            input,
+            Some(CaseBinding::Correlate {
+                kind: case_kind.to_owned(),
+                keys: keys.to_vec(),
+            }),
+        )
+        .await
     }
 
     /// Start a run whose input carries a label.
@@ -690,7 +736,39 @@ impl Runtime {
         self.admit(
             target,
             Tainted::trusted(input),
-            Some((case_kind.to_owned(), keys.to_vec())),
+            Some(CaseBinding::Correlate {
+                kind: case_kind.to_owned(),
+                keys: keys.to_vec(),
+            }),
+        )
+        .await
+    }
+
+    /// Execute tainted input as a new immutable run in an existing case.
+    pub async fn run_tainted_in_case(
+        &self,
+        target: &str,
+        input: Tainted<Value>,
+        case: crate::core::CaseId,
+    ) -> Result<RunOutcome, RuntimeError> {
+        self.admit(target, input, Some(CaseBinding::Existing(case)))
+            .await
+    }
+
+    pub async fn run_tainted_correlated(
+        &self,
+        target: &str,
+        input: Tainted<Value>,
+        case_kind: &str,
+        keys: &[CorrelationKey],
+    ) -> Result<RunOutcome, RuntimeError> {
+        self.admit(
+            target,
+            input,
+            Some(CaseBinding::Correlate {
+                kind: case_kind.to_owned(),
+                keys: keys.to_vec(),
+            }),
         )
         .await
     }
@@ -714,7 +792,10 @@ impl Runtime {
         self.admit_plan(
             plan,
             Tainted::trusted(input),
-            Some((case_kind.to_owned(), keys.to_vec())),
+            Some(CaseBinding::Correlate {
+                kind: case_kind.to_owned(),
+                keys: keys.to_vec(),
+            }),
         )
         .await
     }
@@ -728,7 +809,7 @@ impl Runtime {
         &self,
         target: &str,
         input: Tainted<Value>,
-        case: Option<(String, Vec<CorrelationKey>)>,
+        case: Option<CaseBinding>,
     ) -> Result<RunOutcome, RuntimeError> {
         // A bare target is the degenerate plan: one node, terminal.
         let skill = self.resolve(target)?;
@@ -746,7 +827,7 @@ impl Runtime {
         &self,
         plan: PlanIR,
         input: Tainted<Value>,
-        case: Option<(String, Vec<CorrelationKey>)>,
+        case: Option<CaseBinding>,
     ) -> Result<RunOutcome, RuntimeError> {
         self.admit_plan_as(RunId::generate(), plan, input, case)
             .await
@@ -914,12 +995,13 @@ impl Runtime {
     /// about to happen. Splitting there means a caller can be told the run was
     /// accepted — or refused — before any of it runs, and a refusal stays an
     /// immediate answer rather than becoming a task that silently never appears.
+    #[allow(clippy::too_many_lines)]
     async fn admit_only(
         &self,
         run: RunId,
         plan: PlanIR,
         input: Tainted<Value>,
-        case: Option<(String, Vec<CorrelationKey>)>,
+        case: Option<CaseBinding>,
     ) -> Result<Admitted, RuntimeError> {
         crate::plan::validate(&plan, &self.contract())
             .map_err(|e| RuntimeError::PlanContract(e.to_string()))?;
@@ -977,7 +1059,7 @@ impl Runtime {
         // Correlation is deterministic and runs before planning: which case a
         // message belongs to is a matter of fact, settled by a lookup.
         let case_ctx = match (case, self.cases.as_ref()) {
-            (Some((kind, keys)), Some(cases)) => {
+            (Some(CaseBinding::Correlate { kind, keys }), Some(cases)) => {
                 let correlation = cases
                     .correlate_or_open(&kind, &keys, now_for_admission())
                     .await
@@ -999,6 +1081,44 @@ impl Runtime {
                         RecordKind::CaseBound {
                             case_kind: kind,
                             opened: correlation.is_new(),
+                        },
+                    )
+                    .case(case_id),
+                );
+                Some(CaseContext {
+                    cases: Arc::clone(cases),
+                    tasks: self.tasks.clone(),
+                    events: self.events.clone(),
+                    calendar: Arc::clone(&self.calendar),
+                    case_id,
+                })
+            }
+            (Some(CaseBinding::Existing(case_id)), Some(cases)) => {
+                let existing = cases
+                    .case(case_id)
+                    .await
+                    .map_err(RuntimeError::from_store)?
+                    .ok_or_else(|| {
+                        RuntimeError::PlanContract(format!("no such case: {case_id}"))
+                    })?;
+                if existing.status.is_closed() {
+                    return Err(RuntimeError::PlanContract(format!(
+                        "case '{case_id}' is closed and cannot accept another run"
+                    )));
+                }
+                cases
+                    .attach_run(case_id, run)
+                    .await
+                    .map_err(RuntimeError::from_store)?;
+                for record in &mut records {
+                    record.case = Some(case_id);
+                }
+                records.push(
+                    Append::new(
+                        run,
+                        RecordKind::CaseBound {
+                            case_kind: existing.kind,
+                            opened: false,
                         },
                     )
                     .case(case_id),
@@ -1067,7 +1187,7 @@ impl Runtime {
         run: RunId,
         plan: PlanIR,
         input: Tainted<Value>,
-        case: Option<(String, Vec<CorrelationKey>)>,
+        case: Option<CaseBinding>,
     ) -> Result<RunOutcome, RuntimeError> {
         let admitted = self.admit_only(run, plan, input, case).await?;
         self.execute_admitted(admitted).await

@@ -2245,6 +2245,8 @@ impl StepCtx<'_> {
         if query.as_of.is_none() {
             query.as_of = Some(self.now().await?);
         }
+        let recall_at = query.as_of.expect("recall cutoff set above");
+        let refresh_access = query.refresh_access;
         let selected = self
             .effect(crate::runtime::effects::RecallMemory {
                 memories: Arc::clone(&memories),
@@ -2252,6 +2254,15 @@ impl StepCtx<'_> {
             })
             .await?
             .into_unlabelled();
+
+        if refresh_access && !selected.is_empty() {
+            self.effect(crate::runtime::effects::TouchMemory {
+                memories: Arc::clone(&memories),
+                ids: selected.iter().map(|pick| pick.id.clone()).collect(),
+                at: recall_at,
+            })
+            .await?;
+        }
 
         let mut out = Vec::with_capacity(selected.len());
         for pick in selected {
@@ -2298,7 +2309,7 @@ impl StepCtx<'_> {
     pub async fn semantic_recall(
         &mut self,
         retriever: Arc<dyn crate::memory::SemanticRetriever>,
-        query: crate::memory::SemanticQuery,
+        query: Tainted<crate::memory::SemanticQuery>,
     ) -> Result<Vec<(Tainted<crate::memory::MemoryItem>, f32)>, StepError> {
         let memories = self.memories.clone().ok_or_else(|| {
             StepError::Store(crate::core::StoreError::Backend(
@@ -2306,11 +2317,19 @@ impl StepCtx<'_> {
                     .to_owned(),
             ))
         })?;
+        let plain = query.peek().clone();
+        let arguments = query.map(|query| {
+            serde_json::to_value(query).expect("SemanticQuery serialization is infallible")
+        });
         let hits = self
-            .effect(crate::runtime::effects::SemanticRecall {
-                retriever,
-                query: query.clone(),
-            })
+            .sink(
+                crate::runtime::effects::SemanticRecall {
+                    retriever,
+                    query: plain.clone(),
+                    arguments: arguments.peek().clone(),
+                },
+                &arguments,
+            )
             .await?
             .into_unlabelled();
         let mut out = Vec::with_capacity(hits.len());
@@ -2334,8 +2353,8 @@ impl StepCtx<'_> {
                     ))
                 })?;
             if item.selection_digest() != hit.selected.digest
-                || item.subject != query.subject
-                || query
+                || item.subject != plain.subject
+                || plain
                     .purpose
                     .as_ref()
                     .is_some_and(|purpose| purpose != &item.purpose)
@@ -2404,6 +2423,7 @@ impl StepCtx<'_> {
             version: 0,
             created_at: at,
             expires_at: write.expires_at,
+            access_retention_seconds: write.access_retention_seconds,
             superseded_at: None,
             derived_from,
         };
@@ -2551,6 +2571,94 @@ impl StepCtx<'_> {
             derived_from,
         )
         .await
+    }
+
+    /// Extract a bounded set of durable facts from labelled source material.
+    ///
+    /// Formation is not an ambient hook. The reviewed declaration supplies the
+    /// destination and instruction; the model proposes only stable keys and
+    /// content. Every proposal remains labelled from the model and source and
+    /// is written through [`remember`](Self::remember).
+    pub async fn form_memories(
+        &mut self,
+        formation: crate::memory::Formation,
+        source: Tainted<Value>,
+        provider: Arc<dyn crate::model::ModelProvider>,
+        model: crate::model::ModelId,
+    ) -> Result<Vec<(String, u64)>, StepError> {
+        let source_label = source.label().clone();
+        let prompt = Tainted::object([
+            (
+                "system".to_owned(),
+                Tainted::trusted(serde_json::Value::String(formation.instruction.clone())),
+            ),
+            ("source".to_owned(), source),
+        ]);
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "memories": {
+                    "type": "array",
+                    "maxItems": formation.max_items,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "key": {"type": "string", "minLength": 1},
+                            "content": {}
+                        },
+                        "required": ["key", "content"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["memories"],
+            "additionalProperties": false
+        });
+        let call = crate::model::ModelCall::new(provider, model, prompt.peek().clone())
+            .with_max_sensitivity(formation.max_sensitivity)
+            .with_output_sensitivity(source_label.sensitivity)
+            .expecting(schema);
+        let completion = self.sink(call, &prompt).await?;
+        let label = completion.label().join(&source_label);
+        let value = completion
+            .peek()
+            .structured
+            .as_ref()
+            .expect("formation requested structured output");
+        let proposals = value["memories"]
+            .as_array()
+            .expect("formation schema requires an array")
+            .clone();
+        let mut written = Vec::with_capacity(proposals.len());
+        for proposal in proposals {
+            let key = proposal["key"]
+                .as_str()
+                .expect("formation schema requires key");
+            let id = format!(
+                "formed-{}",
+                crate::core::Digest::of(&crate::core::canon::value_bytes(&serde_json::json!({
+                    "subject": formation.subject,
+                    "purpose": formation.purpose,
+                    "key": key,
+                })))
+                .to_hex()
+            );
+            let mut destination = crate::memory::MemoryWrite::new(
+                id.clone(),
+                formation.subject.clone(),
+                formation.purpose.clone(),
+            );
+            destination.expires_at = formation.expires_at;
+            destination.access_retention_seconds = formation.access_retention_seconds;
+            let version = self
+                .remember(
+                    destination,
+                    Tainted::with_label(proposal["content"].clone(), label.clone()),
+                )
+                .await?;
+            written.push((id, version));
+        }
+        Ok(written)
     }
 
     /// Store bytes in the blob store and record that this case produced them.

@@ -69,7 +69,7 @@ redb = ["dep:redb"]
 # The agent declaration: tool grants, budgets, egress ceiling, injection
 # pattern. Off by default because the runtime is perfectly usable wired by
 # builder calls; the manifest is what makes those declarations reviewable.
-manifest = ["dep:serde_yaml_ng", "dep:base64"]
+manifest = ["dep:serde_yaml_ng", "dep:base64", "dep:jsonschema"]
 # Everything the `agentplane` binary needs to run a declarative agent.
 cli = ["manifest", "redb", "providers", "bedrock", "testkit"]
 # Content-addressed blob storage on any backend OpenDAL reaches — filesystem,
@@ -136,11 +136,11 @@ push = ["dep:reqwest"]
 signing = ["dep:ed25519-dalek"]
 # Model provider drivers over HTTP. The `ModelProvider` trait and the metering
 # rules are always available; this is a concrete driver.
-providers = ["dep:reqwest"]
+providers = ["dep:reqwest", "dep:jsonschema"]
 # Amazon Bedrock's Converse API. Separate from `providers` because the AWS SDK
 # dependency graph is substantial and neither OpenAI nor Anthropic users should
 # pay for it. The provider-neutral model seam remains unconditional.
-bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:aws-smithy-types", "dep:base64"]
+bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:aws-smithy-types", "dep:base64", "dep:jsonschema"]
 # Governed remote-media ingestion. Kept separate from model providers because
 # dereferencing an untrusted URL is a security boundary of its own: every DNS
 # answer and redirect is checked and pinned before bytes enter blob storage.
@@ -158,6 +158,7 @@ serde_json  = "1"
 # Schema *from the type*, so a tool's arguments have one declaration rather
 # than a hand-written copy in a manifest and a hand-indexed copy in the body.
 schemars    = "1"
+jsonschema  = { version = "0.49.5", default-features = false, optional = true }
 futures-core = "0.3"
 thiserror   = "2"
 ulid        = { version = "1", features = ["serde"] }

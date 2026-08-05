@@ -99,6 +99,9 @@ pub struct MemoryItem {
     /// journaled `Recall::as_of`, never an ambient store clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<Timestamp>,
+    /// Sliding retention window refreshed only by an explicit journaled touch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_retention_seconds: Option<u64>,
     /// Set when a later version replaced this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_at: Option<Timestamp>,
@@ -128,6 +131,7 @@ pub struct MemoryWrite {
     pub subject: String,
     pub purpose: String,
     pub expires_at: Option<Timestamp>,
+    pub access_retention_seconds: Option<u64>,
 }
 
 impl MemoryWrite {
@@ -142,6 +146,7 @@ impl MemoryWrite {
             subject: subject.into(),
             purpose: purpose.into(),
             expires_at: None,
+            access_retention_seconds: None,
         }
     }
 
@@ -149,6 +154,13 @@ impl MemoryWrite {
     #[must_use]
     pub const fn expires_at(mut self, at: Timestamp) -> Self {
         self.expires_at = Some(at);
+        self
+    }
+
+    /// Keep the memory for this long after each explicitly journaled recall.
+    #[must_use]
+    pub const fn retain_after_access(mut self, seconds: u64) -> Self {
+        self.access_retention_seconds = Some(seconds);
         self
     }
 }
@@ -203,6 +215,7 @@ impl MemoryItem {
             "written_by": self.written_by,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
+            "access_retention_seconds": self.access_retention_seconds,
             "derived_from": self.derived_from,
         })))
     }
@@ -227,6 +240,9 @@ pub struct Recall {
     /// [`StepCtx::recall`]: crate::runtime::StepCtx::recall
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<Timestamp>,
+    /// Refresh sliding retention for selected memories as a second effect.
+    #[serde(default)]
+    pub refresh_access: bool,
 }
 
 impl Recall {
@@ -237,6 +253,7 @@ impl Recall {
             purpose: None,
             limit: 10,
             as_of: None,
+            refresh_access: false,
         }
     }
 
@@ -257,6 +274,12 @@ impl Recall {
         self.as_of = Some(at);
         self
     }
+
+    #[must_use]
+    pub const fn refresh_access(mut self) -> Self {
+        self.refresh_access = true;
+        self
+    }
 }
 
 /// A semantic query whose exact vector and index identity are journalable.
@@ -275,6 +298,8 @@ pub struct SemanticQuery {
     /// Immutable vector-index snapshot searched by this query.
     pub index_snapshot: String,
     pub limit: usize,
+    /// Highest sensitivity this retriever may receive.
+    pub max_sensitivity: Sensitivity,
 }
 
 /// One ranked semantic selection as journaled.
@@ -432,6 +457,18 @@ pub struct Compaction {
     pub max_sensitivity: Sensitivity,
 }
 
+/// Governed model-assisted formation of durable memories.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Formation {
+    pub subject: String,
+    pub purpose: String,
+    pub instruction: String,
+    pub max_items: usize,
+    pub expires_at: Option<Timestamp>,
+    pub access_retention_seconds: Option<u64>,
+    pub max_sensitivity: Sensitivity,
+}
+
 /// One selected memory, as the journal records it.
 ///
 /// Ids and versions rather than content: this is what makes a replay reproduce
@@ -578,6 +615,9 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// Atomically erase current memories whose `expires_at <= at` unless held.
     /// Returns the number of memory ids erased.
     async fn sweep_expired(&self, at: Timestamp) -> Result<usize, StoreError>;
+
+    /// Refresh sliding access retention for current ids at a journaled instant.
+    async fn touch(&self, ids: &[String], at: Timestamp) -> Result<(), StoreError>;
 }
 
 #[cfg(test)]
@@ -626,6 +666,7 @@ mod semantic_tests {
             embedding_model: "embed-v3@2026-07-01".to_owned(),
             index_snapshot: "snapshot-7".to_owned(),
             limit: 2,
+            max_sensitivity: Sensitivity::Internal,
         };
         let hits = retriever.search(&query).await.expect("semantic search");
         assert_eq!(

@@ -148,6 +148,33 @@ pub struct Spec {
     /// [`Output`] for why declaring it here rather than in code is the point.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Output>,
+    /// Form bounded durable facts from each declarative agent answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_formation: Option<MemoryFormation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryFormation {
+    pub subject: String,
+    pub purpose: String,
+    pub instruction: String,
+    #[serde(default = "default_formation_items")]
+    pub max_items: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_retention_seconds: Option<u64>,
+    #[serde(default = "public_sensitivity")]
+    pub max_sensitivity: crate::core::Sensitivity,
+}
+
+const fn default_formation_items() -> usize {
+    3
+}
+
+const fn public_sensitivity() -> crate::core::Sensitivity {
+    crate::core::Sensitivity::Public
 }
 
 /// The words an agent is given about itself.
@@ -442,13 +469,6 @@ pub struct Models {
     /// The model that reads untrusted material and holds no authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quarantined: Option<ModelRef>,
-    /// Where to go when the privileged model is unavailable.
-    ///
-    /// A fallback is a *different* model, so it is a declared behaviour change
-    /// rather than a transparent one — which is why it belongs in the digest
-    /// beside the others instead of in a retry policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback: Option<ModelRef>,
 }
 
 /// One model, named the way a provider names it.
@@ -480,13 +500,10 @@ pub struct ModelRef {
 /// [`Manifest::digest`], so narrowing a field is a version bump a consumer can
 /// pin against.
 ///
-/// **This crate does not validate results against it**, and that is the same
-/// decision [`crate::model::Completion::structured`] documents: a second JSON
-/// Schema implementation here could disagree with the one that did the
-/// enforcing, and the disagreement would surface as a run refusing an answer
-/// that is in fact conformant. Enforcement belongs at the provider, during
-/// generation, where a constraint prevents a malformed answer instead of
-/// rejecting one already paid for.
+/// The provider enforces this during generation and the driver validates the
+/// parsed result locally as defense in depth. The first prevents invalid output
+/// from consuming tokens; the second stops provider or emulation drift from
+/// becoming malformed application data.
 ///
 /// What the schema is *not* is inert. Handed to
 /// [`ModelCall::expecting`](crate::model::ModelCall::expecting) it goes into the
@@ -660,6 +677,7 @@ impl Manifest {
         self.validate_topology()?;
         self.validate_models()?;
         self.validate_output()?;
+        self.validate_memory_formation()?;
         let mut tool_ids = std::collections::BTreeSet::new();
         for grant in &self.spec.tools {
             if grant.reference.trim().is_empty() {
@@ -828,7 +846,6 @@ impl Manifest {
         for (field, m) in [
             ("spec.models.privileged", &models.privileged),
             ("spec.models.quarantined", &models.quarantined),
-            ("spec.models.fallback", &models.fallback),
         ] {
             if let Some(m) = m
                 && (m.provider.trim().is_empty() || m.model.trim().is_empty())
@@ -837,6 +854,65 @@ impl Manifest {
             }
         }
 
+        if let (Some(privileged), Some(quarantined)) = (&models.privileged, &models.quarantined)
+            && privileged.provider == quarantined.provider
+            && privileged.model == quarantined.model
+        {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.models.quarantined",
+                detail: "the quarantined role names the same provider and model as the \
+                         privileged role, so the declared dual-model isolation has only one \
+                         model behind both sides",
+            });
+        }
+
+        Ok(())
+    }
+
+    fn validate_memory_formation(&self) -> Result<(), ManifestError> {
+        let Some(formation) = &self.spec.memory_formation else {
+            return Ok(());
+        };
+        if self.spec.execution.is_none() {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.memory_formation",
+                detail: "automatic formation is implemented by declarative execution; a coded skill must call StepCtx::form_memories explicitly",
+            });
+        }
+        if self
+            .spec
+            .models
+            .as_ref()
+            .and_then(|models| models.privileged.as_ref())
+            .is_none()
+        {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.memory_formation",
+                detail: "formation needs a declared privileged model",
+            });
+        }
+        for (field, value) in [
+            ("spec.memory_formation.subject", formation.subject.as_str()),
+            ("spec.memory_formation.purpose", formation.purpose.as_str()),
+            (
+                "spec.memory_formation.instruction",
+                formation.instruction.as_str(),
+            ),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ManifestError::Empty(field));
+            }
+        }
+        if !(1..=10).contains(&formation.max_items) {
+            return Err(ManifestError::Syntax(
+                "spec.memory_formation.max_items must be between 1 and 10".to_owned(),
+            ));
+        }
+        if formation.retention_seconds == Some(0) || formation.access_retention_seconds == Some(0) {
+            return Err(ManifestError::Syntax(
+                "memory formation retention windows must be greater than zero".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -898,11 +974,7 @@ impl Manifest {
         let Some(models) = &self.spec.models else {
             return true;
         };
-        let declared = [
-            models.privileged.as_ref(),
-            models.quarantined.as_ref(),
-            models.fallback.as_ref(),
-        ];
+        let declared = [models.privileged.as_ref(), models.quarantined.as_ref()];
         // `models: {}` declares a rules-only agent: nothing is permitted, and
         // that is the field meaning what it says rather than an oversight.
         declared

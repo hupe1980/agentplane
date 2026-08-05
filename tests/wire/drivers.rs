@@ -125,6 +125,7 @@ async fn model_drivers_bound_a_provider_that_never_responds() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .expect_err("OpenAI waited forever for a provider that never responded");
@@ -144,6 +145,7 @@ async fn model_drivers_bound_a_provider_that_never_responds() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .expect_err("Anthropic waited forever for a provider that never responded");
@@ -177,6 +179,7 @@ async fn reasoning_effort_uses_each_providers_native_request_shape() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .expect("OpenAI reasoning request");
@@ -207,6 +210,7 @@ async fn reasoning_effort_uses_each_providers_native_request_shape() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .expect("Anthropic reasoning request");
@@ -723,6 +727,7 @@ fn ask<'a>(model: &'a ModelId, prompt: &'a Value) -> agentplane::model::Request<
         tools: &[],
         exchanges: &[],
         continuation: None,
+        stream: None,
     }
 }
 
@@ -1012,6 +1017,7 @@ async fn a_schema_is_sent_as_a_strict_constraint() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .unwrap();
@@ -1055,6 +1061,7 @@ async fn the_anthropic_driver_sends_a_schema_too() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .unwrap();
@@ -1095,6 +1102,7 @@ async fn an_unparseable_structured_answer_is_billed_and_loud() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .unwrap_err();
@@ -1172,6 +1180,7 @@ async fn anthropic_can_emulate_a_schema_with_a_forced_tool() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .unwrap();
@@ -1228,6 +1237,7 @@ async fn openai_can_emulate_a_schema_with_a_forced_tool() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .unwrap();
@@ -1278,6 +1288,7 @@ async fn the_schema_mode_is_chosen_per_model() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .unwrap();
@@ -1313,6 +1324,7 @@ async fn the_schema_mode_is_chosen_per_model() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .unwrap();
@@ -1357,6 +1369,7 @@ async fn a_model_that_ignores_the_forced_tool_is_caught() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .unwrap_err();
@@ -1411,6 +1424,7 @@ async fn an_incompatible_schema_is_refused_with_the_reason() {
                 tools: &[],
                 exchanges: &[],
                 continuation: None,
+                stream: None,
             })
             .await
             .unwrap_err();
@@ -1455,6 +1469,7 @@ async fn a_conformant_schema_is_not_rewritten() {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .expect("a conformant schema must be accepted");
@@ -1825,6 +1840,7 @@ data: {\"type\":\"message_stop\"}
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .unwrap();
@@ -1871,6 +1887,7 @@ data: {\"type\":\"message_stop\"}
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await
         .expect_err("the fragments do not reassemble into JSON");

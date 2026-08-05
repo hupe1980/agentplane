@@ -496,6 +496,24 @@ impl<T> Tainted<T> {
         &self.label
     }
 
+    /// Clone this value with an additional whole-value dependency.
+    ///
+    /// Structured field labels remain intact: a trusted selector such as a
+    /// model instruction does not become untrusted merely because another
+    /// provider-visible part of the same request contains tool output. The
+    /// whole-value label still joins, so egress ceilings see that dependency.
+    #[cfg(feature = "manifest")]
+    pub(crate) fn with_joined_label(&self, other: &Label) -> Self
+    where
+        T: Clone,
+    {
+        Self {
+            value: self.value.clone(),
+            label: self.label.join(other),
+            fields: self.fields.clone(),
+        }
+    }
+
     /// Read without unwrapping. Safe by design: the lattice governs where a
     /// value may *go*, not whether it may be inspected.
     /// Take the value, dropping the label.

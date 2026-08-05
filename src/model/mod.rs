@@ -37,6 +37,8 @@ pub mod anthropic;
 mod anthropic_stream;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
+#[cfg(feature = "bedrock")]
+mod bedrock_stream;
 #[cfg(feature = "providers")]
 pub mod openai;
 #[cfg(feature = "providers")]
@@ -59,6 +61,15 @@ use crate::core::{
     Disposition, Effect, EffectDescriptor, EffectError, Recovery, RetryPolicy, Sensitivity, Spend,
     Trust,
 };
+
+#[cfg(any(feature = "manifest", feature = "providers", feature = "bedrock"))]
+pub(crate) fn validate_schema(schema: &Value, value: &Value) -> Result<(), String> {
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|error| format!("the declared JSON Schema is invalid: {error}"))?;
+    validator
+        .validate(value)
+        .map_err(|error| format!("value does not satisfy the declared JSON Schema: {error}"))
+}
 
 /// A provider-side media reference hidden inside a provider-native prompt.
 ///
@@ -302,14 +313,12 @@ pub struct Completion {
     /// `None` when no schema was declared. When one was, this is the parsed
     /// value and [`text`](Self::text) still holds the raw string.
     ///
-    /// **This crate does not re-validate against the schema**, and that is a
-    /// decision rather than an omission. The provider enforces the constraint
-    /// during generation; a second JSON Schema implementation here could
-    /// disagree with the one that did the enforcing, and the disagreement would
-    /// surface as a run refusing an answer that is in fact conformant. What the
-    /// driver *does* guarantee is that a declared schema means the text parsed —
-    /// so a provider bug becomes a loud, metered `Unusable` rather than a panic
-    /// three steps downstream.
+    /// Provider constrained decoding prevents malformed output before tokens
+    /// are emitted; this crate then validates the parsed value locally as
+    /// defense in depth. Provider bugs and forced-tool best-effort behavior are
+    /// therefore loud, metered `Unusable` responses rather than malformed data
+    /// reaching downstream code. External schema references are not resolved:
+    /// validation performs no hidden file or network I/O.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured: Option<Value>,
     /// Provider-owned response items required to continue this exact turn.
@@ -331,6 +340,23 @@ pub struct ProviderContinuation {
     pub provider: String,
     /// Exact provider-native items emitted by the preceding response.
     pub state: Value,
+}
+
+/// A live, non-durable model-stream event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "value")]
+pub enum ModelStreamEvent {
+    /// Visible answer text only. Opaque reasoning is never exposed here.
+    TextDelta(String),
+    /// The latest provider-reported usage snapshot.
+    Usage(Usage),
+}
+
+/// Receives live model progress while one terminal completion remains canonical.
+pub trait ModelStreamObserver: Send + Sync + Debug {
+    /// Delivery is advisory and must not block provider consumption. A caller
+    /// needing network backpressure should enqueue into its own bounded channel.
+    fn event(&self, event: crate::core::Tainted<ModelStreamEvent>);
 }
 
 impl ProviderContinuation {
@@ -508,6 +534,9 @@ pub struct Request<'a> {
     pub exchanges: &'a [ToolExchange],
     /// Exact provider-native state emitted beside those tool calls.
     pub continuation: Option<&'a ProviderContinuation>,
+    /// Live observer. Not provider-visible and therefore not effect identity.
+    /// Strict replay never calls it because replay never performs the provider.
+    pub stream: Option<(&'a dyn ModelStreamObserver, &'a crate::core::Label)>,
 }
 
 /// Provider-neutral reasoning depth.
@@ -735,6 +764,7 @@ pub struct ModelCall {
     tools: Vec<ToolDeclaration>,
     exchanges: Vec<ToolExchange>,
     continuation: Option<ProviderContinuation>,
+    stream: Option<Arc<dyn ModelStreamObserver>>,
     max_output_tokens: u32,
     reasoning_effort: Option<ReasoningEffort>,
     provider: Arc<dyn ModelProvider>,
@@ -769,6 +799,7 @@ impl ModelCall {
             tools: Vec::new(),
             exchanges: Vec::new(),
             continuation: None,
+            stream: None,
             max_output_tokens: Self::DEFAULT_MAX_OUTPUT_TOKENS,
             reasoning_effort: None,
             provider,
@@ -851,6 +882,13 @@ impl ModelCall {
     #[must_use]
     pub fn with_continuation(mut self, continuation: ProviderContinuation) -> Self {
         self.continuation = Some(continuation);
+        self
+    }
+
+    /// Observe visible model text as it arrives during live execution.
+    #[must_use]
+    pub fn streaming_to(mut self, observer: Arc<dyn ModelStreamObserver>) -> Self {
+        self.stream = Some(observer);
         self
     }
 
@@ -1053,6 +1091,11 @@ impl Effect for ModelCall {
         refuse_provider_side_media(&prompt, &self.model)
             .map_err(|error| EffectError::Rejected(error.to_string()))?;
 
+        let mut stream_label = crate::core::Label::untrusted(crate::core::SourceId::new(format!(
+            "model:{}",
+            self.model
+        )));
+        stream_label.sensitivity = self.output_sensitivity;
         self.provider
             .complete(Request {
                 model: &self.model,
@@ -1063,6 +1106,10 @@ impl Effect for ModelCall {
                 tools: &self.tools,
                 exchanges: &self.exchanges,
                 continuation: self.continuation.as_ref(),
+                stream: self
+                    .stream
+                    .as_deref()
+                    .map(|observer| (observer, &stream_label)),
             })
             .await
             .map_err(|e| {

@@ -134,6 +134,7 @@ async fn memory_revisions_are_shared_and_serialized(
                 )
                 .expect("time"),
                 expires_at: None,
+                access_retention_seconds: None,
                 superseded_at: None,
                 derived_from: Vec::new(),
             };
@@ -198,6 +199,7 @@ async fn memory_erasure_serializes_with_derivative_creation(
         version: 1,
         created_at: Timestamp::from_unix_timestamp(1_760_000_200).expect("time"),
         expires_at: None,
+        access_retention_seconds: None,
         superseded_at: None,
         derived_from: Vec::new(),
     };
@@ -326,6 +328,7 @@ async fn memories_are_apart(
         version: 0,
         created_at: at,
         expires_at: None,
+        access_retention_seconds: None,
         superseded_at: None,
         derived_from: Vec::new(),
     })

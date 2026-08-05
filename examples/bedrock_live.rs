@@ -33,6 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tools: &[],
             exchanges: &[],
             continuation: None,
+            stream: None,
         })
         .await?;
     println!("{}", completion.text);

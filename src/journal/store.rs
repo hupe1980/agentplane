@@ -260,6 +260,14 @@ pub trait JournalStore: Send + Sync + Debug {
     /// If the store is unreachable.
     async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError>;
 
+    /// Every known run ordered by its last durable append, newest first.
+    ///
+    /// This is a derived discovery index for protocol task listing, never the
+    /// authority for status: callers still read each run's journal head. The
+    /// timestamp is store-observed append time and exists only for ordering and
+    /// cursor stability.
+    async fn recent_runs(&self) -> Result<Vec<(RunId, u64)>, StoreError>;
+
     /// Every record belonging to a case, oldest first.
     ///
     /// *Show me everything about this matter* is the question a regulated

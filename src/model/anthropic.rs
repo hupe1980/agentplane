@@ -520,6 +520,13 @@ fn interpret(
                     .to_owned(),
             });
         };
+        if let Some(schema) = schema {
+            super::validate_schema(schema, &value).map_err(|detail| ModelError::Unusable {
+                model: model.clone(),
+                usage,
+                detail,
+            })?;
+        }
         (value.to_string(), Some(value))
     } else {
         if text.is_empty() {
@@ -740,6 +747,7 @@ impl Anthropic {
         response: reqwest::Response,
         model: &ModelId,
         schema: Option<&Value>,
+        observer: Option<(&dyn super::ModelStreamObserver, &crate::core::Label)>,
     ) -> Result<Completion, ModelError> {
         use futures_util::StreamExt;
 
@@ -761,6 +769,24 @@ impl Anthropic {
                     detail: error.to_string(),
                 })?;
             for event in events {
+                if event.name == "content_block_delta"
+                    && let Ok(value) = serde_json::from_str::<Value>(&event.data)
+                    && value
+                        .get("delta")
+                        .and_then(|delta| delta.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("text_delta")
+                    && let Some(delta) = value
+                        .get("delta")
+                        .and_then(|delta| delta.get("text"))
+                        .and_then(Value::as_str)
+                    && let Some((observer, label)) = observer
+                {
+                    observer.event(crate::core::Tainted::with_label(
+                        super::ModelStreamEvent::TextDelta(delta.to_owned()),
+                        label.clone(),
+                    ));
+                }
                 acc.event(&event.name, &event.data);
             }
             // An `error` event inside a 200. Handled as soon as it lands rather
@@ -784,7 +810,7 @@ impl Anthropic {
         }
 
         let emulating = schema.is_some() && self.mode_for(model) == SchemaMode::ForcedTool;
-        interpret(
+        let completion = interpret(
             model,
             schema,
             emulating,
@@ -796,7 +822,14 @@ impl Anthropic {
                 stop_reason: acc.stop_reason().map(ToOwned::to_owned),
                 continuation: acc.continuation_content(),
             },
-        )
+        )?;
+        if let Some((observer, label)) = observer {
+            observer.event(crate::core::Tainted::with_label(
+                super::ModelStreamEvent::Usage(completion.usage),
+                label.clone(),
+            ));
+        }
+        Ok(completion)
     }
 }
 
@@ -885,6 +918,7 @@ impl ModelProvider for Anthropic {
             tools,
             exchanges,
             continuation,
+            stream,
         } = request;
 
         super::refuse_provider_side_media(prompt, model)?;
@@ -923,10 +957,18 @@ impl ModelProvider for Anthropic {
         }
 
         let mut completion = if self.stream {
-            self.read_streamed(response, model, schema).await?
+            self.read_streamed(response, model, schema, stream).await?
         } else {
             self.read_buffered(response, model, schema).await?
         };
+        if !self.stream
+            && let Some((observer, label)) = stream
+        {
+            observer.event(crate::core::Tainted::with_label(
+                super::ModelStreamEvent::Usage(completion.usage),
+                label.clone(),
+            ));
+        }
         accumulate_continuation(&mut completion, continuation, exchanges);
         Ok(completion)
     }

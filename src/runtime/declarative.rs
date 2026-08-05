@@ -79,7 +79,7 @@ impl Declarative {
     /// Its own function because the loop is the interesting part and reads
     /// badly wedged inside a match arm — and because every governance decision
     /// in it is a separate thing worth finding.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn tool_loop(
         &self,
         cx: &mut StepCtx<'_>,
@@ -88,6 +88,7 @@ impl Declarative {
         model_role: (ModelId, Option<u32>, Option<crate::model::ReasoningEffort>),
         egress: Option<crate::core::Sensitivity>,
         granted: Vec<crate::manifest::ToolGrant>,
+        formation: Option<crate::manifest::MemoryFormation>,
     ) -> Result<Outcome, SkillError> {
         let (model, max_output_tokens, reasoning_effort) = model_role;
         let (catalog, client) = self.tools.clone().ok_or_else(|| {
@@ -143,6 +144,7 @@ impl Declarative {
         ]);
         let mut exchanges: Vec<crate::model::ToolExchange> = Vec::new();
         let mut continuation: Option<crate::model::ProviderContinuation> = None;
+        let mut conversation_label = prompt.label().clone();
 
         for _turn in 0..self.max_turns {
             let mut call = ModelCall::new(
@@ -151,7 +153,8 @@ impl Declarative {
                 prompt.peek().clone(),
             )
             .with_tools(declared.clone())
-            .continuing(exchanges.clone());
+            .continuing(exchanges.clone())
+            .with_output_sensitivity(conversation_label.sensitivity);
             if let Some(state) = continuation.take() {
                 call = call.with_continuation(state);
             }
@@ -164,11 +167,24 @@ impl Declarative {
             if let Some(ceiling) = egress {
                 call = call.with_max_sensitivity(ceiling);
             }
-            let completion = cx.sink(call, &prompt).await?;
+            let outbound = prompt.with_joined_label(&conversation_label);
+            let completion = cx.sink(call, &outbound).await?;
+            let label = completion.label().join(&conversation_label);
+            let completion = Tainted::with_label(completion.into_unlabelled(), label);
 
             // No tools asked for: the model is answering, and the turn
             // that answers is the last one.
             if completion.peek().tool_calls.is_empty() {
+                let formed_source = Tainted::with_label(
+                    completion
+                        .peek()
+                        .structured
+                        .clone()
+                        .unwrap_or_else(|| json!({ "text": completion.peek().text.clone() })),
+                    completion.label().clone(),
+                );
+                self.form_answer(cx, formation.as_ref(), formed_source, &model)
+                    .await?;
                 let answer =
                     completion.map(|c| c.structured.unwrap_or_else(|| json!({ "text": c.text })));
                 return Ok(Outcome::done(answer));
@@ -200,6 +216,20 @@ impl Declarative {
                     continue;
                 };
 
+                let Some(declaration) = declared.iter().find(|tool| tool.name == asked.name) else {
+                    exchanges.push(crate::model::ToolExchange::failed(
+                        asked,
+                        "the selected tool has no model-facing declaration",
+                    ));
+                    continue;
+                };
+                if let Err(detail) =
+                    crate::model::validate_schema(&declaration.parameters, &asked.arguments)
+                {
+                    exchanges.push(crate::model::ToolExchange::failed(asked, detail));
+                    continue;
+                }
+
                 let prepared = crate::tools::ToolCall::prepare(
                     &catalog,
                     Arc::clone(&client),
@@ -224,6 +254,7 @@ impl Declarative {
                 );
                 match cx.sink(prepared, &args).await {
                     Ok(result) => {
+                        conversation_label = conversation_label.join(result.label());
                         exchanges
                             .push(crate::model::ToolExchange::ok(asked, result.peek().clone()));
                     }
@@ -249,8 +280,43 @@ impl Declarative {
             self.name, self.max_turns
         )))
     }
+
+    async fn form_answer(
+        &self,
+        cx: &mut StepCtx<'_>,
+        declaration: Option<&crate::manifest::MemoryFormation>,
+        answer: Tainted<Value>,
+        model: &ModelId,
+    ) -> Result<(), SkillError> {
+        let Some(declaration) = declaration else {
+            return Ok(());
+        };
+        let expires_at = if let Some(seconds) = declaration.retention_seconds {
+            let now = cx.now().await?;
+            Some(now + time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX)))
+        } else {
+            None
+        };
+        cx.form_memories(
+            crate::memory::Formation {
+                subject: declaration.subject.clone(),
+                purpose: declaration.purpose.clone(),
+                instruction: declaration.instruction.clone(),
+                max_items: declaration.max_items,
+                expires_at,
+                access_retention_seconds: declaration.access_retention_seconds,
+                max_sensitivity: declaration.max_sensitivity,
+            },
+            answer,
+            Arc::clone(&self.provider),
+            model.clone(),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl Skill for Declarative {
     fn descriptor(&self) -> SkillDescriptor {
@@ -274,6 +340,7 @@ impl Skill for Declarative {
             egress,
             oversight,
             granted,
+            formation,
         ) = {
             let m = cx.manifest().ok_or_else(|| {
                 // Unreachable through the builder, which only registers this
@@ -304,6 +371,7 @@ impl Skill for Declarative {
                 m.spec.security.max_sensitivity_egress,
                 m.spec.oversight.as_ref().map(Proposal::from_manifest),
                 m.spec.tools.clone(),
+                m.spec.memory_formation.clone(),
             )
         };
 
@@ -320,8 +388,12 @@ impl Skill for Declarative {
                     ("system".to_owned(), Tainted::trusted(json!(system))),
                     ("input".to_owned(), input),
                 ]);
-                let mut call =
-                    ModelCall::new(Arc::clone(&self.provider), model, prompt.peek().clone());
+                let mut call = ModelCall::new(
+                    Arc::clone(&self.provider),
+                    model.clone(),
+                    prompt.peek().clone(),
+                )
+                .with_output_sensitivity(prompt.label().sensitivity);
                 if let Some(max_output_tokens) = max_output_tokens {
                     call = call.with_max_output_tokens(max_output_tokens);
                 }
@@ -346,6 +418,18 @@ impl Skill for Declarative {
                 }
 
                 let completion = cx.sink(call, &prompt).await?;
+                let label = completion.label().join(prompt.label());
+                let completion = Tainted::with_label(completion.into_unlabelled(), label);
+                let formed_source = Tainted::with_label(
+                    completion
+                        .peek()
+                        .structured
+                        .clone()
+                        .unwrap_or_else(|| json!({ "text": completion.peek().text.clone() })),
+                    completion.label().clone(),
+                );
+                self.form_answer(cx, formation.as_ref(), formed_source, &model)
+                    .await?;
                 // wanted — the manifest already said.
                 let answer =
                     completion.map(|c| c.structured.unwrap_or_else(|| json!({ "text": c.text })));
@@ -379,6 +463,7 @@ impl Skill for Declarative {
                     (model, max_output_tokens, reasoning_effort),
                     egress,
                     granted,
+                    formation,
                 )
                 .await
             }

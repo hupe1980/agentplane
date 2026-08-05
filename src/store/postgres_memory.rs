@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS memory_legal_holds (
     PRIMARY KEY (tenant, id)
 );
 
+CREATE TABLE IF NOT EXISTS memory_access_expiry (
+    tenant     TEXT   NOT NULL,
+    id         TEXT   NOT NULL,
+    expires_at BIGINT NOT NULL,
+    PRIMARY KEY (tenant, id)
+);
+
 CREATE INDEX IF NOT EXISTS memory_expiry
     ON memory_items (tenant, expires_at, id)
     WHERE current AND expires_at IS NOT NULL;
@@ -278,11 +285,18 @@ impl MemoryStore for PostgresStore {
             .map_err(|_| StoreError::Backend("memory recall limit exceeds BIGINT".to_owned()))?;
         let rows = client
             .query(
-                "SELECT item FROM memory_items
-                 WHERE tenant = $1 AND subject = $2 AND current
-                   AND ($3::TEXT IS NULL OR purpose = $3)
-                                     AND ($4::BIGINT IS NULL OR expires_at IS NULL OR expires_at > $4)
-                                 ORDER BY created_at DESC, id ASC LIMIT $5",
+                                "SELECT item.item FROM memory_items item
+                                 LEFT JOIN memory_access_expiry access
+                                     ON access.tenant = item.tenant AND access.id = item.id
+                                 WHERE item.tenant = $1 AND item.subject = $2 AND item.current
+                                     AND ($3::TEXT IS NULL OR item.purpose = $3)
+                                     AND ($4::BIGINT IS NULL
+                                                OR (item.expires_at IS NULL AND access.expires_at IS NULL)
+                                                OR GREATEST(
+                                                        COALESCE(item.expires_at, -9223372036854775808),
+                                                        COALESCE(access.expires_at, -9223372036854775808)
+                                                ) > $4)
+                                 ORDER BY item.created_at DESC, item.id ASC LIMIT $5",
                                 &[
                                         &tenant,
                                         &query.subject,
@@ -603,10 +617,16 @@ impl MemoryStore for PostgresStore {
             .query(
                 "SELECT item.id
                  FROM memory_items item
+                                 LEFT JOIN memory_access_expiry access
+                                     ON access.tenant = item.tenant AND access.id = item.id
                  LEFT JOIN memory_legal_holds hold
                    ON hold.tenant = item.tenant AND hold.id = item.id
                  WHERE item.tenant = $1 AND item.current
-                   AND item.expires_at IS NOT NULL AND item.expires_at <= $2
+                                     AND (item.expires_at IS NOT NULL OR access.expires_at IS NOT NULL)
+                                     AND GREATEST(
+                                             COALESCE(item.expires_at, -9223372036854775808),
+                                             COALESCE(access.expires_at, -9223372036854775808)
+                                     ) <= $2
                    AND hold.id IS NULL
                  FOR UPDATE OF item",
                 &[&tenant, &at.unix_timestamp()],
@@ -615,6 +635,12 @@ impl MemoryStore for PostgresStore {
             .map_err(|error| be(&error))?;
         let ids: Vec<String> = rows.iter().map(|row| row.get("id")).collect();
         for id in &ids {
+            tx.execute(
+                "DELETE FROM memory_access_expiry WHERE tenant = $1 AND id = $2",
+                &[&tenant, id],
+            )
+            .await
+            .map_err(|error| be(&error))?;
             tx.execute(
                 "DELETE FROM memory_derived WHERE tenant = $1 AND derived_id = $2",
                 &[&tenant, id],
@@ -637,6 +663,44 @@ impl MemoryStore for PostgresStore {
         }
         tx.commit().await.map_err(|error| be(&error))?;
         Ok(ids.len())
+    }
+
+    async fn touch(&self, ids: &[String], at: crate::core::Timestamp) -> Result<(), StoreError> {
+        let mut client = self.pool_ref().get().await.map_err(|error| {
+            StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
+        })?;
+        let tx = client.transaction().await.map_err(|error| be(&error))?;
+        let tenant = self.tenant_name();
+        for id in ids {
+            let Some(row) = tx
+                .query_opt(
+                    "SELECT item FROM memory_items
+                     WHERE tenant = $1 AND id = $2 AND current FOR UPDATE",
+                    &[&tenant, id],
+                )
+                .await
+                .map_err(|error| be(&error))?
+            else {
+                continue;
+            };
+            let item = decode(&row)?;
+            let Some(window) = item.access_retention_seconds else {
+                continue;
+            };
+            let expiry = at
+                .unix_timestamp()
+                .saturating_add(i64::try_from(window).unwrap_or(i64::MAX));
+            tx.execute(
+                "INSERT INTO memory_access_expiry (tenant, id, expires_at)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (tenant, id) DO UPDATE
+                 SET expires_at = GREATEST(memory_access_expiry.expires_at, EXCLUDED.expires_at)",
+                &[&tenant, id, &expiry],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        }
+        tx.commit().await.map_err(|error| be(&error))
     }
 
     async fn derivatives(&self, id: &str) -> Result<Vec<MemoryItem>, StoreError> {

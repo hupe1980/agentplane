@@ -90,6 +90,15 @@ CREATE INDEX IF NOT EXISTS journal_by_case
     ON journal (tenant, case_id, run_id, seq)
     WHERE case_id IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS run_activity (
+    tenant     TEXT   NOT NULL,
+    run_id     TEXT   NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (tenant, run_id)
+);
+CREATE INDEX IF NOT EXISTS run_activity_recent
+    ON run_activity (tenant, updated_at DESC, run_id DESC);
+
 -- Exactly-once, as a constraint rather than a code path. A second
 -- `EffectStarted` for one effect key in one run cannot be written, whichever
 -- instance is writing and whatever it believes about the journal.
@@ -401,6 +410,18 @@ impl PostgresStore {
             sealed.push(record);
         }
 
+        tx.execute(
+            "INSERT INTO run_activity (tenant, run_id, updated_at) VALUES ($1, $2, $3)
+             ON CONFLICT (tenant, run_id) DO UPDATE SET updated_at = EXCLUDED.updated_at",
+            &[
+                &self.tenant_name(),
+                &run.to_string(),
+                &now_secs().cast_signed(),
+            ],
+        )
+        .await
+        .map_err(|error| be(&error))?;
+
         Ok(sealed)
     }
 }
@@ -493,6 +514,28 @@ impl JournalStore for PostgresStore {
             .iter()
             .filter_map(|r| RunId::parse(r.get::<_, &str>(0)).ok())
             .collect())
+    }
+
+    async fn recent_runs(&self) -> Result<Vec<(RunId, u64)>, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT run_id, updated_at FROM run_activity
+                 WHERE tenant = $1 ORDER BY updated_at DESC, run_id DESC",
+                &[&self.tenant_name()],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        rows.into_iter()
+            .map(|row| {
+                let id: String = row.get(0);
+                let updated: i64 = row.get(1);
+                Ok((
+                    RunId::parse(&id).map_err(|error| StoreError::Backend(error.to_string()))?,
+                    updated.cast_unsigned(),
+                ))
+            })
+            .collect()
     }
 
     async fn case_history(

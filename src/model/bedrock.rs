@@ -12,7 +12,8 @@ use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::config::Region;
 use aws_sdk_bedrockruntime::operation::converse::ConverseError;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ConversationRole, InferenceConfiguration, Message, ReasoningContentBlock,
+    ContentBlock, ConversationRole, InferenceConfiguration, JsonSchemaDefinition, Message,
+    OutputConfig, OutputFormat, OutputFormatStructure, OutputFormatType, ReasoningContentBlock,
     ReasoningTextBlock, SpecificToolChoice, SystemContentBlock, Tool, ToolChoice,
     ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolResultStatus,
     ToolSpecification, ToolUseBlock,
@@ -22,8 +23,8 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use super::{
-    Completion, ModelError, ModelId, ModelProvider, ProviderContinuation, Request, ToolDeclaration,
-    ToolExchange, Usage,
+    Completion, ModelError, ModelId, ModelProvider, ProviderContinuation, Request, SchemaMode,
+    ToolDeclaration, ToolExchange, Usage,
 };
 
 const RESPOND_TOOL: &str = "__agentplane_respond";
@@ -34,6 +35,8 @@ pub struct Bedrock {
     client: Client,
     region: String,
     timeout: Duration,
+    schema_mode: SchemaMode,
+    stream: bool,
 }
 
 impl std::fmt::Debug for Bedrock {
@@ -41,6 +44,8 @@ impl std::fmt::Debug for Bedrock {
         f.debug_struct("Bedrock")
             .field("region", &self.region)
             .field("timeout", &self.timeout)
+            .field("schema_mode", &self.schema_mode)
+            .field("stream", &self.stream)
             .finish_non_exhaustive()
     }
 }
@@ -66,6 +71,8 @@ impl Bedrock {
             client,
             region: region.into(),
             timeout: Duration::from_mins(5),
+            schema_mode: SchemaMode::Native,
+            stream: true,
         }
     }
 
@@ -73,6 +80,20 @@ impl Bedrock {
     #[must_use]
     pub const fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Choose native constrained output or the forced-tool compatibility path.
+    #[must_use]
+    pub const fn structured_via(mut self, mode: SchemaMode) -> Self {
+        self.schema_mode = mode;
+        self
+    }
+
+    /// Use buffered Converse instead of `ConverseStream`.
+    #[must_use]
+    pub const fn buffered(mut self) -> Self {
+        self.stream = false;
         self
     }
 
@@ -216,8 +237,9 @@ impl Bedrock {
         model: &ModelId,
         schema: Option<&Value>,
         tools: &[ToolDeclaration],
+        mode: SchemaMode,
     ) -> Result<Option<ToolConfiguration>, ModelError> {
-        if schema.is_some() && !tools.is_empty() {
+        if schema.is_some() && mode == SchemaMode::ForcedTool && !tools.is_empty() {
             return Err(Self::refused(
                 model,
                 "Bedrock Converse obtains structured output by forcing a synthetic tool, so a \
@@ -225,7 +247,7 @@ impl Bedrock {
             ));
         }
         let mut builder = ToolConfiguration::builder();
-        if let Some(schema) = schema {
+        if let Some(schema) = schema.filter(|_| mode == SchemaMode::ForcedTool) {
             builder = builder
                 .tools(tool(
                     RESPOND_TOOL,
@@ -249,7 +271,7 @@ impl Bedrock {
                 )?);
             }
         }
-        if schema.is_none() && tools.is_empty() {
+        if (schema.is_none() || mode == SchemaMode::Native) && tools.is_empty() {
             Ok(None)
         } else {
             builder
@@ -259,9 +281,172 @@ impl Bedrock {
         }
     }
 
+    fn output_config(
+        model: &ModelId,
+        schema: Option<&Value>,
+        mode: SchemaMode,
+    ) -> Result<Option<OutputConfig>, ModelError> {
+        let Some(schema) = schema.filter(|_| mode == SchemaMode::Native) else {
+            return Ok(None);
+        };
+        let definition = JsonSchemaDefinition::builder()
+            .schema(schema.to_string())
+            .name("agentplane_response")
+            .build()
+            .map_err(|error| Self::refused(model, error.to_string()))?;
+        let format = OutputFormat::builder()
+            .r#type(OutputFormatType::JsonSchema)
+            .structure(OutputFormatStructure::JsonSchema(definition))
+            .build()
+            .map_err(|error| Self::refused(model, error.to_string()))?;
+        Ok(Some(OutputConfig::builder().text_format(format).build()))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn complete_streamed(
+        &self,
+        model: &ModelId,
+        prompt: &Value,
+        messages: Vec<Message>,
+        max_tokens: i32,
+        tools: Option<ToolConfiguration>,
+        output_config: Option<OutputConfig>,
+        schema: Option<&Value>,
+        observer: Option<(&dyn super::ModelStreamObserver, &crate::core::Label)>,
+    ) -> Result<Completion, ModelError> {
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let mut operation = self
+            .client
+            .converse_stream()
+            .model_id(&model.model)
+            .set_messages(Some(messages))
+            .inference_config(
+                InferenceConfiguration::builder()
+                    .max_tokens(max_tokens)
+                    .build(),
+            )
+            .set_tool_config(tools)
+            .set_output_config(output_config);
+        if let Some(system) = prompt.get("system") {
+            let text = system.as_str().ok_or_else(|| {
+                Self::refused(model, "Bedrock's system instruction must be a string")
+            })?;
+            operation = operation.system(SystemContentBlock::Text(text.to_owned()));
+        }
+        let output = tokio::time::timeout_at(deadline, operation.send())
+            .await
+            .map_err(|_| ModelError::Unavailable {
+                model: model.clone(),
+                detail: "Bedrock did not start the stream before the request deadline".to_owned(),
+            })?
+            .map_err(|error| {
+                error.as_service_error().map_or_else(
+                    || ModelError::Unreachable {
+                        model: model.clone(),
+                        detail: error.to_string(),
+                    },
+                    |service| classify_stream_start(model, service),
+                )
+            })?;
+
+        let mut stream = output.stream;
+        let mut accumulator = super::bedrock_stream::Accumulator::new();
+        loop {
+            let event = tokio::time::timeout_at(deadline, stream.recv())
+                .await
+                .map_err(|_| severed_stream(model, &accumulator, "the request deadline elapsed"))?
+                .map_err(|error| {
+                    let detail = error.to_string();
+                    classify_stream_event(model, &accumulator, error.as_service_error(), &detail)
+                })?;
+            let Some(event) = event else {
+                break;
+            };
+            if let aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockDelta(delta) =
+                &event
+                && let Some(aws_sdk_bedrockruntime::types::ContentBlockDelta::Text(text)) =
+                    delta.delta()
+                && let Some((observer, label)) = observer
+            {
+                observer.event(crate::core::Tainted::with_label(
+                    super::ModelStreamEvent::TextDelta(text.clone()),
+                    label.clone(),
+                ));
+            }
+            accumulator.event(event);
+        }
+
+        let Some(stop_reason) = accumulator.stop_reason().cloned() else {
+            return Err(severed_stream(
+                model,
+                &accumulator,
+                "the stream ended before messageStop",
+            ));
+        };
+        let Some(usage) = accumulator.usage() else {
+            return Err(severed_stream(
+                model,
+                &accumulator,
+                "the stream ended without usage metadata",
+            ));
+        };
+        if let Some((observer, label)) = observer {
+            observer.event(crate::core::Tainted::with_label(
+                super::ModelStreamEvent::Usage(usage),
+                label.clone(),
+            ));
+        }
+        let blocks = accumulator
+            .finish()
+            .map_err(|detail| ModelError::Unusable {
+                model: model.clone(),
+                usage,
+                detail,
+            })?;
+        let message = Message::builder()
+            .role(ConversationRole::Assistant)
+            .set_content(Some(blocks))
+            .build()
+            .map_err(|error| ModelError::Unusable {
+                model: model.clone(),
+                usage,
+                detail: error.to_string(),
+            })?;
+        let token_usage = aws_sdk_bedrockruntime::types::TokenUsage::builder()
+            .input_tokens(i32::try_from(usage.input_tokens).unwrap_or(i32::MAX))
+            .output_tokens(i32::try_from(usage.output_tokens).unwrap_or(i32::MAX))
+            .total_tokens(
+                i32::try_from(usage.input_tokens.saturating_add(usage.output_tokens))
+                    .unwrap_or(i32::MAX),
+            )
+            .cache_write_input_tokens(i32::try_from(usage.cache_write_tokens).unwrap_or(i32::MAX))
+            .cache_read_input_tokens(i32::try_from(usage.cache_read_tokens).unwrap_or(i32::MAX))
+            .build()
+            .map_err(|error| ModelError::Unusable {
+                model: model.clone(),
+                usage,
+                detail: error.to_string(),
+            })?;
+        let assembled = aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
+            .output(aws_sdk_bedrockruntime::types::ConverseOutput::Message(
+                message,
+            ))
+            .stop_reason(stop_reason)
+            .usage(token_usage)
+            .build()
+            .map_err(|error| ModelError::Unusable {
+                model: model.clone(),
+                usage,
+                detail: error.to_string(),
+            })?;
+        Self::interpret(model, schema, self.schema_mode, &assembled)
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn interpret(
         model: &ModelId,
         schema: Option<&Value>,
+        mode: SchemaMode,
         output: &aws_sdk_bedrockruntime::operation::converse::ConverseOutput,
     ) -> Result<Completion, ModelError> {
         let usage = output.usage().map_or_else(Usage::default, |usage| Usage {
@@ -310,13 +495,35 @@ impl Bedrock {
             }
         }
 
-        let structured = if schema.is_some() {
+        let emulating = schema.is_some() && mode == SchemaMode::ForcedTool;
+        let structured = if emulating {
             let value = forced.ok_or_else(|| ModelError::Unusable {
                 model: model.clone(),
                 usage,
                 detail: "Bedrock did not honor the forced structured-output tool".to_owned(),
             })?;
+            if let Some(schema) = schema {
+                super::validate_schema(schema, &value).map_err(|detail| ModelError::Unusable {
+                    model: model.clone(),
+                    usage,
+                    detail,
+                })?;
+            }
             text = value.to_string();
+            Some(value)
+        } else if schema.is_some() && calls.is_empty() {
+            let value = serde_json::from_str(&text).map_err(|error| ModelError::Unusable {
+                model: model.clone(),
+                usage,
+                detail: format!("Bedrock native structured output was not JSON: {error}"),
+            })?;
+            super::validate_schema(schema.expect("checked above"), &value).map_err(|detail| {
+                ModelError::Unusable {
+                    model: model.clone(),
+                    usage,
+                    detail,
+                }
+            })?;
             Some(value)
         } else {
             None
@@ -358,8 +565,11 @@ impl ModelProvider for Bedrock {
         json!({
             "driver": "aws-bedrock-converse/v1",
             "region": self.region,
-            "stream": false,
-            "structured_output": "forced-tool",
+            "stream": self.stream,
+            "schema_mode": match self.schema_mode {
+                SchemaMode::Native => "native",
+                SchemaMode::ForcedTool => "forced-tool",
+            },
             "timeout_ms": self.timeout.as_millis(),
         })
     }
@@ -374,6 +584,7 @@ impl ModelProvider for Bedrock {
             tools,
             exchanges,
             continuation,
+            stream,
         } = request;
         super::refuse_provider_side_media(prompt, model)?;
         if reasoning_effort.is_some() {
@@ -386,7 +597,25 @@ impl ModelProvider for Bedrock {
         let max_tokens = i32::try_from(max_output_tokens)
             .map_err(|_| Self::refused(model, "max_output_tokens exceeds Bedrock's i32 limit"))?;
         let messages = Self::messages(model, prompt, exchanges, continuation)?;
-        let tools = Self::tool_config(model, schema, tools)?;
+        let tools = Self::tool_config(model, schema, tools, self.schema_mode)?;
+        let output_config = Self::output_config(model, schema, self.schema_mode)?;
+        if self.stream {
+            let streamed = self
+                .complete_streamed(
+                    model,
+                    prompt,
+                    messages,
+                    max_tokens,
+                    tools,
+                    output_config,
+                    schema,
+                    stream,
+                )
+                .await?;
+            let mut completion = streamed;
+            accumulate_continuation(&mut completion, continuation, exchanges);
+            return Ok(completion);
+        }
         let mut operation = self
             .client
             .converse()
@@ -397,7 +626,8 @@ impl ModelProvider for Bedrock {
                     .max_tokens(max_tokens)
                     .build(),
             )
-            .set_tool_config(tools);
+            .set_tool_config(tools)
+            .set_output_config(output_config);
         if let Some(system) = prompt.get("system") {
             let text = system.as_str().ok_or_else(|| {
                 Self::refused(model, "Bedrock's system instruction must be a string")
@@ -421,7 +651,13 @@ impl ModelProvider for Bedrock {
                 }
             }
         })?;
-        let mut completion = Self::interpret(model, schema, &output)?;
+        let mut completion = Self::interpret(model, schema, self.schema_mode, &output)?;
+        if let Some((observer, label)) = stream {
+            observer.event(crate::core::Tainted::with_label(
+                super::ModelStreamEvent::Usage(completion.usage),
+                label.clone(),
+            ));
+        }
         accumulate_continuation(&mut completion, continuation, exchanges);
         Ok(completion)
     }
@@ -517,7 +753,88 @@ fn classify_service(model: &ModelId, error: &ConverseError) -> ModelError {
     }
 }
 
-fn document_from_json(value: &Value) -> Document {
+fn classify_stream_start(
+    model: &ModelId,
+    error: &aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
+) -> ModelError {
+    let detail = error.to_string();
+    if error.is_throttling_exception() || error.is_model_not_ready_exception() {
+        ModelError::RateLimited {
+            model: model.clone(),
+            detail,
+        }
+    } else if error.is_access_denied_exception()
+        || error.is_resource_not_found_exception()
+        || error.is_validation_exception()
+    {
+        ModelError::Refused {
+            model: model.clone(),
+            detail,
+        }
+    } else {
+        ModelError::Unavailable {
+            model: model.clone(),
+            detail,
+        }
+    }
+}
+
+fn severed_stream(
+    model: &ModelId,
+    accumulator: &super::bedrock_stream::Accumulator,
+    detail: &str,
+) -> ModelError {
+    if let Some(usage) = accumulator.usage() {
+        return ModelError::Interrupted {
+            model: model.clone(),
+            usage,
+            detail: detail.to_owned(),
+        };
+    }
+    if accumulator.generated() {
+        return ModelError::Unaccounted {
+            model: model.clone(),
+            detail: detail.to_owned(),
+        };
+    }
+    ModelError::Unavailable {
+        model: model.clone(),
+        detail: detail.to_owned(),
+    }
+}
+
+fn classify_stream_event(
+    model: &ModelId,
+    accumulator: &super::bedrock_stream::Accumulator,
+    error: Option<&aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError>,
+    detail: &str,
+) -> ModelError {
+    if accumulator.started() || accumulator.generated() {
+        return severed_stream(model, accumulator, detail);
+    }
+    if error.is_some_and(
+        aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError::is_throttling_exception,
+    ) {
+        ModelError::RateLimited {
+            model: model.clone(),
+            detail: detail.to_owned(),
+        }
+    } else if error.is_some_and(
+        aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError::is_validation_exception,
+    ) {
+        ModelError::Refused {
+            model: model.clone(),
+            detail: detail.to_owned(),
+        }
+    } else {
+        ModelError::Unavailable {
+            model: model.clone(),
+            detail: detail.to_owned(),
+        }
+    }
+}
+
+pub(super) fn document_from_json(value: &Value) -> Document {
     match value {
         Value::Null => Document::Null,
         Value::Bool(value) => Document::Bool(*value),
@@ -543,7 +860,7 @@ fn document_from_json(value: &Value) -> Document {
     }
 }
 
-fn json_from_document(value: &Document) -> Value {
+pub(super) fn json_from_document(value: &Document) -> Value {
     match value {
         Document::Null => Value::Null,
         Document::Bool(value) => Value::Bool(*value),
@@ -763,10 +1080,38 @@ mod tests {
             json!({
                 "driver": "aws-bedrock-converse/v1",
                 "region": "eu-west-1",
-                "stream": false,
-                "structured_output": "forced-tool",
+                "stream": true,
+                "schema_mode": "native",
                 "timeout_ms": 300_000,
             })
+        );
+
+        assert_ne!(
+            driver.request_profile(&ModelId::new("bedrock", "m")),
+            driver
+                .buffered()
+                .request_profile(&ModelId::new("bedrock", "m")),
+            "buffered and streamed Bedrock requests reused one effect identity"
+        );
+    }
+
+    #[test]
+    fn native_schema_can_coexist_with_tools_but_forced_fallback_cannot() {
+        let model = ModelId::new("bedrock", "test");
+        let schema = json!({"type": "object"});
+        let tools = vec![ToolDeclaration::new(
+            "lookup",
+            "Look something up.",
+            json!({"type": "object"}),
+        )];
+        assert!(
+            Bedrock::tool_config(&model, Some(&schema), &tools, SchemaMode::Native)
+                .expect("native schema and tools")
+                .is_some()
+        );
+        assert!(
+            Bedrock::tool_config(&model, Some(&schema), &tools, SchemaMode::ForcedTool).is_err(),
+            "forced-tool structured output consumed the same tool channel as caller tools"
         );
     }
 

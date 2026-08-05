@@ -236,13 +236,9 @@ async fn with_providers(
     let mut builder = builder;
     let mut seen: Vec<String> = Vec::new();
 
-    for m in [
-        models.privileged.as_ref(),
-        models.quarantined.as_ref(),
-        models.fallback.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
+    for m in [models.privileged.as_ref(), models.quarantined.as_ref()]
+        .into_iter()
+        .flatten()
     {
         if seen.contains(&m.provider) {
             continue;

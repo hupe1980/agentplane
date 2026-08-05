@@ -57,6 +57,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -213,6 +214,8 @@ pub struct A2aTask {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<Vec<A2aArtifact>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<A2aMessage>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
 }
 
@@ -266,24 +269,19 @@ impl A2aMessage {
             ));
         }
         for (index, part) in self.parts.iter().enumerate() {
-            let variants = usize::from(part.text.is_some())
-                + usize::from(part.data.is_some())
-                + usize::from(part.raw.is_some())
-                + usize::from(part.url.is_some());
-            if variants != 1 {
-                return Err(RpcError::new(
-                    code::INVALID_PARAMS,
-                    format!(
-                        "message.parts[{index}] must contain exactly one of text, data, raw, or url"
-                    ),
-                ));
-            }
             if part.raw.is_some() || part.url.is_some() {
                 return Err(RpcError::new(
                     code::CONTENT_TYPE_NOT_SUPPORTED,
                     format!(
                         "message.parts[{index}] is file content; this agent card advertises only text/plain and application/json"
                     ),
+                ));
+            }
+            let variants = usize::from(part.text.is_some()) + usize::from(part.data.is_some());
+            if variants != 1 {
+                return Err(RpcError::new(
+                    code::INVALID_PARAMS,
+                    format!("message.parts[{index}] must contain exactly one of text or data"),
                 ));
             }
         }
@@ -354,6 +352,20 @@ struct CommonParams {
     url: Option<String>,
     #[serde(default)]
     token: Option<String>,
+    #[serde(default, rename = "contextId")]
+    context_id: Option<String>,
+    #[serde(default)]
+    status: Option<TaskState>,
+    #[serde(default, rename = "pageSize")]
+    page_size: Option<usize>,
+    #[serde(default, rename = "pageToken")]
+    page_token: Option<String>,
+    #[serde(default, rename = "historyLength")]
+    history_length: Option<usize>,
+    #[serde(default, rename = "statusTimestampAfter")]
+    status_timestamp_after: Option<String>,
+    #[serde(default, rename = "includeArtifacts")]
+    include_artifacts: bool,
 }
 
 /// A JSON-RPC error, carrying the HTTP status it should be served with.
@@ -780,15 +792,15 @@ async fn stream_method(
                 "`message` is required by SendStreamingMessage",
             ));
         };
-        let skill = resolve_skill(&server, &message)?;
-        let caller = server.gate(&headers, action::MESSAGE_SEND, &skill).await?;
-        if message.parts.is_empty() {
+        message.validate_parts()?;
+        if message.task_id.is_some() {
             return Err(RpcError::new(
-                code::CONTENT_TYPE_NOT_SUPPORTED,
-                "the message has no parts this agent can read",
+                code::UNSUPPORTED_OPERATION,
+                "continue the conversation with contextId; this server does not mutate an existing task run",
             ));
         }
-
+        let skill = resolve_skill(&server, &message)?;
+        let caller = server.gate(&headers, action::MESSAGE_SEND, &skill).await?;
         // Admitted before the stream opens. A stream that begins and *then*
         // reports a refusal has already told the client the work started —
         // and an SSE body cannot carry a JSON-RPC error the client is looking
@@ -797,7 +809,7 @@ async fn stream_method(
             message.to_input(),
             SourceId::new(format!("peer:{}", caller.actor)),
         );
-        match server.runtime.spawn(&skill, input).await {
+        match spawn_a2a(&server, &skill, input, &message).await {
             Ok(run) => run,
             Err(crate::core::RuntimeError::PolicyDenied(_)) => {
                 return Err(RpcError::new(
@@ -852,10 +864,7 @@ async fn dispatch(
             code::INTERNAL_ERROR,
             "a streaming method reached the non-streaming dispatcher",
         )),
-        method::LIST_TASKS => Err(RpcError::new(
-            code::UNSUPPORTED_OPERATION,
-            "this agent does not implement ListTasks",
-        )),
+        method::LIST_TASKS => list_tasks(server, headers, &params).await,
         method::CREATE_PUSH => push_create(server, headers, params).await,
         method::GET_PUSH => push_get(server, headers, &params).await,
         method::LIST_PUSH => push_list(server, headers, &params).await,
@@ -879,11 +888,11 @@ async fn send_message(
         ));
     };
     message.validate_parts()?;
-    if message.task_id.is_some() || message.context_id.is_some() {
+    if message.task_id.is_some() {
         return Err(RpcError::new(
             code::UNSUPPORTED_OPERATION,
-            "this server does not yet implement A2A multi-turn continuation; taskId/contextId \
-             are refused rather than silently starting an unrelated run",
+            "this server keeps each task as one immutable run; continue the conversation with \
+             contextId to create a new task in the same context",
         ));
     }
     let skill = resolve_skill(server, &message)?;
@@ -907,21 +916,27 @@ async fn send_message(
         .as_ref()
         .is_some_and(|c| c.return_immediately)
     {
-        return match server.runtime.spawn(&skill, input).await {
-            Ok(run) => Ok(json!({
-                "task": task_of(run, TaskState::Working, "accepted", None)
-            })),
+        return match spawn_a2a(server, &skill, input, &message).await {
+            Ok(run) => {
+                let case = task_context(server, run).await?;
+                Ok(json!({
+                    "task": task_of(run, TaskState::Working, "accepted", case)
+                }))
+            }
             Err(crate::core::RuntimeError::PolicyDenied(_)) => {
                 Ok(json!({ "message": declined(&skill) }))
             }
             Err(crate::core::RuntimeError::QuotaExceeded(why)) => {
                 Err(RpcError::new(code::UNSUPPORTED_OPERATION, why.to_string()))
             }
+            Err(crate::core::RuntimeError::PlanContract(why)) if message.context_id.is_some() => {
+                Err(RpcError::new(code::TASK_NOT_FOUND, why))
+            }
             Err(e) => Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
         };
     }
 
-    let outcome = match server.runtime.run_tainted(&skill, input).await {
+    let outcome = match run_a2a(server, &skill, input, &message).await {
         Ok(outcome) => outcome,
         // A policy denial is the agent *declining*, not the agent breaking.
         // Reported as `-32603 Internal error` it reads as "this server is
@@ -941,6 +956,9 @@ async fn send_message(
         Err(crate::core::RuntimeError::QuotaExceeded(why)) => {
             return Err(RpcError::new(code::UNSUPPORTED_OPERATION, why.to_string()));
         }
+        Err(crate::core::RuntimeError::PlanContract(why)) if message.context_id.is_some() => {
+            return Err(RpcError::new(code::TASK_NOT_FOUND, why));
+        }
         Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
     };
 
@@ -950,7 +968,85 @@ async fn send_message(
     // notification that never arrives because it registered a moment too late.
     server.notify(outcome.run_id).await;
 
-    Ok(json!({ "task": task_of_outcome(&outcome) }))
+    let case = task_context(server, outcome.run_id).await?;
+    let mut task = task_of_outcome(&outcome);
+    task.context_id = case;
+    Ok(json!({ "task": task }))
+}
+
+async fn run_a2a(
+    server: &A2aServer,
+    skill: &str,
+    input: Tainted<Value>,
+    message: &A2aMessage,
+) -> Result<crate::runtime::RunOutcome, crate::core::RuntimeError> {
+    if let Some(context) = message.context_id.as_deref() {
+        let case = crate::core::CaseId::parse(context).map_err(|_| {
+            crate::core::RuntimeError::PlanContract("contextId is not a case issued here".into())
+        })?;
+        return server.runtime.run_tainted_in_case(skill, input, case).await;
+    }
+    if server.runtime.cases().is_some() {
+        return server
+            .runtime
+            .run_tainted_correlated(
+                skill,
+                input,
+                "a2a.context",
+                &[crate::core::CorrelationKey::new(
+                    "a2a-message",
+                    message.message_id.clone(),
+                )],
+            )
+            .await;
+    }
+    server.runtime.run_tainted(skill, input).await
+}
+
+async fn spawn_a2a(
+    server: &A2aServer,
+    skill: &str,
+    input: Tainted<Value>,
+    message: &A2aMessage,
+) -> Result<RunId, crate::core::RuntimeError> {
+    if let Some(context) = message.context_id.as_deref() {
+        let case = crate::core::CaseId::parse(context).map_err(|_| {
+            crate::core::RuntimeError::PlanContract("contextId is not a case issued here".into())
+        })?;
+        return server
+            .runtime
+            .spawn_tainted_in_case(skill, input, case)
+            .await;
+    }
+    if server.runtime.cases().is_some() {
+        return server
+            .runtime
+            .spawn_tainted_correlated(
+                skill,
+                input,
+                "a2a.context",
+                &[crate::core::CorrelationKey::new(
+                    "a2a-message",
+                    message.message_id.clone(),
+                )],
+            )
+            .await;
+    }
+    server.runtime.spawn(skill, input).await
+}
+
+async fn task_context(server: &A2aServer, run: RunId) -> Result<Option<String>, RpcError> {
+    server
+        .runtime
+        .journal()
+        .read(run, 1)
+        .await
+        .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the task journal could not be read"))
+        .map(|records| {
+            records
+                .iter()
+                .find_map(|record| record.body.case.map(|case| case.to_string()))
+        })
 }
 
 fn task_of_outcome(outcome: &crate::runtime::RunOutcome) -> A2aTask {
@@ -986,6 +1082,7 @@ fn task_of_outcome(outcome: &crate::runtime::RunOutcome) -> A2aTask {
                 parts: vec![part],
             }]
         }),
+        history: None,
         metadata: None,
     }
 }
@@ -1065,6 +1162,218 @@ async fn get_task(
         .find_map(|r| r.body.case.map(|c| c.to_string()));
 
     Ok(json!({ "task": task_of(id, state, &detail, case) }))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskCursor {
+    updated_at: u64,
+    run: String,
+    context_id: Option<String>,
+    status: Option<TaskState>,
+    status_timestamp_after: Option<String>,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn list_tasks(
+    server: &A2aServer,
+    headers: &HeaderMap,
+    params: &CommonParams,
+) -> Result<Value, RpcError> {
+    server.gate(headers, action::TASK_READ, "tasks").await?;
+    let page_size = params.page_size.unwrap_or(50);
+    if !(1..=100).contains(&page_size) {
+        return Err(RpcError::new(
+            code::INVALID_PARAMS,
+            "pageSize must be between 1 and 100",
+        ));
+    }
+    if params.include_artifacts {
+        return Err(RpcError::new(
+            code::UNSUPPORTED_OPERATION,
+            "ListTasks cannot include artifacts: arbitrary skill outputs are not a journal projection; use GetTask or the blocking SendMessage response",
+        ));
+    }
+    let after = params
+        .status_timestamp_after
+        .as_deref()
+        .map(|value| {
+            time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| {
+                    RpcError::new(
+                        code::INVALID_PARAMS,
+                        "statusTimestampAfter must be an RFC 3339 timestamp",
+                    )
+                })
+        })
+        .transpose()?;
+    let cursor = params
+        .page_token
+        .as_deref()
+        .map(decode_task_cursor)
+        .transpose()?;
+    if let Some(cursor) = &cursor
+        && (cursor.context_id != params.context_id
+            || cursor.status != params.status
+            || cursor.status_timestamp_after != params.status_timestamp_after)
+    {
+        return Err(RpcError::new(
+            code::INVALID_PARAMS,
+            "pageToken was issued for different ListTasks filters",
+        ));
+    }
+
+    let recent = server
+        .runtime
+        .journal()
+        .recent_runs()
+        .await
+        .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the task index could not be read"))?;
+    let mut all = Vec::new();
+    for (run, updated) in &recent {
+        if after.is_some_and(|cutoff| {
+            i64::try_from(*updated)
+                .ok()
+                .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+                .is_none_or(|value| value < cutoff)
+        }) {
+            continue;
+        }
+        let records =
+            server.runtime.journal().read(*run, 1).await.map_err(|_| {
+                RpcError::new(code::INTERNAL_ERROR, "a task journal could not be read")
+            })?;
+        let task = task_from_records(*run, &records, *updated, params.history_length);
+        if params
+            .context_id
+            .as_ref()
+            .is_some_and(|context| task.context_id.as_ref() != Some(context))
+            || params
+                .status
+                .as_ref()
+                .is_some_and(|status| &task.status.state != status)
+        {
+            continue;
+        }
+        all.push((*run, *updated, task));
+    }
+    let total_size = all.len();
+    // Compare against the cursor's ordering position rather than looking up its
+    // exact row. A working task may append and move to the front between pages;
+    // requiring the old `(updated, run)` pair to remain present would then
+    // truncate the rest of the listing.
+    let allowed: std::collections::BTreeSet<RunId> = recent
+        .iter()
+        .filter(|(run, updated)| {
+            cursor
+                .as_ref()
+                .is_none_or(|cursor| after_cursor(*run, *updated, cursor))
+        })
+        .map(|(run, _)| *run)
+        .collect();
+    let page: Vec<_> = all
+        .into_iter()
+        .filter(|(run, _, _)| allowed.contains(run))
+        .take(page_size + 1)
+        .collect();
+    let has_more = page.len() > page_size;
+    let visible = &page[..page.len().min(page_size)];
+    let next_page_token = if has_more {
+        let (run, updated, _) = visible.last().expect("a page with more has a last item");
+        encode_task_cursor(&TaskCursor {
+            updated_at: *updated,
+            run: run.to_string(),
+            context_id: params.context_id.clone(),
+            status: params.status,
+            status_timestamp_after: params.status_timestamp_after.clone(),
+        })?
+    } else {
+        String::new()
+    };
+    Ok(json!({
+        "tasks": visible.iter().map(|(_, _, task)| task).collect::<Vec<_>>(),
+        "nextPageToken": next_page_token,
+        "pageSize": page_size,
+        "totalSize": total_size,
+    }))
+}
+
+fn encode_task_cursor(cursor: &TaskCursor) -> Result<String, RpcError> {
+    crate::core::canon::to_bytes(cursor)
+        .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the task cursor could not be encoded"))
+}
+
+fn decode_task_cursor(token: &str) -> Result<TaskCursor, RpcError> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "pageToken is not a valid task cursor"))
+}
+
+fn after_cursor(run: RunId, updated: u64, cursor: &TaskCursor) -> bool {
+    updated < cursor.updated_at || (updated == cursor.updated_at && run.to_string() < cursor.run)
+}
+
+fn task_from_records(
+    run: RunId,
+    records: &[crate::journal::Record],
+    updated: u64,
+    history_length: Option<usize>,
+) -> A2aTask {
+    let (state, detail) = records.last().map_or(
+        (TaskState::Working, "unknown".to_owned()),
+        |record| match record.kind() {
+            RecordKind::RunSuspended { reason } => (TaskState::InputRequired, reason.to_string()),
+            RecordKind::RunSealed { outcome, .. } => (sealed_state(outcome), outcome.clone()),
+            _ => (TaskState::Working, "running".to_owned()),
+        },
+    );
+    let case = records
+        .iter()
+        .find_map(|record| record.body.case.map(|case| case.to_string()));
+    let timestamp = i64::try_from(updated)
+        .ok()
+        .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+        .and_then(|value| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        });
+    let history = history_length.and_then(|limit| {
+        if limit == 0 {
+            return None;
+        }
+        records.iter().find_map(|record| {
+            let RecordKind::RunAdmitted { input, .. } = record.kind() else {
+                return None;
+            };
+            let text = input
+                .get("text")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            Some(vec![A2aMessage {
+                message_id: format!("{run}-input"),
+                role: "ROLE_USER".to_owned(),
+                parts: vec![Part {
+                    data: text.is_none().then(|| input.clone()),
+                    text,
+                    raw: None,
+                    url: None,
+                    filename: None,
+                    media_type: Some("application/json".to_owned()),
+                }],
+                context_id: case.clone(),
+                task_id: Some(run.to_string()),
+                metadata: None,
+            }])
+        })
+    });
+    let mut task = task_of(run, state, &detail, case);
+    task.status.timestamp = timestamp;
+    task.history = history;
+    task
 }
 
 /// A sealed run's outcome word, as an A2A state.
@@ -1195,6 +1504,7 @@ pub(super) fn task_of(run: RunId, state: TaskState, detail: &str, case: Option<S
             timestamp: None,
         },
         artifacts: None,
+        history: None,
         metadata: None,
     }
 }
@@ -1349,4 +1659,29 @@ async fn push_delete(
         .await
         .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))?;
     Ok(json!({}))
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn a_cursor_survives_its_anchor_moving_to_the_front() {
+        let anchor = RunId::generate();
+        let older = RunId::generate();
+        let cursor = TaskCursor {
+            updated_at: 20,
+            run: anchor.to_string(),
+            context_id: None,
+            status: None,
+            status_timestamp_after: None,
+        };
+        let recent = [(anchor, 30), (older, 10)];
+        let after: Vec<_> = recent
+            .iter()
+            .filter(|(run, updated)| after_cursor(*run, *updated, &cursor))
+            .map(|(run, _)| *run)
+            .collect();
+        assert_eq!(after, vec![older]);
+    }
 }

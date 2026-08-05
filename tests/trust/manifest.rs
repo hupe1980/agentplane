@@ -2052,9 +2052,12 @@ spec:
   budgets: {}
 "#;
 
-    let m = Manifest::parse(YAML).expect("parse");
+    let mut m = Manifest::parse(YAML).expect("parse");
+    m.spec.security.max_sensitivity_egress = Some(agentplane::core::Sensitivity::Internal);
     let provider = agentplane::testkit::FakeProvider::new();
-    // Turn 1: the model asks. Turn 2: it answers.
+    // Turn 1: malformed proposal, refused locally. Turn 2: corrected call.
+    // Turn 3: answer.
+    provider.will_call_tool("toolu_bad", "ledger__read", json!({}));
     provider.will_call_tool("toolu_1", "ledger__read", json!({ "id": "AC-1" }));
     provider.will_say("the balance is 42");
 
@@ -2093,28 +2096,106 @@ spec:
         .run("ledger.ask", json!({ "q": "balance?" }))
         .await
         .expect("run");
-    assert!(
-        matches!(out.status, RunStatus::Succeeded),
-        "the loop did not finish: {:?}",
-        out.status
-    );
+    assert!(matches!(out.status, RunStatus::Succeeded));
     assert_eq!(
         ledger.0.load(Ordering::Relaxed),
         1,
-        "the granted tool was not called exactly once"
+        "the schema-invalid proposal reached the tool or the corrected call did not"
     );
-    assert_eq!(provider.calls(), 2, "two turns: the ask, then the answer");
+    let asked = provider.asked();
+    assert!(
+        asked[1].exchanges[0].failed,
+        "the invalid argument object was not reported back as a failed call"
+    );
+    assert!(
+        asked[1].exchanges[0]
+            .output
+            .as_str()
+            .is_some_and(|detail| detail.contains("does not satisfy")),
+        "the model was not told how to correct its argument shape: {:?}",
+        asked[1].exchanges[0].output
+    );
+    assert_eq!(provider.calls(), 3, "invalid call, corrected call, answer");
 
     // Replay reads the whole conversation back — no model, no tool.
     let replayed = rt.replay(out.run_id, Mode::Strict).await.expect("replay");
     assert!(matches!(replayed.status, RunStatus::Succeeded));
     assert_eq!(
         (provider.calls(), ledger.0.load(Ordering::Relaxed)),
-        (2, 1),
+        (3, 1),
         "a replay re-ran the conversation, so every turn was paid for twice and \
          the tool acted on the world again"
     );
     assert_eq!(out.output, replayed.output, "the loop replays exactly");
+}
+
+#[cfg(all(feature = "redb", feature = "testkit"))]
+#[tokio::test]
+async fn a_tool_result_above_the_model_ceiling_never_reenters_the_provider() {
+    use agentplane::core::Sensitivity;
+    use agentplane::runtime::{Agent, RunStatus, Runtime};
+    use agentplane::tools::{ToolCatalog, ToolClient, ToolError, ToolId, ToolSafety};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct SecretTool;
+    #[async_trait::async_trait]
+    impl ToolClient for SecretTool {
+        async fn call(
+            &self,
+            _tool: &ToolId,
+            _arguments: &Value,
+            _provenance: Option<&agentplane::core::Provenance>,
+        ) -> Result<Value, ToolError> {
+            Ok(json!({"secret": "must not reach the model"}))
+        }
+    }
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: guarded-loop, version: "1.0.0" }
+spec:
+  capabilities: { provides: [guarded.ask] }
+  models: { privileged: { provider: fake, model: declared-1 } }
+  tools:
+    - ref: mcp://vault/read
+      mutates: false
+      description: Read a value.
+      arguments: { type: object }
+  execution: { kind: tool-calling, max_turns: 3 }
+  security: { max_sensitivity_egress: internal }
+  budgets: {}
+"#,
+    )
+    .expect("manifest");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_call_tool("secret-1", "vault__read", json!({}));
+    provider.will_say("this turn must not run");
+    let catalog = Arc::new(
+        ToolCatalog::new().allow(
+            ToolId::new("vault", "read"),
+            ToolSafety::read_only()
+                .max_sensitivity(Sensitivity::Internal)
+                .output_sensitivity(Sensitivity::Secret),
+        ),
+    );
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let runtime = Runtime::builder(store)
+        .provider("fake", Arc::clone(&provider) as Arc<_>)
+        .tools(catalog, Arc::new(SecretTool))
+        .agent(Agent::new(&manifest))
+        .build();
+
+    let outcome = runtime.run("guarded.ask", json!({})).await.expect("run");
+    assert!(matches!(outcome.status, RunStatus::Failed(_)));
+    assert_eq!(
+        provider.calls(),
+        1,
+        "the secret result re-entered the model"
+    );
 }
 
 /// An agent that will not converge is stopped, and says so.
@@ -2162,7 +2243,8 @@ spec:
   budgets: {}
 "#;
 
-    let m = Manifest::parse(YAML).expect("parse");
+    let mut m = Manifest::parse(YAML).expect("parse");
+    m.spec.security.max_sensitivity_egress = Some(agentplane::core::Sensitivity::Internal);
     let provider = agentplane::testkit::FakeProvider::new();
     // Four asks against a ceiling of three: it never gets to answer.
     for i in 0..4 {
@@ -2371,6 +2453,131 @@ spec:
 "#;
     Manifest::parse(yaml)
         .expect("reasoning tool loops are valid now that continuation state is round-tripped");
+}
+
+#[test]
+fn quarantined_model_must_differ_from_privileged_model() {
+    let yaml = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: dual, version: "1.0.0" }
+spec:
+    capabilities: { provides: [review] }
+    models:
+        privileged: { provider: openai, model: gpt-5 }
+        quarantined: { provider: openai, model: gpt-5 }
+    budgets: {}
+"#;
+    match Manifest::parse(yaml) {
+        Err(ManifestError::Unenforceable { field, detail }) => {
+            assert_eq!(field, "spec.models.quarantined");
+            assert!(detail.contains("only one model"), "{detail}");
+        }
+        Err(error) => panic!("wrong refusal: {error}"),
+        Ok(_) => panic!("one model was accepted as both sides of dual-model isolation"),
+    }
+}
+
+#[test]
+fn an_inert_declarative_model_fallback_is_refused() {
+    let yaml = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: fallback, version: "1.0.0" }
+spec:
+    capabilities: { provides: [answer] }
+    models:
+        privileged: { provider: openai, model: gpt-5 }
+        fallback: { provider: anthropic, model: claude-sonnet-4-6 }
+    budgets: {}
+"#;
+    assert!(
+        Manifest::parse(yaml).is_err(),
+        "the manifest accepted a fallback role no runtime code selects"
+    );
+}
+
+#[cfg(all(feature = "redb", feature = "testkit"))]
+#[tokio::test]
+async fn declared_memory_formation_extracts_and_writes_bounded_facts() {
+    use agentplane::memory::MemoryStore;
+    use agentplane::runtime::{Agent, Runtime};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let mut manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: remembering, version: "1.0.0" }
+spec:
+  capabilities: { provides: [remember.answer] }
+  models: { privileged: { provider: fake, model: memory-1 } }
+  execution: { kind: completion }
+  memory_formation:
+    subject: team/support
+    purpose: learned-facts
+    instruction: Extract stable facts only.
+    max_items: 2
+    retention_seconds: 3600
+    access_retention_seconds: 600
+    max_sensitivity: confidential
+  budgets: {}
+"#,
+    )
+    .expect("formation manifest");
+    manifest.spec.security.max_sensitivity_egress =
+        Some(agentplane::core::Sensitivity::Confidential);
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_say("answer");
+    provider.will_answer(agentplane::model::Completion {
+        text: r#"{"memories":[{"key":"language","content":"German"}]}"#.to_owned(),
+        structured: Some(json!({
+            "memories": [{"key": "language", "content": "German"}]
+        })),
+        tool_calls: Vec::new(),
+        usage: agentplane::model::Usage::default(),
+        stop_reason: Some("end_turn".to_owned()),
+        truncated: false,
+        continuation: None,
+    });
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>)
+        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+        .provider(
+            "fake",
+            provider as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .build();
+    let input = agentplane::core::Tainted::with_label(
+        json!({"question": "language?"}),
+        agentplane::core::Label::untrusted(agentplane::core::SourceId::new("customer-record"))
+            .with_sensitivity(agentplane::core::Sensitivity::Confidential),
+    );
+    let outcome = rt.run_tainted("remember.answer", input).await.unwrap();
+    assert!(
+        matches!(outcome.status, agentplane::runtime::RunStatus::Succeeded),
+        "formation run failed: {:?}",
+        outcome.status
+    );
+    let recalled = store
+        .recall(&agentplane::memory::Recall::about("team/support"))
+        .await
+        .unwrap();
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].content, json!("German"));
+    assert_eq!(
+        recalled[0].sensitivity,
+        agentplane::core::Sensitivity::Confidential
+    );
+    assert!(
+        recalled[0]
+            .provenance
+            .contains(&agentplane::core::SourceId::new("customer-record")),
+        "formation discarded the source provenance"
+    );
+    assert_eq!(recalled[0].access_retention_seconds, Some(600));
 }
 
 /// The published Agent Card is derived from the declaration, not written beside it.
