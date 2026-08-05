@@ -47,6 +47,13 @@ fn item(id: &str, subject: &str, content: Value, trust: Trust) -> MemoryItem {
     }
 }
 
+#[tokio::test]
+#[cfg(feature = "testkit")]
+async fn redb_satisfies_the_memory_store_contract() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn MemoryStore>;
+    agentplane::testkit::conformance::memory(store).await;
+}
+
 // ── Trust comes from provenance, not content ────────────────────────────────
 
 /// A memory that says it is trustworthy is not.
@@ -98,6 +105,24 @@ fn a_memory_carries_its_sensitivity_into_the_label() {
     let mut secret = item("m-3", "acct-7", json!({ "pan": "…" }), Trust::Untrusted);
     secret.sensitivity = Sensitivity::Confidential;
     assert_eq!(secret.label().sensitivity, Sensitivity::Confidential);
+}
+
+#[test]
+fn a_selection_commitment_binds_security_metadata() {
+    let untrusted = item(
+        "m-commitment",
+        "acct-7",
+        json!({"note": "same bytes"}),
+        Trust::Untrusted,
+    );
+    let mut trusted = untrusted.clone();
+    trusted.trust = Trust::Trusted;
+    assert_eq!(untrusted.digest(), trusted.digest(), "content changed");
+    assert_ne!(
+        untrusted.selection_digest(),
+        trusted.selection_digest(),
+        "replay commitment ignored a label-changing trust rewrite"
+    );
 }
 
 // ── Retrieval is an effect ──────────────────────────────────────────────────
@@ -173,6 +198,60 @@ impl Skill for Recalls {
     }
 }
 
+/// Writes one memory with a caller-selected source trust.
+#[derive(Debug)]
+struct Remembers(Trust);
+
+#[async_trait::async_trait]
+impl Skill for Remembers {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("remembers").provides("remembers")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.remember(item(
+            "m-identity",
+            "acct-7",
+            json!({"note": "same bytes"}),
+            self.0,
+        ))
+        .await
+        .map_err(SkillError::Step)?;
+        Ok(Outcome::done(Tainted::trusted(json!({"ok": true}))))
+    }
+}
+
+/// Changing a write's security metadata is a changed effect.
+#[tokio::test]
+async fn memory_security_metadata_is_part_of_replay_identity() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let memories = Arc::clone(&store) as Arc<dyn MemoryStore>;
+    let live = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(Arc::clone(&memories))
+        .skill(Remembers(Trust::Untrusted))
+        .build();
+    let run = live.run("remembers", json!({})).await.expect("live");
+    assert_eq!(run.status, RunStatus::Succeeded);
+
+    let changed = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(memories)
+        .skill(Remembers(Trust::Trusted))
+        .build();
+    let replay = changed
+        .replay(run.run_id, Mode::Strict)
+        .await
+        .expect("strict replay reports divergence as an outcome");
+    assert_ne!(
+        replay.status,
+        RunStatus::Succeeded,
+        "changing an identical memory from untrusted to trusted reused the old effect"
+    );
+}
+
 /// A replayed run reads what it read, not what a later search would find.
 ///
 /// The property that makes memory safe to have at all. Memory is mutable state
@@ -238,6 +317,30 @@ async fn a_replayed_recall_does_not_search_again() {
         "the replayed run recalled a different set of memories than the run it \
          replays — the history disagrees with itself"
     );
+
+    // Erasure reserves the id, so an old selection can never name new content.
+    memories
+        .forget("m-1")
+        .await
+        .expect("forget selected memory");
+    assert!(
+        memories
+            .remember(&item(
+                "m-1",
+                "acct-7",
+                json!({ "note": "first" }),
+                Trust::Trusted,
+            ))
+            .await
+            .is_err(),
+        "the erased id was recycled"
+    );
+    let changed = rt.replay(out.run_id, Mode::Strict).await.expect("replay");
+    assert_ne!(
+        changed.status,
+        RunStatus::Succeeded,
+        "strict replay accepted a forgotten selection"
+    );
 }
 
 // ── Versioning and repair ───────────────────────────────────────────────────
@@ -291,6 +394,110 @@ async fn remembering_again_supersedes_rather_than_edits() {
         .expect("version")
         .expect("kept");
     assert_eq!(old.content["note"], "first");
+    assert_eq!(
+        old.superseded_at,
+        Some(at(1_760_000_000)),
+        "the old version stayed addressable but never recorded when it stopped being current"
+    );
+}
+
+/// Revising a derived memory replaces its lineage rather than accumulating it.
+#[tokio::test]
+async fn revising_a_memory_replaces_stale_derivation_edges() {
+    use agentplane::memory::Selected;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn MemoryStore>;
+    let source_a = item("source-a", "acct-7", json!({"fact": "a"}), Trust::Untrusted);
+    let source_b = item("source-b", "acct-7", json!({"fact": "b"}), Trust::Untrusted);
+    store.remember(&source_a).await.expect("source a");
+    store.remember(&source_b).await.expect("source b");
+
+    let mut summary = item(
+        "summary",
+        "acct-7",
+        json!({"summary": "a"}),
+        Trust::Untrusted,
+    );
+    summary.derived_from = vec![Selected {
+        id: "source-a".to_owned(),
+        version: 1,
+        digest: source_a.selection_digest(),
+    }];
+    store.remember(&summary).await.expect("summary v1");
+
+    summary.content = json!({"summary": "b"});
+    summary.derived_from = vec![Selected {
+        id: "source-b".to_owned(),
+        version: 1,
+        digest: source_b.selection_digest(),
+    }];
+    store.remember(&summary).await.expect("summary v2");
+
+    assert!(
+        store
+            .derivatives("source-a")
+            .await
+            .expect("old lineage")
+            .is_empty(),
+        "the revised summary still depended on a source it no longer contains"
+    );
+    assert_eq!(
+        store
+            .derivatives("source-b")
+            .await
+            .expect("new lineage")
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["summary"]
+    );
+}
+
+/// A forgotten id remains reserved, and its lineage remains repairable.
+#[tokio::test]
+async fn a_forgotten_id_cannot_be_reused_and_later_erasure_still_reaches_derivatives() {
+    use agentplane::memory::Selected;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn MemoryStore>;
+    let source = item("source", "acct-7", json!({"fact": "old"}), Trust::Untrusted);
+    store.remember(&source).await.expect("source");
+
+    let mut derived = item(
+        "reused",
+        "acct-7",
+        json!({"summary": "old"}),
+        Trust::Untrusted,
+    );
+    derived.derived_from = vec![Selected {
+        id: "source".to_owned(),
+        version: 1,
+        digest: source.selection_digest(),
+    }];
+    store.remember(&derived).await.expect("derived");
+    store.forget("source").await.expect("correct source");
+    assert!(store.version("reused", 1).await.expect("derived").is_some());
+
+    assert!(
+        store
+            .remember(&item(
+                "source",
+                "acct-9",
+                json!({"note": "unrelated"}),
+                Trust::Trusted,
+            ))
+            .await
+            .is_err(),
+        "a forgotten id was recycled, so old journal selections can name unrelated content"
+    );
+    assert_eq!(
+        store
+            .forget_cascading("source")
+            .await
+            .expect("erase corrected source later"),
+        2,
+        "the correction discarded lineage needed by a later erasure"
+    );
+    assert!(store.version("reused", 1).await.expect("derived").is_none());
 }
 
 /// Forgetting is selective, and reaches every version.

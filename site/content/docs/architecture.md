@@ -1806,6 +1806,45 @@ in-doubt case the effect protocol exists to avoid. A suspended run has no thread
 to notice anything, so `request_cancel` resumes it itself; a run executing
 elsewhere sees the request at its own next boundary.
 
+### Four state lifetimes, not one “memory” switch
+
+Agentplane keeps four concerns separate:
+
+| Lifetime | Mechanism | Meaning |
+|---|---|---|
+| one run and its replays | journal | immutable effect history and replay input |
+| conversation or business matter | case state and correlated events | resumable shared workflow state; not automatic chat-history injection |
+| across runs | `MemoryStore` | erasable, versioned agent/team facts |
+| one model call | assembled prompt/request | a context projection that may be trimmed without changing durable truth |
+
+This distinction matters when provider APIs offer conversations or opaque
+compaction. They may optimize a live request, but they are not replay truth.
+Anything they return that affects a later request has to be represented in that
+request's journaled identity. Summarising an active context does not silently
+promote it into durable memory.
+
+An application chooses durable sharing with `subject`: use an agent-qualified
+subject for private memory or a team-qualified subject for several agents in one
+tenant. `purpose` partitions what may be recalled for a particular job. These
+are query scopes, not ACLs. The policy engine sees `memory.recall` and
+`memory.remember`, the acting agent, tenant, subject/purpose, and write security
+metadata; deployments authorize private/team access there. Tenant-bound store
+handles provide the hard cross-tenant boundary.
+
+The built stores are redb for one node and PostgreSQL for several instances.
+Both run the same memory conformance contract. PostgreSQL serializes concurrent
+revisions of one id; each write atomically replaces the current version and its
+derivation edges. An id cannot move between subject/purpose scopes or be reused
+after erasure, because old journal selections and retained lineage must never
+name unrelated future content. Derived writes validate that every named source
+version and commitment exists and remain in the same subject, so subject erasure
+cannot strand a summary elsewhere.
+
+Core recall intentionally filters by subject/purpose and orders newest first. It
+does not claim semantic/vector search. Embeddings and indexes drift; a future
+semantic retriever belongs behind a separately journaled effect that records its
+model/index identity, filters, scores, and final selection.
+
 ### Memory is delayed code
 
 A vector store bolted onto an agent looks like a cache and behaves like a
@@ -1826,9 +1865,10 @@ journaled release as any other untrusted value.
 chain, so a search inside the deterministic zone would make a replayed run
 retrieve whatever the store holds *now* — different items, different
 conclusions, a history that disagrees with itself. The journal records the
-**selection**: ids, versions and content digests. Replay re-materialises those
-exact versions instead of re-running the ranking, so the result cannot drift as
-the corpus grows.
+**selection**: ids, versions and commitments to content plus immutable security
+metadata. Replay re-materialises those exact versions instead of re-running the
+ranking, so the result cannot drift as the corpus grows or acquire a different
+trust label under identical bytes.
 
 Two consequences fall out of recording the selection rather than the content.
 Personal data stays in an erasable store rather than a hash chain that cannot be
@@ -1836,12 +1876,12 @@ redacted. And a version that was forgotten makes the history that used it
 **unreplayable** — reported loudly, because replaying a different memory would be
 worse than admitting the record is gone.
 
-**Items are versioned and supersedable, never edited.** A memory rewritten in
-place cannot be audited and cannot be repaired: there is no way to ask what the
+**Content is versioned and supersedable, never edited in place.** A rewritten
+memory cannot be audited and cannot be repaired: there is no way to ask what the
 agent believed last Tuesday, and no way to undo one bad write without guessing
-what it replaced. Writes append; forgetting is selective and reaches every
-version, because an erasure that left history behind would be reported
-discharged while the data it named was still readable by id.
+what it replaced. Writes append and mark the prior lifecycle record superseded;
+forgetting is selective and reaches every version. The id remains tombstoned:
+recycling it could make old history refer to unrelated new content.
 
 ### A summary is a memory, and it inherits what it summarised
 
@@ -1875,7 +1915,14 @@ Forgetting therefore comes in two forms, and they are separate calls because
 defaulting either way is wrong half the time. `forget` is what a **correction**
 needs: a stale memory whose summaries remain legitimate should not take them
 with it. `forget_cascading` is what an **erasure** needs: the memory and
-everything transitively derived from it.
+everything transitively derived from it. A correction retains outgoing lineage,
+so deciding later that the request was really an erasure can still reach every
+summary.
+
+What is not built is equally important: no automatic memory formation, semantic
+ranking, TTL/access-time expiry, legal hold, or cryptographic deletion of memory
+content. Applications explicitly write memories today. Provider conversation
+objects and opaque compaction remain conveniences, never the source of truth.
 
 ### Every case mutation is an effect
 

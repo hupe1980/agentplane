@@ -79,6 +79,99 @@ async fn postgres_satisfies_the_journal_store_contract() {
     report.assert_conforms("PostgresStore");
 }
 
+/// Governed memory has the same semantics on the active-active backend.
+#[tokio::test]
+async fn postgres_satisfies_the_memory_store_contract() {
+    use agentplane::memory::MemoryStore;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let base = PostgresStore::connect(&url).await.expect("connect");
+    let tenant = agentplane::core::TenantId::new("memory-conformance").expect("tenant");
+    let store = Arc::new(base.clone().for_tenant(tenant.clone())) as Arc<dyn MemoryStore>;
+
+    conformance::memory(store).await;
+
+    memory_revisions_are_shared_and_serialized(
+        Arc::new(base.clone().for_tenant(tenant.clone())),
+        Arc::new(base.for_tenant(tenant)),
+    )
+    .await;
+}
+
+async fn memory_revisions_are_shared_and_serialized(
+    first: Arc<PostgresStore>,
+    second: Arc<PostgresStore>,
+) {
+    use agentplane::core::{Sensitivity, SourceId, Timestamp, Trust};
+    use agentplane::memory::{MemoryItem, MemoryStore, Recall};
+    use serde_json::json;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let write = |store: Arc<PostgresStore>, barrier: Arc<tokio::sync::Barrier>, value: u64| {
+        tokio::spawn(async move {
+            let item = MemoryItem {
+                id: "shared-memory".to_owned(),
+                subject: "team/research".to_owned(),
+                purpose: "findings".to_owned(),
+                content: json!({"writer": value}),
+                provenance: vec![SourceId::new(format!("agent:{value}"))],
+                sensitivity: Sensitivity::Internal,
+                trust: Trust::Untrusted,
+                written_by: format!("run-{value}"),
+                version: 0,
+                created_at: Timestamp::from_unix_timestamp(
+                    1_760_000_100 + i64::try_from(value).expect("small writer id"),
+                )
+                .expect("time"),
+                superseded_at: None,
+                derived_from: Vec::new(),
+            };
+            barrier.wait().await;
+            store.remember(&item).await.expect("concurrent revision")
+        })
+    };
+
+    let a = write(Arc::clone(&first), Arc::clone(&barrier), 1);
+    let b = write(Arc::clone(&second), barrier, 2);
+    let mut versions = vec![a.await.expect("writer a"), b.await.expect("writer b")];
+    versions.sort_unstable();
+    assert_eq!(
+        versions,
+        vec![1, 2],
+        "concurrent writes allocated one version twice"
+    );
+
+    let current = second
+        .recall(&Recall::about("team/research").for_purpose("findings"))
+        .await
+        .expect("shared recall");
+    assert_eq!(
+        current.len(),
+        1,
+        "two current revisions survived concurrently"
+    );
+    assert_eq!(current[0].version, 2);
+    assert!(
+        first
+            .version("shared-memory", 1)
+            .await
+            .expect("v1")
+            .is_some()
+    );
+    assert!(
+        second
+            .version("shared-memory", 2)
+            .await
+            .expect("v2")
+            .is_some()
+    );
+}
+
 /// The case layer, against the same battery `SQLite` is held to.
 #[tokio::test]
 async fn postgres_satisfies_the_case_layer_contracts() {
@@ -130,8 +223,60 @@ async fn postgres_keeps_tenants_apart() {
     let at = Timestamp::from_unix_timestamp(1_760_000_000).expect("an instant");
 
     journal_is_apart(&acme, &globex).await;
+    memories_are_apart(&acme, &globex, at).await;
     cases_are_apart(&acme, &globex, at).await;
     events_are_apart(&acme, &globex, at).await;
+}
+
+async fn memories_are_apart(
+    acme: &PostgresStore,
+    globex: &PostgresStore,
+    at: agentplane::core::Timestamp,
+) {
+    use agentplane::core::{Sensitivity, SourceId, Trust};
+    use agentplane::memory::{MemoryItem, MemoryStore, Recall};
+    use serde_json::json;
+
+    acme.remember(&MemoryItem {
+        id: "shared-business-id".to_owned(),
+        subject: "account-7".to_owned(),
+        purpose: "support".to_owned(),
+        content: json!({"tenant": "acme"}),
+        provenance: vec![SourceId::new("test")],
+        sensitivity: Sensitivity::Internal,
+        trust: Trust::Untrusted,
+        written_by: "test".to_owned(),
+        version: 0,
+        created_at: at,
+        superseded_at: None,
+        derived_from: Vec::new(),
+    })
+    .await
+    .expect("acme memory");
+
+    assert!(
+        globex
+            .recall(&Recall::about("account-7"))
+            .await
+            .expect("globex recall")
+            .is_empty(),
+        "one tenant recalled another tenant's memory"
+    );
+    assert!(
+        globex
+            .version("shared-business-id", 1)
+            .await
+            .expect("globex by id")
+            .is_none(),
+        "one tenant read another tenant's memory by id"
+    );
+    assert_eq!(
+        acme.recall(&Recall::about("account-7"))
+            .await
+            .expect("acme recall")
+            .len(),
+        1
+    );
 }
 
 /// A valid run id from another tenant names nothing here.

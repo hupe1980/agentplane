@@ -39,13 +39,14 @@
 //! and re-materialises those versions rather than re-running the search, so the
 //! ranking is not re-computed and cannot drift with the corpus.
 //!
-//! # Items are versioned and supersedable, never edited
+//! # Content is versioned and supersedable, never edited in place
 //!
 //! A memory that can be rewritten in place cannot be audited, and cannot be
 //! repaired: there is no way to ask what the agent believed last Tuesday, and no
 //! way to undo one bad write without guessing what it replaced. Writes append a
-//! new version and mark the old one superseded, so forgetting is selective and
-//! lineage survives it.
+//! new version and mark the old version's lifecycle metadata superseded. Its
+//! content and security metadata remain unchanged, forgetting is selective, and
+//! lineage survives correction so a later erasure can still traverse it.
 
 use std::fmt::Debug;
 
@@ -62,7 +63,9 @@ use crate::core::{Digest, Label, Sensitivity, SourceId, StoreError, Timestamp, T
 /// only text cannot answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryItem {
-    /// Stable across versions: this is *the same memory*, revised.
+    /// Stable across versions: this is *the same memory*, revised. Subject and
+    /// purpose cannot change under it, and it is not reusable after forgetting;
+    /// use a new id for another scope or unrelated content.
     pub id: String,
     /// What this is about — an account, a customer, a matter. The primary
     /// retrieval axis, and the unit selective forgetting works on.
@@ -97,7 +100,9 @@ pub struct MemoryItem {
     /// Empty for an ordinary write. Populated by compaction, and it is what
     /// makes a summary repairable: without it, forgetting a poisoned memory
     /// leaves every summary that absorbed it in place, and the attack survives
-    /// its own remedy.
+    /// its own remedy. Stores validate every source commitment and require the
+    /// derived memory to remain in the same subject, so subject erasure reaches
+    /// the whole derivation graph.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derived_from: Vec<Selected>,
 }
@@ -131,6 +136,28 @@ impl MemoryItem {
     #[must_use]
     pub fn digest(&self) -> Digest {
         Digest::of(&crate::core::canon::value_bytes(&self.content))
+    }
+
+    /// Commitment used when this version is selected for a run.
+    ///
+    /// Content alone is insufficient: changing an item's trust, provenance,
+    /// sensitivity, scope, or attribution changes what a replay may do with the
+    /// same bytes. `id` and `version` travel beside this digest in [`Selected`];
+    /// `superseded_at` is deliberately excluded because it is lifecycle state
+    /// that may change after a run selected the version.
+    #[must_use]
+    pub fn selection_digest(&self) -> Digest {
+        Digest::of(&crate::core::canon::value_bytes(&serde_json::json!({
+            "subject": self.subject,
+            "purpose": self.purpose,
+            "content": self.digest().to_hex(),
+            "provenance": self.provenance,
+            "sensitivity": self.sensitivity,
+            "trust": self.trust,
+            "written_by": self.written_by,
+            "created_at": self.created_at,
+            "derived_from": self.derived_from,
+        })))
     }
 }
 
@@ -204,11 +231,13 @@ pub struct Compaction {
 pub struct Selected {
     pub id: String,
     pub version: u64,
-    /// What the content was when it was selected.
+    /// What the immutable content and security metadata were when selected.
     ///
-    /// Checked on replay: an item whose content changed under a version that is
-    /// supposed to be immutable is a store that cannot be trusted to reproduce
-    /// history, and saying so loudly beats replaying a different memory.
+    /// Checked on replay: an item whose content, label inputs, scope, lineage,
+    /// or attribution changed under a version that is supposed to be immutable
+    /// is a store that cannot reproduce history. Lifecycle-only
+    /// `superseded_at` is excluded so a later legitimate revision does not make
+    /// an earlier run unreplayable.
     pub digest: Digest,
 }
 
@@ -228,9 +257,9 @@ pub enum MemoryError {
 
     /// The stored content no longer hashes to what was recorded.
     #[error(
-        "memory '{id}' version {version} has different content than when it was \
-         recalled — a version is supposed to be immutable, so this store cannot \
-         reproduce its own history"
+        "memory '{id}' version {version} has different content or security metadata \
+            than when it was recalled — a version is supposed to be immutable, so this \
+            store cannot reproduce its own history"
     )]
     Rewritten { id: String, version: u64 },
 
@@ -280,7 +309,9 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// Forget a memory and every version of it.
     ///
     /// Selective by construction: one id, not a purge. A repair that can only
-    /// drop everything is one nobody performs.
+    /// drop everything is one nobody performs. The id remains reserved after
+    /// erasure: recycling it could make an old journal selection or derivation
+    /// edge refer to unrelated new content.
     ///
     /// # Errors
     ///

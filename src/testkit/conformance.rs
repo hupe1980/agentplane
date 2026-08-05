@@ -97,6 +97,136 @@ const LEASE: Duration = Duration::from_mins(5);
 /// battery that must work against an unknown backend can get there.
 const SHORT: Duration = Duration::from_secs(1);
 
+/// Exercise the storage-level governed-memory contract against any backend.
+///
+/// Backends remain free to choose indexes and transaction mechanisms, but they
+/// do not get to choose different semantics for versions, scopes, lineage, or
+/// erasure.
+///
+/// # Panics
+///
+/// Panics when the backend violates the contract.
+#[allow(clippy::too_many_lines)]
+pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
+    use crate::core::{Sensitivity, SourceId, Timestamp, Trust};
+    use crate::memory::{MemoryItem, Recall, Selected};
+    use serde_json::json;
+
+    let at = |seconds| Timestamp::from_unix_timestamp(seconds).expect("representable time");
+    let make = |id: &str, subject: &str, purpose: &str, content: serde_json::Value| MemoryItem {
+        id: id.to_owned(),
+        subject: subject.to_owned(),
+        purpose: purpose.to_owned(),
+        content,
+        provenance: vec![SourceId::new("conformance")],
+        sensitivity: Sensitivity::Internal,
+        trust: Trust::Untrusted,
+        written_by: "conformance".to_owned(),
+        version: 0,
+        created_at: at(1_760_000_000),
+        superseded_at: None,
+        derived_from: Vec::new(),
+    };
+
+    let mut first = make("memory-a", "team-a", "support", json!({"value": 1}));
+    assert_eq!(store.remember(&first).await.expect("remember v1"), 1);
+    first.content = json!({"value": 2});
+    first.created_at = at(1_760_000_001);
+    assert_eq!(store.remember(&first).await.expect("remember v2"), 2);
+    let old = store
+        .version("memory-a", 1)
+        .await
+        .expect("old version")
+        .expect("v1 kept");
+    assert_eq!(old.content, json!({"value": 1}));
+    assert_eq!(old.superseded_at, Some(at(1_760_000_001)));
+
+    let moved = make("memory-a", "team-b", "support", json!({"value": 4}));
+    assert!(
+        store.remember(&moved).await.is_err(),
+        "a stable id moved to another subject, so erasing the old subject can miss its history"
+    );
+
+    store
+        .remember(&make("memory-b", "team-a", "payments", json!({"value": 3})))
+        .await
+        .expect("other purpose");
+    let support = store
+        .recall(&Recall::about("team-a").for_purpose("support"))
+        .await
+        .expect("purpose recall");
+    assert_eq!(support.len(), 1);
+    assert_eq!(support[0].id, "memory-a");
+
+    let source = support[0].clone();
+    let mut misplaced = make(
+        "misplaced-summary",
+        "team-b",
+        "support",
+        json!({"summary": true}),
+    );
+    misplaced.derived_from = vec![Selected {
+        id: source.id.clone(),
+        version: source.version,
+        digest: source.selection_digest(),
+    }];
+    assert!(
+        store.remember(&misplaced).await.is_err(),
+        "a derivative escaped its source subject, so subject erasure cannot reach it"
+    );
+
+    let mut derived = make("summary", "team-a", "support", json!({"summary": true}));
+    derived.derived_from = vec![Selected {
+        id: source.id.clone(),
+        version: source.version,
+        digest: source.selection_digest(),
+    }];
+    store.remember(&derived).await.expect("derived");
+    assert_eq!(
+        store
+            .derivatives("memory-a")
+            .await
+            .expect("derivatives")
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["summary"]
+    );
+
+    assert_eq!(
+        store.forget_cascading("memory-a").await.expect("cascade"),
+        2
+    );
+    assert!(
+        store
+            .version("memory-a", 1)
+            .await
+            .expect("forgotten source")
+            .is_none()
+    );
+    assert!(
+        store
+            .version("summary", 1)
+            .await
+            .expect("forgotten summary")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .forget_subject("team-a")
+            .await
+            .expect("subject erasure"),
+        1
+    );
+    assert!(
+        store
+            .recall(&Recall::about("team-a"))
+            .await
+            .expect("empty")
+            .is_empty()
+    );
+}
+
 fn admitted(run: RunId) -> Append {
     Append::new(
         run,

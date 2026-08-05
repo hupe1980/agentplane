@@ -39,8 +39,16 @@ const CURRENT: TableDefinition<(&str, &str), (&str, &str, i64, u64)> =
 /// whole memory model is shaped to avoid.
 const DERIVED: TableDefinition<(&str, &str, &str), ()> = TableDefinition::new("memory_derived");
 
+/// `(tenant, id) -> ()`, identities whose content was erased.
+///
+/// An id is never recycled. Reuse would make an old journal selection name new
+/// content and would make retained derivation edges attach old lineage to an
+/// unrelated memory.
+const FORGOTTEN: TableDefinition<(&str, &str), ()> = TableDefinition::new("memory_forgotten");
+
 #[async_trait]
 impl MemoryStore for RedbStore {
+    #[allow(clippy::too_many_lines)]
     async fn remember(&self, item: &MemoryItem) -> Result<u64, StoreError> {
         let tenant = self.tenant_name();
         let id = item.id.clone();
@@ -67,13 +75,86 @@ impl MemoryStore for RedbStore {
                         (s.to_owned(), p.to_owned(), c, ver)
                     });
 
+                if previous.is_none()
+                    && w.open_table(FORGOTTEN)
+                        .map_err(|e| be(&e))?
+                        .get((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?
+                        .is_some()
+                {
+                    return Err(StoreError::Backend(format!(
+                        "memory id '{id}' was forgotten and cannot be reused"
+                    )));
+                }
+
+                if let Some((previous_subject, previous_purpose, _, _)) = &previous
+                    && (previous_subject != &subject || previous_purpose != &purpose)
+                {
+                    return Err(StoreError::Backend(format!(
+                        "memory id '{id}' is scoped to subject '{previous_subject}' and purpose \
+                         '{previous_purpose}'; use a new id instead of moving it to subject \
+                         '{subject}' and purpose '{purpose}'"
+                    )));
+                }
+
+                for source in &item.derived_from {
+                    let raw = items
+                        .get((tenant.as_str(), source.id.as_str(), source.version))
+                        .map_err(|e| be(&e))?
+                        .map(|raw| raw.value().to_owned())
+                        .ok_or_else(|| {
+                            StoreError::Backend(format!(
+                                "derived memory '{id}' names missing source '{}' version {}",
+                                source.id, source.version
+                            ))
+                        })?;
+                    let source_item: MemoryItem = serde_json::from_str(&raw)
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    if source_item.selection_digest() != source.digest {
+                        return Err(StoreError::Backend(format!(
+                            "derived memory '{id}' names a changed source '{}' version {}",
+                            source.id, source.version
+                        )));
+                    }
+                    if source_item.subject != subject {
+                        return Err(StoreError::Backend(format!(
+                            "derived memory '{id}' must stay in source subject '{}' rather than \
+                             '{subject}'",
+                            source_item.subject
+                        )));
+                    }
+                }
+
                 let version = previous.as_ref().map_or(1, |(_, _, _, v)| v + 1);
                 item.version = version;
+                item.superseded_at = None;
 
-                if let Some((s, p, c, _)) = &previous {
+                if let Some((s, p, c, previous_version)) = &previous {
                     by_subject
-                        .remove((tenant.as_str(), s.as_str(), p.as_str(), *c, id.as_str()))
+                        .remove((tenant.as_str(), s.as_str(), p.as_str(), -*c, id.as_str()))
                         .map_err(|e| be(&e))?;
+
+                    // Supersession is part of the version's durable history,
+                    // not only an index decision. Without this write the public
+                    // `superseded_at` field is permanently `None`, so an audit
+                    // cannot tell when the old belief stopped being current.
+                    let previous_json = items
+                        .get((tenant.as_str(), id.as_str(), *previous_version))
+                        .map_err(|e| be(&e))?
+                        .map(|raw| raw.value().to_owned());
+                    if let Some(previous_json) = previous_json {
+                        let mut superseded: MemoryItem = serde_json::from_str(&previous_json)
+                            .map_err(|e| StoreError::Backend(e.to_string()))?;
+                        superseded.superseded_at = Some(item.created_at);
+                        let json = serde_json::to_string(&superseded)
+                            .map_err(|e| StoreError::Backend(e.to_string()))?;
+                        items
+                            .insert(
+                                (tenant.as_str(), id.as_str(), *previous_version),
+                                json.as_str(),
+                            )
+                            .map_err(|e| be(&e))?;
+                    }
                 }
 
                 let json =
@@ -103,9 +184,24 @@ impl MemoryStore for RedbStore {
 
                 // One edge per source. Written on every version, so a summary
                 // revised to read different sources is findable from the new
-                // ones — an edge list built once at first write would answer for
-                // a derivation that no longer exists.
+                // ones. Remove the old incoming edges first: otherwise a source
+                // no longer present in the current summary can still erase it,
+                // even though the current summary no longer contains it.
                 let mut derived = w.open_table(DERIVED).map_err(|e| be(&e))?;
+                let stale_sources: Vec<String> = derived
+                    .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                    .map_err(|e| be(&e))?
+                    .filter_map(|entry| match entry {
+                        Ok((key, _)) if key.value().2 == id => Some(Ok(key.value().1.to_owned())),
+                        Ok(_) => None,
+                        Err(error) => Some(Err(be(&error))),
+                    })
+                    .collect::<Result<_, StoreError>>()?;
+                for source_id in stale_sources {
+                    derived
+                        .remove((tenant.as_str(), source_id.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?;
+                }
                 for source in &item.derived_from {
                     derived
                         .insert((tenant.as_str(), source.id.as_str(), id.as_str()), ())
@@ -267,20 +363,20 @@ impl MemoryStore for RedbStore {
                 let mut current = w.open_table(CURRENT).map_err(|e| be(&e))?;
                 let mut by_subject = w.open_table(BY_SUBJECT).map_err(|e| be(&e))?;
 
-                if let Some(v) = current
+                let previous = current
                     .get((tenant.as_str(), id.as_str()))
                     .map_err(|e| be(&e))?
                     .map(|v| {
                         let (s, p, c, ver) = v.value();
                         (s.to_owned(), p.to_owned(), c, ver)
-                    })
-                {
+                    });
+                if let Some(v) = &previous {
                     by_subject
                         .remove((
                             tenant.as_str(),
                             v.0.as_str(),
                             v.1.as_str(),
-                            v.2,
+                            -v.2,
                             id.as_str(),
                         ))
                         .map_err(|e| be(&e))?;
@@ -289,25 +385,36 @@ impl MemoryStore for RedbStore {
                     .remove((tenant.as_str(), id.as_str()))
                     .map_err(|e| be(&e))?;
 
+                if previous.is_some() {
+                    w.open_table(FORGOTTEN)
+                        .map_err(|e| be(&e))?
+                        .insert((tenant.as_str(), id.as_str()), ())
+                        .map_err(|e| be(&e))?;
+                }
+
                 // Every version, not only the current one. Forgetting that left
                 // history behind would discharge an erasure request while the
                 // data it named was still readable by id and version.
-                // The edges naming this memory as a *source* go too. Left
-                // behind they would make `derivatives` answer for a memory that
-                // no longer exists, and a repair walking them would forget
-                // summaries of nothing.
+                // Outgoing edges, where this memory is the source, deliberately
+                // stay: a correction may later become an erasure request, and
+                // losing those edges would make its derived summaries
+                // undiscoverable. The tombstone above prevents id reuse from
+                // attaching that lineage to unrelated future content.
                 let mut edges = w.open_table(DERIVED).map_err(|e| be(&e))?;
-                let stale: Vec<String> = edges
-                    .range(
-                        (tenant.as_str(), id.as_str(), "")
-                            ..=(tenant.as_str(), id.as_str(), MAX_STR),
-                    )
+                // Incoming edges no longer point at a current derivative and
+                // are unnecessary for repairing anything upstream.
+                let stale_sources: Vec<String> = edges
+                    .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
                     .map_err(|e| be(&e))?
-                    .map(|e| e.map(|(k, _)| k.value().2.to_owned()).map_err(|e| be(&e)))
-                    .collect::<Result<_, _>>()?;
-                for derived_id in stale {
+                    .filter_map(|entry| match entry {
+                        Ok((key, _)) if key.value().2 == id => Some(Ok(key.value().1.to_owned())),
+                        Ok(_) => None,
+                        Err(error) => Some(Err(be(&error))),
+                    })
+                    .collect::<Result<_, StoreError>>()?;
+                for source_id in stale_sources {
                     edges
-                        .remove((tenant.as_str(), id.as_str(), derived_id.as_str()))
+                        .remove((tenant.as_str(), source_id.as_str(), id.as_str()))
                         .map_err(|e| be(&e))?;
                 }
 

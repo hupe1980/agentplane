@@ -386,20 +386,36 @@ impl ApiResponse {
     /// difference here would surface as a loop that fires in tests and never in
     /// production.
     ///
-    /// `OpenAI` sends arguments as a JSON **string**, so unlike Anthropic there is
-    /// parsing to do — and a call whose arguments do not parse is dropped rather
-    /// than passed on half-built, since dispatching a real side effect from a
-    /// fragment is worse than reporting nothing.
-    fn tool_calls(&self) -> Vec<super::ToolCall> {
+    /// `OpenAI` sends arguments as a JSON **string**, so unlike Anthropic there
+    /// is parsing to do. A malformed call is a provider-protocol failure, not
+    /// "no call": silently dropping it can turn a response containing one bad
+    /// and one good side effect into permission to execute only the good one.
+    fn tool_calls(&self) -> Result<Vec<super::ToolCall>, String> {
         self.output
             .iter()
             .filter(|i| i.kind == "function_call")
             .filter(|i| i.name.as_deref() != Some(RESPOND_TOOL))
-            .filter_map(|i| {
-                Some(super::ToolCall {
-                    id: i.call_id.clone()?,
-                    name: i.name.clone()?,
-                    arguments: serde_json::from_str(i.arguments.as_deref()?).ok()?,
+            .map(|item| {
+                let id = item
+                    .call_id
+                    .clone()
+                    .ok_or_else(|| "a function call carried no call_id".to_owned())?;
+                let name = item
+                    .name
+                    .clone()
+                    .ok_or_else(|| format!("function call '{id}' carried no name"))?;
+                let raw = item.arguments.as_deref().ok_or_else(|| {
+                    format!("function call '{id}' for '{name}' carried no arguments")
+                })?;
+                let arguments = serde_json::from_str(raw).map_err(|error| {
+                    format!(
+                        "function call '{id}' for '{name}' carried malformed JSON arguments: {error}"
+                    )
+                })?;
+                Ok(super::ToolCall {
+                    id,
+                    name,
+                    arguments,
                 })
             })
             .collect()
@@ -631,7 +647,11 @@ impl OpenAi {
         // the suite could produce the shape a real model produces. A live test
         // found it on its first run.
         let emulating = schema.is_some() && self.mode_for(model) == SchemaMode::ForcedTool;
-        let calls = parsed.tool_calls();
+        let calls = parsed.tool_calls().map_err(|detail| ModelError::Unusable {
+            model: model.clone(),
+            usage,
+            detail,
+        })?;
         if text.is_empty() && calls.is_empty() && !truncated && !emulating {
             return Err(ModelError::Unusable {
                 model: model.clone(),
@@ -964,6 +984,35 @@ mod tool_tests {
             "an answer carrying nothing at all was accepted, so the emptiness \
              check was removed rather than corrected"
         );
+    }
+
+    /// A malformed call is not silently equivalent to no call.
+    #[test]
+    fn malformed_tool_arguments_are_a_metered_provider_failure() {
+        let response: ApiResponse = serde_json::from_value(json!({
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "ledger.transfer",
+                "arguments": "{\"amount\":"
+            }],
+            "usage": { "input_tokens": 55, "output_tokens": 15 }
+        }))
+        .expect("response");
+
+        let error = OpenAi::new("test-key")
+            .expect("driver")
+            .interpret(&response, &ModelId::new("openai", "gpt-x"), None)
+            .expect_err("malformed arguments disappeared as if no call was emitted");
+        match error {
+            ModelError::Unusable { usage, detail, .. } => {
+                assert_eq!(usage.input_tokens, 55);
+                assert_eq!(usage.output_tokens, 15);
+                assert!(detail.contains("malformed JSON arguments"), "{detail}");
+            }
+            other => panic!("malformed generated output was not a metered failure: {other:?}"),
+        }
     }
 
     /// Responses takes a **flat** declaration; Chat Completions nests one.

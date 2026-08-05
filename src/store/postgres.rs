@@ -281,6 +281,10 @@ impl PostgresStore {
             .batch_execute(super::postgres_cases::CASE_SCHEMA)
             .await
             .map_err(|e| be(&e))?;
+        client
+            .batch_execute(super::postgres_memory::MEMORY_SCHEMA)
+            .await
+            .map_err(|e| be(&e))?;
         Ok(Self {
             pool,
             signer: None,

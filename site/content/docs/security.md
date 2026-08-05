@@ -472,7 +472,18 @@ still in front of it.
 
 Recall is journaled, which matters here too: what a run retrieved is on the
 record, so a poisoning is traceable to the write and the sessions that read it
-are enumerable rather than guessed at.
+are enumerable rather than guessed at. The selection commitment covers content
+and immutable security metadata — provenance, trust, sensitivity, scope,
+lineage and attribution — so identical bytes cannot acquire a promoted label on
+replay. A forgotten id remains reserved rather than being recycled under an old
+journal reference.
+
+`subject` and `purpose` organize private-agent or shared-team memory; they are
+not ACLs. `memory.recall` and `memory.remember` go through policy with the acting
+agent, tenant, scope and write metadata, while the tenant-bound store handle is
+the hard cross-tenant boundary. A deployment that needs agent-private memory
+must deny other principals in policy rather than trusting a subject naming
+convention.
 
 ### Summarising is not a way to launder or to leak
 
@@ -494,7 +505,9 @@ limit that stops every other path, while reading as maintenance.
 And it cannot **outlive its own repair**. A summary records the exact versions it
 absorbed, so forgetting a poisoned memory can reach what was derived from it —
 `forget` for a correction, which leaves legitimate summaries standing, and
-`forget_cascading` for an erasure, which does not.
+`forget_cascading` for an erasure, which does not. Correction retains the
+outgoing lineage, so a later decision that the source must be erased can still
+find those summaries.
 
 ### A webhook URL is the one destination a caller chooses
 

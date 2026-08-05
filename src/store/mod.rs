@@ -13,6 +13,8 @@ mod postgres;
 #[cfg(feature = "postgres")]
 mod postgres_cases;
 #[cfg(feature = "postgres")]
+mod postgres_memory;
+#[cfg(feature = "postgres")]
 mod postgres_quota;
 #[cfg(feature = "redb")]
 mod redb;

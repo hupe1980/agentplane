@@ -412,7 +412,7 @@ impl Effect for RecallMemory {
             .map(|item| crate::memory::Selected {
                 id: item.id.clone(),
                 version: item.version,
-                digest: item.digest(),
+                digest: item.selection_digest(),
             })
             .collect())
     }
@@ -440,6 +440,11 @@ impl Effect for RememberMemory {
                 "id": self.item.id,
                 "subject": self.item.subject,
                 "purpose": self.item.purpose,
+                "provenance": self.item.provenance,
+                "sensitivity": self.item.sensitivity,
+                "trust": self.item.trust,
+                "created_at": self.item.created_at,
+                "derived_from": self.item.derived_from,
                 // The content's digest, not the content: an effect key is
                 // recorded verbatim, and a memory's content belongs in a store
                 // that can be erased.

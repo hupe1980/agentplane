@@ -2253,11 +2253,11 @@ impl StepCtx<'_> {
                     ))
                 })?;
 
-            // A version is supposed to be immutable. If the content moved under
-            // one, the store cannot reproduce its own history — and a replay
-            // that quietly used the new content would be a different run wearing
-            // the old one's journal.
-            if item.digest() != pick.digest {
+            // A version is supposed to be immutable. If content or label inputs
+            // moved under one, the store cannot reproduce its own history — and
+            // a replay that quietly used the new value would be a different run
+            // wearing the old one's journal.
+            if item.selection_digest() != pick.digest {
                 return Err(StepError::Store(crate::core::StoreError::Backend(
                     crate::memory::MemoryError::Rewritten {
                         id: pick.id,
@@ -2388,7 +2388,7 @@ impl StepCtx<'_> {
             derived_from.push(crate::memory::Selected {
                 id: item.id.clone(),
                 version: item.version,
-                digest: item.digest(),
+                digest: item.selection_digest(),
             });
             let l = source.label();
             provenance.extend(l.provenance.iter().cloned());

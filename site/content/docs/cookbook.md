@@ -980,6 +980,17 @@ let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
     .build();
 ```
 
+Use `PostgresStore` instead of `RedbStore` when several plane instances share
+the memory; it implements the same `MemoryStore` contract and serializes
+concurrent revisions of one id. Choose the subject deliberately:
+
+- `agent/triage/account/{account}` for one agent's private memory;
+- `team/support/account/{account}` for memory shared by support agents.
+
+Those strings organize retrieval; they do **not** grant access. Authorize
+`memory.recall` and `memory.remember` in policy using the acting agent and the
+subject/purpose carried in the effect arguments.
+
 Inside a skill:
 
 ```rust
@@ -1012,7 +1023,8 @@ decision.
 removes one memory and every version of it, which is what selective repair
 needs; a *subject* is the unit a person's erasure names, and `forget_subject` is
 that. If summaries were made from the memory, see the next recipe — erasure has
-to reach them too.
+to reach them too. A forgotten id remains reserved forever; generate a new id
+for new content rather than recycling an old journal identity.
 
 ## 🗜️ Compact a memory without laundering it
 
@@ -1054,6 +1066,8 @@ content is now inside every summary that read it. `forget` is right for a
 **correction** — the memory was stale, the summaries are still legitimate.
 `forget_cascading` is right for an **erasure**, and takes the derivatives with
 it; `derivatives(id)` shows you what that would remove before you commit to it.
+Correction retains that lineage, so a later erasure can still find summaries
+even though the source content has already gone.
 
 ## 🏢 Serve several tenants from one process
 
