@@ -62,24 +62,6 @@ restore_strays() {
 # zero tests and report the mutation as uncaught, which is the loud-looking
 # failure that wastes the most time. `tests/guards/layering.rs` already guarantees every
 # name in the table exists somewhere, so a miss here means a unit test in `src`.
-binary_for() {
-    local test="$1"
-    # The integration tests are grouped into a handful of targets — `tests/
-    # <group>/main.rs` with the files as modules — so the target is the *group
-    # directory* holding the file, not a stem derived from the file itself.
-    local hit
-    hit="$(grep -rl "fn ${test}(" tests 2>/dev/null | head -1)"
-    if [[ -n "$hit" ]]; then
-        local group="${hit#tests/}"
-        printf -- '--test %s' "${group%%/*}"
-        return
-    fi
-    if grep -rq "fn ${test}(" src 2>/dev/null; then
-        printf -- '--lib'
-        return
-    fi
-    printf -- '--no-fail-fast'
-}
 
 cleanup() {
     if [[ -n "$current" ]]; then
@@ -129,68 +111,29 @@ printf '\n%smutants — each must be caught by its named test%s\n' "$DIM" "$OFF"
 
 while IFS=$'\t' read -r name file test desc; do
     current="$name"
-    if ! python3 tools/mutants.py "$name" --apply; then
-        current=""
-        printf '  %sERROR%s %s\n' "$RED" "$OFF" "$desc"
-        failed=1
-        continue
-    fi
-
-    # Two-speed, because the slow path is only needed to tell WEAK from FAIL.
+    # One classifier, not two. `mutants.py --verify` owns *did this guarantee
+    # hold* — it applies, runs the named test, falls back to the full suite only
+    # when that test held, restores on every path, and distinguishes killed from
+    # weak from survived. This script owns the sweep: the lock, the strays, the
+    # progress and the summary.
     #
-    # A mutation changes one source file, so the library rebuilds and *every*
-    # test binary relinks and re-runs — around 570 tests to learn one bit. But
-    # the classification below only consults the whole suite when the named test
-    # did **not** fail, which is the rare and interesting case. So: run the one
-    # binary that holds the named test first, and fall back to the full sweep
-    # only when that comes back clean.
-    #
-    # The full run is never skipped where it matters. PASS is the only verdict
-    # the fast path may produce, and it is the verdict that needs no knowledge of
-    # any other test.
-    # `- should panic` is optional in the pattern because cargo prints it for a
-    # `#[should_panic]` test — `test foo - should panic ... FAILED`. Without it
-    # the classifier cannot see those failing at all, and reports every mutation
-    # whose named test is a `should_panic` as a guarantee nothing can falsify.
-    # That is the worst possible direction for this harness to be wrong in: it
-    # would send somebody hunting for a missing test that exists and works.
-    #
-    # No `--exact`: a unit test's real name is module-qualified
-    # (`core::merkle::tests::foo`), so an exact filter on the leaf name matches
-    # nothing and reports `0 passed` — which the classifier below would read as
-    # "nothing failed", i.e. a guarantee with no test. Substring filtering is
-    # what makes one name work for both trees.
-    target="$(binary_for "$test")"
-    out="$(cargo test --all-features $target "$test" 2>&1)"
-    if ! grep -qE "^test .*${test}( - should panic)? \.\.\. FAILED" <<<"$out"; then
-        out="$(cargo test --all-features --no-fail-fast 2>&1)"
-    fi
-    python3 tools/mutants.py "$name" --revert
+    # They were briefly two implementations of one rule, which is exactly the
+    # shape this codebase rejects: they can disagree about the same mutation,
+    # and the one that rots is the one nobody runs alone.
+    verdict="$(python3 tools/mutants.py "$name" --verify 2>&1)"
+    status=$?
     current=""
 
-    # Order matters. A *failing test* makes cargo print `error: test failed, to
-    # rerun pass ...`, so a naive `^error:` check reads every successful
-    # mutation as a compile failure — which is exactly what the first run of
-    # this script did, reporting all twenty as broken.
-    if grep -qE "^test .*${test}( - should panic)? \.\.\. FAILED" <<<"$out"; then
-        printf '  %sPASS%s  %s\n        %scaught by %s%s\n' \
-            "$GREEN" "$OFF" "$desc" "$DIM" "$test" "$OFF"
-    elif grep -qE "^error\[|could not compile" <<<"$out"; then
-        # A mutation that does not compile tests nothing: it has to *remove the
-        # guarantee*, not break the file.
-        printf '  %sERROR%s %s\n        %sdid not compile%s\n' \
-            "$RED" "$OFF" "$desc" "$DIM" "$OFF"
-        failed=1
-    elif grep -q "test result: FAILED" <<<"$out"; then
-        other="$(grep -oE "^test [a-z_:]+ \.\.\. FAILED" <<<"$out" | head -3 | sed 's/^test //;s/ \.\.\..*//' | paste -sd, -)"
-        printf '  %sWEAK%s  %s\n        %s%s did not fail; caught only by: %s%s\n' \
-            "$YELLOW" "$OFF" "$desc" "$DIM" "$test" "$other" "$OFF"
-        failed=1
-    else
-        printf '  %sFAIL%s  %s\n        %snothing failed — this guarantee has no test that can falsify it%s\n' \
-            "$RED" "$OFF" "$desc" "$DIM" "$OFF"
-        failed=1
-    fi
+    case $status in
+        0) printf '  %sPASS%s  %s\n        %s%s%s\n' \
+               "$GREEN" "$OFF" "$desc" "$DIM" "${verdict#*: }" "$OFF" ;;
+        1) printf '  %sFAIL%s  %s\n        %s%s%s\n' \
+               "$RED" "$OFF" "$desc" "$DIM" "${verdict#*: }" "$OFF"
+           failed=1 ;;
+        *) printf '  %sERROR%s %s\n        %s%s%s\n' \
+               "$RED" "$OFF" "$desc" "$DIM" "$(head -1 <<<"${verdict#*: }")" "$OFF"
+           failed=1 ;;
+    esac
 done < <(python3 tools/mutants.py --list)
 
 if [[ $failed -eq 0 ]]; then

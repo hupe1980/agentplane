@@ -2895,94 +2895,158 @@ def check() -> int:
 
 
 
-def _locate(test: str) -> tuple[str, set[str]] | None:
-    """Which target runs `test`, and which features it needs to build and exist.
+def _locate(test: str) -> tuple[str | None, set[str] | None] | None:
+    """Where `test` lives, and which features it needs to build and exist.
+
+    Returns `(target, features)`, with `target = None` for a unit test in the
+    library — those run under `--lib`, and looking for them only under `tests/`
+    reported *no such test* for four that plainly existed. A tool that says a
+    guarantee is untested when it is tested is worse than one that says nothing.
 
     Read from the source rather than configured, because a second list of
     feature sets is a second thing to keep in step — and the one that rots is
     always the one nobody runs.
 
-    Two unions, and both are necessary for different reasons. Cargo compiles a
-    test *target* as one binary, so **every** module in it must compile: the
-    features come from every file's `#![cfg(...)]`, not just the one holding the
-    test. And the function itself may carry its own `#[cfg(...)]`, which decides
-    whether it exists inside a module that already compiled.
-
-    Missing either produces a run reporting `0 passed`, which looks exactly like
-    a mutation that was caught — the failure this whole command exists to stop.
+    Two unions, for different reasons. Cargo compiles an integration target as
+    one binary, so **every** module in it must compile: the features come from
+    every file's `#![cfg(...)]`, not just the one holding the test. And the
+    function may carry its own `#[cfg(...)]`, which decides whether it exists
+    inside a module that already compiled. Missing either produces a run
+    reporting `0 passed`, which looks exactly like a mutation that was caught.
     """
-    root = pathlib.Path(__file__).resolve().parent.parent / "tests"
-    for path in sorted(root.rglob("*.rs")):
+    root = pathlib.Path(__file__).resolve().parent.parent
+
+    # Integration tests first: they are the common case and name their target.
+    tests = root / "tests"
+    for path in sorted(tests.rglob("*.rs")):
         src = path.read_text()
         at = src.find(f"fn {test}(")
         if at < 0:
             continue
-
-        target = path.relative_to(root).parts[0]
+        target = path.relative_to(tests).parts[0]
         feats: set[str] = set()
-        # Every module in the target, because the whole binary must compile.
-        for sibling in sorted((root / target).rglob("*.rs")):
+        for sibling in sorted((tests / target).rglob("*.rs")):
             for line in sibling.read_text().splitlines():
                 if line.startswith("#!["):
                     feats.update(re.findall(r'feature\s*=\s*"([a-z0-9-]+)"', line))
-        # This function's own gate.
         feats.update(
             re.findall(r'feature\s*=\s*"([a-z0-9-]+)"', src[max(0, at - 400) : at])
         )
         return target, feats
+
+    # A unit test inside the library.
+    #
+    # `None` for the features, meaning *all of them*. A module's gate lives on
+    # its `mod` declaration in the parent — `#[cfg(feature = "providers")] mod
+    # anthropic;` — not inside the file holding the test, so reading the file
+    # finds nothing and the run silently matches no tests. Walking parents to
+    # reconstruct the gate would be a second model of cargo's; building the
+    # whole library is one command and cannot disagree with it.
+    for path in sorted((root / "src").rglob("*.rs")):
+        if f"fn {test}(" in path.read_text():
+            return None, None
     return None
 
 
 def verify(name: str) -> int:
-    """Apply one mutation, run the test it names, and report whether it died.
+    """Apply one mutation, run the test it names, and classify what happened.
 
-    The catalogue records which test each mutation must kill, and `--check`
-    proves the mutation still *matches* the code. Neither proves it still
-    *kills*: a mutation whose test was rewritten around it passes quietly, and
-    a guarantee that stopped being checked looks exactly like one that is.
+    The single implementation of *did this guarantee hold*. `verify-mutants.sh`
+    loops over it and owns only the sweep's concerns — locking, strays,
+    progress, a summary — so there is one classifier rather than two that can
+    disagree about the same mutation.
+
+    Four verdicts, and the middle two are why this is not a boolean:
+
+    * `0` **killed** — the named test failed. The guarantee is pinned by the
+      test written for it.
+    * `1` **weak** — something else failed, but not the named test. The
+      mutation was caught, and the row's claim about *which* test does the
+      catching is wrong. Tripping some other assertion proves only that
+      something broke.
+    * `1` **survived** — nothing failed at all. The guarantee has no test that
+      can falsify it, which is the failure this whole harness exists to find.
+    * `2` **error** — it did not compile, or the named test never ran. A
+      mutation must remove the *guarantee*, not break the file.
+
+    Two-speed on purpose. A mutation changes one source file, so the library
+    rebuilds and every test binary relinks — expensive to learn one bit. The
+    named test's own target runs first, and the full suite runs **only** when
+    that comes back clean, which is the rare and interesting case. `killed` is
+    the one verdict the fast path may produce, and it is the one needing no
+    knowledge of any other test.
 
     Restores the file on every path, including a failure to build.
     """
     path, test, _desc, _find, _replace = MUTANTS[name]
     found = _locate(test)
     if not found:
-        print(f"{name}: no test named '{test}' under tests/")
+        print(f"{name}: no test named '{test}' anywhere in src/ or tests/")
         return 2
     target, feats = found
-    # `redb` and `testkit` are what a test needs to stand up a plane at all.
-    feats |= {"redb", "testkit"}
-    features = ",".join(sorted(feats))
+    if feats is None:
+        # A library unit test: build everything, because the gate that decides
+        # whether this test exists is not in the file it lives in.
+        selector = ["--all-features", "--lib"]
+        features = "all"
+    else:
+        # `redb` and `testkit` are what a test needs to stand up a plane at all.
+        feats |= {"redb", "testkit"}
+        features = ",".join(sorted(feats))
+        selector = ["--features", features, "--test", target]
+
+    def run(args: list[str]) -> str:
+        proc = subprocess.run(
+            ["cargo", "test", *args], capture_output=True, text=True, cwd=ROOT, check=False
+        )
+        return proc.stdout + proc.stderr
 
     if apply(name) != 0:
         return 2
     try:
-        proc = subprocess.run(
-            ["cargo", "test", "--features", features, "--test", target, test],
-            capture_output=True,
-            text=True,
-            cwd=ROOT,
-            check=False,
-        )
+        out = run([*selector, test])
+        if not _named_test_failed(out, test):
+            # Slow path, and only here: the named test held, so the question is
+            # now whether *anything* did.
+            out = run(["--all-features", "--no-fail-fast"])
     finally:
         revert(name)
 
-    out = proc.stdout + proc.stderr
-    ran = re.search(r"test result: \w+\. (\d+) passed; (\d+) failed", out)
-    if not ran:
-        print(f"{name}: could not run '{test}' in {target} ({features})")
-        print("\n".join(out.splitlines()[-6:]))
-        return 2
-    passed, failed = int(ran.group(1)), int(ran.group(2))
-    if failed >= 1:
+    # Order matters. A failing test makes cargo print `error: test failed, to
+    # rerun pass ...`, so a naive `^error:` check reads every successful
+    # mutation as a compile failure.
+    if _named_test_failed(out, test):
         print(f"{name}: KILLED by {test}")
         return 0
-    if passed == 0:
-        # The single most misleading outcome: nothing ran, and "0 failed" reads
-        # like the mutation was caught.
-        print(f"{name}: NOT RUN — '{test}' matched nothing in {target} ({features})")
+    if re.search(r"^error\[|could not compile", out, re.M):
+        print(f"{name}: ERROR — did not compile; a mutation must remove the "
+              f"guarantee, not break the file")
+        print("\n".join(out.splitlines()[-6:]))
         return 2
-    print(f"{name}: SURVIVED — {test} passes with this bug present, in {path}")
+    if "test result: FAILED" in out:
+        others = re.findall(r"^test ([a-z_:]+) \.\.\. FAILED", out, re.M)[:3]
+        print(f"{name}: WEAK — {test} did not fail; caught only by "
+              f"{', '.join(others) or 'something unnamed'}")
+        return 1
+    if not re.search(r"test result: \w+\. \d+ passed", out):
+        print(f"{name}: ERROR — '{test}' never ran in {target or 'lib'} ({features})")
+        return 2
+    print(f"{name}: SURVIVED — nothing failed, so this guarantee has no test "
+          f"that can falsify it ({path})")
     return 1
+
+
+def _named_test_failed(out: str, test: str) -> bool:
+    """Whether cargo reported *this* test failing.
+
+    `- should panic` is optional because cargo prints it for a `#[should_panic]`
+    test. Without it the classifier cannot see those failing at all, and every
+    such mutation reads as a guarantee nothing can falsify — which would send
+    somebody hunting for a missing test that exists and works.
+    """
+    return bool(
+        re.search(rf"^test .*{re.escape(test)}( - should panic)? \.\.\. FAILED", out, re.M)
+    )
 
 
 def main() -> int:
