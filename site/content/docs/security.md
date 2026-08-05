@@ -806,7 +806,7 @@ wrongly:
 
 | Gap | Why it is open |
 |---|---|
-| **The native skill tier is trusted** | A `dyn Skill` compiled into the binary can open its own socket. The gate governs what goes through `cx.effect`, and nothing else. The Wasm tier is the intended answer and is not built |
+| **The native skill tier is trusted** | A `dyn Skill` compiled into the binary can open its own socket. The gate governs what goes through `cx.effect`, and nothing else. This runtime does not claim to sandbox native code: untrusted executables belong behind a governed MCP/A2A/tool boundary and an OS process or container boundary |
 | **An operator who holds the signing key** | Signatures bind authorship, not existence. Whoever controls the workload identity can produce a perfectly signed alternative history |
 | **Independent split-view detection** | Witness cosigning and consistency-proof verification are built, including refusal of a second history at the same size. Only an in-process `MemoryWitness` ships: no remote C2SP `tlog-witness` client or independent counterparty exists, so a self-hosted witness does not protect auditors from its operator |
 | **Revocation** | A delegation is valid until it expires; there is no revocation list, because checking one means I/O on the authorization path — the exact property removed so a gate cannot fail open under load. Chains are short-lived and audience-bound instead |

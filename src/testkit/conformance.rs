@@ -153,6 +153,7 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     a_second_start_for_one_effect_is_rejected(fresh, &mut r).await;
     the_same_effect_key_in_another_run_is_allowed(fresh, &mut r).await;
     a_stale_epoch_is_fenced(fresh, &mut r).await;
+    a_fabricated_future_epoch_is_fenced(fresh, &mut r).await;
     a_live_lease_is_not_stolen(fresh, &mut r).await;
     a_takeover_advances_the_epoch(fresh, &mut r).await;
     a_rejected_batch_writes_nothing(fresh, &mut r).await;
@@ -813,6 +814,34 @@ async fn a_stale_epoch_is_fenced(fresh: Factory<'_>, r: &mut Report) {
             "a superseded owner's write was accepted. The check must happen inside the same \
              transaction that writes: a read-then-write leaves a window a paused instance \
              wakes up into, which is split-brain",
+        ),
+    }
+}
+
+/// A fencing token is proof returned by `acquire`, not a sequence number a
+/// caller may predict.
+///
+/// Checking only `writer < current` rejects zombies but accepts a fabricated
+/// future epoch. The real owner can then append under the actual epoch as well,
+/// so the store has admitted two writers while still claiming the lease is
+/// exclusive. Equality is the ownership check.
+async fn a_fabricated_future_epoch_is_fenced(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let run = RunId::generate();
+    let Ok(lease) = store.acquire(run, "instance-a", LEASE).await else {
+        r.record("fencing", "acquire() failed on a fresh run");
+        return;
+    };
+
+    let invented = lease.epoch.saturating_add(1);
+    match store.append(invented, vec![admitted(run)]).await {
+        Err(crate::core::StoreError::Fenced { .. }) => {}
+        Err(e) => r.record("fencing", format!("expected Fenced, got {e}")),
+        Ok(_) => r.record(
+            "fencing",
+            "an epoch the store never issued was accepted. A fencing token is proof of a \
+             lease, not a number a caller may outrank by adding one",
         ),
     }
 }

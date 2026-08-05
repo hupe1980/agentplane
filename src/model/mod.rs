@@ -450,6 +450,13 @@ impl ModelError {
 pub struct Request<'a> {
     pub model: &'a ModelId,
     pub prompt: &'a Value,
+    /// Maximum tokens the provider may generate for this call.
+    ///
+    /// Provider-neutral because both shipped APIs expose the same control, and
+    /// per-call because a manifest declares it per model role. Keeping it on a
+    /// driver silently discarded that declaration and kept the real request
+    /// limit out of the effect key.
+    pub max_output_tokens: u32,
     /// A JSON Schema the answer must conform to, if one was declared.
     ///
     /// Passed straight through to the provider's own structured-output mode —
@@ -543,10 +550,12 @@ pub struct ToolDeclaration {
     pub description: String,
     /// JSON Schema for the arguments.
     ///
-    /// Sent to `OpenAI` with `strict: true`, which enforces exact conformance
-    /// during generation rather than checking afterwards. That is worth having
-    /// even though it is not a security control: a well-formed argument is still
-    /// an untrusted one, and the field-provenance check is what refuses it.
+    /// Sent with provider-side strict enforcement when the provider accepts the
+    /// schema. `OpenAI` supports only a subset for strict tools, so a valid
+    /// schema with optional fields is sent non-strict rather than rejected by
+    /// the API; typed local tools still deserialize the result exactly. Either
+    /// way this is not a security control: a well-formed argument is still an
+    /// untrusted one, and the field-provenance check is what authorizes it.
     pub parameters: Value,
 }
 
@@ -629,6 +638,7 @@ pub struct ModelCall {
     schema: Option<Value>,
     tools: Vec<ToolDeclaration>,
     exchanges: Vec<ToolExchange>,
+    max_output_tokens: u32,
     provider: Arc<dyn ModelProvider>,
     max_sensitivity: Sensitivity,
     output_sensitivity: Sensitivity,
@@ -647,6 +657,10 @@ pub struct ModelCall {
 }
 
 impl ModelCall {
+    /// Conservative per-call output ceiling used when the caller does not set
+    /// one explicitly.
+    pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+
     /// A completion from this provider.
     #[must_use]
     pub fn new(provider: Arc<dyn ModelProvider>, model: ModelId, prompt: Value) -> Self {
@@ -656,6 +670,7 @@ impl ModelCall {
             schema: None,
             tools: Vec::new(),
             exchanges: Vec::new(),
+            max_output_tokens: Self::DEFAULT_MAX_OUTPUT_TOKENS,
             provider,
             max_sensitivity: Sensitivity::Public,
             output_sensitivity: Sensitivity::Public,
@@ -725,6 +740,13 @@ impl ModelCall {
     #[must_use]
     pub fn continuing(mut self, exchanges: impl IntoIterator<Item = ToolExchange>) -> Self {
         self.exchanges = exchanges.into_iter().collect();
+        self
+    }
+
+    /// Bound how many tokens this call may generate.
+    #[must_use]
+    pub const fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
+        self.max_output_tokens = max_output_tokens;
         self
     }
 
@@ -802,9 +824,10 @@ impl Effect for ModelCall {
     }
 
     fn descriptor(&self) -> EffectDescriptor {
-        // The prompt is in the key. A changed prompt is a changed effect, so an
-        // edited template shows up on replay as divergence rather than as a run
-        // that quietly did something else.
+        // Every provider-visible input is in the key. A changed prompt, schema,
+        // offered tool, or continuation transcript is a changed effect, so an
+        // edit shows up on replay as divergence rather than reading an answer
+        // produced for a request nobody made this time.
         EffectDescriptor::new(
             "model.complete",
             serde_json::json!({
@@ -816,6 +839,28 @@ impl Effect for ModelCall {
                 // answer shaped to the old one would be answering a question
                 // nobody asked.
                 "schema": self.schema,
+                "max_output_tokens": self.max_output_tokens,
+                // Tool descriptions and schemas steer generation just as the
+                // prompt does. Omitting them would let strict replay consume a
+                // completion produced while a different capability surface was
+                // offered.
+                "tools": self.tools.iter().map(|tool| serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })).collect::<Vec<_>>(),
+                // A continuation is the original question plus the exact calls
+                // and results already observed. IDs, arguments, outputs and the
+                // failure bit all affect the next provider response.
+                "exchanges": self.exchanges.iter().map(|exchange| serde_json::json!({
+                    "call": {
+                        "id": exchange.call.id,
+                        "name": exchange.call.name,
+                        "arguments": exchange.call.arguments,
+                    },
+                    "output": exchange.output,
+                    "failed": exchange.failed,
+                })).collect::<Vec<_>>(),
             }),
         )
     }
@@ -891,6 +936,7 @@ impl Effect for ModelCall {
             .complete(Request {
                 model: &self.model,
                 prompt: &prompt,
+                max_output_tokens: self.max_output_tokens,
                 schema: self.schema.as_ref(),
                 tools: &self.tools,
                 exchanges: &self.exchanges,

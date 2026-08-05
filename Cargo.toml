@@ -253,7 +253,7 @@ required-features = ["redb"]
 
 [[example]]
 name              = "tool_loop"
-required-features = ["redb", "testkit", "manifest", "mcp"]
+required-features = ["redb", "testkit", "manifest"]
 
 [[example]]
 name              = "clearing_case"

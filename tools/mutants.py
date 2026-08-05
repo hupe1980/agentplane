@@ -1931,8 +1931,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_declared_tool_is_rendered_in_openais_shape",
         "declared tools drop strict mode, so arguments are checked after the "
         "tokens are paid for rather than enforced during generation",
-        "                            \"strict\": true,",
-        "                            \"strict\": false,",
+        "                        let strict = strict_schema_problem(&t.parameters).is_none();",
+        "                        let strict = false;",
     ),
     "AModelsToolNameResolvesApproximately": (
         "src/tools/mod.rs",
@@ -2596,7 +2596,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                            \"name\": t.name,\n"
         "                            \"description\": t.description,\n"
         "                            \"parameters\": t.parameters,\n"
-        "                            \"strict\": true,\n"
+        "                            \"strict\": strict,\n"
         "                        })",
         "                        json!({\n"
         "                            \"type\": \"function\",\n"
@@ -2604,7 +2604,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                                \"name\": t.name,\n"
         "                                \"description\": t.description,\n"
         "                                \"parameters\": t.parameters,\n"
-        "                                \"strict\": true,\n"
+        "                                \"strict\": strict,\n"
         "                            }\n"
         "                        })",
     ),
@@ -2688,7 +2688,12 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "an_interface_is_selected_by_binding_and_version",
         "interface selection ignores the protocol version, so a client picks an "
         "endpoint speaking a protocol it does not",
-        "            .find(|i| i.protocol_binding == binding && major_minor(&i.protocol_version) == want)",
+        "        self.supported_interfaces.iter().find(|i| {\n"
+        "            i.protocol_binding == binding\n"
+        "                && super::protocol_major_minor(&i.protocol_version) == Some(want)\n"
+        "        })",
+        "        self.supported_interfaces\n"
+        "            .iter()\n"
         "            .find(|i| i.protocol_binding == binding)",
     ),
     "ACardSignatureCoversItself": (
@@ -2941,9 +2946,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_request_without_a_version_is_refused_as_zero_three",
         "a request with no A2A-Version header is answered with 1.0 semantics "
         "rather than refused as the 0.3 client the spec says it is",
-        "        if major_minor(claimed) == major_minor(crate::peers::PROTOCOL_VERSION) {",
+        "        if claimed_version == crate::peers::protocol_major_minor(crate::peers::PROTOCOL_VERSION)\n"
+        "            && claimed_version.is_some()\n"
+        "        {",
         "        if claimed.is_empty()\n"
-        "            || major_minor(claimed) == major_minor(crate::peers::PROTOCOL_VERSION)\n"
+        "            || claimed_version == crate::peers::protocol_major_minor(crate::peers::PROTOCOL_VERSION)\n"
         "        {",
     ),
     "ARunJoinsAnotherTenantsCase": (

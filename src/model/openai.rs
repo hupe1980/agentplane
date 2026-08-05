@@ -45,6 +45,8 @@ use serde_json::{Value, json};
 
 use crate::core::Secret;
 
+#[cfg(test)]
+use super::ModelCall;
 use super::wire::{
     RESPOND_TOOL, classify_status, classify_transport, strict_schema_problem, structured,
 };
@@ -57,7 +59,6 @@ pub struct OpenAi {
     http: reqwest::Client,
     key: Secret,
     base: String,
-    max_output_tokens: u32,
     /// The mode to use for a model with no explicit entry.
     default_schema_mode: SchemaMode,
     /// Per-model overrides.
@@ -85,7 +86,6 @@ impl std::fmt::Debug for OpenAi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAi")
             .field("base", &self.base)
-            .field("max_output_tokens", &self.max_output_tokens)
             .field("key", &"<redacted>")
             .finish_non_exhaustive()
     }
@@ -96,8 +96,6 @@ impl OpenAi {
     ///
     /// An output limit is the cheapest spend control there is. The run-level
     /// ceilings in `core::budget` bound the run; this bounds the call.
-    pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
-
     /// # Errors
     ///
     /// If the HTTP client cannot be built.
@@ -112,7 +110,6 @@ impl OpenAi {
             http,
             key: Secret::new(key),
             base: "https://api.openai.com".to_owned(),
-            max_output_tokens: Self::DEFAULT_MAX_OUTPUT_TOKENS,
             default_schema_mode: SchemaMode::Native,
             schema_modes: std::collections::BTreeMap::new(),
             stream: true,
@@ -124,12 +121,6 @@ impl OpenAi {
     #[must_use]
     pub fn base(mut self, base: impl Into<String>) -> Self {
         self.base = base.into();
-        self
-    }
-
-    #[must_use]
-    pub const fn max_output_tokens(mut self, n: u32) -> Self {
-        self.max_output_tokens = n;
         self
     }
 
@@ -498,6 +489,7 @@ fn instructions(prompt: &Value) -> Option<Value> {
 
 impl OpenAi {
     /// The request body, identical either way but for the `stream` flag.
+    #[cfg(test)]
     fn body(
         &self,
         model: &ModelId,
@@ -506,9 +498,28 @@ impl OpenAi {
         tools: &[super::ToolDeclaration],
         exchanges: &[super::ToolExchange],
     ) -> Result<Value, ModelError> {
+        self.body_with_max(
+            model,
+            prompt,
+            ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            schema,
+            tools,
+            exchanges,
+        )
+    }
+
+    fn body_with_max(
+        &self,
+        model: &ModelId,
+        prompt: &Value,
+        max_output_tokens: u32,
+        schema: Option<&Value>,
+        tools: &[super::ToolDeclaration],
+        exchanges: &[super::ToolExchange],
+    ) -> Result<Value, ModelError> {
         let mut body = json!({
             "model": model.model,
-            "max_output_tokens": self.max_output_tokens,
+            "max_output_tokens": max_output_tokens,
             "input": continue_with(input(prompt), exchanges),
         });
         if let Some(system) = instructions(prompt) {
@@ -540,12 +551,21 @@ impl OpenAi {
                 tools
                     .iter()
                     .map(|t| {
+                        // Responses rejects `strict: true` when a schema falls
+                        // outside its documented subset (notably optional
+                        // object fields). Such schemas are still valid tool
+                        // contracts and local typed tools still deserialize
+                        // their arguments exactly, so retain the declaration
+                        // and make the wire's weaker guarantee explicit rather
+                        // than turning every optional Rust field into a remote
+                        // 400 response.
+                        let strict = strict_schema_problem(&t.parameters).is_none();
                         json!({
                             "type": "function",
                             "name": t.name,
                             "description": t.description,
                             "parameters": t.parameters,
-                            "strict": true,
+                            "strict": strict,
                         })
                     })
                     .collect(),
@@ -701,7 +721,13 @@ impl OpenAi {
                 Ok(chunk) => chunk,
                 Err(e) => return Err(severed(model, &acc, &e.to_string())),
             };
-            for event in decoder.push(&chunk) {
+            let events = decoder
+                .push(&chunk)
+                .map_err(|error| ModelError::Unaccounted {
+                    model: model.clone(),
+                    detail: error.to_string(),
+                })?;
+            for event in events {
                 acc.event(&event.name, &event.data);
             }
             if let Some(message) = acc.error() {
@@ -764,6 +790,7 @@ impl ModelProvider for OpenAi {
         let Request {
             model,
             prompt,
+            max_output_tokens,
             schema,
             tools,
             exchanges,
@@ -777,7 +804,14 @@ impl ModelProvider for OpenAi {
             .http
             .post(format!("{}/v1/responses", self.base))
             .bearer_auth(self.key.expose())
-            .json(&self.body(model, prompt, schema, tools, exchanges)?)
+            .json(&self.body_with_max(
+                model,
+                prompt,
+                max_output_tokens,
+                schema,
+                tools,
+                exchanges,
+            )?)
             .send()
             .await
             .map_err(|e| classify_transport(model, &e))?;
@@ -955,7 +989,12 @@ mod tool_tests {
                 &[ToolDeclaration::new(
                     "ledger.read",
                     "Read a ledger entry.",
-                    json!({ "type": "object" }),
+                    json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": false,
+                    }),
                 )],
                 &[],
             )
@@ -983,6 +1022,30 @@ mod tool_tests {
             f["strict"], true,
             "strict mode enforces the argument schema during generation rather \
              than checking after the tokens are paid for: {body}"
+        );
+
+        let optional = OpenAi::new("test-key")
+            .expect("driver")
+            .body(
+                &ModelId::new("openai", "gpt-x"),
+                &json!({ "input": "hi" }),
+                None,
+                &[ToolDeclaration::new(
+                    "ledger.search",
+                    "Search ledger entries.",
+                    json!({
+                        "type": "object",
+                        "properties": { "cursor": { "type": "string" } },
+                        "required": [],
+                        "additionalProperties": false,
+                    }),
+                )],
+                &[],
+            )
+            .expect("a valid non-strict tool schema remains usable");
+        assert_eq!(
+            optional["tools"][0]["strict"], false,
+            "an optional field was advertised as strict even though OpenAI rejects that schema subset"
         );
 
         // The same shape the forced-tool path already used. They disagreed, and

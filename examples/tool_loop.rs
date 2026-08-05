@@ -1,7 +1,7 @@
 //! The shape most people mean by "an agent": a model choosing tools in a loop.
 //!
 //! ```sh
-//! cargo run --example tool_loop --features redb,testkit,manifest,mcp
+//! cargo run --example tool_loop --features redb,testkit,manifest
 //! ```
 //!
 //! Every other example here drives an effect from *code*. This one hands the
@@ -183,6 +183,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = &first;
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(READS.load(Ordering::Relaxed), 1);
+    let asked = provider.asked();
+    let read = asked[0]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "ledger__read")
+        .expect("the typed read tool was offered");
+    assert_eq!(
+        read.parameters["properties"]["account"]["type"], "string",
+        "the model was not shown the schema derived from ReadBalance"
+    );
     println!("   answered: {}", out.output.as_ref().unwrap());
 
     // Every turn is a journaled effect, so the conversation is reconstructable

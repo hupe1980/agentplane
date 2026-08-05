@@ -24,6 +24,18 @@
 //! comment lines. Implementing only the observed subset is how a parser breaks
 //! the week a provider reformats its output.
 
+/// One event cannot be larger than the journal record that must eventually
+/// hold the completion it contributes to. More importantly, this bounds a
+/// malicious or broken provider that sends an endless line without a newline.
+const DEFAULT_MAX_EVENT_BYTES: usize = 1 << 20;
+
+/// A stream exceeded the amount of event data this decoder will retain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("an SSE line or event exceeded the {limit}-byte limit")]
+pub struct DecodeError {
+    limit: usize,
+}
+
 /// One dispatched event: its name and its accumulated data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
@@ -39,7 +51,7 @@ pub struct Event {
 /// the middle of a line, and occasionally between the `\n\n` that dispatches an
 /// event. A parser that assumed one chunk was one event would work in every test
 /// and fail against a real network.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Decoder {
     /// Bytes received but not yet terminated by a newline.
     partial: String,
@@ -51,6 +63,20 @@ pub struct Decoder {
     /// Tracked separately from `data` being non-empty: a `data:` line with an
     /// empty value is still a data line, and the spec dispatches it.
     started: bool,
+    /// Maximum bytes retained by one partial line or assembled event.
+    max_event_bytes: usize,
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self {
+            partial: String::new(),
+            name: String::new(),
+            data: String::new(),
+            started: false,
+            max_event_bytes: DEFAULT_MAX_EVENT_BYTES,
+        }
+    }
 }
 
 impl Decoder {
@@ -59,12 +85,20 @@ impl Decoder {
         Self::default()
     }
 
+    #[cfg(test)]
+    fn with_max_event_bytes(max_event_bytes: usize) -> Self {
+        Self {
+            max_event_bytes,
+            ..Self::default()
+        }
+    }
+
     /// Push a chunk; get back whatever it completed.
     ///
     /// Lossy on invalid UTF-8 rather than failing. A malformed byte in a
     /// provider's stream should degrade the text of one event, not abort a call
     /// that has already been paid for.
-    pub fn push(&mut self, chunk: &[u8]) -> Vec<Event> {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Event>, DecodeError> {
         self.partial.push_str(&String::from_utf8_lossy(chunk));
         let mut out = Vec::new();
 
@@ -72,6 +106,9 @@ impl Decoder {
         // `partial` — it is the front half of a line whose back half is still in
         // flight.
         while let Some((line, rest)) = split_line(&self.partial) {
+            if line.len() > self.max_event_bytes {
+                return Err(self.too_large());
+            }
             // Every split must shrink the buffer. It does by construction —
             // a terminator is always consumed — but this is a parser fed by a
             // remote peer, and the failure mode of getting it wrong is not a
@@ -89,8 +126,20 @@ impl Decoder {
             if let Some(event) = self.line(&line) {
                 out.push(event);
             }
+            if self.name.len().saturating_add(self.data.len()) > self.max_event_bytes {
+                return Err(self.too_large());
+            }
         }
-        out
+        if self.partial.len() > self.max_event_bytes {
+            return Err(self.too_large());
+        }
+        Ok(out)
+    }
+
+    fn too_large(&self) -> DecodeError {
+        DecodeError {
+            limit: self.max_event_bytes,
+        }
     }
 
     /// Process one line, returning an event if it dispatched one.
@@ -167,7 +216,7 @@ mod tests {
         let mut d = Decoder::new();
         let mut out = Vec::new();
         for c in chunks {
-            out.extend(d.push(c.as_bytes()));
+            out.extend(d.push(c.as_bytes()).expect("valid SSE"));
         }
         out
     }
@@ -319,7 +368,27 @@ mod tests {
     #[test]
     fn invalid_utf8_degrades_rather_than_aborting() {
         let mut d = Decoder::new();
-        let events = d.push(b"data: \xff\xfe\n\n");
+        let events = d.push(b"data: \xff\xfe\n\n").expect("valid SSE");
         assert_eq!(events.len(), 1, "a bad byte must not lose the event");
+    }
+
+    #[test]
+    fn an_unterminated_line_cannot_grow_without_bound() {
+        let mut d = Decoder::with_max_event_bytes(8);
+        let err = d
+            .push(b"123456789")
+            .expect_err("an endless line must be bounded");
+        assert_eq!(err.limit, 8);
+    }
+
+    #[test]
+    fn multi_line_event_data_cannot_grow_without_bound() {
+        let mut d = Decoder::with_max_event_bytes(8);
+        d.push(b"data: 1\n").expect("first line fits");
+        d.push(b"data: 2\n").expect("second line fits");
+        d.push(b"data: 3\n").expect("third line fits");
+        d.push(b"data: 4\n").expect("fourth line fits");
+        d.push(b"data: 5\n")
+            .expect_err("the assembled event exceeds the limit");
     }
 }

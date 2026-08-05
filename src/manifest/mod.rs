@@ -670,9 +670,23 @@ impl Manifest {
         self.validate_topology()?;
         self.validate_models()?;
         self.validate_output()?;
+        let mut tool_ids = std::collections::BTreeSet::new();
         for grant in &self.spec.tools {
             if grant.reference.trim().is_empty() {
                 return Err(ManifestError::Empty("spec.tools[].ref"));
+            }
+            let Some(id) = crate::tools::ToolId::parse(&grant.reference) else {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.tools: '{}' is not an exact mcp://server/tool reference",
+                    grant.reference
+                )));
+            };
+            if !tool_ids.insert(id.clone()) {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.tools: '{}' is granted more than once — two safety declarations \
+                     for one tool make list order decide which one governs",
+                    grant.reference
+                )));
             }
             let mut paths = std::collections::BTreeSet::new();
             for field in &grant.protected_fields {

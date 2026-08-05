@@ -115,7 +115,10 @@ impl Skill for Triage {
             call
         };
 
-        let first_prompt = input.map(|input| json!({ "system": system, "ticket": input }));
+        let first_prompt = Tainted::object([
+            ("system".to_owned(), Tainted::trusted(json!(system.clone()))),
+            ("ticket".to_owned(), input),
+        ]);
         let first = cx
             .sink(build(first_prompt.peek().clone()), &first_prompt)
             .await?;
@@ -132,7 +135,10 @@ impl Skill for Triage {
         // because a call's cost is not known until it has run. What is enforced
         // is *once consumption has reached the limit, nothing further starts*,
         // so a one-call skill completes whatever the token ceiling says.
-        let checked_prompt = draft.map(|draft| json!({ "system": system, "verify": draft }));
+        let checked_prompt = Tainted::object([
+            ("system".to_owned(), Tainted::trusted(json!(system))),
+            ("verify".to_owned(), draft),
+        ]);
         let checked = cx
             .sink(build(checked_prompt.peek().clone()), &checked_prompt)
             .await?;
@@ -176,6 +182,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ticket = json!({ "id": "T-4711", "body": "checkout returns 500 for EU cards" });
     let live = rt.run("support.triage", ticket.clone()).await?;
     println!("\n1. live run       → {:?}", live.status);
+    assert_eq!(
+        live.status,
+        RunStatus::Succeeded,
+        "the nominal manifest run failed — this example is the executable proof that a \
+         declared prompt can handle untrusted input without making its system instruction \
+         untrusted"
+    );
 
     let asked = provider.asked();
     let ask = asked.first().expect("the provider was asked");

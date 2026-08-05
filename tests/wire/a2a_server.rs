@@ -419,6 +419,24 @@ async fn an_unsupported_version_is_refused() {
     assert_eq!(err_code(&body), i64::from(code::VERSION_NOT_SUPPORTED));
 }
 
+/// A suffix is not a patch version and cannot smuggle an unsupported dialect
+/// through a prefix-only `Major.Minor` comparison.
+#[tokio::test]
+async fn a_malformed_version_is_refused() {
+    let f = fixture();
+    let (_, body) = send(
+        &f.router(),
+        rpc_versioned(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+            Some("1.0.preview"),
+        ),
+    )
+    .await;
+    assert_eq!(err_code(&body), i64::from(code::VERSION_NOT_SUPPORTED));
+}
+
 // ── Dispatch ────────────────────────────────────────────────────────────────
 
 /// A peer's message arrives untrusted, provenanced to the peer that sent it.

@@ -182,7 +182,10 @@ pub struct Cancellation {
 ///
 /// Implementations must guarantee, atomically:
 ///
-/// 1. **Fencing** — reject appends whose epoch is below the current lease.
+/// 1. **Fencing** — when a lease exists, reject appends whose epoch is not the
+///    current lease. A token from the future is no more proof of ownership than
+///    a stale one; accepting it lets a caller invent authority without acquiring
+///    the run.
 /// 2. **Exactly-once** — reject a second `EffectStarted` for an effect key that
 ///    already started in this run.
 /// 3. **Chaining** — assign contiguous `seq` and link `prev_hash` to the run's

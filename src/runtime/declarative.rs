@@ -84,10 +84,11 @@ impl Declarative {
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
         system: String,
-        model: ModelId,
+        model_role: (ModelId, Option<u32>),
         egress: Option<crate::core::Sensitivity>,
         granted: Vec<crate::manifest::ToolGrant>,
     ) -> Result<Outcome, SkillError> {
+        let (model, max_output_tokens) = model_role;
         let (catalog, client) = self.tools.clone().ok_or_else(|| {
             SkillError::Other(
                 "this agent declares `tool-calling` but the plane has no tool \
@@ -112,14 +113,19 @@ impl Declarative {
         let declared: Vec<crate::model::ToolDeclaration> = offered
             .iter()
             .map(|(id, grant)| {
-                crate::model::ToolDeclaration::new(
-                    id.wire_name(),
-                    grant.description.clone().unwrap_or_default(),
-                    grant
-                        .arguments
-                        .clone()
-                        .unwrap_or_else(|| json!({ "type": "object" })),
-                )
+                let (description, arguments) = catalog.declaration(id).map_or_else(
+                    || {
+                        (
+                            grant.description.clone().unwrap_or_default(),
+                            grant
+                                .arguments
+                                .clone()
+                                .unwrap_or_else(|| json!({ "type": "object" })),
+                        )
+                    },
+                    |(description, arguments)| (description.to_owned(), arguments.clone()),
+                );
+                crate::model::ToolDeclaration::new(id.wire_name(), description, arguments)
             })
             .collect();
 
@@ -144,6 +150,9 @@ impl Declarative {
             )
             .with_tools(declared.clone())
             .continuing(exchanges.clone());
+            if let Some(max_output_tokens) = max_output_tokens {
+                call = call.with_max_output_tokens(max_output_tokens);
+            }
             if let Some(ceiling) = egress {
                 call = call.with_max_sensitivity(ceiling);
             }
@@ -158,6 +167,14 @@ impl Declarative {
             }
 
             exchanges.clear();
+            // Providers may emit several calls in one response. Execute them in
+            // response order: `StepCtx` is the deterministic admission boundary
+            // and cannot be borrowed concurrently without moving journal,
+            // policy and budget decisions outside it. Parallel execution needs
+            // an explicit runtime primitive that pre-admits an ordered batch and
+            // journals completion order; spawning here would trade latency for
+            // replay correctness. Callers needing concurrency should expose one
+            // aggregate tool whose own implementation owns that contract.
             for asked in completion.peek().tool_calls.clone() {
                 // Matched byte for byte. A name that resolves to nothing
                 // is reported back as a failed call rather than ending
@@ -239,7 +256,7 @@ impl Skill for Declarative {
     ) -> Result<Outcome, SkillError> {
         // Read into owned values before any effect runs, so nothing borrows the
         // agent across an await.
-        let (system, model, schema, egress, oversight, granted) = {
+        let (system, model, max_output_tokens, schema, egress, oversight, granted) = {
             let m = cx.manifest().ok_or_else(|| {
                 // Unreachable through the builder, which only registers this
                 // skill when a manifest declared it. Stated rather than
@@ -249,19 +266,21 @@ impl Skill for Declarative {
                     "a declarative agent ran without a manifest — it has nothing to be".into(),
                 )
             })?;
+            let (model, max_output_tokens) = privileged(m).ok_or_else(|| {
+                SkillError::Other(format!(
+                    "manifest '{}' declares execution but no privileged model — a \
+                     declarative agent has nothing to call",
+                    m.metadata.name
+                ))
+            })?;
             (
                 m.spec
                     .identity
                     .as_ref()
                     .map(Identity::system_prompt)
                     .unwrap_or_default(),
-                privileged(m).ok_or_else(|| {
-                    SkillError::Other(format!(
-                        "manifest '{}' declares execution but no privileged model — a \
-                         declarative agent has nothing to call",
-                        m.metadata.name
-                    ))
-                })?,
+                model,
+                max_output_tokens,
                 m.output_schema().cloned(),
                 m.spec.security.max_sensitivity_egress,
                 m.spec.oversight.as_ref().map(Proposal::from_manifest),
@@ -284,6 +303,9 @@ impl Skill for Declarative {
                 ]);
                 let mut call =
                     ModelCall::new(Arc::clone(&self.provider), model, prompt.peek().clone());
+                if let Some(max_output_tokens) = max_output_tokens {
+                    call = call.with_max_output_tokens(max_output_tokens);
+                }
                 if let Some(schema) = schema {
                     call = call.expecting(schema);
                 }
@@ -302,8 +324,6 @@ impl Skill for Declarative {
                 }
 
                 let completion = cx.sink(call, &prompt).await?;
-                // The declared shape when there is one, the raw text when there
-                // is not. Never both, and never a guess about which the caller
                 // wanted — the manifest already said.
                 let answer =
                     completion.map(|c| c.structured.unwrap_or_else(|| json!({ "text": c.text })));
@@ -330,8 +350,15 @@ impl Skill for Declarative {
             }
 
             ExecutionKind::ToolCalling => {
-                self.tool_loop(cx, input, system, model, egress, granted)
-                    .await
+                self.tool_loop(
+                    cx,
+                    input,
+                    system,
+                    (model, max_output_tokens),
+                    egress,
+                    granted,
+                )
+                .await
             }
         }
     }
@@ -378,9 +405,9 @@ impl Proposal {
     }
 }
 
-fn privileged(m: &Manifest) -> Option<ModelId> {
+fn privileged(m: &Manifest) -> Option<(ModelId, Option<u32>)> {
     let r = m.spec.models.as_ref()?.privileged.as_ref()?;
-    Some(ModelId::new(&r.provider, &r.model))
+    Some((ModelId::new(&r.provider, &r.model), r.max_tokens))
 }
 
 /// What a failed tool call may tell the model, if anything.

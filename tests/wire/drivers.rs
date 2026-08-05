@@ -24,7 +24,7 @@ use std::sync::Arc;
 use agentplane::core::{Delegation, Disposition, Principal, Scope};
 use agentplane::model::anthropic::Anthropic;
 use agentplane::model::openai::OpenAi;
-use agentplane::model::{ModelError, ModelId, ModelProvider, SchemaMode};
+use agentplane::model::{ModelCall, ModelError, ModelId, ModelProvider, SchemaMode};
 use agentplane::peers::a2a::{A2aClient, EXTENSION_URI, Endpoint, PROTOCOL_VERSION};
 use agentplane::peers::{PeerClient, PeerError, PeerId};
 use axum::Router;
@@ -589,6 +589,7 @@ fn ask<'a>(model: &'a ModelId, prompt: &'a Value) -> agentplane::model::Request<
     agentplane::model::Request {
         model,
         prompt,
+        max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
         schema: None,
         tools: &[],
         exchanges: &[],
@@ -875,6 +876,7 @@ async fn a_schema_is_sent_as_a_strict_constraint() {
         .complete(agentplane::model::Request {
             model: &gpt(),
             prompt: &json!("how much"),
+            max_output_tokens: 77,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -883,6 +885,7 @@ async fn a_schema_is_sent_as_a_strict_constraint() {
         .unwrap();
 
     let body = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(body["max_output_tokens"], 77, "{body}");
     assert_eq!(body["text"]["format"]["type"], "json_schema");
     assert_eq!(
         body["text"]["format"]["strict"], true,
@@ -914,6 +917,7 @@ async fn the_anthropic_driver_sends_a_schema_too() {
         .complete(agentplane::model::Request {
             model: &model(),
             prompt: &json!("how much"),
+            max_output_tokens: 88,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -922,6 +926,7 @@ async fn the_anthropic_driver_sends_a_schema_too() {
         .unwrap();
 
     let body = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(body["max_tokens"], 88, "{body}");
     assert_eq!(body["output_config"]["format"]["type"], "json_schema");
     assert_eq!(body["output_config"]["format"]["schema"], sch);
     assert_eq!(out.structured.as_ref().unwrap()["amount"], 7);
@@ -950,6 +955,7 @@ async fn an_unparseable_structured_answer_is_billed_and_loud() {
         .complete(agentplane::model::Request {
             model: &gpt(),
             prompt: &json!("x"),
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1024,6 +1030,7 @@ async fn anthropic_can_emulate_a_schema_with_a_forced_tool() {
         .complete(agentplane::model::Request {
             model: &model(),
             prompt: &json!("how much"),
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1077,6 +1084,7 @@ async fn openai_can_emulate_a_schema_with_a_forced_tool() {
         .complete(agentplane::model::Request {
             model: &gpt(),
             prompt: &json!("how much"),
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1124,6 +1132,7 @@ async fn the_schema_mode_is_chosen_per_model() {
         .complete(agentplane::model::Request {
             model: &ModelId::new("anthropic", "claude-legacy-1"),
             prompt: &json!("x"),
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1156,6 +1165,7 @@ async fn the_schema_mode_is_chosen_per_model() {
         .complete(agentplane::model::Request {
             model: &ModelId::new("anthropic", "claude-opus-4-5"),
             prompt: &json!("x"),
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1197,6 +1207,7 @@ async fn a_model_that_ignores_the_forced_tool_is_caught() {
         .complete(agentplane::model::Request {
             model: &model(),
             prompt: &json!("x"),
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1248,6 +1259,7 @@ async fn an_incompatible_schema_is_refused_with_the_reason() {
             .complete(agentplane::model::Request {
                 model: &gpt(),
                 prompt: &json!("x"),
+                max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
                 schema: Some(&sch),
                 tools: &[],
                 exchanges: &[],
@@ -1289,6 +1301,7 @@ async fn a_conformant_schema_is_not_rewritten() {
         .complete(agentplane::model::Request {
             model: &gpt(),
             prompt: &json!("x"),
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1656,6 +1669,7 @@ data: {\"type\":\"message_stop\"}
         .complete(agentplane::model::Request {
             model: &model(),
             prompt: &prompt,
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1699,6 +1713,7 @@ data: {\"type\":\"message_stop\"}
         .complete(agentplane::model::Request {
             model: &model(),
             prompt: &prompt,
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],

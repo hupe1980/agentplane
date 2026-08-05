@@ -47,6 +47,32 @@ use serde_json::Value;
 /// before we do.
 pub const PROTOCOL_VERSION: &str = "1.0";
 
+/// Parse an A2A protocol version into the `Major.Minor` pair used for
+/// negotiation.
+///
+/// The specification requires decimal `Major.Minor`. A numeric patch is
+/// tolerated because patch releases MUST NOT affect compatibility, but an
+/// arbitrary suffix is not a patch version and must not turn `1.0.preview`
+/// into `1.0`. Keeping this in one place prevents card selection and server
+/// negotiation from accepting different version languages.
+#[cfg(any(feature = "a2a-server", all(feature = "a2a", feature = "manifest")))]
+pub(crate) fn protocol_major_minor(version: &str) -> Option<(u64, u64)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    match parts.next() {
+        None => Some((major, minor)),
+        Some(patch) if !patch.is_empty() && patch.parse::<u64>().is_ok() => {
+            if parts.next().is_none() {
+                Some((major, minor))
+            } else {
+                None
+            }
+        }
+        Some(_) => None,
+    }
+}
+
 #[cfg(feature = "a2a")]
 pub mod a2a;
 #[cfg(feature = "manifest")]

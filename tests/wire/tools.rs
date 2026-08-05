@@ -779,14 +779,18 @@ fn a_model_chosen_tool_name_is_matched_exactly_or_refused() {
     // Every one of these is a name a model plausibly emits, and every one must
     // be a refusal rather than a helpful correction.
     for near in [
-        "ledger/Transfer",  // case
-        "ledger/transfer ", // trailing space
-        " ledger/transfer", // leading space
-        "ledger/transfe",   // truncated
-        "ledger/transfers", // pluralised
-        "ledger.transfer",  // wrong separator
-        "transfer",         // server dropped
-        "ledger/",          // prefix only
+        "LEDGER__TRANSFER",  // exact wire shape, wrong case
+        "ledger__TRANSFER",  // exact server, wrong tool case
+        "ledger__transfer ", // exact wire name with trailing space
+        " ledger__transfer", // exact wire name with leading space
+        "ledger/Transfer",   // case
+        "ledger/transfer ",  // trailing space
+        " ledger/transfer",  // leading space
+        "ledger/transfe",    // truncated
+        "ledger/transfers",  // pluralised
+        "ledger.transfer",   // wrong separator
+        "transfer",          // server dropped
+        "ledger/",           // prefix only
     ] {
         assert!(
             catalog.resolve(near).is_none(),
@@ -892,6 +896,32 @@ fn a_typed_tool_generates_its_own_schema() {
     );
 }
 
+/// Registration order must not choose a typed implementation.
+#[test]
+#[should_panic(expected = "registered twice")]
+fn a_typed_tool_cannot_silently_replace_itself() {
+    use agentplane::tools::ToolBox;
+
+    let _ = ToolBox::new().with::<ReadBalance>().with::<ReadBalance>();
+}
+
+/// `server__tool` stays readable and injective even when either component
+/// contains the separator.
+#[test]
+fn two_tools_cannot_collapse_to_one_model_name() {
+    use agentplane::tools::{ToolCatalog, ToolId, ToolSafety};
+
+    let first = ToolId::new("ledger__archive", "read");
+    let second = ToolId::new("ledger", "archive__read");
+    assert_ne!(first.wire_name(), second.wire_name());
+
+    let catalog = ToolCatalog::new()
+        .allow(first.clone(), ToolSafety::default())
+        .allow(second.clone(), ToolSafety::default());
+    assert_eq!(catalog.resolve(&first.wire_name()), Some(first));
+    assert_eq!(catalog.resolve(&second.wire_name()), Some(second));
+}
+
 /// Code and the reviewed declaration must agree, in both directions.
 ///
 /// Deriving a schema is ergonomics. Noticing that the manifest a reviewer
@@ -924,8 +954,9 @@ spec:
     let tools = ToolBox::new().with::<ReadBalance>();
 
     // They agree.
-    let ok =
-        granted("    - ref: mcp://ledger/read\n      mutates: false\n      description: Read.");
+    let ok = granted(
+        "    - ref: mcp://ledger/read\n      mutates: false\n      description: Read a ledger account's balance.",
+    );
     assert!(tools.check_against(&ok).is_ok());
 
     // Implemented, never granted: the binary can do something its declaration
@@ -1035,21 +1066,14 @@ fn a_manifest_may_be_stricter_than_a_tool_claims() {
 
     // `ReadBalance` declares `mutates() == false`; the operator says otherwise.
     let m = Manifest::parse(
-        r#"
-apiVersion: agentplane.hupe1980.github.io/v1alpha1
-kind: Agent
-metadata: { name: teller, version: "1.0.0" }
-spec:
-  capabilities:
-    provides: [ledger.ask]
-  tools:
-    - ref: mcp://ledger/read
-      mutates: true
-      description: Read, but the operator is cautious.
-  budgets: {}
-"#,
-    )
-    .expect("parse");
+            r#"
+    apiVersion: agentplane.hupe1980.github.io/v1alpha1
+    kind: Agent
+    metadata: { name: teller, version: "1.0.0" }
+    spec: { capabilities: { provides: [ledger.ask] }, tools: [{ ref: "mcp://ledger/read", mutates: true, description: "Read a ledger account's balance." }], budgets: {} }
+    "#,
+        )
+        .expect("parse");
 
     assert!(
         ToolBox::new()
@@ -1057,6 +1081,41 @@ spec:
             .check_against(&m)
             .is_ok(),
         "an operator being more cautious than the author was refused"
+    );
+}
+
+/// The typed argument shape is the one a model receives; the manifest does not
+/// carry a second schema that can drift from the deserializer.
+#[cfg(feature = "manifest")]
+#[test]
+fn a_typed_tool_refuses_a_second_manifest_schema() {
+    use agentplane::manifest::Manifest;
+    use agentplane::tools::ToolBox;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities: { provides: [ledger.ask] }
+  tools:
+    - ref: mcp://ledger/read
+      mutates: false
+      description: Read a ledger account's balance.
+      arguments: { type: object, properties: { wrong: { type: string } } }
+  budgets: {}
+"#,
+    )
+    .expect("parse");
+
+    let problems = ToolBox::new()
+        .with::<ReadBalance>()
+        .check_against(&manifest)
+        .expect_err("a second schema was accepted");
+    assert!(
+        problems.iter().any(|p| p.contains("remove `arguments`")),
+        "the refusal did not identify the duplicate schema: {problems:?}"
     );
 }
 

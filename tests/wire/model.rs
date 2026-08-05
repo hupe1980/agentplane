@@ -24,7 +24,10 @@ use agentplane::core::{
     SkillError, Tainted, Trust,
 };
 use agentplane::journal::{JournalStore, RecordKind};
-use agentplane::model::{Completion, ModelCall, ModelError, ModelId, ModelProvider, Usage};
+use agentplane::model::{
+    Completion, ModelCall, ModelError, ModelId, ModelProvider, ToolCall, ToolDeclaration,
+    ToolExchange, Usage,
+};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use agentplane::testkit::FakeProvider;
@@ -464,6 +467,78 @@ fn a_changed_prompt_is_a_different_effect() {
         b.descriptor().args,
         "an edited prompt must show up as divergence on replay, not as a run that \
          quietly did something else"
+    );
+}
+
+/// Offered capabilities steer the answer and therefore belong to its identity.
+#[test]
+fn changed_tool_declarations_are_a_different_effect() {
+    let provider = FakeProvider::new() as Arc<dyn ModelProvider>;
+    let a = ModelCall::new(Arc::clone(&provider), model(), json!({ "q": "balance" })).with_tools([
+        ToolDeclaration::new(
+            "read_balance",
+            "Read the available balance.",
+            json!({
+                "type": "object",
+                "properties": { "account": { "type": "string" } },
+                "required": ["account"],
+                "additionalProperties": false,
+            }),
+        ),
+    ]);
+    let b = ModelCall::new(provider, model(), json!({ "q": "balance" })).with_tools([
+        ToolDeclaration::new(
+            "read_balance",
+            "Read the settled balance.",
+            json!({
+                "type": "object",
+                "properties": { "account": { "type": "string" } },
+                "required": ["account"],
+                "additionalProperties": false,
+            }),
+        ),
+    ]);
+
+    assert_ne!(
+        a.descriptor().args,
+        b.descriptor().args,
+        "strict replay must not reuse an answer produced under a different tool description"
+    );
+}
+
+/// Tool results are additional model input, not metadata about the same call.
+#[test]
+fn changed_tool_exchanges_are_a_different_effect() {
+    let provider = FakeProvider::new() as Arc<dyn ModelProvider>;
+    let call = ToolCall {
+        id: "call-1".to_owned(),
+        name: "read_balance".to_owned(),
+        arguments: json!({ "account": "A-1" }),
+    };
+    let a = ModelCall::new(Arc::clone(&provider), model(), json!({ "q": "balance" }))
+        .continuing([ToolExchange::ok(call.clone(), json!({ "balance": 42 }))]);
+    let b = ModelCall::new(provider, model(), json!({ "q": "balance" }))
+        .continuing([ToolExchange::failed(call, "ledger unavailable")]);
+
+    assert_ne!(
+        a.descriptor().args,
+        b.descriptor().args,
+        "strict replay must not reuse an answer produced from a different tool result"
+    );
+}
+
+#[test]
+fn a_changed_output_ceiling_is_a_different_effect() {
+    let provider = FakeProvider::new() as Arc<dyn ModelProvider>;
+    let a = ModelCall::new(Arc::clone(&provider), model(), json!({ "q": "balance" }))
+        .with_max_output_tokens(100);
+    let b =
+        ModelCall::new(provider, model(), json!({ "q": "balance" })).with_max_output_tokens(200);
+
+    assert_ne!(
+        a.descriptor().args,
+        b.descriptor().args,
+        "strict replay must not reuse an answer generated under a different token ceiling"
     );
 }
 

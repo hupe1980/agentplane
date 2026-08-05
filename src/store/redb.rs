@@ -614,7 +614,7 @@ impl JournalStore for RedbStore {
                     let leases = w.open_table(RUN_LEASE).map_err(|e| be(&e))?;
                     if let Some(l) = leases.get(key.as_str()).map_err(|e| be(&e))? {
                         let (_, current, _) = l.value();
-                        if epoch < current {
+                        if epoch != current {
                             return Err(StoreError::Fenced {
                                 run: key.clone(),
                                 held: epoch,
@@ -854,7 +854,7 @@ impl JournalStore for RedbStore {
                     let leases = w.open_table(RUN_LEASE).map_err(|e| be(&e))?;
                     if let Some(l) = leases.get(key.as_str()).map_err(|e| be(&e))? {
                         let (_, current, _) = l.value();
-                        if epoch < current {
+                        if epoch != current {
                             return Err(StoreError::Fenced {
                                 run: key.clone(),
                                 held: epoch,

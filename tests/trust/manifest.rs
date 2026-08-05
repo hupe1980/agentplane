@@ -142,6 +142,36 @@ fn a_tool_grant_defaults_to_mutating() {
     );
 }
 
+/// A grant must name something the transport and catalogue can resolve.
+#[test]
+fn a_malformed_tool_reference_is_refused_at_parse_time() {
+    let malformed = GOOD.replace(
+        "mcp://validator/apply_correction",
+        "validator/apply_correction",
+    );
+    match Manifest::parse(&malformed) {
+        Err(ManifestError::Syntax(detail)) => assert!(
+            detail.contains("mcp://server/tool"),
+            "the refusal did not explain the required reference shape: {detail}"
+        ),
+        Err(other) => panic!("wrong refusal: {other}"),
+        Ok(_) => panic!("a tool reference the catalogue cannot resolve was accepted"),
+    }
+}
+
+/// One tool has one reviewed safety declaration.
+#[test]
+fn duplicate_tool_grants_are_refused() {
+    let duplicate = GOOD.replace(
+        "    - ref: \"mcp://validator/apply_correction\"",
+        "    - ref: \"mcp://validator/apply_correction\"\n      mutates: false\n    - ref: \"mcp://validator/apply_correction\"",
+    );
+    assert!(
+        matches!(Manifest::parse(&duplicate), Err(ManifestError::Syntax(detail)) if detail.contains("more than once")),
+        "two safety declarations for one tool were accepted"
+    );
+}
+
 #[test]
 fn protected_tool_fields_are_strict_and_digest_covered() {
     let protected = GOOD.replace(
@@ -1551,7 +1581,7 @@ spec:
   capabilities:
     provides: [support.summarise]
   models:
-    privileged: { provider: fake, model: sum-1 }
+        privileged: { provider: fake, model: sum-1, max_tokens: 321 }
   output:
     schema:
       type: object
@@ -1620,6 +1650,10 @@ async fn an_agent_defined_only_in_yaml_runs() {
         "the manifest's prompt is not the one that was sent"
     );
     assert_eq!(ask.model, agentplane::model::ModelId::new("fake", "sum-1"));
+    assert_eq!(
+        ask.max_output_tokens, 321,
+        "the manifest's per-model output ceiling was parsed but not applied to the call"
+    );
     assert!(
         ask.schema.is_some(),
         "the declared result shape was not requested"
@@ -2427,7 +2461,14 @@ fn an_agent_card_is_derived_from_the_manifest() {
 fn the_extended_card_discloses_more_but_not_the_model() {
     use agentplane::peers::{AgentCard, ExtendedAgentCard};
 
-    let m = Manifest::parse(GOOD).expect("parse");
+    // Give the fixture a distinctive model. Without one, a mutation that copies
+    // the model into `topology` still serializes no model at all and this test
+    // passes without exercising the disclosure it names.
+    let m = Manifest::parse(&GOOD.replace(
+        "  tools:",
+        "  models:\n    privileged: { provider: secret-provider, model: crown-model-7 }\n  tools:",
+    ))
+    .expect("parse");
     let public = AgentCard::derive(&m, "https://plane/a2a").expect("public");
     let extended = ExtendedAgentCard::derive(&m, "https://plane/a2a").expect("extended");
 
@@ -2469,7 +2510,7 @@ fn the_extended_card_discloses_more_but_not_the_model() {
     // the protected-field rules are a map of where to push.
     let wire = serde_json::to_string(&extended).expect("serialise");
     assert!(
-        !wire.contains("claude") && !wire.contains("gpt") && !wire.contains("provider"),
+        !wire.contains("secret-provider") && !wire.contains("crown-model-7"),
         "the extended card disclosed which model the agent runs on: {wire}"
     );
     assert!(
@@ -2764,6 +2805,15 @@ fn an_interface_is_selected_by_binding_and_version() {
             tenant: None,
         },
     );
+    card.supported_interfaces.insert(
+        1,
+        CardInterface {
+            url: "https://plane/a2a/preview".to_owned(),
+            protocol_binding: JSONRPC.to_owned(),
+            protocol_version: "1.0.preview".to_owned(),
+            tenant: None,
+        },
+    );
 
     let chosen = card
         .select_interface(JSONRPC, "1.0")
@@ -2772,6 +2822,12 @@ fn an_interface_is_selected_by_binding_and_version() {
         chosen.url, "https://plane/a2a",
         "selection took the first entry regardless of version, so the client \
          would speak 1.0 at a 0.3 endpoint"
+    );
+
+    assert!(
+        card.select_interface(JSONRPC, "1.0.9").is_some(),
+        "a numeric patch release changed compatibility even though A2A says \
+         patch versions must not participate in negotiation"
     );
 
     // And a binding this crate does not speak is not selected at all.

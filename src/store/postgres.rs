@@ -315,7 +315,7 @@ impl PostgresStore {
         if let Some(row) = lease {
             let current: i64 = row.get(0);
             let current = current.cast_unsigned();
-            if epoch < current {
+            if epoch != current {
                 return Err(StoreError::Fenced {
                     run: run.to_string(),
                     held: epoch,

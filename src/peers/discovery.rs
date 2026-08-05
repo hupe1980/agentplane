@@ -171,10 +171,11 @@ impl AgentCard {
     /// would pick an endpoint that speaks a protocol this client does not.
     #[must_use]
     pub fn select_interface(&self, binding: &str, version: &str) -> Option<&CardInterface> {
-        let want = major_minor(version);
-        self.supported_interfaces
-            .iter()
-            .find(|i| i.protocol_binding == binding && major_minor(&i.protocol_version) == want)
+        let want = super::protocol_major_minor(version)?;
+        self.supported_interfaces.iter().find(|i| {
+            i.protocol_binding == binding
+                && super::protocol_major_minor(&i.protocol_version) == Some(want)
+        })
     }
 
     /// An endpoint for this crate's A2A client, taken from the card.
@@ -211,10 +212,4 @@ impl AgentCard {
             None => endpoint,
         })
     }
-}
-
-/// `Major.Minor`, which is what the spec compares.
-fn major_minor(v: &str) -> (&str, &str) {
-    let mut parts = v.split('.');
-    (parts.next().unwrap_or(""), parts.next().unwrap_or(""))
 }

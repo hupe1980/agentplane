@@ -118,7 +118,7 @@ short string still fits.
 | Obligation | Why not |
 |---|---|
 | **Art. 9** risk management | There is a policy seam and a Cedar adapter, but no risk-tier model. Cedar's `symcc` could *prove* properties of a policy set rather than test them; nothing invokes it |
-| **Art. 13** machine-readable description | A manifest declares an agent's prompt, grants, ceilings, models, result shape and oversight; the registry pins it by digest, can verify a domain-separated publisher attestation, and refuses publisher reassignment; and the runtime **refuses** effects the declaration never named. What is still absent: the shipped registry is process-local rather than durable or remote, trust in publisher keys remains a deployment decision, and the A2A agent card derived from the manifest is designed, not built |
+| **Art. 13** machine-readable description | A manifest declares an agent's prompt, grants, ceilings, models, result shape and oversight; the registry pins it by digest, can verify a domain-separated publisher attestation, and refuses publisher reassignment; the runtime **refuses** effects the declaration never named; and the A2A Agent Card is derived from that same manifest and served by the optional A2A server. What is still absent: the shipped registry is process-local rather than durable or remote, and trust in publisher keys remains a deployment decision |
 | **Art. 50** transparency to users | An interface obligation, not a runtime one (above) |
 | Anything about your **model** | Bias, accuracy, training data, and evaluation are properties of the model and its use. This is a runtime |
 | A **conformity assessment** | A person does that, about a system, in a context |

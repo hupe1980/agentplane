@@ -801,9 +801,10 @@ refusing costs nothing rather than after the eager members have run.
 
 ## 🧰 Define a tool once
 
-A tool is one type. Its arguments are its fields, its schema comes from those
-fields, and its description comes from the doc comment — so the sentence a model
-reads is the sentence a maintainer reads.
+A tool is one type. Its arguments are its fields and its schema comes from those
+fields, so the model is shown exactly what the body deserializes. The description
+stays in the manifest because it steers model behaviour and therefore belongs in
+the digest-covered review artifact:
 
 ```rust
 /// Read a ledger account's balance.
@@ -836,8 +837,9 @@ to index and no field name to misspell.
 
 This is the shape Python's `@tool`, Pydantic AI, the OpenAI Agents SDK and Rig
 all arrived at, and the reasons are the same: a schema written twice is a schema
-that disagrees with itself, and a description kept apart from the code is the
-copy nobody updates.
+that disagrees with itself. Those SDKs also derive the description from code,
+which is right when code is the declaration. Here the manifest is the reviewed,
+content-addressed declaration, so model-steering prose belongs there instead.
 
 `.toolbox(..)` is one call because it used to be three, and two of them were
 optional. It derives the catalogue from each agent's own declaration — the

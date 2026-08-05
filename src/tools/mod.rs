@@ -106,14 +106,29 @@ impl ToolId {
     /// providers restrict them to letters, digits, underscore and hyphen, so a
     /// `:` or `/` is rejected before the model ever sees the tool. The double
     /// underscore is the separator because a single one appears inside ordinary
-    /// tool names and would make `a_b/c` and `a/b_c` collide.
+    /// tool names and would make `a_b/c` and `a/b_c` collide. Underscores in
+    /// either component are escaped as `_u`, so the separator can never occur
+    /// inside an encoded component: `a__b/c` and `a/b__c` remain distinct
+    /// rather than being refused or resolved by map order.
     ///
     /// This is the name [`ToolCatalog::resolve`] matches, because it is the only
     /// one a model can actually emit.
     #[must_use]
     pub fn wire_name(&self) -> String {
-        format!("{}__{}", self.server, self.tool)
+        format!(
+            "{}__{}",
+            wire_component(&self.server),
+            wire_component(&self.tool)
+        )
     }
+}
+
+/// Escape the one byte reserved by the model-name separator.
+///
+/// Every input underscore becomes `_u`; therefore encoded components contain
+/// no `__`, and concatenating two of them with `__` is injective.
+fn wire_component(value: &str) -> String {
+    value.replace('_', "_u")
 }
 
 impl std::fmt::Display for ToolId {
@@ -323,6 +338,10 @@ pub trait ToolClient: Send + Sync + Debug {
 #[derive(Debug, Default, Clone)]
 pub struct ToolCatalog {
     entries: BTreeMap<ToolId, (ToolSafety, Advertised)>,
+    /// What a model is shown. Separate from safety because presentation is not
+    /// authority, and absent for catalogues used only by hand-written skills.
+    #[cfg(feature = "manifest")]
+    declarations: BTreeMap<ToolId, (String, Value)>,
 }
 
 impl ToolCatalog {
@@ -372,7 +391,17 @@ impl ToolCatalog {
                     .unwrap_or(ToolSafety::default().max_sensitivity),
                 ..ToolSafety::default()
             };
-            catalog = catalog.allow(id, safety);
+            catalog = catalog.allow(id.clone(), safety);
+            if grant.description.is_some() || grant.arguments.is_some() {
+                catalog = catalog.declare(
+                    id,
+                    grant.description.clone().unwrap_or_default(),
+                    grant
+                        .arguments
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
+                );
+            }
         }
         catalog
     }
@@ -382,6 +411,25 @@ impl ToolCatalog {
     pub fn allow(mut self, id: ToolId, safety: ToolSafety) -> Self {
         self.entries.insert(id, (safety, Advertised::default()));
         self
+    }
+
+    /// Attach the description and argument schema a model is shown.
+    ///
+    /// Crate-private because callers should either derive this from a
+    /// [`ToolBox`] or keep it in the digest-covered manifest. A third public
+    /// declaration path would recreate the drift this method removes.
+    #[cfg(feature = "manifest")]
+    pub(crate) fn declare(mut self, id: ToolId, description: String, arguments: Value) -> Self {
+        self.declarations.insert(id, (description, arguments));
+        self
+    }
+
+    /// Model-facing declaration, when this catalogue carries one.
+    #[cfg(feature = "manifest")]
+    pub(crate) fn declaration(&self, id: &ToolId) -> Option<(&str, &Value)> {
+        self.declarations
+            .get(id)
+            .map(|(description, arguments)| (description.as_str(), arguments))
     }
 
     /// Every entry, so several agents' catalogues can be combined.

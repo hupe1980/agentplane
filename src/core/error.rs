@@ -563,8 +563,9 @@ pub enum StoreError {
         current: u64,
     },
 
-    /// The writer's epoch is below the current lease: it has been taken over and
-    /// is now a zombie. It must drop the run, not retry.
+    /// The writer did not present the current lease epoch. A stale writer has
+    /// been taken over; a future epoch was never acquired. Neither owns the run,
+    /// and neither may retry blindly.
     #[error("fenced: run {run} is owned at epoch {current}, writer held {held}")]
     Fenced {
         run: String,

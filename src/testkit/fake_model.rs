@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+#[cfg(test)]
+use crate::model::ModelCall;
 use crate::model::{Completion, ModelError, ModelId, ModelProvider, Request, Usage};
 
 /// What the fake was asked.
@@ -37,7 +39,10 @@ use crate::model::{Completion, ModelError, ModelId, ModelProvider, Request, Usag
 pub struct Ask {
     pub model: ModelId,
     pub prompt: Value,
+    pub max_output_tokens: u32,
     pub schema: Option<Value>,
+    /// The exact tool surface the model was offered this turn.
+    pub tools: Vec<crate::model::ToolDeclaration>,
     /// What this turn was told about the tools the last turn asked for.
     ///
     /// Recorded because it is the only place a *refusal* reaches a model, and
@@ -232,7 +237,9 @@ impl ModelProvider for FakeProvider {
         self.asked.lock().expect("fake").push(Ask {
             model: request.model.clone(),
             prompt: request.prompt.clone(),
+            max_output_tokens: request.max_output_tokens,
             schema: request.schema.cloned(),
+            tools: request.tools.to_vec(),
             exchanges: request.exchanges.to_vec(),
         });
 
@@ -260,6 +267,7 @@ mod tests {
         Request {
             model,
             prompt,
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             schema: schema.map(|s| &*Box::leak(Box::new(s.clone()))),
             tools: &[],
             exchanges: &[],
@@ -301,6 +309,7 @@ mod tests {
             .complete(Request {
                 model: &m,
                 prompt: short,
+                max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
                 schema: None,
                 tools: &[],
                 exchanges: &[],
@@ -311,6 +320,7 @@ mod tests {
             .complete(Request {
                 model: &m,
                 prompt: long,
+                max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
                 schema: None,
                 tools: &[],
                 exchanges: &[],

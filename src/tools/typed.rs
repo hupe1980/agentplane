@@ -23,10 +23,11 @@
 //! arrived at the same three rules, and they are right:
 //!
 //! 1. **The schema comes from the type**, never from a second document.
-//! 2. **The description comes from the doc comment**, so the thing a model reads
-//!    is the thing a maintainer reads. There is no second string to update.
-//! 3. **One artifact per tool** — its name, its arguments, its safety and its
-//!    body in one place.
+//! 2. **The body receives that type**, rather than indexing a second untyped
+//!    representation by hand.
+//! 3. **Model-steering prose stays in the manifest.** Unlike ordinary agent
+//!    SDKs, this runtime has a digest-covered review artifact; changing what the
+//!    model is told a tool does must change that artifact's identity.
 //!
 //! ```no_run
 //! # use agentplane::tools::{Tool, ToolError};
@@ -159,19 +160,24 @@ impl ToolBox {
     #[must_use]
     pub fn with<T: Tool>(mut self) -> Self {
         let schema = serde_json::to_value(schemars::schema_for!(T))
-            .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
-        // **The doc comment is the description.** `schemars` already lifts it
-        // into the schema, so a separate constant would be the same sentence
-        // written twice — and the copy a model reads would be the one nobody
-        // updates. This is the rule Python's `@tool`, Pydantic AI and the
-        // `OpenAI` Agents SDK all settled on, for the same reason.
+            .expect("a schemars-generated schema must serialize to JSON");
+        // Keep the type's description for inspection and for deployments with
+        // no manifest presentation. A declarative agent deliberately uses the
+        // manifest's description instead: it is model-steering text, so a
+        // change must be visible in the digest-covered review artifact.
         let description = schema
             .get("description")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        let id = ToolId::new(T::SERVER, T::NAME);
+        assert!(
+            !self.tools.contains_key(&id),
+            "typed tool '{id}' was registered twice — silently replacing one body with \
+             another makes registration order decide which implementation runs"
+        );
         self.tools.insert(
-            ToolId::new(T::SERVER, T::NAME),
+            id,
             Registered {
                 description,
                 schema,
@@ -234,11 +240,11 @@ impl ToolBox {
     /// than the first.
     #[cfg(feature = "manifest")]
     pub fn check_against(&self, manifest: &crate::manifest::Manifest) -> Result<(), Vec<String>> {
-        let granted: BTreeMap<ToolId, bool> = manifest
+        let granted: BTreeMap<ToolId, &crate::manifest::ToolGrant> = manifest
             .spec
             .tools
             .iter()
-            .filter_map(|g| ToolId::parse(&g.reference).map(|id| (id, g.mutates)))
+            .filter_map(|g| ToolId::parse(&g.reference).map(|id| (id, g)))
             .collect();
 
         let mut problems = Vec::new();
@@ -252,11 +258,20 @@ impl ToolBox {
             // being *less* cautious is not: marking a self-declared mutating
             // tool read-only exempts it from the whole-value taint gate, so
             // model-chosen arguments reach something that changes the world.
-            if registered.mutates && granted.get(id) == Some(&false) {
+            if registered.mutates && granted.get(id).is_some_and(|g| !g.mutates) {
                 problems.push(format!(
                     "'{id}' declares that it mutates and the manifest grants it as \
                      read-only — that exemption lets model-chosen arguments reach \
                      something that changes the world"
+                ));
+            }
+            if let Some(grant) = granted.get(id)
+                && grant.arguments.is_some()
+            {
+                problems.push(format!(
+                    "'{id}' repeats its argument schema in the manifest — typed tools \
+                     derive it from the Rust argument type, so the second copy can only \
+                     drift; remove `arguments` from this grant"
                 ));
             }
         }

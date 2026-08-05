@@ -3718,6 +3718,19 @@ impl RuntimeBuilder {
             "tools were wired to a plane with no declared agent — a grant is an \
              agent's declaration, so there is nothing here that admits them"
         );
+        // The typed argument type is the schema source. Overlay its
+        // presentation only after every manifest has been checked, so the
+        // model sees exactly what the body will deserialize rather than the
+        // old permissive `{ type: object }` fallback.
+        for id in tools.ids() {
+            let (description, schema, _) = tools
+                .declared(id)
+                .expect("every registered typed tool has a declaration");
+            let reviewed_description = catalog
+                .declaration(id)
+                .map_or_else(|| description.to_owned(), |(text, _)| text.to_owned());
+            catalog = catalog.declare(id.clone(), reviewed_description, schema.clone());
+        }
         self.tools = Some((
             Arc::new(catalog),
             Arc::new(tools) as Arc<dyn crate::tools::ToolClient>,

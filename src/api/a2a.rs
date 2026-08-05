@@ -583,7 +583,10 @@ impl A2aServer {
             .get(VERSION_HEADER)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if major_minor(claimed) == major_minor(crate::peers::PROTOCOL_VERSION) {
+        let claimed_version = crate::peers::protocol_major_minor(claimed);
+        if claimed_version == crate::peers::protocol_major_minor(crate::peers::PROTOCOL_VERSION)
+            && claimed_version.is_some()
+        {
             return Ok(());
         }
         let seen = if claimed.is_empty() {
@@ -628,12 +631,6 @@ impl A2aServer {
             ),
         ))
     }
-}
-
-/// `Major.Minor`, which is what the spec compares.
-fn major_minor(v: &str) -> (&str, &str) {
-    let mut parts = v.split('.');
-    (parts.next().unwrap_or(""), parts.next().unwrap_or(""))
 }
 
 /// The public Agent Card.

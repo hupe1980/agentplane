@@ -49,6 +49,8 @@ use serde_json::{Value, json};
 
 use crate::core::Secret;
 
+#[cfg(test)]
+use super::ModelCall;
 use super::wire::{RESPOND_TOOL, classify_status, classify_transport, structured};
 use super::{
     Completion, ModelError, ModelId, ModelProvider, Request, SchemaMode, Usage, anthropic_stream,
@@ -65,7 +67,6 @@ pub struct Anthropic {
     key: Secret,
     base: String,
     version: String,
-    max_tokens: u32,
     /// The mode to use for a model with no explicit entry.
     default_schema_mode: SchemaMode,
     /// Per-model overrides.
@@ -98,7 +99,6 @@ impl std::fmt::Debug for Anthropic {
         f.debug_struct("Anthropic")
             .field("base", &self.base)
             .field("version", &self.version)
-            .field("max_tokens", &self.max_tokens)
             .field("key", &"<redacted>")
             .finish_non_exhaustive()
     }
@@ -116,8 +116,6 @@ impl Anthropic {
     /// Deliberately not unbounded-by-default: an output limit is the cheapest
     /// spend control there is, and the budget ceilings in `core::budget` govern
     /// the run rather than the individual call.
-    pub const DEFAULT_MAX_TOKENS: u32 = 4096;
-
     /// # Errors
     ///
     /// If the HTTP client cannot be built.
@@ -133,7 +131,6 @@ impl Anthropic {
             key: Secret::new(key),
             base: "https://api.anthropic.com".to_owned(),
             version: Self::VERSION.to_owned(),
-            max_tokens: Self::DEFAULT_MAX_TOKENS,
             default_schema_mode: SchemaMode::Native,
             schema_modes: std::collections::BTreeMap::new(),
             stream: true,
@@ -145,12 +142,6 @@ impl Anthropic {
     #[must_use]
     pub fn base(mut self, base: impl Into<String>) -> Self {
         self.base = base.into();
-        self
-    }
-
-    #[must_use]
-    pub const fn max_tokens(mut self, n: u32) -> Self {
-        self.max_tokens = n;
         self
     }
 
@@ -524,6 +515,7 @@ fn interpret(
 
 impl Anthropic {
     /// The request body, identical either way but for the `stream` flag.
+    #[cfg(test)]
     fn body(
         &self,
         model: &ModelId,
@@ -532,9 +524,28 @@ impl Anthropic {
         tools: &[super::ToolDeclaration],
         exchanges: &[super::ToolExchange],
     ) -> Result<Value, ModelError> {
+        self.body_with_max(
+            model,
+            prompt,
+            ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            schema,
+            tools,
+            exchanges,
+        )
+    }
+
+    fn body_with_max(
+        &self,
+        model: &ModelId,
+        prompt: &Value,
+        max_output_tokens: u32,
+        schema: Option<&Value>,
+        tools: &[super::ToolDeclaration],
+        exchanges: &[super::ToolExchange],
+    ) -> Result<Value, ModelError> {
         let mut body = json!({
             "model": model.model,
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_output_tokens,
             "messages": continue_with(messages(prompt), exchanges),
         });
         if let Some(system) = system(prompt) {
@@ -552,6 +563,7 @@ impl Anthropic {
                             "name": t.name,
                             "description": t.description,
                             "input_schema": t.parameters,
+                            "strict": true,
                         })
                     })
                     .collect(),
@@ -664,7 +676,13 @@ impl Anthropic {
                 // an answer half-delivered.
                 Err(e) => return Err(severed(model, &acc, &e.to_string())),
             };
-            for event in decoder.push(&chunk) {
+            let events = decoder
+                .push(&chunk)
+                .map_err(|error| ModelError::Unaccounted {
+                    model: model.clone(),
+                    detail: error.to_string(),
+                })?;
+            for event in events {
                 acc.event(&event.name, &event.data);
             }
             // An `error` event inside a 200. Handled as soon as it lands rather
@@ -767,6 +785,7 @@ impl ModelProvider for Anthropic {
         let Request {
             model,
             prompt,
+            max_output_tokens,
             schema,
             tools,
             exchanges,
@@ -783,7 +802,14 @@ impl ModelProvider for Anthropic {
             .post(format!("{}/v1/messages", self.base))
             .header("x-api-key", self.key.expose())
             .header("anthropic-version", &self.version)
-            .json(&self.body(model, prompt, schema, tools, exchanges)?)
+            .json(&self.body_with_max(
+                model,
+                prompt,
+                max_output_tokens,
+                schema,
+                tools,
+                exchanges,
+            )?)
             .send()
             .await
             .map_err(|e| classify_transport(model, &e))?;
@@ -986,6 +1012,10 @@ mod tool_tests {
 
         let tool = &body["tools"][0];
         assert_eq!(tool["name"], "ledger.read");
+        assert_eq!(
+            tool["strict"], true,
+            "strict tool use must enforce the declared input schema during generation: {body}"
+        );
         assert_eq!(
             tool["input_schema"]["type"], "object",
             "Anthropic names the argument schema `input_schema`; `parameters` is              OpenAI's spelling and this request would be rejected: {body}"
