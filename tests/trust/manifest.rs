@@ -2357,7 +2357,7 @@ spec:
 }
 
 #[test]
-fn a_reasoning_enabled_tool_loop_is_refused_until_continuation_is_lossless() {
+fn a_reasoning_enabled_tool_loop_is_a_valid_declaration() {
     let yaml = r#"
 apiVersion: agentplane.hupe1980.github.io/v1alpha1
 kind: Agent
@@ -2369,16 +2369,8 @@ spec:
   execution: { kind: tool-calling }
   budgets: {}
 "#;
-    match Manifest::parse(yaml) {
-        Err(ManifestError::Unenforceable { field, detail }) => {
-            assert_eq!(field, "spec.models.privileged.reasoning_effort");
-            assert!(detail.contains("opaque"), "{detail}");
-        }
-        Err(error) => panic!("wrong refusal: {error}"),
-        Ok(_) => panic!(
-            "a reasoning tool loop was accepted even though provider reasoning state is dropped"
-        ),
-    }
+    Manifest::parse(yaml)
+        .expect("reasoning tool loops are valid now that continuation state is round-tripped");
 }
 
 /// The published Agent Card is derived from the declaration, not written beside it.

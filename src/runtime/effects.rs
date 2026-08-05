@@ -373,6 +373,44 @@ pub struct RecallMemory {
     pub(crate) query: crate::memory::Recall,
 }
 
+/// Semantic ranking is an effect because an index and embedding implementation
+/// can change independently of durable memory truth.
+#[derive(Debug, Clone)]
+pub struct SemanticRecall {
+    pub(crate) retriever: std::sync::Arc<dyn crate::memory::SemanticRetriever>,
+    pub(crate) query: crate::memory::SemanticQuery,
+}
+
+#[async_trait]
+impl Effect for SemanticRecall {
+    type Output = Vec<crate::memory::SemanticHit>;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "memory.semantic-recall",
+            json!({
+                "retriever": self.retriever.profile(),
+                "query": self.query,
+            }),
+        )
+    }
+
+    fn mutates(&self) -> bool {
+        false
+    }
+
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    async fn perform(&self) -> Result<Self::Output, EffectError> {
+        self.retriever
+            .search(&self.query)
+            .await
+            .map_err(|error| EffectError::Other(error.to_string()))
+    }
+}
+
 #[async_trait]
 impl Effect for RecallMemory {
     type Output = Vec<crate::memory::Selected>;
@@ -444,6 +482,7 @@ impl Effect for RememberMemory {
                 "sensitivity": self.item.sensitivity,
                 "trust": self.item.trust,
                 "created_at": self.item.created_at,
+                "expires_at": self.item.expires_at,
                 "derived_from": self.item.derived_from,
                 // The content's digest, not the content: an effect key is
                 // recorded verbatim, and a memory's content belongs in a store
@@ -458,6 +497,29 @@ impl Effect for RememberMemory {
             .remember(&self.item)
             .await
             .map_err(|e| EffectError::Other(e.to_string()))
+    }
+}
+
+/// Erase expired memories at one journaled cutoff.
+#[derive(Debug, Clone)]
+pub struct SweepExpiredMemory {
+    pub(crate) memories: std::sync::Arc<dyn crate::memory::MemoryStore>,
+    pub(crate) at: crate::core::Timestamp,
+}
+
+#[async_trait]
+impl Effect for SweepExpiredMemory {
+    type Output = usize;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new("memory.sweep-expired", json!({ "at": self.at }))
+    }
+
+    async fn perform(&self) -> Result<Self::Output, EffectError> {
+        self.memories
+            .sweep_expired(self.at)
+            .await
+            .map_err(|error| EffectError::Other(error.to_string()))
     }
 }
 

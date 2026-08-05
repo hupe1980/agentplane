@@ -256,26 +256,9 @@ struct ApiUsage {
 }
 
 #[derive(Debug, Deserialize)]
-struct ApiBlock {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    text: String,
-    /// A tool call's provider-assigned id.
-    #[serde(default)]
-    id: Option<String>,
-    /// Which tool the model wants called.
-    #[serde(default)]
-    name: Option<String>,
-    /// A forced tool call's arguments — already an object, not a JSON string.
-    #[serde(default)]
-    input: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ApiResponse {
     #[serde(default)]
-    content: Vec<ApiBlock>,
+    content: Vec<Value>,
     #[serde(default)]
     usage: Option<ApiUsage>,
     #[serde(default)]
@@ -308,8 +291,8 @@ impl ApiResponse {
     fn text(&self) -> String {
         self.content
             .iter()
-            .filter(|b| b.kind == "text")
-            .map(|b| b.text.as_str())
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join("")
     }
@@ -328,15 +311,15 @@ impl ApiResponse {
     fn tool_calls(&self) -> Vec<super::ToolCall> {
         self.content
             .iter()
-            .filter(|b| b.kind == "tool_use")
-            .filter(|b| b.name.as_deref() != Some(RESPOND_TOOL))
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .filter(|b| b.get("name").and_then(Value::as_str) != Some(RESPOND_TOOL))
             .filter_map(|b| {
                 Some(super::ToolCall {
-                    id: b.id.clone()?,
-                    name: b.name.clone()?,
+                    id: b.get("id")?.as_str()?.to_owned(),
+                    name: b.get("name")?.as_str()?.to_owned(),
                     // Already decoded here, unlike the streaming path where it
                     // arrives as JSON fragments.
-                    arguments: b.input.clone().unwrap_or(Value::Null),
+                    arguments: b.get("input").cloned().unwrap_or(Value::Null),
                 })
             })
             .collect()
@@ -352,8 +335,11 @@ impl ApiResponse {
     fn forced_tool_input(&self) -> Option<&Value> {
         self.content
             .iter()
-            .find(|b| b.kind == "tool_use" && b.name.as_deref() == Some(RESPOND_TOOL))
-            .and_then(|b| b.input.as_ref())
+            .find(|b| {
+                b.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && b.get("name").and_then(Value::as_str) == Some(RESPOND_TOOL)
+            })
+            .and_then(|b| b.get("input"))
     }
 }
 
@@ -367,7 +353,11 @@ impl ApiResponse {
 /// All results go in **one** user message. A separate message per result is
 /// accepted by the API and reads to the model as several conversational turns,
 /// which is not what happened — the calls were parallel.
-fn continue_with(messages: Value, exchanges: &[super::ToolExchange]) -> Value {
+fn continue_with(
+    messages: Value,
+    exchanges: &[super::ToolExchange],
+    continuation: Option<&super::ProviderContinuation>,
+) -> Value {
     if exchanges.is_empty() {
         return messages;
     }
@@ -375,36 +365,63 @@ fn continue_with(messages: Value, exchanges: &[super::ToolExchange]) -> Value {
         Value::Array(v) => v,
         other => vec![json!({ "role": "user", "content": other })],
     };
-    out.push(json!({
-        "role": "assistant",
-        "content": exchanges
-            .iter()
-            .map(|e| json!({
-                "type": "tool_use",
-                "id": e.call.id,
-                "name": e.call.name,
-                "input": e.call.arguments,
-            }))
-            .collect::<Vec<_>>(),
-    }));
-    out.push(json!({
+    if let Some(state) = continuation.and_then(|state| state.state.as_array()) {
+        out.extend(state.iter().cloned());
+    } else {
+        out.push(json!({
+            "role": "assistant",
+            "content": exchanges
+                .iter()
+                .map(|e| json!({
+                    "type": "tool_use",
+                    "id": e.call.id,
+                    "name": e.call.name,
+                    "input": e.call.arguments,
+                }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+    out.push(tool_results(exchanges));
+    Value::Array(out)
+}
+
+fn tool_results(exchanges: &[super::ToolExchange]) -> Value {
+    json!({
         "role": "user",
         "content": exchanges
             .iter()
-            .map(|e| json!({
+            .map(|exchange| json!({
                 "type": "tool_result",
-                "tool_use_id": e.call.id,
-                // Stringified: `content` takes text or blocks, not arbitrary
-                // JSON, and a bare object is rejected.
-                "content": match &e.output {
-                    Value::String(s) => s.clone(),
+                "tool_use_id": exchange.call.id,
+                "content": match &exchange.output {
+                    Value::String(value) => value.clone(),
                     other => other.to_string(),
                 },
-                "is_error": e.failed,
+                "is_error": exchange.failed,
             }))
             .collect::<Vec<_>>(),
-    }));
-    Value::Array(out)
+    })
+}
+
+fn accumulate_continuation(
+    completion: &mut Completion,
+    prior: Option<&super::ProviderContinuation>,
+    exchanges: &[super::ToolExchange],
+) {
+    let Some(current) = completion.continuation.as_mut() else {
+        return;
+    };
+    let mut transcript = prior
+        .and_then(|value| value.state.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if !exchanges.is_empty() {
+        transcript.push(tool_results(exchanges));
+    }
+    if let Some(messages) = current.state.as_array() {
+        transcript.extend(messages.iter().cloned());
+    }
+    current.state = Value::Array(transcript);
 }
 
 /// The prompt shape this driver accepts.
@@ -460,6 +477,8 @@ struct Assembled {
     tool_calls: Vec<super::ToolCall>,
     usage: Usage,
     stop_reason: Option<String>,
+    /// Exact provider-native assistant blocks for a subsequent tool turn.
+    continuation: Value,
 }
 
 fn interpret(
@@ -474,6 +493,7 @@ fn interpret(
         tool_calls,
         usage,
         stop_reason,
+        continuation,
     } = assembled;
     // It generated and then declined. Metered, because generation happened —
     // and `Unusable` rather than `Refused` for exactly that reason: a refusal
@@ -513,6 +533,12 @@ fn interpret(
         (text, parsed_schema)
     };
 
+    let continuation = (!tool_calls.is_empty()).then(|| {
+        super::ProviderContinuation::new(
+            "anthropic",
+            json!([{ "role": "assistant", "content": continuation }]),
+        )
+    });
     Ok(Completion {
         structured: structured_value,
         tool_calls,
@@ -522,6 +548,7 @@ fn interpret(
         // room, not because it finished.
         truncated: stop_reason.as_deref() == Some("max_tokens"),
         stop_reason,
+        continuation,
     })
 }
 
@@ -544,6 +571,7 @@ impl Anthropic {
             schema,
             tools,
             exchanges,
+            None,
         )
     }
 
@@ -557,20 +585,28 @@ impl Anthropic {
         schema: Option<&Value>,
         tools: &[super::ToolDeclaration],
         exchanges: &[super::ToolExchange],
+        continuation: Option<&super::ProviderContinuation>,
     ) -> Result<Value, ModelError> {
-        if reasoning_effort.is_some() && !exchanges.is_empty() {
+        if let Some(state) = continuation
+            && (state.provider != "anthropic" || !state.state.is_array())
+        {
             return Err(ModelError::Refused {
                 model: model.clone(),
-                detail: "reasoning-enabled tool continuation is not supported yet: Anthropic \
-                         requires the signed thinking blocks from the prior response, and \
-                         dropping them would make the next turn invalid or weaker"
+                detail: "the continuation was not an Anthropic assistant-content array".to_owned(),
+            });
+        }
+        if reasoning_effort.is_some() && !exchanges.is_empty() && continuation.is_none() {
+            return Err(ModelError::Refused {
+                model: model.clone(),
+                detail: "reasoning-enabled tool continuation requires the signed thinking \
+                         and assistant blocks from the prior Anthropic response"
                     .to_owned(),
             });
         }
         let mut body = json!({
             "model": model.model,
             "max_tokens": max_output_tokens,
-            "messages": continue_with(messages(prompt), exchanges),
+            "messages": continue_with(messages(prompt), exchanges, continuation),
         });
         if let Some(effort) = reasoning_effort {
             if matches!(
@@ -686,6 +722,7 @@ impl Anthropic {
                 tool_calls: parsed.tool_calls(),
                 usage: parsed.usage(),
                 stop_reason: parsed.stop_reason.clone(),
+                continuation: Value::Array(parsed.content.clone()),
             },
         )
     }
@@ -757,6 +794,7 @@ impl Anthropic {
                 tool_calls: acc.tool_calls(),
                 usage: acc.billed(),
                 stop_reason: acc.stop_reason().map(ToOwned::to_owned),
+                continuation: acc.continuation_content(),
             },
         )
     }
@@ -846,6 +884,7 @@ impl ModelProvider for Anthropic {
             schema,
             tools,
             exchanges,
+            continuation,
         } = request;
 
         super::refuse_provider_side_media(prompt, model)?;
@@ -868,6 +907,7 @@ impl ModelProvider for Anthropic {
                 schema,
                 tools,
                 exchanges,
+                continuation,
             )?)
             .send()
             .await
@@ -882,11 +922,13 @@ impl ModelProvider for Anthropic {
             return Err(classify_status(model, status.as_u16(), &detail));
         }
 
-        if self.stream {
-            self.read_streamed(response, model, schema).await
+        let mut completion = if self.stream {
+            self.read_streamed(response, model, schema).await?
         } else {
-            self.read_buffered(response, model, schema).await
-        }
+            self.read_buffered(response, model, schema).await?
+        };
+        accumulate_continuation(&mut completion, continuation, exchanges);
+        Ok(completion)
     }
 }
 
@@ -1150,7 +1192,9 @@ mod tool_tests {
 #[cfg(test)]
 mod continuation_tests {
     use super::*;
-    use crate::model::{ToolCall as ModelToolCall, ToolExchange};
+    use crate::model::{
+        ProviderContinuation, ReasoningEffort, ToolCall as ModelToolCall, ToolExchange,
+    };
 
     fn driver() -> Anthropic {
         Anthropic::new("test-key").expect("build the driver")
@@ -1206,6 +1250,63 @@ mod continuation_tests {
             "the result must carry the id of the call it answers, or the API \
              rejects it: {body}"
         );
+    }
+
+    #[test]
+    fn signed_thinking_round_trips_unchanged_before_tool_results() {
+        let content = json!([
+            {"type": "thinking", "thinking": "private reasoning", "signature": "signed-value"},
+            {"type": "text", "text": "checking"},
+            {"type": "tool_use", "id": "toolu_01", "name": "ledger.read", "input": {"id": "AC-1"}}
+        ]);
+        let state = ProviderContinuation::new(
+            "anthropic",
+            json!([{ "role": "assistant", "content": content.clone() }]),
+        );
+        let body = driver()
+            .body_with_max(
+                &ModelId::new("anthropic", "claude-x"),
+                &json!({"messages": [{"role": "user", "content": "balance?"}]}),
+                4096,
+                Some(ReasoningEffort::High),
+                None,
+                &[],
+                &[exchange(false)],
+                Some(&state),
+            )
+            .expect("lossless thinking continuation");
+
+        assert_eq!(body["messages"][1]["content"], content);
+        assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn continuation_accumulates_every_prior_message() {
+        let prior = ProviderContinuation::new(
+            "anthropic",
+            json!([{ "role": "assistant", "content": [{"type": "thinking", "signature": "first"}] }]),
+        );
+        let mut completion = Completion {
+            text: String::new(),
+            tool_calls: vec![ModelToolCall {
+                id: "toolu_02".to_owned(),
+                name: "ledger.read".to_owned(),
+                arguments: json!({}),
+            }],
+            usage: Usage::default(),
+            stop_reason: Some("tool_use".to_owned()),
+            truncated: false,
+            structured: None,
+            continuation: Some(ProviderContinuation::new(
+                "anthropic",
+                json!([{ "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_02"}] }]),
+            )),
+        };
+        accumulate_continuation(&mut completion, Some(&prior), &[exchange(false)]);
+        let state = completion.continuation.unwrap().state;
+        assert_eq!(state[0]["content"][0]["signature"], "first");
+        assert_eq!(state[1]["role"], "user");
+        assert_eq!(state[2]["content"][0]["id"], "toolu_02");
     }
 
     /// A failed tool is reported as failed, not as a strange answer.

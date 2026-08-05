@@ -41,6 +41,12 @@ struct ToolBlock {
 #[derive(Debug, Default)]
 pub struct Accumulator {
     text: String,
+    /// Complete provider-native content blocks, in their original order.
+    ///
+    /// These are returned to Anthropic on the next tool turn. In particular,
+    /// thinking text and its signature must remain together; dropping either
+    /// makes an extended-thinking continuation invalid or silently weaker.
+    blocks: std::collections::BTreeMap<u64, Value>,
     /// Every tool block being reassembled, keyed by content-block index.
     ///
     /// Anthropic hands tool input over as *fragments of a JSON string* when
@@ -158,6 +164,26 @@ impl Accumulator {
             .collect()
     }
 
+    /// Exact assistant content to round-trip on a tool continuation.
+    #[must_use]
+    pub fn continuation_content(&self) -> Value {
+        Value::Array(
+            self.blocks
+                .iter()
+                .map(|(index, block)| {
+                    let mut block = block.clone();
+                    if block.get("type").and_then(Value::as_str) == Some("tool_use")
+                        && let Some(tool) = self.tools.get(index)
+                        && let Ok(input) = serde_json::from_str::<Value>(&tool.json)
+                    {
+                        block["input"] = input;
+                    }
+                    block
+                })
+                .collect(),
+        )
+    }
+
     /// Absorb one event.
     ///
     /// Unknown event types are ignored on purpose: Anthropic's versioning policy
@@ -190,6 +216,11 @@ impl Accumulator {
             }
             "content_block_start" => {
                 let block = value.get("content_block");
+                if let Some(index) = value.get("index").and_then(Value::as_u64)
+                    && let Some(block) = block
+                {
+                    self.blocks.insert(index, block.clone());
+                }
                 let is_tool =
                     block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use");
                 if is_tool && let Some(index) = value.get("index").and_then(Value::as_u64) {
@@ -259,6 +290,7 @@ impl Accumulator {
             Some("text_delta") => {
                 if let Some(t) = delta.get("text").and_then(Value::as_str) {
                     self.text.push_str(t);
+                    self.append_block_string(value, "text", t);
                 }
             }
             Some("input_json_delta") => {
@@ -273,13 +305,32 @@ impl Accumulator {
                     block.json.push_str(p);
                 }
             }
-            // `thinking_delta` and `signature_delta` are deliberately dropped.
-            // Reasoning tokens are billed and *are* counted — they are in
-            // `output_tokens`, which is read above — but the reasoning text is
-            // not the answer, and concatenating it into `text` would hand the
-            // caller a completion that says something the model did not
-            // conclude.
+            Some("thinking_delta") => {
+                if let Some(thinking) = delta.get("thinking").and_then(Value::as_str) {
+                    self.append_block_string(value, "thinking", thinking);
+                }
+            }
+            Some("signature_delta") => {
+                if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                    self.append_block_string(value, "signature", signature);
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn append_block_string(&mut self, event: &Value, field: &str, fragment: &str) {
+        let Some(index) = event.get("index").and_then(Value::as_u64) else {
+            return;
+        };
+        let Some(block) = self.blocks.get_mut(&index).and_then(Value::as_object_mut) else {
+            return;
+        };
+        let value = block
+            .entry(field.to_owned())
+            .or_insert_with(|| Value::String(String::new()));
+        if let Some(text) = value.as_str() {
+            *value = Value::String(format!("{text}{fragment}"));
         }
     }
 
@@ -387,6 +438,33 @@ mod tests {
         assert_eq!(acc.stop_reason(), Some("end_turn"));
         assert_eq!(acc.billed().input_tokens, 25);
         assert_eq!(acc.billed().output_tokens, 15);
+    }
+
+    #[test]
+    fn thinking_and_signature_are_reassembled_for_continuation() {
+        let mut acc = Accumulator::new();
+        acc.event(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        );
+        acc.event(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private reasoning"}}"#,
+        );
+        acc.event(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signed-value"}}"#,
+        );
+
+        assert_eq!(
+            acc.continuation_content()[0],
+            serde_json::json!({
+                "type": "thinking",
+                "thinking": "private reasoning",
+                "signature": "signed-value"
+            })
+        );
+        assert!(acc.text().is_empty(), "thinking is not visible answer text");
     }
 
     /// The property the whole streaming path exists for.

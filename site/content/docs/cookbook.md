@@ -1004,10 +1004,42 @@ for memory in &known {
 // sensitivity and provenance from it; there is no metadata field with which it
 // can be promoted while being stored.
 cx.remember(
-    MemoryWrite::new(format!("triage-{account}"), account.clone(), "support"),
+    MemoryWrite::new(format!("triage-{account}"), account.clone(), "support")
+        .expires_at(retention_cutoff),
     summary,
 ).await?;
 ```
+
+Fresh recall evaluates expiry against `StepCtx`'s journaled clock. Exact
+versions remain replayable until a lifecycle skill calls
+`cx.sweep_expired_memories()`; its cutoff and removed count are journaled, and
+strict replay does not erase twice. The backend sweep erases all versions and
+reserves the id. `set_legal_hold(id, true)`
+blocks ordinary, subject, cascading and expiry erasure atomically. A hold is
+privileged lifecycle administration, not something model output should request.
+
+Semantic ranking stays outside `MemoryStore` and inside the journal:
+
+```rust
+let hits = cx.semantic_recall(
+    retriever, // Arc<dyn SemanticRetriever>
+    SemanticQuery {
+        subject: account.clone(),
+        purpose: Some("support".into()),
+        text: "refund policy".into(),
+        embedding: query_vector,
+        embedding_model: "embed-v3@2026-07-01".into(),
+        index_snapshot: "support-2026-08-05".into(),
+        limit: 5,
+    },
+).await?;
+```
+
+The effect records the exact vector, embedding revision, immutable index
+snapshot, filters, scores and `(id, version, digest)` selections. Replay does
+not rerank. It materializes exact versions from authoritative memory and rejects
+out-of-scope or changed commitments. `InMemorySemanticRetriever` is the exact
+cosine reference; production ANN stores implement the same seam.
 
 **The trap:** stripping the label before writing. `StepCtx::remember` prevents
 the obvious laundering path by accepting `MemoryWrite` plus `Tainted<Value>` and
@@ -1021,6 +1053,30 @@ needs; a *subject* is the unit a person's erasure names, and `forget_subject` is
 that. If summaries were made from the memory, see the next recipe — erasure has
 to reach them too. A forgotten id remains reserved forever; generate a new id
 for new content rather than recycling an old journal identity.
+
+## ☁️ Use Amazon Bedrock Converse
+
+Enable the separate `bedrock` feature, then load AWS's standard credential
+chain and an explicit region:
+
+```rust
+let provider: Arc<dyn ModelProvider> = Arc::new(
+    agentplane::model::bedrock::Bedrock::from_env("eu-west-1").await?
+);
+```
+
+The buffered driver supports Converse text, tools/results, usage, truncation,
+forced-tool structured output and exact reasoning-content continuation. Region,
+buffering, timeout and schema mode are in effect identity. Explicit
+`reasoning_effort` is refused because Converse has no portable mapping across
+its model families; streaming is not claimed until partial-failure usage can be
+accounted honestly.
+
+OpenAI and Anthropic declarative tool loops preserve reasoning automatically.
+`Completion::continuation` carries opaque OpenAI output items or Anthropic
+thinking/signature blocks. A custom loop must pass that value through
+`ModelCall::with_continuation` beside `continuing(exchanges)`; otherwise a
+reasoning-enabled continuation fails closed.
 
 ## 🗜️ Compact a memory without laundering it
 

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS memory_items (
     subject     TEXT   NOT NULL,
     purpose     TEXT   NOT NULL,
     created_at  BIGINT NOT NULL,
+    expires_at  BIGINT,
     current     BOOLEAN NOT NULL,
     item        JSONB  NOT NULL,
     PRIMARY KEY (tenant, id, version)
@@ -50,6 +51,16 @@ CREATE TABLE IF NOT EXISTS memory_forgotten (
     id     TEXT NOT NULL,
     PRIMARY KEY (tenant, id)
 );
+
+CREATE TABLE IF NOT EXISTS memory_legal_holds (
+    tenant TEXT NOT NULL,
+    id     TEXT NOT NULL,
+    PRIMARY KEY (tenant, id)
+);
+
+CREATE INDEX IF NOT EXISTS memory_expiry
+    ON memory_items (tenant, expires_at, id)
+    WHERE current AND expires_at IS NOT NULL;
 ";
 
 fn be(error: &tokio_postgres::Error) -> StoreError {
@@ -220,8 +231,8 @@ impl MemoryStore for PostgresStore {
             .map_err(|error| StoreError::Backend(error.to_string()))?;
         tx.execute(
             "INSERT INTO memory_items
-                (tenant, id, version, subject, purpose, created_at, current, item)
-             VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)",
+                (tenant, id, version, subject, purpose, created_at, expires_at, current, item)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8)",
             &[
                 &tenant,
                 &stored.id,
@@ -229,6 +240,9 @@ impl MemoryStore for PostgresStore {
                 &stored.subject,
                 &stored.purpose,
                 &stored.created_at.unix_timestamp(),
+                &stored
+                    .expires_at
+                    .map(crate::core::Timestamp::unix_timestamp),
                 &json,
             ],
         )
@@ -267,8 +281,15 @@ impl MemoryStore for PostgresStore {
                 "SELECT item FROM memory_items
                  WHERE tenant = $1 AND subject = $2 AND current
                    AND ($3::TEXT IS NULL OR purpose = $3)
-                 ORDER BY created_at DESC, id ASC LIMIT $4",
-                &[&tenant, &query.subject, &query.purpose, &limit],
+                                     AND ($4::BIGINT IS NULL OR expires_at IS NULL OR expires_at > $4)
+                                 ORDER BY created_at DESC, id ASC LIMIT $5",
+                                &[
+                                        &tenant,
+                                        &query.subject,
+                                        &query.purpose,
+                                        &query.as_of.map(crate::core::Timestamp::unix_timestamp),
+                                        &limit,
+                                ],
             )
             .await
             .map_err(|error| be(&error))?;
@@ -300,10 +321,29 @@ impl MemoryStore for PostgresStore {
         let tenant = self.tenant_name();
         tx.query_one(
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&format!("memory-lifecycle:{}:{tenant}", tenant.len())],
+        )
+        .await
+        .map_err(|error| be(&error))?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
             &[&format!("memory-id:{}:{tenant}{id}", tenant.len())],
         )
         .await
         .map_err(|error| be(&error))?;
+        if tx
+            .query_opt(
+                "SELECT 1 FROM memory_legal_holds WHERE tenant = $1 AND id = $2",
+                &[&tenant, &id],
+            )
+            .await
+            .map_err(|error| be(&error))?
+            .is_some()
+        {
+            return Err(StoreError::Backend(format!(
+                "memory '{id}' is under legal hold"
+            )));
+        }
         tx.execute(
             "DELETE FROM memory_derived WHERE tenant = $1 AND derived_id = $2",
             &[&tenant, &id],
@@ -335,6 +375,12 @@ impl MemoryStore for PostgresStore {
         })?;
         let tx = client.transaction().await.map_err(|error| be(&error))?;
         let tenant = self.tenant_name();
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&format!("memory-lifecycle:{}:{tenant}", tenant.len())],
+        )
+        .await
+        .map_err(|error| be(&error))?;
 
         // Exclusive against the shared lock every memory write takes. The
         // derivation graph is therefore stable for the complete traversal and
@@ -366,6 +412,22 @@ impl MemoryStore for PostgresStore {
                 .await
                 .map_err(|error| be(&error))?;
             queue.extend(rows.iter().map(|row| row.get::<_, String>("derived_id")));
+        }
+
+        for memory_id in &doomed {
+            if tx
+                .query_opt(
+                    "SELECT 1 FROM memory_legal_holds WHERE tenant = $1 AND id = $2",
+                    &[&tenant, memory_id],
+                )
+                .await
+                .map_err(|error| be(&error))?
+                .is_some()
+            {
+                return Err(StoreError::Backend(format!(
+                    "memory '{memory_id}' is under legal hold"
+                )));
+            }
         }
 
         for memory_id in &doomed {
@@ -403,6 +465,12 @@ impl MemoryStore for PostgresStore {
         let tenant = self.tenant_name();
         tx.query_one(
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&format!("memory-lifecycle:{}:{tenant}", tenant.len())],
+        )
+        .await
+        .map_err(|error| be(&error))?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
             &[&format!(
                 "memory-subject:{}:{tenant}{subject}",
                 tenant.len()
@@ -419,6 +487,21 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|error| be(&error))?;
         let ids: Vec<String> = rows.iter().map(|row| row.get("id")).collect();
+        for id in &ids {
+            if tx
+                .query_opt(
+                    "SELECT 1 FROM memory_legal_holds WHERE tenant = $1 AND id = $2",
+                    &[&tenant, id],
+                )
+                .await
+                .map_err(|error| be(&error))?
+                .is_some()
+            {
+                return Err(StoreError::Backend(format!(
+                    "memory '{id}' is under legal hold"
+                )));
+            }
+        }
         for id in &ids {
             tx.execute(
                 "DELETE FROM memory_derived WHERE tenant = $1 AND derived_id = $2",
@@ -440,6 +523,118 @@ impl MemoryStore for PostgresStore {
         )
         .await
         .map_err(|error| be(&error))?;
+        tx.commit().await.map_err(|error| be(&error))?;
+        Ok(ids.len())
+    }
+
+    async fn set_legal_hold(&self, id: &str, held: bool) -> Result<(), StoreError> {
+        let mut client = self.pool_ref().get().await.map_err(|error| {
+            StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
+        })?;
+        let tx = client.transaction().await.map_err(|error| be(&error))?;
+        let tenant = self.tenant_name();
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&format!("memory-lifecycle:{}:{tenant}", tenant.len())],
+        )
+        .await
+        .map_err(|error| be(&error))?;
+        let exists = tx
+            .query_opt(
+                "SELECT 1 FROM memory_items
+                 WHERE tenant = $1 AND id = $2 AND current FOR UPDATE",
+                &[&tenant, &id],
+            )
+            .await
+            .map_err(|error| be(&error))?
+            .is_some();
+        if held && !exists {
+            return Err(StoreError::Backend(format!(
+                "cannot hold missing memory '{id}'"
+            )));
+        }
+        if held {
+            tx.execute(
+                "INSERT INTO memory_legal_holds (tenant, id) VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING",
+                &[&tenant, &id],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        } else {
+            tx.execute(
+                "DELETE FROM memory_legal_holds WHERE tenant = $1 AND id = $2",
+                &[&tenant, &id],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        }
+        tx.commit().await.map_err(|error| be(&error))
+    }
+
+    async fn legal_hold(&self, id: &str) -> Result<bool, StoreError> {
+        let client = self.pool_ref().get().await.map_err(|error| {
+            StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
+        })?;
+        let tenant = self.tenant_name();
+        client
+            .query_opt(
+                "SELECT 1 FROM memory_legal_holds WHERE tenant = $1 AND id = $2",
+                &[&tenant, &id],
+            )
+            .await
+            .map(|row| row.is_some())
+            .map_err(|error| be(&error))
+    }
+
+    async fn sweep_expired(&self, at: crate::core::Timestamp) -> Result<usize, StoreError> {
+        let mut client = self.pool_ref().get().await.map_err(|error| {
+            StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
+        })?;
+        let tx = client.transaction().await.map_err(|error| be(&error))?;
+        let tenant = self.tenant_name();
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&format!("memory-lifecycle:{}:{tenant}", tenant.len())],
+        )
+        .await
+        .map_err(|error| be(&error))?;
+        let rows = tx
+            .query(
+                "SELECT item.id
+                 FROM memory_items item
+                 LEFT JOIN memory_legal_holds hold
+                   ON hold.tenant = item.tenant AND hold.id = item.id
+                 WHERE item.tenant = $1 AND item.current
+                   AND item.expires_at IS NOT NULL AND item.expires_at <= $2
+                   AND hold.id IS NULL
+                 FOR UPDATE OF item",
+                &[&tenant, &at.unix_timestamp()],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        let ids: Vec<String> = rows.iter().map(|row| row.get("id")).collect();
+        for id in &ids {
+            tx.execute(
+                "DELETE FROM memory_derived WHERE tenant = $1 AND derived_id = $2",
+                &[&tenant, id],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+            tx.execute(
+                "DELETE FROM memory_items WHERE tenant = $1 AND id = $2",
+                &[&tenant, id],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+            tx.execute(
+                "INSERT INTO memory_forgotten (tenant, id) VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING",
+                &[&tenant, id],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        }
         tx.commit().await.map_err(|error| be(&error))?;
         Ok(ids.len())
     }

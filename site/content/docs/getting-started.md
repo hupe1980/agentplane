@@ -100,7 +100,8 @@ is refused, exhausted or failed exits non-zero, because whoever scripts this
 needs the shell's own answer to "did it work".
 
 Keys come from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`), never
-from the file: an agent's declaration must not change when its key does. And only
+from the file; Bedrock uses `AWS_REGION` and AWS's standard credential chain.
+An agent's declaration must not change when its credential does. And only
 the providers the manifest *names* are registered — otherwise exporting the wrong
 variable would make the agent runnable on a model its declaration never named.
 
@@ -122,7 +123,7 @@ tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
 Everything beyond a single-node runtime is opt-in:
 
 ```toml
-agentplane = { version = "0.2", features = ["postgres", "http", "mcp", "providers", "media", "cedar", "signing"] }
+agentplane = { version = "0.2", features = ["postgres", "http", "mcp", "providers", "bedrock", "media", "cedar", "signing"] }
 ```
 
 | feature | gives you |
@@ -135,6 +136,7 @@ agentplane = { version = "0.2", features = ["postgres", "http", "mcp", "provider
 | `a2a-server` | being called: the public Agent Card and the A2A 1.0 JSON-RPC methods |
 | `push` | A2A push notifications: durable webhook registrations and SSRF-guarded delivery |
 | `providers` | Anthropic and OpenAI model drivers |
+| `bedrock` | Amazon Bedrock Runtime Converse through the AWS SDK; separate because the dependency graph is substantial |
 | `media` | governed remote-media fetch: exact grants, SSRF-safe pinned DNS, redirects, limits, validation, digest and retention |
 | `cedar` | Cedar as the authorization engine |
 | `signing` | Ed25519 record attestation |

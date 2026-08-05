@@ -71,7 +71,7 @@ redb = ["dep:redb"]
 # builder calls; the manifest is what makes those declarations reviewable.
 manifest = ["dep:serde_yaml_ng", "dep:base64"]
 # Everything the `agentplane` binary needs to run a declarative agent.
-cli = ["manifest", "redb", "providers", "testkit"]
+cli = ["manifest", "redb", "providers", "bedrock", "testkit"]
 # Content-addressed blob storage on any backend OpenDAL reaches — filesystem,
 # S3, GCS, Azure. The other half of the journal's record-size limit: bytes too
 # big for the chain go here, and the chain commits to their digest.
@@ -137,6 +137,10 @@ signing = ["dep:ed25519-dalek"]
 # Model provider drivers over HTTP. The `ModelProvider` trait and the metering
 # rules are always available; this is a concrete driver.
 providers = ["dep:reqwest"]
+# Amazon Bedrock's Converse API. Separate from `providers` because the AWS SDK
+# dependency graph is substantial and neither OpenAI nor Anthropic users should
+# pay for it. The provider-neutral model seam remains unconditional.
+bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:aws-smithy-types", "dep:base64"]
 # Governed remote-media ingestion. Kept separate from model providers because
 # dereferencing an untrusted URL is a security boundary of its own: every DNS
 # answer and redirect is checked and pinned before bytes enter blob storage.
@@ -209,6 +213,9 @@ ed25519-dalek = { version = "3", default-features = false, features = ["alloc", 
 # report for a severed response is "cost unknown", and the budget ceiling that
 # exists to bound a runaway provider reads zero while it spends.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "http2", "charset", "stream"], optional = true }
+aws-config = { version = "1.8.18", optional = true }
+aws-sdk-bedrockruntime = { version = "1.135.0", optional = true }
+aws-smithy-types = { version = "1.5.0", optional = true }
 
 [dev-dependencies]
 # For the streaming driver tests: the stub server hands axum a body stream of
@@ -242,6 +249,10 @@ required-features = ["cli"]
 [[example]]
 name              = "openai_live"
 required-features = ["redb", "providers"]
+
+[[example]]
+name              = "bedrock_live"
+required-features = ["bedrock"]
 
 [[example]]
 name              = "durable_pipeline"

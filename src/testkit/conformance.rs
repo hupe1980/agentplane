@@ -124,6 +124,7 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
         written_by: "conformance".to_owned(),
         version: 0,
         created_at: at(1_760_000_000),
+        expires_at: None,
         superseded_at: None,
         derived_from: Vec::new(),
     };
@@ -224,6 +225,80 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
             .await
             .expect("empty")
             .is_empty()
+    );
+
+    let mut expiring = make(
+        "memory-expiring",
+        "team-lifecycle",
+        "support",
+        json!({"temporary": true}),
+    );
+    expiring.expires_at = Some(at(1_760_000_100));
+    store.remember(&expiring).await.expect("expiring memory");
+    assert_eq!(
+        store
+            .recall(&Recall::about("team-lifecycle").at(at(1_760_000_099)))
+            .await
+            .expect("before expiry")
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .recall(&Recall::about("team-lifecycle").at(at(1_760_000_100)))
+            .await
+            .expect("at expiry")
+            .is_empty(),
+        "expiry is inclusive"
+    );
+    assert!(
+        store
+            .version("memory-expiring", 1)
+            .await
+            .expect("exact replay version")
+            .is_some(),
+        "hiding an expired current item must not silently break replay"
+    );
+
+    store
+        .set_legal_hold("memory-expiring", true)
+        .await
+        .expect("place legal hold");
+    assert!(
+        store
+            .legal_hold("memory-expiring")
+            .await
+            .expect("read hold")
+    );
+    assert!(
+        store.forget("memory-expiring").await.is_err(),
+        "ordinary erasure bypassed legal hold"
+    );
+    assert_eq!(
+        store
+            .sweep_expired(at(1_760_000_101))
+            .await
+            .expect("held sweep"),
+        0,
+        "expiry sweep bypassed legal hold"
+    );
+    store
+        .set_legal_hold("memory-expiring", false)
+        .await
+        .expect("release legal hold");
+    assert_eq!(
+        store
+            .sweep_expired(at(1_760_000_101))
+            .await
+            .expect("expiry sweep"),
+        1
+    );
+    assert!(
+        store
+            .version("memory-expiring", 1)
+            .await
+            .expect("swept version")
+            .is_none()
     );
 }
 

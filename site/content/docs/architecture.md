@@ -1746,12 +1746,14 @@ exact failure the design is shaped to avoid. An idle stream may now be reaped by
 an intermediary, which is the better failure, because a client can recover from a
 closed connection and cannot recover from one that never ends.
 
-### Model providers (`providers`)
+### Model providers (`providers`, `bedrock`)
 
-Two drivers: the Anthropic Messages API, and the OpenAI **Responses** API —
+The `providers` feature ships Anthropic Messages and OpenAI **Responses** —
 Responses rather than Chat Completions because it is the current primitive and
 reports both usage and completeness directly. They exist mostly to prove the seam
-is right: that a driver can report *what a failure consumed*.
+is right: that a driver can report *what a failure consumed*. The separate
+`bedrock` feature ships Amazon Bedrock Runtime Converse through the AWS SDK;
+separate gating avoids imposing its dependency graph on either HTTP driver.
 
 Status classification is shared between them, in `model::wire`, because it is
 doctrine rather than vendor detail:
@@ -1783,11 +1785,23 @@ Details worth stating:
   `output_config.effort`, refusing unsupported values before dispatch. The
   manifest field reaches declarative completion requests.
 
-  Reasoning-enabled tool continuation remains deliberately refused. OpenAI
-  requires opaque reasoning/output items to be passed back; Anthropic requires
-  signed thinking blocks. The current normalized `ToolExchange` does not retain
-  either. Dropping them and continuing would silently weaken the model, so the
-  missing provider-state continuation is stated rather than approximated.
+  Reasoning-enabled tool continuation is self-contained and journaled.
+  `Completion::continuation` carries provider-tagged opaque state; the next
+  `ModelCall` commits to it in effect identity. OpenAI round-trips complete
+  Responses output items, including encrypted reasoning and assistant phase.
+  Anthropic's buffered path retains complete assistant blocks and its streaming
+  accumulator reassembles thinking and signature deltas before tool results.
+  A missing or wrong-provider state fails closed. No `previous_response_id` or
+  provider-held conversation is replay truth.
+
+* **Bedrock is intentionally buffered and conservative.** Converse text,
+  tools/results, signed or redacted reasoning continuation, usage, truncation
+  and forced-tool structured output are supported. Region, buffering, timeout
+  and schema mode enter the provider profile. Access, validation and not-found
+  errors are refusals; throttling and model-not-ready are retryable. Buffered
+  model timeout/model/service errors expose no partial usage and are therefore
+  `Unavailable`, never guessed free or landed. Streaming and a universal
+  reasoning-effort mapping are refused until those semantics are provable.
 
 * **Structured output has two modes, because native support is not universal.**
   `SchemaMode::Native` uses the provider's constrained decoding, where a
@@ -1887,9 +1901,24 @@ version and commitment exists and remain in the same subject, so subject erasure
 cannot strand a summary elsewhere.
 
 Core recall intentionally filters by subject/purpose and orders newest first. It
-does not claim semantic/vector search. Embeddings and indexes drift; a future
-semantic retriever belongs behind a separately journaled effect that records its
-model/index identity, filters, scores, and final selection.
+does not hide semantic/vector search inside `MemoryStore`. Embeddings and
+indexes drift; `SemanticRetriever` is a separately journaled effect recording
+query text/vector, embedding model/revision, immutable index snapshot, filters,
+scores and exact final commitments. The runtime then materializes those exact
+versions from authoritative memory and re-checks scope and digest. The built-in
+implementation is deterministic exact cosine for tests and small corpora; an
+external ANN database implements the seam and never becomes memory truth.
+
+Lifecycle is explicit and deterministic. A write may declare immutable
+`expires_at`; fresh recall compares it with `StepCtx`'s journaled clock. Exact
+versions remain available for replay until `sweep_expired` atomically erases all
+versions and reserves the id. `StepCtx::sweep_expired_memories` wraps that
+operation as an effect with a journaled cutoff/count; unknown crash recovery
+requires an operator because repeating can delete idempotently but cannot
+reproduce the first removed count. Legal hold blocks ordinary, subject, cascading
+and expiry erasure atomically on both backends. There is no access-time expiry:
+making recall update hidden state would make retention depend on retries and
+replay.
 
 ### Memory is delayed code
 
@@ -1968,10 +1997,11 @@ over `derivatives` and `forget`: that loop had a gap in which another writer
 could add a summary after traversal. redb uses one write transaction;
 PostgreSQL excludes derivative creation for the complete traversal and deletion.
 
-What is not built is equally important: no automatic memory formation, semantic
-ranking, TTL/access-time expiry, legal hold, or cryptographic deletion of memory
-content. Applications explicitly write memories today. Provider conversation
-objects and opaque compaction remain conveniences, never the source of truth.
+What is not built is equally important: no automatic memory formation,
+access-time retention or cryptographic deletion of memory content. Applications
+explicitly decide what becomes durable. Live-store erasure does not yet make
+memory copies in backups unreadable. Provider conversations and compaction
+remain projections, never the source of durable memory truth.
 
 ### Every case mutation is an effect
 

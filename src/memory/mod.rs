@@ -92,6 +92,13 @@ pub struct MemoryItem {
     /// Monotonic per `id`. A write appends; nothing is edited in place.
     pub version: u64,
     pub created_at: Timestamp,
+    /// When this version stops being eligible for fresh recall.
+    ///
+    /// Exact-version reads remain available for replay until an explicit
+    /// lifecycle sweep erases the memory. The cutoff is evaluated against the
+    /// journaled `Recall::as_of`, never an ambient store clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Timestamp>,
     /// Set when a later version replaced this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_at: Option<Timestamp>,
@@ -120,6 +127,7 @@ pub struct MemoryWrite {
     pub id: String,
     pub subject: String,
     pub purpose: String,
+    pub expires_at: Option<Timestamp>,
 }
 
 impl MemoryWrite {
@@ -133,7 +141,15 @@ impl MemoryWrite {
             id: id.into(),
             subject: subject.into(),
             purpose: purpose.into(),
+            expires_at: None,
         }
+    }
+
+    /// Expire this memory from fresh recall at a deterministic instant.
+    #[must_use]
+    pub const fn expires_at(mut self, at: Timestamp) -> Self {
+        self.expires_at = Some(at);
+        self
     }
 }
 
@@ -186,6 +202,7 @@ impl MemoryItem {
             "trust": self.trust,
             "written_by": self.written_by,
             "created_at": self.created_at,
+            "expires_at": self.expires_at,
             "derived_from": self.derived_from,
         })))
     }
@@ -204,6 +221,12 @@ pub struct Recall {
     pub purpose: Option<String>,
     /// At most this many, newest first.
     pub limit: usize,
+    /// Deterministic lifecycle cutoff. Set by [`StepCtx::recall`] from its
+    /// journaled clock; direct store callers may choose one explicitly.
+    ///
+    /// [`StepCtx::recall`]: crate::runtime::StepCtx::recall
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<Timestamp>,
 }
 
 impl Recall {
@@ -213,6 +236,7 @@ impl Recall {
             subject: subject.into(),
             purpose: None,
             limit: 10,
+            as_of: None,
         }
     }
 
@@ -227,6 +251,162 @@ impl Recall {
         self.limit = n;
         self
     }
+
+    #[must_use]
+    pub const fn at(mut self, at: Timestamp) -> Self {
+        self.as_of = Some(at);
+        self
+    }
+}
+
+/// A semantic query whose exact vector and index identity are journalable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticQuery {
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// Human-readable query used to produce `embedding`.
+    pub text: String,
+    /// Exact query vector. Embedding generation is a separate effect; carrying
+    /// the vector here prevents a replay from silently using a changed model.
+    pub embedding: Vec<f32>,
+    /// Stable embedding model and revision.
+    pub embedding_model: String,
+    /// Immutable vector-index snapshot searched by this query.
+    pub index_snapshot: String,
+    pub limit: usize,
+}
+
+/// One ranked semantic selection as journaled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticHit {
+    pub selected: Selected,
+    pub score: f32,
+}
+
+/// Derived semantic index, never durable memory truth.
+#[async_trait]
+pub trait SemanticRetriever: Send + Sync + Debug {
+    /// Stable non-secret implementation configuration for effect identity.
+    fn profile(&self) -> Value;
+
+    async fn search(&self, query: &SemanticQuery) -> Result<Vec<SemanticHit>, StoreError>;
+}
+
+/// One immutable vector record for [`InMemorySemanticRetriever`].
+#[derive(Debug, Clone)]
+pub struct SemanticVector {
+    pub subject: String,
+    pub purpose: String,
+    pub selected: Selected,
+    pub embedding: Vec<f32>,
+}
+
+/// Deterministic exact cosine retriever for tests and small corpora.
+#[derive(Debug, Clone)]
+pub struct InMemorySemanticRetriever {
+    identity: String,
+    snapshot: String,
+    vectors: Vec<SemanticVector>,
+}
+
+impl InMemorySemanticRetriever {
+    #[must_use]
+    pub fn new(
+        identity: impl Into<String>,
+        snapshot: impl Into<String>,
+        vectors: Vec<SemanticVector>,
+    ) -> Self {
+        Self {
+            identity: identity.into(),
+            snapshot: snapshot.into(),
+            vectors,
+        }
+    }
+}
+
+#[async_trait]
+impl SemanticRetriever for InMemorySemanticRetriever {
+    fn profile(&self) -> Value {
+        serde_json::json!({
+            "driver": "in-memory-exact-cosine/v1",
+            "identity": self.identity,
+            "snapshot": self.snapshot,
+        })
+    }
+
+    async fn search(&self, query: &SemanticQuery) -> Result<Vec<SemanticHit>, StoreError> {
+        if query.index_snapshot != self.snapshot {
+            return Err(StoreError::Backend(format!(
+                "semantic query names index snapshot '{}' but retriever holds '{}'",
+                query.index_snapshot, self.snapshot
+            )));
+        }
+        validate_vector(&query.embedding)?;
+        let mut hits = Vec::new();
+        for candidate in &self.vectors {
+            if candidate.subject != query.subject
+                || query
+                    .purpose
+                    .as_ref()
+                    .is_some_and(|purpose| purpose != &candidate.purpose)
+            {
+                continue;
+            }
+            validate_vector(&candidate.embedding)?;
+            if candidate.embedding.len() != query.embedding.len() {
+                return Err(StoreError::Backend(format!(
+                    "semantic vector dimension {} does not match query dimension {}",
+                    candidate.embedding.len(),
+                    query.embedding.len()
+                )));
+            }
+            let dot: f32 = candidate
+                .embedding
+                .iter()
+                .zip(&query.embedding)
+                .map(|(a, b)| *a * *b)
+                .sum();
+            let left = candidate
+                .embedding
+                .iter()
+                .map(|value| value.powi(2))
+                .sum::<f32>()
+                .sqrt();
+            let right = query
+                .embedding
+                .iter()
+                .map(|value| value.powi(2))
+                .sum::<f32>()
+                .sqrt();
+            let score = if left == 0.0 || right == 0.0 {
+                0.0
+            } else {
+                dot / (left * right)
+            };
+            hits.push(SemanticHit {
+                selected: candidate.selected.clone(),
+                score,
+            });
+        }
+        hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.selected.id.cmp(&b.selected.id))
+                .then_with(|| a.selected.version.cmp(&b.selected.version))
+        });
+        hits.truncate(query.limit);
+        Ok(hits)
+    }
+}
+
+fn validate_vector(vector: &[f32]) -> Result<(), StoreError> {
+    if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+        return Err(StoreError::Backend(
+            "semantic vectors must be non-empty and finite".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Where a summary should land.
@@ -387,4 +567,77 @@ pub trait MemoryStore: Send + Sync + Debug {
     ///
     /// If the store cannot be reached.
     async fn forget_cascading(&self, id: &str) -> Result<usize, StoreError>;
+
+    /// Place or release a legal hold. A held id cannot be forgotten, swept, or
+    /// removed as part of subject/cascading erasure.
+    async fn set_legal_hold(&self, id: &str, held: bool) -> Result<(), StoreError>;
+
+    /// Whether an id is currently protected by legal hold.
+    async fn legal_hold(&self, id: &str) -> Result<bool, StoreError>;
+
+    /// Atomically erase current memories whose `expires_at <= at` unless held.
+    /// Returns the number of memory ids erased.
+    async fn sweep_expired(&self, at: Timestamp) -> Result<usize, StoreError>;
+}
+
+#[cfg(test)]
+mod semantic_tests {
+    use super::*;
+
+    fn selected(id: &str) -> Selected {
+        Selected {
+            id: id.to_owned(),
+            version: 1,
+            digest: Digest::of(id.as_bytes()),
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_cosine_retrieval_is_scoped_ranked_and_snapshot_bound() {
+        let retriever = InMemorySemanticRetriever::new(
+            "reference",
+            "snapshot-7",
+            vec![
+                SemanticVector {
+                    subject: "account-1".to_owned(),
+                    purpose: "support".to_owned(),
+                    selected: selected("near"),
+                    embedding: vec![1.0, 0.0],
+                },
+                SemanticVector {
+                    subject: "account-1".to_owned(),
+                    purpose: "support".to_owned(),
+                    selected: selected("far"),
+                    embedding: vec![0.0, 1.0],
+                },
+                SemanticVector {
+                    subject: "account-2".to_owned(),
+                    purpose: "support".to_owned(),
+                    selected: selected("wrong-subject"),
+                    embedding: vec![1.0, 0.0],
+                },
+            ],
+        );
+        let query = SemanticQuery {
+            subject: "account-1".to_owned(),
+            purpose: Some("support".to_owned()),
+            text: "query".to_owned(),
+            embedding: vec![1.0, 0.0],
+            embedding_model: "embed-v3@2026-07-01".to_owned(),
+            index_snapshot: "snapshot-7".to_owned(),
+            limit: 2,
+        };
+        let hits = retriever.search(&query).await.expect("semantic search");
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.selected.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["near", "far"]
+        );
+        assert!(hits[0].score > hits[1].score);
+
+        let mut stale = query;
+        stale.index_snapshot = "snapshot-8".to_owned();
+        assert!(retriever.search(&stale).await.is_err());
+    }
 }

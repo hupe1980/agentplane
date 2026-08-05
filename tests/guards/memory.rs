@@ -21,7 +21,10 @@ use agentplane::core::{
     Timestamp, Trust,
 };
 use agentplane::journal::JournalStore;
-use agentplane::memory::{MemoryItem, MemoryStore, Recall};
+use agentplane::memory::{
+    InMemorySemanticRetriever, MemoryItem, MemoryStore, Recall, SemanticHit, SemanticQuery,
+    SemanticRetriever, SemanticVector,
+};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
@@ -42,6 +45,7 @@ fn item(id: &str, subject: &str, content: Value, trust: Trust) -> MemoryItem {
         written_by: String::new(),
         version: 0,
         created_at: at(1_760_000_000),
+        expires_at: None,
         superseded_at: None,
         derived_from: Vec::new(),
     }
@@ -133,6 +137,7 @@ fn a_selection_commitment_binds_security_metadata() {
 struct Counted {
     inner: Arc<dyn MemoryStore>,
     searches: Arc<std::sync::atomic::AtomicUsize>,
+    sweeps: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -166,6 +171,21 @@ impl MemoryStore for Counted {
     }
     async fn forget_cascading(&self, id: &str) -> Result<usize, agentplane::core::StoreError> {
         self.inner.forget_cascading(id).await
+    }
+    async fn set_legal_hold(
+        &self,
+        id: &str,
+        held: bool,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.set_legal_hold(id, held).await
+    }
+    async fn legal_hold(&self, id: &str) -> Result<bool, agentplane::core::StoreError> {
+        self.inner.legal_hold(id).await
+    }
+    async fn sweep_expired(&self, at: Timestamp) -> Result<usize, agentplane::core::StoreError> {
+        self.sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.sweep_expired(at).await
     }
 }
 
@@ -212,6 +232,19 @@ impl MemoryStore for RejectsComposedCascade {
 
     async fn forget_cascading(&self, id: &str) -> Result<usize, agentplane::core::StoreError> {
         self.inner.forget_cascading(id).await
+    }
+    async fn set_legal_hold(
+        &self,
+        id: &str,
+        held: bool,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.set_legal_hold(id, held).await
+    }
+    async fn legal_hold(&self, id: &str) -> Result<bool, agentplane::core::StoreError> {
+        self.inner.legal_hold(id).await
+    }
+    async fn sweep_expired(&self, at: Timestamp) -> Result<usize, agentplane::core::StoreError> {
+        self.inner.sweep_expired(at).await
     }
 }
 
@@ -272,6 +305,83 @@ impl Skill for Recalls {
 
         let ids: Vec<String> = found.iter().map(|m| m.peek().id.clone()).collect();
         Ok(Outcome::done(Tainted::trusted(json!({ "recalled": ids }))))
+    }
+}
+
+#[derive(Debug)]
+struct CountedRetriever {
+    inner: InMemorySemanticRetriever,
+    searches: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl SemanticRetriever for CountedRetriever {
+    fn profile(&self) -> Value {
+        self.inner.profile()
+    }
+
+    async fn search(
+        &self,
+        query: &SemanticQuery,
+    ) -> Result<Vec<SemanticHit>, agentplane::core::StoreError> {
+        self.searches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.search(query).await
+    }
+}
+
+#[derive(Debug)]
+struct SemanticRecalls(Arc<dyn SemanticRetriever>);
+
+#[async_trait::async_trait]
+impl Skill for SemanticRecalls {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("semantic-recalls").provides("semantic-recalls")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let found = cx
+            .semantic_recall(
+                Arc::clone(&self.0),
+                SemanticQuery {
+                    subject: "acct-semantic".to_owned(),
+                    purpose: Some("support".to_owned()),
+                    text: "refund".to_owned(),
+                    embedding: vec![1.0, 0.0],
+                    embedding_model: "test-embedding@1".to_owned(),
+                    index_snapshot: "snapshot-1".to_owned(),
+                    limit: 1,
+                },
+            )
+            .await
+            .map_err(SkillError::Step)?;
+        Ok(Outcome::done(Tainted::trusted(json!({
+            "id": found[0].0.peek().id,
+            "score": found[0].1,
+        }))))
+    }
+}
+
+#[derive(Debug)]
+struct Sweeps;
+
+#[async_trait::async_trait]
+impl Skill for Sweeps {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("sweeps-memory").provides("sweeps-memory")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let removed = cx.sweep_expired_memories().await?;
+        Ok(Outcome::done(Tainted::trusted(json!({"removed": removed}))))
     }
 }
 
@@ -346,9 +456,11 @@ async fn a_replayed_recall_does_not_search_again() {
 
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
     let searches = Arc::new(AtomicUsize::new(0));
+    let sweeps = Arc::new(AtomicUsize::new(0));
     let memories = Arc::new(Counted {
         inner: Arc::clone(&store) as Arc<dyn MemoryStore>,
         searches: Arc::clone(&searches),
+        sweeps,
     }) as Arc<dyn MemoryStore>;
 
     memories
@@ -422,6 +534,114 @@ async fn a_replayed_recall_does_not_search_again() {
         changed.status,
         RunStatus::Succeeded,
         "strict replay accepted a forgotten selection"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_semantic_recall_does_not_rerank_the_index() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let memories = Arc::clone(&store) as Arc<dyn MemoryStore>;
+    memories
+        .remember(&item(
+            "semantic-near",
+            "acct-semantic",
+            json!({"note": "refund policy"}),
+            Trust::Untrusted,
+        ))
+        .await
+        .expect("remember");
+    let stored = memories
+        .version("semantic-near", 1)
+        .await
+        .expect("version")
+        .expect("stored");
+    let searches = Arc::new(AtomicUsize::new(0));
+    let retriever = Arc::new(CountedRetriever {
+        inner: InMemorySemanticRetriever::new(
+            "test-index",
+            "snapshot-1",
+            vec![SemanticVector {
+                subject: stored.subject.clone(),
+                purpose: stored.purpose.clone(),
+                selected: agentplane::memory::Selected {
+                    id: stored.id.clone(),
+                    version: stored.version,
+                    digest: stored.selection_digest(),
+                },
+                embedding: vec![1.0, 0.0],
+            }],
+        ),
+        searches: Arc::clone(&searches),
+    }) as Arc<dyn SemanticRetriever>;
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(memories)
+        .skill(SemanticRecalls(retriever))
+        .build();
+
+    let live = rt
+        .run("semantic-recalls", json!({}))
+        .await
+        .expect("live semantic recall");
+    assert_eq!(live.status, RunStatus::Succeeded);
+    assert_eq!(searches.load(Ordering::SeqCst), 1);
+    let replay = rt
+        .replay(live.run_id, Mode::Strict)
+        .await
+        .expect("strict replay");
+    assert_eq!(replay.status, RunStatus::Succeeded);
+    assert_eq!(replay.output, live.output);
+    assert_eq!(
+        searches.load(Ordering::SeqCst),
+        1,
+        "strict replay re-ran mutable semantic ranking"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_expiry_sweep_does_not_erase_again() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let mut expired = item(
+        "expired-once",
+        "acct-expiry",
+        json!({"temporary": true}),
+        Trust::Untrusted,
+    );
+    expired.expires_at = Some(at(1));
+    store
+        .remember(&expired)
+        .await
+        .expect("remember expired item");
+    let sweeps = Arc::new(AtomicUsize::new(0));
+    let memories = Arc::new(Counted {
+        inner: Arc::clone(&store) as Arc<dyn MemoryStore>,
+        searches: Arc::new(AtomicUsize::new(0)),
+        sweeps: Arc::clone(&sweeps),
+    }) as Arc<dyn MemoryStore>;
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(memories)
+        .skill(Sweeps)
+        .build();
+
+    let live = rt
+        .run("sweeps-memory", json!({}))
+        .await
+        .expect("live sweep");
+    assert_eq!(live.status, RunStatus::Succeeded);
+    assert_eq!(live.output.as_ref().unwrap()["removed"], 1);
+    assert_eq!(sweeps.load(Ordering::SeqCst), 1);
+    let replay = rt
+        .replay(live.run_id, Mode::Strict)
+        .await
+        .expect("strict replay");
+    assert_eq!(replay.output, live.output);
+    assert_eq!(
+        sweeps.load(Ordering::SeqCst),
+        1,
+        "strict replay performed the expiry mutation again"
     );
 }
 
@@ -780,6 +1000,7 @@ impl agentplane::model::ModelProvider for Summarises {
             },
             stop_reason: Some("stop".to_owned()),
             truncated: false,
+            continuation: None,
         })
     }
 }

@@ -479,6 +479,25 @@ lineage and attribution — so identical bytes cannot acquire a promoted label o
 replay. A forgotten id remains reserved rather than being recycled under an old
 journal reference.
 
+Expiry is evaluated against a run's journaled clock, not a store's ambient
+clock, so replay does not change as wall time advances. Expiry first hides a
+current item from fresh recall; exact versions remain available for old-run
+replay until an explicit sweep erases them. Legal hold blocks every erasure
+path, including subject and cascading deletion and the expiry sweep, atomically
+on both stores. Recall does not update “last accessed”: a hidden write in a read
+would make retention depend on replay and retry behavior.
+
+A semantic index is treated as an untrusted derived selector, never as memory
+truth. Its query vector, embedding revision, immutable snapshot, filters,
+scores and exact selections are journaled. The runtime then re-reads each exact
+version from `MemoryStore` and verifies subject, purpose and digest. A poisoned
+or stale ANN index can cause a loud refusal or rank legitimate in-scope records
+badly; it cannot substitute another subject's content or rewrite a version.
+
+The residual lifecycle gap is cryptographic deletion: memory rows are not yet
+sealed under subject/case data keys. Erasing the live store therefore does not
+make old backup copies unreadable, unlike keyring-backed payload erasure.
+
 `subject` and `purpose` organize private-agent or shared-team memory; they are
 not ACLs. `memory.recall` and `memory.remember` go through policy with the acting
 agent, tenant, scope and write metadata, while the tenant-bound store handle is

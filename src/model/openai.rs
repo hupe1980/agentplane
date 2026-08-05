@@ -295,33 +295,6 @@ struct ApiUsage {
 }
 
 #[derive(Debug, Deserialize)]
-struct ContentPart {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    text: String,
-    #[serde(default)]
-    refusal: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OutputItem {
-    #[serde(rename = "type", default)]
-    kind: String,
-    #[serde(default)]
-    content: Vec<ContentPart>,
-    /// A forced function call's arguments — a JSON **string**, unlike
-    /// Anthropic's decoded object.
-    #[serde(default)]
-    arguments: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    /// The call id a result must be returned under.
-    #[serde(default)]
-    call_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct Incomplete {
     #[serde(default)]
     reason: String,
@@ -332,7 +305,9 @@ struct ApiResponse {
     #[serde(default)]
     status: String,
     #[serde(default)]
-    output: Vec<OutputItem>,
+    /// Raw by design: every field, including fields this SDK version does not
+    /// know, must be returned to Responses on a tool continuation.
+    output: Vec<Value>,
     #[serde(default)]
     usage: Option<ApiUsage>,
     #[serde(default)]
@@ -377,9 +352,10 @@ impl ApiResponse {
     fn text(&self) -> String {
         self.output
             .iter()
-            .flat_map(|i| i.content.iter())
-            .filter(|c| c.kind == "output_text")
-            .map(|c| c.text.as_str())
+            .filter_map(|item| item.get("content").and_then(Value::as_array))
+            .flatten()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join("")
     }
@@ -388,8 +364,11 @@ impl ApiResponse {
     fn forced_tool_arguments(&self) -> Option<&str> {
         self.output
             .iter()
-            .find(|i| i.kind == "function_call" && i.name.as_deref() == Some(RESPOND_TOOL))
-            .and_then(|i| i.arguments.as_deref())
+            .find(|item| {
+                item.get("type").and_then(Value::as_str) == Some("function_call")
+                    && item.get("name").and_then(Value::as_str) == Some(RESPOND_TOOL)
+            })
+            .and_then(|item| item.get("arguments").and_then(Value::as_str))
     }
 
     /// Tool calls the model asked for, excluding this crate's forced one.
@@ -405,20 +384,25 @@ impl ApiResponse {
     fn tool_calls(&self) -> Result<Vec<super::ToolCall>, String> {
         self.output
             .iter()
-            .filter(|i| i.kind == "function_call")
-            .filter(|i| i.name.as_deref() != Some(RESPOND_TOOL))
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .filter(|item| item.get("name").and_then(Value::as_str) != Some(RESPOND_TOOL))
             .map(|item| {
                 let id = item
-                    .call_id
-                    .clone()
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
                     .ok_or_else(|| "a function call carried no call_id".to_owned())?;
                 let name = item
-                    .name
-                    .clone()
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
                     .ok_or_else(|| format!("function call '{id}' carried no name"))?;
-                let raw = item.arguments.as_deref().ok_or_else(|| {
-                    format!("function call '{id}' for '{name}' carried no arguments")
-                })?;
+                let raw = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        format!("function call '{id}' for '{name}' carried no arguments")
+                    })?;
                 let arguments = serde_json::from_str(raw).map_err(|error| {
                     format!(
                         "function call '{id}' for '{name}' carried malformed JSON arguments: {error}"
@@ -437,9 +421,15 @@ impl ApiResponse {
     fn refusal(&self) -> Option<&str> {
         self.output
             .iter()
-            .flat_map(|i| i.content.iter())
-            .find(|c| c.kind == "refusal")
-            .map(|c| c.refusal.as_str())
+            .filter_map(|item| item.get("content").and_then(Value::as_array))
+            .flatten()
+            .find(|part| part.get("type").and_then(Value::as_str) == Some("refusal"))
+            .and_then(|part| part.get("refusal").and_then(Value::as_str))
+    }
+
+    /// Every output item exactly as the next Responses request needs it.
+    fn continuation(&self) -> Value {
+        Value::Array(self.output.clone())
     }
 }
 
@@ -476,7 +466,11 @@ fn input(prompt: &Value) -> Value {
 ///
 /// A string input becomes a message item first, because items and a bare string
 /// cannot be mixed in one array.
-fn continue_with(input: Value, exchanges: &[super::ToolExchange]) -> Value {
+fn continue_with(
+    input: Value,
+    exchanges: &[super::ToolExchange],
+    continuation: Option<&super::ProviderContinuation>,
+) -> Value {
     if exchanges.is_empty() {
         return input;
     }
@@ -484,15 +478,21 @@ fn continue_with(input: Value, exchanges: &[super::ToolExchange]) -> Value {
         Value::Array(v) => v,
         other => vec![json!({ "role": "user", "content": other })],
     };
-    for e in exchanges {
-        out.push(json!({
-            "type": "function_call",
-            "call_id": e.call.id,
-            "name": e.call.name,
-            // Responses carries arguments as a JSON *string*, unlike the object
-            // Anthropic takes.
-            "arguments": e.call.arguments.to_string(),
+    if let Some(state) = continuation.and_then(|state| state.state.as_array()) {
+        out.extend(state.iter().cloned());
+    } else {
+        // Compatibility path for manually assembled, non-reasoning exchanges.
+        // Built-in completions always carry their exact provider output.
+        out.extend(exchanges.iter().map(|e| {
+            json!({
+                "type": "function_call",
+                "call_id": e.call.id,
+                "name": e.call.name,
+                "arguments": e.call.arguments.to_string(),
+            })
         }));
+    }
+    for e in exchanges {
         out.push(json!({
             "type": "function_call_output",
             "call_id": e.call.id,
@@ -503,6 +503,39 @@ fn continue_with(input: Value, exchanges: &[super::ToolExchange]) -> Value {
         }));
     }
     Value::Array(out)
+}
+
+fn function_outputs(exchanges: &[super::ToolExchange]) -> impl Iterator<Item = Value> + '_ {
+    exchanges.iter().map(|exchange| {
+        json!({
+            "type": "function_call_output",
+            "call_id": exchange.call.id,
+            "output": match &exchange.output {
+                Value::String(value) => value.clone(),
+                other => other.to_string(),
+            },
+        })
+    })
+}
+
+/// Extend the provider transcript after a successful response.
+fn accumulate_continuation(
+    completion: &mut Completion,
+    prior: Option<&super::ProviderContinuation>,
+    exchanges: &[super::ToolExchange],
+) {
+    let Some(current) = completion.continuation.as_mut() else {
+        return;
+    };
+    let mut state = prior
+        .and_then(|value| value.state.as_array())
+        .cloned()
+        .unwrap_or_default();
+    state.extend(function_outputs(exchanges));
+    if let Some(items) = current.state.as_array() {
+        state.extend(items.iter().cloned());
+    }
+    current.state = Value::Array(state);
 }
 
 /// The system instruction, if the caller set one.
@@ -534,6 +567,7 @@ impl OpenAi {
             schema,
             tools,
             exchanges,
+            None,
         )
     }
 
@@ -547,20 +581,28 @@ impl OpenAi {
         schema: Option<&Value>,
         tools: &[super::ToolDeclaration],
         exchanges: &[super::ToolExchange],
+        continuation: Option<&super::ProviderContinuation>,
     ) -> Result<Value, ModelError> {
-        if reasoning_effort.is_some() && !exchanges.is_empty() {
+        if let Some(state) = continuation
+            && (state.provider != "openai" || !state.state.is_array())
+        {
             return Err(ModelError::Refused {
                 model: model.clone(),
-                detail: "reasoning-enabled tool continuation is not supported yet: OpenAI \
-                         requires every opaque reasoning/output item from the prior response, \
-                         and dropping them would silently degrade the next turn"
+                detail: "the continuation was not an OpenAI output-item array".to_owned(),
+            });
+        }
+        if reasoning_effort.is_some() && !exchanges.is_empty() && continuation.is_none() {
+            return Err(ModelError::Refused {
+                model: model.clone(),
+                detail: "reasoning-enabled tool continuation requires the complete opaque \
+                         output items from the prior OpenAI response"
                     .to_owned(),
             });
         }
         let mut body = json!({
             "model": model.model,
             "max_output_tokens": max_output_tokens,
-            "input": continue_with(input(prompt), exchanges),
+            "input": continue_with(input(prompt), exchanges, continuation),
         });
         if let Some(effort) = reasoning_effort {
             body["reasoning"] = json!({ "effort": effort.as_str() });
@@ -711,6 +753,8 @@ impl OpenAi {
             (text, parsed_schema)
         };
 
+        let continuation = (!calls.is_empty())
+            .then(|| super::ProviderContinuation::new("openai", parsed.continuation()));
         Ok(Completion {
             structured: structured_value,
             tool_calls: calls,
@@ -721,6 +765,7 @@ impl OpenAi {
                 |i| format!("incomplete:{}", i.reason),
             )),
             truncated,
+            continuation,
         })
     }
 
@@ -856,6 +901,7 @@ impl ModelProvider for OpenAi {
             schema,
             tools,
             exchanges,
+            continuation,
         } = request;
 
         super::refuse_provider_side_media(prompt, model)?;
@@ -875,6 +921,7 @@ impl ModelProvider for OpenAi {
                 schema,
                 tools,
                 exchanges,
+                continuation,
             )?)
             .send()
             .await
@@ -886,11 +933,13 @@ impl ModelProvider for OpenAi {
             return Err(classify_status(model, status.as_u16(), &detail));
         }
 
-        if self.stream {
-            self.read_streamed(response, model, schema).await
+        let mut completion = if self.stream {
+            self.read_streamed(response, model, schema).await?
         } else {
-            self.read_buffered(response, model, schema).await
-        }
+            self.read_buffered(response, model, schema).await?
+        };
+        accumulate_continuation(&mut completion, continuation, exchanges);
+        Ok(completion)
     }
 }
 
@@ -1190,7 +1239,9 @@ mod tool_tests {
 #[cfg(test)]
 mod continuation_tests {
     use super::*;
-    use crate::model::{ToolCall as ModelToolCall, ToolExchange};
+    use crate::model::{
+        ProviderContinuation, ReasoningEffort, ToolCall as ModelToolCall, ToolExchange,
+    };
 
     /// Responses pairs a `function_call` with a `function_call_output`.
     ///
@@ -1237,5 +1288,97 @@ mod continuation_tests {
             "Responses carries arguments as a JSON string, unlike Anthropic's \
              object: {body}"
         );
+    }
+
+    #[test]
+    fn encrypted_reasoning_and_assistant_phase_round_trip_unchanged() {
+        let opaque = json!([
+            {
+                "id": "rs_1",
+                "type": "reasoning",
+                "encrypted_content": "opaque-ciphertext",
+                "summary": []
+            },
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "checking"}]
+            },
+            {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_01",
+                "name": "ledger.read",
+                "arguments": "{\"id\":\"AC-1\"}",
+                "status": "completed"
+            }
+        ]);
+        let state = ProviderContinuation::new("openai", opaque.clone());
+        let body = OpenAi::new("test-key")
+            .expect("driver")
+            .body_with_max(
+                &ModelId::new("openai", "gpt-x"),
+                &json!({"input": "balance?"}),
+                4096,
+                Some(ReasoningEffort::High),
+                None,
+                &[],
+                &[ToolExchange::ok(
+                    ModelToolCall {
+                        id: "call_01".to_owned(),
+                        name: "ledger.read".to_owned(),
+                        arguments: json!({"id": "AC-1"}),
+                    },
+                    json!({"balance": 42}),
+                )],
+                Some(&state),
+            )
+            .expect("lossless reasoning continuation");
+
+        assert_eq!(
+            &body["input"].as_array().unwrap()[1..4],
+            opaque.as_array().unwrap()
+        );
+        assert_eq!(body["input"][4]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn continuation_accumulates_every_prior_tool_turn() {
+        let prior = ProviderContinuation::new(
+            "openai",
+            json!([{"type": "reasoning", "encrypted_content": "first"}]),
+        );
+        let exchange = ToolExchange::ok(
+            ModelToolCall {
+                id: "call_1".to_owned(),
+                name: "lookup".to_owned(),
+                arguments: json!({}),
+            },
+            json!({"value": 1}),
+        );
+        let mut completion = Completion {
+            text: String::new(),
+            tool_calls: vec![ModelToolCall {
+                id: "call_2".to_owned(),
+                name: "lookup".to_owned(),
+                arguments: json!({}),
+            }],
+            usage: Usage::default(),
+            stop_reason: Some("completed".to_owned()),
+            truncated: false,
+            structured: None,
+            continuation: Some(ProviderContinuation::new(
+                "openai",
+                json!([{"type": "function_call", "call_id": "call_2"}]),
+            )),
+        };
+        accumulate_continuation(&mut completion, Some(&prior), &[exchange]);
+        let state = completion.continuation.unwrap().state;
+        assert_eq!(state[0]["encrypted_content"], "first");
+        assert_eq!(state[1]["type"], "function_call_output");
+        assert_eq!(state[2]["call_id"], "call_2");
     }
 }

@@ -106,6 +106,7 @@ impl FakeProvider {
             stop_reason: Some("end_turn".to_owned()),
             truncated: false,
             structured: None,
+            continuation: None,
         })
     }
 
@@ -130,6 +131,7 @@ impl FakeProvider {
             stop_reason: Some("tool_use".to_owned()),
             truncated: false,
             structured: None,
+            continuation: None,
         })
     }
 
@@ -193,6 +195,7 @@ fn echo(request: &Request<'_>) -> Completion {
                 stop_reason: Some("end_turn".to_owned()),
                 truncated: false,
                 structured: Some(value),
+                continuation: None,
             }
         }
         None => Completion {
@@ -202,6 +205,7 @@ fn echo(request: &Request<'_>) -> Completion {
             stop_reason: Some("end_turn".to_owned()),
             truncated: false,
             structured: None,
+            continuation: None,
         },
     }
 }
@@ -276,6 +280,7 @@ mod tests {
             schema: schema.map(|s| &*Box::leak(Box::new(s.clone()))),
             tools: &[],
             exchanges: &[],
+            continuation: None,
         }
     }
 
@@ -319,6 +324,7 @@ mod tests {
                 schema: None,
                 tools: &[],
                 exchanges: &[],
+                continuation: None,
             })
             .await
             .unwrap();
@@ -331,6 +337,7 @@ mod tests {
                 schema: None,
                 tools: &[],
                 exchanges: &[],
+                continuation: None,
             })
             .await
             .unwrap();

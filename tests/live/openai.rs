@@ -295,6 +295,7 @@ async fn openai_accepts_our_tool_declaration_and_asks_for_it() {
             schema: None,
             tools: &tools,
             exchanges: &[],
+            continuation: None,
         })
         .await
         .expect("the live completion failed");

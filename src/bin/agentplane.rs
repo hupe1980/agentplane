@@ -51,6 +51,7 @@ PROVIDERS
     from the file — an agent's declaration must not change when its key does.
 
       anthropic   ANTHROPIC_API_KEY
+    bedrock     AWS_REGION plus the standard AWS credential chain
       openai      OPENAI_API_KEY
       fake        no key. Answers deterministically without a network, so a
                   manifest can be exercised before anyone pays for it.
@@ -178,7 +179,7 @@ fn execute(manifest: &Manifest, opts: &Options) -> Result<ExitCode, String> {
             Arc::new(RedbStore::open_in_memory().map_err(|e| e.to_string())?)
         };
 
-        let builder = with_providers(Runtime::builder(Arc::clone(&store)), manifest)?;
+        let builder = with_providers(Runtime::builder(Arc::clone(&store)), manifest).await?;
         let agent = builder
             .agent(agentplane::runtime::Agent::new(manifest))
             .build();
@@ -225,7 +226,10 @@ fn execute(manifest: &Manifest, opts: &Options) -> Result<ExitCode, String> {
 /// Registering every driver whose key happens to be set would make the agent
 /// runnable on a model its declaration does not name, the moment somebody
 /// exports the wrong variable.
-fn with_providers(builder: RuntimeBuilder, manifest: &Manifest) -> Result<RuntimeBuilder, String> {
+async fn with_providers(
+    builder: RuntimeBuilder,
+    manifest: &Manifest,
+) -> Result<RuntimeBuilder, String> {
     let Some(models) = &manifest.spec.models else {
         return Ok(builder);
     };
@@ -244,17 +248,26 @@ fn with_providers(builder: RuntimeBuilder, manifest: &Manifest) -> Result<Runtim
             continue;
         }
         seen.push(m.provider.clone());
-        builder = builder.provider(m.provider.clone(), driver(&m.provider)?);
+        builder = builder.provider(m.provider.clone(), driver(&m.provider).await?);
     }
     Ok(builder)
 }
 
-fn driver(name: &str) -> Result<Arc<dyn ModelProvider>, String> {
+async fn driver(name: &str) -> Result<Arc<dyn ModelProvider>, String> {
     match name {
         #[cfg(feature = "providers")]
         "anthropic" => Ok(Arc::new(
             agentplane::model::anthropic::Anthropic::new(key("ANTHROPIC_API_KEY")?)
                 .map_err(|e| e.to_string())?,
+        )),
+        #[cfg(feature = "bedrock")]
+        "bedrock" => Ok(Arc::new(
+            agentplane::model::bedrock::Bedrock::from_env(
+                std::env::var("AWS_REGION").map_err(|_| {
+                    "AWS_REGION is not set, and the manifest names Bedrock".to_owned()
+                })?,
+            )
+            .await?,
         )),
         #[cfg(feature = "providers")]
         "openai" => Ok(Arc::new(
@@ -264,7 +277,7 @@ fn driver(name: &str) -> Result<Arc<dyn ModelProvider>, String> {
         #[cfg(feature = "testkit")]
         "fake" => Ok(agentplane::testkit::FakeProvider::new()),
         other => Err(format!(
-            "no driver for provider '{other}'. This binary ships anthropic, openai and fake; \
+            "no driver for provider '{other}'. This binary ships anthropic, bedrock, openai and fake; \
              anything else is an embedder's own driver, registered through \
              RuntimeBuilder::provider"
         )),

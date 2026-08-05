@@ -2232,7 +2232,7 @@ impl StepCtx<'_> {
     /// replaying a different memory.
     pub async fn recall(
         &mut self,
-        query: crate::memory::Recall,
+        mut query: crate::memory::Recall,
     ) -> Result<Vec<Tainted<crate::memory::MemoryItem>>, StepError> {
         let memories = self.memories.clone().ok_or_else(|| {
             StepError::Store(crate::core::StoreError::Backend(
@@ -2242,6 +2242,9 @@ impl StepCtx<'_> {
             ))
         })?;
 
+        if query.as_of.is_none() {
+            query.as_of = Some(self.now().await?);
+        }
         let selected = self
             .effect(crate::runtime::effects::RecallMemory {
                 memories: Arc::clone(&memories),
@@ -2282,6 +2285,68 @@ impl StepCtx<'_> {
 
             let label = item.label();
             out.push(Tainted::with_label(item, label));
+        }
+        Ok(out)
+    }
+
+    /// Rank governed memories through a derived semantic index.
+    ///
+    /// The retriever returns only immutable `(id, version, digest)` commitments
+    /// and scores. The selection is journaled; live execution and replay then
+    /// materialize exact versions from the authoritative memory store and
+    /// verify scope and digest before exposing content.
+    pub async fn semantic_recall(
+        &mut self,
+        retriever: Arc<dyn crate::memory::SemanticRetriever>,
+        query: crate::memory::SemanticQuery,
+    ) -> Result<Vec<(Tainted<crate::memory::MemoryItem>, f32)>, StepError> {
+        let memories = self.memories.clone().ok_or_else(|| {
+            StepError::Store(crate::core::StoreError::Backend(
+                "no memory store is configured; semantic retrieval needs authoritative memory"
+                    .to_owned(),
+            ))
+        })?;
+        let hits = self
+            .effect(crate::runtime::effects::SemanticRecall {
+                retriever,
+                query: query.clone(),
+            })
+            .await?
+            .into_unlabelled();
+        let mut out = Vec::with_capacity(hits.len());
+        for hit in hits {
+            if !hit.score.is_finite() {
+                return Err(StepError::Store(crate::core::StoreError::Backend(
+                    "semantic retriever returned a non-finite score".to_owned(),
+                )));
+            }
+            let item = memories
+                .version(&hit.selected.id, hit.selected.version)
+                .await
+                .map_err(StepError::Store)?
+                .ok_or_else(|| {
+                    StepError::Store(crate::core::StoreError::Backend(
+                        crate::memory::MemoryError::Forgotten {
+                            id: hit.selected.id.clone(),
+                            version: hit.selected.version,
+                        }
+                        .to_string(),
+                    ))
+                })?;
+            if item.selection_digest() != hit.selected.digest
+                || item.subject != query.subject
+                || query
+                    .purpose
+                    .as_ref()
+                    .is_some_and(|purpose| purpose != &item.purpose)
+            {
+                return Err(StepError::Store(crate::core::StoreError::Backend(
+                    "semantic retriever returned an out-of-scope or changed memory commitment"
+                        .to_owned(),
+                )));
+            }
+            let label = item.label();
+            out.push((Tainted::with_label(item, label), hit.score));
         }
         Ok(out)
     }
@@ -2338,11 +2403,30 @@ impl StepCtx<'_> {
             written_by: self.run.to_string(),
             version: 0,
             created_at: at,
+            expires_at: write.expires_at,
             superseded_at: None,
             derived_from,
         };
         Ok(self
             .effect(crate::runtime::effects::RememberMemory { memories, item })
+            .await?
+            .into_unlabelled())
+    }
+
+    /// Atomically erase memories expired at the run's journaled clock.
+    ///
+    /// Legal holds remain authoritative in the backend. The cutoff and removed
+    /// count are journaled, so strict replay reports the historical decision
+    /// without mutating memory a second time.
+    pub async fn sweep_expired_memories(&mut self) -> Result<usize, StepError> {
+        let memories = self.memories.clone().ok_or_else(|| {
+            StepError::Store(crate::core::StoreError::Backend(
+                "no memory store is configured; there is nothing to sweep".to_owned(),
+            ))
+        })?;
+        let at = self.now().await?;
+        Ok(self
+            .effect(crate::runtime::effects::SweepExpiredMemory { memories, at })
             .await?
             .into_unlabelled())
     }

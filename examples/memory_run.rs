@@ -5,9 +5,12 @@
 
 use std::sync::Arc;
 
-use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, SourceId, Tainted};
+use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, SourceId, Tainted, Timestamp};
 use agentplane::journal::JournalStore;
-use agentplane::memory::{MemoryItem, MemoryStore, MemoryWrite, Recall};
+use agentplane::memory::{
+    InMemorySemanticRetriever, MemoryItem, MemoryStore, MemoryWrite, Recall, Selected,
+    SemanticQuery, SemanticRetriever, SemanticVector,
+};
 use agentplane::runtime::{Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
@@ -36,6 +39,10 @@ impl Skill for TeamMemory {
                     "team-support-language",
                     "team/support",
                     "customer-preferences",
+                )
+                .expires_at(
+                    Timestamp::from_unix_timestamp(4_102_444_800)
+                        .expect("2100-01-01 is representable"),
                 ),
                 fact,
             )
@@ -53,6 +60,45 @@ impl Skill for TeamMemory {
             .into_iter()
             .map(|memory| memory.map(|item| item.content));
         Ok(Outcome::done(Tainted::array(values)))
+    }
+}
+
+#[derive(Debug)]
+struct SemanticMemory(Arc<dyn SemanticRetriever>);
+
+#[async_trait::async_trait]
+impl Skill for SemanticMemory {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("semantic_memory").provides("support.semantic-memory")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let found = cx
+            .semantic_recall(
+                Arc::clone(&self.0),
+                SemanticQuery {
+                    subject: "team/support".to_owned(),
+                    purpose: Some("customer-preferences".to_owned()),
+                    text: "preferred language".to_owned(),
+                    embedding: vec![1.0, 0.0],
+                    embedding_model: "example-embedding@1".to_owned(),
+                    index_snapshot: "example-snapshot-1".to_owned(),
+                    limit: 1,
+                },
+            )
+            .await?;
+        Ok(Outcome::done(
+            found
+                .into_iter()
+                .next()
+                .expect("the example indexed one memory")
+                .0
+                .map(|item| item.content),
+        ))
     }
 }
 
@@ -92,8 +138,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .contains(&SourceId::new("user:customer-7"))
     );
 
+    let retriever = Arc::new(InMemorySemanticRetriever::new(
+        "example-index",
+        "example-snapshot-1",
+        vec![SemanticVector {
+            subject: stored.subject.clone(),
+            purpose: stored.purpose.clone(),
+            selected: Selected {
+                id: stored.id.clone(),
+                version: stored.version,
+                digest: stored.selection_digest(),
+            },
+            embedding: vec![1.0, 0.0],
+        }],
+    )) as Arc<dyn SemanticRetriever>;
+    let semantic = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+        .skill(SemanticMemory(retriever))
+        .build();
+    let ranked = semantic.run("support.semantic-memory", json!({})).await?;
+    assert_eq!(ranked.output, Some(json!("Customer prefers German")));
+
+    store.set_legal_hold("team-support-language", true).await?;
+    let after_expiry = Timestamp::from_unix_timestamp(4_102_444_801)?;
+    assert_eq!(store.sweep_expired(after_expiry).await?, 0);
+    store.set_legal_hold("team-support-language", false).await?;
+    assert_eq!(store.sweep_expired(after_expiry).await?, 1);
+
     println!(
-        "remembered and recalled with provenance: {}",
+        "remembered, semantically recalled, held, and expired: {}",
         stored.content
     );
     Ok(())

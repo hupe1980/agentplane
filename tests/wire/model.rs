@@ -287,6 +287,7 @@ async fn a_failed_completion_spends_the_budget_that_stops_the_next_one() {
             stop_reason: Some("end_turn".into()),
             truncated: false,
             structured: None,
+            continuation: None,
         });
 
     let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
@@ -562,6 +563,7 @@ fn a_successful_completion_bills_its_usage() {
         stop_reason: None,
         truncated: false,
         structured: None,
+        continuation: None,
     };
     assert_eq!(call.spend(&completion).tokens, 10);
     assert_eq!(call.spend(&completion).minor_units, 5);

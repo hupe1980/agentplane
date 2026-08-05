@@ -46,6 +46,9 @@ const DERIVED: TableDefinition<(&str, &str, &str), ()> = TableDefinition::new("m
 /// unrelated memory.
 const FORGOTTEN: TableDefinition<(&str, &str), ()> = TableDefinition::new("memory_forgotten");
 
+/// `(tenant, id) -> ()`, legal holds that block every erasure path.
+const HOLDS: TableDefinition<(&str, &str), ()> = TableDefinition::new("memory_legal_holds");
+
 #[async_trait]
 impl MemoryStore for RedbStore {
     #[allow(clippy::too_many_lines)]
@@ -220,6 +223,7 @@ impl MemoryStore for RedbStore {
         let subject = query.subject.clone();
         let purpose = query.purpose.clone();
         let limit = query.limit;
+        let as_of = query.as_of;
 
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
@@ -272,6 +276,9 @@ impl MemoryStore for RedbStore {
                 };
                 let item: MemoryItem = serde_json::from_str(raw.value())
                     .map_err(|e| StoreError::Backend(e.to_string()))?;
+                if as_of.is_some_and(|at| item.expires_at.is_some_and(|expires| expires <= at)) {
+                    continue;
+                }
                 out.push(item);
             }
             Ok(out)
@@ -395,6 +402,19 @@ impl MemoryStore for RedbStore {
                     queue.extend(children);
                 }
 
+                let holds = w.open_table(HOLDS).map_err(|e| be(&e))?;
+                for memory_id in &doomed {
+                    if holds
+                        .get((tenant.as_str(), memory_id.as_str()))
+                        .map_err(|e| be(&e))?
+                        .is_some()
+                    {
+                        return Err(StoreError::Backend(format!(
+                            "memory '{memory_id}' is under legal hold"
+                        )));
+                    }
+                }
+
                 for memory_id in &doomed {
                     let previous = current
                         .get((tenant.as_str(), memory_id.as_str()))
@@ -473,6 +493,16 @@ impl MemoryStore for RedbStore {
         self.with_db(move |db| {
             let w = begin_write(db)?;
             {
+                if w.open_table(HOLDS)
+                    .map_err(|e| be(&e))?
+                    .get((tenant.as_str(), id.as_str()))
+                    .map_err(|e| be(&e))?
+                    .is_some()
+                {
+                    return Err(StoreError::Backend(format!(
+                        "memory '{id}' is under legal hold"
+                    )));
+                }
                 let mut items = w.open_table(ITEMS).map_err(|e| be(&e))?;
                 let mut current = w.open_table(CURRENT).map_err(|e| be(&e))?;
                 let mut by_subject = w.open_table(BY_SUBJECT).map_err(|e| be(&e))?;
@@ -552,49 +582,271 @@ impl MemoryStore for RedbStore {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn forget_subject(&self, subject: &str) -> Result<usize, StoreError> {
         let tenant = self.tenant_name();
         let subject = subject.to_owned();
-
-        // The ids first, in a read, then each forgotten through the same path a
-        // single forget takes. One implementation of "remove a memory
-        // completely" rather than two that can disagree about what completely
-        // means.
-        let ids = self
-            .with_db({
-                let tenant = tenant.clone();
-                let subject = subject.clone();
-                move |db| {
-                    let r = db.begin_read().map_err(|e| be(&e))?;
-                    let Ok(by_subject) = r.open_table(BY_SUBJECT) else {
-                        return Ok(Vec::new());
-                    };
-                    let mut ids = Vec::new();
-                    for entry in by_subject
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let count = {
+                let mut items = w.open_table(ITEMS).map_err(|e| be(&e))?;
+                let mut current = w.open_table(CURRENT).map_err(|e| be(&e))?;
+                let mut by_subject = w.open_table(BY_SUBJECT).map_err(|e| be(&e))?;
+                let mut edges = w.open_table(DERIVED).map_err(|e| be(&e))?;
+                let mut forgotten = w.open_table(FORGOTTEN).map_err(|e| be(&e))?;
+                let holds = w.open_table(HOLDS).map_err(|e| be(&e))?;
+                let ids: Vec<String> = by_subject
+                    .range(
+                        (tenant.as_str(), subject.as_str(), "", i64::MIN, "")
+                            ..=(
+                                tenant.as_str(),
+                                subject.as_str(),
+                                MAX_STR,
+                                i64::MAX,
+                                MAX_STR,
+                            ),
+                    )
+                    .map_err(|e| be(&e))?
+                    .map(|entry| {
+                        entry
+                            .map(|(key, _)| key.value().4.to_owned())
+                            .map_err(|error| be(&error))
+                    })
+                    .collect::<Result<_, _>>()?;
+                for id in &ids {
+                    if holds
+                        .get((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?
+                        .is_some()
+                    {
+                        return Err(StoreError::Backend(format!(
+                            "memory '{id}' is under legal hold"
+                        )));
+                    }
+                }
+                for id in &ids {
+                    let previous = current
+                        .get((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?
+                        .map(|value| {
+                            let (scope, purpose, created, _) = value.value();
+                            (scope.to_owned(), purpose.to_owned(), created)
+                        });
+                    if let Some((scope, purpose, created)) = previous {
+                        by_subject
+                            .remove((
+                                tenant.as_str(),
+                                scope.as_str(),
+                                purpose.as_str(),
+                                -created,
+                                id.as_str(),
+                            ))
+                            .map_err(|e| be(&e))?;
+                    }
+                    current
+                        .remove((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?;
+                    forgotten
+                        .insert((tenant.as_str(), id.as_str()), ())
+                        .map_err(|e| be(&e))?;
+                    let incoming: Vec<String> = edges
+                        .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                        .map_err(|e| be(&e))?
+                        .filter_map(|entry| match entry {
+                            Ok((key, _)) if key.value().2 == id => {
+                                Some(Ok(key.value().1.to_owned()))
+                            }
+                            Ok(_) => None,
+                            Err(error) => Some(Err(be(&error))),
+                        })
+                        .collect::<Result<_, StoreError>>()?;
+                    for source in incoming {
+                        edges
+                            .remove((tenant.as_str(), source.as_str(), id.as_str()))
+                            .map_err(|e| be(&e))?;
+                    }
+                    let versions: Vec<u64> = items
                         .range(
-                            (tenant.as_str(), subject.as_str(), "", i64::MIN, "")
-                                ..=(
-                                    tenant.as_str(),
-                                    subject.as_str(),
-                                    MAX_STR,
-                                    i64::MAX,
-                                    MAX_STR,
-                                ),
+                            (tenant.as_str(), id.as_str(), 0)
+                                ..=(tenant.as_str(), id.as_str(), u64::MAX),
                         )
                         .map_err(|e| be(&e))?
-                    {
-                        let (k, _) = entry.map_err(|e| be(&e))?;
-                        ids.push(k.value().4.to_owned());
+                        .map(|entry| {
+                            entry
+                                .map(|(key, _)| key.value().2)
+                                .map_err(|error| be(&error))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    for version in versions {
+                        items
+                            .remove((tenant.as_str(), id.as_str(), version))
+                            .map_err(|e| be(&e))?;
                     }
-                    Ok(ids)
                 }
-            })
-            .await?;
+                ids.len()
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(count)
+        })
+        .await
+    }
 
-        let count = ids.len();
-        for id in ids {
-            self.forget(&id).await?;
-        }
-        Ok(count)
+    async fn set_legal_hold(&self, id: &str, held: bool) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
+        let id = id.to_owned();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            {
+                let current = w.open_table(CURRENT).map_err(|e| be(&e))?;
+                if held
+                    && current
+                        .get((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?
+                        .is_none()
+                {
+                    return Err(StoreError::Backend(format!(
+                        "cannot hold missing memory '{id}'"
+                    )));
+                }
+                let mut holds = w.open_table(HOLDS).map_err(|e| be(&e))?;
+                if held {
+                    holds
+                        .insert((tenant.as_str(), id.as_str()), ())
+                        .map_err(|e| be(&e))?;
+                } else {
+                    holds
+                        .remove((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?;
+                }
+            }
+            w.commit().map_err(|e| be(&e))
+        })
+        .await
+    }
+
+    async fn legal_hold(&self, id: &str) -> Result<bool, StoreError> {
+        let tenant = self.tenant_name();
+        let id = id.to_owned();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(holds) = r.open_table(HOLDS) else {
+                return Ok(false);
+            };
+            holds
+                .get((tenant.as_str(), id.as_str()))
+                .map(|value| value.is_some())
+                .map_err(|e| be(&e))
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn sweep_expired(&self, at: crate::core::Timestamp) -> Result<usize, StoreError> {
+        let tenant = self.tenant_name();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let removed = {
+                let mut items = w.open_table(ITEMS).map_err(|e| be(&e))?;
+                let mut current = w.open_table(CURRENT).map_err(|e| be(&e))?;
+                let mut by_subject = w.open_table(BY_SUBJECT).map_err(|e| be(&e))?;
+                let mut forgotten = w.open_table(FORGOTTEN).map_err(|e| be(&e))?;
+                let mut edges = w.open_table(DERIVED).map_err(|e| be(&e))?;
+                let holds = w.open_table(HOLDS).map_err(|e| be(&e))?;
+                let entries: Vec<(String, String, String, i64, u64)> = current
+                    .range((tenant.as_str(), "")..=(tenant.as_str(), MAX_STR))
+                    .map_err(|e| be(&e))?
+                    .map(|entry| {
+                        entry
+                            .map(|(key, value)| {
+                                let (_, id) = key.value();
+                                let (subject, purpose, created, version) = value.value();
+                                (
+                                    id.to_owned(),
+                                    subject.to_owned(),
+                                    purpose.to_owned(),
+                                    created,
+                                    version,
+                                )
+                            })
+                            .map_err(|e| be(&e))
+                    })
+                    .collect::<Result<_, _>>()?;
+                let mut expired = Vec::new();
+                for (id, subject, purpose, created, version) in entries {
+                    if holds
+                        .get((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let Some(raw) = items
+                        .get((tenant.as_str(), id.as_str(), version))
+                        .map_err(|e| be(&e))?
+                    else {
+                        continue;
+                    };
+                    let item: MemoryItem = serde_json::from_str(raw.value())
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    if item.expires_at.is_some_and(|expires| expires <= at) {
+                        expired.push((id, subject, purpose, created));
+                    }
+                }
+                for (id, subject, purpose, created) in &expired {
+                    by_subject
+                        .remove((
+                            tenant.as_str(),
+                            subject.as_str(),
+                            purpose.as_str(),
+                            -*created,
+                            id.as_str(),
+                        ))
+                        .map_err(|e| be(&e))?;
+                    current
+                        .remove((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?;
+                    forgotten
+                        .insert((tenant.as_str(), id.as_str()), ())
+                        .map_err(|e| be(&e))?;
+                    let incoming: Vec<String> = edges
+                        .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                        .map_err(|e| be(&e))?
+                        .filter_map(|entry| match entry {
+                            Ok((key, _)) if key.value().2 == id => {
+                                Some(Ok(key.value().1.to_owned()))
+                            }
+                            Ok(_) => None,
+                            Err(error) => Some(Err(be(&error))),
+                        })
+                        .collect::<Result<_, StoreError>>()?;
+                    for source in incoming {
+                        edges
+                            .remove((tenant.as_str(), source.as_str(), id.as_str()))
+                            .map_err(|e| be(&e))?;
+                    }
+                    let versions: Vec<u64> = items
+                        .range(
+                            (tenant.as_str(), id.as_str(), 0)
+                                ..=(tenant.as_str(), id.as_str(), u64::MAX),
+                        )
+                        .map_err(|e| be(&e))?
+                        .map(|entry| {
+                            entry
+                                .map(|(key, _)| key.value().2)
+                                .map_err(|error| be(&error))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    for version in versions {
+                        items
+                            .remove((tenant.as_str(), id.as_str(), version))
+                            .map_err(|e| be(&e))?;
+                    }
+                }
+                expired.len()
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(removed)
+        })
+        .await
     }
 }

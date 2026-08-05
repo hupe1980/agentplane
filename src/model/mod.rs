@@ -35,6 +35,8 @@
 pub mod anthropic;
 #[cfg(feature = "providers")]
 mod anthropic_stream;
+#[cfg(feature = "bedrock")]
+pub mod bedrock;
 #[cfg(feature = "providers")]
 pub mod openai;
 #[cfg(feature = "providers")]
@@ -310,6 +312,35 @@ pub struct Completion {
     /// three steps downstream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured: Option<Value>,
+    /// Provider-owned response items required to continue this exact turn.
+    ///
+    /// This is deliberately opaque to the runtime. `OpenAI` uses complete
+    /// Responses output items (including encrypted reasoning); Anthropic uses
+    /// the complete assistant content blocks (including signed thinking). The
+    /// next request returns the value only to the provider that issued it.
+    /// Keeping it in the journal makes continuation independent of expiring
+    /// provider-side conversation state and reproducible on replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ProviderContinuation>,
+}
+
+/// Opaque, self-contained provider state for one continuation turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderContinuation {
+    /// Provider name that owns [`state`](Self::state).
+    pub provider: String,
+    /// Exact provider-native items emitted by the preceding response.
+    pub state: Value,
+}
+
+impl ProviderContinuation {
+    #[must_use]
+    pub fn new(provider: impl Into<String>, state: Value) -> Self {
+        Self {
+            provider: provider.into(),
+            state,
+        }
+    }
 }
 
 /// Why a completion failed.
@@ -475,6 +506,8 @@ pub struct Request<'a> {
     pub tools: &'a [ToolDeclaration],
     /// Tools already run this turn, and what they returned.
     pub exchanges: &'a [ToolExchange],
+    /// Exact provider-native state emitted beside those tool calls.
+    pub continuation: Option<&'a ProviderContinuation>,
 }
 
 /// Provider-neutral reasoning depth.
@@ -701,6 +734,7 @@ pub struct ModelCall {
     schema: Option<Value>,
     tools: Vec<ToolDeclaration>,
     exchanges: Vec<ToolExchange>,
+    continuation: Option<ProviderContinuation>,
     max_output_tokens: u32,
     reasoning_effort: Option<ReasoningEffort>,
     provider: Arc<dyn ModelProvider>,
@@ -734,6 +768,7 @@ impl ModelCall {
             schema: None,
             tools: Vec::new(),
             exchanges: Vec::new(),
+            continuation: None,
             max_output_tokens: Self::DEFAULT_MAX_OUTPUT_TOKENS,
             reasoning_effort: None,
             provider,
@@ -805,6 +840,17 @@ impl ModelCall {
     #[must_use]
     pub fn continuing(mut self, exchanges: impl IntoIterator<Item = ToolExchange>) -> Self {
         self.exchanges = exchanges.into_iter().collect();
+        self
+    }
+
+    /// Continue with exact provider-native state from the preceding response.
+    ///
+    /// This state is not interpreted, synthesized, or fetched by id. It is
+    /// journaled as part of this call's identity and returned only to the
+    /// provider that produced it.
+    #[must_use]
+    pub fn with_continuation(mut self, continuation: ProviderContinuation) -> Self {
+        self.continuation = Some(continuation);
         self
     }
 
@@ -935,6 +981,7 @@ impl Effect for ModelCall {
                     "output": exchange.output,
                     "failed": exchange.failed,
                 })).collect::<Vec<_>>(),
+                "continuation": self.continuation,
             }),
         )
     }
@@ -1015,6 +1062,7 @@ impl Effect for ModelCall {
                 schema: self.schema.as_ref(),
                 tools: &self.tools,
                 exchanges: &self.exchanges,
+                continuation: self.continuation.as_ref(),
             })
             .await
             .map_err(|e| {
@@ -1266,6 +1314,7 @@ mod tests {
                 stop_reason: Some("stop".to_owned()),
                 truncated: false,
                 structured: None,
+                continuation: None,
             })
         }
     }

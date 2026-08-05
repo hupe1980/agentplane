@@ -1155,8 +1155,13 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the structured answer is taken from whichever tool block came first, "
         "so a caller's own tool call emitted ahead of the forced one is "
         "returned as the schema-shaped answer — a wrong answer that parses",
-        """            .find(|b| b.kind == "tool_use" && b.name.as_deref() == Some(RESPOND_TOOL))""",
-        """            .find(|b| b.kind == "tool_use")""",
+        """            .find(|b| {
+                b.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && b.get("name").and_then(Value::as_str) == Some(RESPOND_TOOL)
+            })""",
+        """            .find(|b| {
+                b.get("type").and_then(Value::as_str) == Some("tool_use")
+            })""",
     ),
     "StreamedToolArgumentsAreMixed": (
         "src/model/anthropic_stream.rs",
@@ -1955,7 +1960,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_failed_tool_is_marked_is_error",
         "a failed tool is reported as an ordinary result, so the model is taught "
         "the operation succeeded and returned something strange",
-        '                "is_error": e.failed,',
+        '                "is_error": exchange.failed,',
         '                "is_error": false,',
     ),
     "AToolCallingAgentRunsForever": (

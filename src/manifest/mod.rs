@@ -721,20 +721,6 @@ impl Manifest {
         if execution.kind != ExecutionKind::ToolCalling {
             return Ok(());
         }
-        if self
-            .spec
-            .models
-            .as_ref()
-            .and_then(|models| models.privileged.as_ref())
-            .is_some_and(|model| model.reasoning_effort.is_some())
-        {
-            return Err(ManifestError::Unenforceable {
-                field: "spec.models.privileged.reasoning_effort",
-                detail: "reasoning-enabled tool loops require preserving provider-specific \
-                         opaque reasoning/thinking blocks across turns; that continuation is \
-                         not implemented, so accepting this would silently weaken reasoning",
-            });
-        }
         for grant in &self.spec.tools {
             if grant
                 .description

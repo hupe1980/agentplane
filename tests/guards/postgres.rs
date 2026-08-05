@@ -133,6 +133,7 @@ async fn memory_revisions_are_shared_and_serialized(
                     1_760_000_100 + i64::try_from(value).expect("small writer id"),
                 )
                 .expect("time"),
+                expires_at: None,
                 superseded_at: None,
                 derived_from: Vec::new(),
             };
@@ -196,6 +197,7 @@ async fn memory_erasure_serializes_with_derivative_creation(
         written_by: "test".to_owned(),
         version: 1,
         created_at: Timestamp::from_unix_timestamp(1_760_000_200).expect("time"),
+        expires_at: None,
         superseded_at: None,
         derived_from: Vec::new(),
     };
@@ -323,6 +325,7 @@ async fn memories_are_apart(
         written_by: "test".to_owned(),
         version: 0,
         created_at: at,
+        expires_at: None,
         superseded_at: None,
         derived_from: Vec::new(),
     })

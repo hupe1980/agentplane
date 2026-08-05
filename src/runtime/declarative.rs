@@ -142,6 +142,7 @@ impl Declarative {
             ("input".to_owned(), input),
         ]);
         let mut exchanges: Vec<crate::model::ToolExchange> = Vec::new();
+        let mut continuation: Option<crate::model::ProviderContinuation> = None;
 
         for _turn in 0..self.max_turns {
             let mut call = ModelCall::new(
@@ -151,6 +152,9 @@ impl Declarative {
             )
             .with_tools(declared.clone())
             .continuing(exchanges.clone());
+            if let Some(state) = continuation.take() {
+                call = call.with_continuation(state);
+            }
             if let Some(max_output_tokens) = max_output_tokens {
                 call = call.with_max_output_tokens(max_output_tokens);
             }
@@ -170,6 +174,7 @@ impl Declarative {
                 return Ok(Outcome::done(answer));
             }
 
+            continuation.clone_from(&completion.peek().continuation);
             exchanges.clear();
             // Providers may emit several calls in one response. Execute them in
             // response order: `StepCtx` is the deterministic admission boundary
