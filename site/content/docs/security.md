@@ -535,27 +535,36 @@ derivative creation cannot commit in the gap between traversal and deletion.
 
 ### A webhook URL is the one destination a caller chooses
 
-The `push` module provides the transport controls a future A2A outbox needs. A
+The `push` module provides the durable A2A registration cursor and transport. A
 webhook URL inverts this crate's usual rule that destinations are granted, not
 discovered: it comes from whoever created the task. Three controls stack — an
 operator host grant, HTTPS only, and every resolved address checked with the
 connection pinned to it — and the grant is re-checked at delivery so revoking a
 host stops registrations made while it was granted.
 
-The payload carries the task's **state, not its output**. Otherwise a caller who
-can create a task could have its contents posted to any permitted host, and the
-allowlist would be an exfiltration channel rather than a control. A receiver
-learns that something finished and comes back through the authenticated
-`GetTask` to learn what.
+A registered receiver gets the same status and artifact `StreamResponse`
+objects as an SSE subscriber. Treating its URL as authorized for that task is
+therefore explicit: URL validation happens before task admission, every push
+method is authenticated, task authorization is checked, and tenant-leading
+registration keys prevent cross-tenant lookup. A host allowlist is not a
+substitute for those checks.
 
-The token a receiver supplies is stored as a secret, echoed only in the outbound
-`Authorization` header, and never returned to a caller reading the
-configuration — it is a bearer credential for somebody else's endpoint.
+The A2A `token` is an opaque correlation/validation secret and is stored and
+redacted as such. It is **not** guessed to be a bearer credential.
+`authentication.schemes` and `authentication.credentials` are persisted
+separately; the selected scheme and credential form the outbound
+`Authorization` header. Neither secret is returned when a configuration is
+read or listed, and secret wrappers suppress debug/display leakage.
 
-These controls do **not** make A2A push complete. At-least-once delivery requires
-task transitions and outbox entries to commit atomically, then a durable worker
-to retry until acknowledgement. The server advertises push false until that
-protocol exists.
+The task journal is already the atomic outbox, so there is no second-write gap.
+Each receiver persists its first unacknowledged journal sequence and the worker
+advances only after HTTP 2xx. Delivery is at least once, deliberately not
+exactly once: a crash between POST and cursor update, or active-active workers
+racing, can duplicate an update. Cursor advancement is monotonic, failures are
+persisted with bounded backoff, and a projection failure is retried rather than
+silently acknowledging a terminal task without its artifact. Operators must
+schedule the worker returned by the server; only that wired deployment
+advertises push.
 
 ### A peer's message is untrusted, and names its sender
 

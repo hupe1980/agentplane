@@ -2660,9 +2660,9 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/push/mod.rs",
         "a_configuration_read_back_does_not_carry_its_token",
         "a configuration read back carries its token, so a caller learns the "
-        "bearer credential for somebody else's webhook",
-        "            \"url\": self.url,\n        })",
-        "            \"url\": self.url,\n            \"token\": self.token.as_ref().map(crate::core::Secret::expose),\n        })",
+        "correlation secret for somebody else's webhook",
+        "            \"url\": self.url,\n            \"authentication\": self.authentication.as_ref().map(|auth| serde_json::json!({",
+        "            \"url\": self.url,\n            \"token\": self.token.as_ref().map(crate::core::Secret::expose),\n            \"authentication\": self.authentication.as_ref().map(|auth| serde_json::json!({",
     ),
     "OneTenantReadsAnothersWebhooks": (
         "src/store/redb_push.rs",

@@ -18,19 +18,18 @@
 //! current state and continues, any instance can serve it, and the events cannot
 //! disagree with history because they *are* history.
 //!
-//! The cost is a poll rather than a push. It is a real cost and it is stated
-//! rather than hidden: one indexed read per subscriber per interval, against a
-//! store that is already answering worse queries. What it buys is a stream that
-//! survives the things streams are asked to survive.
+//! The cost is polling the journal for each open subscriber. It is a real cost
+//! and is stated rather than hidden: one indexed read per subscriber per
+//! interval, against a store that is already answering worse queries. What it
+//! buys is a stream that survives the things streams are asked to survive.
 //!
 //! # When the stream ends
 //!
-//! The spec requires closing on a terminal state. This also closes on
-//! `INPUT_REQUIRED`, which is *not* terminal, and the reason is that a suspended
-//! run may be waiting on a human for a week. Holding a connection open for that
-//! is not streaming, it is a leak with a spec reference. The client is told the
-//! run is waiting and can subscribe again — which costs it nothing, because the
-//! stream is rebuilt from the journal rather than resumed from memory.
+//! The spec requires closing on a terminal state. `INPUT_REQUIRED` and
+//! `AUTH_REQUIRED` are interrupted rather than terminal, so they remain open:
+//! an out-of-band answer may resume the task without another client request.
+//! Intermediaries may reap a very idle connection; reconnecting is safe because
+//! the stream is rebuilt from the journal rather than resumed from memory.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,8 +47,7 @@ use super::a2a::{A2aArtifact, A2aTask, TaskState, sealed_state, task_artifacts, 
 /// How often a subscriber re-reads the journal.
 ///
 /// Short enough that progress feels live, long enough that a hundred
-/// subscribers are not a hundred reads per millisecond. A push would avoid the
-/// question and lose the properties in the module docs.
+/// subscribers are not a hundred reads per millisecond.
 const POLL: Duration = Duration::from_millis(200);
 
 /// One `StreamResponse`, as the wire carries it.
@@ -66,7 +64,12 @@ fn stream_response(id: &Value, payload: &Value) -> Event {
 /// id to put there. It carries the **run's own id** rather than an empty string:
 /// a standalone run genuinely is its whole context, so this is a true statement
 /// about grouping rather than a placeholder a client has to special-case.
-fn status_update(run: RunId, case: Option<&str>, state: TaskState, detail: &str) -> Value {
+pub(super) fn status_update(
+    run: RunId,
+    case: Option<&str>,
+    state: TaskState,
+    detail: &str,
+) -> Value {
     json!({
         "statusUpdate": {
             "taskId": run.to_string(),
@@ -84,7 +87,7 @@ fn status_update(run: RunId, case: Option<&str>, state: TaskState, detail: &str)
     })
 }
 
-fn artifact_update(run: RunId, case: Option<&str>, artifact: &A2aArtifact) -> Value {
+pub(super) fn artifact_update(run: RunId, case: Option<&str>, artifact: &A2aArtifact) -> Value {
     json!({
         "artifactUpdate": {
             "taskId": run.to_string(),
@@ -101,7 +104,7 @@ fn artifact_update(run: RunId, case: Option<&str>, artifact: &A2aArtifact) -> Va
 /// Deliberately not every record: a subscriber wants to know *what is
 /// happening*, and a stream that narrates internal bookkeeping is one people
 /// stop reading. Records with no caller-visible meaning produce no event.
-fn progress_of(kind: &RecordKind) -> Option<(TaskState, String)> {
+pub(super) fn progress_of(kind: &RecordKind) -> Option<(TaskState, String)> {
     match kind {
         RecordKind::StepStarted { skill } => Some((TaskState::Working, format!("started {skill}"))),
         RecordKind::StepFinished { outcome } => {
@@ -113,6 +116,33 @@ fn progress_of(kind: &RecordKind) -> Option<(TaskState, String)> {
         RecordKind::RunSealed { outcome, .. } => Some((sealed_state(outcome), outcome.clone())),
         _ => None,
     }
+}
+
+/// `StreamResponse` payloads represented by one durable record.
+pub(super) async fn payloads_for_record(
+    runtime: &Runtime,
+    record: &crate::journal::Record,
+    case: Option<&str>,
+) -> Result<Vec<Value>, crate::core::RuntimeError> {
+    let run = record.body.run;
+    if let RecordKind::RunSealed { outcome, .. } = record.kind() {
+        let state = sealed_state(outcome);
+        let mut payloads = Vec::new();
+        if state == TaskState::Completed
+            && let Some(artifacts) = task_artifacts(runtime, run, state).await?
+        {
+            payloads.extend(
+                artifacts
+                    .iter()
+                    .map(|artifact| artifact_update(run, case, artifact)),
+            );
+        }
+        payloads.push(status_update(run, case, state, outcome));
+        return Ok(payloads);
+    }
+    Ok(progress_of(record.kind())
+        .map(|(state, detail)| vec![status_update(run, case, state, &detail)])
+        .unwrap_or_default())
 }
 
 /// Whether a state ends the stream.
@@ -166,14 +196,18 @@ pub fn tail(
                 next = record.body.seq + 1;
                 if let RecordKind::RunSealed { outcome, .. } = record.kind() {
                     let state = sealed_state(outcome);
-                    if state == TaskState::Completed
-                        && let Some(artifacts) = task_artifacts(&runtime, run, state).await
-                    {
-                        for artifact in artifacts {
-                            yield Ok(stream_response(
-                                &id,
-                                &artifact_update(run, case.as_deref(), &artifact),
-                            ));
+                    if state == TaskState::Completed {
+                        match task_artifacts(&runtime, run, state).await {
+                            Ok(Some(artifacts)) => {
+                                for artifact in artifacts {
+                                    yield Ok(stream_response(
+                                        &id,
+                                        &artifact_update(run, case.as_deref(), &artifact),
+                                    ));
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(_) => return,
                         }
                     }
                     yield Ok(stream_response(
@@ -225,6 +259,6 @@ pub async fn current(runtime: &Runtime, run: RunId) -> Option<(A2aTask, Option<S
         .find_map(|r| r.body.case.map(|c| c.to_string()));
     let next = last.body.seq + 1;
     let mut task = task_of(run, state, &detail, case.clone());
-    task.artifacts = task_artifacts(runtime, run, state).await;
+    task.artifacts = task_artifacts(runtime, run, state).await.ok()?;
     Some((task, case, next))
 }

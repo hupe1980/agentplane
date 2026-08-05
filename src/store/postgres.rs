@@ -163,6 +163,26 @@ CREATE TABLE IF NOT EXISTS run_cancel (
     requested_at BIGINT NOT NULL,
     PRIMARY KEY (tenant, run_id)
 );
+
+-- A2A push uses the journal itself as the outbox. `next_seq` is the first task
+-- record this receiver has not acknowledged; advancing only after a 2xx makes a
+-- crash produce a duplicate rather than a lost notification.
+CREATE TABLE IF NOT EXISTS push_delivery (
+    tenant          TEXT   NOT NULL,
+    task_id         TEXT   NOT NULL,
+    config_id       TEXT   NOT NULL,
+    url             TEXT   NOT NULL,
+    token           TEXT,
+    auth_scheme     TEXT,
+    auth_credentials TEXT,
+    next_seq        BIGINT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at BIGINT NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    PRIMARY KEY (tenant, task_id, config_id)
+);
+CREATE INDEX IF NOT EXISTS push_delivery_due
+    ON push_delivery (tenant, next_attempt_at, task_id, config_id);
 ";
 
 /// A journal on `PostgreSQL`.

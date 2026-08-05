@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use agentplane::core::{RunId, Secret};
-use agentplane::push::{PushConfig, PushError, PushPolicy, PushStore};
+use agentplane::push::{PushAuthentication, PushConfig, PushError, PushPolicy, PushStore};
 use agentplane::store::RedbStore;
 
 fn config(url: &str) -> PushConfig {
@@ -19,7 +19,11 @@ fn config(url: &str) -> PushConfig {
         id: "cfg-1".to_owned(),
         task: RunId::generate(),
         url: url.to_owned(),
-        token: Some(Secret::new("the-receivers-token")),
+        token: Some(Secret::new("opaque-a2a-token")),
+        authentication: Some(PushAuthentication {
+            scheme: "Bearer".to_owned(),
+            credentials: Secret::new("the-receivers-token"),
+        }),
     }
 }
 
@@ -129,7 +133,7 @@ async fn a_webhook_resolving_to_a_private_address_is_refused() {
 
 /// A configuration read back never carries its token.
 ///
-/// The token is a bearer credential for somebody else's endpoint. A caller that
+/// The token is a correlation secret for somebody else's endpoint. A caller that
 /// can read a configuration it did not create would otherwise learn it — and the
 /// only party that needs it already has it.
 #[test]
@@ -167,27 +171,81 @@ async fn registrations_round_trip() {
         task,
         url: "https://hooks.acme.example/two".to_owned(),
         token: None,
+        authentication: None,
     };
 
-    store.put(&first).await.expect("put");
-    store.put(&second).await.expect("put");
+    store.put(&first, 1).await.expect("put");
+    store.put(&second, 5).await.expect("put");
 
     let back = store.get(task, "one").await.expect("get").expect("present");
     assert_eq!(back.url, first.url);
     assert_eq!(
         back.token.as_ref().map(Secret::expose),
+        Some("opaque-a2a-token")
+    );
+    assert_eq!(
+        back.authentication
+            .as_ref()
+            .map(|authentication| authentication.credentials.expose()),
         Some("the-receivers-token"),
-        "the token did not survive storage, so every notification after a \
-         restart would be unauthenticated at the receiver"
+        "authentication did not survive storage, so notifications after restart would be anonymous"
     );
 
     let all = store.list(task).await.expect("list");
     assert_eq!(all.len(), 2, "a task's registrations were not both listed");
 
+    let due = store.due(0, 10).await.expect("due");
+    assert_eq!(due.len(), 2);
+    assert_eq!(due[0].next_seq, 1);
+    store
+        .retry(task, "one", 100, "receiver unavailable")
+        .await
+        .expect("retry");
+    assert_eq!(store.due(99, 10).await.expect("not due").len(), 1);
+    store.advance(task, "one", 7).await.expect("advance");
+    let advanced = store
+        .due(0, 10)
+        .await
+        .expect("advanced")
+        .into_iter()
+        .find(|registration| registration.config.id == "one")
+        .expect("one");
+    assert_eq!(advanced.next_seq, 7);
+    assert_eq!(advanced.attempts, 0);
+
     store.delete(task, "one").await.expect("delete");
     store.delete(task, "one").await.expect("deleting twice");
     assert!(store.get(task, "one").await.expect("get").is_none());
     assert_eq!(store.list(task).await.expect("list").len(), 1);
+}
+
+/// Replacing credentials or a URL must not acknowledge events on the receiver's
+/// behalf. Otherwise an update while a webhook is down can jump its cursor to
+/// the task head and silently lose every pending notification.
+#[tokio::test]
+async fn replacing_a_registration_preserves_its_unacknowledged_cursor() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn PushStore>;
+    let first = config("https://hooks.acme.example/old");
+    store.put(&first, 3).await.expect("put");
+
+    let mut replacement = first.clone();
+    replacement.url = "https://hooks.acme.example/new".to_owned();
+    store
+        .put(&replacement, 10)
+        .await
+        .expect("replace destination");
+
+    let registration = store
+        .due(0, 1)
+        .await
+        .expect("due")
+        .pop()
+        .expect("registration");
+    assert_eq!(registration.config.url, replacement.url);
+    assert_eq!(
+        registration.next_seq, 3,
+        "replacement acknowledged records 3 through 9 without delivering them"
+    );
 }
 
 /// One tenant cannot read another's webhooks.
@@ -209,7 +267,7 @@ async fn one_tenants_webhooks_are_not_another_tenants() {
 
     let theirs = config("https://hooks.acme.example/secret");
     let task = theirs.task;
-    acme.put(&theirs).await.expect("acme registers");
+    acme.put(&theirs, 1).await.expect("acme registers");
 
     assert!(
         globex.get(task, "cfg-1").await.expect("get").is_none(),

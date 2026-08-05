@@ -59,7 +59,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::core::{PolicyDecision, PolicyRequest, RunId, SourceId, Tainted};
+use crate::core::{PolicyDecision, PolicyRequest, RunId, Seq, SourceId, Tainted};
 use crate::journal::RecordKind;
 use crate::manifest::Manifest;
 use crate::peers::{AgentCard, ExtendedAgentCard, WELL_KNOWN_PATH};
@@ -387,14 +387,11 @@ struct SendConfiguration {
     #[serde(default)]
     history_length: Option<usize>,
     #[serde(default)]
-    task_push_notification_config: Option<Value>,
+    task_push_notification_config: Option<PushRequest>,
 }
 
 impl SendConfiguration {
     fn validate(&self) -> Result<(), RpcError> {
-        if self.task_push_notification_config.is_some() {
-            return Err(push_not_supported_error());
-        }
         if !self.accepted_output_modes.is_empty()
             && !self
                 .accepted_output_modes
@@ -410,6 +407,47 @@ impl SendConfiguration {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PushAuthenticationRequest {
+    scheme: String,
+    #[serde(default)]
+    credentials: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PushRequest {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    url: String,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    authentication: Option<PushAuthenticationRequest>,
+}
+
+impl PushRequest {
+    fn config(&self, task: RunId) -> crate::push::PushConfig {
+        crate::push::PushConfig {
+            id: self.id.clone().unwrap_or_else(|| format!("push-{task}")),
+            task,
+            url: self.url.clone(),
+            token: self.token.clone().map(crate::core::Secret::new),
+            authentication: self.authentication.as_ref().map(|authentication| {
+                crate::push::PushAuthentication {
+                    scheme: authentication.scheme.clone(),
+                    credentials: crate::core::Secret::new(
+                        authentication.credentials.clone().unwrap_or_default(),
+                    ),
+                }
+            }),
+        }
+    }
+}
+
 /// What every method's params may carry.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct CommonParams {
@@ -422,6 +460,14 @@ struct CommonParams {
     id: Option<String>,
     #[serde(default)]
     configuration: Option<SendConfiguration>,
+    #[serde(default, rename = "taskId")]
+    push_task: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    authentication: Option<PushAuthenticationRequest>,
     #[serde(default, rename = "contextId")]
     context_id: Option<String>,
     #[serde(default)]
@@ -491,6 +537,31 @@ pub struct A2aServer {
     extended: ExtendedAgentCard,
     /// The card's advertised skill ids — what a caller may ask for.
     skills: Vec<String>,
+    push: Option<PushRuntime>,
+}
+
+#[derive(Debug, Clone)]
+struct PushRuntime {
+    store: Arc<dyn crate::push::PushStore>,
+    transport: Arc<dyn crate::push::PushTransport>,
+}
+
+/// Durable A2A webhook delivery, driven by an operator scheduler.
+#[derive(Debug, Clone)]
+pub struct A2aPushWorker {
+    runtime: Arc<Runtime>,
+    push: PushRuntime,
+}
+
+/// Outcome of one bounded push sweep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PushSweepReport {
+    pub registrations: usize,
+    pub records: usize,
+    pub deliveries: usize,
+    pub retries: usize,
+    pub completed: usize,
+    pub saturated: bool,
 }
 
 impl std::fmt::Debug for A2aServer {
@@ -513,6 +584,8 @@ pub enum ServerSetupError {
     NoPolicy,
     #[error("the agent card could not be derived: {0}")]
     Card(#[from] crate::manifest::ManifestError),
+    #[error("push changes the signed Agent Card; configure it before calling signing_cards_with")]
+    CardAlreadySigned,
 }
 
 impl A2aServer {
@@ -562,6 +635,7 @@ impl A2aServer {
             card,
             extended,
             skills,
+            push: None,
         })
     }
 
@@ -588,6 +662,36 @@ impl A2aServer {
         self.card.sign(signer)?;
         self.extended.public.sign(signer)?;
         Ok(self)
+    }
+
+    /// Enable A2A push configuration and expose a durable delivery worker.
+    ///
+    /// The worker uses the task journal itself as its outbox. A registration's
+    /// cursor advances only after a receiver returns 2xx, so a crash between
+    /// POST and acknowledgement persistence repeats an event and never loses
+    /// one. Call [`A2aServer::push_worker`] before consuming the server into its
+    /// router and schedule [`A2aPushWorker::run_once`] from every instance.
+    pub fn with_push(
+        mut self,
+        store: Arc<dyn crate::push::PushStore>,
+        transport: Arc<dyn crate::push::PushTransport>,
+    ) -> Result<Self, ServerSetupError> {
+        if !self.card.signatures.is_empty() || !self.extended.public.signatures.is_empty() {
+            return Err(ServerSetupError::CardAlreadySigned);
+        }
+        self.card.capabilities.push_notifications = true;
+        self.extended.public.capabilities.push_notifications = true;
+        self.push = Some(PushRuntime { store, transport });
+        Ok(self)
+    }
+
+    /// A cloneable worker handle, when push is configured.
+    #[must_use]
+    pub fn push_worker(&self) -> Option<A2aPushWorker> {
+        self.push.clone().map(|push| A2aPushWorker {
+            runtime: Arc::clone(&self.runtime),
+            push,
+        })
     }
 
     /// The router.
@@ -720,6 +824,147 @@ impl A2aServer {
     }
 }
 
+impl A2aPushWorker {
+    /// Deliver at most `limit` due registrations once.
+    ///
+    /// `at` is Unix time in seconds and is explicit to make backoff tests
+    /// deterministic. The operator owns scheduling and the clock.
+    /// Multiple workers may race and produce duplicates, which A2A receivers
+    /// must tolerate; cursor updates use monotonic advancement, so they cannot
+    /// lose an event.
+    pub async fn run_once(
+        &self,
+        at: u64,
+        limit: usize,
+    ) -> Result<PushSweepReport, crate::core::StoreError> {
+        let due = self.push.store.due(at, limit.saturating_add(1)).await?;
+        let saturated = due.len() > limit;
+        let mut report = PushSweepReport {
+            registrations: due.len().min(limit),
+            saturated,
+            ..PushSweepReport::default()
+        };
+        for registration in due.into_iter().take(limit) {
+            let mut attempts = registration.attempts;
+            let records = self
+                .runtime
+                .journal()
+                .read(registration.config.task, registration.next_seq)
+                .await?;
+            if records.is_empty() && self.cleanup_acknowledged_terminal(&registration).await? {
+                report.completed += 1;
+                continue;
+            }
+            for record in records {
+                let case = record.body.case.map(|case| case.to_string());
+                let payloads = match super::a2a_stream::payloads_for_record(
+                    &self.runtime,
+                    &record,
+                    case.as_deref(),
+                )
+                .await
+                {
+                    Ok(payloads) => payloads,
+                    Err(error) => {
+                        let exponent = attempts.min(8);
+                        self.push
+                            .store
+                            .retry(
+                                registration.config.task,
+                                &registration.config.id,
+                                at.saturating_add(1u64 << exponent),
+                                &error.to_string(),
+                            )
+                            .await?;
+                        report.retries += 1;
+                        break;
+                    }
+                };
+                let mut failed = None;
+                for payload in payloads {
+                    match self
+                        .push
+                        .transport
+                        .deliver(&registration.config, &payload)
+                        .await
+                    {
+                        Ok(crate::push::Delivered::Accepted) => {
+                            report.deliveries += 1;
+                        }
+                        Ok(other) => failed = Some(format!("receiver outcome: {other:?}")),
+                        Err(error) => failed = Some(error.to_string()),
+                    }
+                    if failed.is_some() {
+                        break;
+                    }
+                }
+                if let Some(error) = failed {
+                    let exponent = attempts.min(8);
+                    let delay = 1u64 << exponent;
+                    self.push
+                        .store
+                        .retry(
+                            registration.config.task,
+                            &registration.config.id,
+                            at.saturating_add(delay),
+                            &error,
+                        )
+                        .await?;
+                    report.retries += 1;
+                    break;
+                }
+                self.push
+                    .store
+                    .advance(
+                        registration.config.task,
+                        &registration.config.id,
+                        record.body.seq.saturating_add(1),
+                    )
+                    .await?;
+                attempts = 0;
+                report.records += 1;
+                if matches!(record.kind(), RecordKind::RunSealed { .. }) {
+                    self.push
+                        .store
+                        .delete(registration.config.task, &registration.config.id)
+                        .await?;
+                    report.completed += 1;
+                    break;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    async fn cleanup_acknowledged_terminal(
+        &self,
+        registration: &crate::push::PushRegistration,
+    ) -> Result<bool, crate::core::StoreError> {
+        if registration.next_seq <= 1 {
+            return Ok(false);
+        }
+        let previous = self
+            .runtime
+            .journal()
+            .read(
+                registration.config.task,
+                registration.next_seq.saturating_sub(1),
+            )
+            .await?;
+        let completed = previous.last().is_some_and(|record| {
+            record.body.seq.saturating_add(1) == registration.next_seq
+                && matches!(record.kind(), RecordKind::RunSealed { .. })
+        });
+        if completed {
+            self.push
+                .store
+                .delete(registration.config.task, &registration.config.id)
+                .await?;
+        }
+        Ok(completed)
+    }
+}
+
 /// The public Agent Card.
 ///
 /// Unauthenticated on purpose — see the module docs. It is derived from the
@@ -819,6 +1064,13 @@ async fn stream_method(
         }
         let skill = resolve_skill(&server, &message)?;
         let caller = server.gate(&headers, action::MESSAGE_SEND, &skill).await?;
+        if let Some(push) = params
+            .configuration
+            .as_ref()
+            .and_then(|configuration| configuration.task_push_notification_config.as_ref())
+        {
+            validate_inline_push(&server, &headers, &skill, push).await?;
+        }
         // Admitted before the stream opens. A stream that begins and *then*
         // reports a refusal has already told the client the work started —
         // and an SSE body cannot carry a JSON-RPC error the client is looking
@@ -828,7 +1080,16 @@ async fn stream_method(
             SourceId::new(format!("peer:{}", caller.actor)),
         );
         match spawn_a2a(&server, &skill, input, &message).await {
-            Ok(run) => run,
+            Ok(run) => {
+                if let Some(push) = params
+                    .configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.task_push_notification_config.as_ref())
+                {
+                    register_push(&server, push, run, 1).await?;
+                }
+                run
+            }
             Err(crate::core::RuntimeError::PolicyDenied(_)) => {
                 return Err(RpcError::new(
                     code::UNSUPPORTED_OPERATION,
@@ -894,9 +1155,10 @@ async fn dispatch(
             "a streaming method reached the non-streaming dispatcher",
         )),
         method::LIST_TASKS => list_tasks(server, headers, &params).await,
-        method::CREATE_PUSH | method::GET_PUSH | method::LIST_PUSH | method::DELETE_PUSH => {
-            push_not_supported(server, headers).await
-        }
+        method::CREATE_PUSH => push_create(server, headers, &params).await,
+        method::GET_PUSH => push_get(server, headers, &params).await,
+        method::LIST_PUSH => push_list(server, headers, &params).await,
+        method::DELETE_PUSH => push_delete(server, headers, &params).await,
         other => Err(RpcError::new(
             code::METHOD_NOT_FOUND,
             format!("no such A2A method: {other}"),
@@ -930,6 +1192,10 @@ async fn send_message(
     if let Some(configuration) = &params.configuration {
         configuration.validate()?;
     }
+    let inline_push = params
+        .configuration
+        .as_ref()
+        .and_then(|configuration| configuration.task_push_notification_config.clone());
     let Some(message) = params.message else {
         return Err(RpcError::new(
             code::INVALID_PARAMS,
@@ -946,6 +1212,9 @@ async fn send_message(
     }
     let skill = resolve_skill(server, &message)?;
     let caller = server.gate(headers, action::MESSAGE_SEND, &skill).await?;
+    if let Some(push) = &inline_push {
+        validate_inline_push(server, headers, &skill, push).await?;
+    }
 
     // Untrusted, and provenanced to the peer that sent it. A protected sink
     // field can then name the one counterparty it will take an amount from, and
@@ -967,6 +1236,9 @@ async fn send_message(
     {
         return match spawn_a2a(server, &skill, input, &message).await {
             Ok(run) => {
+                if let Some(push) = &inline_push {
+                    register_push(server, push, run, 1).await?;
+                }
                 let case = task_context(server, run).await?;
                 Ok(json!({
                     "task": task_of(run, TaskState::Working, "accepted", case)
@@ -1012,6 +1284,9 @@ async fn send_message(
     };
 
     let case = task_context(server, outcome.run_id).await?;
+    if let Some(push) = &inline_push {
+        register_push(server, push, outcome.run_id, 1).await?;
+    }
     let mut task = task_of_outcome(&outcome);
     task.context_id = case;
     if let Some(history_length) = params
@@ -1232,7 +1507,9 @@ async fn get_task(
 
     let mut task = task_of(id, state, &detail, case.clone());
     task.history = task_history(id, &records, params.history_length, case.as_deref());
-    task.artifacts = task_artifacts(&server.runtime, id, state).await;
+    task.artifacts = task_artifacts(&server.runtime, id, state)
+        .await
+        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
     Ok(json!({ "task": task }))
 }
 
@@ -1363,7 +1640,9 @@ async fn list_tasks(
     for (run, _, task) in visible {
         let mut task = task.clone();
         if params.include_artifacts {
-            task.artifacts = task_artifacts(&server.runtime, *run, task.status.state).await;
+            task.artifacts = task_artifacts(&server.runtime, *run, task.status.state)
+                .await
+                .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
         }
         tasks.push(task);
     }
@@ -1479,15 +1758,14 @@ pub(super) async fn task_artifacts(
     runtime: &Runtime,
     run: RunId,
     state: TaskState,
-) -> Option<Vec<A2aArtifact>> {
+) -> Result<Option<Vec<A2aArtifact>>, crate::core::RuntimeError> {
     if state != TaskState::Completed {
-        return None;
+        return Ok(None);
     }
     runtime
         .replay(run, crate::runtime::Mode::Strict)
         .await
-        .ok()
-        .and_then(|outcome| task_of_outcome(&outcome).artifacts)
+        .map(|outcome| task_of_outcome(&outcome).artifacts)
 }
 
 /// A sealed run's outcome word, as an A2A state.
@@ -1629,9 +1907,8 @@ pub(super) fn task_of(run: RunId, state: TaskState, detail: &str, case: Option<S
     }
 }
 
-async fn push_not_supported(server: &A2aServer, headers: &HeaderMap) -> Result<Value, RpcError> {
-    server.gate(headers, action::TASK_PUSH, "push").await?;
-    Err(push_not_supported_error())
+fn push_runtime(server: &A2aServer) -> Result<&PushRuntime, RpcError> {
+    server.push.as_ref().ok_or_else(push_not_supported_error)
 }
 
 fn push_not_supported_error() -> RpcError {
@@ -1639,6 +1916,208 @@ fn push_not_supported_error() -> RpcError {
         code::PUSH_NOT_SUPPORTED,
         "this agent does not implement push notifications; its card advertises pushNotifications as false",
     )
+}
+
+async fn push_task(server: &A2aServer, raw: Option<&str>) -> Result<RunId, RpcError> {
+    let raw = raw.ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "`taskId` is required"))?;
+    let task = RunId::parse(raw)
+        .map_err(|_| RpcError::new(code::TASK_NOT_FOUND, format!("no such task: {raw}")))?;
+    let records = server
+        .runtime
+        .journal()
+        .read(task, 1)
+        .await
+        .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the journal could not be read"))?;
+    if records.is_empty() {
+        return Err(RpcError::new(
+            code::TASK_NOT_FOUND,
+            format!("no such task: {task}"),
+        ));
+    }
+    Ok(task)
+}
+
+fn push_request(params: &CommonParams) -> Result<PushRequest, RpcError> {
+    let url = params
+        .url
+        .clone()
+        .ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "`url` is required"))?;
+    Ok(PushRequest {
+        id: params.id.clone(),
+        task_id: params.push_task.clone(),
+        url,
+        token: params.token.clone(),
+        authentication: params.authentication.clone(),
+    })
+}
+
+fn validate_push_request(server: &A2aServer, request: &PushRequest) -> Result<(), RpcError> {
+    let push = push_runtime(server)?;
+    let config = request.config(RunId::generate());
+    if let Some(authentication) = &config.authentication {
+        authentication
+            .validate()
+            .map_err(|error| RpcError::new(code::INVALID_PARAMS, error.to_string()))?;
+    }
+    push.transport
+        .validate(&config)
+        .map_err(|error| RpcError::new(code::INVALID_PARAMS, error.to_string()))
+}
+
+async fn validate_inline_push(
+    server: &A2aServer,
+    headers: &HeaderMap,
+    skill: &str,
+    request: &PushRequest,
+) -> Result<(), RpcError> {
+    if request
+        .task_id
+        .as_deref()
+        .is_some_and(|task| !task.is_empty())
+    {
+        return Err(RpcError::new(
+            code::INVALID_PARAMS,
+            "taskPushNotificationConfig.taskId must be empty in SendMessage",
+        ));
+    }
+    server
+        .gate(headers, action::TASK_PUSH, &format!("new:{skill}"))
+        .await?;
+    validate_push_request(server, request)
+}
+
+async fn register_push(
+    server: &A2aServer,
+    request: &PushRequest,
+    task: RunId,
+    next_seq: Seq,
+) -> Result<crate::push::PushConfig, RpcError> {
+    let push = push_runtime(server)?;
+    if request
+        .task_id
+        .as_deref()
+        .is_some_and(|configured| !configured.is_empty() && configured != task.to_string())
+    {
+        return Err(RpcError::new(
+            code::INVALID_PARAMS,
+            "push configuration taskId does not match its task",
+        ));
+    }
+    let config = request.config(task);
+    if let Some(authentication) = &config.authentication {
+        authentication
+            .validate()
+            .map_err(|error| RpcError::new(code::INVALID_PARAMS, error.to_string()))?;
+    }
+    push.transport
+        .validate(&config)
+        .map_err(|error| RpcError::new(code::INVALID_PARAMS, error.to_string()))?;
+    push.store
+        .put(&config, next_seq)
+        .await
+        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
+    Ok(config)
+}
+
+async fn push_create(
+    server: &A2aServer,
+    headers: &HeaderMap,
+    params: &CommonParams,
+) -> Result<Value, RpcError> {
+    let resource = params.push_task.as_deref().unwrap_or("push");
+    server.gate(headers, action::TASK_PUSH, resource).await?;
+    push_runtime(server)?;
+    let task = push_task(server, params.push_task.as_deref()).await?;
+    let request = push_request(params)?;
+    let head = server
+        .runtime
+        .journal()
+        .head(task)
+        .await
+        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
+    let tail = server
+        .runtime
+        .journal()
+        .read(task, head.seq)
+        .await
+        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
+    let next_seq = if tail
+        .last()
+        .is_some_and(|record| matches!(record.kind(), RecordKind::RunSealed { .. }))
+    {
+        head.seq
+    } else {
+        head.seq.saturating_add(1)
+    };
+    Ok(register_push(server, &request, task, next_seq)
+        .await?
+        .redacted())
+}
+
+async fn push_get(
+    server: &A2aServer,
+    headers: &HeaderMap,
+    params: &CommonParams,
+) -> Result<Value, RpcError> {
+    let resource = params.push_task.as_deref().unwrap_or("push");
+    server.gate(headers, action::TASK_PUSH, resource).await?;
+    let push = push_runtime(server)?;
+    let task = push_task(server, params.push_task.as_deref()).await?;
+    let id = params
+        .id
+        .as_deref()
+        .ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "`id` is required"))?;
+    push.store
+        .get(task, id)
+        .await
+        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?
+        .map(|config| config.redacted())
+        .ok_or_else(|| {
+            RpcError::new(
+                code::TASK_NOT_FOUND,
+                format!("no push configuration '{id}' for task {task}"),
+            )
+        })
+}
+
+async fn push_list(
+    server: &A2aServer,
+    headers: &HeaderMap,
+    params: &CommonParams,
+) -> Result<Value, RpcError> {
+    let resource = params.push_task.as_deref().unwrap_or("push");
+    server.gate(headers, action::TASK_PUSH, resource).await?;
+    let push = push_runtime(server)?;
+    let task = push_task(server, params.push_task.as_deref()).await?;
+    let configs = push
+        .store
+        .list(task)
+        .await
+        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
+    Ok(json!({
+        "configs": configs.iter().map(crate::push::PushConfig::redacted).collect::<Vec<_>>(),
+        "nextPageToken": "",
+    }))
+}
+
+async fn push_delete(
+    server: &A2aServer,
+    headers: &HeaderMap,
+    params: &CommonParams,
+) -> Result<Value, RpcError> {
+    let resource = params.push_task.as_deref().unwrap_or("push");
+    server.gate(headers, action::TASK_PUSH, resource).await?;
+    let push = push_runtime(server)?;
+    let task = push_task(server, params.push_task.as_deref()).await?;
+    let id = params
+        .id
+        .as_deref()
+        .ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "`id` is required"))?;
+    push.store
+        .delete(task, id)
+        .await
+        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
+    Ok(json!({}))
 }
 
 #[cfg(test)]

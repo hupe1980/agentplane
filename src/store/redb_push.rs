@@ -1,10 +1,10 @@
 //! Webhook registrations on redb.
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::core::{RunId, Secret, StoreError};
-use crate::push::{PushConfig, PushStore};
+use crate::core::{RunId, Secret, Seq, StoreError};
+use crate::push::{PushAuthentication, PushConfig, PushRegistration, PushStore};
 
 use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
@@ -14,12 +14,25 @@ use super::redb::{MAX_STR, RedbStore, be, begin_write};
 /// not a capability, and a handle for one tenant must not be able to read
 /// another's webhook — which would disclose both a URL and, without the split
 /// below, a bearer token for it.
-const PUSH: TableDefinition<(&str, &str, &str), (&str, &str, u8)> =
+type StoredPush<'a> = (&'a str, &'a str, u8, &'a str, &'a str, u8);
+
+const PUSH: TableDefinition<(&str, &str, &str), StoredPush<'_>> =
     TableDefinition::new("push_configs");
+
+const PUSH_CURSOR: TableDefinition<(&str, &str, &str), &str> =
+    TableDefinition::new("push_delivery_cursor");
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Cursor {
+    next_seq: Seq,
+    attempts: u32,
+    next_attempt_at: u64,
+    last_error: Option<String>,
+}
 
 #[async_trait]
 impl PushStore for RedbStore {
-    async fn put(&self, config: &PushConfig) -> Result<(), StoreError> {
+    async fn put(&self, config: &PushConfig, next_seq: Seq) -> Result<(), StoreError> {
         let tenant = self.tenant_name();
         let task = config.task.to_string();
         let id = config.id.clone();
@@ -31,6 +44,10 @@ impl PushStore for RedbStore {
             .token
             .as_ref()
             .map_or_else(|| (String::new(), 0), |s| (s.expose().to_owned(), 1));
+        let (auth_scheme, auth_credentials, has_auth) = config.authentication.as_ref().map_or_else(
+            || (String::new(), String::new(), 0),
+            |auth| (auth.scheme.clone(), auth.credentials.expose().to_owned(), 1),
+        );
 
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -38,9 +55,38 @@ impl PushStore for RedbStore {
                 let mut t = w.open_table(PUSH).map_err(|e| be(&e))?;
                 t.insert(
                     (tenant.as_str(), task.as_str(), id.as_str()),
-                    (url.as_str(), token.as_str(), has_token),
+                    (
+                        url.as_str(),
+                        token.as_str(),
+                        has_token,
+                        auth_scheme.as_str(),
+                        auth_credentials.as_str(),
+                        has_auth,
+                    ),
                 )
                 .map_err(|e| be(&e))?;
+                let mut cursors = w.open_table(PUSH_CURSOR).map_err(|e| be(&e))?;
+                let existing = cursors
+                    .get((tenant.as_str(), task.as_str(), id.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|raw| {
+                        serde_json::from_str::<Cursor>(raw.value())
+                            .map_err(|error| StoreError::Backend(error.to_string()))
+                    })
+                    .transpose()?;
+                let cursor = serde_json::to_string(&Cursor {
+                    next_seq: existing.map_or(next_seq, |cursor| cursor.next_seq),
+                    attempts: 0,
+                    next_attempt_at: 0,
+                    last_error: None,
+                })
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+                cursors
+                    .insert(
+                        (tenant.as_str(), task.as_str(), id.as_str()),
+                        cursor.as_str(),
+                    )
+                    .map_err(|e| be(&e))?;
             }
             w.commit().map_err(|e| be(&e))?;
             Ok(())
@@ -63,12 +109,16 @@ impl PushStore for RedbStore {
             else {
                 return Ok(None);
             };
-            let (url, token, has_token) = v.value();
+            let (url, token, has_token, auth_scheme, auth_credentials, has_auth) = v.value();
             Ok(Some(PushConfig {
                 id,
                 task,
                 url: url.to_owned(),
                 token: (has_token == 1).then(|| Secret::new(token)),
+                authentication: (has_auth == 1).then(|| PushAuthentication {
+                    scheme: auth_scheme.to_owned(),
+                    credentials: Secret::new(auth_credentials),
+                }),
             }))
         })
         .await
@@ -91,15 +141,102 @@ impl PushStore for RedbStore {
                 .map_err(|e| be(&e))?
             {
                 let (k, v) = e.map_err(|e| be(&e))?;
-                let (url, token, has_token) = v.value();
+                let (url, token, has_token, auth_scheme, auth_credentials, has_auth) = v.value();
                 out.push(PushConfig {
                     id: k.value().2.to_owned(),
                     task,
                     url: url.to_owned(),
                     token: (has_token == 1).then(|| Secret::new(token)),
+                    authentication: (has_auth == 1).then(|| PushAuthentication {
+                        scheme: auth_scheme.to_owned(),
+                        credentials: Secret::new(auth_credentials),
+                    }),
                 });
             }
             Ok(out)
+        })
+        .await
+    }
+
+    async fn due(&self, at: u64, limit: usize) -> Result<Vec<PushRegistration>, StoreError> {
+        let tenant = self.tenant_name();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(configs) = r.open_table(PUSH) else {
+                return Ok(Vec::new());
+            };
+            let Ok(cursors) = r.open_table(PUSH_CURSOR) else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for entry in cursors
+                .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                .map_err(|e| be(&e))?
+            {
+                if out.len() >= limit {
+                    break;
+                }
+                let (key, raw) = entry.map_err(|e| be(&e))?;
+                let cursor: Cursor = serde_json::from_str(raw.value())
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+                if cursor.next_attempt_at > at {
+                    continue;
+                }
+                let (_, task, id) = key.value();
+                let Some(value) = configs
+                    .get((tenant.as_str(), task, id))
+                    .map_err(|e| be(&e))?
+                else {
+                    continue;
+                };
+                let (url, token, has_token, auth_scheme, auth_credentials, has_auth) =
+                    value.value();
+                let task =
+                    RunId::parse(task).map_err(|error| StoreError::Backend(error.to_string()))?;
+                out.push(PushRegistration {
+                    config: PushConfig {
+                        id: id.to_owned(),
+                        task,
+                        url: url.to_owned(),
+                        token: (has_token == 1).then(|| Secret::new(token)),
+                        authentication: (has_auth == 1).then(|| PushAuthentication {
+                            scheme: auth_scheme.to_owned(),
+                            credentials: Secret::new(auth_credentials),
+                        }),
+                    },
+                    next_seq: cursor.next_seq,
+                    attempts: cursor.attempts,
+                    next_attempt_at: cursor.next_attempt_at,
+                    last_error: cursor.last_error,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn advance(&self, task: RunId, id: &str, next_seq: Seq) -> Result<(), StoreError> {
+        update_cursor(self, task, id, move |cursor| {
+            cursor.next_seq = cursor.next_seq.max(next_seq);
+            cursor.attempts = 0;
+            cursor.next_attempt_at = 0;
+            cursor.last_error = None;
+        })
+        .await
+    }
+
+    async fn retry(
+        &self,
+        task: RunId,
+        id: &str,
+        next_attempt_at: u64,
+        error: &str,
+    ) -> Result<(), StoreError> {
+        let error = error.to_owned();
+        update_cursor(self, task, id, move |cursor| {
+            cursor.attempts = cursor.attempts.saturating_add(1);
+            cursor.next_attempt_at = next_attempt_at;
+            cursor.last_error = Some(error);
         })
         .await
     }
@@ -114,10 +251,49 @@ impl PushStore for RedbStore {
                 let mut t = w.open_table(PUSH).map_err(|e| be(&e))?;
                 t.remove((tenant.as_str(), task.as_str(), id.as_str()))
                     .map_err(|e| be(&e))?;
+                let mut cursors = w.open_table(PUSH_CURSOR).map_err(|e| be(&e))?;
+                cursors
+                    .remove((tenant.as_str(), task.as_str(), id.as_str()))
+                    .map_err(|e| be(&e))?;
             }
             w.commit().map_err(|e| be(&e))?;
             Ok(())
         })
         .await
     }
+}
+
+async fn update_cursor(
+    store: &RedbStore,
+    task: RunId,
+    id: &str,
+    update: impl FnOnce(&mut Cursor) + Send + 'static,
+) -> Result<(), StoreError> {
+    let tenant = store.tenant_name();
+    let task = task.to_string();
+    let id = id.to_owned();
+    store
+        .with_db(move |db| {
+            let w = begin_write(db)?;
+            {
+                let mut cursors = w.open_table(PUSH_CURSOR).map_err(|e| be(&e))?;
+                let Some(raw) = cursors
+                    .get((tenant.as_str(), task.as_str(), id.as_str()))
+                    .map_err(|e| be(&e))?
+                else {
+                    return Ok(());
+                };
+                let mut cursor: Cursor = serde_json::from_str(raw.value())
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+                drop(raw);
+                update(&mut cursor);
+                let raw = serde_json::to_string(&cursor)
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+                cursors
+                    .insert((tenant.as_str(), task.as_str(), id.as_str()), raw.as_str())
+                    .map_err(|e| be(&e))?;
+            }
+            w.commit().map_err(|e| be(&e))
+        })
+        .await
 }

@@ -1300,7 +1300,7 @@ src/
              retrieval, and labels taken from provenance rather than content
   netguard/  which IP addresses this plane will connect to — one rule, shared
              by governed media and webhook delivery
-  push/      Webhook registration and guarded-delivery primitives; no A2A outbox
+  push/      Durable A2A webhook cursors and SSRF-guarded delivery
              (feature `push`)
   quota/     per-tenant ceilings on concurrent work and spend, accounted in
              the store so they survive a second instance
@@ -1578,7 +1578,7 @@ the invariant for the one route nobody would think to check.
 | `GetExtendedAgentCard` | the authenticated card |
 | `SendStreamingMessage`, `SubscribeToTask` | SSE status and artifact updates, read from the journal; terminal subscription is refused |
 | `ListTasks` | newest-first, cursor-paginated and per-task-authorized tasks with context/status/time filters, bounded history, and optional artifacts |
-| the push-notification configs | `PushNotificationNotSupportedError`; no durable outbox/worker exists |
+| the push-notification configs | durable create/get/list/delete when wired; the protocol-specific refusal otherwise |
 | anything else | `-32601`, method not found |
 
 **Blocking is the default, and unset means blocking** — the spec's rule. A
@@ -1596,10 +1596,11 @@ Further decisions are load-bearing.
 
 **The card describes the deployment, not compiled code.** `A2aServer::new`
 requires a typed bearer scheme and scopes, because a client cannot authenticate
-from an abstract `Authenticator` it cannot see. Push is always false: durable
-configuration rows plus a callback do not satisfy A2A's at-least-once delivery
-contract across a process crash. It remains unsupported until a transactional
-outbox and delivery worker exist.
+from an abstract `Authenticator` it cannot see. Push stays false and its methods
+use `PushNotificationNotSupportedError` until `with_push` supplies durable
+registration/cursor storage and a governed transport. Configure before signing:
+the capability is in the signed payload. `push_worker()` returns the handle an
+operator schedules on each instance.
 
 **Parts are a oneof.** Exactly one of text, data, raw, or URL must be present.
 This server advertises text and JSON data; raw and URL file parts are refused as
@@ -1648,9 +1649,9 @@ that will never change. The decline says only that it was declined: the
 runtime's own denial names the action and resource the gate keyed on, which is
 enough to map this plane's authorization vocabulary by probing it.
 
-Push notifications are advertised false and their methods use the protocol's
-specific refusal. Streaming is advertised true because status and artifact
-events exist; `SubscribeToTask` follows 1.0 by refusing terminal tasks.
+Push is advertised exactly when its durable worker is wired. Streaming is
+advertised true because status and artifact events exist; `SubscribeToTask`
+follows 1.0 by refusing terminal tasks.
 
 #### A signed card says who published it
 
@@ -1712,12 +1713,23 @@ The grant is re-checked **at delivery**, not only at registration. A
 registration outlives the configuration that permitted it, and the tasks that
 outlive a config change are exactly the long-running ones push exists for.
 
-What is delivered is the task's **state, not its output**. A webhook is an
-endpoint we were told about by a caller; it learns that something finished and
-must come back through `GetTask` — authenticated — to learn what. That is
-stricter than the spec requires, because otherwise a caller who can create a task
-can have its contents posted to any permitted host, which turns an allowlist into
-an exfiltration channel.
+The **journal is the outbox**. Each registration stores the first sequence not
+acknowledged by that receiver. Workers derive the same status and artifact
+`StreamResponse` payloads as SSE and advance only after HTTP 2xx. A crash after
+POST but before cursor persistence repeats the payload; it cannot lose it.
+redb and PostgreSQL persist cursor, retry instant, attempt count and diagnostic.
+Several active-active workers may duplicate delivery, which receivers are
+required to process idempotently; monotonic advancement prevents regression.
+Failures back off exponentially, terminal acknowledgement removes the config,
+and registering after completion starts at the terminal record so it is not an
+inert promise.
+
+Artifacts are delivered because A2A defines push and streaming over the same
+union. This makes task-level authorization and the destination host grant
+load-bearing: registering a URL is an explicit authorization to send that
+task's updates there. The opaque A2A `token` is not confused with
+`AuthenticationInfo`; only the latter forms the HTTP `Authorization` header,
+and credentials are never returned or printed.
 
 The IP classification is [`netguard`](#module-layout), shared with governed
 media. Two implementations of one rule diverge, and the one that diverges is

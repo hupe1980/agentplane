@@ -14,6 +14,8 @@ mod postgres;
 mod postgres_cases;
 #[cfg(feature = "postgres")]
 mod postgres_memory;
+#[cfg(all(feature = "postgres", feature = "push"))]
+mod postgres_push;
 #[cfg(feature = "postgres")]
 mod postgres_quota;
 #[cfg(feature = "redb")]

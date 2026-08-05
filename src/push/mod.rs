@@ -26,22 +26,24 @@
 //!
 //! # What is delivered, and what is not
 //!
-//! The payload is a `StreamResponse` — the same shape streaming sends, so a
-//! receiver parses one thing. It carries the task's **state**, not its output. A
-//! webhook is an unauthenticated-by-us endpoint at an address we were told
-//! about: it is told that something finished, and must come back through
-//! `GetTask` — authenticated — to learn what.
+//! The payload is a `StreamResponse` — the same status/artifact union streaming
+//! sends, so a receiver parses one thing and A2A's two delivery mechanisms do
+//! not disagree. Registering a destination is therefore authorization to send
+//! that task's output there: task-level policy and the operator host grant are
+//! both checked rather than treating the allowlist as sufficient authority.
 //!
-//! That is stricter than the spec requires and deliberate. The alternative is
-//! that a caller who can create a task can have its contents posted to any host
-//! the deployment permits, which turns an allowlist into an exfiltration
-//! channel.
+//! # The journal is the outbox
+//!
+//! A registration stores the first journal sequence it has not acknowledged.
+//! Workers derive `StreamResponse` payloads from those records and advance only
+//! after HTTP 2xx. A crash after POST but before cursor persistence duplicates
+//! an event instead of losing it, which is A2A's at-least-once contract.
 
 use std::fmt::Debug;
 
 use async_trait::async_trait;
 
-use crate::core::{RunId, Secret, StoreError};
+use crate::core::{RunId, Secret, Seq, StoreError};
 
 /// Where a peer wants to be told about a task.
 #[derive(Debug, Clone)]
@@ -52,19 +54,93 @@ pub struct PushConfig {
     pub task: RunId,
     /// Where to POST. HTTPS, and on a granted host.
     pub url: String,
-    /// A token the receiver gave us, echoed back so it can tell our delivery
-    /// from anyone else's POST to the same URL.
-    ///
-    /// Held as a [`Secret`]: it is a bearer credential for somebody else's
-    /// endpoint, and a credential that can be printed is a credential in a log.
+    /// A2A's opaque token for this task/session. It is not HTTP authentication;
+    /// those credentials live in [`authentication`](Self::authentication).
     pub token: Option<Secret>,
+    /// HTTP authentication for the receiver, distinct from A2A's opaque
+    /// per-task/session token.
+    pub authentication: Option<PushAuthentication>,
+}
+
+/// Authentication information from A2A's push configuration.
+#[derive(Clone)]
+pub struct PushAuthentication {
+    pub scheme: String,
+    pub credentials: Secret,
+}
+
+impl Debug for PushAuthentication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushAuthentication")
+            .field("scheme", &self.scheme)
+            .field("credentials", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PushAuthentication {
+    /// Validate the HTTP authentication scheme and resulting header value.
+    ///
+    /// Kept on the protocol value rather than only on [`PushSender`], so a
+    /// custom transport cannot accidentally make malformed A2A input valid.
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::Malformed`] when the required scheme is not an RFC 9110
+    /// token or the credentials cannot be represented in a header.
+    pub fn validate(&self) -> Result<(), PushError> {
+        if self.scheme.is_empty()
+            || !self.scheme.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+        {
+            return Err(PushError::Malformed(
+                "authentication.scheme must be an HTTP authentication token".to_owned(),
+            ));
+        }
+        let value = format!("{} {}", self.scheme, self.credentials.expose());
+        reqwest::header::HeaderValue::from_str(&value)
+            .map(|_| ())
+            .map_err(|error| PushError::Malformed(format!("invalid authentication: {error}")))
+    }
+}
+
+/// One durable delivery cursor.
+///
+/// The journal is the outbox: `next_seq` names the first task record not yet
+/// acknowledged by this receiver. A crash after POST and before `advance`
+/// causes a duplicate, never a loss — the at-least-once direction A2A requires.
+#[derive(Debug, Clone)]
+pub struct PushRegistration {
+    pub config: PushConfig,
+    pub next_seq: Seq,
+    pub attempts: u32,
+    pub next_attempt_at: u64,
+    pub last_error: Option<String>,
 }
 
 impl PushConfig {
     /// What a caller may see back.
     ///
     /// The token is **not** echoed. A caller that can read a config it did not
-    /// create would otherwise learn another party's webhook credential, and the
+    /// create would otherwise learn another party's correlation secret, and the
     /// only party that needs the token already has it.
     #[must_use]
     pub fn redacted(&self) -> serde_json::Value {
@@ -72,6 +148,9 @@ impl PushConfig {
             "id": self.id,
             "taskId": self.task.to_string(),
             "url": self.url,
+            "authentication": self.authentication.as_ref().map(|auth| serde_json::json!({
+                "scheme": auth.scheme,
+            })),
         })
     }
 }
@@ -101,10 +180,14 @@ pub enum PushError {
 pub trait PushStore: Send + Sync + Debug {
     /// Register or replace a configuration.
     ///
+    /// Replacement preserves the existing acknowledgement cursor. Changing a
+    /// URL or credentials is not permission to discard updates that receiver
+    /// has not accepted.
+    ///
     /// # Errors
     ///
     /// If the store cannot be reached.
-    async fn put(&self, config: &PushConfig) -> Result<(), StoreError>;
+    async fn put(&self, config: &PushConfig, next_seq: Seq) -> Result<(), StoreError>;
 
     /// One configuration.
     ///
@@ -119,6 +202,21 @@ pub trait PushStore: Send + Sync + Debug {
     ///
     /// If the store cannot be reached.
     async fn list(&self, task: RunId) -> Result<Vec<PushConfig>, StoreError>;
+
+    /// Registrations whose retry instant has arrived, in stable order.
+    async fn due(&self, at: u64, limit: usize) -> Result<Vec<PushRegistration>, StoreError>;
+
+    /// Acknowledge every record before `next_seq`.
+    async fn advance(&self, task: RunId, id: &str, next_seq: Seq) -> Result<(), StoreError>;
+
+    /// Record a failed attempt without advancing the cursor.
+    async fn retry(
+        &self,
+        task: RunId,
+        id: &str,
+        next_attempt_at: u64,
+        error: &str,
+    ) -> Result<(), StoreError>;
 
     /// Forget one. Idempotent.
     ///
@@ -191,6 +289,18 @@ pub struct PushSender {
     timeout: std::time::Duration,
 }
 
+/// Delivery transport used by the durable worker.
+#[async_trait]
+pub trait PushTransport: Send + Sync + Debug {
+    fn validate(&self, config: &PushConfig) -> Result<(), PushError>;
+
+    async fn deliver(
+        &self,
+        config: &PushConfig,
+        payload: &serde_json::Value,
+    ) -> Result<Delivered, PushError>;
+}
+
 impl PushSender {
     /// The spec recommends 10–30 seconds; a webhook that needs longer is doing
     /// work it should not be doing on our thread.
@@ -235,7 +345,7 @@ impl PushSender {
         config: &PushConfig,
         payload: &serde_json::Value,
     ) -> Result<Delivered, PushError> {
-        self.policy.check(&config.url)?;
+        <Self as PushTransport>::validate(self, config)?;
 
         let url =
             reqwest::Url::parse(&config.url).map_err(|e| PushError::Malformed(e.to_string()))?;
@@ -273,10 +383,16 @@ impl PushSender {
             // The spec's media type, so a receiver can route on it.
             .header("Content-Type", "application/a2a+json")
             .json(payload);
-        if let Some(token) = &config.token {
-            // The receiver's own token, echoed so it can tell our delivery from
-            // anyone else's POST to the same URL.
-            request = request.bearer_auth(token.expose());
+        if let Some(authentication) = &config.authentication {
+            let value = format!(
+                "{} {}",
+                authentication.scheme,
+                authentication.credentials.expose()
+            );
+            let value = reqwest::header::HeaderValue::from_str(&value).map_err(|error| {
+                PushError::Malformed(format!("invalid authentication: {error}"))
+            })?;
+            request = request.header(reqwest::header::AUTHORIZATION, value);
         }
 
         // A transport failure is an *outcome*, not an error of this function. A
@@ -288,6 +404,25 @@ impl PushSender {
             Ok(response) => Delivered::Rejected(response.status().as_u16()),
             Err(e) => Delivered::Unreachable(e.to_string()),
         })
+    }
+}
+
+#[async_trait]
+impl PushTransport for PushSender {
+    fn validate(&self, config: &PushConfig) -> Result<(), PushError> {
+        self.policy.check(&config.url)?;
+        if let Some(authentication) = &config.authentication {
+            authentication.validate()?;
+        }
+        Ok(())
+    }
+
+    async fn deliver(
+        &self,
+        config: &PushConfig,
+        payload: &serde_json::Value,
+    ) -> Result<Delivered, PushError> {
+        PushSender::deliver(self, config, payload).await
     }
 }
 

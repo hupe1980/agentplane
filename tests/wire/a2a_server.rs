@@ -18,15 +18,16 @@
 
 use std::sync::{Arc, Mutex};
 
-use agentplane::api::a2a::{A2aServer, ServerSetupError, TaskState, action, code};
+use agentplane::api::a2a::{A2aPushWorker, A2aServer, ServerSetupError, TaskState, action, code};
 use agentplane::api::{AuthError, Authenticator, Caller};
 use agentplane::core::{
-    Digest, Outcome, PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest, Skill,
-    SkillDescriptor, SkillError, Tainted, TenantId,
+    Digest, Outcome, PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest, RunId,
+    Skill, SkillDescriptor, SkillError, Tainted, TenantId,
 };
 use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
 use agentplane::peers::CardSecurity;
+use agentplane::push::{Delivered, PushConfig, PushError, PushStore, PushTransport};
 use agentplane::runtime::{Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use axum::body::Body;
@@ -164,6 +165,7 @@ impl PolicyEngine for Recording {
 
 struct Fixture {
     rt: Arc<Runtime>,
+    store: Arc<RedbStore>,
     policy: Arc<Recording>,
     seen: Seen,
     manifest: Manifest,
@@ -187,9 +189,44 @@ fn fixture_from(yaml: &str, policy: Arc<Recording>) -> Fixture {
     }
     Fixture {
         rt: builder.build(),
+        store,
         policy,
         seen,
         manifest,
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecordingPush {
+    payloads: Mutex<Vec<Value>>,
+    failures: Mutex<usize>,
+}
+
+impl RecordingPush {
+    fn fail_next(&self) {
+        *self.failures.lock().unwrap() += 1;
+    }
+}
+
+#[async_trait::async_trait]
+impl PushTransport for RecordingPush {
+    fn validate(&self, config: &PushConfig) -> Result<(), PushError> {
+        if config.url.starts_with("https://client.example/") {
+            Ok(())
+        } else {
+            Err(PushError::HostNotGranted(config.url.clone()))
+        }
+    }
+
+    async fn deliver(&self, _config: &PushConfig, payload: &Value) -> Result<Delivered, PushError> {
+        self.payloads.lock().unwrap().push(payload.clone());
+        let mut failures = self.failures.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            Ok(Delivered::Unreachable("offline".to_owned()))
+        } else {
+            Ok(Delivered::Accepted)
+        }
     }
 }
 
@@ -212,6 +249,25 @@ impl Fixture {
         )
         .expect("the fixture wires a policy engine")
         .router()
+    }
+
+    fn push_server(&self) -> (A2aServer, A2aPushWorker, Arc<RecordingPush>) {
+        let transport = Arc::new(RecordingPush::default());
+        let server = A2aServer::new(
+            self.rt.clone(),
+            Arc::new(HeaderAuth),
+            &card_security(),
+            &self.manifest,
+            "https://plane.internal/a2a",
+        )
+        .expect("the fixture wires a policy engine")
+        .with_push(
+            Arc::clone(&self.store) as Arc<dyn agentplane::push::PushStore>,
+            Arc::clone(&transport) as Arc<dyn PushTransport>,
+        )
+        .expect("push before signing");
+        let worker = server.push_worker().expect("worker");
+        (server, worker, transport)
     }
 }
 
@@ -313,6 +369,320 @@ async fn the_agent_card_is_public() {
     );
 }
 
+#[tokio::test]
+async fn the_card_advertises_push_only_with_a_durable_worker() {
+    let f = fixture();
+    let (server, _worker, _transport) = f.push_server();
+    let req = Request::builder()
+        .uri("/.well-known/agent-card.json")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let (_, card) = send(&server.router(), req).await;
+    assert_eq!(card["capabilities"]["pushNotifications"], true);
+}
+
+#[tokio::test]
+async fn malformed_inline_push_authentication_is_refused_before_admission() {
+    let f = fixture();
+    let (server, _worker, _transport) = f.push_server();
+    let (_, body) = send(
+        &server.router(),
+        rpc(
+            "SendMessage",
+            &json!({
+                "message": text("go"),
+                "configuration": {
+                    "taskPushNotificationConfig": {
+                        "url": "https://client.example/hook",
+                        "authentication": {"scheme": "", "credentials": "secret"}
+                    }
+                }
+            }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(err_code(&body), i64::from(code::INVALID_PARAMS), "{body:#}");
+    assert!(
+        f.seen.lock().unwrap().is_empty(),
+        "malformed push input was rejected only after its skill ran"
+    );
+}
+
+#[tokio::test]
+async fn inline_push_has_its_own_authorization_gate() {
+    let f = fixture();
+    *f.policy.hidden_resource.lock().unwrap() = Some("new:settlement.check".to_owned());
+    let (server, _worker, _transport) = f.push_server();
+    let (_, body) = send(
+        &server.router(),
+        rpc(
+            "SendMessage",
+            &json!({
+                "message": text("go"),
+                "configuration": {
+                    "taskPushNotificationConfig": {
+                        "url": "https://client.example/hook"
+                    }
+                }
+            }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert!(body.get("error").is_some(), "{body:#}");
+    assert!(
+        f.policy
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|action| action == agentplane::api::a2a::action::TASK_PUSH),
+        "inline push bypassed the push-specific policy action"
+    );
+    assert!(
+        f.seen.lock().unwrap().is_empty(),
+        "the push denial happened only after its skill ran"
+    );
+}
+
+#[tokio::test]
+async fn inline_push_requires_an_empty_task_id_before_admission() {
+    let f = fixture();
+    let (server, _worker, _transport) = f.push_server();
+    let (_, body) = send(
+        &server.router(),
+        rpc(
+            "SendMessage",
+            &json!({
+                "message": text("go"),
+                "configuration": {
+                    "taskPushNotificationConfig": {
+                        "taskId": "client-chosen-task",
+                        "url": "https://client.example/hook"
+                    }
+                }
+            }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(err_code(&body), i64::from(code::INVALID_PARAMS), "{body:#}");
+    assert!(
+        f.seen.lock().unwrap().is_empty(),
+        "invalid inline taskId was rejected only after its skill ran"
+    );
+}
+
+#[tokio::test]
+async fn push_configuration_crud_is_authorized_and_redacted() {
+    let f = fixture();
+    let (_, sent) = send(
+        &f.router(),
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = sent["result"]["task"]["id"].as_str().unwrap();
+    let (server, _worker, _transport) = f.push_server();
+    let router = server.router();
+    let create = json!({
+        "taskId": task,
+        "id": "cfg-1",
+        "url": "https://client.example/hook",
+        "token": "opaque-token",
+        "authentication": {"scheme": "Bearer", "credentials": "receiver-secret"}
+    });
+    let (_, created) = send(
+        &router,
+        rpc("CreateTaskPushNotificationConfig", &create, Some("peer-a")),
+    )
+    .await;
+    assert_eq!(created["result"]["id"], "cfg-1");
+    assert_eq!(created["result"]["authentication"]["scheme"], "Bearer");
+    assert!(!created.to_string().contains("receiver-secret"));
+    assert!(!created.to_string().contains("opaque-token"));
+
+    let key = json!({"taskId": task, "id": "cfg-1"});
+    let (_, got) = send(
+        &router,
+        rpc("GetTaskPushNotificationConfig", &key, Some("peer-a")),
+    )
+    .await;
+    assert_eq!(got["result"]["url"], "https://client.example/hook");
+    let (_, listed) = send(
+        &router,
+        rpc(
+            "ListTaskPushNotificationConfigs",
+            &json!({"taskId": task}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(listed["result"]["configs"].as_array().unwrap().len(), 1);
+
+    send(
+        &router,
+        rpc("DeleteTaskPushNotificationConfig", &key, Some("peer-a")),
+    )
+    .await;
+    let (_, missing) = send(
+        &router,
+        rpc("GetTaskPushNotificationConfig", &key, Some("peer-a")),
+    )
+    .await;
+    assert_eq!(err_code(&missing), i64::from(code::TASK_NOT_FOUND));
+}
+
+#[tokio::test]
+async fn push_worker_retries_from_the_same_journal_cursor_and_cleans_terminal_tasks() {
+    let f = fixture();
+    let (server, worker, transport) = f.push_server();
+    transport.fail_next();
+    let router = server.router();
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({
+                "message": text("go"),
+                "configuration": {
+                    "taskPushNotificationConfig": {
+                        "url": "https://client.example/hook",
+                        "authentication": {
+                            "scheme": "Bearer",
+                            "credentials": "receiver-secret"
+                        }
+                    }
+                }
+            }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert!(sent["result"]["task"]["id"].is_string(), "{sent:#}");
+
+    let failed = worker.run_once(10, 10).await.expect("failed sweep");
+    assert_eq!(failed.retries, 1);
+    assert_eq!(failed.deliveries, 0);
+    assert_eq!(worker.run_once(10, 10).await.unwrap().registrations, 0);
+
+    let delivered = worker.run_once(11, 10).await.expect("retry sweep");
+    assert!(delivered.deliveries > 0);
+    assert_eq!(delivered.completed, 1);
+    {
+        let payloads = transport.payloads.lock().unwrap();
+        assert_eq!(payloads[0], payloads[1], "retry skipped the failed payload");
+        assert!(
+            payloads
+                .iter()
+                .any(|payload| payload.get("artifactUpdate").is_some()),
+            "terminal output was not pushed"
+        );
+    }
+    assert_eq!(worker.run_once(12, 10).await.unwrap().registrations, 0);
+}
+
+#[tokio::test]
+async fn push_registration_after_completion_delivers_the_terminal_record() {
+    let f = fixture();
+    let (server, worker, transport) = f.push_server();
+    let router = server.router();
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = sent["result"]["task"]["id"].as_str().unwrap();
+    assert_eq!(
+        sent["result"]["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+
+    let (_, created) = send(
+        &router,
+        rpc(
+            "CreateTaskPushNotificationConfig",
+            &json!({
+                "taskId": task,
+                "id": "late",
+                "url": "https://client.example/hook"
+            }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(created["result"]["id"], "late", "{created:#}");
+
+    let report = worker.run_once(10, 10).await.expect("late sweep");
+    assert_eq!(report.completed, 1);
+    assert!(
+        transport
+            .payloads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|payload| payload.get("artifactUpdate").is_some()),
+        "late registration omitted the completed task's artifact"
+    );
+    assert_eq!(worker.run_once(11, 10).await.unwrap().registrations, 0);
+}
+
+#[tokio::test]
+async fn push_worker_cleans_up_after_advance_won_the_race_with_a_crash() {
+    let f = fixture();
+    let (server, worker, _transport) = f.push_server();
+    let router = server.router();
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = RunId::parse(sent["result"]["task"]["id"].as_str().unwrap()).unwrap();
+    let (_, created) = send(
+        &router,
+        rpc(
+            "CreateTaskPushNotificationConfig",
+            &json!({
+                "taskId": task.to_string(),
+                "id": "crashed-after-advance",
+                "url": "https://client.example/hook"
+            }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(created["result"]["id"], "crashed-after-advance");
+    let head = f.rt.journal().head(task).await.unwrap();
+    f.store
+        .advance(task, "crashed-after-advance", head.seq.saturating_add(1))
+        .await
+        .unwrap();
+
+    let report = worker.run_once(10, 10).await.unwrap();
+    assert_eq!(report.completed, 1);
+    assert!(
+        f.store
+            .get(task, "crashed-after-advance")
+            .await
+            .unwrap()
+            .is_none(),
+        "a terminal registration survived forever after advance-before-delete"
+    );
+}
+
 /// Every method authenticates, and the card is the only route that does not.
 #[tokio::test]
 async fn every_method_is_authenticated() {
@@ -324,6 +694,22 @@ async fn every_method_is_authenticated() {
         ("GetTask", json!({"id": "01JRJ0000000000000000000000"})),
         ("CancelTask", json!({"id": "01JRJ0000000000000000000000"})),
         ("GetExtendedAgentCard", json!({})),
+        (
+            "CreateTaskPushNotificationConfig",
+            json!({"taskId": "01JRJ0000000000000000000000", "url": "https://client.example/hook"}),
+        ),
+        (
+            "GetTaskPushNotificationConfig",
+            json!({"taskId": "01JRJ0000000000000000000000", "id": "cfg"}),
+        ),
+        (
+            "ListTaskPushNotificationConfigs",
+            json!({"taskId": "01JRJ0000000000000000000000"}),
+        ),
+        (
+            "DeleteTaskPushNotificationConfig",
+            json!({"taskId": "01JRJ0000000000000000000000", "id": "cfg"}),
+        ),
     ] {
         let (_, body) = send(&router, rpc(method, &params, None)).await;
         assert!(

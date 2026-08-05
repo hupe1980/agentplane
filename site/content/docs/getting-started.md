@@ -134,7 +134,7 @@ agentplane = { version = "0.2", features = ["postgres", "http", "mcp", "provider
 | `mcp` | MCP tool transport |
 | `a2a` | A2A peer transport — calling other agents |
 | `a2a-server` | being called: the public Agent Card and the A2A 1.0 JSON-RPC methods |
-| `push` | Webhook registration and SSRF-guarded delivery primitives; A2A push still needs a durable outbox/worker |
+| `push` | Persistent A2A registration cursors, retrying worker API, and SSRF-guarded webhook delivery; `a2a-server` includes it |
 | `providers` | Anthropic and OpenAI model drivers |
 | `bedrock` | Amazon Bedrock Runtime Converse through the AWS SDK; separate because the dependency graph is substantial |
 | `media` | governed remote-media fetch: exact grants, SSRF-safe pinned DNS, redirects, limits, validation, digest and retention |

@@ -108,6 +108,59 @@ async fn postgres_satisfies_the_memory_store_contract() {
     .await;
 }
 
+#[cfg(feature = "push")]
+#[tokio::test]
+async fn postgres_persists_push_delivery_cursors() {
+    use agentplane::core::{RunId, Secret};
+    use agentplane::push::{PushAuthentication, PushConfig, PushStore};
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let store = PostgresStore::connect(&url)
+        .await
+        .expect("connect")
+        .for_tenant(agentplane::core::TenantId::new("push-postgres").unwrap());
+    let task = RunId::generate();
+    let config = PushConfig {
+        id: "cfg".to_owned(),
+        task,
+        url: "https://client.example/hook".to_owned(),
+        token: Some(Secret::new("opaque")),
+        authentication: Some(PushAuthentication {
+            scheme: "Bearer".to_owned(),
+            credentials: Secret::new("credential"),
+        }),
+    };
+    store.put(&config, 3).await.expect("put");
+    let due = store.due(0, 10).await.expect("due");
+    assert_eq!(due[0].next_seq, 3);
+    assert_eq!(
+        due[0]
+            .config
+            .authentication
+            .as_ref()
+            .map(|auth| auth.credentials.expose()),
+        Some("credential")
+    );
+    store.retry(task, "cfg", 20, "offline").await.unwrap();
+    assert!(store.due(19, 10).await.unwrap().is_empty());
+    store.advance(task, "cfg", 7).await.unwrap();
+    assert_eq!(store.due(0, 10).await.unwrap()[0].next_seq, 7);
+    let mut replacement = config.clone();
+    replacement.url = "https://client.example/new-hook".to_owned();
+    store.put(&replacement, 99).await.expect("replace");
+    let replaced = store.due(0, 10).await.unwrap();
+    assert_eq!(replaced[0].config.url, replacement.url);
+    assert_eq!(
+        replaced[0].next_seq, 7,
+        "replacement acknowledged pending events"
+    );
+}
+
 async fn memory_revisions_are_shared_and_serialized(
     first: Arc<PostgresStore>,
     second: Arc<PostgresStore>,

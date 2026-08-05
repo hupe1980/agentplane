@@ -13,6 +13,50 @@ For the vocabulary — effect, disposition, label — see
 
 ---
 
+## 🔔 Wire durable A2A push
+
+Push is a deployment capability, not merely a Cargo feature. Supply the same
+tenant-scoped durable store used by the runtime and a transport with an explicit
+host grant, take the worker handle, and only then sign the card:
+
+```rust,ignore
+use agentplane::api::a2a::A2aServer;
+use agentplane::push::{PushPolicy, PushSender, PushStore, PushTransport};
+use std::sync::Arc;
+
+let sender = Arc::new(PushSender::new(
+    PushPolicy::new().allow_host("hooks.customer.example"),
+));
+let server = A2aServer::new(runtime, authenticator, &security, &manifest, public_url)?
+    .with_push(
+        store.clone() as Arc<dyn PushStore>,
+        sender as Arc<dyn PushTransport>,
+    )?;
+let worker = server.push_worker().expect("push was just configured");
+let router = server.signing_cards_with(&card_signer)?.router();
+
+// Run this from the deployment's scheduler on every instance. A saturated
+// sweep means more due registrations exist, so drain another bounded batch
+// immediately; otherwise wait until the next scheduler tick.
+loop {
+    // Unix seconds come from this operational scheduler's clock. The worker
+    // never reaches for ambient time, which keeps backoff tests deterministic.
+    let report = worker.run_once(scheduler_now, 100).await?;
+    if !report.saturated {
+        break;
+    }
+}
+```
+
+There is deliberately no hidden Tokio worker. Lifecycle, shutdown, frequency
+and alerting belong to the process supervisor. Delivery is at least once: a
+crash after the receiver accepts but before cursor persistence repeats the
+event, and receivers must be idempotent. The journal is the outbox, so there is
+no task-transition/outbox dual write to lose. Configure push before card signing
+because `pushNotifications` is part of the signed document.
+
+---
+
 ## 🧬 Build an agent
 
 An agent here is not a class you subclass. It is **skills** (what it can do), a
