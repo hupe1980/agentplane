@@ -108,6 +108,44 @@ impl QuotaStore for PostgresStore {
         })
     }
 
+    async fn set_halt(&self, reason: Option<&str>) -> Result<(), StoreError> {
+        let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
+        match reason {
+            Some(reason) => {
+                client
+                    .execute(
+                        "INSERT INTO quota_halted (tenant, reason) VALUES ($1, $2)
+                         ON CONFLICT (tenant) DO UPDATE SET reason = EXCLUDED.reason",
+                        &[&self.tenant_name(), &reason],
+                    )
+                    .await
+                    .map_err(|e| be(&e))?;
+            }
+            None => {
+                client
+                    .execute(
+                        "DELETE FROM quota_halted WHERE tenant = $1",
+                        &[&self.tenant_name()],
+                    )
+                    .await
+                    .map_err(|e| be(&e))?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn halted(&self) -> Result<Option<String>, StoreError> {
+        let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
+        let row = client
+            .query_opt(
+                "SELECT reason FROM quota_halted WHERE tenant = $1",
+                &[&self.tenant_name()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(row.map(|row| row.get::<_, String>(0)))
+    }
+
     async fn release(&self, run: RunId) -> Result<(), StoreError> {
         let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
         client

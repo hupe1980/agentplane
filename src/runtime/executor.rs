@@ -396,6 +396,59 @@ impl Runtime {
 
     /// The stop request standing against a run, if any.
     ///
+    /// Stop this tenant from starting new work, or let it start again.
+    ///
+    /// The emergency stop. `Some(reason)` halts, `None` lifts, and the reason is
+    /// required because the next person to look will be somebody else, possibly
+    /// at three in the morning, and *why* is the whole question.
+    ///
+    /// **What it stops, precisely.** New admissions, across every instance,
+    /// because the flag is in the store rather than in this process — a switch
+    /// that stops only the instance it was thrown on is the in-process-counter
+    /// failure arriving during an incident. Refusals are their own error, not a
+    /// ceiling: a ceiling means *not right now* and invites a retry, which is
+    /// exactly what somebody pulling this switch is trying to stop.
+    ///
+    /// **What it does not stop, deliberately.** Runs already executing, and
+    /// suspended runs resuming. Those are existing work, and refusing to let
+    /// them continue would strand them mid-saga with reversals unrun — turning
+    /// an incident into a second one. To stop work in flight, cancel it: that
+    /// unwinds what it did and records who asked. This is the front door, not a
+    /// power cut, and saying so is the difference between a control an operator
+    /// can reason about and one they discover the shape of during an outage.
+    ///
+    /// Requires a quota store; without one there is nowhere durable to keep the
+    /// flag, and an emergency stop that a restart forgets is not one.
+    ///
+    /// # Errors
+    ///
+    /// If no quota store is wired, or the store is unreachable.
+    pub async fn set_halt(&self, reason: Option<&str>) -> Result<(), RuntimeError> {
+        let quotas = self.quotas.as_ref().ok_or_else(|| {
+            RuntimeError::Store(crate::core::StoreError::Backend(
+                "an emergency stop needs a quota store to keep the flag in — an \
+                 in-process one is forgotten by a restart and never seen by a \
+                 second instance"
+                    .to_owned(),
+            ))
+        })?;
+        quotas.set_halt(reason).await.map_err(RuntimeError::Store)
+    }
+
+    /// Why this tenant is halted, if it is.
+    ///
+    /// # Errors
+    ///
+    /// If no quota store is wired, or the store is unreachable.
+    pub async fn halted(&self) -> Result<Option<String>, RuntimeError> {
+        let quotas = self.quotas.as_ref().ok_or_else(|| {
+            RuntimeError::Store(crate::core::StoreError::Backend(
+                "no quota store is wired, so no emergency stop can be set or read".to_owned(),
+            ))
+        })?;
+        quotas.halted().await.map_err(RuntimeError::Store)
+    }
+
     /// # Errors
     ///
     /// If the store is unreachable.
@@ -515,6 +568,30 @@ impl Runtime {
         let Some(quotas) = self.quotas.as_ref() else {
             return Ok(());
         };
+
+        // The halt is checked **before** the unlimited shortcut, because an
+        // emergency stop is not a ceiling and a tenant with no ceilings is
+        // exactly the one an operator is most likely to need to stop. Reading it
+        // fails closed for the same reason the ceilings do: a switch that yields
+        // when its store is unreachable is a switch an attacker throws by taking
+        // the store down.
+        match quotas.halted().await {
+            Ok(Some(reason)) => {
+                return Err(RuntimeError::QuotaExceeded(
+                    crate::quota::QuotaError::Halted {
+                        tenant: self.tenant.as_str().to_owned(),
+                        reason,
+                    },
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(RuntimeError::QuotaExceeded(
+                    crate::quota::QuotaError::Unavailable(e.to_string()),
+                ));
+            }
+        }
+
         if self.quota.is_unlimited() {
             return Ok(());
         }

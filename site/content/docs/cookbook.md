@@ -962,6 +962,33 @@ the first.
 **The trap:** believing the type is the security boundary. It is not — it is the
 *shape*. The manifest still declares what this deployment permits.
 
+## 🧱 Where are the built-in tools?
+
+There are none, and the reason is worth two paragraphs because every other
+framework ships some.
+
+The tools they ship are mostly **provider-hosted** — ADK's Google Search and
+Code Execution, the OpenAI Agents SDK's `WebSearchTool` and
+`CodeInterpreterTool`. Those run on the provider's servers *during generation*.
+Here a world-visible action is an effect: announced durably before it acts,
+authorized against the agent's declaration, metered against a budget, and read
+back from the journal on replay. A hosted tool is none of those and cannot be
+made into any of them, because by the time the completion comes back the call has
+already happened. Accepting one would put an action outside the journal, which is
+the single thing this runtime exists to prevent.
+
+For tools that run *in this process*, the domain-neutral ones already have
+governed homes: fetching a URL is the `media` feature,
+with SSRF, DNS-pinning and content controls a generic `http_get` would have to
+reimplement badly; running untrusted code belongs behind an OS process boundary
+as an MCP server, not inside the deterministic zone. What is left is a connector
+catalogue — and a catalogue is authority somebody has to review, entry by entry,
+forever.
+
+What you get instead: `execution.kind` is the built-in *behaviour* —
+`completion` and `tool-calling` are the prebuilt agent loop, minus the part that
+runs outside the journal — and a typed `Tool` is about fifteen lines.
+
 ## 🔌 Call tools on an MCP server you already run
 
 The tool tier is not "your tools, MCP-shaped". `tools::McpClient` is a real MCP
@@ -1169,19 +1196,52 @@ let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
 
 Use `PostgresStore` instead of `RedbStore` when several plane instances share
 the memory; it implements the same `MemoryStore` contract and serializes
-concurrent revisions of one id. Choose the subject deliberately:
+concurrent revisions of one id.
 
-- `agent/triage/account/{account}` for one agent's private memory;
-- `team/support/account/{account}` for memory shared by support agents.
+### Choosing a subject: private, team, global
+
+A subject does **three** jobs at once, and picking one means deciding all three:
+
+| | |
+|---|---|
+| **Sharing** | who retrieves it — by convention, enforced by policy |
+| **Retrieval** | `Recall::about(subject)` ranges over exactly this scope |
+| **Erasure** | `forget_subject` / `erase_subject` name a subject, so it is the unit a person's erasure request deletes |
+
+```text
+agent/triage/account/{account}    one agent's private memory about one account
+team/support/account/{account}    shared by the support agents
+tenant/policy                     every agent in the tenant reads it
+```
 
 Those strings organize retrieval; they do **not** grant access. Authorize
 `memory.recall` and `memory.remember` in policy using the acting agent and the
 subject/purpose carried in the effect arguments.
 
+**A tenant-global subject is expressible and carries two hazards worth naming**,
+because nothing structural stops either:
+
+* **Blast radius.** A poisoned global memory reaches every agent in the tenant.
+  Trust ranking bounds the damage — an untrusted global memory cannot evict a
+  trusted one, and it stays untrusted at every sink — but it is still read by
+  everything. Prefer a narrow subject and widen deliberately.
+* **Erasure.** A subject is the unit an erasure request names. Personal data in a
+  global subject is therefore *outside* any one person's erasure unit, and
+  `forget_subject("tenant/policy")` would erase everybody's. Keep global subjects
+  for material that is nobody's personal data — policy text, product facts — and
+  keep anything attributable to a person in a subject that names them.
+
+Global memory is the right shape for *"refunds over €5,000 need a manager"*. It
+is the wrong shape for *"this customer prefers German"*.
+
 Inside a skill:
 
 ```rust
-let known = cx.recall(Recall::about(&account).for_purpose("support").limit(5)).await?;
+let subject = format!("team/support/account/{account}");
+let known = cx.recall(Recall::about(&subject).for_purpose("support").limit(5)).await?;
+// Trusted memories come first: recall truncates, and ordering the window by
+// recency alone lets anything able to write an untrusted memory evict the
+// trusted ones by writing `limit` of them.
 // Every item is labelled. Reading metadata is free; acting on the content is not.
 for memory in &known {
     println!("{} (trust {:?})", memory.peek().id, memory.label().trust);

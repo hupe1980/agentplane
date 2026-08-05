@@ -60,7 +60,10 @@ fn decoded_media(
     Ok((media_type.to_owned(), bytes))
 }
 
-fn content_from_prompt_json(block: &Value, model: &ModelId) -> Result<ContentBlock, ModelError> {
+pub(crate) fn content_from_prompt_json(
+    block: &Value,
+    model: &ModelId,
+) -> Result<ContentBlock, ModelError> {
     if let Some(text) = block.get("text").and_then(Value::as_str) {
         return Ok(ContentBlock::Text(text.to_owned()));
     }

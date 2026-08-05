@@ -16,13 +16,36 @@ use super::redb::{MAX_STR, RedbStore, be, begin_write};
 /// a memory that can be repaired and one that can only be purged.
 const ITEMS: TableDefinition<(&str, &str, u64), &str> = TableDefinition::new("memory_items");
 
-/// `(tenant, subject, purpose, created_at, id) -> version`, current versions only.
+/// `(tenant, subject, purpose, created_at, id) -> (version, trust rank)`,
+/// current versions only.
 ///
 /// The retrieval path. Subject leads because it is the axis an operator reasons
 /// about and the unit an erasure request names; `created_at` is negated so a
 /// forward scan reads newest first without reversing an iterator.
-const BY_SUBJECT: TableDefinition<(&str, &str, &str, i64, &str), u64> =
+///
+/// The **trust rank rides in the index value** so a bounded recall can rank by
+/// it without reading every item. Recall truncates, and truncating by recency
+/// alone is an eviction an attacker steers: anything that can write an untrusted
+/// memory — model output and tool output both can, by design — writes `limit` of
+/// them and the trusted ones silently lose. Every label stays correct in that
+/// scenario, which is what makes it hard to see; the defect is in the ordering,
+/// not the labelling.
+/// `(tenant, subject, purpose, negated created_at, id)`.
+type SubjectKey<'a> = (&'a str, &'a str, &'a str, i64, &'a str);
+/// The current version, and how it ranks for trust.
+type SubjectEntry = (u64, u8);
+
+const BY_SUBJECT: TableDefinition<SubjectKey, SubjectEntry> =
     TableDefinition::new("memory_by_subject");
+
+/// Lower sorts first. Explicit rather than relying on the enum's own order, so
+/// a new level has to be given a rank rather than inheriting one.
+const fn trust_rank(trust: crate::core::Trust) -> u8 {
+    match trust {
+        crate::core::Trust::Trusted => 0,
+        crate::core::Trust::Untrusted => 1,
+    }
+}
 
 /// `(tenant, id) -> (subject, purpose, created_at, version)`, the current one.
 ///
@@ -185,7 +208,7 @@ impl MemoryStore for RedbStore {
                             -created,
                             id.as_str(),
                         ),
-                        version,
+                        (version, trust_rank(item.trust)),
                     )
                     .map_err(|e| be(&e))?;
 
@@ -266,15 +289,28 @@ impl MemoryStore for RedbStore {
                 ),
             };
 
-            let mut out = Vec::new();
+            // Two buckets, each bounded by `limit`, filled in one pass — so a
+            // trusted memory is never evicted by a newer untrusted one, and the
+            // scan still reads at most `2 * limit` items rather than the whole
+            // subject. The index range is walked to its end because the rank is
+            // in the value: stopping early would be the recency-only truncation
+            // this exists to remove.
+            let mut trusted: Vec<MemoryItem> = Vec::new();
+            let mut untrusted: Vec<MemoryItem> = Vec::new();
             for entry in by_subject.range(from..=to).map_err(|e| be(&e))? {
-                if out.len() >= limit {
+                if trusted.len() >= limit {
                     break;
                 }
                 let (k, v) = entry.map_err(|e| be(&e))?;
+                let (version, rank) = v.value();
+                // A full untrusted bucket cannot improve the answer, and
+                // deserializing into it would be work thrown away.
+                if rank != 0 && untrusted.len() >= limit {
+                    continue;
+                }
                 let id = k.value().4;
                 let Some(raw) = items
-                    .get((tenant.as_str(), id, v.value()))
+                    .get((tenant.as_str(), id, version))
                     .map_err(|e| be(&e))?
                 else {
                     continue;
@@ -294,9 +330,17 @@ impl MemoryStore for RedbStore {
                 if as_of.is_some_and(|at| effective.is_some_and(|expires| expires <= at)) {
                     continue;
                 }
-                out.push(item);
+                if rank == 0 {
+                    trusted.push(item);
+                } else {
+                    untrusted.push(item);
+                }
             }
-            Ok(out)
+            trusted.truncate(limit);
+            let room = limit - trusted.len();
+            untrusted.truncate(room);
+            trusted.append(&mut untrusted);
+            Ok(trusted)
         })
         .await
     }

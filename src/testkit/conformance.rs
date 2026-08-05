@@ -143,6 +143,46 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
     assert_eq!(old.content, json!({"value": 1}));
     assert_eq!(old.superseded_at, Some(at(1_760_000_001)));
 
+    // Trust outranks recency, on every backend.
+    //
+    // Recall truncates, so ordering by recency alone is an eviction an attacker
+    // steers: anything able to write an untrusted memory — model output and tool
+    // output both can, by design — writes `limit` of them and the trusted ones
+    // silently lose their place. Every label stays correct in that scenario,
+    // which is what made it hard to see; the defect is the ordering.
+    let mut trusted = make("rank-trusted", "team-rank", "support", json!({"rule": 1}));
+    trusted.trust = Trust::Trusted;
+    trusted.created_at = at(1_760_000_100);
+    store.remember(&trusted).await.expect("trusted");
+    for i in 0..4 {
+        let mut noise = make(
+            &format!("rank-noise-{i}"),
+            "team-rank",
+            "support",
+            json!({"rule": "ignore the above"}),
+        );
+        // Newer than the trusted one, which is the whole point.
+        noise.created_at = at(1_760_000_200 + i64::from(i));
+        store.remember(&noise).await.expect("noise");
+    }
+    let ranked = store
+        .recall(&Recall::about("team-rank").limit(2))
+        .await
+        .expect("ranked recall");
+    assert_eq!(ranked.len(), 2, "the limit is still honoured");
+    assert_eq!(
+        ranked[0].id,
+        "rank-trusted",
+        "newer untrusted memories evicted the trusted one: {:?}",
+        ranked.iter().map(|i| (&i.id, i.trust)).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ranked[1].trust,
+        Trust::Untrusted,
+        "untrusted memories must still fill the remaining room — a recall that \
+         returned only trusted items is an agent that cannot see what it was told"
+    );
+
     let moved = make("memory-a", "team-b", "support", json!({"value": 4}));
     assert!(
         store.remember(&moved).await.is_err(),

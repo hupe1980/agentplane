@@ -362,6 +362,29 @@ and having two ways to spell it is how a plane ends up with a policy layer
 everyone believes is on. The default is `DenyAll`, and whether an engine governed
 a run is recorded at admission.
 
+### Retrieval ranks by trust, not only by recency
+
+A memory recall is bounded — a caller asks for ten — and what fills that window
+decides what a model treats as established fact. Ordering it by recency alone is
+an eviction an attacker steers, and the reason is worth stating precisely because
+every label involved stays correct.
+
+Model output and tool output can become memories. That is the design, and they
+arrive untrusted. But anything able to write an untrusted memory can write as
+many as the limit, and the trusted ones then lose their place in the window
+silently: the caller gets exactly the number it asked for, each item honestly
+labelled untrusted, with nothing saying that a trusted memory existed and did not
+fit. The defect is in the **ordering, not the labelling** — which is what makes
+it hard to see, because inspecting any single returned item shows a correct
+answer.
+
+So trust leads the retrieval index on both backends, ahead of recency. It is a
+ranking key, and a ranking key belongs in the index rather than in a sort applied
+afterwards — the same reason the tenant leads every other key here. Untrusted
+memories still fill whatever room is left: a recall that returned only trusted
+items would be an agent that cannot see what it was told, which is a different
+defect rather than a stricter version of this one.
+
 ### The authorization context {#the-authorization-context}
 
 Cedar's entity model is the part that has to be learned, and prose about it does

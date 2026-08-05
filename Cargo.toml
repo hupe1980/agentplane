@@ -307,6 +307,13 @@ required-features = ["redb", "testkit", "media"]
 name              = "manifest_run"
 required-features = ["redb", "testkit", "manifest"]
 
+# A real MCP server in-process beside a typed tool, so the two-transport shape
+# is runnable rather than only described. `rmcp`'s server half is a
+# dev-dependency, which examples may use.
+[[example]]
+name              = "mcp_tools"
+required-features = ["redb", "testkit", "manifest", "mcp"]
+
 # Three agents, three manifests, three runtimes.
 [[example]]
 name              = "blog_room"

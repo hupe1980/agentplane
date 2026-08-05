@@ -228,6 +228,17 @@ CREATE TABLE IF NOT EXISTS quota_running (
     PRIMARY KEY (tenant, run_id)
 );
 
+-- The emergency stop: one row per halted tenant, none for the rest.
+--
+-- In the database rather than in a process, because a switch that stops only
+-- the instance it was thrown on is not a switch — it is the in-process-counter
+-- failure arriving during an incident.
+CREATE TABLE IF NOT EXISTS quota_halted (
+    tenant      TEXT   NOT NULL,
+    reason      TEXT   NOT NULL,
+    PRIMARY KEY (tenant)
+);
+
 CREATE TABLE IF NOT EXISTS quota_spent (
     tenant      TEXT   NOT NULL,
     period      TEXT   NOT NULL,

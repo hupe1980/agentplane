@@ -458,3 +458,56 @@ fn every_documented_manifest_parses() {
          the examples were removed or the fence scan stopped matching them"
     );
 }
+
+/// Every example is actually run by the recipe that claims to run them all.
+///
+/// `just examples` is the only thing that executes example code, so an example
+/// missing from it compiles forever and never runs — which is worse than not
+/// having it, because the README points readers at something nothing checks.
+/// `memory_run` had been in that state.
+///
+/// The two `_live` examples are exempt by name and by design: they spend money
+/// against a real provider, and a credential being available is not a decision
+/// to use it.
+#[test]
+fn every_example_is_run_by_the_examples_recipe() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let recipe = read("justfile");
+    let block = recipe
+        .split("\nexamples:")
+        .nth(1)
+        .expect("the justfile has an `examples` recipe")
+        .split("\n\n")
+        .next()
+        .expect("the recipe ends at a blank line");
+
+    let mut on_disk: Vec<String> = std::fs::read_dir(root.join("examples"))
+        .expect("the examples directory is readable")
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let p = e.path();
+            (p.extension()? == "rs")
+                .then(|| p.file_stem()?.to_str().map(str::to_owned))
+                .flatten()
+        })
+        .filter(|name| !name.ends_with("_live"))
+        .collect();
+    on_disk.sort();
+
+    assert!(
+        on_disk.len() > 8,
+        "only {on_disk:?} were found — the examples directory moved and this \
+         guard is now inert"
+    );
+
+    let missing: Vec<&String> = on_disk
+        .iter()
+        .filter(|name| !block.contains(&format!("--example {name}")))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "these examples are never executed by `just examples`, so nothing \
+         notices when they stop working: {missing:?}"
+    );
+}

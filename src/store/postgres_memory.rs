@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS memory_items (
     created_at  BIGINT NOT NULL,
     expires_at  BIGINT,
     current     BOOLEAN NOT NULL,
+    -- Lower sorts first: 0 trusted, 1 untrusted. A ranking key belongs in the
+    -- index rather than in a sort, for the same reason the tenant does.
+    trust_rank  SMALLINT NOT NULL,
     item        JSONB  NOT NULL,
     PRIMARY KEY (tenant, id, version)
 );
@@ -31,9 +34,13 @@ CREATE TABLE IF NOT EXISTS memory_items (
 CREATE UNIQUE INDEX IF NOT EXISTS memory_one_current
     ON memory_items (tenant, id) WHERE current;
 
--- Current memories for one governed scope, newest first.
+-- Current memories for one governed scope: most trusted first, then newest.
+--
+-- `trust_rank` leads `created_at` because recall truncates, and truncating by
+-- recency alone is an eviction an attacker steers — anything able to write an
+-- untrusted memory writes `limit` of them and the trusted ones silently lose.
 CREATE INDEX IF NOT EXISTS memory_by_subject
-    ON memory_items (tenant, subject, purpose, created_at DESC, id)
+    ON memory_items (tenant, subject, purpose, trust_rank, created_at DESC, id)
     WHERE current;
 
 CREATE TABLE IF NOT EXISTS memory_derived (
@@ -96,6 +103,15 @@ fn version_i64(version: u64) -> Result<i64, StoreError> {
             "memory version {version} exceeds PostgreSQL BIGINT"
         ))
     })
+}
+
+/// Lower sorts first. Explicit rather than relying on the enum's own order, so
+/// a new level has to be given a rank rather than inheriting one.
+const fn trust_rank(trust: crate::core::Trust) -> i16 {
+    match trust {
+        crate::core::Trust::Trusted => 0,
+        crate::core::Trust::Untrusted => 1,
+    }
 }
 
 #[async_trait]
@@ -238,8 +254,9 @@ impl MemoryStore for PostgresStore {
             .map_err(|error| StoreError::Backend(error.to_string()))?;
         tx.execute(
             "INSERT INTO memory_items
-                (tenant, id, version, subject, purpose, created_at, expires_at, current, item)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8)",
+                (tenant, id, version, subject, purpose, created_at, expires_at, current,
+                 trust_rank, item)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8, $9)",
             &[
                 &tenant,
                 &stored.id,
@@ -250,6 +267,7 @@ impl MemoryStore for PostgresStore {
                 &stored
                     .expires_at
                     .map(crate::core::Timestamp::unix_timestamp),
+                &trust_rank(stored.trust),
                 &json,
             ],
         )
@@ -296,7 +314,7 @@ impl MemoryStore for PostgresStore {
                                                         COALESCE(item.expires_at, -9223372036854775808),
                                                         COALESCE(access.expires_at, -9223372036854775808)
                                                 ) > $4)
-                                 ORDER BY item.created_at DESC, item.id ASC LIMIT $5",
+                                 ORDER BY item.trust_rank ASC, item.created_at DESC, item.id ASC LIMIT $5",
                                 &[
                                         &tenant,
                                         &query.subject,

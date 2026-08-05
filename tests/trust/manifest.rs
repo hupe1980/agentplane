@@ -1697,7 +1697,7 @@ fn oversight_without_a_declarative_agent_is_refused() {
         .replace("  execution:\n    kind: completion\n", "")
         .replace(
             "  identity:",
-            "  oversight:\n    approval: required\n    deadline: same-day\n  identity:",
+            "  oversight:\n    approval: required\n    deadline: { name: same-day, kind: hours, params: { n: 8 } }\n  identity:",
         );
     match Manifest::parse(&coded) {
         Err(ManifestError::Unenforceable { field, .. }) => {
@@ -1713,7 +1713,7 @@ fn oversight_without_a_declarative_agent_is_refused() {
     // Beside a declarative agent it is accepted, because there it binds.
     let declared = DECLARATIVE.replace(
         "  identity:",
-        "  oversight:\n    approval: required\n    deadline: same-day\n  identity:",
+        "  oversight:\n    approval: required\n    deadline: { name: same-day, kind: hours, params: { n: 8 } }\n  identity:",
     );
     Manifest::parse(&declared).expect("oversight binds for a declarative agent");
 }
@@ -1727,7 +1727,7 @@ fn oversight_without_a_declarative_agent_is_refused() {
 fn proceeding_with_no_human_must_be_stated() {
     let sloppy = DECLARATIVE.replace(
         "  identity:",
-        "  oversight:\n    approval: required\n    deadline: same-day\n    on_expiry: proceed\n  identity:",
+        "  oversight:\n    approval: required\n    deadline: { name: same-day, kind: hours, params: { n: 8 } }\n    on_expiry: proceed\n  identity:",
     );
     assert!(
         matches!(
@@ -1750,7 +1750,7 @@ fn an_unstated_expiry_denies() {
     use agentplane::manifest::Expiry;
     let m = Manifest::parse(&DECLARATIVE.replace(
         "  identity:",
-        "  oversight:\n    approval: required\n    deadline: same-day\n  identity:",
+        "  oversight:\n    approval: required\n    deadline: { name: same-day, kind: hours, params: { n: 8 } }\n  identity:",
     ))
     .expect("parse");
     let o = m.spec.oversight.expect("oversight");

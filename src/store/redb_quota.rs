@@ -25,6 +25,15 @@ const RUNNING: TableDefinition<(&str, &str), i64> = TableDefinition::new("quota_
 /// `(tenant, period) -> (tokens, minor_units)`.
 const SPENT: TableDefinition<(&str, &str), (u64, i64)> = TableDefinition::new("quota_spent");
 
+/// `tenant -> reason`. The emergency stop.
+///
+/// One row per halted tenant and nothing for the rest, so the check is a point
+/// lookup and an unhalted plane pays one miss. In the store rather than in the
+/// process, because a switch that stops only the instance it was thrown on is
+/// not a switch — it is the in-process-counter failure arriving during an
+/// incident.
+const HALTED: TableDefinition<&str, &str> = TableDefinition::new("quota_halted");
+
 #[async_trait]
 impl QuotaStore for RedbStore {
     async fn reserve(
@@ -103,6 +112,46 @@ impl QuotaStore for RedbStore {
             tenant: self.tenant_name(),
             running,
         })
+    }
+
+    async fn set_halt(&self, reason: Option<&str>) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
+        let reason = reason.map(ToOwned::to_owned);
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            {
+                let mut halted = w.open_table(HALTED).map_err(|e| be(&e))?;
+                match &reason {
+                    Some(reason) => {
+                        halted
+                            .insert(tenant.as_str(), reason.as_str())
+                            .map_err(|e| be(&e))?;
+                    }
+                    None => {
+                        halted.remove(tenant.as_str()).map_err(|e| be(&e))?;
+                    }
+                }
+            }
+            w.commit().map_err(|e| be(&e))
+        })
+        .await
+    }
+
+    async fn halted(&self) -> Result<Option<String>, StoreError> {
+        let tenant = self.tenant_name();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            // An absent table is an unhalted plane, not an error: nothing has
+            // ever been halted, so there is nothing to read.
+            let Ok(halted) = r.open_table(HALTED) else {
+                return Ok(None);
+            };
+            Ok(halted
+                .get(tenant.as_str())
+                .map_err(|e| be(&e))?
+                .map(|v| v.value().to_owned()))
+        })
+        .await
     }
 
     async fn release(&self, run: RunId) -> Result<(), StoreError> {

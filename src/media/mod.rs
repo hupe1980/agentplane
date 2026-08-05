@@ -299,15 +299,47 @@ pub struct MediaCandidate<'a> {
     pub bytes: &'a [u8],
 }
 
+/// What a validator concluded about an artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// The bytes are acceptable as they arrived.
+    Accept,
+    /// Store and send **these** bytes instead.
+    ///
+    /// The seam for normalisation — stripping EXIF, dropping ancillary chunks,
+    /// re-encoding to one canonical form. It exists because a validator that can
+    /// only veto cannot do any of that, and rejecting every photograph that
+    /// carries GPS metadata is not a control anyone leaves switched on.
+    ///
+    /// The runtime deliberately ships **no** normaliser. Stripping metadata
+    /// means parsing the format, and owning a parser for every format an
+    /// embedder might accept is a permanent liability for a job that belongs to
+    /// whoever chose the formats. What the runtime owns is the guarantee around
+    /// it: the replacement is re-checked against the declared media type and the
+    /// size ceiling, and the **digest is taken over the bytes that survive** — so
+    /// the journal commits to what was inspected and sent, never to what
+    /// arrived.
+    Replace(Vec<u8>),
+}
+
 /// An operator-supplied content validator.
 ///
 /// `identity` must include the validator and ruleset version. It is included in
 /// the effect key and the resulting evidence, so changing scanner semantics is
-/// a changed effect rather than an invisible deployment detail.
+/// a changed effect rather than an invisible deployment detail — and that covers
+/// a normaliser exactly as it covers a scanner, since changing what is stripped
+/// changes what the model saw.
 #[async_trait]
 pub trait MediaValidator: Send + Sync + Debug {
     fn identity(&self) -> &str;
-    async fn validate(&self, candidate: &MediaCandidate<'_>) -> Result<(), String>;
+
+    /// Inspect the candidate, and optionally replace it.
+    ///
+    /// # Errors
+    ///
+    /// A reason the artifact is refused. Refusing is final; there is no
+    /// "accept with warnings", because a warning nobody reads is an accept.
+    async fn validate(&self, candidate: &MediaCandidate<'_>) -> Result<Verdict, String>;
 }
 
 /// A configured governed-media fetcher.
@@ -408,20 +440,41 @@ impl GovernedMedia {
                     "media type '{media_type}' has no built-in signature check; configure a versioned content validator"
                 )));
             }
-            let candidate = MediaCandidate {
-                source_url: source.as_str(),
-                final_url: current.as_str(),
-                media_type: &media_type,
-                bytes: &bytes,
-            };
             let mut validated_by = Vec::with_capacity(self.validators.len());
+            let mut bytes = bytes;
             for validator in &self.validators {
-                validator.validate(&candidate).await.map_err(|detail| {
+                let candidate = MediaCandidate {
+                    source_url: source.as_str(),
+                    final_url: current.as_str(),
+                    media_type: &media_type,
+                    // Each validator sees what the one before it produced, or a
+                    // normaliser and a scanner would disagree about which bytes
+                    // were scanned.
+                    bytes: &bytes,
+                };
+                let verdict = validator.validate(&candidate).await.map_err(|detail| {
                     MediaError::Refused(format!(
                         "media validator '{}' refused the artifact: {detail}",
                         validator.identity()
                     ))
                 })?;
+                if let Verdict::Replace(replacement) = verdict {
+                    // A replacement is bytes the deployment chose, and it is
+                    // re-checked exactly as the fetched bytes were. Without
+                    // this, a normaliser is a hole straight past the signature
+                    // check and the size ceiling that every fetched byte
+                    // crosses — the more dangerous for being on the inside.
+                    if replacement.len() > self.policy.max_bytes {
+                        return Err(MediaError::Refused(format!(
+                            "media validator '{}' returned {} bytes, past the {} ceiling",
+                            validator.identity(),
+                            replacement.len(),
+                            self.policy.max_bytes
+                        )));
+                    }
+                    validate_media_signature(&media_type, &replacement)?;
+                    bytes = replacement;
+                }
                 validated_by.push(validator.identity().to_owned());
             }
             return Ok(FetchBody {
@@ -1132,8 +1185,8 @@ mod tests {
             fn identity(&self) -> &str {
                 &self.0
             }
-            async fn validate(&self, _: &MediaCandidate<'_>) -> Result<(), String> {
-                Ok(())
+            async fn validate(&self, _: &MediaCandidate<'_>) -> Result<Verdict, String> {
+                Ok(Verdict::Accept)
             }
         }
 
@@ -1149,5 +1202,189 @@ mod tests {
         assert_eq!(effect.trust(), Trust::Untrusted);
         assert_eq!(descriptor.args["validators"][0], "clamav:rules-42");
         assert_eq!(descriptor.args["policy"]["max_bytes"], DEFAULT_MAX_BYTES);
+    }
+}
+
+/// The block builders, checked against the drivers that must consume them.
+///
+/// These two sides were tested separately and nothing connected them. The
+/// builders produce a provider's block shape; each driver parses that shape back
+/// out. Both had tests, and both tests built their own JSON by hand — so a
+/// renamed key in either would have passed the whole suite while multimodal
+/// dispatch silently stopped working for that provider.
+///
+/// It is the two-implementations-of-one-rule shape, applied to a wire format:
+/// they agree everywhere except the boundary nobody probed. So the producer's
+/// real output is fed to the real consumer here.
+#[cfg(test)]
+mod block_shape_tests {
+    use super::{FetchedMedia, MediaRetention};
+    use crate::core::Digest;
+    use serde_json::Value;
+
+    fn fetched(media_type: &str) -> FetchedMedia {
+        FetchedMedia {
+            digest: Digest::of(b"bytes"),
+            media_type: media_type.to_owned(),
+            bytes: 5,
+            source_url: "https://media.example/a".to_owned(),
+            final_url: "https://media.example/a".to_owned(),
+            redirects: 0,
+            validated_by: Vec::new(),
+            hops: Vec::new(),
+            retention: MediaRetention::External {
+                policy: "test".to_owned(),
+            },
+        }
+    }
+
+    /// Substitute the marker the way live dispatch does, so the driver sees what
+    /// it would really receive.
+    fn materialized(block: &Value, with: &str) -> Value {
+        match block {
+            Value::Object(o) if o.contains_key("$agentplane_media") => {
+                Value::String(with.to_owned())
+            }
+            Value::Object(o) => Value::Object(
+                o.iter()
+                    .map(|(k, v)| (k.clone(), materialized(v, with)))
+                    .collect(),
+            ),
+            Value::Array(a) => Value::Array(a.iter().map(|v| materialized(v, with)).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// Every builder emits exactly one marker, in the field carrying the bytes.
+    ///
+    /// The property that keeps the digest out of the journal: a builder that
+    /// inlined bytes instead would put the payload in the effect key.
+    #[test]
+    fn every_provider_block_carries_exactly_one_media_marker() {
+        let media = fetched("image/png");
+        for (name, block) in [
+            ("anthropic", media.anthropic_image()),
+            ("openai", media.openai_image()),
+            ("bedrock", media.bedrock_image()),
+        ] {
+            let text = serde_json::to_string(&block).expect("serializable");
+            assert_eq!(
+                text.matches("$agentplane_media").count(),
+                1,
+                "{name} block does not carry exactly one marker: {text}"
+            );
+            assert!(
+                !text.contains("\"data\":\"iVBOR") && !text.contains("base64,"),
+                "{name} block inlined bytes rather than a digest marker: {text}"
+            );
+        }
+        let document = fetched("application/pdf").bedrock_document();
+        assert_eq!(
+            serde_json::to_string(&document)
+                .expect("serializable")
+                .matches("$agentplane_media")
+                .count(),
+            1
+        );
+    }
+
+    /// The Bedrock driver parses the block the Bedrock builder produces.
+    #[cfg(feature = "bedrock")]
+    #[test]
+    fn the_bedrock_driver_accepts_the_bedrock_builders_own_block() {
+        use base64::Engine as _;
+        let model = crate::model::ModelId::new("bedrock", "test");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"png");
+
+        let block = materialized(&fetched("image/png").bedrock_image(), &encoded);
+        crate::model::bedrock::content_from_prompt_json(&block, &model)
+            .expect("the driver must accept the block its own builder produced");
+
+        let pdf = base64::engine::general_purpose::STANDARD.encode(b"pdf");
+        let doc = materialized(&fetched("application/pdf").bedrock_document(), &pdf);
+        crate::model::bedrock::content_from_prompt_json(&doc, &model)
+            .expect("the driver must accept the document its own builder produced");
+    }
+}
+
+/// The normalisation seam: a validator may replace the bytes, within bounds.
+#[cfg(test)]
+mod normalisation_tests {
+    use super::{MediaCandidate, MediaValidator, Verdict, validate_media_signature};
+    use async_trait::async_trait;
+
+    /// A one-byte PNG header plus a fake ancillary payload.
+    fn png(extra: &[u8]) -> Vec<u8> {
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        out.extend_from_slice(extra);
+        out
+    }
+
+    #[derive(Debug)]
+    struct Strips(&'static str, Vec<u8>);
+
+    #[async_trait]
+    impl MediaValidator for Strips {
+        fn identity(&self) -> &str {
+            self.0
+        }
+        async fn validate(&self, _: &MediaCandidate<'_>) -> Result<Verdict, String> {
+            Ok(Verdict::Replace(self.1.clone()))
+        }
+    }
+
+    /// A replacement is held to the same signature check the fetched bytes were.
+    ///
+    /// Without this, the normalisation seam is a hole straight past the check
+    /// every fetched byte crosses — and the more dangerous for being on the
+    /// inside, since a deployment adds a normaliser precisely to make media
+    /// *safer*.
+    #[test]
+    fn a_replacement_is_still_checked_against_the_declared_media_type() {
+        // The honest case: a stripped PNG is still a PNG.
+        assert!(validate_media_signature("image/png", &png(b"IDAT")).is_ok());
+
+        // The case that matters: a normaliser returning something else entirely
+        // must not smuggle it through under the declared type.
+        let smuggled = b"%PDF-1.4 not an image at all".to_vec();
+        assert!(
+            validate_media_signature("image/png", &smuggled).is_err(),
+            "a replacement of a different format passed the signature check"
+        );
+    }
+
+    /// The digest commits to what survived validation, not to what arrived.
+    ///
+    /// This is the property that makes replacement safe to journal at all: the
+    /// chain must commit to the bytes that were inspected *and* sent, or an
+    /// auditor reading the digest is reading about a different artifact than the
+    /// model saw.
+    #[tokio::test]
+    async fn the_stored_digest_is_of_the_replaced_bytes() {
+        let original = png(b"EXIF-GPS-51.5074N");
+        let stripped = png(b"IDAT");
+        assert_ne!(original, stripped);
+
+        let validator = Strips("strip-exif:v1", stripped.clone());
+        let candidate = MediaCandidate {
+            source_url: "https://media.example/a.png",
+            final_url: "https://media.example/a.png",
+            media_type: "image/png",
+            bytes: &original,
+        };
+        let Ok(Verdict::Replace(out)) = validator.validate(&candidate).await else {
+            panic!("the normaliser did not replace");
+        };
+        assert_eq!(out, stripped);
+        assert_eq!(
+            crate::core::Digest::of(&out),
+            crate::core::Digest::of(&stripped),
+            "the digest must be of the bytes that survive validation"
+        );
+        assert_ne!(
+            crate::core::Digest::of(&out),
+            crate::core::Digest::of(&original),
+            "the fixture no longer distinguishes stripped from original bytes"
+        );
     }
 }

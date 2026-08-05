@@ -251,11 +251,8 @@ pub struct Oversight {
     /// rather than by omission.
     #[serde(default)]
     pub approvers: Vec<String>,
-    /// The obligation that bounds the wait, by name.
-    ///
-    /// Resolved by the deployment's `Calendar`, so "five working days" means
-    /// whatever that domain says it means and this crate never guesses.
-    pub deadline: String,
+    /// The obligation that bounds the wait.
+    pub deadline: OversightDeadline,
     /// What happens when the window closes.
     #[serde(default)]
     pub on_expiry: Expiry,
@@ -268,12 +265,70 @@ pub struct Oversight {
     pub allow_unattended: bool,
 }
 
-/// Whether a human decides.
+/// The obligation that bounds an oversight wait.
+///
+/// # Why this is not just a name
+///
+/// It was, and the feature did not work. A declarative agent writes no code, so
+/// naming an obligation it cannot register left the run failing with *"wait
+/// references deadline 'review', which is not registered on this case"* — the
+/// one configuration the whole declarative tier exists for. The row claiming
+/// oversight was built had only ever been checked by parse tests.
+///
+/// So the declaration carries what registering needs, and the agent registers
+/// it. `kind` and `params` are handed to the deployment's `Calendar` unchanged,
+/// so *five working days* means whatever that domain says it means and this
+/// crate never guesses — which is the same reason the name alone was never
+/// enough.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OversightDeadline {
+    /// What the obligation is called on the case.
+    pub name: String,
+    /// The resolution rule, e.g. `hours`, `days`, `working-days`.
+    ///
+    /// Interpreted by the deployment's `Calendar`. A kind it does not know is a
+    /// refusal at resolution time, not a silent default.
+    pub kind: String,
+    /// Parameters for that rule, e.g. `{ n: 2 }`.
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+impl OversightDeadline {
+    /// The runtime shape, for registering the obligation.
+    #[must_use]
+    pub fn spec(&self) -> crate::core::DeadlineSpec {
+        crate::core::DeadlineSpec::new(
+            self.kind.clone(),
+            if self.params.is_null() {
+                serde_json::json!({})
+            } else {
+                self.params.clone()
+            },
+        )
+    }
+}
+
+/// What a human decides on.
+///
+/// Two values, both enforced, and neither is a predicate — "require approval
+/// when severity is high" is one step from an `if`, which is where a config
+/// format stops being config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Approval {
     /// Every answer waits for a person.
     Required,
+    /// Only the tool calls that ask for it wait; the answer returns unattended.
+    ///
+    /// The shape most deployments actually want, and the one that was missing.
+    /// Gating the *answer* of a tool-calling agent is a review that arrives
+    /// after the agent has already moved the money — the tool ran several turns
+    /// ago, and a reviewer refusing now is refusing a summary of something that
+    /// already happened. Gating the **call** is the control the answer gate
+    /// reads like.
+    ToolsOnly,
 }
 
 /// What happens when the approval window closes.
@@ -604,6 +659,24 @@ pub struct ToolGrant {
     /// Only a `tool-calling` agent uses it; a skill knows what it is calling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Whether a person approves each call, before it happens.
+    ///
+    /// The gate for a high-impact action. The task shows the **exact tool and
+    /// the exact arguments** that will be dispatched — not a description of
+    /// them, and not the answer they will eventually produce — because a
+    /// reviewer who cannot see what will happen is not reviewing.
+    ///
+    /// Needs `spec.oversight`, which supplies the approvers, the obligation
+    /// bounding the wait and what happens when it closes. Refused without it:
+    /// a grant claiming a human is in the loop when nothing would ask one is
+    /// exactly the decoration this format rejects.
+    ///
+    /// There is deliberately no diff. A diff needs the resource's current state,
+    /// which is domain knowledge this runtime does not have — and a field named
+    /// `diff` that showed arguments would be a control claiming more than it
+    /// does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_approval: bool,
     /// A JSON Schema for the arguments, carried opaquely.
     ///
     /// Sent to providers that enforce it during generation, so a well-shaped
@@ -706,6 +779,7 @@ impl Manifest {
             }
         }
         self.validate_oversight()?;
+        self.validate_tool_approval()?;
         self.validate_tool_grants()?;
         self.validate_topology()?;
         self.validate_models()?;
@@ -805,8 +879,23 @@ impl Manifest {
                          control nothing performs",
             });
         }
-        if o.deadline.trim().is_empty() {
-            return Err(ManifestError::Empty("spec.oversight.deadline"));
+        if o.deadline.name.trim().is_empty() {
+            return Err(ManifestError::Empty("spec.oversight.deadline.name"));
+        }
+        if o.deadline.kind.trim().is_empty() {
+            return Err(ManifestError::Empty("spec.oversight.deadline.kind"));
+        }
+        // `tools-only` with nothing asking for it gates nothing at all, and
+        // reads in review as oversight that is present.
+        if o.approval == Approval::ToolsOnly
+            && !self.spec.tools.iter().any(|grant| grant.requires_approval)
+        {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.oversight.approval",
+                detail: "'tools-only' with no tool grant requesting approval gates nothing — \
+                         set `requires_approval: true` on the calls a person must see, or \
+                         use 'required' to gate the answer",
+            });
         }
         // The same explicitness the runtime demands, demanded in the file.
         if o.on_expiry == Expiry::Proceed && !o.allow_unattended {
@@ -815,6 +904,43 @@ impl Manifest {
                 detail: "'proceed' needs `allow_unattended: true` — acting with no human when \
                          the window closes must be a decision somebody wrote down, not a \
                          value picked off a list",
+            });
+        }
+        Ok(())
+    }
+
+    /// A grant that asks for a human needs somewhere for that request to go.
+    fn validate_tool_approval(&self) -> Result<(), ManifestError> {
+        let asking: Vec<&str> = self
+            .spec
+            .tools
+            .iter()
+            .filter(|grant| grant.requires_approval)
+            .map(|grant| grant.reference.as_str())
+            .collect();
+        if asking.is_empty() {
+            return Ok(());
+        }
+        if self.spec.oversight.is_none() {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.tools[].requires_approval",
+                detail: "a grant asks for approval but `spec.oversight` is absent, so there \
+                         is nobody to ask, no window to wait in and no rule for what happens \
+                         when it closes — a grant claiming a human is in the loop when none is",
+            });
+        }
+        // The loop that would open the task is the declarative one. Beside a
+        // coded skill nothing would apply this, which is the decoration the
+        // whole format refuses.
+        if !matches!(
+            self.spec.execution.as_ref().map(|e| e.kind),
+            Some(ExecutionKind::ToolCalling)
+        ) {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.tools[].requires_approval",
+                detail: "per-call approval is applied by the `tool-calling` loop; a \
+                         hand-written skill chooses its own moment to ask, and a \
+                         `completion` agent calls no tools at all",
             });
         }
         Ok(())

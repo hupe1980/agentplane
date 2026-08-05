@@ -143,6 +143,16 @@ pub enum QuotaError {
         limit: i64,
     },
 
+    /// An operator stopped this tenant from starting new work.
+    ///
+    /// Deliberately its own variant rather than a zero ceiling. A ceiling says
+    /// *not right now*, and a caller is right to retry it; a halt says *somebody
+    /// is dealing with an incident*, and retrying is exactly what an operator
+    /// pulling the switch is trying to stop. Collapsing the two would teach
+    /// callers to hammer through the one refusal that means stop.
+    #[error("tenant '{tenant}' is halted by an operator: {reason}")]
+    Halted { tenant: String, reason: String },
+
     /// The accounting itself could not be reached.
     ///
     /// Fails **closed**. A quota that yields when its store is unreachable is a
@@ -192,6 +202,29 @@ pub trait QuotaStore: Send + Sync + Debug {
     ///
     /// If the store cannot be reached.
     async fn release(&self, run: RunId) -> Result<(), StoreError>;
+
+    /// Stop this tenant from starting new work, or let it start again.
+    ///
+    /// `Some(reason)` halts; `None` lifts. The reason is required when halting
+    /// because the next person to look will be someone else, possibly at 3am,
+    /// and *why* is the whole question.
+    ///
+    /// **In the store, not in the process.** An in-memory flag is a switch that
+    /// only stops the instance it was thrown on — which is the same failure an
+    /// in-process quota counter has, arriving at the worst possible moment. One
+    /// tenant's halt does not touch another's.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn set_halt(&self, reason: Option<&str>) -> Result<(), StoreError>;
+
+    /// Why this tenant is halted, if it is.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn halted(&self) -> Result<Option<String>, StoreError>;
 
     /// Add to what this tenant has spent in `period`.
     ///

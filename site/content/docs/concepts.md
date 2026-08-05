@@ -298,8 +298,10 @@ Four properties carry it:
   *somebody set it*.
 
 **Human tasks** are the other half. `oversight.approval: required` in a manifest
-makes a declarative agent open a worklist task carrying its **actual answer** and
-return only once a person decides. `TaskStore::claim` enforces four-eyes, and the
+makes a declarative agent register its obligation, open a worklist task carrying
+its **actual answer**, and return only once a person decides. Nothing durable is
+written until then — memory formation happens *after* approval, because a memory
+formed from a refused answer is read by the next run as established fact. `TaskStore::claim` enforces four-eyes, and the
 wire types deliberately carry **no actor field** — who is acting comes from the
 request's identity, never from its body, so an approval cannot be forged by the
 thing being approved.

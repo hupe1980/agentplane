@@ -363,3 +363,65 @@ async fn a_quota_refusal_is_not_a_policy_denial() {
         other => panic!("expected a quota refusal, got {other:?}"),
     }
 }
+
+/// The emergency stop refuses new work, across instances, and says why.
+///
+/// Three properties in one test because they are one control:
+///
+/// * it refuses a tenant with **no ceilings at all** — the halt is checked
+///   before the unlimited shortcut, because an unlimited tenant is exactly the
+///   one an operator is most likely to need to stop;
+/// * the refusal is **its own error**, not a ceiling. A ceiling says *not right
+///   now* and invites a retry, which is what somebody pulling this switch is
+///   trying to stop;
+/// * a **second plane on the same store** refuses too, because the flag is in
+///   the store. An in-process switch stops only the instance it was thrown on,
+///   which is the in-process-counter failure arriving during an incident.
+#[tokio::test]
+async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
+    let store = RedbStore::open_in_memory().expect("store");
+    // Deliberately unlimited: a halt is not a ceiling.
+    let one = plane(&store, "acme", TenantQuota::default());
+    let two = plane(&store, "acme", TenantQuota::default());
+
+    // The positive half, first: nothing is refused before the switch is thrown.
+    assert_eq!(
+        one.run("work", json!({})).await.expect("run").status,
+        RunStatus::Succeeded
+    );
+
+    one.set_halt(Some("incident 42: ledger reconciliation is wrong"))
+        .await
+        .expect("halt");
+
+    for (which, rt) in [("the halting instance", &one), ("a second instance", &two)] {
+        match rt.run("work", json!({})).await {
+            Err(agentplane::core::RuntimeError::QuotaExceeded(
+                agentplane::quota::QuotaError::Halted { tenant, reason },
+            )) => {
+                assert_eq!(tenant, "acme");
+                assert!(
+                    reason.contains("incident 42"),
+                    "{which}: the refusal must carry the operator's reason, got '{reason}'"
+                );
+            }
+            other => panic!("{which} admitted a run while halted: {other:?}"),
+        }
+    }
+
+    // Another tenant on the same store is untouched: a halt is per tenant, or
+    // an incident in one customer's data stops everybody else's business too.
+    let other = plane(&store, "globex", TenantQuota::default());
+    assert_eq!(
+        other.run("work", json!({})).await.expect("run").status,
+        RunStatus::Succeeded,
+        "halting one tenant stopped another"
+    );
+
+    one.set_halt(None).await.expect("lift");
+    assert_eq!(
+        two.run("work", json!({})).await.expect("run").status,
+        RunStatus::Succeeded,
+        "work did not resume on the second instance after the halt was lifted"
+    );
+}

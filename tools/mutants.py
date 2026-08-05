@@ -2498,6 +2498,84 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "::trusted(v));\n        }\n"
         "        self.sink(\n            crate::runtime::effects::Embed {",
     ),
+    "MemoryFormsBeforeTheHumanDecides": (
+        "src/runtime/declarative.rs",
+        "a_refused_answer_is_not_written_into_memory",
+        "an answer is written into durable memory before oversight decides, so "
+        "a reviewer's refusal fails the run while the refused answer stays a "
+        "standing fact the next run reads as established",
+        "        if let Some(spec) = oversight.filter(Proposal::gates_the_answer) {",
+        "        self.form_answer(cx, formation, formed_source.clone(), model)\n"
+        "            .await?;\n"
+        "        if let Some(spec) = oversight.filter(Proposal::gates_the_answer) {",
+    ),
+    "ToolCallingSkipsOversight": (
+        "src/runtime/declarative.rs",
+        "a_tool_calling_agent_still_asks_a_human",
+        "a tool-calling agent returns its answer without asking anyone, so a "
+        "declared `oversight.approval: required` is a control the runtime "
+        "silently does not apply — on the execution kind that has already "
+        "touched the world by the time it answers",
+        "                return self\n                    .settle(",
+        "                if true {\n                    return Ok(Outcome::done(answer));\n                }\n"
+        "                return self\n                    .settle(",
+    ),
+    "OversightNeverRegistersItsObligation": (
+        "src/runtime/declarative.rs",
+        "a_refused_answer_is_not_written_into_memory",
+        "the obligation bounding an oversight wait is never registered, so a "
+        "declarative agent — which writes no code and therefore cannot register "
+        "it either — fails outright in the one configuration the declarative "
+        "tier exists for",
+        "            cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)\n                .await?;",
+        "",
+    ),
+    "TheMediaBuilderAndItsDriverDrift": (
+        "src/media/mod.rs",
+        "the_bedrock_driver_accepts_the_bedrock_builders_own_block",
+        "the Bedrock media block builder emits a key its own driver does not "
+        "read, so multimodal dispatch to that provider silently stops working "
+        "while both sides' hand-written tests still pass",
+        "    pub fn bedrock_image(&self) -> Value {\n        json!({\n            \"type\": \"image\",\n            \"media_type\": self.media_type,",
+        "    pub fn bedrock_image(&self) -> Value {\n        json!({\n            \"type\": \"image\",\n            \"mime_type\": self.media_type,",
+    ),
+    "AnObligationCannotBeWithdrawn": (
+        "src/runtime/ctx.rs",
+        "a_cancelled_obligation_no_longer_blocks_closing_the_case",
+        "withdrawing an obligation does nothing, so a case whose matter went "
+        "away can never be closed — the obligation that exists to stop a "
+        "premature close instead makes the close impossible",
+        "        self.transition_deadline(name, DeadlineState::Cancelled)\n            .await\n    }",
+        "        let _ = name;\n        Ok(())\n    }",
+    ),
+    "RecencyOutranksTrustInRecall": (
+        "src/store/redb_memory.rs",
+        "newer_untrusted_memories_cannot_evict_a_trusted_one",
+        "recall truncates by recency alone, so anything able to write an "
+        "untrusted memory writes `limit` of them and evicts every trusted one "
+        "from the window — silently, because each item is honestly labelled and "
+        "the caller gets exactly the number it asked for",
+        "                if rank == 0 {\n                    trusted.push(item);\n                } else {\n                    untrusted.push(item);\n                }",
+        "                trusted.push(item);",
+    ),
+    "AHaltDoesNotStopAnUnlimitedTenant": (
+        "src/runtime/executor.rs",
+        "a_halt_refuses_new_runs_on_every_instance_and_names_the_reason",
+        "the emergency stop is checked after the no-ceilings shortcut, so a "
+        "tenant with no quotas configured cannot be halted at all — which is "
+        "the tenant an operator is most likely to need to stop",
+        "        match quotas.halted().await {",
+        "        if self.quota.is_unlimited() {\n            return Ok(());\n        }\n        match quotas.halted().await {",
+    ),
+    "AHighImpactCallSkipsItsApproval": (
+        "src/runtime/declarative.rs",
+        "a_call_needing_approval_does_not_happen_until_it_is_approved",
+        "a tool grant asking for a human is dispatched without asking, so the "
+        "mutation happens and the only review left is of the answer — which "
+        "arrives after the money moved",
+        "                if grant.requires_approval {",
+        "                if false && grant.requires_approval {",
+    ),
     "McpDispatchesAnyServersTool": (
         "src/tools/mcp.rs",
         "a_tool_from_another_server_is_refused_rather_than_run_here",

@@ -612,3 +612,385 @@ async fn a_resubmitted_decision_is_a_duplicate() {
     let again = f.rt.answer_task(task.id, &d).await.unwrap();
     assert_eq!(again, agentplane::core::Delivery::Duplicate);
 }
+
+// ── Declarative oversight ───────────────────────────────────────────────────
+//
+// Two defects lived here, and both were invisible because every test in this
+// repository approved. `Decision::reject` had no caller at all.
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+fn overseen_agent(kind: &str, tools: &str) -> agentplane::manifest::Manifest {
+    let mut manifest = agentplane::manifest::Manifest::parse(&format!(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: overseen, version: "1.0.0" }}
+spec:
+  capabilities: {{ provides: [overseen.answer] }}
+  models: {{ privileged: {{ provider: fake, model: m-1 }} }}
+  execution: {{ kind: {kind} }}
+  oversight:
+    approval: required
+    deadline: {{ name: review, kind: hours, params: {{ n: 4 }} }}
+{tools}
+  memory_formation:
+    subject: team/support
+    purpose: learned-facts
+    instruction: Extract stable facts only.
+    max_items: 2
+    max_sensitivity: confidential
+  budgets: {{}}
+"#
+    ))
+    .expect("manifest");
+    manifest.spec.security.max_sensitivity_egress =
+        Some(agentplane::core::Sensitivity::Confidential);
+    manifest
+}
+
+/// A rejected answer does not become a durable memory.
+///
+/// The defect this pins: memories were formed **before** the human decided, so
+/// `oversight.approval: required` refused the answer as a return value while the
+/// same answer had already been written into the agent's own memory — which a
+/// later run reads into its context window as established fact. A reviewer's
+/// refusal accomplished nothing except failing the run that produced it.
+///
+/// Memory is delayed code. A control that governs the reply and not the write
+/// governs the less important half.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_refused_answer_is_not_written_into_memory() {
+    use agentplane::memory::{MemoryStore, Recall};
+    use agentplane::runtime::Agent;
+
+    let manifest = overseen_agent("completion", "");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_say("the customer speaks German");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+        .cases(Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>)
+        .events(Arc::clone(&store) as Arc<dyn agentplane::case::EventStore>)
+        .tasks(Arc::clone(&store) as Arc<dyn agentplane::case::TaskStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .build();
+
+    rt.run_in_case(
+        "overseen.answer",
+        json!({ "q": "x" }),
+        "review",
+        &[key("doc-1")],
+    )
+    .await
+    .expect("the run suspends on the task");
+
+    // Nothing is formed while a decision is outstanding, either.
+    assert!(
+        store
+            .recall(&Recall::about("team/support"))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a memory was formed while the answer was still awaiting a human"
+    );
+
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    rt.decide_task(
+        task.id,
+        &Decision::reject("carol", "that is not what the customer said"),
+        &officer(),
+    )
+    .await
+    .expect("the rejection is recorded");
+
+    assert!(
+        store
+            .recall(&Recall::about("team/support"))
+            .await
+            .unwrap()
+            .is_empty(),
+        "the answer a human refused was written into durable memory anyway, \
+         where a later run reads it as established fact"
+    );
+}
+
+/// A `tool-calling` agent reaches oversight too.
+///
+/// It did not, and nothing said so: `oversight` parsed, the plane built, the run
+/// completed, and no human was ever asked. That is a declared control the
+/// runtime silently did not apply — on the execution kind that most needs it,
+/// since a tool-calling agent has already touched the world by the time it
+/// answers.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_tool_calling_agent_still_asks_a_human() {
+    use agentplane::memory::MemoryStore;
+    use agentplane::runtime::Agent;
+    use agentplane::tools::{Tool, ToolBox, ToolFailure};
+
+    /// Read a ledger account's balance.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct ReadBalance {
+        /// The account to read.
+        account: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ReadBalance {
+        const SERVER: &'static str = "ledger";
+        const NAME: &'static str = "read";
+        fn mutates() -> bool {
+            false
+        }
+        async fn call(self) -> Result<Value, ToolFailure> {
+            Ok(json!({ "account": self.account, "balance": 42 }))
+        }
+    }
+
+    let manifest = overseen_agent(
+        "tool-calling",
+        "  tools:\n    - ref: tool://ledger/read\n      mutates: false\n      \
+         description: Read a ledger account's balance.",
+    );
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_call_tool("call_1", "ledger__read", json!({ "account": "AC-1" }));
+    provider.will_say("AC-1 holds 42.");
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+        .cases(Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>)
+        .events(Arc::clone(&store) as Arc<dyn agentplane::case::EventStore>)
+        .tasks(Arc::clone(&store) as Arc<dyn agentplane::case::TaskStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .toolbox(ToolBox::new().with::<ReadBalance>())
+        .build();
+
+    rt.run_in_case(
+        "overseen.answer",
+        json!({ "q": "AC-1?" }),
+        "review",
+        &[key("doc-2")],
+    )
+    .await
+    .expect("the run suspends on the task");
+
+    let waiting = store.queue(&officer(), 10).await.unwrap();
+    assert_eq!(
+        waiting.len(),
+        1,
+        "a tool-calling agent declaring oversight returned without asking anyone"
+    );
+}
+
+/// A withdrawn obligation stops blocking the case it was on.
+///
+/// `cancel_deadline` is the third of the three obligation transitions and the
+/// only one nothing exercised — `deadline` and `meet_deadline` both had tests,
+/// so the lifecycle looked covered. It is the transition that matters when a
+/// matter goes away: a case cannot close while an obligation is open, so an
+/// obligation that can be registered and met but not *withdrawn* leaves every
+/// no-longer-applicable case permanently unclosable.
+#[tokio::test]
+async fn a_cancelled_obligation_no_longer_blocks_closing_the_case() {
+    #[derive(Debug)]
+    struct Withdraws;
+
+    #[async_trait::async_trait]
+    impl Skill for Withdraws {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("withdraws").provides("demo.withdraw")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            cx.deadline("dispute-window", &DeadlineSpec::days(5), None)
+                .await?;
+            cx.cancel_deadline("dispute-window").await?;
+            Ok(Outcome::done(Tainted::trusted(json!({}))))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(store.clone() as Arc<dyn TaskStore>)
+        .skill(Withdraws)
+        .build();
+
+    let out = rt
+        .run_in_case("demo.withdraw", json!({}), "dispute", &[key("INV-9")])
+        .await
+        .unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    let case = store
+        .correlate(&[key("INV-9")])
+        .await
+        .unwrap()
+        .expect("the case exists");
+    let deadline = store
+        .deadlines(case)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.name == "dispute-window")
+        .expect("the obligation is still on the record");
+    assert_eq!(
+        deadline.state,
+        DeadlineState::Cancelled,
+        "a withdrawn obligation must be recorded as cancelled, not deleted — \
+         the case's history has to say it was withdrawn rather than never set"
+    );
+
+    store
+        .close(case)
+        .await
+        .expect("a case with no open obligation closes");
+}
+
+/// A high-impact call waits for a person, and the person sees the call.
+///
+/// The gap this closes: oversight gated the agent's **answer**, which for a
+/// tool-calling agent is a review that arrives after the money moved. The tool
+/// ran several turns earlier, so a reviewer refusing then was refusing a summary
+/// of something that had already happened.
+///
+/// Both halves are checked, because only one of them is the interesting one:
+/// the world must be untouched while the task is outstanding, and the task must
+/// carry the **exact tool and arguments** rather than a description of them.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_call_needing_approval_does_not_happen_until_it_is_approved() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use agentplane::runtime::Agent;
+    use agentplane::tools::{Tool, ToolBox, ToolFailure};
+
+    static POSTED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Move funds between accounts.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct Transfer {
+        /// Where the money goes.
+        recipient: String,
+        /// How much, in minor units.
+        amount: i64,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Transfer {
+        const SERVER: &'static str = "ledger";
+        const NAME: &'static str = "transfer";
+        async fn call(self) -> Result<Value, ToolFailure> {
+            POSTED.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "moved": self.amount, "to": self.recipient }))
+        }
+    }
+
+    let manifest = agentplane::manifest::Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities: { provides: [desk.pay] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: tool-calling, max_turns: 4 }
+  oversight:
+    # Only the call waits. The answer returns unattended, which is the shape
+    # most deployments actually want.
+    approval: tools-only
+    deadline: { name: payment-review, kind: hours, params: { n: 4 } }
+  tools:
+    - ref: tool://ledger/transfer
+      mutates: true
+      description: Move funds between accounts.
+      requires_approval: true
+      # The model may choose these, within a ceiling. Declaring them is what
+      # lifts the blanket refusal a mutating tool otherwise applies to untrusted
+      # arguments — and the human gate below is a second, independent control.
+      protected_fields:
+        - path: /recipient
+          max_sensitivity: internal
+        - path: /amount
+          max_sensitivity: internal
+  budgets: {}
+"#,
+    )
+    .expect("manifest");
+
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_call_tool(
+        "call_1",
+        "ledger__transfer",
+        json!({ "recipient": "AC-9", "amount": 250_000 }),
+    );
+    provider.will_say("done");
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .events(Arc::clone(&store) as Arc<dyn EventStore>)
+        .tasks(Arc::clone(&store) as Arc<dyn TaskStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .toolbox(ToolBox::new().with::<Transfer>())
+        .build();
+
+    rt.run_in_case(
+        "desk.pay",
+        json!({ "q": "pay AC-9" }),
+        "payment",
+        &[key("PAY-1")],
+    )
+    .await
+    .expect("the run suspends on the approval");
+
+    assert_eq!(
+        POSTED.load(Ordering::SeqCst),
+        0,
+        "the transfer happened before anyone approved it"
+    );
+
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    let shown = &task.justification.proposed_action;
+    assert_eq!(
+        shown["tool"], "tool://ledger/transfer",
+        "the reviewer was not shown which tool would run: {shown}"
+    );
+    assert_eq!(
+        shown["arguments"]["amount"], 250_000,
+        "the reviewer was not shown the exact arguments: {shown}"
+    );
+
+    rt.decide_task(
+        task.id,
+        &Decision::reject("carol", "that account is not on the settlement list"),
+        &officer(),
+    )
+    .await
+    .expect("the rejection is recorded");
+
+    assert_eq!(
+        POSTED.load(Ordering::SeqCst),
+        0,
+        "a refused call was dispatched anyway"
+    );
+}

@@ -166,7 +166,9 @@ examples:
     cargo run --example tool_loop --features redb,testkit,manifest
     cargo run --example model_run --features redb,testkit
     cargo run --example media_run --features redb,testkit,media
+    cargo run --example memory_run
     cargo run --example manifest_run --features redb,testkit,manifest
+    cargo run --example mcp_tools --features redb,testkit,manifest,mcp
     cargo run --example blog_room --features redb,testkit,manifest
 
 # the binary is never exercised by `cargo test` — it only compiles

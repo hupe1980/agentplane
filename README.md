@@ -72,6 +72,10 @@ cargo run --example media_run --features redb,testkit,media
 # An agent whose prompt, model, result shape and ceilings come from a file.
 cargo run --example manifest_run --features redb,testkit,manifest
 
+# A real MCP server in this process beside a typed Rust tool — one agent
+# reaching both, and a strict replay that calls neither.
+cargo run --example mcp_tools --features redb,testkit,manifest,mcp
+
 # Three agents — an orchestrator and two specialists — each with its own manifest.
 cargo run --example blog_room --features redb,testkit,manifest
 ```
@@ -103,7 +107,8 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | 💸 | **Budgets that bind** — a failed model call is billed for what it burned, because the provider bills for it too |
 | 🧬 | **Effects that take together, or not at all** — a group declares the resources it touches and refuses any member outside them. Each reversible member records the concrete call that undoes it, built from what that call *actually returned* rather than reconstructed later from state that has moved — the gap a per-step saga leaves, since `compensate` is handed the output of a step that failed and therefore has none. `commit` is the frontier: invariants are checked there because it is the last instant at which failing them is free, and only then are **deferred** members released. That is what makes an irreversible send safe — an aborted group never sends it, which beats sending and apologising. Doubt reverses nothing |
 | 🧱 | **A member that commits *with* the journal** — when the resource shares the journal's database, its write and the record that it happened go in one transaction. No reversal to fail, no in-doubt window to survive, and an abort is a rollback. It is the one place this design can do better than a saga, and it says so rather than letting the word *transactional* imply it everywhere else |
-| 👤 | **Human oversight** — durable worklists with four-eyes, declared expiry behaviour, and an operator who can *stop* a run and have it unwind |
+| 👤 | **Human oversight on the *call*, not a summary of it** — `requires_approval: true` on a tool grant opens a task carrying the exact tool and arguments about to be dispatched, and nothing happens until somebody approves. Gating the agent's answer instead is a review that arrives after the money moved. Durable worklists, four-eyes, declared expiry behaviour, and an operator who can *stop* a run and have it unwind |
+| 🛑 | **An emergency stop that a restart does not forget** — halt a tenant and every instance refuses new work, because the flag is in the store rather than in one process. It is its own refusal, not a ceiling: a ceiling means *not right now* and invites the retry a halt exists to stop. New work only — runs already in flight are stopped by cancelling them, which unwinds what they did |
 | 🕰️ | **The sweeper is audited too** — breaching an obligation and escalating a case happen on a clock, with no run to explain them, so a tick that decides anything writes its decisions into a sealed run of its own. State cannot tell *the sweep breached this at 02:00* from *somebody set it*, and no human was there to remember |
 | 🔦 | **A finding you can find** — every conclusion the runtime reaches is queryable by whoever must clear it, including its own worst one: `GET /runs?outcome=quarantined`. A status returned to a caller that already returned, an event on a stream nobody reads, and a counter with no alert are all detection without delivery — the failure production studies of agent runtimes report most |
 | 🔌 | **Model drivers included** — `OpenAI` Responses, Anthropic Messages and a separately gated AWS Bedrock Converse driver, so adopting this does not mean keeping your provider plumbing. Streaming, native structured output, reasoning continuation across tool turns and cached-token accounting are in each one. What makes a driver work is not the transport but the **failure mapping**: every error is reduced to whether the call landed, and guessing that wrong is how a payment happens twice |
@@ -206,7 +211,8 @@ one is not.
 |---|---|
 | Ship a prompt library or IDE | Your prompts; agentplane pins the manifest that governs them by digest |
 | Route or proxy model traffic | LiteLLM, Bifrost — **the drivers themselves ship**: OpenAI Responses, Anthropic Messages and Bedrock Converse are here, with streaming, structured output, reasoning continuation and per-provider failure mappings. What is out of scope is *choosing between them at runtime* |
-| Implement a vector database | LanceDB / pgvector behind a seam |
+| Implement a vector database | LanceDB / pgvector behind the `SemanticRetriever` seam; embedding is a journaled effect so the query vector is history rather than a recomputation |
+| Ship a built-in tool catalogue | Write a typed `Tool`, or wire an MCP server. The tools other frameworks ship — web search, code interpreter — are mostly **provider-hosted**: they run during generation, so the call is not announced, authorized, metered or replayable. That is a world-visible action outside the journal, which is the one thing this runtime is for. Governed URL fetching is the `media` feature; untrusted code belongs behind a process boundary |
 | Replace a deterministic protocol engine | Keep it; agentplane sits *beside* it, never inside it |
 | Require Kubernetes | One static binary |
 | Train, fine-tune, or serve models | Permanently out of scope |

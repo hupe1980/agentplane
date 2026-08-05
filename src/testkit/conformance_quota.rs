@@ -36,6 +36,7 @@ pub async fn check(store: &dyn QuotaStore, report: &mut Report) {
     ceiling_refuses_and_frees(store, at, report).await;
     reserving_twice_takes_one_slot(store, at, report).await;
     spend_accrues_per_period(store, report).await;
+    halt(store, report).await;
 }
 
 /// A ceiling of zero admits nothing.
@@ -198,5 +199,74 @@ async fn spend_accrues_per_period(store: &dyn QuotaStore, report: &mut Report) {
             ),
         ),
         Err(e) => report.record("reading an untouched period", format!("{e}")),
+    }
+}
+
+/// The emergency stop, held to the same contract on every backend.
+///
+/// Three properties, and the third is the one an in-process flag fails.
+async fn halt(store: &dyn QuotaStore, report: &mut Report) {
+    report.checked += 1;
+    match store.halted().await {
+        Ok(None) => {}
+        Ok(Some(reason)) => report.record(
+            "a fresh tenant is not halted",
+            format!("an untouched tenant reports itself halted for '{reason}', so a plane would refuse every run it was never told to refuse"),
+        ),
+        Err(e) => report.record("reading the halt", format!("{e}")),
+    }
+
+    report.checked += 1;
+    if let Err(e) = store.set_halt(Some("incident 42")).await {
+        report.record("setting the halt", format!("{e}"));
+    }
+    match store.halted().await {
+        Ok(Some(reason)) if reason == "incident 42" => {}
+        Ok(other) => report.record(
+            "the halt survives being written",
+            format!(
+                "after halting, the store reports {other:?} — a switch that does \
+                 not read back is one an operator believes they threw"
+            ),
+        ),
+        Err(e) => report.record("reading the halt back", format!("{e}")),
+    }
+
+    // The reason is replaced rather than appended to, so the current one is
+    // always the current one.
+    report.checked += 1;
+    if let Err(e) = store.set_halt(Some("incident 43")).await {
+        report.record("re-halting", format!("{e}"));
+    }
+    match store.halted().await {
+        Ok(Some(reason)) if reason == "incident 43" => {}
+        Ok(other) => report.record(
+            "re-halting replaces the reason",
+            format!("expected the newer reason, got {other:?}"),
+        ),
+        Err(e) => report.record("re-reading the halt", format!("{e}")),
+    }
+
+    report.checked += 1;
+    if let Err(e) = store.set_halt(None).await {
+        report.record("lifting the halt", format!("{e}"));
+    }
+    match store.halted().await {
+        Ok(None) => {}
+        Ok(Some(reason)) => report.record(
+            "a lifted halt stays lifted",
+            format!(
+                "the tenant is still halted for '{reason}' after the stop was \
+                 lifted, so an incident that is over never ends"
+            ),
+        ),
+        Err(e) => report.record("reading a lifted halt", format!("{e}")),
+    }
+
+    // Lifting a halt nobody set is a no-op, not an error: an operator clearing
+    // a switch they are not sure about must not be punished for it.
+    report.checked += 1;
+    if let Err(e) = store.set_halt(None).await {
+        report.record("lifting an unset halt", format!("{e}"));
     }
 }

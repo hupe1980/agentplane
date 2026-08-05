@@ -316,11 +316,6 @@ impl Task {
         }
         self.candidate_roles.is_empty() || self.candidate_roles.iter().any(|r| roles.contains(r))
     }
-
-    #[must_use]
-    pub fn is_overdue(&self, now: Timestamp) -> bool {
-        self.state.is_pending() && self.due_at.is_some_and(|d| now >= d)
-    }
 }
 
 /// A human's answer.

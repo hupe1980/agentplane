@@ -88,6 +88,7 @@ impl Declarative {
         model_role: (ModelId, Option<u32>, Option<crate::model::ReasoningEffort>),
         egress: Option<crate::core::Sensitivity>,
         granted: Vec<crate::manifest::ToolGrant>,
+        oversight: Option<Proposal>,
         formation: Option<crate::manifest::MemoryFormation>,
     ) -> Result<Outcome, SkillError> {
         let (model, max_output_tokens, reasoning_effort) = model_role;
@@ -183,11 +184,25 @@ impl Declarative {
                         .unwrap_or_else(|| json!({ "text": completion.peek().text.clone() })),
                     completion.label().clone(),
                 );
-                self.form_answer(cx, formation.as_ref(), formed_source, &model)
-                    .await?;
                 let answer =
                     completion.map(|c| c.structured.unwrap_or_else(|| json!({ "text": c.text })));
-                return Ok(Outcome::done(answer));
+                // A tool-calling agent reaches oversight by the same path a
+                // completion does. It did not, and the manifest said nothing
+                // about that: `oversight` parsed, built and ran while no human
+                // was ever asked — a declared control the runtime silently did
+                // not apply, on the execution kind that most needs it, since it
+                // is the one that has already touched the world by the time it
+                // answers.
+                return self
+                    .settle(
+                        cx,
+                        answer,
+                        formed_source,
+                        oversight,
+                        formation.as_ref(),
+                        &model,
+                    )
+                    .await;
             }
 
             continuation.clone_from(&completion.peek().continuation);
@@ -205,10 +220,15 @@ impl Declarative {
                 // is reported back as a failed call rather than ending
                 // the run: the model gets to correct itself, and it never
                 // gets the tool it nearly named.
-                let Some(id) = catalog
-                    .resolve(&asked.name)
-                    .filter(|id| offered.iter().any(|(o, _)| o == id))
-                else {
+                // The grant travels with the id: it carries whether this call
+                // needs a person, and resolving it twice is one decision read
+                // from two places.
+                let Some((id, grant)) = catalog.resolve(&asked.name).and_then(|id| {
+                    offered
+                        .iter()
+                        .find(|(offered, _)| *offered == id)
+                        .map(|(_, grant)| (id, *grant))
+                }) else {
                     exchanges.push(crate::model::ToolExchange::failed(
                         asked,
                         "no tool of that name is granted to this agent",
@@ -230,6 +250,7 @@ impl Declarative {
                     continue;
                 }
 
+                let reference = id.reference();
                 let prepared = crate::tools::ToolCall::prepare(
                     &catalog,
                     Arc::clone(&client),
@@ -252,6 +273,47 @@ impl Declarative {
                     asked.arguments.clone(),
                     completion.label().clone(),
                 );
+
+                // A person sees the call **before** it is dispatched, when the
+                // grant asks for one. Gating the agent's final answer instead
+                // would be a review that arrives after the money moved: the
+                // tool ran turns ago, and refusing now refuses a summary of
+                // something that already happened.
+                //
+                // What the task carries is the exact tool and the exact
+                // arguments about to be sent — not a description of them, and
+                // not the answer they will produce.
+                if grant.requires_approval {
+                    let Some(spec) = oversight.as_ref() else {
+                        // Unreachable through the parser, which refuses the
+                        // pair. Stated rather than unwrapped: a panic here
+                        // would be a crash for a wiring mistake.
+                        return Err(SkillError::Other(
+                            "a tool grant requires approval but the agent declares no                              oversight policy — there is nobody to ask"
+                                .into(),
+                        ));
+                    };
+                    cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)
+                        .await?;
+                    let proposed = json!({
+                        "tool": reference,
+                        "arguments": asked.arguments.clone(),
+                    });
+                    let decision = cx.task(&spec.with_action(proposed)).await?;
+                    if !decision.approved {
+                        // Reported to the model the way every other refused call
+                        // is, and without the reviewer's words. A human's free
+                        // text steering the next turn is untrusted content in
+                        // the one slot this design keeps clean; the reason
+                        // belongs in the journal, where the operator reads it.
+                        exchanges.push(crate::model::ToolExchange::failed(
+                            asked,
+                            "a reviewer did not approve this call",
+                        ));
+                        continue;
+                    }
+                }
+
                 match cx.sink(prepared, &args).await {
                     Ok(result) => {
                         conversation_label = conversation_label.join(result.label());
@@ -279,6 +341,58 @@ impl Declarative {
             "'{}' did not finish within {} model turns — it was still asking for tools",
             self.name, self.max_turns
         )))
+    }
+
+    /// Ask the human, then keep what they approved.
+    ///
+    /// Both execution kinds end here, and the **order** is the whole reason it
+    /// is one function rather than two tails.
+    ///
+    /// Forming memories before the decision was a real defect, and a quiet one.
+    /// A declared `oversight.approval: required` refused the answer as a *return
+    /// value* while the same answer had already been written into the agent's
+    /// durable memory — which a later run reads into its context window as
+    /// established fact. So a rejected answer became a standing fact, and the
+    /// only thing the reviewer's refusal accomplished was failing the run that
+    /// produced it. Memory is delayed code; a control that governs the reply and
+    /// not the write governs the less important half.
+    ///
+    /// It also ran when oversight *failed* for an unrelated reason — a missing
+    /// case store, an expired window — so the write did not even need a rejection
+    /// to survive a decision nobody made.
+    async fn settle(
+        &self,
+        cx: &mut StepCtx<'_>,
+        answer: Tainted<Value>,
+        formed_source: Tainted<Value>,
+        oversight: Option<Proposal>,
+        formation: Option<&crate::manifest::MemoryFormation>,
+        model: &ModelId,
+    ) -> Result<Outcome, SkillError> {
+        if let Some(spec) = oversight.filter(Proposal::gates_the_answer) {
+            // Register the obligation the wait is bounded by. A declarative
+            // agent writes no code, so nothing else can — and naming an
+            // unregistered obligation is what made this feature fail outright
+            // in the only configuration it exists for. `register_deadline` is
+            // idempotent by primary key, so a second run joining the same case
+            // shares the obligation rather than colliding with it.
+            cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)
+                .await?;
+            // The proposal shown is the answer itself, not a description of it —
+            // a reviewer who cannot see what will happen is not reviewing.
+            let decision = cx.task(&spec.with_action(answer.peek().clone())).await?;
+            if !decision.approved {
+                // Named and quoted, because "the agent failed" is not something
+                // an operator can act on and "Carol refused, because X" is.
+                return Ok(Outcome::fail(format!(
+                    "{} refused this answer: {}",
+                    decision.actor, decision.reason
+                )));
+            }
+        }
+        self.form_answer(cx, formation, formed_source, model)
+            .await?;
+        Ok(Outcome::done(answer))
     }
 
     async fn form_answer(
@@ -428,31 +542,19 @@ impl Skill for Declarative {
                         .unwrap_or_else(|| json!({ "text": completion.peek().text.clone() })),
                     completion.label().clone(),
                 );
-                self.form_answer(cx, formation.as_ref(), formed_source, &model)
-                    .await?;
                 // wanted — the manifest already said.
                 let answer =
                     completion.map(|c| c.structured.unwrap_or_else(|| json!({ "text": c.text })));
 
-                let Some(spec) = oversight else {
-                    return Ok(Outcome::done(answer));
-                };
-
-                // A human decides before the answer leaves. The proposal shown
-                // is the answer itself, not a description of it — a reviewer who
-                // cannot see what will happen is not reviewing.
-                let decision = cx.task(&spec.with_action(answer.peek().clone())).await?;
-                if decision.approved {
-                    Ok(Outcome::done(answer))
-                } else {
-                    // Named and quoted, because "the agent failed" is not
-                    // something an operator can act on and "Carol refused,
-                    // because X" is.
-                    Ok(Outcome::fail(format!(
-                        "{} refused this answer: {}",
-                        decision.actor, decision.reason
-                    )))
-                }
+                self.settle(
+                    cx,
+                    answer,
+                    formed_source,
+                    oversight,
+                    formation.as_ref(),
+                    &model,
+                )
+                .await
             }
 
             ExecutionKind::ToolCalling => {
@@ -463,6 +565,7 @@ impl Skill for Declarative {
                     (model, max_output_tokens, reasoning_effort),
                     egress,
                     granted,
+                    oversight,
                     formation,
                 )
                 .await
@@ -478,8 +581,9 @@ impl Skill for Declarative {
 /// it once there is one.
 #[derive(Debug, Clone)]
 struct Proposal {
+    approval: crate::manifest::Approval,
     approvers: Vec<String>,
-    deadline: String,
+    deadline: crate::manifest::OversightDeadline,
     on_expiry: crate::core::OnExpiry,
     allow_unattended: bool,
 }
@@ -488,6 +592,7 @@ impl Proposal {
     fn from_manifest(o: &crate::manifest::Oversight) -> Self {
         use crate::manifest::Expiry;
         Self {
+            approval: o.approval,
             approvers: o.approvers.clone(),
             deadline: o.deadline.clone(),
             on_expiry: match o.on_expiry {
@@ -499,11 +604,16 @@ impl Proposal {
         }
     }
 
+    /// Whether the final answer waits, as opposed to only the calls that ask.
+    const fn gates_the_answer(&self) -> bool {
+        matches!(self.approval, crate::manifest::Approval::Required)
+    }
+
     fn with_action(&self, action: Value) -> crate::core::TaskSpec {
         let mut spec = crate::core::TaskSpec::new(
             "agent.approve",
             crate::core::Justification::new("approve this agent's answer", action),
-            self.deadline.clone(),
+            self.deadline.name.clone(),
         );
         spec.candidate_roles.clone_from(&self.approvers);
         spec.on_expiry = self.on_expiry;

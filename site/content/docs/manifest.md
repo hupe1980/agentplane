@@ -51,7 +51,9 @@ spec:
       description: "Read a support ticket."
   output:
     schema: { type: object, required: [severity], properties: { severity: { type: string } } }
-  oversight:      { approval: required, deadline: refund-review }
+  oversight:
+    approval: required
+    deadline: { name: refund-review, kind: working-days, params: { n: 1 } }
   memory_formation:
     subject: "agent:triage"
     purpose: "support"
@@ -203,6 +205,7 @@ sub-run's reported spend is billed to the run that ordered it.
 | `max_sensitivity` | `public` | The highest sensitivity this tool may be *sent*. |
 | `description` | — | What the model is told. Required for a `tool-calling` agent. In the digest, because text that steers tool selection belongs where the system prompt does. |
 | `arguments` | derived | JSON Schema. Omit it for a typed `Tool`: the schema comes from the Rust argument type, and stating it twice is refused because a second copy can only drift. |
+| `requires_approval` | `false` | A person approves **this call**, seeing the exact tool and arguments, before it is dispatched. Needs `spec.oversight` (which supplies approvers, the obligation bounding the wait, and what happens when it closes) and `execution.kind: tool-calling`; refused without either. |
 | `protected_fields` | none | See below. |
 
 ### `protected_fields`
@@ -243,14 +246,23 @@ human is in the loop when none is.
 
 | Field | Default | Notes |
 |---|---|---|
-| `approval` | — | `required`. The only value, because the alternative is a predicate. |
+| `approval` | — | `required` gates every answer. `tools-only` gates only the grants that set `requires_approval`, leaving the answer unattended — the shape most deployments want, since gating a tool-calling agent's *answer* is a review that arrives after the tool already ran. Neither is a predicate: *"require approval when severity is high"* is one step from an `if`. |
 | `approvers` | anyone | Roles that may decide. Empty means anyone — worth choosing on purpose rather than by omission. |
-| `deadline` | — | The obligation that bounds the wait, by **name**. Resolved by the deployment's `Calendar`, so "five working days" means whatever that domain says and this crate never guesses. |
+| `deadline` | — | The obligation that bounds the wait: `{ name, kind, params }`. The agent **registers** it, which is why the declaration carries more than a name — a file-only agent writes no code, so naming an obligation nothing registers made oversight fail outright. `kind` and `params` go to the deployment's `Calendar` unchanged, so "one working day" means whatever that domain says and this crate never guesses. |
 | `on_expiry` | deny | What happens when the window closes. |
 | `allow_unattended` | `false` | Explicit consent required for `on_expiry: proceed`, so acting with no human is a greppable decision somebody made rather than an enum variant they picked off a list. |
 
-The agent opens a task carrying its **actual answer** and returns only on
-approval. See [human oversight](@/docs/concepts.md#oversight).
+The agent registers the obligation, opens a task carrying its **actual answer**,
+and returns only on approval. It applies to **both** execution kinds — a
+`tool-calling` agent has already touched the world by the time it answers, which
+is the case that most needs a person.
+
+Nothing is written until the answer is approved. In particular
+`memory_formation` runs *after* the decision, because a memory formed from a
+refused answer would be read by the next run as established fact — a control that
+governed the reply and not the write would govern the less important half.
+
+See [human oversight](@/docs/concepts.md#oversight).
 
 ## `spec.memory_formation`
 
