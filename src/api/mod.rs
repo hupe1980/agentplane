@@ -111,7 +111,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -506,6 +506,7 @@ impl Api {
     /// either gate — `tests/wire/api.rs` walks the route table and asserts it.
     pub fn router(self) -> Router {
         Router::new()
+            .route("/runs", get(runs_by_outcome))
             .route("/runs/{run}", get(run_view))
             .route("/runs/{run}/cancel", post(cancel_run))
             .route("/tasks", get(worklist))
@@ -576,6 +577,7 @@ impl Api {
 /// somebody else's verb.
 pub mod action {
     pub const RUN_READ: &str = "api:run.read";
+    pub const RUN_LIST: &str = "api:run.list";
     pub const RUN_CANCEL: &str = "api:run.cancel";
     pub const TASK_LIST: &str = "api:task.list";
     pub const TASK_READ: &str = "api:task.read";
@@ -735,6 +737,48 @@ async fn cancel_run(
             "recorded": fresh,
         })),
     ))
+}
+
+/// Runs that ended a given way — in practice, *what is quarantined right now*.
+///
+/// A quarantine is the most serious conclusion this runtime reaches, and until
+/// this route it produced a status, an `error!` event and a counter: nothing an
+/// operator could ask for. A run started with `spawn` returns before the status
+/// exists at all, so for those the log line was the only trace.
+///
+/// Every other backlog here is findable by whoever must clear it — escalated
+/// cases, overdue tasks, breached obligations. This one was not, and a finding
+/// nobody can find is one that never reached a human in actionable form.
+async fn runs_by_outcome(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Query(q): Query<OutcomeQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let outcome = q.outcome.unwrap_or_else(|| "quarantined".to_owned());
+    let s = api.gate(&headers, action::RUN_LIST, &outcome).await?;
+
+    // One more than the page, so a full page and an overflowing one are
+    // distinguishable — the same reason the worklist asks for one extra.
+    let mut found = s
+        .plane
+        .journal()
+        .runs_by_outcome(&outcome, api.limit + 1)
+        .await
+        .map_err(|_| store_failed())?;
+    let truncated = found.len() > api.limit;
+    found.truncate(api.limit);
+
+    Ok(Json(json!({
+        "outcome": outcome,
+        "runs": found.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "truncated": truncated,
+    })))
+}
+
+/// Which ending to list. Defaults to the one somebody is looking for.
+#[derive(serde::Deserialize)]
+struct OutcomeQuery {
+    outcome: Option<String>,
 }
 
 async fn worklist(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Worklist>, ApiError> {

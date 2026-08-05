@@ -153,7 +153,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "tool_output_cannot_reach_a_mutating_sink",
         "untrusted data may reach a mutating sink",
         """        if protected.is_empty() {
-            if effect.mutates() && label.is_untrusted() {
+            if mutates && label.is_untrusted() {
                 return Err(PolicyError::TaintGate { sink: sink_name }.into());
             }
             return Ok(());
@@ -162,6 +162,97 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
             let _ = label;
             return Ok(());
         }""",
+    ),
+    "RefusalsTeachTheModel": (
+        "src/runtime/declarative.rs",
+        "a_refusal_tells_the_model_nothing_it_can_differentiate",
+        "the tool-calling loop hands the model the precise policy refusal, "
+        "turning the policy into a queryable service",
+        "        crate::core::StepError::Policy(p) => Some(p.for_model().to_owned()),",
+        "        crate::core::StepError::Policy(p) => Some(p.to_string()),",
+    ),
+    "AnUnknownOutcomeBecomesAChatMessage": (
+        "src/runtime/declarative.rs",
+        "an_undecidable_tool_call_quarantines_rather_than_answering_the_model",
+        "every error the tool-calling loop meets is stringified back to the "
+        "model, so an undecidable outcome never reaches the executor and the "
+        "run ends Succeeded instead of quarantined",
+        "        _ => None,\n    }\n}",
+        "        _ => Some(e.to_string()),\n    }\n}",
+    ),
+    "AnInDoubtEffectIsAnApology": (
+        "src/runtime/declarative.rs",
+        "an_in_doubt_tool_call_does_not_become_a_chat_message",
+        "an in-doubt effect error is reported to the model as a failed call, so "
+        "the loop invites it to reach the same effect another way while the "
+        "first may still be in flight",
+        """        crate::core::StepError::Effect(inner)
+            if inner.disposition() != crate::core::Disposition::InDoubt =>
+        {
+            Some(inner.to_string())
+        }""",
+        """        crate::core::StepError::Effect(inner) => Some(inner.to_string()),""",
+    ),
+    "EveryFailureLooksLikeARefusal": (
+        "src/runtime/declarative.rs",
+        "a_tool_that_ran_and_failed_reports_its_own_words",
+        "the far side's own answer is replaced by the uniform refusal, blinding "
+        "the model to the one thing it can act on",
+        """        crate::core::StepError::Effect(inner)
+            if inner.disposition() != crate::core::Disposition::InDoubt =>
+        {
+            Some(inner.to_string())
+        }""",
+        """        crate::core::StepError::Effect(inner)
+            if inner.disposition() != crate::core::Disposition::InDoubt =>
+        {
+            Some(crate::core::REFUSED.to_owned())
+        }""",
+    ),
+    "TheTaintGateTakesTheCatalogueAtItsWord": (
+        "src/runtime/ctx.rs",
+        "the_taint_gate_takes_the_stricter_of_catalogue_and_grant",
+        "the sink gate reads `mutates` from the catalogue alone, so a catalogue "
+        "calling a reviewed-mutating tool read-only exempts it from the "
+        "whole-value taint gate",
+        """        let mutates = effect.mutates()
+            || (manifest_gates
+                && self
+                    .tool_grant_for(&effect.descriptor())
+                    .is_some_and(|g| g.mutates));""",
+        """        let mutates = effect.mutates();""",
+    ),
+    "TheQuarantineListKeepsTheOldest": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "the outcome index pages in ascending order, so a backlog past one page "
+        "never surfaces the quarantine that just happened",
+        """                .map_err(|e| be(&e))?
+                .rev()
+            {
+                if out.len() >= limit {""",
+        """                .map_err(|e| be(&e))?
+            {
+                if out.len() >= limit {""",
+    ),
+    "OneToolTwoDeclarationsLastWins": (
+        "src/runtime/executor.rs",
+        "two_agents_may_not_declare_one_tool_differently",
+        "two agents declaring one tool differently merge by registration order "
+        "instead of being refused",
+        """                if let Some((first, existing)) = source.get(&id) {
+                    assert!(
+                        existing == &safety,""",
+        """                if let Some((first, existing)) = source.get(&id) {
+                    assert!(
+                        existing == &safety || true,""",
+    ),
+    "AStatedCatalogueMayRelaxAGrant": (
+        "src/runtime/executor.rs",
+        "a_stated_catalogue_may_not_relax_a_reviewed_mutating_grant",
+        "a hand-written catalogue laxer than the reviewed manifest builds anyway",
+        "        self.assert_catalogue_not_laxer_than_grants();",
+        "        let _ = Self::assert_catalogue_not_laxer_than_grants;",
     ),
     "ReadOnlyProtectedFieldsIgnored": (
         "src/runtime/ctx.rs",
@@ -2315,6 +2406,97 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "asked by a regulator",
         "                    if let Some(case) = record.body.case {",
         "                    if false && let Some(case) = record.body.case {",
+    ),
+    "AQuarantineIsUnfindable": (
+        "src/store/redb.rs",
+        "a_quarantined_run_can_be_found_afterwards",
+        "a sealed run is not indexed by how it ended, so the most serious "
+        "conclusion this runtime reaches leaves a status, a log line and a "
+        "counter — and no way to ask what is quarantined right now",
+        "                    w.open_table(RUN_BY_OUTCOME)\n"
+        "                        .map_err(|e| be(&e))?\n"
+        "                        .insert((tenant.as_str(), outcome.as_str(), next), key.as_str())\n"
+        "                        .map_err(|e| be(&e))?;",
+        "",
+    ),
+    "TheGateReadsWhatTheRecordDoesNot": (
+        "src/runtime/ctx.rs",
+        "the_label_authorization_consulted_is_journaled",
+        "authorization consults the outbound label and the journal does not "
+        "record it, so the decision cannot be re-derived by anyone who was not "
+        "there — an auditor must take the runtime's word that the right label "
+        "was presented",
+        "                    outbound_label: outbound.cloned(),",
+        "                    outbound_label: None,",
+    ),
+    "InPlaneHandoffIsUngoverned": (
+        "src/runtime/ctx.rs",
+        "a_specialist_cannot_commission_another_agent",
+        "the delegation ceiling is not consulted on the path `cx.commission` "
+        "takes, so it governs the A2A peer call and not the function call — a "
+        "specialist hands work off inside one process, and A->B->C->A is "
+        "reachable with no peer boundary to cross and no allowlist to notice",
+        "        self.check_delegation_depth(&effect)?;",
+        "",
+    ),
+    "ADerivedCatalogueRelaxesAGrant": (
+        "src/tools/mod.rs",
+        "a_catalogue_derived_from_a_manifest_keeps_its_security_fields",
+        "a catalogue derived from a manifest drops the grant's protected "
+        "fields, so a reviewer's field rules vanish on the way to the runtime — "
+        "worse than the duplication it replaced, because the operator believes "
+        "they declared something they did not",
+        "                protected_fields: grant.protected_fields.clone(),",
+        "                protected_fields: Vec::new(),",
+    ),
+    "CodeAndDeclarationMayDisagree": (
+        "src/tools/typed.rs",
+        "a_box_that_disagrees_with_its_manifest_is_refused",
+        "a binary may implement tools its manifest never granted, so the "
+        "reviewed declaration stops describing the agent — and the dispatch "
+        "gates cannot catch it, because by then the disagreement has already "
+        "shaped what the model was offered",
+        "        if problems.is_empty() {",
+        "        if true {",
+    ),
+    "TheCoherenceCheckIsAdvisory": (
+        "src/runtime/executor.rs",
+        "a_plane_will_not_build_with_tools_its_manifest_does_not_grant",
+        "the tool/manifest coherence check exists but nothing runs it, so a "
+        "deployer must remember to call it — and a control a caller may forget "
+        "is advice that reads like a control, which is the one thing I12 says a "
+        "declared control may never be",
+        "        self.settle_toolbox();\n        self.assert_catalogue_not_laxer_than_grants();",
+        "",
+    ),
+    "OnlyTheFirstAgentIsChecked": (
+        "src/runtime/executor.rs",
+        "every_agent_on_a_plane_is_checked_against_the_tools",
+        "coherence is checked against the first declared agent and no other, so "
+        "a plane hosting several agents enforces one declaration and ignores the "
+        "rest — and the ignored ones are exactly where a second team's manifest "
+        "drifts unnoticed",
+        "            if let Err(problems) = tools.check_against(manifest) {",
+        "            if declared > 1 {\n                continue;\n            }\n"
+        "            if let Err(problems) = tools.check_against(manifest) {",
+    ),
+    "TwoCataloguesSilentlyMerge": (
+        "src/runtime/executor.rs",
+        "a_plane_may_not_state_its_catalogue_and_derive_it",
+        "a plane that wires tools twice takes one silently — the derived "
+        "catalogue replaces the operator's explicit one, so the plane runs under "
+        "grants nobody chose and nothing says which won",
+        "        assert!(\n            self.tools.is_none(),",
+        "        assert!(\n            true || self.tools.is_none(),",
+    ),
+    "AToolboxNeedsNoDeclaration": (
+        "src/runtime/executor.rs",
+        "tools_wired_to_a_plane_with_no_declaration_are_refused",
+        "tools may be wired to a plane with no declared agent, so the coherence "
+        "check passes by having nothing to compare against — enforcement that is "
+        "satisfied by the absence of the thing it enforces against",
+        "        assert!(\n            declared > 0,",
+        "        assert!(\n            true || declared > 0,",
     ),
     "MetricsLeakTheTenantByDefault": (
         "src/runtime/metrics.rs",

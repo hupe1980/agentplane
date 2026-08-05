@@ -427,6 +427,7 @@ async fn an_orphaned_mutating_effect_is_quarantined_not_retried() {
                         backoff_ms: 0,
                         recovery: Recovery::RequiresOperator,
                         mutates: true,
+                        outbound_label: None,
                     },
                 )
                 .step(StepId(0))

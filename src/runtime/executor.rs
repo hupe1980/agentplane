@@ -264,6 +264,8 @@ impl Runtime {
             replanner: None,
             calendar: None,
             #[cfg(feature = "manifest")]
+            toolbox: None,
+            #[cfg(feature = "manifest")]
             agents: Vec::new(),
             #[cfg(feature = "manifest")]
             providers: HashMap::new(),
@@ -3205,6 +3207,9 @@ pub struct RuntimeBuilder {
     quotas: Option<Arc<dyn crate::quota::QuotaStore>>,
     quota: crate::quota::TenantQuota,
     budget: Budget,
+    /// Typed tools whose coherence with every agent is checked at `build`.
+    #[cfg(feature = "manifest")]
+    toolbox: Option<crate::tools::ToolBox>,
     /// Agents registered on this plane, each with its own declaration.
     #[cfg(feature = "manifest")]
     agents: Vec<Agent>,
@@ -3499,6 +3504,33 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Typed tools, with their catalogue derived and their coherence enforced.
+    ///
+    /// The one-call form, and the reason it exists is not brevity. Deriving the
+    /// catalogue and checking it against every agent's manifest were both
+    /// possible before and both **optional**, and a control a caller may forget
+    /// is not a control — it is advice that reads like one.
+    ///
+    /// So this does three things that were three things:
+    ///
+    /// * derives the catalogue from each agent's declaration, so a grant, its
+    ///   ceiling and its protected fields are stated once;
+    /// * refuses to build if the tools this binary implements and the manifests
+    ///   a reviewer approved have drifted apart;
+    /// * wires the box as the client.
+    ///
+    /// The work happens in [`build`](Self::build) rather than here, and that is
+    /// the whole reason it is trustworthy: checking on this call would check
+    /// against the agents registered *so far*, so `.toolbox(..).agent(..)` would
+    /// pass by having nothing to disagree with. An enforcement that depends on
+    /// the order a builder was written is not one.
+    #[cfg(feature = "manifest")]
+    #[must_use]
+    pub fn toolbox(mut self, tools: crate::tools::ToolBox) -> Self {
+        self.toolbox = Some(tools);
+        self
+    }
+
     /// Which tenant this plane runs as.
     ///
     /// **One plane, one tenant.** A plane serving several would have to pick the
@@ -3606,6 +3638,164 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Derive the tool catalogue from the agents and refuse a disagreement.
+    ///
+    /// Every agent, not the first: a plane may host several, and a tool granted
+    /// to none of them is still a tool this binary can be asked for.
+    ///
+    /// # Panics
+    ///
+    /// If the box and any agent's manifest disagree. A build-time
+    /// misconfiguration is a programmer error, and it is treated the way the
+    /// tenant mismatch beside it is: loudly, before anything runs.
+    #[cfg(feature = "manifest")]
+    fn settle_toolbox(&mut self) {
+        let Some(tools) = self.toolbox.take() else {
+            return;
+        };
+        // Both forms wired is not a merge and must not silently be one. The
+        // hand-built catalogue is the operator saying something deliberate; the
+        // derived one is the agent's declaration. Overwriting either with the
+        // other would run a plane under grants nobody chose.
+        assert!(
+            self.tools.is_none(),
+            "this plane wires tools twice — `tools(..)` states the catalogue \
+             explicitly and `toolbox(..)` derives it from the agents, so one of \
+             them would silently replace the other's grants"
+        );
+        let mut catalog = crate::tools::ToolCatalog::new();
+        let mut declared = 0usize;
+        // Which agent's declaration a tool's catalogue entry came from, so a
+        // second agent declaring the same tool *differently* is a build-time
+        // refusal rather than a silent overwrite.
+        //
+        // A plane has one catalogue and its agents have one manifest each, so
+        // two agents granting `mcp://ledger/read` with different protected
+        // fields cannot both be satisfied. Merging by last-writer would resolve
+        // it by **registration order** — the one thing this builder already
+        // says an enforcement must never depend on — and it fails at a
+        // distance: `declared` compares each agent's manifest against the
+        // catalogue-derived descriptor exactly, so the agent that lost the race
+        // is refused *every* call to that tool, in production, with a message
+        // blaming a code-versus-manifest drift that neither file exhibits.
+        let mut source: BTreeMap<crate::tools::ToolId, (String, crate::tools::ToolSafety)> =
+            BTreeMap::new();
+        for agent in &self.agents {
+            let Some(manifest) = agent.manifest.as_ref() else {
+                continue;
+            };
+            declared += 1;
+            if let Err(problems) = tools.check_against(manifest) {
+                panic!(
+                    "the tools this binary implements and the manifest of agent \
+                     '{}' disagree — the declaration a reviewer approved no longer \
+                     describes the agent:\n  {}",
+                    manifest.metadata.name,
+                    problems.join("\n  ")
+                );
+            }
+            for (id, safety) in crate::tools::ToolCatalog::from_manifest(manifest).entries() {
+                if let Some((first, existing)) = source.get(&id) {
+                    assert!(
+                        existing == &safety,
+                        "agents '{first}' and '{}' both grant '{}' and declare it \
+                         differently — a plane has one catalogue, so one of the two \
+                         reviewed declarations would silently not be the one enforced",
+                        manifest.metadata.name,
+                        id.reference()
+                    );
+                    continue;
+                }
+                source.insert(id.clone(), (manifest.metadata.name.clone(), safety.clone()));
+                catalog = catalog.allow(id, safety);
+            }
+        }
+        // A box with nothing to be coherent *with* is the same defect one step
+        // earlier: tools wired to a plane where no declaration admits them, so
+        // nothing a reviewer reads describes what this binary can reach.
+        assert!(
+            declared > 0,
+            "tools were wired to a plane with no declared agent — a grant is an \
+             agent's declaration, so there is nothing here that admits them"
+        );
+        self.tools = Some((
+            Arc::new(catalog),
+            Arc::new(tools) as Arc<dyn crate::tools::ToolClient>,
+        ));
+    }
+
+    /// Settle the tool catalogue: derive it if asked, then hold it to the
+    /// declarations.
+    ///
+    /// One call because the two halves are one decision seen from either side.
+    /// [`settle_toolbox`](Self::settle_toolbox) covers the derived catalogue,
+    /// where code and manifest could disagree; the check after it covers the
+    /// stated one, where operator and manifest could. Whichever way the
+    /// catalogue arrived, it is checked before anything runs.
+    #[cfg(feature = "manifest")]
+    fn settle_tools(&mut self) {
+        self.settle_toolbox();
+        self.assert_catalogue_not_laxer_than_grants();
+    }
+
+    /// Refuse a stated catalogue that is **laxer** than a reviewed grant.
+    ///
+    /// `toolbox(..)` derives the catalogue from the manifests, so the two
+    /// cannot drift. `tools(..)` states it by hand, and there the operator's
+    /// entry and the agent's declaration are two copies of one decision — with
+    /// nothing, until this, that noticed them disagreeing.
+    ///
+    /// Only one direction is a defect, the same one
+    /// [`ToolBox::check_against`](crate::tools::ToolBox::check_against) refuses.
+    /// An operator being **more** cautious than the declaration is fine and
+    /// often right. An operator being **less** cautious is not, and it changes
+    /// two things at once:
+    ///
+    /// * the whole-value taint gate stops firing, so model-chosen arguments
+    ///   reach something that changes the world;
+    /// * `ToolSafety::read_only` carries `Recovery::Retry`, so a timed-out call
+    ///   to a money-moving tool is sent a second time.
+    ///
+    /// The dispatch gates already take the stricter `mutates` of the two, so
+    /// the first is contained at runtime. The second is not — recovery is read
+    /// from the catalogue alone — and neither should have to be, because this
+    /// is a wiring mistake with a fix and no recovery. It is refused here,
+    /// beside the rest of them.
+    #[cfg(feature = "manifest")]
+    fn assert_catalogue_not_laxer_than_grants(&self) {
+        let Some((catalog, _)) = self.tools.as_ref() else {
+            return;
+        };
+        let mut problems = Vec::new();
+        for agent in &self.agents {
+            let Some(manifest) = agent.manifest.as_ref() else {
+                continue;
+            };
+            for grant in &manifest.spec.tools {
+                if !grant.mutates {
+                    continue;
+                }
+                let Some(id) = crate::tools::ToolId::parse(&grant.reference) else {
+                    continue;
+                };
+                if catalog.safety(&id).is_some_and(|s| !s.mutates) {
+                    problems.push(format!(
+                        "agent '{}' grants '{}' as mutating and the stated catalogue \
+                         calls it read-only",
+                        manifest.metadata.name, grant.reference
+                    ));
+                }
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "the stated tool catalogue is laxer than a reviewed manifest grant — \
+             a read-only entry exempts the tool from the whole-value taint gate \
+             and makes a timed-out call retryable:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+
     /// Assemble the runtime.
     ///
     /// # Panics
@@ -3624,6 +3814,10 @@ impl RuntimeBuilder {
     ///   model grants and egress ceiling.
     /// * Two skills share a name. A name is what a capability resolves to and
     ///   what governance is keyed on; two of them make both lookups arbitrary.
+    /// * A stated catalogue calls a tool read-only that a reviewed manifest
+    ///   grants as mutating. That exemption drops the whole-value taint gate
+    ///   and makes a timed-out money-moving call retryable — the one direction
+    ///   an operator cannot be right about.
     /// * A declarative agent names a provider no driver is registered for, or
     ///   declares `spec.execution` without a privileged model to call.
     /// * A plane and its store — or its blob store — are scoped to different
@@ -3634,8 +3828,12 @@ impl RuntimeBuilder {
     ///   another's keyspace while every erasure and every policy request names
     ///   the right one.
     #[must_use]
-    pub fn build(self) -> Arc<Runtime> {
+    // `mut` is for `settle_toolbox`, which only exists when manifests do.
+    #[cfg_attr(not(feature = "manifest"), allow(unused_mut))]
+    pub fn build(mut self) -> Arc<Runtime> {
         assert_same_tenant(self.store.as_ref(), self.blobs.as_ref(), &self.tenant);
+        #[cfg(feature = "manifest")]
+        self.settle_tools();
 
         let mut skills = HashMap::new();
         let mut by_capability = HashMap::new();

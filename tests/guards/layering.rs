@@ -1510,13 +1510,46 @@ fn every_api_route_is_covered_by_the_unauthenticated_test() {
         paths.len()
     );
 
+    // Matched on the route's **shape**, not on its segments appearing
+    // somewhere. Segment matching passed `/runs` the moment `/runs/{run}`
+    // existed, because "runs" was already in the file — so a genuinely new
+    // route was silently unguarded and the guard said otherwise. That is the
+    // failure this guard exists to prevent, committed by the guard.
+    //
+    // The shape replaces every `{param}` with a wildcard and requires a request
+    // in the test whose path has the same literal segments in the same
+    // positions. Still tolerant of real ids and `format!`, still intolerant of
+    // a route nobody asked for.
+    let requested: Vec<Vec<String>> = body
+        .match_indices('"')
+        .filter_map(|(i, _)| {
+            let rest = &body[i + 1..];
+            rest.find('"').map(|end| &rest[..end])
+        })
+        .filter(|s| s.starts_with('/'))
+        .map(|s| {
+            s.split('?')
+                .next()
+                .unwrap_or(s)
+                .split('/')
+                .filter(|seg| !seg.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .collect();
+
     let mut uncovered = Vec::new();
     for path in &paths {
-        let literal: Vec<&str> = path
-            .split('/')
-            .filter(|s| !s.is_empty() && !s.starts_with('{'))
-            .collect();
-        if !literal.iter().all(|seg| body.contains(seg)) {
+        let want: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let covered = requested.iter().any(|got| {
+            got.len() == want.len()
+                && want.iter().zip(got).all(|(w, g)| {
+                    // A `{param}` matches whatever the test substituted for it;
+                    // a literal segment must be that literal.
+                    w.starts_with('{') || w == g
+                })
+        });
+        if !covered {
             uncovered.push(*path);
         }
     }

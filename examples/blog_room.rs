@@ -19,6 +19,9 @@
 //!
 //! 1. Only the orchestrator may delegate, and it had to say **why**.
 //! 2. A specialist that tries to grant itself delegation is refused at parse.
+//!    The *runtime* half — a specialist refused when it actually hands off —
+//!    is enforced by the same ceiling and covered in the test suite; this
+//!    example shows the declaration, not the dispatch.
 //! 3. Delegation is a **journaled effect**, so a replay reassembles the post
 //!    without waking a single specialist.
 //! 4. Budgets compose: the specialists' spend is billed to the run that
@@ -161,12 +164,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let overreaching = RESEARCHER.replace("max_delegation_depth: 0", "max_delegation_depth: 1");
     match Manifest::parse(&overreaching) {
         Err(ManifestError::IncoherentTopology { .. }) => {
-            println!("\n3. specialist granting itself delegation → refused");
+            println!("\n3. specialist granting itself delegation → refused at parse");
         }
         Err(e) => panic!("wrong refusal: {e}"),
         Ok(_) => panic!(
-            "a specialist was allowed to hand off — the bound on the chain is \
-             gone, and A->B->C->A is reachable again"
+            "a specialist declared a delegation ceiling above zero, which the \
+             role forbids"
         ),
     }
 

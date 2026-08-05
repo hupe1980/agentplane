@@ -36,8 +36,13 @@
 
 #[cfg(feature = "mcp")]
 mod mcp;
+// Not gated on a transport: a typed tool is a tool this process implements, and
+// needs no wire at all.
+mod typed;
+
 #[cfg(feature = "mcp")]
 pub use mcp::McpClient;
+pub use typed::{Tool, ToolBox};
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -79,6 +84,20 @@ impl ToolId {
     #[must_use]
     pub fn reference(&self) -> String {
         format!("mcp://{}/{}", self.server, self.tool)
+    }
+
+    /// The inverse of [`reference`](Self::reference).
+    ///
+    /// `None` for anything that is not `mcp://server/tool`. Refusing rather
+    /// than guessing: a reference this cannot parse is one the transport cannot
+    /// dial either, and inventing an id from it would grant a tool nobody
+    /// wrote down.
+    #[must_use]
+    pub fn parse(reference: &str) -> Option<Self> {
+        let rest = reference.strip_prefix("mcp://")?;
+        let (server, tool) = rest.split_once('/')?;
+        (!server.is_empty() && !tool.is_empty() && !tool.contains('/'))
+            .then(|| Self::new(server, tool))
     }
 
     /// How a **model** names this tool: `server__tool`.
@@ -312,11 +331,69 @@ impl ToolCatalog {
         Self::default()
     }
 
+    /// Every tool a manifest declares, with the safety it declared.
+    ///
+    /// # Why this exists
+    ///
+    /// A manifest and a catalogue are two parties speaking: the agent's author
+    /// says what it needs, the operator says what it may have. That separation
+    /// is real in a deployment where those are different people — and pure tax
+    /// when they are the same one, which is most of the time. Stating `mutates`,
+    /// `max_sensitivity` and the protected fields **twice** is not two
+    /// decisions, it is one decision and a chance to disagree about it.
+    ///
+    /// So the common case is one declaration. An operator who wants to say
+    /// something different still can: `allow` after this replaces an entry, and
+    /// the manifest's own grant is re-checked at dispatch regardless — a
+    /// catalogue cannot widen what a declaration never asked for.
+    ///
+    /// The fields a manifest does not carry — retry, recovery, output
+    /// sensitivity — take their cautious defaults, which is the same posture a
+    /// hand-written `ToolSafety::default()` starts from.
+    #[cfg(feature = "manifest")]
+    #[must_use]
+    pub fn from_manifest(manifest: &crate::manifest::Manifest) -> Self {
+        let mut catalog = Self::new();
+        for grant in &manifest.spec.tools {
+            let Some(id) = ToolId::parse(&grant.reference) else {
+                // A reference the transport cannot name is refused by manifest
+                // validation, so reaching here means the two disagree about
+                // what a reference is — and inventing an id would grant a tool
+                // nobody wrote down.
+                continue;
+            };
+            let safety = ToolSafety {
+                mutates: grant.mutates,
+                protected_fields: grant.protected_fields.clone(),
+                // The fields a manifest does not carry take their cautious
+                // defaults, which is where a hand-written safety starts too.
+                max_sensitivity: grant
+                    .max_sensitivity
+                    .unwrap_or(ToolSafety::default().max_sensitivity),
+                ..ToolSafety::default()
+            };
+            catalog = catalog.allow(id, safety);
+        }
+        catalog
+    }
+
     /// Permit a tool, with the operator's declaration of what it does.
     #[must_use]
     pub fn allow(mut self, id: ToolId, safety: ToolSafety) -> Self {
         self.entries.insert(id, (safety, Advertised::default()));
         self
+    }
+
+    /// Every entry, so several agents' catalogues can be combined.
+    ///
+    /// Owned rather than borrowed because a merge builds a new catalogue: two
+    /// agents on one plane may each declare tools, and the plane needs both.
+    #[must_use]
+    pub fn entries(self) -> Vec<(ToolId, ToolSafety)> {
+        self.entries
+            .into_iter()
+            .map(|(id, (safety, _))| (id, safety))
+            .collect()
     }
 
     /// Resolve a name a **model** chose to a tool the operator granted.

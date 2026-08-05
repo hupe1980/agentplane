@@ -130,9 +130,21 @@ CREATE TABLE IF NOT EXISTS run_seal (
     chain_head BYTEA  NOT NULL,
     log_index  BIGINT NOT NULL,
     sealed_at  BIGINT NOT NULL,
+    -- How the run ended. **Derived**, not authoritative: the executor appends
+    -- `RunSealed` before sealing, so tamper detection covers the outcome and
+    -- this column can be rebuilt from the chain. It exists so *what is
+    -- quarantined right now* is a query rather than a log search — a finding
+    -- nobody can find is one that never reached a human.
+    outcome    TEXT   NOT NULL,
     PRIMARY KEY (tenant, run_id),
     UNIQUE (tenant, log_index)
 );
+
+-- One outcome's backlog without touching another tenant's. Scanned **newest
+-- first** — see `JournalStore::runs_by_outcome` for why the direction is part
+-- of the contract rather than a detail of this index.
+CREATE INDEX IF NOT EXISTS run_seal_by_outcome
+    ON run_seal (tenant, outcome, log_index);
 
 CREATE TABLE IF NOT EXISTS run_cancel (
     tenant       TEXT   NOT NULL,
@@ -452,6 +464,33 @@ impl JournalStore for PostgresStore {
         Ok(out)
     }
 
+    async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                // **Newest first.** See `JournalStore::runs_by_outcome`:
+                // ascending order plus a page limit means a plane whose backlog
+                // already exceeds one page returns the same runs forever, and
+                // the quarantine that just happened never appears.
+                "SELECT run_id FROM run_seal
+                  WHERE tenant = $1 AND outcome = $2
+                  ORDER BY log_index DESC
+                  LIMIT $3",
+                &[
+                    &self.tenant_name(),
+                    &outcome,
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+
+        Ok(rows
+            .iter()
+            .filter_map(|r| RunId::parse(r.get::<_, &str>(0)).ok())
+            .collect())
+    }
+
     async fn case_history(
         &self,
         case: crate::core::CaseId,
@@ -613,7 +652,7 @@ impl JournalStore for PostgresStore {
         Ok(())
     }
 
-    async fn seal(&self, run: RunId, _epoch: Epoch, _outcome: &str) -> Result<Digest, StoreError> {
+    async fn seal(&self, run: RunId, _epoch: Epoch, outcome: &str) -> Result<Digest, StoreError> {
         // The conclusion is already *in* the chain — the executor appends
         // `RunSealed` before calling this — so sealing reports the terminal hash
         // rather than writing a second one. Tamper detection therefore covers
@@ -627,14 +666,15 @@ impl JournalStore for PostgresStore {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
         client
             .execute(
-                "INSERT INTO run_seal (tenant, run_id, chain_head, log_index, sealed_at)
-                 VALUES ($1, $2, $3, nextval('run_log_position'), $4)
+                "INSERT INTO run_seal (tenant, run_id, chain_head, log_index, sealed_at, outcome)
+                 VALUES ($1, $2, $3, nextval('run_log_position'), $4, $5)
                  ON CONFLICT (tenant, run_id) DO NOTHING",
                 &[
                     &self.tenant_name(),
                     &run.to_string(),
                     &head.as_bytes().to_vec(),
                     &now_secs().cast_signed(),
+                    &outcome,
                 ],
             )
             .await

@@ -199,6 +199,40 @@ Every field of `SweepReport` is a number worth alerting on. `is_quiet()` is the
 useful predicate: a healthy plane sweeps silently, so a non-silent sweep means
 something happened.
 
+### A finding has to be findable
+
+Every conclusion this runtime reaches is queryable by whoever must clear it:
+escalated cases by status, overdue tasks by role, breached obligations by the
+sweep, dead-lettered events by their own list.
+
+Quarantine was the exception, and it was the worst one to have. A quarantine
+means the recorded history can no longer be trusted, or a mutation is in a state
+nobody can establish — and it produced a run status, an `error!` event and a
+counter. None of those can be asked for, and a run started with `spawn` or over
+A2A's `return_immediately` returns *before* the status exists, so the log line
+was the only trace.
+
+```sh
+curl -H "$AUTH" 'https://plane/runs?outcome=quarantined'
+```
+
+Sealed runs are indexed by how they ended. The index is **derived**: the
+executor appends `RunSealed` before sealing, so tamper detection covers the
+outcome and this can be rebuilt from the chain. It is a convenience, never an
+authority.
+
+The list comes back **newest first**, and `truncated` says whether there is
+more. That ordering is part of the store contract rather than a detail of the
+index, because the obvious alternative reintroduces the exact failure this
+endpoint exists to remove: a bounded query in ascending order is a page that
+stops changing, so a plane whose backlog already exceeds one page returns the
+same runs forever and the quarantine that just happened is the one that never
+appears. Emitted, indexed, queryable — and still not delivered.
+
+The general rule is worth stating because it is easy to satisfy accidentally and
+easy to lose: a control that notices and does not deliver is closer to none than
+to half, because it also manufactures the belief that somebody was told.
+
 ### One matter, one scan
 
 *Show me everything about this matter* is the question a regulated deployment
@@ -562,6 +596,7 @@ whether a run id exists by comparing a `400` against a `404`.
 
 | Route | The question it answers |
 |---|---|
+| `GET /runs?outcome=…` | What ended this way and has not been cleared? Newest first; defaults to `quarantined` |
 | `GET /runs/{run}` | What is this run doing, and **why is it not finishing**? |
 | `GET /tasks` | What is waiting for me? |
 | `GET /tasks/{task}` | What is this proposal, and may I decide it? |

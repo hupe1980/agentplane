@@ -417,6 +417,7 @@ mod tests {
             mutates: false,
             attempt: 1,
             backoff_ms: 0,
+            outbound_label: None,
         }
     }
 

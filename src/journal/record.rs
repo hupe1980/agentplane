@@ -197,6 +197,19 @@ pub enum RecordKind {
         /// How long the runtime waited before this attempt, in milliseconds.
         /// Zero on the first.
         backoff_ms: u64,
+        /// The label of the value this effect will send, when it binds one.
+        ///
+        /// Recorded because **authorization consults it**, and a decision whose
+        /// inputs are not on the record cannot be re-derived by anyone who was
+        /// not there. Policy is total and side-effect free, so an auditor
+        /// holding the bundle identity, the descriptor and this can reach the
+        /// same verdict offline — and without it they must take the runtime's
+        /// word that the right label was presented.
+        ///
+        /// Absent for `cx.effect`, which binds no value and presents none, so
+        /// the ordinary case costs no bytes and hashes identically.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outbound_label: Option<Label>,
     },
 
     EffectDone {

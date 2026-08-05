@@ -736,6 +736,7 @@ async fn an_unauthenticated_request_is_refused_everywhere() {
     let router = f.router();
 
     for req in [
+        get("/runs?outcome=quarantined", None),
         get("/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV", None),
         post(
             "/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/cancel",

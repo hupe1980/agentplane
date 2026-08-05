@@ -353,12 +353,17 @@ impl<'a> StepCtx<'a> {
         input: Tainted<Value>,
     ) -> Result<Tainted<Value>, StepError> {
         let plane = self.plane.clone();
+        let depth = self
+            .identity
+            .as_ref()
+            .map_or(0, crate::core::Delegation::depth);
         let commissioned = self
             .effect(Commission {
                 capability: capability.to_owned(),
                 input: input.peek().clone(),
                 label: input.label().clone(),
                 plane,
+                depth,
             })
             .await?;
         Ok(commissioned.map(|c| c.answer))
@@ -569,6 +574,17 @@ impl<'a> StepCtx<'a> {
         mut effect: E,
         outbound: Option<&crate::core::Label>,
     ) -> Result<E::Output, StepError> {
+        // Checked once, on the path *both* `effect` and `sink` take, and before
+        // the retry loop because a depth violation is not attempt-dependent.
+        //
+        // It lived in `sink` alone, which meant the ceiling governed the A2A
+        // peer call and not `cx.commission` — the rule held across a network
+        // boundary and not across a function call, which is the wrong way
+        // round. The loop a `specialist` role exists to prevent is the in-plane
+        // one: A commissions B commissions C commissions A, inside one process,
+        // with no peer boundary to cross and no allowlist to notice.
+        self.check_delegation_depth(&effect)?;
+
         let descriptor = effect.descriptor();
         let policy = effect.retry();
         let recovery = effect.recovery();
@@ -598,39 +614,17 @@ impl<'a> StepCtx<'a> {
                         self.replayed_done(&descriptor.kind, attempt, spend);
                         return Ok(serde_json::from_value(output)?);
                     }
-                    // The recorded run was refused here, so this one is too —
-                    // whatever budget is in force now. The verdict is history.
-                    Some(EffectReplay::Refused { limit, used }) => {
-                        return Err(StepError::Budget(crate::core::BudgetExceeded::Recorded {
-                            limit,
-                            used,
-                        }));
-                    }
-                    // The recorded run was refused here, so this one is too —
-                    // whatever the policy set says now. Re-evaluating would
-                    // re-judge last year's run under this year's rules.
-                    Some(EffectReplay::Denied {
-                        reason,
-                        action,
-                        resource,
-                    }) => {
-                        return Err(StepError::Denied {
-                            action,
-                            resource,
-                            reason,
-                        });
+                    Some(
+                        refusal @ (EffectReplay::Refused { .. } | EffectReplay::Denied { .. }),
+                    ) => {
+                        return Err(recorded_refusal(refusal));
                     }
                     Some(EffectReplay::Failed {
                         error,
                         disposition,
                         spend,
                     }) => {
-                        // Billed on the way past, exactly as the live path bills
-                        // it: a replayed run must reach the same budget verdict
-                        // at the same point, and a metered failure is part of
-                        // what the original run spent.
-                        self.bill(spend);
-                        attempt = self.recorded_failure(
+                        attempt = self.replay_recorded_failure(
                             &descriptor,
                             ordinal,
                             attempt,
@@ -639,6 +633,7 @@ impl<'a> StepCtx<'a> {
                             &policy,
                             &error,
                             disposition,
+                            spend,
                         )?;
                         continue;
                     }
@@ -681,7 +676,10 @@ impl<'a> StepCtx<'a> {
             }
             let waited = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
 
-            let failure = match self.traced_attempt(&effect, key, attempt, waited).await? {
+            let failure = match self
+                .traced_attempt(&effect, key, attempt, waited, outbound)
+                .await?
+            {
                 Ok(output) => return Ok(output),
                 Err(e) => e,
             };
@@ -752,7 +750,10 @@ impl<'a> StepCtx<'a> {
             // this call, and writing another would report two attempts where
             // one interrupted attempt was resumed.
             Recovery::Retry | Recovery::Idempotent { .. } => {
-                match self.perform_once(effect, key, attempt, 0, false).await? {
+                match self
+                    .perform_once(effect, key, attempt, 0, false, None)
+                    .await?
+                {
                     Ok(output) => Ok(output),
                     Err(e) => Err(StepError::Effect(e)),
                 }
@@ -762,7 +763,10 @@ impl<'a> StepCtx<'a> {
             Recovery::Reconcile => match self.reconcile_and_record(effect, key).await? {
                 Reconciliation::Landed(output) => Ok(output),
                 Reconciliation::DidNotHappen => {
-                    match self.perform_once(effect, key, attempt, 0, false).await? {
+                    match self
+                        .perform_once(effect, key, attempt, 0, false, None)
+                        .await?
+                    {
                         Ok(output) => Ok(output),
                         Err(e) => Err(StepError::Effect(e)),
                     }
@@ -1222,6 +1226,7 @@ impl<'a> StepCtx<'a> {
         key: EffectKey,
         attempt: u32,
         waited_ms: u64,
+        outbound: Option<&crate::core::Label>,
     ) -> Result<Result<E::Output, crate::core::EffectError>, StepError> {
         let span = tracing::info_span!(
             telemetry::EFFECT_SPAN,
@@ -1250,7 +1255,7 @@ impl<'a> StepCtx<'a> {
         self.meter
             .count(metrics::EFFECTS, &effect.descriptor().kind);
         let outcome = self
-            .perform_once(effect, key, attempt, waited_ms, true)
+            .perform_once(effect, key, attempt, waited_ms, true, outbound)
             .instrument(span.clone())
             .await?;
         span.record(
@@ -1483,6 +1488,8 @@ impl<'a> StepCtx<'a> {
                 mutates: false,
                 attempt: 1,
                 backoff_ms: 0,
+                // A durable wait binds no outbound value.
+                outbound_label: None,
             },
         )
         .await?;
@@ -1601,24 +1608,30 @@ impl<'a> StepCtx<'a> {
             .into());
         }
 
+        // The reviewed grant may only tighten — here as at the authorization
+        // gate, which has ORed the manifest's `mutates` in since it existed.
+        //
+        // `Effect::mutates` on a tool call reports what the **catalogue** says.
+        // A manifest declaring the same tool mutating is the deployment's own
+        // statement about it, and the whole-value taint gate below is precisely
+        // the control that statement buys. Without this line an operator
+        // catalogue calling a reviewed-mutating tool read-only exempts it from
+        // that gate, so model-chosen arguments reach something that changes the
+        // world — the one direction `ToolBox::check_against` says nobody can be
+        // right about, reached by the path that check cannot see.
+        //
+        // Live dispatch only, for the same reason the ceiling above is: a
+        // tightened manifest must not re-judge an effect that already happened.
         #[cfg(feature = "manifest")]
-        if let (Some(actual), Some(ceiling)) = (
-            effect.delegation_depth(),
-            self.manifest
-                .as_ref()
-                .filter(|_| manifest_gates)
-                .and_then(|m| m.spec.security.max_delegation_depth),
-        ) && actual > usize::from(ceiling)
-        {
-            return Err(PolicyError::DelegationDepth {
-                sink: sink_name,
-                actual,
-                ceiling: usize::from(ceiling),
-            }
-            .into());
-        }
+        let mutates = effect.mutates()
+            || (manifest_gates
+                && self
+                    .tool_grant_for(&effect.descriptor())
+                    .is_some_and(|g| g.mutates));
+        #[cfg(not(feature = "manifest"))]
+        let mutates = effect.mutates();
 
-        Self::enforce_protected_fields(&effect, args, sink_name)?;
+        Self::enforce_protected_fields(&effect, args, sink_name, mutates)?;
 
         // The same label the gates above enforced, handed to the deployment's
         // own rules. See `authorize` for why it belongs there too.
@@ -1629,11 +1642,12 @@ impl<'a> StepCtx<'a> {
         effect: &E,
         args: &Tainted<Value>,
         sink_name: String,
+        mutates: bool,
     ) -> Result<(), StepError> {
         let label = args.label();
         let protected = effect.protected_fields();
         if protected.is_empty() {
-            if effect.mutates() && label.is_untrusted() {
+            if mutates && label.is_untrusted() {
                 return Err(PolicyError::TaintGate { sink: sink_name }.into());
             }
             return Ok(());
@@ -1876,6 +1890,71 @@ impl<'a> StepCtx<'a> {
         }
     }
 
+    /// Consume a recorded failure and decide what the run did next.
+    ///
+    /// Billed on the way past, exactly as the live path bills it: a replayed run
+    /// must reach the same budget verdict at the same point, and a metered
+    /// failure is part of what the original run spent.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_recorded_failure(
+        &mut self,
+        descriptor: &EffectDescriptor,
+        ordinal: u32,
+        attempt: u32,
+        key: EffectKey,
+        recovery: &crate::core::Recovery,
+        policy: &crate::core::RetryPolicy,
+        error: &str,
+        disposition: crate::core::Disposition,
+        spend: crate::core::Spend,
+    ) -> Result<u32, StepError> {
+        self.bill(spend);
+        self.recorded_failure(
+            descriptor,
+            ordinal,
+            attempt,
+            key,
+            recovery,
+            policy,
+            error,
+            disposition,
+        )
+    }
+
+    /// Refuse an effect that would delegate deeper than the declaration allows.
+    ///
+    /// Live dispatch only, like every other manifest gate: a replay reads its
+    /// effects back, so a tightened ceiling must not retroactively refuse an
+    /// effect that already happened.
+    // `self` and `effect` are both unused without `manifest`, and the ceiling
+    // lives on the manifest — so a build with no manifest support has nothing to
+    // check rather than a different rule.
+    #[allow(
+        unused_variables,
+        clippy::unnecessary_wraps,
+        clippy::unused_self,
+        clippy::needless_pass_by_ref_mut
+    )]
+    fn check_delegation_depth<E: Effect>(&self, effect: &E) -> Result<(), StepError> {
+        #[cfg(feature = "manifest")]
+        if let (Some(actual), Some(ceiling)) = (
+            effect.delegation_depth(),
+            self.manifest
+                .as_ref()
+                .filter(|_| !self.mode.is_replaying())
+                .and_then(|m| m.spec.security.max_delegation_depth),
+        ) && actual > usize::from(ceiling)
+        {
+            return Err(PolicyError::DelegationDepth {
+                sink: effect.descriptor().kind,
+                actual,
+                ceiling: usize::from(ceiling),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     /// One attempt: announce, act, record.
     ///
     /// The nested result separates two failures that must not be confused. The
@@ -1891,6 +1970,7 @@ impl<'a> StepCtx<'a> {
         attempt: u32,
         backoff_ms: u64,
         write_start: bool,
+        outbound: Option<&crate::core::Label>,
     ) -> Result<Result<E::Output, crate::core::EffectError>, StepError> {
         // `EffectStarted` goes down *before* the call. If the process dies
         // between here and the terminal record, replay sees an orphan and the
@@ -1905,6 +1985,7 @@ impl<'a> StepCtx<'a> {
                     mutates: effect.mutates(),
                     attempt,
                     backoff_ms,
+                    outbound_label: outbound.cloned(),
                 },
             )
             .await?;
@@ -1985,6 +2066,33 @@ impl<'a> StepCtx<'a> {
             a = a.case(c.case_id);
         }
         a
+    }
+}
+
+/// A refusal the recorded run met, as the error this one meets.
+///
+/// The verdict is history: a run refused by a ceiling or a rule was refused
+/// then, whatever the ceiling or the rule says now. Re-deriving either would
+/// re-judge last year's run under this year's configuration, which is the one
+/// thing replay must never do.
+fn recorded_refusal(replay: EffectReplay) -> StepError {
+    match replay {
+        EffectReplay::Refused { limit, used } => {
+            StepError::Budget(crate::core::BudgetExceeded::Recorded { limit, used })
+        }
+        EffectReplay::Denied {
+            reason,
+            action,
+            resource,
+        } => StepError::Denied {
+            action,
+            resource,
+            reason,
+        },
+        // The caller matches only these two.
+        other => StepError::Effect(crate::core::EffectError::Other(format!(
+            "not a recorded refusal: {other:?}"
+        ))),
     }
 }
 
@@ -2840,6 +2948,8 @@ impl StepCtx<'_> {
                 mutates: false,
                 attempt: 1,
                 backoff_ms: 0,
+                // An awaited inbound event binds no outbound value.
+                outbound_label: None,
             },
         )
         .await?;
@@ -3007,6 +3117,8 @@ struct Commission {
     input: Value,
     label: crate::core::Label,
     plane: std::sync::Weak<super::Runtime>,
+    /// How deep the commissioning run already is.
+    depth: usize,
 }
 
 /// What a commission produced, and what it cost.
@@ -3045,6 +3157,22 @@ impl Effect for Commission {
     /// Another agent's answer is somebody else's data.
     fn trust(&self) -> crate::core::Trust {
         crate::core::Trust::Untrusted
+    }
+
+    /// Handing work to another agent **is** delegation, and the depth ceiling
+    /// has to see it.
+    ///
+    /// This is the in-plane hand-off, and it is the one that matters for the
+    /// loop a `specialist` role exists to prevent: A commissions B commissions C
+    /// commissions A, inside one process, with no peer boundary to cross and no
+    /// egress allowlist to notice. Declaring nothing here meant the ceiling
+    /// governed only the A2A path — so the rule held across the network and not
+    /// across a function call, which is the wrong way round.
+    ///
+    /// One deeper than the chain this run already carries, or the first link
+    /// when there is none.
+    fn delegation_depth(&self) -> Option<usize> {
+        Some(self.depth + 1)
     }
 
     /// Bill the commissioning run for what the sub-run spent, so a delegating

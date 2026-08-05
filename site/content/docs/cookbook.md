@@ -126,6 +126,28 @@ let plan = PlanIR::new(vec![
 let out = rt.run_plan(plan, json!({ "text": "printer on fire" })).await?;
 ```
 
+### Which one: a plan, or a commission?
+
+Both compose several steps, and the choice is not a matter of taste.
+
+A **plan** is an authorization graph. Use it when the shape is known before the
+work starts: the steps, what feeds what, which one is terminal. It is frozen at
+admission and checked against the manifest, so a run cannot execute a step
+nobody authorized — and a failure unwinds it in reverse.
+
+A **commission** is an effect. Use it when one agent needs an answer from
+another and the shape is decided *while running* — an editor that reads a brief
+and then decides it needs research. It is journaled like any other effect, the
+answer comes back untrusted, and the sub-run has its own journal and its own
+ceiling.
+
+The rule of thumb: **if you can draw the graph before you start, draw it.** A
+plan is checkable in advance and a commission is not; the commission's advantage
+is that it does not need to be.
+
+Most agents need neither. `rt.run(capability, input)` is one capability and no
+graph, which is what nine of the twelve examples use.
+
 **The trap:** letting untrusted text become the instruction. A model reads its
 order and its data as the same undifferentiated text, so a document saying
 *"ignore previous instructions"* is obeyed like one if it lands in `/system`.
@@ -776,6 +798,92 @@ an atomic member — it is a `reversible` one.
 notion of a foreign table, so it lends no transaction and the member is refused
 at registration. That is a capability being absent, and it is refused where
 refusing costs nothing rather than after the eager members have run.
+
+## 🧰 Define a tool once
+
+A tool is one type. Its arguments are its fields, its schema comes from those
+fields, and its description comes from the doc comment — so the sentence a model
+reads is the sentence a maintainer reads.
+
+```rust
+/// Read a ledger account's balance.
+#[derive(Deserialize, JsonSchema)]
+struct ReadBalance {
+    /// The account to read.
+    account: String,
+}
+
+#[async_trait]
+impl Tool for ReadBalance {
+    const SERVER: &'static str = "ledger";
+    const NAME: &'static str = "read";
+    fn mutates() -> bool { false }
+
+    async fn call(self) -> Result<Value, ToolError> {
+        Ok(json!({ "account": self.account, "balance": 42 }))
+    }
+}
+
+let rt = Runtime::builder(store)
+    .agent(Agent::new(&manifest))
+    .toolbox(ToolBox::new().with::<ReadBalance>().with::<PostEntry>())
+    .build();
+```
+
+`call` takes `self` because **the arguments are the tool**: by the time it runs,
+the model's JSON is this type or the call was refused. There is no `Value` left
+to index and no field name to misspell.
+
+This is the shape Python's `@tool`, Pydantic AI, the OpenAI Agents SDK and Rig
+all arrived at, and the reasons are the same: a schema written twice is a schema
+that disagrees with itself, and a description kept apart from the code is the
+copy nobody updates.
+
+`.toolbox(..)` is one call because it used to be three, and two of them were
+optional. It derives the catalogue from each agent's own declaration — the
+grants, their ceilings and their protected fields, stated once — and it
+**refuses to build** if the tools this binary implements and the manifests a
+reviewer approved have drifted **in either direction**: a tool implemented but
+not granted means the binary can do something its declaration does not admit; a
+grant with nothing behind it means the model is offered a tool that fails when
+chosen. Neither is caught by the dispatch gates, which refuse a *call* long
+after the disagreement shaped what the model was told it could do.
+
+The check runs at `build`, not when the box is wired, and that is what makes it
+worth trusting: checking on the `.toolbox(..)` call would check against the
+agents registered *so far*, so writing `.toolbox(..).agent(..)` would pass by
+having nothing yet to disagree with. Every agent on the plane is checked, not
+the first.
+
+**The trap:** believing the type is the security boundary. It is not — it is the
+*shape*. The manifest still declares what this deployment permits.
+
+## 🧾 When the two parties really do differ
+
+`.toolbox(..)` covers the common case, where the tools a binary implements are
+the tools its agents declare. The two-party split is still there when it is
+real: an operator who wants to say something *different* from the agent's author
+builds the catalogue themselves and passes it with the client:
+
+```rust
+let catalog = ToolCatalog::from_manifest(&manifest)
+    .allow(ToolId::new("ledger", "read"), ToolSafety::read_only());
+
+let rt = Runtime::builder(store)
+    .agent(Agent::new(&manifest))
+    .tools(Arc::new(catalog), client)
+    .build();
+```
+
+The manifest's own grant is re-checked at dispatch either way, so a catalogue
+can only narrow what a declaration asked for, never widen it.
+
+Wiring both forms on one plane is **refused**, not merged: one would silently
+replace the other's grants and nothing would say which won.
+
+**The trap:** believing the catalogue is the security boundary on its own. It is
+one of two: the manifest is inside the agent's digest, the catalogue is the
+deployment's. A tool absent from *either* is not callable.
 
 ## 🔐 Restrict where the plane may connect
 

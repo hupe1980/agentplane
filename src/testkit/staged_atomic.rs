@@ -139,6 +139,14 @@ impl JournalStore for StagedAtomic {
         self.inner.release_lease(run, epoch).await
     }
 
+    async fn runs_by_outcome(
+        &self,
+        outcome: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::core::RunId>, StoreError> {
+        self.inner.runs_by_outcome(outcome, limit).await
+    }
+
     async fn case_history(
         &self,
         case: crate::core::CaseId,

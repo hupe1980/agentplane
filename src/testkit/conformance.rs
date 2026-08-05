@@ -119,6 +119,7 @@ fn started(run: RunId, key: EffectKey) -> Append {
             mutates: true,
             attempt: 1,
             backoff_ms: 0,
+            outbound_label: None,
         },
     )
     .step(StepId(0))
@@ -157,6 +158,7 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     a_rejected_batch_writes_nothing(fresh, &mut r).await;
     read_starts_where_it_is_told(fresh, &mut r).await;
     a_case_scan_selects_one_matter(fresh, &mut r).await;
+    sealed_runs_are_findable_by_how_they_ended(fresh, &mut r).await;
     a_stop_request_needs_no_lease(fresh, &mut r).await;
     the_first_asker_stays_on_the_record(fresh, &mut r).await;
     an_attestation_survives_the_round_trip(fresh, &mut r).await;
@@ -912,6 +914,87 @@ async fn a_rejected_batch_writes_nothing(fresh: Factory<'_>, r: &mut Report) {
 /// Both halves are checked, because either alone passes for the wrong reason: a
 /// scan that returns nothing satisfies "no foreign records", and a scan that
 /// returns everything satisfies "finds its own".
+/// A quarantined run is findable by the person who has to deal with it.
+///
+/// The most serious conclusion this runtime reaches used to produce a status, a
+/// log line and a counter — none of which can be queried, and a run started with
+/// `spawn` returns before the status exists. Every other backlog is findable by
+/// whoever must clear it; this one was not, which is the shape production
+/// studies of agent runtimes report as the most common failure: not an
+/// undetected fault, but a detected one whose signal never reaches a human.
+///
+/// Both directions, because either alone passes for the wrong reason: a scan
+/// returning nothing satisfies "no other outcome", and one returning everything
+/// satisfies "finds its own".
+async fn sealed_runs_are_findable_by_how_they_ended(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+
+    let mut quarantined = Vec::new();
+    for (outcome, count) in [("quarantined", 2usize), ("succeeded", 1)] {
+        for _ in 0..count {
+            let run = RunId::generate();
+            let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+                return;
+            };
+            let _ = store.append(lease.epoch, vec![admitted(run)]).await;
+            if store.seal(run, lease.epoch, outcome).await.is_err() {
+                return;
+            }
+            if outcome == "quarantined" {
+                quarantined.push(run);
+            }
+        }
+    }
+
+    match store.runs_by_outcome("quarantined", 100).await {
+        Ok(found) => {
+            if found.len() != 2 {
+                r.record(
+                    "outcome index",
+                    format!(
+                        "runs_by_outcome must find both quarantined runs, got {}",
+                        found.len()
+                    ),
+                );
+            }
+            if found.iter().any(|run| !quarantined.contains(run)) {
+                r.record(
+                    "outcome index",
+                    "runs_by_outcome returned a run that ended some other way".to_owned(),
+                );
+            }
+        }
+        Err(e) => r.record("outcome index", format!("runs_by_outcome failed: {e}")),
+    }
+
+    // The bound is applied rather than advisory — **and it keeps the newest**.
+    //
+    // Checking only the count is a check that proves nothing: a page limit in
+    // ascending order returns the right *number* of runs and the wrong ones,
+    // so a plane whose backlog exceeds one page shows the same list forever and
+    // the quarantine that just happened never appears. `quarantined` is in
+    // creation order, so the last element is the one a bounded query must keep.
+    let newest = quarantined.last().copied();
+    match store.runs_by_outcome("quarantined", 1).await {
+        Ok(found) if found.len() == 1 && Some(found[0]) == newest => {}
+        Ok(found) if found.len() == 1 => r.record(
+            "outcome index",
+            "runs_by_outcome(limit=1) kept the oldest run — a bounded query in \
+             ascending order never surfaces the quarantine that just happened"
+                .to_owned(),
+        ),
+        Ok(found) => r.record(
+            "outcome index",
+            format!("runs_by_outcome(limit=1) returned {} runs", found.len()),
+        ),
+        Err(e) => r.record(
+            "outcome index",
+            format!("runs_by_outcome(limit=1) failed: {e}"),
+        ),
+    }
+}
+
 async fn a_case_scan_selects_one_matter(fresh: Factory<'_>, r: &mut Report) {
     r.checked += 1;
     let store = fresh().await;

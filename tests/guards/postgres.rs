@@ -48,13 +48,29 @@ async fn postgres_satisfies_the_journal_store_contract() {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
 
+    // A **distinct tenant per handle**, because the battery's `fresh()` means
+    // "a store with no history" and one database does not provide that by
+    // reconnecting to it. redb's in-memory handle is genuinely fresh; Postgres
+    // reconnects to the same rows, so checks that count what the store holds —
+    // the Merkle log's size against the number of sealed runs — saw every
+    // earlier check's runs and passed only by accident of ordering.
+    //
+    // Isolating by tenant rather than by database is deliberate: the schema is
+    // tenant-first precisely so one tenant cannot see another's rows, so this
+    // exercises the isolation the store claims instead of working around it.
+    let next = std::sync::atomic::AtomicUsize::new(0);
     let report = conformance::check(&|| {
         let url = url.clone();
+        let n = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move {
             Arc::new(
                 PostgresStore::connect(&url)
                     .await
-                    .expect("connect to the test container"),
+                    .expect("connect to the test container")
+                    .for_tenant(
+                        agentplane::core::TenantId::new(format!("conformance-{n}"))
+                            .expect("a legal tenant id"),
+                    ),
             ) as Arc<dyn JournalStore>
         })
     })

@@ -217,6 +217,46 @@ pub trait JournalStore: Send + Sync + Debug {
     /// Read a run's records from `from` (inclusive, 1-based) onward.
     async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError>;
 
+    /// Sealed runs that ended a given way, oldest first.
+    ///
+    /// The question this exists for is *what is quarantined right now?* — and
+    /// until it existed, the answer was "watch the logs". A quarantine is the
+    /// most serious conclusion this runtime reaches: the recorded history can no
+    /// longer be trusted, or a mutation is in a state nobody can establish. It
+    /// produced a run status, an `error!` event and a counter, none of which an
+    /// operator can query, and a run started with `spawn` returns before the
+    /// status exists at all.
+    ///
+    /// Longitudinal studies of production agent runtimes name that shape as the
+    /// most common failure mode: not an undetected fault, but a detected one
+    /// whose signal never reaches a human in a form they can act on. Every other
+    /// backlog here is findable by whoever must clear it — escalated cases,
+    /// overdue tasks, breached obligations. This one was not.
+    ///
+    /// A **derived** index: the outcome's home is the chain, since the executor
+    /// appends `RunSealed` before sealing and tamper detection therefore covers
+    /// how a run ended. This can be rebuilt from the journal and is a
+    /// convenience, never an authority.
+    ///
+    /// Bounded, and the bound is visible: `limit` results means *at least*
+    /// that many, not exactly.
+    ///
+    /// **Newest first**, and that ordering is part of the contract rather than
+    /// an incidental property of the index. A bounded query in ascending order
+    /// is a page that stops changing: once a plane's quarantine backlog exceeds
+    /// one page, the same runs come back forever and the quarantine that just
+    /// happened is precisely the one that never appears. That is the failure
+    /// this method exists to remove, reintroduced by the ordering — a signal
+    /// that is emitted, indexed, queryable, and still does not reach anyone.
+    ///
+    /// The backlog an operator has already seen is the one they can afford to
+    /// page past; the one that arrived while they were not looking is not.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable.
+    async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError>;
+
     /// Every record belonging to a case, oldest first.
     ///
     /// *Show me everything about this matter* is the question a regulated

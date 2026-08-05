@@ -638,3 +638,47 @@ impl RuntimeError {
         matches!(self, Self::Fenced { .. } | Self::ChainBroken { .. })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Disposition, RuntimeError};
+
+    /// Two embedder-facing predicates, each of which was public, documented,
+    /// and called by nothing — so a wrong `matches!` arm would have been
+    /// invisible. Neither claims to *be* a control, which is what separates
+    /// them from `PolicyError::for_model`; they are still decisions an embedder
+    /// makes recovery choices on.
+    #[test]
+    fn only_a_call_that_never_left_is_safe_to_repeat_on_its_own_terms() {
+        assert!(Disposition::DidNotHappen.is_definitely_safe_to_repeat());
+        // The two that matter. `InDoubt` is the whole reason this is not a
+        // negation of `Landed`: a timed-out payment may well have been taken.
+        assert!(!Disposition::InDoubt.is_definitely_safe_to_repeat());
+        assert!(!Disposition::Landed.is_definitely_safe_to_repeat());
+    }
+
+    #[test]
+    fn an_owner_abandons_a_fenced_run_and_a_broken_chain_and_nothing_else() {
+        assert!(
+            RuntimeError::Fenced {
+                run: "run-1".into(),
+                held: 1,
+                current: 2,
+            }
+            .is_terminal_for_owner()
+        );
+        assert!(
+            RuntimeError::ChainBroken {
+                seq: 1,
+                detail: "hash mismatch".into(),
+            }
+            .is_terminal_for_owner()
+        );
+        // An ordinary store failure is retryable by this instance: nobody else
+        // owns the run and the history is still trustworthy.
+        assert!(
+            !RuntimeError::Store(crate::core::StoreError::Backend("timeout".into()))
+                .is_terminal_for_owner()
+        );
+    }
+}

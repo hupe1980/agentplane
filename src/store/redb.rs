@@ -71,6 +71,23 @@ const RUN_LEASE: TableDefinition<&str, (&str, u64, u64)> = TableDefinition::new(
 /// `run_id -> (outcome, chain_head, sealed_at)`.
 const RUN_SEAL: TableDefinition<&str, (&str, &[u8], u64)> = TableDefinition::new("run_seal");
 
+/// `(tenant, outcome, log_index) -> run_id`: sealed runs by how they ended.
+///
+/// A **derived** index. The outcome's home is the chain — the executor appends
+/// `RunSealed` before sealing, so tamper detection covers how a run ended, which
+/// it would not if a side table were authoritative. This is a convenience for
+/// the one question the chain answers slowly: *what is quarantined right now?*
+///
+/// It exists because a quarantine is the most serious thing this runtime can
+/// conclude, and until now it produced a status, a log line and a counter —
+/// none of which an operator can query. A finding nobody can find is a finding
+/// that never reached a human in actionable form, which is the failure mode
+/// production studies of agent runtimes report most often.
+///
+/// Ordered by seal position, so a scan yields oldest-first without a sort.
+const RUN_BY_OUTCOME: TableDefinition<(&str, &str, u64), &str> =
+    TableDefinition::new("run_by_outcome");
+
 /// `log_index -> run_id`, the plane's Merkle log in seal order.
 ///
 /// Positions are never reissued, so this table keeps gaps when a run is removed
@@ -166,6 +183,7 @@ impl RedbStore {
             w.open_table(EFFECT_ONCE).map_err(|e| be(&e))?;
             w.open_table(RUN_LEASE).map_err(|e| be(&e))?;
             w.open_table(RUN_SEAL).map_err(|e| be(&e))?;
+            w.open_table(RUN_BY_OUTCOME).map_err(|e| be(&e))?;
             w.open_table(SEAL_LOG).map_err(|e| be(&e))?;
             w.open_table(RUN_CANCEL).map_err(|e| be(&e))?;
             w.open_table(COUNTERS).map_err(|e| be(&e))?;
@@ -880,6 +898,14 @@ impl JournalStore for RedbStore {
                         .map_err(|e| be(&e))?
                         .insert((tenant.as_str(), next), key.as_str())
                         .map_err(|e| be(&e))?;
+                    // Derived from the outcome in the same transaction that
+                    // seals it, so the index cannot describe a run the log does
+                    // not hold. Keyed by seal position, so a scan is
+                    // oldest-first without a sort.
+                    w.open_table(RUN_BY_OUTCOME)
+                        .map_err(|e| be(&e))?
+                        .insert((tenant.as_str(), outcome.as_str(), next), key.as_str())
+                        .map_err(|e| be(&e))?;
                     counters
                         .insert(counter.as_str(), next + 1)
                         .map_err(|e| be(&e))?;
@@ -888,6 +914,44 @@ impl JournalStore for RedbStore {
             };
             w.commit().map_err(|e| be(&e))?;
             Ok(head_hash)
+        })
+        .await
+    }
+
+    async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError> {
+        let tenant = self.tenant_name();
+        let outcome = outcome.to_owned();
+        let prefix = format!("{tenant}/");
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let idx = r.open_table(RUN_BY_OUTCOME).map_err(|e| be(&e))?;
+            let mut out = Vec::new();
+            // **Newest first**, which is what makes the bound survivable. See
+            // `JournalStore::runs_by_outcome`: ascending order plus a page
+            // limit means a plane whose backlog already exceeds one page
+            // returns the *same* runs forever, and the quarantine that just
+            // happened is the one that never appears.
+            for entry in idx
+                .range(
+                    (tenant.as_str(), outcome.as_str(), 0)
+                        ..=(tenant.as_str(), outcome.as_str(), u64::MAX),
+                )
+                .map_err(|e| be(&e))?
+                .rev()
+            {
+                if out.len() >= limit {
+                    break;
+                }
+                let (_, v) = entry.map_err(|e| be(&e))?;
+                // Keys are `tenant/run`; the caller asked for runs.
+                let key = v.value();
+                if let Some(id) = key.strip_prefix(prefix.as_str())
+                    && let Ok(run) = RunId::parse(id)
+                {
+                    out.push(run);
+                }
+            }
+            Ok(out)
         })
         .await
     }

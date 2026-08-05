@@ -1097,3 +1097,62 @@ async fn the_same_rule_permits_the_same_effect_when_the_value_is_trusted() {
     let out = rt.run("demo.post", json!({})).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded, "got {:?}", out.status);
 }
+
+/// The label the gate consulted is on the record.
+///
+/// Authorization reads the outbound label, so a record without it describes a
+/// decision whose inputs cannot be recovered. Policy here is total and
+/// side-effect free, which means an auditor holding the bundle identity, the
+/// effect descriptor and this label can reach the same verdict offline — and
+/// without it they must take the runtime's word that the right label was
+/// presented.
+///
+/// Named by the property-level evidence literature as *policy basis*: the
+/// question is not only *was this permitted* but *under what, and can someone
+/// else check it*.
+#[tokio::test]
+async fn the_label_authorization_consulted_is_journaled() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        // Permissive on purpose: what is under test is whether the label the
+        // gate *consulted* is recorded, and a denial stops before the effect is
+        // ever announced.
+        .policy(Arc::new(Counting::default()))
+        .skill(Posts { trusted: false })
+        .build();
+
+    let out = rt.run("demo.post", json!({})).await.unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded, "got {:?}", out.status);
+
+    let labels: Vec<_> = store
+        .read(out.run_id, 1)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|r| match r.kind() {
+            RecordKind::EffectStarted { outbound_label, .. } => outbound_label.clone(),
+            _ => None,
+        })
+        .collect();
+
+    let sink = labels
+        .iter()
+        .find(|l| {
+            l.provenance
+                .iter()
+                .any(|s| s.to_string().contains("broker-x"))
+        })
+        .expect(
+            "the label the gate consulted is absent from the record, so the \
+             authorization decision cannot be re-derived by anyone who was not \
+             there",
+        );
+    assert_eq!(sink.trust, agentplane::core::Trust::Untrusted);
+
+    // And an effect that binds no value records none, so the field means
+    // *what was presented* rather than defaulting to something plausible.
+    assert!(
+        labels.len() < 4,
+        "every effect recorded a label, including those that present none: {labels:?}"
+    );
+}

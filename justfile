@@ -163,6 +163,7 @@ examples:
     cargo run --example governed_transfer
     cargo run --example saga_checkout
     cargo run --example effect_group
+    cargo run --example tool_loop --features redb,testkit,manifest,mcp
     cargo run --example model_run --features redb,testkit
     cargo run --example media_run --features redb,testkit,media
     cargo run --example manifest_run --features redb,testkit,manifest

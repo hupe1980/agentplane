@@ -533,6 +533,7 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                         mutates: false,
                         attempt: 1,
                         backoff_ms: 0,
+                        outbound_label: None,
                     },
                 )
                 .step(StepId(0))

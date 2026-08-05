@@ -38,6 +38,13 @@ pub struct Ask {
     pub model: ModelId,
     pub prompt: Value,
     pub schema: Option<Value>,
+    /// What this turn was told about the tools the last turn asked for.
+    ///
+    /// Recorded because it is the only place a *refusal* reaches a model, and
+    /// without it no test can assert what the model was told — which is how a
+    /// loop handing back the precise policy message passed every test in the
+    /// suite. `PolicyError::for_model` existed, was tested, and had no callers.
+    pub exchanges: Vec<crate::model::ToolExchange>,
 }
 
 /// A `ModelProvider` that answers without a model.
@@ -226,6 +233,7 @@ impl ModelProvider for FakeProvider {
             model: request.model.clone(),
             prompt: request.prompt.clone(),
             schema: request.schema.cloned(),
+            exchanges: request.exchanges.to_vec(),
         });
 
         // Scoped so the guard is gone before anything else happens: a lock held

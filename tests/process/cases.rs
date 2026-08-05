@@ -1162,3 +1162,83 @@ async fn a_case_s_history_includes_a_sweep_that_escalated_it() {
         "the limit was not applied"
     );
 }
+
+/// A quarantined run is findable by whoever has to deal with it.
+///
+/// The most serious conclusion this runtime reaches used to produce a run
+/// status, an `error!` event and a counter — none of which can be queried, and
+/// a run started with `spawn` returns before the status exists at all. Every
+/// other backlog here is findable by whoever must clear it; this one was not,
+/// and a finding nobody can find is one that never reached a human in a form
+/// they could act on.
+#[tokio::test]
+async fn a_quarantined_run_can_be_found_afterwards() {
+    /// Fails in a way that cannot be resolved: the outcome is unknown and the
+    /// declared recovery forbids guessing.
+    #[derive(Debug)]
+    struct Undecidable;
+
+    #[async_trait::async_trait]
+    impl agentplane::core::Effect for Undecidable {
+        type Output = Value;
+        fn descriptor(&self) -> agentplane::core::EffectDescriptor {
+            agentplane::core::EffectDescriptor::nullary("ledger.transfer")
+        }
+        fn retry(&self) -> agentplane::core::RetryPolicy {
+            agentplane::core::RetryPolicy::never()
+        }
+        async fn perform(&self) -> Result<Value, agentplane::core::EffectError> {
+            Err(agentplane::core::EffectError::Timeout {
+                driver: "ledger".to_owned(),
+                waited_ms: 30_000,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct Transfers;
+
+    #[async_trait::async_trait]
+    impl Skill for Transfers {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("transfers").provides("ledger.transfer")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, agentplane::core::SkillError> {
+            cx.effect(Undecidable).await?;
+            Ok(Outcome::done(Tainted::trusted(json!("done"))))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Transfers)
+        .build();
+
+    let out = rt.run("ledger.transfer", json!({})).await.unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Quarantined(_)),
+        "expected a quarantine, got {:?}",
+        out.status
+    );
+
+    let found = store.runs_by_outcome("quarantined", 50).await.unwrap();
+    assert!(
+        found.contains(&out.run_id),
+        "the quarantined run is not findable, so the only trace of the most \
+         serious thing this runtime concluded is a log line: {found:?}"
+    );
+
+    // And a run that ended well is not in that backlog, so the query selects
+    // rather than returning whatever it can reach.
+    let ok = rt.run("ledger.transfer", json!({})).await.unwrap();
+    let succeeded = store.runs_by_outcome("succeeded", 50).await.unwrap();
+    assert!(
+        !succeeded.contains(&out.run_id),
+        "a quarantined run appeared under `succeeded`"
+    );
+    assert!(!found.contains(&ok.run_id) || ok.run_id == out.run_id);
+}

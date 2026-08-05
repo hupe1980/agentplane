@@ -170,6 +170,14 @@ the operator; `PolicyError::for_model()` returns one uniform sentence for
 anything that reaches a prompt. An auditor can still answer *why*; the thing that
 might be attacking the policy learns nothing it can tell apart.
 
+There is exactly one path in the runtime where a refusal reaches a model — the
+tool-calling loop's failed-call result — and it is the enforcement point rather
+than a place the rule is remembered. Worth stating plainly, because the rule
+being written down is not the same as it being applied: `for_model` existed and
+was tested by calling it directly, which proves the *function* is uniform and
+says nothing about whether anything uses it. The test that matters runs an agent
+whose call is refused and reads what the next turn was told.
+
 That leaves the refused/allowed bit itself, which no wording removes short of
 fabricating success. `Budget::max_denials` bounds it instead — a ceiling on how
 often one run may be refused, checked **before** the policy is consulted, since a
@@ -322,6 +330,22 @@ two graphs would exist only in the checks this crate happens to have written.
 `cx.effect` presents no label, because it has no labelled value to bind. Absent
 is **not** trusted: a rule requiring a source simply does not match, so it fails
 closed.
+
+### A decision somebody else can check
+
+Policy is total and side-effect free so that a third party can re-derive a
+verdict without running the plane. That only works if **every input it consulted
+is on the record** — otherwise re-deriving means guessing at the parts that are
+missing, and the honest answer becomes *take our word for it*.
+
+So a `sink` dispatch journals the label the gate saw, on `EffectStarted`, beside
+the descriptor it authorized. An effect that binds no value records none, so the
+field says *what was presented* rather than defaulting to something plausible.
+
+This was a real gap and a recent one: the label reached the policy request one
+revision before it reached the journal. A control strengthened without its
+evidence following is the shape that makes an audit trail quietly insufficient
+while looking complete.
 
 ### The engine cannot fail
 

@@ -201,9 +201,15 @@ impl Declarative {
                         exchanges
                             .push(crate::model::ToolExchange::ok(asked, result.peek().clone()));
                     }
-                    Err(e) => {
-                        exchanges.push(crate::model::ToolExchange::failed(asked, e.to_string()));
-                    }
+                    Err(e) => match model_facing(&e) {
+                        Some(detail) => {
+                            exchanges.push(crate::model::ToolExchange::failed(asked, detail));
+                        }
+                        // Not something to tell the model and carry on. It
+                        // leaves this loop the way it would leave a hand-written
+                        // skill, so the executor reaches its own verdict.
+                        None => return Err(e.into()),
+                    },
                 }
             }
         }
@@ -375,4 +381,68 @@ impl Proposal {
 fn privileged(m: &Manifest) -> Option<ModelId> {
     let r = m.spec.models.as_ref()?.privileged.as_ref()?;
     Some(ModelId::new(&r.provider, &r.model))
+}
+
+/// What a failed tool call may tell the model, if anything.
+///
+/// `Some(text)` continues the loop with that text as the tool's result.
+/// **`None` means the error is not the model's business and must leave the
+/// loop**, so the executor reaches the verdict it would reach for a
+/// hand-written skill.
+///
+/// This used to be `e.to_string()` for every error, which is two different
+/// mistakes wearing one match arm.
+///
+/// # A refusal produced here is an oracle
+///
+/// Every [`PolicyError`](crate::core::PolicyError) message is written for an
+/// operator reading a journal and is precise on purpose: which sink, which
+/// field, what sensitivity, which ceiling. Handing that to a model turns the
+/// policy into a queryable service — injected content varies the request,
+/// watches which variants come back refused, and reads the boundary off the
+/// answers. `EgressCeiling` is the sharpest: it names the *sensitivity of the
+/// data*, so a few probes classify what the run was never allowed to reveal
+/// without any of it crossing the boundary.
+///
+/// So a refusal is [`REFUSED`](crate::core::REFUSED) and nothing else. The
+/// journal still keeps the full reason. `PolicyError::for_model` has said this
+/// since it was written; until now nothing called it, and the one path that
+/// feeds a refusal to a model used `Display`.
+///
+/// # An unknown outcome is not a failed call
+///
+/// [`StepError::Undecidable`](crate::core::StepError::Undecidable) is the
+/// runtime saying it cannot tell "never applied" from "applied,
+/// acknowledgement lost" — a timed-out payment may well have been taken. The
+/// executor quarantines on it. Reported to the model as a failed call, the
+/// quarantine never happens: the model apologises, the loop continues, and the
+/// run ends **`Succeeded`** over a mutation nobody can account for. That is I5
+/// inverted by an error-handling convenience.
+///
+/// Suspension, budget ceilings, store failures and divergence leave for the
+/// same reason: each has a handler above this loop, and each is silently
+/// disarmed by being turned into a chat message.
+///
+/// # What does reach the model
+///
+/// The far side's own answer, and only that. A tool that was unreachable,
+/// declined the request, or ran and reported failure is information the model
+/// needs in order to try something else — and it is text the far side already
+/// controls, so withholding it protects nothing.
+fn model_facing(e: &crate::core::StepError) -> Option<String> {
+    match e {
+        crate::core::StepError::Policy(p) => Some(p.for_model().to_owned()),
+        // The far side spoke, or demonstrably did not — and `disposition` is
+        // the crate's own name for that distinction, so this reads it rather
+        // than re-deriving it from the variant list and drifting from it.
+        // `InDoubt` never becomes a chat message: whether it also quarantines
+        // is the recovery policy's call, made above this loop, and reporting it
+        // here would take that call away.
+        crate::core::StepError::Effect(inner)
+            if inner.disposition() != crate::core::Disposition::InDoubt =>
+        {
+            Some(inner.to_string())
+        }
+        _ => None,
+    }
 }

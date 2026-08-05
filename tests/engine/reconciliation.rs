@@ -373,6 +373,7 @@ async fn a_crash_orphan_is_resolved_by_the_probe_rather_than_escalated() {
                         mutates: true,
                         attempt: 1,
                         backoff_ms: 0,
+                        outbound_label: None,
                     },
                 )
                 .step(StepId(0))
@@ -450,6 +451,7 @@ async fn strict_replay_of_an_orphan_neither_performs_nor_probes_nor_writes() {
                         mutates: true,
                         attempt: 1,
                         backoff_ms: 0,
+                        outbound_label: None,
                     },
                 )
                 .step(StepId(0))

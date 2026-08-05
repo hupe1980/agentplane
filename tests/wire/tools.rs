@@ -806,3 +806,1001 @@ fn a_model_chosen_tool_name_is_matched_exactly_or_refused() {
          offered something that is refused after it has been paid for"
     );
 }
+
+// ── A tool is one thing ─────────────────────────────────────────────────────
+
+/// Read a ledger account's balance.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ReadBalance {
+    /// The account to read.
+    account: String,
+}
+
+#[async_trait::async_trait]
+impl agentplane::tools::Tool for ReadBalance {
+    const SERVER: &'static str = "ledger";
+    const NAME: &'static str = "read";
+
+    fn mutates() -> bool {
+        false
+    }
+
+    async fn call(self) -> Result<Value, ToolError> {
+        Ok(json!({ "account": self.account, "balance": 42 }))
+    }
+}
+
+/// The arguments a model sends become the tool's type, or the call is refused.
+///
+/// This is the whole point of a typed tool. The old shape read fields out of a
+/// `Value` by hand — `arguments["id"].as_str().unwrap_or("unknown")` — so a
+/// renamed field produced a plausible wrong answer rather than an error, and
+/// nothing reconciled the manifest's schema with the code that read it.
+#[tokio::test]
+async fn a_typed_tool_refuses_arguments_that_do_not_fit() {
+    use agentplane::tools::{ToolBox, ToolClient, ToolId};
+
+    let tools = ToolBox::new().with::<ReadBalance>();
+    let id = ToolId::new("ledger", "read");
+
+    let ok = tools
+        .call(&id, &json!({ "account": "AC-1" }), None)
+        .await
+        .expect("well-formed arguments");
+    assert_eq!(ok["balance"], 42);
+
+    // A field the type does not have. Refused *before* the body runs, so there
+    // is nothing to index wrongly and no default to stand in for an answer.
+    let err = tools
+        .call(&id, &json!({ "acct": "AC-1" }), None)
+        .await
+        .expect_err("arguments that do not fit were accepted");
+    assert!(
+        err.to_string().contains("declared shape"),
+        "the refusal did not say the arguments were the problem: {err}"
+    );
+
+    // And a tool this box does not offer is refused rather than timed out
+    // against nothing.
+    assert!(
+        tools
+            .call(&ToolId::new("ledger", "post"), &json!({}), None)
+            .await
+            .is_err()
+    );
+}
+
+/// The schema a model is shown comes from the type.
+#[test]
+fn a_typed_tool_generates_its_own_schema() {
+    use agentplane::tools::{ToolBox, ToolId};
+
+    let tools = ToolBox::new().with::<ReadBalance>();
+    let (description, schema, mutates) = tools
+        .declared(&ToolId::new("ledger", "read"))
+        .expect("the registered tool");
+
+    assert_eq!(description, "Read a ledger account's balance.");
+    assert!(!mutates);
+    assert_eq!(
+        schema["properties"]["account"]["type"], "string",
+        "the schema was not derived from the type: {schema}"
+    );
+    assert_eq!(
+        schema["required"][0], "account",
+        "a required argument did not survive derivation: {schema}"
+    );
+}
+
+/// Code and the reviewed declaration must agree, in both directions.
+///
+/// Deriving a schema is ergonomics. Noticing that the manifest a reviewer
+/// approved and the tools this binary implements have drifted apart is a
+/// control — and it is not caught by the dispatch gates, which refuse a *call*
+/// long after the disagreement shaped what the model was offered.
+#[cfg(feature = "manifest")]
+#[test]
+fn a_box_that_disagrees_with_its_manifest_is_refused() {
+    use agentplane::manifest::Manifest;
+    use agentplane::tools::ToolBox;
+
+    let granted = |refs: &str| {
+        Manifest::parse(&format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: teller, version: "1.0.0" }}
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  tools:
+{refs}
+  budgets: {{}}
+"#
+        ))
+        .expect("parse")
+    };
+
+    let tools = ToolBox::new().with::<ReadBalance>();
+
+    // They agree.
+    let ok =
+        granted("    - ref: mcp://ledger/read\n      mutates: false\n      description: Read.");
+    assert!(tools.check_against(&ok).is_ok());
+
+    // Implemented, never granted: the binary can do something its declaration
+    // does not admit.
+    let ungranted =
+        granted("    - ref: mcp://ledger/post\n      mutates: true\n      description: Post.");
+    let problems = tools
+        .check_against(&ungranted)
+        .expect_err("a tool nobody granted was accepted");
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("ledger/read") && p.contains("grants no such tool")),
+        "{problems:?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("ledger/post") && p.contains("nothing implements it")),
+        "a grant with no implementation was not reported: {problems:?}"
+    );
+}
+
+/// Post an amount to a ledger account.
+// Only the manifest-coherence tests construct it, so without that feature it is
+// genuinely unused rather than merely unreferenced.
+#[cfg(feature = "manifest")]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PostsMoney {
+    /// The account to post to.
+    account: String,
+}
+
+#[cfg(feature = "manifest")]
+#[async_trait::async_trait]
+impl agentplane::tools::Tool for PostsMoney {
+    const SERVER: &'static str = "ledger";
+    const NAME: &'static str = "post";
+
+    // The author's claim about their own code: this changes the world.
+    async fn call(self) -> Result<Value, ToolError> {
+        Ok(json!({ "posted": self.account }))
+    }
+}
+
+/// A manifest may be stricter than a tool claims, never laxer.
+///
+/// The type's `mutates()` is the *author's* statement about their own code; the
+/// manifest is the *deployment's*. When they disagree, the direction decides
+/// whether it is a defect.
+///
+/// An operator being **more** cautious is fine — they may know about a side
+/// effect the author forgot, and the runtime simply treats the call carefully.
+/// An operator being **less** cautious is not: a manifest marking a
+/// self-declared mutating tool as read-only exempts it from the whole-value
+/// taint gate, so model-chosen arguments reach something that changes the
+/// world. That is the one direction nobody can be right about.
+#[cfg(feature = "manifest")]
+#[test]
+fn a_manifest_may_not_declare_a_mutating_tool_read_only() {
+    use agentplane::manifest::Manifest;
+    use agentplane::tools::ToolBox;
+
+    let manifest = |mutates: &str| {
+        Manifest::parse(&format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: teller, version: "1.0.0" }}
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  tools:
+    - ref: mcp://ledger/post
+      mutates: {mutates}
+      description: Post an amount.
+  budgets: {{}}
+"#
+        ))
+        .expect("parse")
+    };
+
+    let tools = ToolBox::new().with::<PostsMoney>();
+
+    // Agreement.
+    assert!(tools.check_against(&manifest("true")).is_ok());
+
+    // The manifest is laxer than the code claims about itself.
+    let problems = tools
+        .check_against(&manifest("false"))
+        .expect_err("a manifest relaxed a tool's own claim that it mutates");
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("ledger/post") && p.contains("mutat")),
+        "the disagreement was not reported: {problems:?}"
+    );
+}
+
+/// And the other direction is allowed, because the operator is the one being
+/// careful.
+#[cfg(feature = "manifest")]
+#[test]
+fn a_manifest_may_be_stricter_than_a_tool_claims() {
+    use agentplane::manifest::Manifest;
+    use agentplane::tools::ToolBox;
+
+    // `ReadBalance` declares `mutates() == false`; the operator says otherwise.
+    let m = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  tools:
+    - ref: mcp://ledger/read
+      mutates: true
+      description: Read, but the operator is cautious.
+  budgets: {}
+"#,
+    )
+    .expect("parse");
+
+    assert!(
+        ToolBox::new()
+            .with::<ReadBalance>()
+            .check_against(&m)
+            .is_ok(),
+        "an operator being more cautious than the author was refused"
+    );
+}
+
+/// The coherence check is not advisory.
+///
+/// [`ToolBox::check_against`] could be called, which meant it could be *not*
+/// called — and a control a deployer may forget is advice that reads like a
+/// control. The runtime's own I12 says no declared control may be advisory, so
+/// `toolbox` runs it at build time and refuses.
+///
+/// This is the test that distinguishes "the check exists" from "the check
+/// runs". Deleting the call in `RuntimeBuilder::toolbox` leaves every other
+/// test in this file green.
+#[cfg(feature = "manifest")]
+#[test]
+#[should_panic(expected = "disagree")]
+fn a_plane_will_not_build_with_tools_its_manifest_does_not_grant() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::tools::ToolBox;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  tools:
+    - ref: mcp://ledger/read
+      mutates: false
+      description: Read.
+  budgets: {}
+"#,
+    )
+    .expect("parse");
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    // `PostsMoney` is implemented here and granted nowhere in that manifest.
+    //
+    // The box is wired **before** the agent on purpose. Checking inside
+    // `toolbox()` would look like enforcement and find nothing to disagree with
+    // here, so this ordering is what distinguishes the two designs.
+    let _ = Runtime::builder(store as Arc<dyn JournalStore>)
+        .toolbox(ToolBox::new().with::<ReadBalance>().with::<PostsMoney>())
+        .agent(Agent::new(&manifest))
+        .build();
+}
+
+/// And a plane whose tools and manifest agree builds.
+///
+/// The pair matters: without this, a `toolbox` that panicked unconditionally
+/// would pass the test above and look like enforcement.
+///
+/// That the derived catalogue is *correct* — the right grant, with the right
+/// safety — is not asserted here, because the plane catalogue is reached only
+/// through a declarative agent and asserting it from outside would need a
+/// public accessor existing for a test. It is checked where it is observable:
+/// `examples/tool_loop.rs` runs a model that chooses `ledger/read` and counts
+/// the call, and `just ci` runs the examples.
+#[cfg(feature = "manifest")]
+#[test]
+fn a_coherent_plane_builds_and_derives_its_catalogue() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::tools::ToolBox;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  models:
+    privileged: { provider: fake, model: teller-1 }
+  tools:
+    - ref: mcp://ledger/read
+      mutates: false
+      max_sensitivity: internal
+      description: Read.
+  execution: { kind: tool-calling, max_turns: 2 }
+  budgets: {}
+"#,
+    )
+    .expect("parse");
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let _ = Runtime::builder(store as Arc<dyn JournalStore>)
+        .toolbox(ToolBox::new().with::<ReadBalance>())
+        .provider(
+            "fake",
+            agentplane::testkit::FakeProvider::new() as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .build();
+}
+
+/// Every agent on the plane, not the first one.
+///
+/// A plane can host several agents, and the second is exactly where a manifest
+/// drifts without anyone noticing — a first agent that still agrees would
+/// otherwise vouch for a second that does not.
+#[cfg(feature = "manifest")]
+#[test]
+#[should_panic(expected = "'cashier'")]
+fn every_agent_on_a_plane_is_checked_against_the_tools() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::tools::ToolBox;
+
+    let agent = |name: &str, grants: &str| {
+        Manifest::parse(&format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: {name}, version: "1.0.0" }}
+spec:
+  capabilities:
+    provides: [{name}.ask]
+  tools:
+{grants}
+  budgets: {{}}
+"#
+        ))
+        .expect("parse")
+    };
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let _ = Runtime::builder(store as Arc<dyn JournalStore>)
+        // Agrees with the box.
+        .agent(Agent::new(&agent(
+            "teller",
+            "    - ref: mcp://ledger/read\n      mutates: false\n      description: Read.",
+        )))
+        // Does not: it grants a tool nothing implements.
+        .agent(Agent::new(&agent(
+            "cashier",
+            "    - ref: mcp://ledger/read\n      mutates: false\n      description: Read.\n\
+             \x20   - ref: mcp://ledger/settle\n      mutates: true\n      description: Settle.",
+        )))
+        .toolbox(ToolBox::new().with::<ReadBalance>())
+        .build();
+}
+
+/// Wiring tools twice is refused rather than resolved.
+///
+/// `tools(..)` states the catalogue explicitly; `toolbox(..)` derives it from
+/// the agents. Both are legitimate and they are not a merge — letting one
+/// overwrite the other would run the plane under grants nobody chose, and the
+/// deployer would have no way to tell which won.
+#[cfg(feature = "manifest")]
+#[test]
+#[should_panic(expected = "wires tools twice")]
+fn a_plane_may_not_state_its_catalogue_and_derive_it() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::tools::ToolBox;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  tools:
+    - ref: mcp://ledger/read
+      mutates: false
+      description: Read.
+  budgets: {}
+"#,
+    )
+    .expect("parse");
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let _ = Runtime::builder(store as Arc<dyn JournalStore>)
+        .agent(Agent::new(&manifest))
+        .tools(
+            Arc::new(
+                ToolCatalog::new().allow(ToolId::new("ledger", "read"), ToolSafety::read_only()),
+            ),
+            Fake::ok() as Arc<dyn ToolClient>,
+        )
+        .toolbox(ToolBox::new().with::<ReadBalance>())
+        .build();
+}
+
+/// A box wired to a plane with no declared agent is the same defect one step
+/// earlier.
+///
+/// A grant lives in an agent's declaration, so a plane with no declaration has
+/// nothing that admits these tools — and the coherence check would pass by
+/// having nothing to compare against, which is exactly the shape of enforcement
+/// this design refuses everywhere else.
+#[cfg(feature = "manifest")]
+#[test]
+#[should_panic(expected = "no declared agent")]
+fn tools_wired_to_a_plane_with_no_declaration_are_refused() {
+    use agentplane::tools::ToolBox;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let _ = Runtime::builder(store as Arc<dyn JournalStore>)
+        .toolbox(ToolBox::new().with::<ReadBalance>())
+        .build();
+}
+
+/// A stated catalogue may be stricter than a reviewed grant, never laxer.
+///
+/// `toolbox(..)` derives the catalogue from the manifests, so the two cannot
+/// drift. `tools(..)` states it by hand, and there the operator's entry and the
+/// agent's declaration are two copies of one decision — with nothing that
+/// noticed them disagreeing.
+///
+/// The direction matters for the same reason it does in
+/// `a_manifest_may_not_declare_a_mutating_tool_read_only`, and the consequences
+/// are worse here because the catalogue is what the *effect* reads: a
+/// `read_only` entry drops `mutates`, which drops the whole-value taint gate,
+/// and it carries `Recovery::Retry`, which sends a timed-out transfer again.
+#[cfg(feature = "manifest")]
+#[test]
+#[should_panic(expected = "laxer than a reviewed manifest grant")]
+fn a_stated_catalogue_may_not_relax_a_reviewed_mutating_grant() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  tools:
+    - ref: mcp://ledger/post
+      mutates: true
+      description: Post an amount.
+  budgets: {}
+"#,
+    )
+    .expect("parse");
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let _ = Runtime::builder(store as Arc<dyn JournalStore>)
+        .tools(
+            Arc::new(
+                ToolCatalog::new().allow(ToolId::new("ledger", "post"), ToolSafety::read_only()),
+            ),
+            Fake::ok() as Arc<dyn ToolClient>,
+        )
+        .agent(Agent::new(&manifest))
+        .build();
+}
+
+/// And the taint gate itself takes the stricter of the two, not the
+/// catalogue's word.
+///
+/// The build-time refusal above is the primary control, and this is the one
+/// underneath it: the dispatch gate must not be reachable through a catalogue
+/// that disagrees. Before this held, untrusted model-chosen arguments reached a
+/// tool the reviewed manifest declares mutating, and the run **succeeded** —
+/// the authorization gate had OR-ed the manifest's `mutates` in since it
+/// existed, and the sink gate beside it had not.
+///
+/// The sensitivity is pinned to `Public` deliberately: an untrusted label is
+/// `Internal` by default, so a careless version of this test is refused by the
+/// egress ceiling and never reaches the gate it means to check.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn the_taint_gate_takes_the_stricter_of_catalogue_and_grant() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+
+    #[derive(Debug)]
+    struct Posts {
+        catalog: ToolCatalog,
+        client: Arc<Fake>,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Posts {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("post").provides("ledger.ask")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let args = json!({ "account": "attacker" });
+            let write = ToolCall::prepare(
+                &self.catalog,
+                Arc::clone(&self.client) as Arc<dyn ToolClient>,
+                ToolId::new("ledger", "post"),
+                args.clone(),
+            )
+            .map_err(|e| SkillError::Other(e.to_string()))?;
+            let untrusted = Tainted::with_label(
+                args,
+                Label::untrusted(SourceId::new("model:evil")).with_sensitivity(Sensitivity::Public),
+            );
+            let out = cx.sink(write, &untrusted).await?;
+            Ok(Outcome::done(out))
+        }
+    }
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  tools:
+    - ref: mcp://ledger/post
+      mutates: true
+      description: Post an amount.
+  budgets: {}
+"#,
+    )
+    .expect("parse");
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let client = Fake::ok();
+    let catalog = ToolCatalog::new().allow(ToolId::new("ledger", "post"), ToolSafety::read_only());
+
+    // Wired without `agent(..)`, so the build-time refusal above is not what is
+    // being tested — this reaches the dispatch gate on its own.
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .agent(Agent::new(&manifest).skill(Posts {
+            catalog,
+            client: Arc::clone(&client),
+        }))
+        .build()
+        .run("ledger.ask", json!({}))
+        .await;
+
+    assert!(
+        client.calls.lock().unwrap().is_empty(),
+        "untrusted arguments reached a tool the reviewed manifest declares \
+         mutating, because the catalogue called it read-only"
+    );
+    let out = out.expect("the run itself completes");
+    assert!(
+        matches!(&out.status, RunStatus::Failed(m) if m.contains("mutating sink")),
+        "the refusal must name the taint gate, not something incidental: {:?}",
+        out.status
+    );
+}
+
+/// Two agents may share a tool, and must not disagree about it.
+///
+/// A plane has one catalogue and its agents have one manifest each, so two
+/// agents granting `mcp://ledger/read` with different protected fields cannot
+/// both be satisfied. Merging by last-writer would resolve that by
+/// **registration order**, which is exactly what `toolbox` already refuses to
+/// let enforcement depend on — and it fails at a distance rather than here: the
+/// dispatch gate compares each agent's manifest against the catalogue-derived
+/// descriptor exactly, so the agent that lost the race is refused *every* call
+/// to that tool, in production, with a message blaming a code-versus-manifest
+/// drift that neither file exhibits.
+///
+/// The stricter declaration is the one that loses when it is registered first,
+/// which is the ordering a careful author is most likely to write.
+#[cfg(feature = "manifest")]
+#[test]
+#[should_panic(expected = "declare it differently")]
+fn two_agents_may_not_declare_one_tool_differently() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let _ = shared_tool_plane(
+        store,
+        "      protected_fields:\n        - path: /account\n          require_trusted: true",
+        "",
+    );
+}
+
+/// And two agents that agree about a shared tool build.
+///
+/// The pair matters: without it, a check that panicked whenever two agents
+/// touched one tool would pass the test above and look like enforcement while
+/// making the ordinary multi-agent plane unbuildable.
+#[cfg(feature = "manifest")]
+#[test]
+fn two_agents_agreeing_about_one_tool_build() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let _ = shared_tool_plane(store, "", "");
+}
+
+/// Two agents on one plane, each granting `mcp://ledger/read` with whatever
+/// extra declaration the caller appends.
+#[cfg(feature = "manifest")]
+fn shared_tool_plane(
+    store: Arc<RedbStore>,
+    teller_extra: &str,
+    cashier_extra: &str,
+) -> Arc<agentplane::runtime::Runtime> {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::tools::ToolBox;
+
+    #[derive(Debug)]
+    struct Noop(&'static str);
+    #[async_trait::async_trait]
+    impl Skill for Noop {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new(self.0).provides(self.0)
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            Ok(Outcome::done(Tainted::trusted(json!({}))))
+        }
+    }
+
+    let agent = |name: &str, extra: &str| {
+        Manifest::parse(&format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: {name}, version: "1.0.0" }}
+spec:
+  capabilities:
+    provides: [{name}]
+  tools:
+    - ref: mcp://ledger/read
+      mutates: false
+      description: Read.
+{extra}
+  budgets: {{}}
+"#
+        ))
+        .expect("parse")
+    };
+
+    Runtime::builder(store as Arc<dyn JournalStore>)
+        .agent(Agent::new(&agent("teller", teller_extra)).skill(Noop("teller")))
+        .agent(Agent::new(&agent("cashier", cashier_extra)).skill(Noop("cashier")))
+        .toolbox(ToolBox::new().with::<ReadBalance>())
+        .build()
+}
+
+// ── What a failed tool call may tell the model ──────────────────────────────
+//
+// One blanket `Err(e) => ToolExchange::failed(asked, e.to_string())` sat here
+// and carried two different mistakes. Each test below is one of them, plus the
+// case that keeps the fix from being over-broad.
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+fn tool_calling_agent(ceiling: &str) -> String {
+    format!(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: teller, version: "1.0.0" }}
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  identity:
+    role: A teller.
+  models:
+    privileged: {{ provider: fake, model: teller-1 }}
+  tools:
+    - ref: mcp://ledger/read
+      mutates: false
+{ceiling}
+      description: Read a balance.
+  execution: {{ kind: tool-calling, max_turns: 3 }}
+  budgets: {{}}
+"#
+    )
+}
+
+/// A tool whose answer never arrives — the canonical in-doubt case.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+/// Read a ledger account's balance.
+struct TimesOut {
+    /// The account to read.
+    account: String,
+}
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[async_trait::async_trait]
+impl agentplane::tools::Tool for TimesOut {
+    const SERVER: &'static str = "ledger";
+    const NAME: &'static str = "read";
+    fn mutates() -> bool {
+        false
+    }
+    async fn call(self) -> Result<Value, ToolError> {
+        let _ = self.account;
+        Err(ToolError::TimedOut {
+            tool: ToolId::new("ledger", "read"),
+            detail: "no answer in 30s".into(),
+        })
+    }
+}
+
+/// A tool the far side ran and reported failed. Landed, and the model's
+/// business.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+/// Read a ledger account's balance.
+struct Declines {
+    /// The account to read.
+    account: String,
+}
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[async_trait::async_trait]
+impl agentplane::tools::Tool for Declines {
+    const SERVER: &'static str = "ledger";
+    const NAME: &'static str = "read";
+    fn mutates() -> bool {
+        false
+    }
+    async fn call(self) -> Result<Value, ToolError> {
+        let _ = self.account;
+        Err(ToolError::ToolFailed {
+            tool: ToolId::new("ledger", "read"),
+            detail: "account AC-1 is closed".into(),
+        })
+    }
+}
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+async fn run_tool_calling<T: agentplane::tools::Tool>(
+    ceiling: &str,
+) -> (
+    agentplane::runtime::RunOutcome,
+    Arc<agentplane::testkit::FakeProvider>,
+) {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::testkit::FakeProvider;
+    use agentplane::tools::ToolBox;
+
+    let provider = FakeProvider::new();
+    provider.will_call_tool("call_1", "ledger__read", json!({ "account": "AC-1" }));
+    provider.will_say("the balance is 42");
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let manifest = Manifest::parse(&tool_calling_agent(ceiling)).expect("parse");
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .toolbox(ToolBox::new().with::<T>())
+        .build();
+
+    let out = rt
+        .run("ledger.ask", json!({ "q": "AC-1?" }))
+        .await
+        .expect("the run completes");
+    (out, provider)
+}
+
+/// An unknown outcome is not a failed call, and must not be reported as one.
+///
+/// `StepError::Undecidable` is the runtime saying it cannot tell "never
+/// applied" from "applied, acknowledgement lost" — a timed-out payment may well
+/// have been taken — and the executor quarantines on it. Handed to the model as
+/// a failed call it never reaches the executor: the model apologises, the loop
+/// continues, and the run ends **`Succeeded`** over a mutation nobody can
+/// account for. That is I5 inverted by an error-handling convenience, and it is
+/// what this asserts against.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn an_undecidable_tool_call_quarantines_rather_than_answering_the_model() {
+    let (out, provider) = run_tool_calling::<TimesOut>("      max_sensitivity: internal").await;
+
+    assert!(
+        matches!(&out.status, RunStatus::Quarantined(m) if m.contains("undecidable")),
+        "a tool call whose outcome is unknown must quarantine the run, not \
+         become a chat message: {:?}",
+        out.status
+    );
+    assert_eq!(
+        provider.calls(),
+        1,
+        "the loop asked the model again after an unknown outcome, which is the \
+         apology that replaces the quarantine"
+    );
+}
+
+/// A refusal tells the model one uniform sentence.
+///
+/// Every `PolicyError` message is written for an operator reading a journal and
+/// is precise on purpose: which sink, which field, what sensitivity, which
+/// ceiling. Handed to a model, that precision turns the policy into a queryable
+/// service — injected content varies the request, watches which variants come
+/// back refused, and reads the boundary off the answers. `EgressCeiling` is the
+/// sharpest, because it names the *sensitivity of the data*.
+///
+/// `PolicyError::for_model` has said so since it was written. Until this test
+/// it had **no callers**: the one path in the crate that feeds a refusal to a
+/// model used `Display`, and every existing test passed because the only test
+/// of the control called the function directly rather than checking that
+/// anything used it.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_refusal_tells_the_model_nothing_it_can_differentiate() {
+    // No `max_sensitivity`, so the grant keeps the cautious `Public` default and
+    // the model's own untrusted (`Internal`) arguments are refused at the
+    // ceiling — the sharpest oracle there is.
+    let (out, provider) = run_tool_calling::<Declines>("").await;
+    assert!(matches!(out.status, RunStatus::Succeeded));
+
+    let told: Vec<String> = provider
+        .asked()
+        .into_iter()
+        .flat_map(|a| a.exchanges)
+        .filter(|x| x.failed)
+        .map(|x| x.output.as_str().unwrap_or_default().to_owned())
+        .collect();
+
+    assert_eq!(
+        told,
+        vec![agentplane::core::REFUSED.to_owned()],
+        "the model was told something it can differentiate"
+    );
+    for text in &told {
+        for leak in ["Internal", "Public", "ceiling", "sensitivity", "mcp.tools"] {
+            assert!(
+                !text.contains(leak),
+                "the model-facing refusal carries '{leak}': {text}"
+            );
+        }
+    }
+}
+
+/// And the far side's own answer still reaches the model.
+///
+/// The pair matters: a fix that made *every* failure uniform would pass the
+/// test above while blinding the model to the one thing it can act on. A tool
+/// that ran and declined is information the model needs in order to try
+/// something else, and it is text the far side already controls — withholding
+/// it protects nothing.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_tool_that_ran_and_failed_reports_its_own_words() {
+    let (out, provider) = run_tool_calling::<Declines>("      max_sensitivity: internal").await;
+    assert!(matches!(out.status, RunStatus::Succeeded));
+
+    let told: Vec<String> = provider
+        .asked()
+        .into_iter()
+        .flat_map(|a| a.exchanges)
+        .filter(|x| x.failed)
+        .map(|x| x.output.as_str().unwrap_or_default().to_owned())
+        .collect();
+
+    assert_eq!(
+        told.len(),
+        1,
+        "expected exactly one failed exchange: {told:?}"
+    );
+    assert!(
+        told[0].contains("account AC-1 is closed"),
+        "the far side's own answer must reach the model: {}",
+        told[0]
+    );
+}
+
+/// An in-doubt outcome is not a chat message even when the run survives it.
+///
+/// The case above is the one the executor quarantines. This is its quieter
+/// sibling: the operator declared the tool safe to repeat (`Recovery::Retry`),
+/// so the runtime does not quarantine — it returns the effect error, and a
+/// hand-written skill would end the run with it.
+///
+/// The loop must do the same. `InDoubt` means the world may already have
+/// changed; telling the model "that failed, try something else" invites it to
+/// reach the same effect by another route while the first one may still be in
+/// flight. Whether that is worth quarantining over is the recovery policy's
+/// call, made above this loop — reporting it here takes the call away.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn an_in_doubt_tool_call_does_not_become_a_chat_message() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::testkit::FakeProvider;
+
+    #[derive(Debug)]
+    struct Times;
+    #[async_trait::async_trait]
+    impl ToolClient for Times {
+        async fn call(
+            &self,
+            tool: &ToolId,
+            _a: &Value,
+            _p: Option<&agentplane::core::Provenance>,
+        ) -> Result<Value, ToolError> {
+            Err(ToolError::TimedOut {
+                tool: tool.clone(),
+                detail: "no answer in 30s".into(),
+            })
+        }
+    }
+
+    let provider = FakeProvider::new();
+    provider.will_call_tool("call_1", "ledger__read", json!({ "account": "AC-1" }));
+    provider.will_say("the balance is 42");
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let manifest = Manifest::parse(&tool_calling_agent("      max_sensitivity: internal")).unwrap();
+
+    // `read_only()` carries `Recovery::Retry` — the operator saying this call is
+    // safe to repeat, which is what keeps this out of the quarantine path.
+    let catalog = ToolCatalog::new().allow(
+        ToolId::new("ledger", "read"),
+        ToolSafety::read_only().max_sensitivity(Sensitivity::Internal),
+    );
+
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .tools(Arc::new(catalog), Arc::new(Times) as Arc<dyn ToolClient>)
+        .agent(Agent::new(&manifest))
+        .build()
+        .run("ledger.ask", json!({ "q": "AC-1?" }))
+        .await
+        .expect("the run completes");
+
+    assert!(
+        matches!(&out.status, RunStatus::Failed(m) if m.contains("did not answer in time")),
+        "an in-doubt tool call was reported to the model and the loop carried \
+         on: {:?}",
+        out.status
+    );
+    assert_eq!(
+        provider.calls(),
+        1,
+        "the model was asked again after an in-doubt outcome"
+    );
+}

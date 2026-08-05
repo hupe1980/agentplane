@@ -740,6 +740,10 @@ impl crate::journal::AtomicWork for GroupCommit {
                     mutates: true,
                     attempt: 1,
                     backoff_ms: 0,
+                    // An atomic member binding outbound arguments is refused at
+                    // registration — it would need `sink`, and a group has no
+                    // labelled value to bind on its behalf.
+                    outbound_label: None,
                 })
                 .effect(*key),
             );

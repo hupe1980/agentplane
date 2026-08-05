@@ -2952,3 +2952,178 @@ spec:
          instruction's label"
     );
 }
+
+/// A specialist may not delegate — including on its own plane.
+///
+/// The declaration is refused at parse time: a manifest with `role: specialist`
+/// and `max_delegation_depth` above zero is incoherent. That is the *structural*
+/// half, and it was the only half. The runtime half is this: a specialist whose
+/// ceiling is zero must be refused when it actually hands work off.
+///
+/// `cx.commission` is the in-plane hand-off, and it is the one that matters for
+/// the loop the role exists to prevent — A commissions B commissions C
+/// commissions A, all inside one process, with no peer boundary to cross and no
+/// egress allowlist to notice.
+#[tokio::test]
+async fn a_specialist_cannot_commission_another_agent() {
+    use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted};
+    use agentplane::journal::JournalStore;
+    use agentplane::runtime::{Agent, RunStatus, Runtime, StepCtx};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+
+    const SPECIALIST: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: researcher, version: "1.0.0" }
+spec:
+  capabilities:
+    provides: [research.do]
+  topology: { mode: single, role: specialist }
+  security:
+    max_delegation_depth: 0
+  budgets: {}
+"#;
+
+    const HELPER: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: helper, version: "1.0.0" }
+spec:
+  capabilities:
+    provides: [help.with]
+  topology: { mode: single, role: specialist }
+  security:
+    max_delegation_depth: 0
+  budgets: {}
+"#;
+
+    /// Hands work off to another agent on the same plane.
+    #[derive(Debug)]
+    struct HandsOff;
+
+    #[async_trait::async_trait]
+    impl Skill for HandsOff {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("researcher").provides("research.do")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let answer = cx
+                .commission("help.with", Tainted::trusted(json!({ "q": "anything" })))
+                .await?;
+            Ok(Outcome::done(answer))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Helps;
+
+    #[async_trait::async_trait]
+    impl Skill for Helps {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("helper").provides("help.with")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            Ok(Outcome::done(Tainted::trusted(json!("helped"))))
+        }
+    }
+
+    let researcher = Manifest::parse(SPECIALIST).expect("parse");
+    let helper = Manifest::parse(HELPER).expect("parse");
+    let store: Arc<dyn JournalStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+
+    let rt = Runtime::builder(store)
+        .agent(Agent::new(&researcher).skill(HandsOff))
+        .agent(Agent::new(&helper).skill(Helps))
+        .build();
+
+    let out = rt.run("research.do", json!({})).await.expect("run");
+
+    let RunStatus::Failed(why) = &out.status else {
+        panic!(
+            "a specialist handed work to another agent on its own plane — the \
+             bound on the chain is a comment, and A->B->C->A is reachable: {:?}",
+            out.status
+        );
+    };
+    assert!(
+        why.contains("delegat"),
+        "refused for an unrelated reason: {why}"
+    );
+}
+
+/// A catalogue derived from a manifest carries what the manifest declared.
+///
+/// A manifest and a catalogue are two parties speaking: the agent's author says
+/// what it needs, the operator says what it may have. That separation is real
+/// when those are different people, and pure tax when they are the same one —
+/// stating `mutates`, the ceiling and the protected fields twice is not two
+/// decisions, it is one decision and a chance to disagree about it.
+///
+/// So the derived catalogue must carry the *security* fields faithfully. A
+/// derivation that quietly relaxed one would be worse than the duplication it
+/// replaced: the operator would believe they had declared something they had
+/// not.
+#[test]
+fn a_catalogue_derived_from_a_manifest_keeps_its_security_fields() {
+    use agentplane::core::{ProtectedField, Sensitivity};
+    use agentplane::tools::{ToolCatalog, ToolId};
+
+    const YAML: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  tools:
+    - ref: mcp://ledger/read
+      mutates: false
+      max_sensitivity: internal
+      description: Read a balance.
+    - ref: mcp://ledger/post
+      mutates: true
+      max_sensitivity: confidential
+      description: Post an amount.
+      protected_fields:
+        - path: /account
+          require_trusted: true
+  budgets: {}
+"#;
+
+    let m = Manifest::parse(YAML).expect("parse");
+    let catalog = ToolCatalog::from_manifest(&m);
+
+    let read = catalog
+        .safety(&ToolId::new("ledger", "read"))
+        .expect("the declared read tool is in the catalogue");
+    assert!(!read.mutates, "a read-only grant became mutating");
+    assert_eq!(read.max_sensitivity, Sensitivity::Internal);
+
+    let post = catalog
+        .safety(&ToolId::new("ledger", "post"))
+        .expect("the declared write tool is in the catalogue");
+    assert!(post.mutates, "a mutating grant was relaxed to read-only");
+    assert_eq!(post.max_sensitivity, Sensitivity::Confidential);
+    assert_eq!(
+        post.protected_fields,
+        vec![ProtectedField::trusted("/account")],
+        "the field rules a reviewer approved did not survive the derivation"
+    );
+
+    // A tool the manifest never declared is not in the catalogue, so deriving
+    // cannot widen what the declaration asked for.
+    assert!(
+        catalog.safety(&ToolId::new("ledger", "delete")).is_none(),
+        "the derivation invented a grant"
+    );
+}
