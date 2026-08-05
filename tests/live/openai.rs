@@ -291,6 +291,7 @@ async fn openai_accepts_our_tool_declaration_and_asks_for_it() {
             model: &id,
             prompt: &prompt,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
             schema: None,
             tools: &tools,
             exchanges: &[],

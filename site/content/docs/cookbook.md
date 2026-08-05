@@ -1000,24 +1000,20 @@ for memory in &known {
     println!("{} (trust {:?})", memory.peek().id, memory.label().trust);
 }
 
-cx.remember(MemoryItem {
-    id: format!("triage-{account}"),
-    subject: account.clone(),
-    purpose: "support".to_owned(),
-    content: summary,
-    // Where it came from. This is what everything downstream is labelled by.
-    provenance: vec![SourceId::new("model:triage")],
-    trust: Trust::Untrusted,
-    ..item
-}).await?;
+// `summary` is a `Tainted<Value>` from the model. The runtime derives trust,
+// sensitivity and provenance from it; there is no metadata field with which it
+// can be promoted while being stored.
+cx.remember(
+    MemoryWrite::new(format!("triage-{account}"), account.clone(), "support"),
+    summary,
+).await?;
 ```
 
-**The trap:** writing model output with `trust: Trusted` because it looks fine.
-That is the one way to launder it — the label everything later reads is taken
-from this field, not from the content. Declaring it trusted here is the same act
-as `cx.release`, without the policy check or the record. If a memory genuinely
-needs to be believed, release it explicitly where a reviewer can see the
-decision.
+**The trap:** stripping the label before writing. `StepCtx::remember` prevents
+the obvious laundering path by accepting `MemoryWrite` plus `Tainted<Value>` and
+deriving all security metadata. If a memory genuinely needs improved trust or
+sensitivity, call `cx.release` first so policy and the journal record the
+decision; then store the released value.
 
 **The second trap:** expecting `forget` to be enough for an erasure request. It
 removes one memory and every version of it, which is what selective repair

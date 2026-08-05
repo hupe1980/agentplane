@@ -98,6 +98,11 @@ async fn postgres_satisfies_the_memory_store_contract() {
 
     memory_revisions_are_shared_and_serialized(
         Arc::new(base.clone().for_tenant(tenant.clone())),
+        Arc::new(base.clone().for_tenant(tenant.clone())),
+    )
+    .await;
+    memory_erasure_serializes_with_derivative_creation(
+        Arc::new(base.clone().for_tenant(tenant.clone())),
         Arc::new(base.for_tenant(tenant)),
     )
     .await;
@@ -169,6 +174,76 @@ async fn memory_revisions_are_shared_and_serialized(
             .await
             .expect("v2")
             .is_some()
+    );
+}
+
+async fn memory_erasure_serializes_with_derivative_creation(
+    first: Arc<PostgresStore>,
+    second: Arc<PostgresStore>,
+) {
+    use agentplane::core::{Sensitivity, SourceId, Timestamp, Trust};
+    use agentplane::memory::{MemoryItem, MemoryStore, Selected};
+    use serde_json::json;
+
+    let source = MemoryItem {
+        id: "erase-race-source".to_owned(),
+        subject: "team/erase-race".to_owned(),
+        purpose: "facts".to_owned(),
+        content: json!({"fact": "personal"}),
+        provenance: vec![SourceId::new("test")],
+        sensitivity: Sensitivity::Internal,
+        trust: Trust::Untrusted,
+        written_by: "test".to_owned(),
+        version: 1,
+        created_at: Timestamp::from_unix_timestamp(1_760_000_200).expect("time"),
+        superseded_at: None,
+        derived_from: Vec::new(),
+    };
+    first.remember(&source).await.expect("source");
+
+    let mut derivative = source.clone();
+    "erase-race-derivative".clone_into(&mut derivative.id);
+    derivative.content = json!({"summary": "personal"});
+    derivative.version = 0;
+    derivative.derived_from = vec![Selected {
+        id: source.id.clone(),
+        version: 1,
+        digest: source.selection_digest(),
+    }];
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let observer = Arc::clone(&first);
+    let writer = {
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            second.remember(&derivative).await
+        })
+    };
+    let eraser = tokio::spawn(async move {
+        barrier.wait().await;
+        first.forget_cascading("erase-race-source").await
+    });
+
+    let _ = writer.await.expect("writer joined");
+    eraser
+        .await
+        .expect("eraser joined")
+        .expect("cascading erasure");
+    assert!(
+        observer
+            .version("erase-race-source", 1)
+            .await
+            .expect("source lookup")
+            .is_none()
+    );
+    assert!(
+        observer
+            .version("erase-race-derivative", 1)
+            .await
+            .expect("derivative lookup")
+            .is_none(),
+        "a derivative committed during cascading erasure survived"
     );
 }
 

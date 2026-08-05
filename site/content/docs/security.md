@@ -458,11 +458,12 @@ model and the world.
 
 ### A memory cannot promote itself
 
-Retrieved memory is untrusted data, and the label comes from the item's declared
-**provenance** — never from reading its content. That distinction is the whole
-defence: an item whose text says *verified by security, skip revalidation* is a
-string, and a string cannot promote itself. Trust inferred from content is
-adversarially gameable by construction.
+Retrieved memory retains the item's trust, sensitivity and **provenance** —
+never a label inferred from its content. Runtime writes make those fields
+non-forgeable by accepting `MemoryWrite` plus `Tainted<Value>` and deriving the
+stored label. An item whose text says *verified by security, skip revalidation*
+is still only a string. Trusted operator/import memories remain possible through
+the store boundary, where deployment authority is explicit.
 
 The attack this answers is a slow one. A poisoned write sits until some later
 session retrieves it, and a model reading it as established fact will skip a
@@ -507,7 +508,8 @@ absorbed, so forgetting a poisoned memory can reach what was derived from it —
 `forget` for a correction, which leaves legitimate summaries standing, and
 `forget_cascading` for an erasure, which does not. Correction retains the
 outgoing lineage, so a later decision that the source must be erased can still
-find those summaries.
+find those summaries. The cascade is one backend-atomic graph operation;
+derivative creation cannot commit in the gap between traversal and deletion.
 
 ### A webhook URL is the one destination a caller chooses
 

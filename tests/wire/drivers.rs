@@ -24,7 +24,9 @@ use std::sync::Arc;
 use agentplane::core::{Delegation, Disposition, Principal, Scope};
 use agentplane::model::anthropic::Anthropic;
 use agentplane::model::openai::OpenAi;
-use agentplane::model::{ModelCall, ModelError, ModelId, ModelProvider, SchemaMode};
+use agentplane::model::{
+    ModelCall, ModelError, ModelId, ModelProvider, ReasoningEffort, SchemaMode,
+};
 use agentplane::peers::a2a::{A2aClient, EXTENSION_URI, Endpoint, PROTOCOL_VERSION};
 use agentplane::peers::{PeerClient, PeerError, PeerId};
 use axum::Router;
@@ -73,6 +75,22 @@ async fn serve(canned: Canned) -> String {
     format!("http://{addr}")
 }
 
+async fn serve_hanging() -> String {
+    async fn hang() -> &'static str {
+        std::future::pending::<&'static str>().await
+    }
+
+    let app = Router::new()
+        .route("/v1/messages", post(hang))
+        .route("/v1/responses", post(hang));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
 fn canned_observed(status: u16, body: Value) -> (Canned, SeenBody, SeenHeaders) {
     let seen = Arc::new(std::sync::Mutex::new(None));
     let seen_headers = Arc::new(std::sync::Mutex::new(None));
@@ -86,6 +104,112 @@ fn canned_observed(status: u16, body: Value) -> (Canned, SeenBody, SeenHeaders) 
         seen,
         seen_headers,
     )
+}
+
+#[tokio::test]
+async fn model_drivers_bound_a_provider_that_never_responds() {
+    let url = serve_hanging().await;
+    let timeout = std::time::Duration::from_millis(25);
+    let prompt = json!("hello");
+    let openai_model = ModelId::new("openai", "gpt-x");
+    let anthropic_model = ModelId::new("anthropic", "claude-x");
+
+    let openai = OpenAi::new("k").unwrap().base(url.clone()).timeout(timeout);
+    let openai_error = openai
+        .complete(agentplane::model::Request {
+            model: &openai_model,
+            prompt: &prompt,
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
+            schema: None,
+            tools: &[],
+            exchanges: &[],
+        })
+        .await
+        .expect_err("OpenAI waited forever for a provider that never responded");
+    assert!(
+        matches!(openai_error, ModelError::Unavailable { .. }),
+        "a pre-response timeout had the wrong recovery meaning: {openai_error}"
+    );
+
+    let anthropic = Anthropic::new("k").unwrap().base(url).timeout(timeout);
+    let anthropic_error = anthropic
+        .complete(agentplane::model::Request {
+            model: &anthropic_model,
+            prompt: &prompt,
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
+            schema: None,
+            tools: &[],
+            exchanges: &[],
+        })
+        .await
+        .expect_err("Anthropic waited forever for a provider that never responded");
+    assert!(
+        matches!(anthropic_error, ModelError::Unavailable { .. }),
+        "a pre-response timeout had the wrong recovery meaning: {anthropic_error}"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_effort_uses_each_providers_native_request_shape() {
+    let (openai_canned, openai_seen) = canned(
+        200,
+        json!({
+            "status": "completed",
+            "output": [{"content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+    );
+    let openai_url = serve(openai_canned).await;
+    let openai = OpenAi::new("k").unwrap().base(openai_url).buffered();
+    let prompt = json!("think");
+    let id = ModelId::new("openai", "gpt-5.6");
+    openai
+        .complete(agentplane::model::Request {
+            model: &id,
+            prompt: &prompt,
+            max_output_tokens: 4096,
+            reasoning_effort: Some(ReasoningEffort::XHigh),
+            schema: None,
+            tools: &[],
+            exchanges: &[],
+        })
+        .await
+        .expect("OpenAI reasoning request");
+    assert_eq!(
+        openai_seen.lock().unwrap().as_ref().unwrap()["reasoning"]["effort"],
+        "xhigh"
+    );
+
+    let (anthropic_canned, anthropic_seen) = canned(
+        200,
+        json!({
+            "content": [{"type": "text", "text": "{\"ok\":true}"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "stop_reason": "end_turn"
+        }),
+    );
+    let anthropic_url = serve(anthropic_canned).await;
+    let anthropic = Anthropic::new("k").unwrap().base(anthropic_url).buffered();
+    let id = ModelId::new("anthropic", "claude-opus-5");
+    let schema = json!({"type": "object"});
+    anthropic
+        .complete(agentplane::model::Request {
+            model: &id,
+            prompt: &prompt,
+            max_output_tokens: 4096,
+            reasoning_effort: Some(ReasoningEffort::High),
+            schema: Some(&schema),
+            tools: &[],
+            exchanges: &[],
+        })
+        .await
+        .expect("Anthropic reasoning request");
+    let body = anthropic_seen.lock().unwrap().clone().unwrap();
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert_eq!(body["output_config"]["effort"], "high");
+    assert_eq!(body["output_config"]["format"]["type"], "json_schema");
 }
 
 fn canned(status: u16, body: Value) -> (Canned, SeenBody) {
@@ -590,6 +714,7 @@ fn ask<'a>(model: &'a ModelId, prompt: &'a Value) -> agentplane::model::Request<
         model,
         prompt,
         max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+        reasoning_effort: None,
         schema: None,
         tools: &[],
         exchanges: &[],
@@ -877,6 +1002,7 @@ async fn a_schema_is_sent_as_a_strict_constraint() {
             model: &gpt(),
             prompt: &json!("how much"),
             max_output_tokens: 77,
+            reasoning_effort: None,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -918,6 +1044,7 @@ async fn the_anthropic_driver_sends_a_schema_too() {
             model: &model(),
             prompt: &json!("how much"),
             max_output_tokens: 88,
+            reasoning_effort: None,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -956,6 +1083,7 @@ async fn an_unparseable_structured_answer_is_billed_and_loud() {
             model: &gpt(),
             prompt: &json!("x"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1031,6 +1159,7 @@ async fn anthropic_can_emulate_a_schema_with_a_forced_tool() {
             model: &model(),
             prompt: &json!("how much"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1085,6 +1214,7 @@ async fn openai_can_emulate_a_schema_with_a_forced_tool() {
             model: &gpt(),
             prompt: &json!("how much"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1133,6 +1263,7 @@ async fn the_schema_mode_is_chosen_per_model() {
             model: &ModelId::new("anthropic", "claude-legacy-1"),
             prompt: &json!("x"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1166,6 +1297,7 @@ async fn the_schema_mode_is_chosen_per_model() {
             model: &ModelId::new("anthropic", "claude-opus-4-5"),
             prompt: &json!("x"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1208,6 +1340,7 @@ async fn a_model_that_ignores_the_forced_tool_is_caught() {
             model: &model(),
             prompt: &json!("x"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1260,6 +1393,7 @@ async fn an_incompatible_schema_is_refused_with_the_reason() {
                 model: &gpt(),
                 prompt: &json!("x"),
                 max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+                reasoning_effort: None,
                 schema: Some(&sch),
                 tools: &[],
                 exchanges: &[],
@@ -1302,6 +1436,7 @@ async fn a_conformant_schema_is_not_rewritten() {
             model: &gpt(),
             prompt: &json!("x"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1670,6 +1805,7 @@ data: {\"type\":\"message_stop\"}
             model: &model(),
             prompt: &prompt,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
@@ -1714,6 +1850,7 @@ data: {\"type\":\"message_stop\"}
             model: &model(),
             prompt: &prompt,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],

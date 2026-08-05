@@ -457,6 +457,8 @@ pub struct Request<'a> {
     /// driver silently discarded that declaration and kept the real request
     /// limit out of the effect key.
     pub max_output_tokens: u32,
+    /// How much internal reasoning to request, when explicitly configured.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// A JSON Schema the answer must conform to, if one was declared.
     ///
     /// Passed straight through to the provider's own structured-output mode —
@@ -473,6 +475,57 @@ pub struct Request<'a> {
     pub tools: &'a [ToolDeclaration],
     /// Tools already run this turn, and what they returned.
     pub exchanges: &'a [ToolExchange],
+}
+
+/// Provider-neutral reasoning depth.
+///
+/// Providers and models support different subsets. An explicit unsupported
+/// value is refused before dispatch rather than silently downgraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::ReasoningEffort;
+
+    #[test]
+    fn every_reasoning_effort_has_a_pinned_wire_spelling() {
+        for (effort, wire) in [
+            (ReasoningEffort::None, "none"),
+            (ReasoningEffort::Minimal, "minimal"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::XHigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+        ] {
+            assert_eq!(effort.as_str(), wire);
+        }
+    }
 }
 
 /// How a driver should obtain a schema-conforming answer.
@@ -515,6 +568,16 @@ pub enum SchemaMode {
 /// Talks to a provider.
 #[async_trait]
 pub trait ModelProvider: Send + Sync + Debug {
+    /// Stable, non-secret configuration that changes the provider wire request.
+    ///
+    /// It is part of [`ModelCall`]'s effect identity. A provider switching from
+    /// native schema enforcement to a forced tool, changing endpoint/API
+    /// version, or changing streaming behavior must not replay an answer
+    /// produced under the old transport contract. API keys never belong here.
+    fn request_profile(&self, _model: &ModelId) -> Value {
+        Value::Null
+    }
+
     /// Complete a prompt.
     ///
     /// # Errors
@@ -639,6 +702,7 @@ pub struct ModelCall {
     tools: Vec<ToolDeclaration>,
     exchanges: Vec<ToolExchange>,
     max_output_tokens: u32,
+    reasoning_effort: Option<ReasoningEffort>,
     provider: Arc<dyn ModelProvider>,
     max_sensitivity: Sensitivity,
     output_sensitivity: Sensitivity,
@@ -671,6 +735,7 @@ impl ModelCall {
             tools: Vec::new(),
             exchanges: Vec::new(),
             max_output_tokens: Self::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
             provider,
             max_sensitivity: Sensitivity::Public,
             output_sensitivity: Sensitivity::Public,
@@ -747,6 +812,13 @@ impl ModelCall {
     #[must_use]
     pub const fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
         self.max_output_tokens = max_output_tokens;
+        self
+    }
+
+    /// Request an explicit reasoning depth.
+    #[must_use]
+    pub const fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
         self
     }
 
@@ -833,6 +905,7 @@ impl Effect for ModelCall {
             serde_json::json!({
                 "provider": self.model.provider,
                 "model": self.model.model,
+                "provider_profile": self.provider.request_profile(&self.model),
                 "prompt": self.prompt,
                 // In the key for the same reason the prompt is: a changed
                 // schema is a changed question, and a replay that read back an
@@ -840,6 +913,7 @@ impl Effect for ModelCall {
                 // nobody asked.
                 "schema": self.schema,
                 "max_output_tokens": self.max_output_tokens,
+                "reasoning_effort": self.reasoning_effort,
                 // Tool descriptions and schemas steer generation just as the
                 // prompt does. Omitting them would let strict replay consume a
                 // completion produced while a different capability surface was
@@ -937,6 +1011,7 @@ impl Effect for ModelCall {
                 model: &self.model,
                 prompt: &prompt,
                 max_output_tokens: self.max_output_tokens,
+                reasoning_effort: self.reasoning_effort,
                 schema: self.schema.as_ref(),
                 tools: &self.tools,
                 exchanges: &self.exchanges,

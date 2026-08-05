@@ -90,10 +90,18 @@ impl MemoryStore for PostgresStore {
         let tx = client.transaction().await.map_err(|error| be(&error))?;
         let tenant = self.tenant_name();
 
-        // A shared subject lock lets unrelated ids in the subject proceed while
-        // excluding `forget_subject`. ID locks cover the first write, where no
-        // current row exists for `FOR UPDATE`, and every derivation source is
-        // locked too so it cannot disappear between validation and commit.
+        // A shared graph lock excludes cascading erasure while allowing normal
+        // memory writes to proceed concurrently. The shared subject lock lets
+        // unrelated ids in the subject proceed while excluding
+        // `forget_subject`. ID locks cover the first write, where no current row
+        // exists for `FOR UPDATE`, and every derivation source is locked too so
+        // it cannot disappear between validation and commit.
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))",
+            &[&format!("memory-graph:{}:{tenant}", tenant.len())],
+        )
+        .await
+        .map_err(|error| be(&error))?;
         tx.query_one(
             "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))",
             &[&format!(
@@ -319,6 +327,72 @@ impl MemoryStore for PostgresStore {
             .map_err(|error| be(&error))?;
         }
         tx.commit().await.map_err(|error| be(&error))
+    }
+
+    async fn forget_cascading(&self, id: &str) -> Result<usize, StoreError> {
+        let mut client = self.pool_ref().get().await.map_err(|error| {
+            StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
+        })?;
+        let tx = client.transaction().await.map_err(|error| be(&error))?;
+        let tenant = self.tenant_name();
+
+        // Exclusive against the shared lock every memory write takes. The
+        // derivation graph is therefore stable for the complete traversal and
+        // deletion, not merely for each query in it.
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&format!("memory-graph:{}:{tenant}", tenant.len())],
+        )
+        .await
+        .map_err(|error| be(&error))?;
+
+        let mut queue = vec![id.to_owned()];
+        let mut doomed = std::collections::BTreeSet::new();
+        while let Some(source) = queue.pop() {
+            if !doomed.insert(source.clone()) {
+                continue;
+            }
+            let rows = tx
+                .query(
+                    "SELECT edge.derived_id
+                     FROM memory_derived edge
+                     JOIN memory_items item
+                       ON item.tenant = edge.tenant
+                      AND item.id = edge.derived_id
+                      AND item.current
+                     WHERE edge.tenant = $1 AND edge.source_id = $2",
+                    &[&tenant, &source],
+                )
+                .await
+                .map_err(|error| be(&error))?;
+            queue.extend(rows.iter().map(|row| row.get::<_, String>("derived_id")));
+        }
+
+        for memory_id in &doomed {
+            tx.execute(
+                "DELETE FROM memory_derived
+                 WHERE tenant = $1 AND (source_id = $2 OR derived_id = $2)",
+                &[&tenant, memory_id],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+            tx.execute(
+                "DELETE FROM memory_items WHERE tenant = $1 AND id = $2",
+                &[&tenant, memory_id],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+            tx.execute(
+                "INSERT INTO memory_forgotten (tenant, id) VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING",
+                &[&tenant, memory_id],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        }
+
+        tx.commit().await.map_err(|error| be(&error))?;
+        Ok(doomed.len())
     }
 
     async fn forget_subject(&self, subject: &str) -> Result<usize, StoreError> {

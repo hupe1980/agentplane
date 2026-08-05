@@ -1274,8 +1274,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/ctx.rs",
         "the_manifest_delegation_ceiling_binds_every_handoff",
         "a handoff may exceed the reviewed manifest's delegation-depth ceiling",
-        "        ) && actual > usize::from(ceiling)",
-        "        ) && false",
+        "            && actual > usize::from(ceiling)",
+        "            && false",
     ),
     "PeerCallHidesItsDelegationDepth": (
         "src/peers/mod.rs",

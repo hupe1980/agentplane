@@ -107,6 +107,36 @@ pub struct MemoryItem {
     pub derived_from: Vec<Selected>,
 }
 
+/// Where a runtime memory write lands.
+///
+/// Security metadata is intentionally absent. [`StepCtx::remember`] derives
+/// trust, provenance and sensitivity from the `Tainted<Value>` being stored, so
+/// an untrusted model result cannot be promoted by constructing metadata that
+/// says otherwise.
+///
+/// [`StepCtx::remember`]: crate::runtime::StepCtx::remember
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryWrite {
+    pub id: String,
+    pub subject: String,
+    pub purpose: String,
+}
+
+impl MemoryWrite {
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        subject: impl Into<String>,
+        purpose: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            subject: subject.into(),
+            purpose: purpose.into(),
+        }
+    }
+}
+
 impl MemoryItem {
     /// The label a recalled value carries.
     ///
@@ -347,27 +377,14 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// because they answer different questions, and defaulting either way would
     /// be wrong half the time — silently.
     ///
+    /// This is a required store operation rather than a default assembled from
+    /// [`derivatives`](Self::derivatives) and [`forget`](Self::forget). Those
+    /// calls are individually atomic but leave a gap in which another writer
+    /// can add a derivative that the erasure never sees. Implementations must
+    /// serialize derivative creation with the complete traversal and deletion.
+    ///
     /// # Errors
     ///
     /// If the store cannot be reached.
-    async fn forget_cascading(&self, id: &str) -> Result<usize, StoreError> {
-        let mut removed = 0;
-        let mut queue = vec![id.to_owned()];
-        let mut seen = std::collections::BTreeSet::new();
-        while let Some(next) = queue.pop() {
-            if !seen.insert(next.clone()) {
-                // A derivation cycle is not expressible by construction — a
-                // summary names versions that already exist — but a store is a
-                // store, and a repair that loops forever is worse than one that
-                // stops.
-                continue;
-            }
-            for derived in self.derivatives(&next).await? {
-                queue.push(derived.id);
-            }
-            self.forget(&next).await?;
-            removed += 1;
-        }
-        Ok(removed)
-    }
+    async fn forget_cascading(&self, id: &str) -> Result<usize, StoreError>;
 }

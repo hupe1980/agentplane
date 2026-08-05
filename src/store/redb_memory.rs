@@ -353,6 +353,120 @@ impl MemoryStore for RedbStore {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
+    async fn forget_cascading(&self, id: &str) -> Result<usize, StoreError> {
+        let tenant = self.tenant_name();
+        let root = id.to_owned();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let removed = {
+                let mut items = w.open_table(ITEMS).map_err(|e| be(&e))?;
+                let mut current = w.open_table(CURRENT).map_err(|e| be(&e))?;
+                let mut by_subject = w.open_table(BY_SUBJECT).map_err(|e| be(&e))?;
+                let mut edges = w.open_table(DERIVED).map_err(|e| be(&e))?;
+                let mut forgotten = w.open_table(FORGOTTEN).map_err(|e| be(&e))?;
+
+                // redb admits one writer, so the graph cannot grow between
+                // this traversal and the deletions below.
+                let mut queue = vec![root];
+                let mut doomed = std::collections::BTreeSet::new();
+                while let Some(source) = queue.pop() {
+                    if !doomed.insert(source.clone()) {
+                        continue;
+                    }
+                    let children: Vec<String> = edges
+                        .range(
+                            (tenant.as_str(), source.as_str(), "")
+                                ..=(tenant.as_str(), source.as_str(), MAX_STR),
+                        )
+                        .map_err(|e| be(&e))?
+                        .filter_map(|entry| match entry {
+                            Ok((key, _)) => {
+                                let child = key.value().2.to_owned();
+                                match current.get((tenant.as_str(), child.as_str())) {
+                                    Ok(Some(_)) => Some(Ok(child)),
+                                    Ok(None) => None,
+                                    Err(error) => Some(Err(be(&error))),
+                                }
+                            }
+                            Err(error) => Some(Err(be(&error))),
+                        })
+                        .collect::<Result<_, StoreError>>()?;
+                    queue.extend(children);
+                }
+
+                for memory_id in &doomed {
+                    let previous = current
+                        .get((tenant.as_str(), memory_id.as_str()))
+                        .map_err(|e| be(&e))?
+                        .map(|value| {
+                            let (subject, purpose, created, version) = value.value();
+                            (subject.to_owned(), purpose.to_owned(), created, version)
+                        });
+                    if let Some((subject, purpose, created, _)) = &previous {
+                        by_subject
+                            .remove((
+                                tenant.as_str(),
+                                subject.as_str(),
+                                purpose.as_str(),
+                                -*created,
+                                memory_id.as_str(),
+                            ))
+                            .map_err(|e| be(&e))?;
+                    }
+                    current
+                        .remove((tenant.as_str(), memory_id.as_str()))
+                        .map_err(|e| be(&e))?;
+                    forgotten
+                        .insert((tenant.as_str(), memory_id.as_str()), ())
+                        .map_err(|e| be(&e))?;
+
+                    let versions: Vec<u64> = items
+                        .range(
+                            (tenant.as_str(), memory_id.as_str(), 0)
+                                ..=(tenant.as_str(), memory_id.as_str(), u64::MAX),
+                        )
+                        .map_err(|e| be(&e))?
+                        .map(|entry| {
+                            entry
+                                .map(|(key, _)| key.value().2)
+                                .map_err(|error| be(&error))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    for version in versions {
+                        items
+                            .remove((tenant.as_str(), memory_id.as_str(), version))
+                            .map_err(|e| be(&e))?;
+                    }
+                }
+
+                // Cascading erasure no longer needs repair lineage for any
+                // vertex it removed. Delete both incoming and outgoing edges.
+                let stale_edges: Vec<(String, String)> = edges
+                    .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                    .map_err(|e| be(&e))?
+                    .filter_map(|entry| match entry {
+                        Ok((key, _)) => {
+                            let (_, source, derived) = key.value();
+                            (doomed.contains(source) || doomed.contains(derived))
+                                .then(|| Ok((source.to_owned(), derived.to_owned())))
+                        }
+                        Err(error) => Some(Err(be(&error))),
+                    })
+                    .collect::<Result<_, StoreError>>()?;
+                for (source, derived) in stale_edges {
+                    edges
+                        .remove((tenant.as_str(), source.as_str(), derived.as_str()))
+                        .map_err(|e| be(&e))?;
+                }
+                doomed.len()
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(removed)
+        })
+        .await
+    }
+
     async fn forget(&self, id: &str) -> Result<(), StoreError> {
         let tenant = self.tenant_name();
         let id = id.to_owned();

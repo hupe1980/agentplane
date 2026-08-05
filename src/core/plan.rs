@@ -37,13 +37,6 @@ pub enum Topology {
     /// One agent, one context, many tools. No inter-agent surface at all.
     #[default]
     Single,
-    /// A deterministic router picks exactly one agent per trigger.
-    ///
-    /// Still one agent per task, so it carries none of the coordination risk.
-    /// Worth distinguishing: picking one specialist out of thirty by event type
-    /// is a dispatch table, not a multi-agent system, and conflating the two
-    /// makes people pay for risk they never took on.
-    Routed,
     /// Several agents contribute to one task.
     ///
     /// Requires a justification (see [`Collaboration`]) that the plan contract

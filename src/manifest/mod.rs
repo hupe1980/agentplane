@@ -376,13 +376,6 @@ pub enum TopologyMode {
     /// absent, which is why it is the default.
     #[default]
     Single,
-    /// A deterministic router selects exactly **one** agent per trigger.
-    ///
-    /// Still one agent per task, so the coordination risk is absent here too.
-    /// Picking one specialist out of twenty-nine by event type is a dispatch
-    /// table, not a multi-agent system — the distinction that most "we run
-    /// multi-agent" claims actually describe.
-    Routed,
     /// Several agents contribute to one task. The full failure surface.
     Collaborative,
 }
@@ -404,12 +397,6 @@ pub enum Role {
     /// ceiling in [`Security::max_delegation_depth`] a bound on the arrangement
     /// rather than on one agent's manners.
     Orchestrator,
-    /// Makes a single dispatch decision and does not orchestrate.
-    ///
-    /// Distinct from an orchestrator on purpose: a router chooses *once* and
-    /// steps out, so it never accumulates the multi-turn coordination state that
-    /// inter-agent misalignment needs in order to happen.
-    Router,
 }
 
 /// Why collaboration is worth its cost.
@@ -479,6 +466,9 @@ pub struct ModelRef {
     /// A per-call output ceiling, if this role needs one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Explicit reasoning depth. Omitted uses the selected model's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<crate::model::ReasoningEffort>,
 }
 
 /// The shape an agent promises its callers.
@@ -730,6 +720,20 @@ impl Manifest {
         };
         if execution.kind != ExecutionKind::ToolCalling {
             return Ok(());
+        }
+        if self
+            .spec
+            .models
+            .as_ref()
+            .and_then(|models| models.privileged.as_ref())
+            .is_some_and(|model| model.reasoning_effort.is_some())
+        {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.models.privileged.reasoning_effort",
+                detail: "reasoning-enabled tool loops require preserving provider-specific \
+                         opaque reasoning/thinking blocks across turns; that continuation is \
+                         not implemented, so accepting this would silently weaken reasoning",
+            });
         }
         for grant in &self.spec.tools {
             if grant

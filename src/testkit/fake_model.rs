@@ -32,7 +32,9 @@ use serde_json::{Value, json};
 
 #[cfg(test)]
 use crate::model::ModelCall;
-use crate::model::{Completion, ModelError, ModelId, ModelProvider, Request, Usage};
+use crate::model::{
+    Completion, ModelError, ModelId, ModelProvider, ReasoningEffort, Request, Usage,
+};
 
 /// What the fake was asked.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +42,7 @@ pub struct Ask {
     pub model: ModelId,
     pub prompt: Value,
     pub max_output_tokens: u32,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub schema: Option<Value>,
     /// The exact tool surface the model was offered this turn.
     pub tools: Vec<crate::model::ToolDeclaration>,
@@ -238,6 +241,7 @@ impl ModelProvider for FakeProvider {
             model: request.model.clone(),
             prompt: request.prompt.clone(),
             max_output_tokens: request.max_output_tokens,
+            reasoning_effort: request.reasoning_effort,
             schema: request.schema.cloned(),
             tools: request.tools.to_vec(),
             exchanges: request.exchanges.to_vec(),
@@ -268,6 +272,7 @@ mod tests {
             model,
             prompt,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
             schema: schema.map(|s| &*Box::leak(Box::new(s.clone()))),
             tools: &[],
             exchanges: &[],
@@ -310,6 +315,7 @@ mod tests {
                 model: &m,
                 prompt: short,
                 max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+                reasoning_effort: None,
                 schema: None,
                 tools: &[],
                 exchanges: &[],
@@ -321,6 +327,7 @@ mod tests {
                 model: &m,
                 prompt: long,
                 max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+                reasoning_effort: None,
                 schema: None,
                 tools: &[],
                 exchanges: &[],

@@ -1937,13 +1937,26 @@ impl<'a> StepCtx<'a> {
     )]
     fn check_delegation_depth<E: Effect>(&self, effect: &E) -> Result<(), StepError> {
         #[cfg(feature = "manifest")]
-        if let (Some(actual), Some(ceiling)) = (
-            effect.delegation_depth(),
-            self.manifest
-                .as_ref()
-                .filter(|_| !self.mode.is_replaying())
-                .and_then(|m| m.spec.security.max_delegation_depth),
-        ) && actual > usize::from(ceiling)
+        let ceiling = self
+            .manifest
+            .as_ref()
+            .filter(|_| !self.mode.is_replaying())
+            .and_then(|manifest| {
+                // Role is authority, not prose. A specialist means zero
+                // delegation even when the duplicate numeric ceiling is
+                // omitted; otherwise omission restores exactly the handoff
+                // power the role claims not to have.
+                manifest
+                    .spec
+                    .topology
+                    .as_ref()
+                    .is_some_and(|topology| topology.role == crate::manifest::Role::Specialist)
+                    .then_some(0)
+                    .or(manifest.spec.security.max_delegation_depth)
+            });
+        #[cfg(feature = "manifest")]
+        if let (Some(actual), Some(ceiling)) = (effect.delegation_depth(), ceiling)
+            && actual > usize::from(ceiling)
         {
             return Err(PolicyError::DelegationDepth {
                 sink: effect.descriptor().kind,
@@ -2279,16 +2292,30 @@ impl StepCtx<'_> {
     /// memory this run wrote once, and the version number the run went on to use
     /// would be wrong.
     ///
-    /// The item's `trust` and `provenance` are the writer's declaration about
-    /// **where the content came from**, and everything that later reads it is
-    /// labelled from them. Declaring model output trusted here is the one way to
-    /// launder it, which is why it is a decision a reviewer can see rather than
-    /// a default.
+    /// Trust, provenance and sensitivity are derived from `content`. They are
+    /// not fields the caller can declare: allowing a skill to store untrusted
+    /// model output with `trust: Trusted` would be an unjournaled release and a
+    /// cross-session laundering primitive.
     ///
     /// # Errors
     ///
     /// [`StepError`] if this plane has no memory store, or the write fails.
-    pub async fn remember(&mut self, item: crate::memory::MemoryItem) -> Result<u64, StepError> {
+    pub async fn remember(
+        &mut self,
+        write: crate::memory::MemoryWrite,
+        content: Tainted<Value>,
+    ) -> Result<u64, StepError> {
+        let at = self.now().await?;
+        self.remember_at(write, content, at, Vec::new()).await
+    }
+
+    async fn remember_at(
+        &mut self,
+        write: crate::memory::MemoryWrite,
+        content: Tainted<Value>,
+        at: crate::core::Timestamp,
+        derived_from: Vec<crate::memory::Selected>,
+    ) -> Result<u64, StepError> {
         let memories = self.memories.clone().ok_or_else(|| {
             StepError::Store(crate::core::StoreError::Backend(
                 "no memory store is configured; `Runtime::builder(..).memory(..)` is what \
@@ -2296,8 +2323,24 @@ impl StepCtx<'_> {
                     .to_owned(),
             ))
         })?;
-        let mut item = item;
-        item.written_by = self.run.to_string();
+        let label = content.label().clone();
+        let mut provenance: Vec<_> = label.provenance.iter().cloned().collect();
+        provenance.sort();
+        provenance.dedup();
+        let item = crate::memory::MemoryItem {
+            id: write.id,
+            subject: write.subject,
+            purpose: write.purpose,
+            content: content.into_unlabelled(),
+            provenance,
+            sensitivity: label.sensitivity,
+            trust: label.trust,
+            written_by: self.run.to_string(),
+            version: 0,
+            created_at: at,
+            superseded_at: None,
+            derived_from,
+        };
         Ok(self
             .effect(crate::runtime::effects::RememberMemory { memories, item })
             .await?
@@ -2410,20 +2453,19 @@ impl StepCtx<'_> {
         provenance.sort();
         provenance.dedup();
 
-        self.remember(crate::memory::MemoryItem {
-            id: into.id,
-            subject: into.subject,
-            purpose: into.purpose,
-            content: summary.into_unlabelled(),
-            provenance,
-            sensitivity,
-            trust,
-            written_by: String::new(),
-            version: 0,
-            created_at: into.at,
-            superseded_at: None,
+        // The explicit joins above protect a future trusted local summariser.
+        // Bind them back onto the value before the common write path derives
+        // storage metadata; no parallel metadata channel remains.
+        let mut summary_label = label;
+        summary_label.provenance = provenance.into_iter().collect();
+        summary_label.sensitivity = sensitivity;
+        summary_label.trust = trust;
+        self.remember_at(
+            crate::memory::MemoryWrite::new(into.id, into.subject, into.purpose),
+            Tainted::with_label(summary.into_unlabelled(), summary_label),
+            into.at,
             derived_from,
-        })
+        )
         .await
     }
 

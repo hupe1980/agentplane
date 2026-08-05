@@ -79,6 +79,8 @@ pub struct OpenAi {
     stream: bool,
     /// Where this driver may connect, if the deployment says.
     egress: Option<crate::core::Egress>,
+    /// Whole HTTP request, including a streamed response body.
+    timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for OpenAi {
@@ -92,6 +94,8 @@ impl std::fmt::Debug for OpenAi {
 }
 
 impl OpenAi {
+    pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+
     /// A ceiling every request carries.
     ///
     /// An output limit is the cheapest spend control there is. The run-level
@@ -114,7 +118,15 @@ impl OpenAi {
             schema_modes: std::collections::BTreeMap::new(),
             stream: true,
             egress: None,
+            timeout: Self::DEFAULT_TIMEOUT,
         })
+    }
+
+    /// Bound connection, generation, and response streaming as one operation.
+    #[must_use]
+    pub const fn timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Point at a different host — a gateway, or a test server.
@@ -518,26 +530,41 @@ impl OpenAi {
             model,
             prompt,
             ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
             schema,
             tools,
             exchanges,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn body_with_max(
         &self,
         model: &ModelId,
         prompt: &Value,
         max_output_tokens: u32,
+        reasoning_effort: Option<super::ReasoningEffort>,
         schema: Option<&Value>,
         tools: &[super::ToolDeclaration],
         exchanges: &[super::ToolExchange],
     ) -> Result<Value, ModelError> {
+        if reasoning_effort.is_some() && !exchanges.is_empty() {
+            return Err(ModelError::Refused {
+                model: model.clone(),
+                detail: "reasoning-enabled tool continuation is not supported yet: OpenAI \
+                         requires every opaque reasoning/output item from the prior response, \
+                         and dropping them would silently degrade the next turn"
+                    .to_owned(),
+            });
+        }
         let mut body = json!({
             "model": model.model,
             "max_output_tokens": max_output_tokens,
             "input": continue_with(input(prompt), exchanges),
         });
+        if let Some(effort) = reasoning_effort {
+            body["reasoning"] = json!({ "effort": effort.as_str() });
+        }
         if let Some(system) = instructions(prompt) {
             body["instructions"] = system;
         }
@@ -806,11 +833,26 @@ fn severed(model: &ModelId, acc: &openai_stream::Accumulator, detail: &str) -> M
 
 #[async_trait]
 impl ModelProvider for OpenAi {
+    fn request_profile(&self, model: &ModelId) -> Value {
+        let schema_mode = match self.mode_for(model) {
+            SchemaMode::Native => "native",
+            SchemaMode::ForcedTool => "forced-tool",
+        };
+        json!({
+            "driver": "openai-responses/v1",
+            "base": self.base,
+            "schema_mode": schema_mode,
+            "stream": self.stream,
+            "timeout_ms": self.timeout.as_millis(),
+        })
+    }
+
     async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
         let Request {
             model,
             prompt,
             max_output_tokens,
+            reasoning_effort,
             schema,
             tools,
             exchanges,
@@ -823,11 +865,13 @@ impl ModelProvider for OpenAi {
         let response = self
             .http
             .post(format!("{}/v1/responses", self.base))
+            .timeout(self.timeout)
             .bearer_auth(self.key.expose())
             .json(&self.body_with_max(
                 model,
                 prompt,
                 max_output_tokens,
+                reasoning_effort,
                 schema,
                 tools,
                 exchanges,
@@ -853,9 +897,33 @@ impl ModelProvider for OpenAi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Effect as _;
 
     fn driver() -> OpenAi {
         OpenAi::new("test-key").expect("build the driver")
+    }
+
+    #[test]
+    fn provider_wire_profile_is_part_of_effect_identity() {
+        let model = ModelId::new("openai", "gpt-x");
+        let native = ModelCall::new(
+            std::sync::Arc::new(driver()),
+            model.clone(),
+            json!("answer"),
+        )
+        .expecting(json!({"type": "object"}));
+        let forced = ModelCall::new(
+            std::sync::Arc::new(driver().structured_via(SchemaMode::ForcedTool)),
+            model,
+            json!("answer"),
+        )
+        .expecting(json!({"type": "object"}));
+
+        assert_ne!(
+            native.descriptor(),
+            forced.descriptor(),
+            "native constrained output and forced-tool output reused one effect identity"
+        );
     }
 
     /// The Responses API spells it `instructions`; the caller spells it `system`.

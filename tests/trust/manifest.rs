@@ -1044,19 +1044,17 @@ fn a_specialist_that_may_delegate_is_refused() {
 /// A lone agent cannot be an orchestrator.
 #[test]
 fn single_mode_refuses_a_coordinating_role() {
-    for role in ["orchestrator", "router"] {
-        let s = GOOD.replace(
-            "  security:",
-            &format!("  topology: {{ mode: single, role: {role} }}\n  security:"),
-        );
-        assert!(
-            matches!(
-                Manifest::parse(&s),
-                Err(ManifestError::IncoherentTopology { .. })
-            ),
-            "mode 'single' accepted role '{role}' — there is nobody to coordinate"
-        );
-    }
+    let s = GOOD.replace(
+        "  security:",
+        "  topology: { mode: single, role: orchestrator }\n  security:",
+    );
+    assert!(
+        matches!(
+            Manifest::parse(&s),
+            Err(ManifestError::IncoherentTopology { .. })
+        ),
+        "mode 'single' accepted an orchestrator — there is nobody to coordinate"
+    );
 }
 
 /// Collaboration has to say why, and only collaboration may.
@@ -1078,7 +1076,7 @@ fn collaboration_requires_a_reason_and_nothing_else_may_carry_one() {
     // one that was required.
     let stray = GOOD.replace(
         "  security:",
-        "  topology: { mode: routed, role: router, reason: distinct-authority }\n  security:",
+        "  topology: { mode: single, role: specialist, reason: distinct-authority }\n  security:",
     );
     assert!(
         matches!(
@@ -1087,14 +1085,6 @@ fn collaboration_requires_a_reason_and_nothing_else_may_carry_one() {
         ),
         "a collaboration reason was accepted on a non-collaborative mode"
     );
-
-    // And a routed router, which is the shape most "we run multi-agent"
-    // deployments actually have.
-    Manifest::parse(&GOOD.replace(
-        "  security:",
-        "  topology: { mode: routed, role: router }\n  security:",
-    ))
-    .expect("routing to one agent per trigger is a dispatch table, and legitimate");
 }
 
 /// Every topology value has a pinned wire spelling.
@@ -1104,7 +1094,6 @@ fn every_topology_value_has_a_pinned_wire_spelling() {
 
     for (wire, expected) in [
         ("single", TopologyMode::Single),
-        ("routed", TopologyMode::Routed),
         ("collaborative", TopologyMode::Collaborative),
     ] {
         let role = if wire == "single" {
@@ -1133,14 +1122,16 @@ fn every_topology_value_has_a_pinned_wire_spelling() {
     for (wire, expected) in [
         ("specialist", Role::Specialist),
         ("orchestrator", Role::Orchestrator),
-        ("router", Role::Router),
     ] {
+        let depth = if wire == "specialist" { "0" } else { "2" };
         let m = Manifest::parse(
             &GOOD
-                .replace("max_delegation_depth: 2", "max_delegation_depth: 0")
+                .replace("max_delegation_depth: 2", &format!("max_delegation_depth: {depth}"))
                 .replace(
                     "  security:",
-                    &format!("  topology: {{ mode: routed, role: {wire} }}\n  security:"),
+                    &format!(
+                        "  topology: {{ mode: collaborative, role: {wire}, reason: distinct-authority }}\n  security:"
+                    ),
                 ),
         )
         .replace_err(wire);
@@ -1581,7 +1572,7 @@ spec:
   capabilities:
     provides: [support.summarise]
   models:
-        privileged: { provider: fake, model: sum-1, max_tokens: 321 }
+      privileged: { provider: fake, model: sum-1, max_tokens: 321, reasoning_effort: high }
   output:
     schema:
       type: object
@@ -1653,6 +1644,11 @@ async fn an_agent_defined_only_in_yaml_runs() {
     assert_eq!(
         ask.max_output_tokens, 321,
         "the manifest's per-model output ceiling was parsed but not applied to the call"
+    );
+    assert_eq!(
+        ask.reasoning_effort,
+        Some(agentplane::model::ReasoningEffort::High),
+        "the manifest's reasoning effort was parsed but not applied to the call"
     );
     assert!(
         ask.schema.is_some(),
@@ -2360,6 +2356,31 @@ spec:
     );
 }
 
+#[test]
+fn a_reasoning_enabled_tool_loop_is_refused_until_continuation_is_lossless() {
+    let yaml = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: thinker, version: "1.0.0" }
+spec:
+  capabilities: { provides: [think] }
+  models: { privileged: { provider: fake, model: loop-1, reasoning_effort: high } }
+  tools: [{ ref: "mcp://ledger/read", description: "Read a ledger account." }]
+  execution: { kind: tool-calling }
+  budgets: {}
+"#;
+    match Manifest::parse(yaml) {
+        Err(ManifestError::Unenforceable { field, detail }) => {
+            assert_eq!(field, "spec.models.privileged.reasoning_effort");
+            assert!(detail.contains("opaque"), "{detail}");
+        }
+        Err(error) => panic!("wrong refusal: {error}"),
+        Ok(_) => panic!(
+            "a reasoning tool loop was accepted even though provider reasoning state is dropped"
+        ),
+    }
+}
+
 /// The published Agent Card is derived from the declaration, not written beside it.
 ///
 /// A card is what a peer reads before deciding to call at all, so it is the most
@@ -2400,14 +2421,10 @@ fn an_agent_card_is_derived_from_the_manifest() {
         "streaming is implemented — `SendStreamingMessage` and `SubscribeToTask` \
          are served from the journal — so the flag must say so"
     );
-    // Tracks the build rather than a hardcoded answer: the flag exists to tell
-    // a caller what *this* deployment can do, and "we compiled that out" is not
-    // a distinction a peer can discover any other way.
-    assert_eq!(
-        card.capabilities.push_notifications,
-        cfg!(feature = "push"),
-        "the card's push flag disagrees with whether this build has the \
-         machinery — a caller plans against it either way"
+    assert!(
+        !card.capabilities.push_notifications,
+        "card derivation has no deployment push store or sender, so compiled \
+         machinery alone must not become an advertised capability"
     );
     assert!(
         card.capabilities.extended_agent_card,
@@ -2500,10 +2517,9 @@ fn the_extended_card_discloses_more_but_not_the_model() {
         public.capabilities.streaming,
         "the extended card must agree with the public one about streaming"
     );
-    assert_eq!(
-        public.capabilities.push_notifications,
-        cfg!(feature = "push"),
-        "the extended card must agree with the build about push notifications"
+    assert!(
+        !public.capabilities.push_notifications,
+        "standalone derivation has no deployment push store/sender and must stay conservative"
     );
 
     // What it still will not say. The model is a fact about a supply chain, and
@@ -2578,11 +2594,11 @@ fn the_card_uses_the_spec_field_names() {
          tenant is not a routing identifier: {iface:#}"
     );
 
-    // The capabilities block says false for what does not exist, and the flags
-    // are spelled the spec's way too.
+    // Standalone derivation has no deployment push store/sender. The A2A server
+    // turns this on only when `with_push` wires both.
     let caps = &json["capabilities"];
     assert_eq!(caps["streaming"], true);
-    assert_eq!(caps["pushNotifications"], cfg!(feature = "push"));
+    assert_eq!(caps["pushNotifications"], false);
 }
 
 // ── Card signing ────────────────────────────────────────────────────────────
@@ -3014,7 +3030,8 @@ spec:
 /// The declaration is refused at parse time: a manifest with `role: specialist`
 /// and `max_delegation_depth` above zero is incoherent. That is the *structural*
 /// half, and it was the only half. The runtime half is this: a specialist whose
-/// ceiling is zero must be refused when it actually hands work off.
+/// ceiling is zero — including when that zero is implied by the role — must be
+/// refused when it actually hands work off.
 ///
 /// `cx.commission` is the in-plane hand-off, and it is the one that matters for
 /// the loop the role exists to prevent — A commissions B commissions C
@@ -3036,8 +3053,6 @@ spec:
   capabilities:
     provides: [research.do]
   topology: { mode: single, role: specialist }
-  security:
-    max_delegation_depth: 0
   budgets: {}
 "#;
 

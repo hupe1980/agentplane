@@ -90,6 +90,8 @@ pub struct Anthropic {
     stream: bool,
     /// Where this driver may connect, if the deployment says.
     egress: Option<crate::core::Egress>,
+    /// Whole HTTP request, including a streamed response body.
+    timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for Anthropic {
@@ -105,6 +107,8 @@ impl std::fmt::Debug for Anthropic {
 }
 
 impl Anthropic {
+    pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+
     /// The API version this driver speaks.
     ///
     /// Pinned rather than tracking the newest: a provider that changes its
@@ -135,7 +139,15 @@ impl Anthropic {
             schema_modes: std::collections::BTreeMap::new(),
             stream: true,
             egress: None,
+            timeout: Self::DEFAULT_TIMEOUT,
         })
+    }
+
+    /// Bound connection, generation, and response streaming as one operation.
+    #[must_use]
+    pub const fn timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Point at a different host — a gateway, or a test server.
@@ -528,26 +540,56 @@ impl Anthropic {
             model,
             prompt,
             ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            None,
             schema,
             tools,
             exchanges,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn body_with_max(
         &self,
         model: &ModelId,
         prompt: &Value,
         max_output_tokens: u32,
+        reasoning_effort: Option<super::ReasoningEffort>,
         schema: Option<&Value>,
         tools: &[super::ToolDeclaration],
         exchanges: &[super::ToolExchange],
     ) -> Result<Value, ModelError> {
+        if reasoning_effort.is_some() && !exchanges.is_empty() {
+            return Err(ModelError::Refused {
+                model: model.clone(),
+                detail: "reasoning-enabled tool continuation is not supported yet: Anthropic \
+                         requires the signed thinking blocks from the prior response, and \
+                         dropping them would make the next turn invalid or weaker"
+                    .to_owned(),
+            });
+        }
         let mut body = json!({
             "model": model.model,
             "max_tokens": max_output_tokens,
             "messages": continue_with(messages(prompt), exchanges),
         });
+        if let Some(effort) = reasoning_effort {
+            if matches!(
+                effort,
+                super::ReasoningEffort::None
+                    | super::ReasoningEffort::Minimal
+                    | super::ReasoningEffort::XHigh
+            ) {
+                return Err(ModelError::Refused {
+                    model: model.clone(),
+                    detail: format!(
+                        "Anthropic adaptive thinking does not support reasoning effort '{}'",
+                        effort.as_str()
+                    ),
+                });
+            }
+            body["thinking"] = json!({ "type": "adaptive" });
+            body["output_config"]["effort"] = json!(effort.as_str());
+        }
         if let Some(system) = system(prompt) {
             body["system"] = system;
         }
@@ -574,9 +616,8 @@ impl Anthropic {
                 // GA in 2026 as `output_config.format`, without the beta header
                 // the November 2025 preview required.
                 SchemaMode::Native => {
-                    body["output_config"] = json!({
-                        "format": { "type": "json_schema", "schema": schema }
-                    });
+                    body["output_config"]["format"] =
+                        json!({ "type": "json_schema", "schema": schema });
                 }
                 // The universal fallback: one tool whose input schema is the
                 // answer's shape, and a `tool_choice` the model cannot decline.
@@ -781,11 +822,27 @@ fn stream_error(
 
 #[async_trait]
 impl ModelProvider for Anthropic {
+    fn request_profile(&self, model: &ModelId) -> Value {
+        let schema_mode = match self.mode_for(model) {
+            SchemaMode::Native => "native",
+            SchemaMode::ForcedTool => "forced-tool",
+        };
+        json!({
+            "driver": "anthropic-messages/v1",
+            "base": self.base,
+            "api_version": self.version,
+            "schema_mode": schema_mode,
+            "stream": self.stream,
+            "timeout_ms": self.timeout.as_millis(),
+        })
+    }
+
     async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
         let Request {
             model,
             prompt,
             max_output_tokens,
+            reasoning_effort,
             schema,
             tools,
             exchanges,
@@ -800,12 +857,14 @@ impl ModelProvider for Anthropic {
         let response = self
             .http
             .post(format!("{}/v1/messages", self.base))
+            .timeout(self.timeout)
             .header("x-api-key", self.key.expose())
             .header("anthropic-version", &self.version)
             .json(&self.body_with_max(
                 model,
                 prompt,
                 max_output_tokens,
+                reasoning_effort,
                 schema,
                 tools,
                 exchanges,

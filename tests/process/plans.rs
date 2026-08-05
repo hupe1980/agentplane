@@ -246,12 +246,10 @@ fn collaboration_for_authority_needs_differing_capabilities() {
     ));
 }
 
-/// Single and routed topologies carry no coordination surface, so nothing to
-/// justify.
+/// A single-agent plan carries no coordination surface, so nothing to justify.
 #[test]
-fn single_and_routed_topologies_need_no_justification() {
+fn single_topology_needs_no_justification() {
     validate(&ok_plan().topology(Topology::Single), &contract()).unwrap();
-    validate(&ok_plan().topology(Topology::Routed), &contract()).unwrap();
 }
 
 // ── The ready-set ───────────────────────────────────────────────────────────

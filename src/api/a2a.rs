@@ -211,7 +211,17 @@ pub struct A2aTask {
     pub context_id: Option<String>,
     pub status: TaskStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<A2aArtifact>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+}
+
+/// One output produced by an A2A task.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aArtifact {
+    pub artifact_id: String,
+    pub parts: Vec<Part>,
 }
 
 /// One piece of a message.
@@ -222,6 +232,14 @@ pub struct Part {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
 }
 
 /// A2A's `Message`.
@@ -240,6 +258,38 @@ pub struct A2aMessage {
 }
 
 impl A2aMessage {
+    fn validate_parts(&self) -> Result<(), RpcError> {
+        if self.parts.is_empty() {
+            return Err(RpcError::new(
+                code::CONTENT_TYPE_NOT_SUPPORTED,
+                "the message has no parts this agent can read; it accepts text and data parts",
+            ));
+        }
+        for (index, part) in self.parts.iter().enumerate() {
+            let variants = usize::from(part.text.is_some())
+                + usize::from(part.data.is_some())
+                + usize::from(part.raw.is_some())
+                + usize::from(part.url.is_some());
+            if variants != 1 {
+                return Err(RpcError::new(
+                    code::INVALID_PARAMS,
+                    format!(
+                        "message.parts[{index}] must contain exactly one of text, data, raw, or url"
+                    ),
+                ));
+            }
+            if part.raw.is_some() || part.url.is_some() {
+                return Err(RpcError::new(
+                    code::CONTENT_TYPE_NOT_SUPPORTED,
+                    format!(
+                        "message.parts[{index}] is file content; this agent card advertises only text/plain and application/json"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// What the runtime receives as input.
     ///
     /// A stable shape, always the same two keys, rather than a clever unwrapping
@@ -383,6 +433,11 @@ pub enum ServerSetupError {
     NoPolicy,
     #[error("the agent card could not be derived: {0}")]
     Card(#[from] crate::manifest::ManifestError),
+    #[error(
+        "push cannot be enabled after Agent Cards are signed because the capability is part of \
+         the signed payload; call `with_push` before `signing_cards_with`"
+    )]
+    CardAlreadySigned,
 }
 
 impl A2aServer {
@@ -399,6 +454,7 @@ impl A2aServer {
     pub fn new(
         runtime: Arc<Runtime>,
         auth: Arc<dyn Authenticator>,
+        security: &crate::peers::CardSecurity,
         manifest: &Manifest,
         url: impl Into<String>,
     ) -> Result<Self, ServerSetupError> {
@@ -406,6 +462,8 @@ impl A2aServer {
         let url = url.into();
         let mut card = AgentCard::derive(manifest, url.clone())?;
         let mut extended = ExtendedAgentCard::derive(manifest, url)?;
+        security.apply(&mut card);
+        security.apply(&mut extended.public);
 
         // The card names the tenant only when there is one to route on. A2A's
         // rule is that a client echoes this value back in every request, so
@@ -464,14 +522,18 @@ impl A2aServer {
     /// spec's code and the card advertises `pushNotifications: false` — so a
     /// deployment that has not made the egress decision is not quietly making
     /// outbound requests to addresses its callers chose.
-    #[must_use]
     pub fn with_push(
         mut self,
         store: Arc<dyn crate::push::PushStore>,
         sender: crate::push::PushSender,
-    ) -> Self {
+    ) -> Result<Self, ServerSetupError> {
+        if !self.card.signatures.is_empty() || !self.extended.public.signatures.is_empty() {
+            return Err(ServerSetupError::CardAlreadySigned);
+        }
+        self.card.capabilities.push_notifications = true;
+        self.extended.public.capabilities.push_notifications = true;
         self.push = Some((store, sender));
-        self
+        Ok(self)
     }
 
     /// Tell every webhook registered for this task what state it reached.
@@ -816,16 +878,16 @@ async fn send_message(
             "`message` is required by SendMessage",
         ));
     };
-    let skill = resolve_skill(server, &message)?;
-    let caller = server.gate(headers, action::MESSAGE_SEND, &skill).await?;
-
-    if message.parts.is_empty() {
+    message.validate_parts()?;
+    if message.task_id.is_some() || message.context_id.is_some() {
         return Err(RpcError::new(
-            code::CONTENT_TYPE_NOT_SUPPORTED,
-            "the message has no parts this agent can read; it accepts text and \
-             data parts",
+            code::UNSUPPORTED_OPERATION,
+            "this server does not yet implement A2A multi-turn continuation; taskId/contextId \
+             are refused rather than silently starting an unrelated run",
         ));
     }
+    let skill = resolve_skill(server, &message)?;
+    let caller = server.gate(headers, action::MESSAGE_SEND, &skill).await?;
 
     // Untrusted, and provenanced to the peer that sent it. A protected sink
     // field can then name the one counterparty it will take an amount from, and
@@ -888,14 +950,44 @@ async fn send_message(
     // notification that never arrives because it registered a moment too late.
     server.notify(outcome.run_id).await;
 
-    Ok(json!({
-        "task": task_of(
-            outcome.run_id,
-            state_of(&outcome.status),
-            outcome.status.as_str(),
-            None,
-        )
-    }))
+    Ok(json!({ "task": task_of_outcome(&outcome) }))
+}
+
+fn task_of_outcome(outcome: &crate::runtime::RunOutcome) -> A2aTask {
+    let part = match outcome.output.clone().unwrap_or(Value::Null) {
+        Value::String(text) => Part {
+            text: Some(text),
+            data: None,
+            raw: None,
+            url: None,
+            filename: None,
+            media_type: Some("text/plain".to_owned()),
+        },
+        data => Part {
+            text: None,
+            data: Some(data),
+            raw: None,
+            url: None,
+            filename: None,
+            media_type: Some("application/json".to_owned()),
+        },
+    };
+    A2aTask {
+        id: outcome.run_id.to_string(),
+        context_id: None,
+        status: TaskStatus {
+            state: state_of(&outcome.status),
+            message: None,
+            timestamp: None,
+        },
+        artifacts: matches!(outcome.status, crate::runtime::RunStatus::Succeeded).then(|| {
+            vec![A2aArtifact {
+                artifact_id: format!("{}-result", outcome.run_id),
+                parts: vec![part],
+            }]
+        }),
+        metadata: None,
+    }
 }
 
 /// Which capability this message asks for.
@@ -1068,6 +1160,10 @@ fn declined(skill: &str) -> A2aMessage {
         parts: vec![Part {
             text: Some("this agent declined the request".to_owned()),
             data: None,
+            raw: None,
+            url: None,
+            filename: None,
+            media_type: Some("text/plain".to_owned()),
         }],
         context_id: None,
         task_id: None,
@@ -1087,6 +1183,10 @@ pub(super) fn task_of(run: RunId, state: TaskState, detail: &str, case: Option<S
                 parts: vec![Part {
                     text: Some(detail.to_owned()),
                     data: None,
+                    raw: None,
+                    url: None,
+                    filename: None,
+                    media_type: Some("text/plain".to_owned()),
                 }],
                 context_id: None,
                 task_id: Some(run.to_string()),
@@ -1094,6 +1194,7 @@ pub(super) fn task_of(run: RunId, state: TaskState, detail: &str, case: Option<S
             }),
             timestamp: None,
         },
+        artifacts: None,
         metadata: None,
     }
 }

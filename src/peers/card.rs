@@ -21,10 +21,10 @@
 //! # What it will not claim
 //!
 //! Every capability flag is true only when the thing behind it exists. Push
-//! notifications are advertised as **false** because there is no callback store
-//! and no governed outbound delivery — and a card is a promise a caller plans
-//! against, so advertising an unimplemented transport does not degrade
-//! gracefully: it produces a caller waiting for events nobody will send.
+//! notifications are advertised as **false** by derivation and enabled by the
+//! A2A server only when that deployment wires both durable callback storage and
+//! governed outbound delivery. A compiled feature is not a deployed capability,
+//! and a card is a promise a caller plans against.
 //!
 //! Streaming and the extended card are true because both are implemented, not
 //! because they sounded good on a card.
@@ -63,7 +63,7 @@ pub struct CardSkill {
 pub struct CardCapabilities {
     /// Server-sent events for incremental results.
     pub streaming: bool,
-    /// Webhook callbacks for long tasks. Not implemented.
+    /// Webhook callbacks for long tasks, when this deployment wires them.
     pub push_notifications: bool,
     /// A richer card for authenticated callers — see [`ExtendedAgentCard`].
     pub extended_agent_card: bool,
@@ -76,10 +76,9 @@ impl CardCapabilities {
             // `SendStreamingMessage` and `SubscribeToTask`, served from the
             // journal — see `api::a2a_stream`.
             streaming: true,
-            // True only when this build has the machinery. A card is a promise
-            // a caller plans against, and "we compiled that out" is not a
-            // distinction a peer can discover any other way.
-            push_notifications: cfg!(feature = "push"),
+            // Conservative until `A2aServer::with_push` wires the durable store
+            // and governed sender. Compiled code alone cannot deliver anything.
+            push_notifications: false,
             extended_agent_card: true,
         }
     }
@@ -111,6 +110,84 @@ pub struct CardInterface {
     pub tenant: Option<String>,
 }
 
+/// HTTP authentication advertised by an A2A interface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpAuthSecurityScheme {
+    pub scheme: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_format: Option<String>,
+}
+
+/// One A2A security scheme.
+///
+/// This release exposes the scheme the shipped client already uses: HTTP
+/// bearer authentication. More variants belong here only when a transport can
+/// actually acquire and send them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardSecurityScheme {
+    pub http_auth_security_scheme: HttpAuthSecurityScheme,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityScopeList {
+    pub list: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardSecurityRequirement {
+    pub schemes: std::collections::BTreeMap<String, SecurityScopeList>,
+}
+
+/// Deployment authentication published on an Agent Card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardSecurity {
+    name: String,
+    scheme: CardSecurityScheme,
+    scopes: Vec<String>,
+}
+
+impl CardSecurity {
+    /// Advertise HTTP bearer authentication under `name`.
+    #[must_use]
+    pub fn bearer(
+        name: impl Into<String>,
+        scopes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            scheme: CardSecurityScheme {
+                http_auth_security_scheme: HttpAuthSecurityScheme {
+                    scheme: "Bearer".to_owned(),
+                    bearer_format: None,
+                },
+            },
+            scopes: scopes.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn bearer_format(mut self, format: impl Into<String>) -> Self {
+        self.scheme.http_auth_security_scheme.bearer_format = Some(format.into());
+        self
+    }
+
+    #[cfg(feature = "a2a-server")]
+    pub(crate) fn apply(&self, card: &mut AgentCard) {
+        card.security_schemes
+            .insert(self.name.clone(), self.scheme.clone());
+        card.security_requirements.push(CardSecurityRequirement {
+            schemes: std::collections::BTreeMap::from([(
+                self.name.clone(),
+                SecurityScopeList {
+                    list: self.scopes.clone(),
+                },
+            )]),
+        });
+    }
+}
+
 /// An A2A Agent Card, derived from a manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,6 +200,11 @@ pub struct AgentCard {
     pub default_input_modes: Vec<String>,
     pub default_output_modes: Vec<String>,
     pub skills: Vec<CardSkill>,
+    /// How to authenticate every non-card operation on this interface.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub security_schemes: std::collections::BTreeMap<String, CardSecurityScheme>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_requirements: Vec<CardSecurityRequirement>,
     /// Detached JWS signatures over this card.
     ///
     /// Several are allowed so a publisher can rotate keys without a window in
@@ -187,9 +269,11 @@ impl AgentCard {
             }],
             // Text only. Declaring a modality this plane cannot accept produces
             // a caller that sends bytes nobody will read.
-            default_input_modes: vec!["text/plain".to_owned()],
-            default_output_modes: vec!["text/plain".to_owned()],
+            default_input_modes: vec!["text/plain".to_owned(), "application/json".to_owned()],
+            default_output_modes: vec!["text/plain".to_owned(), "application/json".to_owned()],
             skills,
+            security_schemes: std::collections::BTreeMap::new(),
+            security_requirements: Vec::new(),
             // Unsigned until somebody signs it. An empty list serializes as an
             // absent field, so an unsigned card is not a card with an empty
             // promise on it.

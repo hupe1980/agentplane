@@ -26,6 +26,7 @@ use agentplane::core::{
 };
 use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
+use agentplane::peers::CardSecurity;
 use agentplane::runtime::{Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use axum::body::Body;
@@ -159,6 +160,7 @@ impl PolicyEngine for Recording {
 
 struct Fixture {
     rt: Arc<Runtime>,
+    store: Arc<RedbStore>,
     policy: Arc<Recording>,
     seen: Seen,
     manifest: Manifest,
@@ -168,7 +170,7 @@ fn fixture_from(yaml: &str, policy: Arc<Recording>) -> Fixture {
     let manifest = Manifest::parse(yaml).expect("parse");
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let mut builder = Runtime::builder(store as Arc<dyn JournalStore>)
+    let mut builder = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .policy(policy.clone() as Arc<dyn PolicyEngine>);
     for cap in &manifest.spec.capabilities.provides {
         // Leaked so the descriptor can hold a `&'static str`; these live for the
@@ -181,6 +183,7 @@ fn fixture_from(yaml: &str, policy: Arc<Recording>) -> Fixture {
     }
     Fixture {
         rt: builder.build(),
+        store,
         policy,
         seen,
         manifest,
@@ -191,15 +194,39 @@ fn fixture() -> Fixture {
     fixture_from(ONE_SKILL, Arc::new(Recording::default()))
 }
 
+fn card_security() -> CardSecurity {
+    CardSecurity::bearer("bearer", ["peer"])
+}
+
 impl Fixture {
     fn router(&self) -> axum::Router {
         A2aServer::new(
             self.rt.clone(),
             Arc::new(HeaderAuth),
+            &card_security(),
             &self.manifest,
             "https://plane.internal/a2a",
         )
         .expect("the fixture wires a policy engine")
+        .router()
+    }
+
+    fn router_with_push(&self) -> axum::Router {
+        A2aServer::new(
+            self.rt.clone(),
+            Arc::new(HeaderAuth),
+            &card_security(),
+            &self.manifest,
+            "https://plane.internal/a2a",
+        )
+        .expect("the fixture wires a policy engine")
+        .with_push(
+            Arc::clone(&self.store) as Arc<dyn agentplane::push::PushStore>,
+            agentplane::push::PushSender::new(
+                agentplane::push::PushPolicy::new().allow_host("client.example"),
+            ),
+        )
+        .expect("push is wired before card signing")
         .router()
     }
 }
@@ -278,6 +305,20 @@ async fn the_agent_card_is_public() {
     assert_eq!(body["name"], "settlement-checker");
     assert_eq!(body["skills"][0]["id"], "settlement.check");
     assert_eq!(
+        body["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["scheme"], "Bearer",
+        "the server requires authentication but its card does not tell clients how to authenticate"
+    );
+    assert_eq!(
+        body["securityRequirements"][0]["schemes"]["bearer"]["list"],
+        json!(["peer"]),
+        "the card omitted the scope required by the server fixture"
+    );
+    assert_eq!(
+        body["capabilities"]["pushNotifications"], false,
+        "the server advertised push because it was compiled even though this deployment \
+         wired no push store or sender; every push method will refuse"
+    );
+    assert_eq!(
         body["supportedInterfaces"][0]["protocolVersion"], "1.0",
         "a client selects an interface by version, and one without it is unusable"
     );
@@ -286,6 +327,19 @@ async fn the_agent_card_is_public() {
         0,
         "the public card asked the policy engine, which means it is not public"
     );
+}
+
+#[tokio::test]
+async fn the_card_advertises_push_only_after_deployment_wires_it() {
+    let f = fixture();
+    let req = Request::builder()
+        .uri("/.well-known/agent-card.json")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+
+    let (_, body) = send(&f.router_with_push(), req).await;
+    assert_eq!(body["capabilities"]["pushNotifications"], true);
 }
 
 /// Every method authenticates, and the card is the only route that does not.
@@ -545,9 +599,71 @@ async fn an_unadvertised_skill_cannot_be_named() {
     );
 }
 
-/// The task returned uses A2A's own state spelling.
 #[tokio::test]
-async fn a_completed_run_is_reported_as_a_completed_task() {
+async fn unsupported_and_ambiguous_parts_are_refused_before_dispatch() {
+    let f = fixture();
+    let router = f.router();
+
+    let (_, raw) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": {
+                "messageId": "m-raw",
+                "role": "ROLE_USER",
+                "parts": [{"raw": "aGVsbG8=", "mediaType": "image/png"}]
+            }}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(err_code(&raw), i64::from(code::CONTENT_TYPE_NOT_SUPPORTED));
+
+    let (_, ambiguous) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": {
+                "messageId": "m-both",
+                "role": "ROLE_USER",
+                "parts": [{"text": "one", "data": {"two": 2}}]
+            }}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(err_code(&ambiguous), i64::from(code::INVALID_PARAMS));
+    assert!(
+        f.seen.lock().unwrap().is_empty(),
+        "invalid parts reached a skill"
+    );
+}
+
+#[tokio::test]
+async fn unsupported_multi_turn_continuations_are_not_silently_restarted() {
+    let f = fixture();
+    let (_, body) = send(
+        &f.router(),
+        rpc(
+            "SendMessage",
+            &json!({"message": {
+                "messageId": "m-followup",
+                "role": "ROLE_USER",
+                "taskId": "run_01KZ8000000000000000000000",
+                "contextId": "case-7",
+                "parts": [{"text": "continue"}]
+            }}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(err_code(&body), i64::from(code::UNSUPPORTED_OPERATION));
+    assert!(f.seen.lock().unwrap().is_empty());
+}
+
+/// A blocking call returns the answer as a task artifact.
+#[tokio::test]
+async fn a_blocking_call_returns_the_agents_answer() {
     let f = fixture();
     let (_, body) = send(
         &f.router(),
@@ -559,14 +675,14 @@ async fn a_completed_run_is_reported_as_a_completed_task() {
     )
     .await;
 
-    let task = &body["result"]["task"];
     assert_eq!(
-        task["status"]["state"], "TASK_STATE_COMPLETED",
-        "the state must use the ProtoJSON spelling a client matches on: {task:#}"
+        body["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "the blocking response was not a completed task: {body:#}"
     );
-    assert!(
-        task["id"].as_str().is_some_and(|s| !s.is_empty()),
-        "the task must carry the run id, or the caller cannot poll it: {task:#}"
+    assert_eq!(
+        body["result"]["task"]["artifacts"][0]["parts"][0]["data"],
+        json!({"ok": true}),
+        "the skill succeeded but its output was discarded: {body:#}"
     );
 }
 
@@ -760,6 +876,7 @@ async fn a_named_tenant_is_advertised_and_required() {
     let router = A2aServer::new(
         rt,
         Arc::new(HeaderAuth),
+        &card_security(),
         &manifest,
         "https://plane.internal/a2a",
     )
@@ -853,6 +970,7 @@ async fn a_plane_without_a_policy_engine_is_not_served() {
     let built = A2aServer::new(
         rt,
         Arc::new(HeaderAuth),
+        &card_security(),
         &manifest,
         "https://plane.internal/a2a",
     );
@@ -1297,6 +1415,7 @@ async fn a_published_card_can_be_signed_and_verified() {
     let router = A2aServer::new(
         f.rt.clone(),
         Arc::new(HeaderAuth),
+        &card_security(),
         &f.manifest,
         "https://plane.internal/a2a",
     )
@@ -1386,6 +1505,7 @@ async fn a_client_discovers_verifies_and_calls_a_tenant_scoped_agent() {
     let router = A2aServer::new(
         rt,
         Arc::new(HeaderAuth),
+        &card_security(),
         &manifest,
         format!("http://{addr}/a2a"),
     )
@@ -1460,6 +1580,7 @@ async fn discovery_refuses_a_card_signed_by_a_stranger() {
     let router = A2aServer::new(
         f.rt.clone(),
         Arc::new(HeaderAuth),
+        &card_security(),
         &f.manifest,
         format!("http://{addr}/a2a"),
     )

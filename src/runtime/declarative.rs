@@ -79,16 +79,17 @@ impl Declarative {
     /// Its own function because the loop is the interesting part and reads
     /// badly wedged inside a match arm — and because every governance decision
     /// in it is a separate thing worth finding.
+    #[allow(clippy::too_many_lines)]
     async fn tool_loop(
         &self,
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
         system: String,
-        model_role: (ModelId, Option<u32>),
+        model_role: (ModelId, Option<u32>, Option<crate::model::ReasoningEffort>),
         egress: Option<crate::core::Sensitivity>,
         granted: Vec<crate::manifest::ToolGrant>,
     ) -> Result<Outcome, SkillError> {
-        let (model, max_output_tokens) = model_role;
+        let (model, max_output_tokens, reasoning_effort) = model_role;
         let (catalog, client) = self.tools.clone().ok_or_else(|| {
             SkillError::Other(
                 "this agent declares `tool-calling` but the plane has no tool \
@@ -152,6 +153,9 @@ impl Declarative {
             .continuing(exchanges.clone());
             if let Some(max_output_tokens) = max_output_tokens {
                 call = call.with_max_output_tokens(max_output_tokens);
+            }
+            if let Some(effort) = reasoning_effort {
+                call = call.with_reasoning_effort(effort);
             }
             if let Some(ceiling) = egress {
                 call = call.with_max_sensitivity(ceiling);
@@ -256,7 +260,16 @@ impl Skill for Declarative {
     ) -> Result<Outcome, SkillError> {
         // Read into owned values before any effect runs, so nothing borrows the
         // agent across an await.
-        let (system, model, max_output_tokens, schema, egress, oversight, granted) = {
+        let (
+            system,
+            model,
+            max_output_tokens,
+            reasoning_effort,
+            schema,
+            egress,
+            oversight,
+            granted,
+        ) = {
             let m = cx.manifest().ok_or_else(|| {
                 // Unreachable through the builder, which only registers this
                 // skill when a manifest declared it. Stated rather than
@@ -266,7 +279,7 @@ impl Skill for Declarative {
                     "a declarative agent ran without a manifest — it has nothing to be".into(),
                 )
             })?;
-            let (model, max_output_tokens) = privileged(m).ok_or_else(|| {
+            let (model, max_output_tokens, reasoning_effort) = privileged(m).ok_or_else(|| {
                 SkillError::Other(format!(
                     "manifest '{}' declares execution but no privileged model — a \
                      declarative agent has nothing to call",
@@ -281,6 +294,7 @@ impl Skill for Declarative {
                     .unwrap_or_default(),
                 model,
                 max_output_tokens,
+                reasoning_effort,
                 m.output_schema().cloned(),
                 m.spec.security.max_sensitivity_egress,
                 m.spec.oversight.as_ref().map(Proposal::from_manifest),
@@ -305,6 +319,9 @@ impl Skill for Declarative {
                     ModelCall::new(Arc::clone(&self.provider), model, prompt.peek().clone());
                 if let Some(max_output_tokens) = max_output_tokens {
                     call = call.with_max_output_tokens(max_output_tokens);
+                }
+                if let Some(effort) = reasoning_effort {
+                    call = call.with_reasoning_effort(effort);
                 }
                 if let Some(schema) = schema {
                     call = call.expecting(schema);
@@ -354,7 +371,7 @@ impl Skill for Declarative {
                     cx,
                     input,
                     system,
-                    (model, max_output_tokens),
+                    (model, max_output_tokens, reasoning_effort),
                     egress,
                     granted,
                 )
@@ -405,9 +422,15 @@ impl Proposal {
     }
 }
 
-fn privileged(m: &Manifest) -> Option<(ModelId, Option<u32>)> {
+fn privileged(
+    m: &Manifest,
+) -> Option<(ModelId, Option<u32>, Option<crate::model::ReasoningEffort>)> {
     let r = m.spec.models.as_ref()?.privileged.as_ref()?;
-    Some((ModelId::new(&r.provider, &r.model), r.max_tokens))
+    Some((
+        ModelId::new(&r.provider, &r.model),
+        r.max_tokens,
+        r.reasoning_effort,
+    ))
 }
 
 /// What a failed tool call may tell the model, if anything.

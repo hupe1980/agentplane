@@ -856,12 +856,12 @@ asserting it finished is not evidence.
 | Topology | Inter-agent failure surface | Cost |
 |---|---|---|
 | `Single` | None — structurally absent | 1× |
-| `Routed` | None — still one agent per task | 1× |
 | `Collaborative(reason)` | Full | ~15× tokens |
 
-Routing is not collaboration. Picking one specialist out of thirty by event type
-is a dispatch table, and conflating it with multi-agent work makes people pay
-for risk they never took on.
+Routing one trigger to one specialist is a deployment dispatch table, not an
+agent topology. It deliberately has no manifest variant: the runtime does not
+execute that routing decision, so accepting a `routed` declaration would make a
+reviewer believe behavior was digest-covered when it was not.
 
 `Collaborative` requires a reason the contract checks:
 
@@ -1572,7 +1572,7 @@ the invariant for the one route nobody would think to check.
 
 | Method | Behaviour |
 |---|---|
-| `SendMessage` | admits a run and returns the `Task`; honours `returnImmediately` |
+| `SendMessage` | blocking returns a completed `Task` with the answer artifact; `returnImmediately` returns a working `Task` |
 | `GetTask` | the run's state, read from its **last** record |
 | `CancelTask` | a durable stop request; the task stays `WORKING` |
 | `GetExtendedAgentCard` | the authenticated card |
@@ -1581,7 +1581,10 @@ the invariant for the one route nobody would think to check.
 | the push-notification configs | registrations, behind `push` |
 | anything else | `-32601`, method not found |
 
-**Blocking is the default, and unset means blocking** — the spec's rule.
+**Blocking is the default, and unset means blocking** — the spec's rule. A
+successful blocking call returns the skill output as a text or data artifact;
+the old status-only completed Task discarded the answer and was not useful to
+an interoperable client.
 `configuration.returnImmediately` switches to returning as soon as the task
 exists, leaving the caller to poll `GetTask`. Admission still happens before
 either returns: the policy gate, the lease and the admission records are written
@@ -1589,7 +1592,24 @@ first, so the id handed back is one `GetTask` can already answer for. Spawning
 first and admitting later would hand out ids for runs the gate went on to
 refuse, turning a decline into a task that never appears.
 
-Four further decisions are load-bearing.
+Further decisions are load-bearing.
+
+**The card describes the deployment, not compiled code.** `A2aServer::new`
+requires a typed bearer scheme and scopes, because a client cannot authenticate
+from an abstract `Authenticator` it cannot see. Push stays false until
+`with_push` supplies both durable registrations and a governed sender; compiling
+the module is not the same as configuring an outbound capability.
+
+**Parts are a oneof.** Exactly one of text, data, raw, or URL must be present.
+This server advertises text and JSON data; raw and URL file parts are refused as
+unsupported before a skill runs. Previously unknown file fields were ignored,
+turning a valid image request into an empty input dispatched to a skill.
+
+**Unsupported continuation is refused, not restarted.** `taskId`/`contextId`
+multi-turn continuation is not implemented yet. Ignoring those identifiers and
+starting an unrelated run gives the caller a successful response in the wrong
+conversation, so the server returns `UnsupportedOperation` until it can bind
+them to durable case/task history.
 
 **The 1.0 method names only.** 1.0 renamed every method; `message/send` was 0.3.
 A server that answers both accepts clients which have silently lost half the
@@ -1621,10 +1641,8 @@ that will never change. The decline says only that it was declined: the
 runtime's own denial names the action and resource the gate keyed on, which is
 enough to map this plane's authorization vocabulary by probing it.
 
-Push notifications stay advertised `false` on the card, because a card is a
-promise a caller plans against and an unimplemented transport does not degrade
-gracefully — it produces a caller waiting for events nobody will send. Streaming
-is advertised `true`, because it exists.
+Push notifications are advertised only when wired on this server. Streaming is
+advertised `true`, because it exists.
 
 #### A signed card says who published it
 
@@ -1748,7 +1766,28 @@ A refusal *before* generating costs nothing; a refusal *after* costs whatever it
 took to decide. A budget that cannot tell them apart under-counts exactly when a
 model is being difficult.
 
-Three details worth stating:
+Details worth stating:
+
+* **Provider configuration that changes the wire is effect identity.** Each
+  driver publishes a non-secret request profile: endpoint, API/driver version,
+  per-model schema mode, streaming mode and timeout. Strict replay therefore
+  cannot reuse a completion produced under a different provider request shape.
+  API keys are transport credentials and never enter the profile or journal.
+* **Every call is time-bounded.** Both drivers apply a configurable whole-request
+  timeout, five minutes by default, across connection, generation and stream.
+  A timeout after streamed output uses the same partial-generation accounting as
+  any other severed stream.
+* **Reasoning effort is typed and digest-covered.** `none`, `minimal`, `low`,
+  `medium`, `high`, `xhigh` and `max` map to OpenAI `reasoning.effort`;
+  Anthropic accepts its supported subset and renders adaptive thinking plus
+  `output_config.effort`, refusing unsupported values before dispatch. The
+  manifest field reaches declarative completion requests.
+
+  Reasoning-enabled tool continuation remains deliberately refused. OpenAI
+  requires opaque reasoning/output items to be passed back; Anthropic requires
+  signed thinking blocks. The current normalized `ToolExchange` does not retain
+  either. Dropping them and continuing would silently weaken the model, so the
+  missing provider-state continuation is stated rather than approximated.
 
 * **Structured output has two modes, because native support is not universal.**
   `SchemaMode::Native` uses the provider's constrained decoding, where a
@@ -1830,6 +1869,13 @@ are query scopes, not ACLs. The policy engine sees `memory.recall` and
 `memory.remember`, the acting agent, tenant, subject/purpose, and write security
 metadata; deployments authorize private/team access there. Tenant-bound store
 handles provide the hard cross-tenant boundary.
+
+Runtime writes take a `MemoryWrite` destination and `Tainted<Value>` content.
+Trust, provenance and sensitivity are derived from that value. They are not
+caller-settable metadata: allowing a skill to mark model output trusted while
+storing it would be an unjournaled release and a delayed privilege escalation.
+Operator/import tooling may still write complete `MemoryItem`s directly through
+the store trait; that path is outside a run and is deployment authority.
 
 The built stores are redb for one node and PostgreSQL for several instances.
 Both run the same memory conformance contract. PostgreSQL serializes concurrent
@@ -1917,7 +1963,10 @@ needs: a stale memory whose summaries remain legitimate should not take them
 with it. `forget_cascading` is what an **erasure** needs: the memory and
 everything transitively derived from it. A correction retains outgoing lineage,
 so deciding later that the request was really an erasure can still reach every
-summary.
+summary. Cascading erasure is a required backend operation, not a default loop
+over `derivatives` and `forget`: that loop had a gap in which another writer
+could add a summary after traversal. redb uses one write transaction;
+PostgreSQL excludes derivative creation for the complete traversal and deletion.
 
 What is not built is equally important: no automatic memory formation, semantic
 ranking, TTL/access-time expiry, legal hold, or cryptographic deletion of memory
@@ -2272,18 +2321,17 @@ manifest:
 | `mode` | shape | inter-agent failure surface |
 |---|---|---|
 | `single` *(default)* | one agent, one context, many tools | structurally absent |
-| `routed` | a deterministic router picks exactly **one** agent per trigger | absent — still one agent per task |
 | `collaborative` | several agents contribute to one task | the full surface |
 
 | `role` | may delegate | |
 |---|---|---|
 | `specialist` *(default)* | **no** | does one thing, hands off to nobody |
 | `orchestrator` | yes | decomposes, delegates, assembles |
-| `router` | no | one dispatch decision, then it steps out |
 
 **Routing is not collaboration.** Picking one specialist out of twenty-nine by
-event type is a dispatch table, and carries none of the coordination risk — which
-is what most "we run multi-agent" deployments actually are.
+event type is a deployment dispatch table. Because the runtime does not perform
+that choice, `routed` and `router` are not accepted manifest values: declarations
+must govern behavior, not describe behavior implemented somewhere else.
 
 Three combinations are refused, because the fields are individually fine and it
 is the combination that describes nothing:
@@ -2292,7 +2340,8 @@ is the combination that describes nothing:
   reported top failure mode of handoff architectures is the infinite loop — A
   hands to B, B to C, C back to A. The structural answer is that most agents in
   an arrangement have no authority to hand off at all, and a specialist that may
-  delegate is an orchestrator nobody reviewed as one.
+  delegate is an orchestrator nobody reviewed as one. The role itself imposes
+  zero at dispatch when the numeric field is omitted.
 * **`single` with a coordinating role.** There is nobody to orchestrate or route
   to.
 * **`collaborative` with no `reason`, or a `reason` without `collaborative`.**

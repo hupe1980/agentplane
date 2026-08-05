@@ -164,6 +164,83 @@ impl MemoryStore for Counted {
     async fn derivatives(&self, id: &str) -> Result<Vec<MemoryItem>, agentplane::core::StoreError> {
         self.inner.derivatives(id).await
     }
+    async fn forget_cascading(&self, id: &str) -> Result<usize, agentplane::core::StoreError> {
+        self.inner.forget_cascading(id).await
+    }
+}
+
+/// Refuses the separately atomic traversal primitive.
+#[derive(Debug)]
+struct RejectsComposedCascade {
+    inner: Arc<dyn MemoryStore>,
+}
+
+#[async_trait::async_trait]
+impl MemoryStore for RejectsComposedCascade {
+    async fn remember(&self, item: &MemoryItem) -> Result<u64, agentplane::core::StoreError> {
+        self.inner.remember(item).await
+    }
+
+    async fn recall(
+        &self,
+        query: &Recall,
+    ) -> Result<Vec<MemoryItem>, agentplane::core::StoreError> {
+        self.inner.recall(query).await
+    }
+
+    async fn version(
+        &self,
+        id: &str,
+        version: u64,
+    ) -> Result<Option<MemoryItem>, agentplane::core::StoreError> {
+        self.inner.version(id, version).await
+    }
+
+    async fn forget(&self, id: &str) -> Result<(), agentplane::core::StoreError> {
+        self.inner.forget(id).await
+    }
+
+    async fn forget_subject(&self, subject: &str) -> Result<usize, agentplane::core::StoreError> {
+        self.inner.forget_subject(subject).await
+    }
+
+    async fn derivatives(&self, id: &str) -> Result<Vec<MemoryItem>, agentplane::core::StoreError> {
+        Err(agentplane::core::StoreError::Backend(format!(
+            "forget_cascading tried to compose itself through derivatives({id})"
+        )))
+    }
+
+    async fn forget_cascading(&self, id: &str) -> Result<usize, agentplane::core::StoreError> {
+        self.inner.forget_cascading(id).await
+    }
+}
+
+#[tokio::test]
+async fn cascading_erasure_is_atomic_with_derivative_creation() {
+    let inner = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn MemoryStore>;
+    let source = item(
+        "race-source",
+        "acct-race",
+        json!({"fact": "erase me"}),
+        Trust::Untrusted,
+    );
+    inner.remember(&source).await.expect("source");
+    let store = RejectsComposedCascade {
+        inner: Arc::clone(&inner),
+    };
+
+    store
+        .forget_cascading("race-source")
+        .await
+        .expect("backend-atomic cascading erasure");
+    assert!(
+        inner
+            .version("race-source", 1)
+            .await
+            .expect("source")
+            .is_none(),
+        "the backend did not erase the source"
+    );
 }
 
 /// Recalls, and reports what it saw.
@@ -213,12 +290,17 @@ impl Skill for Remembers {
         cx: &mut StepCtx<'_>,
         _input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
-        cx.remember(item(
+        let source = item(
             "m-identity",
             "acct-7",
             json!({"note": "same bytes"}),
             self.0,
-        ))
+        );
+        let label = source.label();
+        cx.remember(
+            agentplane::memory::MemoryWrite::new("m-identity", "acct-7", "support"),
+            Tainted::with_label(source.content, label),
+        )
         .await
         .map_err(SkillError::Step)?;
         Ok(Outcome::done(Tainted::trusted(json!({"ok": true}))))
