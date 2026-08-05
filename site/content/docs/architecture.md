@@ -1300,7 +1300,7 @@ src/
              retrieval, and labels taken from provenance rather than content
   netguard/  which IP addresses this plane will connect to — one rule, shared
              by governed media and webhook delivery
-  push/      A2A push notifications: webhook registrations and guarded delivery
+  push/      Webhook registration and guarded-delivery primitives; no A2A outbox
              (feature `push`)
   quota/     per-tenant ceilings on concurrent work and spend, accounted in
              the store so they survive a second instance
@@ -1573,12 +1573,12 @@ the invariant for the one route nobody would think to check.
 | Method | Behaviour |
 |---|---|
 | `SendMessage` | blocking returns a completed `Task` with the answer artifact; `returnImmediately` returns a working `Task` |
-| `GetTask` | the run's state, read from its **last** record |
+| `GetTask` | state, bounded input history, and replay-reconstructed terminal artifacts |
 | `CancelTask` | a durable stop request; the task stays `WORKING` |
 | `GetExtendedAgentCard` | the authenticated card |
-| `SendStreamingMessage`, `SubscribeToTask` | SSE, read from the journal |
-| `ListTasks` | newest-first, cursor-paginated current tasks with context/status/time filters and bounded history |
-| the push-notification configs | registrations, behind `push` |
+| `SendStreamingMessage`, `SubscribeToTask` | SSE status and artifact updates, read from the journal; terminal subscription is refused |
+| `ListTasks` | newest-first, cursor-paginated and per-task-authorized tasks with context/status/time filters, bounded history, and optional artifacts |
+| the push-notification configs | `PushNotificationNotSupportedError`; no durable outbox/worker exists |
 | anything else | `-32601`, method not found |
 
 **Blocking is the default, and unset means blocking** — the spec's rule. A
@@ -1596,14 +1596,16 @@ Further decisions are load-bearing.
 
 **The card describes the deployment, not compiled code.** `A2aServer::new`
 requires a typed bearer scheme and scopes, because a client cannot authenticate
-from an abstract `Authenticator` it cannot see. Push stays false until
-`with_push` supplies both durable registrations and a governed sender; compiling
-the module is not the same as configuring an outbound capability.
+from an abstract `Authenticator` it cannot see. Push is always false: durable
+configuration rows plus a callback do not satisfy A2A's at-least-once delivery
+contract across a process crash. It remains unsupported until a transactional
+outbox and delivery worker exist.
 
 **Parts are a oneof.** Exactly one of text, data, raw, or URL must be present.
 This server advertises text and JSON data; raw and URL file parts are refused as
-unsupported before a skill runs. Previously unknown file fields were ignored,
-turning a valid image request into an empty input dispatched to a skill.
+unsupported before a skill runs, and a declared `mediaType` must agree with the
+chosen member. Inbound messages must have `ROLE_USER`. Previously unknown file
+fields or server-role messages could be accepted as ordinary input.
 
 **A context continues; a task does not mutate.** `contextId` maps to a durable
 case. Each follow-up is a new immutable task/run attached to that case, so
@@ -1632,6 +1634,11 @@ the one counterparty it will accept an amount from. Admitting it as trusted
 would let a value that arrived over the network wear the runtime's own
 authority.
 
+The skill receives stable `text` and `data` projections plus the exact inbound
+Message under reserved `$a2a_message`. Keeping the original roles, Parts,
+metadata, extensions and references in the admitted record is what lets
+`GetTask` reconstruct history rather than inventing a look-alike message later.
+
 Refusals carry the spec's codes rather than a generic error, because a caller
 has to tell *this agent cannot do that* from *you spelled it wrong*: one is
 worth reporting, the other worth retrying differently. For the same reason a
@@ -1641,8 +1648,9 @@ that will never change. The decline says only that it was declined: the
 runtime's own denial names the action and resource the gate keyed on, which is
 enough to map this plane's authorization vocabulary by probing it.
 
-Push notifications are advertised only when wired on this server. Streaming is
-advertised `true`, because it exists.
+Push notifications are advertised false and their methods use the protocol's
+specific refusal. Streaming is advertised true because status and artifact
+events exist; `SubscribeToTask` follows 1.0 by refusing terminal tasks.
 
 #### A signed card says who published it
 
@@ -1770,6 +1778,19 @@ model is being difficult.
 
 Details worth stating:
 
+* **There is no stale universal model-profile boolean.** Provider SDKs expose
+  model profiles, native web/code/MCP tools, tool search, caching and compaction,
+  but those features do not share execution, billing or replay semantics.
+  Portable capabilities such as tools, schema mode, continuation and streaming
+  are typed here; provider-specific capabilities remain explicit provider
+  configuration. Provider-native tools are not represented as ordinary
+  `ToolDeclaration`s because they execute outside the plane's tool sink.
+* **Deferred tool search is not authority discovery.** Current OpenAI and
+  Anthropic models can search thousands of deferred tools, which improves token
+  cost. Letting that search load executable authority would bypass exact
+  manifest review. Applications should keep the initial surface small or expose
+  an aggregate/governed retrieval tool until a search effect journals the query,
+  loaded definitions and grant recheck.
 * **Provider configuration that changes the wire is effect identity.** Each
   driver publishes a non-secret request profile: endpoint, API/driver version,
   per-model schema mode, streaming mode and timeout. Strict replay therefore
@@ -1794,9 +1815,11 @@ Details worth stating:
   A missing or wrong-provider state fails closed. No `previous_response_id` or
   provider-held conversation is replay truth.
 
-* **Bedrock streams conservatively.** Converse text, tools/results, signed or
-  redacted reasoning continuation, usage, truncation, native JSON Schema and
-  forced-tool fallback are supported. `ConverseStream` is the default;
+* **Bedrock streams conservatively.** Converse text, governed inline
+  images/documents, tools/results, signed or redacted reasoning continuation,
+  usage, truncation, native JSON Schema and forced-tool fallback are supported.
+  Document names are constant and neutral because Bedrock treats them as model
+  input. `ConverseStream` is the default;
   `.buffered()` opts out. Region, stream mode, timeout and schema mode enter the
   provider profile. Access, validation and not-found errors are refusals;
   throttling and model-not-ready are retryable. Stream failures are
@@ -1887,6 +1910,20 @@ compaction. They may optimize a live request, but they are not replay truth.
 Anything they return that affects a later request has to be represented in that
 request's journaled identity. Summarising an active context does not silently
 promote it into durable memory.
+
+LangGraph and CoALA further name long-term content **semantic** (facts),
+**episodic** (experiences/few-shot traces), and **procedural** (instructions).
+Those are useful application schemas, not three storage engines. `MemoryStore`
+stores versioned labelled JSON collections for semantic or episodic records;
+procedural changes belong in a reviewed manifest version, not writable memory
+that can silently rewrite the system prompt. A single mutable user “profile” is
+also not a special primitive: use narrow versioned items unless the application
+owns a typed profile/patch contract and its conflict policy.
+
+Formation is currently **hot-path and synchronous**, making latency and failure
+part of the run. Background formation can be built as an explicit scheduled
+skill over journal/case inputs; it is not a hidden hook, because another run and
+effect history must own that mutation.
 
 An application chooses durable sharing with `subject`: use an agent-qualified
 subject for private memory or a team-qualified subject for several agents in one

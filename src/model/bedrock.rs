@@ -1,8 +1,7 @@
 //! Amazon Bedrock Runtime through the provider-neutral Converse API.
 //!
-//! This driver is deliberately buffered. Converse returns usage with the whole
-//! response; claiming streaming support before every event-stream failure can
-//! be classified and metered would weaken the runtime's spend guarantees.
+//! `ConverseStream` is the default so partial generation can be classified and
+//! metered. Buffered mode is an explicit opt-out.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -12,8 +11,9 @@ use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::config::Region;
 use aws_sdk_bedrockruntime::operation::converse::ConverseError;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ConversationRole, InferenceConfiguration, JsonSchemaDefinition, Message,
-    OutputConfig, OutputFormat, OutputFormatStructure, OutputFormatType, ReasoningContentBlock,
+    ContentBlock, ConversationRole, DocumentBlock, DocumentFormat, DocumentSource, ImageBlock,
+    ImageFormat, ImageSource, InferenceConfiguration, JsonSchemaDefinition, Message, OutputConfig,
+    OutputFormat, OutputFormatStructure, OutputFormatType, ReasoningContentBlock,
     ReasoningTextBlock, SpecificToolChoice, SystemContentBlock, Tool, ToolChoice,
     ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolResultStatus,
     ToolSpecification, ToolUseBlock,
@@ -28,6 +28,107 @@ use super::{
 };
 
 const RESPOND_TOOL: &str = "__agentplane_respond";
+
+fn decoded_media(
+    block: &Value,
+    expected_type: &str,
+    model: &ModelId,
+) -> Result<(String, Vec<u8>), ModelError> {
+    let actual = block
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if actual != expected_type {
+        return Err(Bedrock::refused(
+            model,
+            format!("unsupported Bedrock content block '{actual}'"),
+        ));
+    }
+    let media_type = block
+        .get("media_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Bedrock::refused(model, "Bedrock media block has no media_type"))?;
+    let data = block
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Bedrock::refused(model, "Bedrock media block has no inline base64 data"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|error| {
+            Bedrock::refused(model, format!("invalid Bedrock media base64: {error}"))
+        })?;
+    Ok((media_type.to_owned(), bytes))
+}
+
+fn content_from_prompt_json(block: &Value, model: &ModelId) -> Result<ContentBlock, ModelError> {
+    if let Some(text) = block.get("text").and_then(Value::as_str) {
+        return Ok(ContentBlock::Text(text.to_owned()));
+    }
+    match block.get("type").and_then(Value::as_str) {
+        Some("image") => {
+            let (media_type, bytes) = decoded_media(block, "image", model)?;
+            let format = match media_type.as_str() {
+                "image/gif" => ImageFormat::Gif,
+                "image/jpeg" => ImageFormat::Jpeg,
+                "image/png" => ImageFormat::Png,
+                "image/webp" => ImageFormat::Webp,
+                other => {
+                    return Err(Bedrock::refused(
+                        model,
+                        format!("Bedrock does not support image media type '{other}'"),
+                    ));
+                }
+            };
+            ImageBlock::builder()
+                .format(format)
+                .source(ImageSource::Bytes(Blob::new(bytes)))
+                .build()
+                .map(ContentBlock::Image)
+                .map_err(|error| Bedrock::refused(model, error.to_string()))
+        }
+        Some("document") => {
+            let (media_type, bytes) = decoded_media(block, "document", model)?;
+            let format = match media_type.as_str() {
+                "text/csv" => DocumentFormat::Csv,
+                "application/msword" => DocumentFormat::Doc,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+                    DocumentFormat::Docx
+                }
+                "text/html" => DocumentFormat::Html,
+                "text/markdown" => DocumentFormat::Md,
+                "application/pdf" => DocumentFormat::Pdf,
+                "text/plain" => DocumentFormat::Txt,
+                "application/vnd.ms-excel" => DocumentFormat::Xls,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+                    DocumentFormat::Xlsx
+                }
+                other => {
+                    return Err(Bedrock::refused(
+                        model,
+                        format!("Bedrock does not support document media type '{other}'"),
+                    ));
+                }
+            };
+            DocumentBlock::builder()
+                .format(format)
+                // Neutral and constant: Bedrock warns that document names are
+                // prompt-injection-bearing model input.
+                .name("document")
+                .source(DocumentSource::Bytes(Blob::new(bytes)))
+                .build()
+                .map(ContentBlock::Document)
+                .map_err(|error| Bedrock::refused(model, error.to_string()))
+        }
+        Some(other) => Err(Bedrock::refused(
+            model,
+            format!("unsupported Bedrock content block '{other}'"),
+        )),
+        None => Err(Bedrock::refused(
+            model,
+            "Bedrock content block has neither text nor a supported type",
+        )),
+    }
+}
 
 /// Amazon Bedrock Runtime's Converse driver.
 #[derive(Clone)]
@@ -198,15 +299,7 @@ impl Bedrock {
             Value::Array(blocks) => {
                 let blocks = blocks
                     .iter()
-                    .map(|block| {
-                        let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
-                            Self::refused(
-                                model,
-                                "initial Bedrock messages support text content blocks only",
-                            )
-                        })?;
-                        Ok(ContentBlock::Text(text.to_owned()))
-                    })
+                    .map(|block| content_from_prompt_json(block, model))
                     .collect::<Result<Vec<_>, ModelError>>()?;
                 Message::builder()
                     .role(role)
@@ -1051,6 +1144,53 @@ mod tests {
     fn smithy_documents_round_trip_json() {
         let value = json!({"s": "x", "n": -2, "u": 3, "f": 1.5, "a": [true, null]});
         assert_eq!(json_from_document(&document_from_json(&value)), value);
+    }
+
+    #[test]
+    fn governed_images_and_documents_become_inline_bedrock_blocks() {
+        let model = ModelId::new("bedrock", "test");
+        let image = content_from_prompt_json(
+            &json!({
+                "type": "image",
+                "media_type": "image/png",
+                "data": base64::engine::general_purpose::STANDARD.encode(b"png")
+            }),
+            &model,
+        )
+        .expect("image");
+        assert_eq!(
+            image.as_image().expect("image block").format(),
+            &ImageFormat::Png
+        );
+
+        let document = content_from_prompt_json(
+            &json!({
+                "type": "document",
+                "media_type": "application/pdf",
+                "data": base64::engine::general_purpose::STANDARD.encode(b"pdf")
+            }),
+            &model,
+        )
+        .expect("document");
+        let document = document.as_document().expect("document block");
+        assert_eq!(document.format(), &DocumentFormat::Pdf);
+        assert_eq!(document.name(), "document");
+    }
+
+    #[test]
+    fn bedrock_media_never_accepts_a_remote_source() {
+        let model = ModelId::new("bedrock", "test");
+        assert!(
+            content_from_prompt_json(
+                &json!({
+                    "type": "image",
+                    "media_type": "image/png",
+                    "url": "https://example.test/image.png"
+                }),
+                &model,
+            )
+            .is_err()
+        );
     }
 
     #[test]

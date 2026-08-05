@@ -43,7 +43,7 @@ use crate::core::{RunId, Seq};
 use crate::journal::RecordKind;
 use crate::runtime::Runtime;
 
-use super::a2a::{A2aTask, TaskState, sealed_state, task_of};
+use super::a2a::{A2aArtifact, A2aTask, TaskState, sealed_state, task_artifacts, task_of};
 
 /// How often a subscriber re-reads the journal.
 ///
@@ -84,6 +84,18 @@ fn status_update(run: RunId, case: Option<&str>, state: TaskState, detail: &str)
     })
 }
 
+fn artifact_update(run: RunId, case: Option<&str>, artifact: &A2aArtifact) -> Value {
+    json!({
+        "artifactUpdate": {
+            "taskId": run.to_string(),
+            "contextId": case.unwrap_or(&run.to_string()),
+            "artifact": artifact,
+            "append": false,
+            "lastChunk": true,
+        }
+    })
+}
+
 /// What a journal record says about progress, if anything a caller can use.
 ///
 /// Deliberately not every record: a subscriber wants to know *what is
@@ -105,12 +117,13 @@ fn progress_of(kind: &RecordKind) -> Option<(TaskState, String)> {
 
 /// Whether a state ends the stream.
 ///
-/// Terminal states, plus `INPUT_REQUIRED` — see the module docs on why a
-/// suspended run closes the connection rather than holding it for a week.
+/// Only terminal states end a subscription. `INPUT_REQUIRED` can receive a
+/// later message or out-of-band authorization and therefore remains live under
+/// A2A 1.0.
 const fn closes(state: TaskState) -> bool {
     matches!(
         state,
-        TaskState::Completed | TaskState::Failed | TaskState::Canceled | TaskState::InputRequired
+        TaskState::Completed | TaskState::Failed | TaskState::Canceled | TaskState::Rejected
     )
 }
 
@@ -151,6 +164,25 @@ pub fn tail(
             let mut done = false;
             for record in &records {
                 next = record.body.seq + 1;
+                if let RecordKind::RunSealed { outcome, .. } = record.kind() {
+                    let state = sealed_state(outcome);
+                    if state == TaskState::Completed
+                        && let Some(artifacts) = task_artifacts(&runtime, run, state).await
+                    {
+                        for artifact in artifacts {
+                            yield Ok(stream_response(
+                                &id,
+                                &artifact_update(run, case.as_deref(), &artifact),
+                            ));
+                        }
+                    }
+                    yield Ok(stream_response(
+                        &id,
+                        &status_update(run, case.as_deref(), state, outcome),
+                    ));
+                    done = true;
+                    continue;
+                }
                 if let Some((state, detail)) = progress_of(record.kind()) {
                     yield Ok(stream_response(
                         &id,
@@ -192,5 +224,7 @@ pub async fn current(runtime: &Runtime, run: RunId) -> Option<(A2aTask, Option<S
         .iter()
         .find_map(|r| r.body.case.map(|c| c.to_string()));
     let next = last.body.seq + 1;
-    Some((task_of(run, state, &detail, case.clone()), case, next))
+    let mut task = task_of(run, state, &detail, case.clone());
+    task.artifacts = task_artifacts(runtime, run, state).await;
+    Some((task, case, next))
 }

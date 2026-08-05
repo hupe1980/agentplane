@@ -2358,6 +2358,29 @@ spec:
     );
 }
 
+#[test]
+fn the_programmatic_manifest_builder_uses_the_yaml_validation_path() {
+    let missing_budget = Manifest::builder("built", "1.0.0")
+        .configure(|spec| {
+            spec.capabilities.provides.push("built.run".to_owned());
+        })
+        .build();
+    assert!(
+        missing_budget.is_err(),
+        "typed construction bypassed the explicit-budget rule"
+    );
+
+    let manifest = Manifest::builder("built", "1.0.0")
+        .configure(|spec| {
+            spec.capabilities.provides.push("built.run".to_owned());
+            spec.budgets = Some(agentplane::manifest::Budgets::default());
+        })
+        .build()
+        .expect("validated builder");
+    assert_eq!(manifest.metadata.name, "built");
+    assert_eq!(manifest.spec.capabilities.provides, ["built.run"]);
+}
+
 /// A tool-calling agent must be able to describe its tools.
 ///
 /// The model picks from what it is told. A grant with no description gives it a
@@ -2794,7 +2817,7 @@ fn the_card_uses_the_spec_field_names() {
     );
 
     // Standalone derivation has no deployment push store/sender. The A2A server
-    // turns this on only when `with_push` wires both.
+    // remains off until a durable outbox and delivery worker exist.
     let caps = &json["capabilities"];
     assert_eq!(caps["streaming"], true);
     assert_eq!(caps["pushNotifications"], false);

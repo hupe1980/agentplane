@@ -535,11 +535,12 @@ derivative creation cannot commit in the gap between traversal and deletion.
 
 ### A webhook URL is the one destination a caller chooses
 
-Push notifications invert this crate's usual rule that destinations are granted,
-not discovered: the URL comes from whoever created the task. Three controls
-stack — an operator host grant, HTTPS only, and every resolved address checked
-with the connection pinned to it — and the grant is re-checked at delivery so
-revoking a host stops notifications for registrations made while it was granted.
+The `push` module provides the transport controls a future A2A outbox needs. A
+webhook URL inverts this crate's usual rule that destinations are granted, not
+discovered: it comes from whoever created the task. Three controls stack — an
+operator host grant, HTTPS only, and every resolved address checked with the
+connection pinned to it — and the grant is re-checked at delivery so revoking a
+host stops registrations made while it was granted.
 
 The payload carries the task's **state, not its output**. Otherwise a caller who
 can create a task could have its contents posted to any permitted host, and the
@@ -550,6 +551,11 @@ learns that something finished and comes back through the authenticated
 The token a receiver supplies is stored as a secret, echoed only in the outbound
 `Authorization` header, and never returned to a caller reading the
 configuration — it is a bearer credential for somebody else's endpoint.
+
+These controls do **not** make A2A push complete. At-least-once delivery requires
+task transitions and outbox entries to commit atomically, then a durable worker
+to retry until acknowledgement. The server advertises push false until that
+protocol exists.
 
 ### A peer's message is untrusted, and names its sender
 
@@ -726,6 +732,12 @@ tool may do; the transport decides what is known about what happened.
 | `Timeout`, `Cancelled` | `InDoubt` |
 | `TransportSend`, `TransportClosed` | `InDoubt` |
 | `UnexpectedResponse` | `Landed` |
+
+A successful response prefers `structuredContent`; otherwise every MCP content
+block is serialized as typed JSON. Flattening only text blocks made a valid
+image, audio or embedded-resource result become an empty string. Interpretation
+still belongs to the skill, but transport must not destroy data before the
+skill sees it.
 
 Three of those are worth defending, because the tempting answer is wrong in the
 expensive direction each time:

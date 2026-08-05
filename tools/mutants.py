@@ -2737,7 +2737,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     "AStreamNeverClosesOnAFinishedTask": (
         "src/api/a2a_stream.rs",
-        "subscribing_to_a_finished_task_still_reports_it",
+        "subscribing_to_a_finished_task_is_unsupported",
         "a stream opened on an already-finished task polls forever: the record "
         "that ended the run was consumed before the subscriber existed, so the "
         "loop never sees it — which is every client reconnecting after a drop",

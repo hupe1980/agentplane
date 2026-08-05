@@ -76,8 +76,9 @@ impl CardCapabilities {
             // `SendStreamingMessage` and `SubscribeToTask`, served from the
             // journal — see `api::a2a_stream`.
             streaming: true,
-            // Conservative until `A2aServer::with_push` wires the durable store
-            // and governed sender. Compiled code alone cannot deliver anything.
+            // Conservative until a durable outbox and delivery worker exist.
+            // Config storage plus a best-effort callback cannot satisfy A2A's
+            // at-least-once delivery contract across process failure.
             push_notifications: false,
             extended_agent_card: true,
         }

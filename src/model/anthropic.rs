@@ -308,18 +308,34 @@ impl ApiResponse {
     /// The buffered twin of `Accumulator::tool_calls`, and it must agree with
     /// it: streaming is the default, so a difference here would show up as a
     /// loop that fires in tests and never in production.
-    fn tool_calls(&self) -> Vec<super::ToolCall> {
+    fn tool_calls(&self) -> Result<Vec<super::ToolCall>, String> {
         self.content
             .iter()
-            .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
-            .filter(|b| b.get("name").and_then(Value::as_str) != Some(RESPOND_TOOL))
-            .filter_map(|b| {
-                Some(super::ToolCall {
-                    id: b.get("id")?.as_str()?.to_owned(),
-                    name: b.get("name")?.as_str()?.to_owned(),
-                    // Already decoded here, unlike the streaming path where it
-                    // arrives as JSON fragments.
-                    arguments: b.get("input").cloned().unwrap_or(Value::Null),
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .filter(|block| block.get("name").and_then(Value::as_str) != Some(RESPOND_TOOL))
+            .map(|block| {
+                let id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        "Anthropic returned a tool_use block without an id".to_owned()
+                    })?;
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        "Anthropic returned a tool_use block without a name".to_owned()
+                    })?;
+                let arguments = block
+                    .get("input")
+                    .cloned()
+                    .ok_or_else(|| format!("Anthropic tool_use '{id}' has no input arguments"))?;
+                Ok(super::ToolCall {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    arguments,
                 })
             })
             .collect()
@@ -719,6 +735,12 @@ impl Anthropic {
         })?;
 
         let emulating = schema.is_some() && self.mode_for(model) == SchemaMode::ForcedTool;
+        let usage = parsed.usage();
+        let tool_calls = parsed.tool_calls().map_err(|detail| ModelError::Unusable {
+            model: model.clone(),
+            usage,
+            detail,
+        })?;
         interpret(
             model,
             schema,
@@ -726,8 +748,8 @@ impl Anthropic {
             Assembled {
                 text: parsed.text(),
                 forced: parsed.forced_tool_input().cloned(),
-                tool_calls: parsed.tool_calls(),
-                usage: parsed.usage(),
+                tool_calls,
+                usage,
                 stop_reason: parsed.stop_reason.clone(),
                 continuation: Value::Array(parsed.content.clone()),
             },
@@ -810,6 +832,12 @@ impl Anthropic {
         }
 
         let emulating = schema.is_some() && self.mode_for(model) == SchemaMode::ForcedTool;
+        let usage = acc.billed();
+        let tool_calls = acc.tool_calls().map_err(|detail| ModelError::Unusable {
+            model: model.clone(),
+            usage,
+            detail,
+        })?;
         let completion = interpret(
             model,
             schema,
@@ -817,8 +845,8 @@ impl Anthropic {
             Assembled {
                 text: acc.text().to_owned(),
                 forced: acc.forced_tool_input(),
-                tool_calls: acc.tool_calls(),
-                usage: acc.billed(),
+                tool_calls,
+                usage,
                 stop_reason: acc.stop_reason().map(ToOwned::to_owned),
                 continuation: acc.continuation_content(),
             },
@@ -1008,10 +1036,26 @@ mod tests {
             "the structured answer was taken from the caller's tool call"
         );
 
-        let calls = parsed.tool_calls();
+        let calls = parsed.tool_calls().expect("well-formed tool calls");
         assert_eq!(calls.len(), 1, "the forced tool is not a caller tool call");
         assert_eq!(calls[0].name, "refund");
         assert_eq!(calls[0].id, "c1");
+    }
+
+    #[test]
+    fn a_malformed_buffered_tool_call_is_loud() {
+        let parsed: ApiResponse = serde_json::from_value(json!({
+            "content": [
+                { "type": "tool_use", "name": "refund", "input": { "amount": 999 } }
+            ],
+            "usage": { "input_tokens": 10, "output_tokens": 4 }
+        }))
+        .expect("response envelope");
+
+        assert!(
+            parsed.tool_calls().is_err(),
+            "a missing call id was silently turned into no tool calls"
+        );
     }
 
     /// A system instruction has to leave as a top-level parameter.

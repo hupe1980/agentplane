@@ -215,6 +215,14 @@ let call = ModelCall::new(provider, model, prompt.peek().clone())
 let answer = cx.sink(call, &prompt).await?;
 ```
 
+Use `artifact.anthropic_image()` for Anthropic,
+`artifact.openai_image()` for OpenAI, and `artifact.bedrock_image()` or
+`artifact.bedrock_document()` for Bedrock Converse. All four produce digest
+markers that materialize only during live dispatch. Bedrock documents use the
+constant neutral name `document`; AWS explicitly treats caller-chosen document
+names as prompt-injection-bearing content. Unsupported media types and every
+remote/S3 provider source are refused rather than guessed.
+
 Run `cargo run --example media_run --features redb,testkit,media` for the
 offline, executable half of this contract: provider-URL refusal, an exact
 digest/type capability, live-only materialization, untrusted output, and strict
@@ -351,6 +359,13 @@ let rt = Runtime::builder(store)
 
 let out = rt.run("support.summarise", ticket).await?;
 ```
+
+Rust-generated declarations use `Manifest::builder(name, version)` with
+`.configure(|spec| ...)` or `.spec(spec)`, then `.build()`. The builder is
+deliberately thin: nested values remain the same public typed `Spec` used by
+Serde, and build runs the same normalization and validation as YAML. Direct
+struct construction should finish with `manifest.build()`; otherwise the value
+has not earned the guarantees a parsed manifest has.
 
 Add a human to the loop without writing the call:
 

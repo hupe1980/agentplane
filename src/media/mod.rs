@@ -612,6 +612,28 @@ impl FetchedMedia {
         })
     }
 
+    /// A Bedrock Converse image block whose bytes are materialized only inside
+    /// a live [`ModelCall`](crate::model::ModelCall).
+    #[must_use]
+    pub fn bedrock_image(&self) -> Value {
+        json!({
+            "type": "image",
+            "media_type": self.media_type,
+            "data": self.materialization("base64"),
+        })
+    }
+
+    /// A Bedrock Converse document block with a neutral, non-user-controlled
+    /// name. Bedrock treats document names as prompt content.
+    #[must_use]
+    pub fn bedrock_document(&self) -> Value {
+        json!({
+            "type": "document",
+            "media_type": self.media_type,
+            "data": self.materialization("base64"),
+        })
+    }
+
     fn materialization(&self, encoding: &str) -> Value {
         json!({
             "$agentplane_media": {

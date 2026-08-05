@@ -18,7 +18,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use agentplane::api::a2a::{A2aServer, ServerSetupError, action, code};
+use agentplane::api::a2a::{A2aServer, ServerSetupError, TaskState, action, code};
 use agentplane::api::{AuthError, Authenticator, Caller};
 use agentplane::core::{
     Digest, Outcome, PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest, Skill,
@@ -140,12 +140,16 @@ struct Recording {
     /// Permit at the gate and refuse inside the runtime, which is the path a
     /// real deployment takes when a peer may call but not do this.
     deny_runs: bool,
+    hidden_resource: Mutex<Option<String>>,
 }
 
 impl PolicyEngine for Recording {
     fn authorize(&self, request: &PolicyRequest<'_>) -> PolicyDecision {
         self.seen.lock().unwrap().push(request.action.to_owned());
-        let refuse = self.deny || (self.deny_runs && !request.action.starts_with("a2a:"));
+        let hidden = self.hidden_resource.lock().unwrap();
+        let refuse = self.deny
+            || (self.deny_runs && !request.action.starts_with("a2a:"))
+            || hidden.as_deref() == Some(request.resource);
         if refuse {
             PolicyDecision::deny("secret-rule: the test policy refuses this")
         } else {
@@ -160,7 +164,6 @@ impl PolicyEngine for Recording {
 
 struct Fixture {
     rt: Arc<Runtime>,
-    store: Arc<RedbStore>,
     policy: Arc<Recording>,
     seen: Seen,
     manifest: Manifest,
@@ -184,7 +187,6 @@ fn fixture_from(yaml: &str, policy: Arc<Recording>) -> Fixture {
     }
     Fixture {
         rt: builder.build(),
-        store,
         policy,
         seen,
         manifest,
@@ -209,25 +211,6 @@ impl Fixture {
             "https://plane.internal/a2a",
         )
         .expect("the fixture wires a policy engine")
-        .router()
-    }
-
-    fn router_with_push(&self) -> axum::Router {
-        A2aServer::new(
-            self.rt.clone(),
-            Arc::new(HeaderAuth),
-            &card_security(),
-            &self.manifest,
-            "https://plane.internal/a2a",
-        )
-        .expect("the fixture wires a policy engine")
-        .with_push(
-            Arc::clone(&self.store) as Arc<dyn agentplane::push::PushStore>,
-            agentplane::push::PushSender::new(
-                agentplane::push::PushPolicy::new().allow_host("client.example"),
-            ),
-        )
-        .expect("push is wired before card signing")
         .router()
     }
 }
@@ -330,19 +313,6 @@ async fn the_agent_card_is_public() {
     );
 }
 
-#[tokio::test]
-async fn the_card_advertises_push_only_after_deployment_wires_it() {
-    let f = fixture();
-    let req = Request::builder()
-        .uri("/.well-known/agent-card.json")
-        .method("GET")
-        .body(Body::empty())
-        .unwrap();
-
-    let (_, body) = send(&f.router_with_push(), req).await;
-    assert_eq!(body["capabilities"]["pushNotifications"], true);
-}
-
 /// Every method authenticates, and the card is the only route that does not.
 #[tokio::test]
 async fn every_method_is_authenticated() {
@@ -376,6 +346,7 @@ async fn a_denying_policy_stops_every_method() {
             seen: Mutex::new(Vec::new()),
             deny: true,
             deny_runs: false,
+            hidden_resource: Mutex::new(None),
         }),
     );
     let router = f.router();
@@ -657,6 +628,70 @@ async fn unsupported_and_ambiguous_parts_are_refused_before_dispatch() {
         f.seen.lock().unwrap().is_empty(),
         "invalid parts reached a skill"
     );
+
+    for (message, expected) in [
+        (
+            json!({
+                "messageId": "m-role",
+                "role": "ROLE_AGENT",
+                "parts": [{"text": "pretend to be the server"}]
+            }),
+            code::INVALID_PARAMS,
+        ),
+        (
+            json!({
+                "messageId": "m-media-type",
+                "role": "ROLE_USER",
+                "parts": [{"text": "not an image", "mediaType": "image/png"}]
+            }),
+            code::CONTENT_TYPE_NOT_SUPPORTED,
+        ),
+    ] {
+        let (_, body) = send(
+            &router,
+            rpc("SendMessage", &json!({"message": message}), Some("peer-a")),
+        )
+        .await;
+        assert_eq!(err_code(&body), i64::from(expected));
+    }
+}
+
+#[tokio::test]
+async fn malformed_method_parameters_are_not_silently_defaulted() {
+    let f = fixture();
+    let states = [
+        TaskState::Unspecified,
+        TaskState::Submitted,
+        TaskState::Working,
+        TaskState::Completed,
+        TaskState::Failed,
+        TaskState::Canceled,
+        TaskState::InputRequired,
+        TaskState::Rejected,
+        TaskState::AuthRequired,
+    ];
+    for params in [
+        json!({"pageSize": "many"}),
+        json!({"status": "TASK_STATE_NOT_REAL"}),
+        json!([]),
+    ] {
+        let (_, body) = send(&f.router(), rpc("ListTasks", &params, Some("peer-a"))).await;
+        assert_eq!(
+            err_code(&body),
+            i64::from(code::INVALID_PARAMS),
+            "malformed params became defaults: {body:#}"
+        );
+    }
+
+    for state in states {
+        let state = serde_json::to_value(state).expect("task state serializes");
+        let (_, valid_but_empty) = send(
+            &f.router(),
+            rpc("ListTasks", &json!({"status": state}), Some("peer-a")),
+        )
+        .await;
+        assert_eq!(valid_but_empty["result"]["totalSize"], 0, "{state}");
+    }
 }
 
 #[tokio::test]
@@ -743,6 +778,51 @@ async fn list_tasks_filters_context_and_uses_opaque_cursor_pages() {
     let (_, page_two) = send(&f.router(), rpc("ListTasks", &next, Some("peer-a"))).await;
     assert_eq!(page_two["result"]["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(page_two["result"]["nextPageToken"], "");
+
+    let (_, with_artifacts) = send(
+        &f.router(),
+        rpc(
+            "ListTasks",
+            &json!({"contextId": context, "includeArtifacts": true}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert!(
+        with_artifacts["result"]["tasks"][0]["artifacts"].is_array(),
+        "includeArtifacts was accepted but artifacts were not reconstructed: {with_artifacts:#}"
+    );
+}
+
+#[tokio::test]
+async fn list_tasks_omits_tasks_the_caller_cannot_read() {
+    let f = fixture();
+    let router = f.router();
+    let (_, first) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("first")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let hidden = first["result"]["task"]["id"].as_str().unwrap().to_owned();
+    send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("second")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    *f.policy.hidden_resource.lock().unwrap() = Some(hidden.clone());
+
+    let (_, listed) = send(&router, rpc("ListTasks", &json!({}), Some("peer-a"))).await;
+    let tasks = listed["result"]["tasks"].as_array().unwrap();
+    assert_eq!(listed["result"]["totalSize"], 1);
+    assert!(tasks.iter().all(|task| task["id"] != hidden));
 }
 
 #[tokio::test]
@@ -790,6 +870,97 @@ async fn a_blocking_call_returns_the_agents_answer() {
         json!({"ok": true}),
         "the skill succeeded but its output was discarded: {body:#}"
     );
+}
+
+#[tokio::test]
+async fn get_task_honors_history_length_and_reconstructs_artifacts() {
+    let f = fixture();
+    let router = f.router();
+    let message = json!({
+        "messageId": "history-message",
+        "role": "ROLE_USER",
+        "parts": [{
+            "text": "remember this",
+            "mediaType": "text/plain",
+            "metadata": {"part": true}
+        }],
+        "metadata": {"request": true},
+        "extensions": ["https://example.test/a2a/history/v1"],
+        "referenceTaskIds": ["related-task"]
+    });
+    let (_, sent) = send(
+        &router,
+        rpc("SendMessage", &json!({"message": message}), Some("peer-a")),
+    )
+    .await;
+    let id = sent["result"]["task"]["id"].as_str().unwrap();
+
+    let (_, got) = send(
+        &router,
+        rpc(
+            "GetTask",
+            &json!({"id": id, "historyLength": 1}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["task"]["history"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(got["result"]["task"]["history"][0], message);
+    assert!(got["result"]["task"]["artifacts"].is_array());
+
+    let (_, without_history) = send(
+        &router,
+        rpc(
+            "GetTask",
+            &json!({"id": id, "historyLength": 0}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert!(without_history["result"]["task"].get("history").is_none());
+
+    let (_, blocking_history) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({
+                "message": text("another"),
+                "configuration": {"historyLength": 1}
+            }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert!(blocking_history["result"]["task"]["history"].is_array());
+}
+
+#[tokio::test]
+async fn send_configuration_refuses_impossible_output_modes_and_inline_push() {
+    let f = fixture();
+    for (configuration, expected) in [
+        (
+            json!({"acceptedOutputModes": ["image/png"]}),
+            code::CONTENT_TYPE_NOT_SUPPORTED,
+        ),
+        (
+            json!({"taskPushNotificationConfig": {"url": "https://client.example/hook"}}),
+            code::PUSH_NOT_SUPPORTED,
+        ),
+    ] {
+        let (_, body) = send(
+            &f.router(),
+            rpc(
+                "SendMessage",
+                &json!({"message": text("go"), "configuration": configuration}),
+                Some("peer-a"),
+            ),
+        )
+        .await;
+        assert_eq!(err_code(&body), i64::from(expected), "{body:#}");
+    }
 }
 
 // ── Refusals say which kind they are ────────────────────────────────────────
@@ -1090,6 +1261,7 @@ async fn a_policy_denial_is_a_decline_not_a_server_fault() {
             seen: Mutex::new(Vec::new()),
             deny: false,
             deny_runs: true,
+            hidden_resource: Mutex::new(None),
         }),
     );
     let (status, body) = send(
@@ -1395,15 +1567,17 @@ async fn a_status_update_carries_its_task_and_context() {
             .is_some_and(|c| !c.is_empty()),
         "contextId is required and must not be empty: {update:#}"
     );
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame["result"].get("artifactUpdate").is_some()),
+        "the streaming task completed without delivering its output artifact: {frames:#?}"
+    );
 }
 
-/// `SubscribeToTask` streams a run this call did not start.
-///
-/// The property that makes the stream durable rather than a channel: a
-/// subscriber that was not present when the run started — or that reconnects
-/// after dropping — is told the current state and continues from it.
+/// A2A 1.0 permits subscription only while a task can still update.
 #[tokio::test]
-async fn subscribing_to_a_finished_task_still_reports_it() {
+async fn subscribing_to_a_finished_task_is_unsupported() {
     let f = fixture();
     let router = f.router();
 
@@ -1418,19 +1592,15 @@ async fn subscribing_to_a_finished_task_still_reports_it() {
     .await;
     let id = sent["result"]["task"]["id"].as_str().unwrap().to_owned();
 
-    let (status, content_type, frames) = sse_frames(
+    let (_, body) = send(
         &router,
         rpc("SubscribeToTask", &json!({"id": id}), Some("peer-a")),
     )
     .await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert!(content_type.starts_with("text/event-stream"));
     assert_eq!(
-        frames[0]["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
-        "a subscriber that arrived after the run finished must still be told \
-         what happened, not left waiting: {:#}",
-        frames[0]
+        err_code(&body),
+        i64::from(code::UNSUPPORTED_OPERATION),
+        "a terminal task incorrectly opened a subscription: {body:#}"
     );
 }
 
@@ -1463,6 +1633,7 @@ async fn streaming_is_gated_too() {
             seen: Mutex::new(Vec::new()),
             deny: true,
             deny_runs: false,
+            hidden_resource: Mutex::new(None),
         }),
     );
     let (_, body) = send(

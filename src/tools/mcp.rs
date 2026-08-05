@@ -220,13 +220,18 @@ impl ToolClient for McpClient {
             });
         }
 
-        // Structured content when the server provides it, otherwise the
-        // rendered blocks. Both are the outside world's data and are labelled
-        // untrusted by the effect layer.
+        // Structured content when the server provides it, otherwise preserve
+        // every protocol block. Flattening to text silently discarded images,
+        // audio and resources — a successful multimodal tool call became an
+        // empty string, which is corruption rather than graceful degradation.
+        // Both forms are labelled untrusted by the effect layer.
         if let Some(structured) = result.structured_content {
             return Ok(structured);
         }
-        Ok(Value::String(render(&result)))
+        serde_json::to_value(&result.content).map_err(|error| ToolError::Malformed {
+            tool: tool.clone(),
+            detail: format!("MCP tool result content could not be represented: {error}"),
+        })
     }
 }
 
@@ -241,11 +246,6 @@ fn kind_of(v: &Value) -> &'static str {
     }
 }
 
-/// Flatten a tool result's content blocks to text.
-///
-/// Deliberately lossy and deliberately not parsed: whatever a server returns is
-/// untrusted input, and the place to interpret it is a skill that knows what it
-/// asked for.
 fn render(result: &rmcp::model::CallToolResult) -> String {
     result
         .content

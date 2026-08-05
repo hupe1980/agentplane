@@ -145,20 +145,29 @@ impl Accumulator {
 
     /// Tool calls the model asked for, excluding this crate's forced one.
     ///
-    /// A block whose fragments did not reassemble into JSON is **dropped rather
-    /// than guessed at**. Handing a caller a tool call with partial arguments
-    /// would dispatch a real side effect built from half a request, which is the
-    /// one outcome worse than reporting nothing.
-    #[must_use]
-    pub fn tool_calls(&self) -> Vec<super::ToolCall> {
+    /// A block whose fragments did not reassemble into JSON is a loud failure.
+    /// It is never dispatched half-built, and it is not silently dropped: the
+    /// latter would make a `tool_use` stop look like an empty final answer.
+    pub fn tool_calls(&self) -> Result<Vec<super::ToolCall>, String> {
         self.tools
             .iter()
             .filter(|(index, _)| Some(**index) != self.tool_index)
-            .filter_map(|(_, b)| {
-                Some(super::ToolCall {
-                    id: b.id.clone(),
-                    name: b.name.clone(),
-                    arguments: serde_json::from_str(&b.json).ok()?,
+            .map(|(_, block)| {
+                if block.id.is_empty() || block.name.is_empty() {
+                    return Err(
+                        "Anthropic streamed a tool_use block without an id or name".to_owned()
+                    );
+                }
+                let arguments = serde_json::from_str(&block.json).map_err(|error| {
+                    format!(
+                        "Anthropic tool_use '{}' arguments did not form JSON: {error}",
+                        block.id
+                    )
+                })?;
+                Ok(super::ToolCall {
+                    id: block.id.clone(),
+                    name: block.name.clone(),
+                    arguments,
                 })
             })
             .collect()
@@ -604,7 +613,7 @@ mod tests {
         acc.event("content_block_delta", &tool_fragment(0, "250}"));
         acc.event("content_block_delta", &tool_fragment(1, r#""ops"}"#));
 
-        let calls = acc.tool_calls();
+        let calls = acc.tool_calls().expect("well-formed tool calls");
         assert_eq!(calls.len(), 2, "both tool calls must survive");
         assert_eq!(calls[0].id, "call_a");
         assert_eq!(calls[0].name, "refund");
@@ -636,7 +645,9 @@ mod tests {
         );
 
         assert!(
-            acc.tool_calls().is_empty(),
+            acc.tool_calls()
+                .expect("well-formed forced tool")
+                .is_empty(),
             "the schema-shaping tool must not look like a request to act"
         );
         assert_eq!(
@@ -646,19 +657,15 @@ mod tests {
         );
     }
 
-    /// Arguments that never reassemble are dropped, not passed on half-built.
+    /// Arguments that never reassemble are rejected, not silently dropped.
     #[test]
-    fn a_truncated_tool_call_is_dropped_rather_than_guessed() {
+    fn a_truncated_tool_call_is_loud_rather_than_guessed() {
         let mut acc = Accumulator::new();
         feed(&mut acc, &[START]);
         acc.event("content_block_start", &tool_start(0, "t1", "refund"));
         acc.event("content_block_delta", &tool_fragment(0, r#"{"amount":25"#));
 
-        assert!(
-            acc.tool_calls().is_empty(),
-            "a refund whose amount the stream never finished sending must not be \
-             dispatched — half a request is worse than none"
-        );
+        assert!(acc.tool_calls().is_err());
     }
 
     #[test]

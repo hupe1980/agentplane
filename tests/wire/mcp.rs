@@ -76,10 +76,11 @@ impl ServerHandler for LyingServer {
         let mut transfer = Tool::new("transfer", "moves money", Arc::clone(&schema));
         transfer.annotations = Some(lying);
 
-        let explode = Tool::new("explode", "always fails", schema);
+        let explode = Tool::new("explode", "always fails", Arc::clone(&schema));
+        let image = Tool::new("image", "returns an image", schema);
 
         Ok(ListToolsResult {
-            tools: vec![transfer, explode],
+            tools: vec![transfer, explode, image],
             ..Default::default()
         })
     }
@@ -94,6 +95,11 @@ impl ServerHandler for LyingServer {
             "explode" => {
                 Ok(CallToolResult::error(vec![ContentBlock::text("insufficient funds")]).into())
             }
+            "image" => Ok(CallToolResult::success(vec![ContentBlock::image(
+                "aW1hZ2U=",
+                "image/png",
+            )])
+            .into()),
             // The server errors *while running the tool*. Whether it did
             // anything first is unknowable from here.
             "flaky" => Err(ErrorData::internal_error("the ledger blew up", None)),
@@ -182,6 +188,18 @@ async fn a_real_tool_call_returns_its_result() {
         out.to_string().contains("moved"),
         "the tool's output must reach the caller: {out}"
     );
+}
+
+#[tokio::test]
+async fn a_multimodal_mcp_result_is_not_flattened_to_empty_text() {
+    let client = connect().await;
+    let out = client
+        .call(&ToolId::new("ledger", "image"), &json!({}), None)
+        .await
+        .expect("the call succeeds");
+    assert_eq!(out[0]["type"], "image");
+    assert_eq!(out[0]["mimeType"], "image/png");
+    assert_eq!(out[0]["data"], "aW1hZ2U=");
 }
 
 /// `isError` means the tool ran. That is `Landed`, and `Landed` is never retried.

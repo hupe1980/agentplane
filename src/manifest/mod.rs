@@ -82,7 +82,7 @@ pub struct Metadata {
 }
 
 /// The declaration proper.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Who the agent is told it is.
@@ -618,6 +618,35 @@ const fn yes() -> bool {
 }
 
 impl Manifest {
+    /// Begin a programmatic declaration with the required identity fields.
+    ///
+    /// YAML and Rust construction converge on [`Manifest::build`]; neither gets
+    /// a weaker validation path. The builder is intentionally small rather than
+    /// mirroring every nested field with dozens of forwarding methods: callers
+    /// configure the public typed [`Spec`] directly and the final build
+    /// normalizes and validates it.
+    #[must_use]
+    pub fn builder(name: impl Into<String>, version: impl Into<String>) -> ManifestBuilder {
+        ManifestBuilder {
+            metadata: Metadata {
+                name: name.into(),
+                version: version.into(),
+            },
+            spec: Spec::default(),
+        }
+    }
+
+    /// Normalize and validate a typed manifest value.
+    ///
+    /// Use this after direct struct construction. It is the programmatic twin
+    /// of [`Manifest::parse`] and prevents the common DX failure where a caller
+    /// can build a value that YAML would have refused.
+    pub fn build(mut self) -> Result<Self, ManifestError> {
+        self.normalize();
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Parse and validate a YAML manifest.
     ///
     /// # Errors
@@ -1017,5 +1046,39 @@ impl Manifest {
             max_wallclock_secs: b.max_wallclock_secs,
             ..Budget::default()
         }
+    }
+}
+
+/// Minimal programmatic builder for a manifest.
+#[derive(Debug, Clone)]
+pub struct ManifestBuilder {
+    metadata: Metadata,
+    spec: Spec,
+}
+
+impl ManifestBuilder {
+    /// Configure the declaration body as one typed unit.
+    #[must_use]
+    pub fn spec(mut self, spec: Spec) -> Self {
+        self.spec = spec;
+        self
+    }
+
+    /// Mutate the typed declaration body without moving it out of the builder.
+    #[must_use]
+    pub fn configure(mut self, configure: impl FnOnce(&mut Spec)) -> Self {
+        configure(&mut self.spec);
+        self
+    }
+
+    /// Produce the same normalized, validated value as YAML parsing.
+    pub fn build(self) -> Result<Manifest, ManifestError> {
+        Manifest {
+            api_version: API_VERSION.to_owned(),
+            kind: KIND.to_owned(),
+            metadata: self.metadata,
+            spec: self.spec,
+        }
+        .build()
     }
 }

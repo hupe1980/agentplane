@@ -41,14 +41,12 @@
 //! to infer and it is used; when it advertises several and none was named, the
 //! call is refused rather than guessed.
 //!
-//! # What is not implemented, and says so
+//! # The unsupported part says so
 //!
-//! Streaming, task subscription and push notifications need machinery that does
-//! not exist here. They are refused with the spec's own codes —
-//! `UnsupportedOperationError` and `PushNotificationNotSupportedError`, not
-//! "method not found" — because a caller has to be able to tell *this agent
-//! cannot do that* from *you spelled it wrong*. The card advertises them as
-//! false for the same reason.
+//! Streaming and non-terminal task subscription are durable journal views.
+//! Push notifications are not implemented: safe transport primitives are not a
+//! transactional outbox and retrying worker. Every push method therefore uses
+//! `PushNotificationNotSupportedError`, and the card advertises false.
 
 use std::sync::Arc;
 
@@ -150,6 +148,10 @@ const VERSION_HEADER: &str = "a2a-version";
 /// agent does not keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskState {
+    #[serde(rename = "TASK_STATE_UNSPECIFIED")]
+    Unspecified,
+    #[serde(rename = "TASK_STATE_SUBMITTED")]
+    Submitted,
     #[serde(rename = "TASK_STATE_WORKING")]
     Working,
     #[serde(rename = "TASK_STATE_COMPLETED")]
@@ -160,6 +162,10 @@ pub enum TaskState {
     Canceled,
     #[serde(rename = "TASK_STATE_INPUT_REQUIRED")]
     InputRequired,
+    #[serde(rename = "TASK_STATE_REJECTED")]
+    Rejected,
+    #[serde(rename = "TASK_STATE_AUTH_REQUIRED")]
+    AuthRequired,
 }
 
 /// Where a run's status maps onto A2A's task states.
@@ -224,7 +230,15 @@ pub struct A2aTask {
 #[serde(rename_all = "camelCase")]
 pub struct A2aArtifact {
     pub artifact_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub parts: Vec<Part>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
 }
 
 /// One piece of a message.
@@ -243,6 +257,8 @@ pub struct Part {
     pub filename: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 /// A2A's `Message`.
@@ -258,10 +274,20 @@ pub struct A2aMessage {
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_task_ids: Vec<String>,
 }
 
 impl A2aMessage {
     fn validate_parts(&self) -> Result<(), RpcError> {
+        if self.role != "ROLE_USER" {
+            return Err(RpcError::new(
+                code::INVALID_PARAMS,
+                "an inbound Message role must be ROLE_USER",
+            ));
+        }
         if self.parts.is_empty() {
             return Err(RpcError::new(
                 code::CONTENT_TYPE_NOT_SUPPORTED,
@@ -284,16 +310,37 @@ impl A2aMessage {
                     format!("message.parts[{index}] must contain exactly one of text or data"),
                 ));
             }
+            let supported = match (part.text.is_some(), part.data.is_some()) {
+                (true, false) => part
+                    .media_type
+                    .as_deref()
+                    .is_none_or(|value| value == "text/plain"),
+                (false, true) => part
+                    .media_type
+                    .as_deref()
+                    .is_none_or(|value| value == "application/json"),
+                _ => false,
+            };
+            if !supported {
+                return Err(RpcError::new(
+                    code::CONTENT_TYPE_NOT_SUPPORTED,
+                    format!(
+                        "message.parts[{index}] mediaType does not match this agent's text/plain and application/json inputs"
+                    ),
+                ));
+            }
         }
         Ok(())
     }
 
     /// What the runtime receives as input.
     ///
-    /// A stable shape, always the same two keys, rather than a clever unwrapping
+    /// A stable shape, always the same three keys, rather than a clever unwrapping
     /// that hands a skill a bare string sometimes and an object other times. A
     /// skill parsing its own input should not have to branch on how many parts
-    /// the caller happened to send.
+    /// the caller happened to send. `$a2a_message` preserves the exact protocol
+    /// object for task-history reconstruction; `text` and `data` remain the
+    /// ergonomic projections skills normally consume.
     fn to_input(&self) -> Value {
         let text: Vec<&str> = self
             .parts
@@ -301,7 +348,11 @@ impl A2aMessage {
             .filter_map(|p| p.text.as_deref())
             .collect();
         let data: Vec<Value> = self.parts.iter().filter_map(|p| p.data.clone()).collect();
-        json!({ "text": text.join("\n"), "data": data })
+        json!({
+            "text": text.join("\n"),
+            "data": data,
+            "$a2a_message": self,
+        })
     }
 
     /// The skill this message asks for, if it named one.
@@ -331,6 +382,32 @@ struct SendConfiguration {
     /// Blocking is the spec's default and the default here: unset means wait.
     #[serde(default)]
     return_immediately: bool,
+    #[serde(default)]
+    accepted_output_modes: Vec<String>,
+    #[serde(default)]
+    history_length: Option<usize>,
+    #[serde(default)]
+    task_push_notification_config: Option<Value>,
+}
+
+impl SendConfiguration {
+    fn validate(&self) -> Result<(), RpcError> {
+        if self.task_push_notification_config.is_some() {
+            return Err(push_not_supported_error());
+        }
+        if !self.accepted_output_modes.is_empty()
+            && !self
+                .accepted_output_modes
+                .iter()
+                .any(|mode| matches!(mode.as_str(), "text/plain" | "application/json"))
+        {
+            return Err(RpcError::new(
+                code::CONTENT_TYPE_NOT_SUPPORTED,
+                "acceptedOutputModes contains no mode this agent can produce",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// What every method's params may carry.
@@ -345,13 +422,6 @@ struct CommonParams {
     id: Option<String>,
     #[serde(default)]
     configuration: Option<SendConfiguration>,
-    /// `TaskPushNotificationConfig` fields, flattened as the RPC sends them.
-    #[serde(default, rename = "taskId")]
-    push_task: Option<String>,
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    token: Option<String>,
     #[serde(default, rename = "contextId")]
     context_id: Option<String>,
     #[serde(default)]
@@ -421,8 +491,6 @@ pub struct A2aServer {
     extended: ExtendedAgentCard,
     /// The card's advertised skill ids — what a caller may ask for.
     skills: Vec<String>,
-    /// Webhook storage and delivery, when this deployment wires them.
-    push: Option<(Arc<dyn crate::push::PushStore>, crate::push::PushSender)>,
 }
 
 impl std::fmt::Debug for A2aServer {
@@ -445,11 +513,6 @@ pub enum ServerSetupError {
     NoPolicy,
     #[error("the agent card could not be derived: {0}")]
     Card(#[from] crate::manifest::ManifestError),
-    #[error(
-        "push cannot be enabled after Agent Cards are signed because the capability is part of \
-         the signed payload; call `with_push` before `signing_cards_with`"
-    )]
-    CardAlreadySigned,
 }
 
 impl A2aServer {
@@ -499,7 +562,6 @@ impl A2aServer {
             card,
             extended,
             skills,
-            push: None,
         })
     }
 
@@ -526,72 +588,6 @@ impl A2aServer {
         self.card.sign(signer)?;
         self.extended.public.sign(signer)?;
         Ok(self)
-    }
-
-    /// Deliver push notifications for tasks peers register webhooks against.
-    ///
-    /// Without this the four `…PushNotificationConfig` methods refuse with the
-    /// spec's code and the card advertises `pushNotifications: false` — so a
-    /// deployment that has not made the egress decision is not quietly making
-    /// outbound requests to addresses its callers chose.
-    pub fn with_push(
-        mut self,
-        store: Arc<dyn crate::push::PushStore>,
-        sender: crate::push::PushSender,
-    ) -> Result<Self, ServerSetupError> {
-        if !self.card.signatures.is_empty() || !self.extended.public.signatures.is_empty() {
-            return Err(ServerSetupError::CardAlreadySigned);
-        }
-        self.card.capabilities.push_notifications = true;
-        self.extended.public.capabilities.push_notifications = true;
-        self.push = Some((store, sender));
-        Ok(self)
-    }
-
-    /// Tell every webhook registered for this task what state it reached.
-    ///
-    /// Called when a task concludes. Best-effort by construction: a webhook is
-    /// somebody else's endpoint, and its being down is ordinary rather than a
-    /// failure of the run that finished. Outcomes are logged, not raised.
-    ///
-    /// The payload is a `StreamResponse` carrying the task's **state** and not
-    /// its output — see [`crate::push`] for why an allowlist plus a body is an
-    /// exfiltration channel.
-    pub async fn notify(&self, task: RunId) {
-        let Some((store, sender)) = self.push.as_ref() else {
-            return;
-        };
-        let Ok(configs) = store.list(task).await else {
-            tracing::warn!(%task, "could not read this task's webhooks");
-            return;
-        };
-        if configs.is_empty() {
-            return;
-        }
-        let Some((current, case, _)) = super::a2a_stream::current(&self.runtime, task).await else {
-            return;
-        };
-        let payload = json!({
-            "statusUpdate": {
-                "taskId": task.to_string(),
-                "contextId": case.unwrap_or_else(|| task.to_string()),
-                "status": { "state": current.status.state },
-            }
-        });
-
-        for config in &configs {
-            match sender.deliver(config, &payload).await {
-                Ok(crate::push::Delivered::Accepted) => {}
-                Ok(other) => tracing::info!(
-                    %task, config = %config.id, outcome = ?other,
-                    "a webhook did not accept a notification"
-                ),
-                Err(why) => tracing::warn!(
-                    %task, config = %config.id, %why,
-                    "a webhook is registered but may no longer be delivered to"
-                ),
-            }
-        }
     }
 
     /// The router.
@@ -644,6 +640,23 @@ impl A2aServer {
             PolicyDecision::Permit => Ok(caller),
             PolicyDecision::Deny { reason } => Err(RpcError::new(code::INVALID_REQUEST, reason)),
         }
+    }
+
+    fn permits(&self, caller: &Caller, action: &str, resource: &str) -> bool {
+        let context = json!({
+            "roles": caller.roles,
+            "peer": caller.actor,
+            "tenant": caller.tenant.as_str(),
+        });
+        matches!(
+            self.policy.authorize(&PolicyRequest {
+                principal: &caller.actor,
+                action,
+                resource,
+                context: &context,
+            }),
+            PolicyDecision::Permit
+        )
     }
 
     /// Refuse a version this server does not speak.
@@ -776,8 +789,13 @@ async fn stream_method(
     >,
     RpcError,
 > {
-    let params: CommonParams = serde_json::from_value(req.params.clone()).unwrap_or_default();
+    let params = parse_params(&req.params)?;
     server.check_tenant(&params)?;
+    if req.method == method::SEND_STREAMING
+        && let Some(configuration) = &params.configuration
+    {
+        configuration.validate()?;
+    }
 
     let run = if req.method == method::SUBSCRIBE {
         let id = task_id(&params)?;
@@ -830,6 +848,17 @@ async fn stream_method(
             format!("no such task: {run}"),
         ));
     };
+    if req.method == method::SUBSCRIBE
+        && matches!(
+            task.status.state,
+            TaskState::Completed | TaskState::Failed | TaskState::Canceled | TaskState::Rejected
+        )
+    {
+        return Err(RpcError::new(
+            code::UNSUPPORTED_OPERATION,
+            "SubscribeToTask requires a non-terminal task",
+        ));
+    }
 
     Ok(super::a2a_stream::tail(
         Arc::clone(&server.runtime),
@@ -846,7 +875,7 @@ async fn dispatch(
     headers: &HeaderMap,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let params: CommonParams = serde_json::from_value(req.params.clone()).unwrap_or_default();
+    let params = parse_params(&req.params)?;
     server.check_tenant(&params)?;
 
     match req.method.as_str() {
@@ -865,10 +894,9 @@ async fn dispatch(
             "a streaming method reached the non-streaming dispatcher",
         )),
         method::LIST_TASKS => list_tasks(server, headers, &params).await,
-        method::CREATE_PUSH => push_create(server, headers, params).await,
-        method::GET_PUSH => push_get(server, headers, &params).await,
-        method::LIST_PUSH => push_list(server, headers, &params).await,
-        method::DELETE_PUSH => push_delete(server, headers, &params).await,
+        method::CREATE_PUSH | method::GET_PUSH | method::LIST_PUSH | method::DELETE_PUSH => {
+            push_not_supported(server, headers).await
+        }
         other => Err(RpcError::new(
             code::METHOD_NOT_FOUND,
             format!("no such A2A method: {other}"),
@@ -876,11 +904,32 @@ async fn dispatch(
     }
 }
 
+fn parse_params(value: &Value) -> Result<CommonParams, RpcError> {
+    if value.is_null() {
+        return Ok(CommonParams::default());
+    }
+    if !value.is_object() {
+        return Err(RpcError::new(
+            code::INVALID_PARAMS,
+            "A2A method parameters must be a JSON object",
+        ));
+    }
+    serde_json::from_value(value.clone()).map_err(|error| {
+        RpcError::new(
+            code::INVALID_PARAMS,
+            format!("request parameters do not match the A2A method schema: {error}"),
+        )
+    })
+}
+
 async fn send_message(
     server: &A2aServer,
     headers: &HeaderMap,
     params: CommonParams,
 ) -> Result<Value, RpcError> {
+    if let Some(configuration) = &params.configuration {
+        configuration.validate()?;
+    }
     let Some(message) = params.message else {
         return Err(RpcError::new(
             code::INVALID_PARAMS,
@@ -962,15 +1011,29 @@ async fn send_message(
         Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
     };
 
-    // The run is over by the time a blocking send returns, so any webhook
-    // registered against it is told now. A caller that both blocks *and*
-    // registers gets the answer twice, which is its choice — and cheaper than a
-    // notification that never arrives because it registered a moment too late.
-    server.notify(outcome.run_id).await;
-
     let case = task_context(server, outcome.run_id).await?;
     let mut task = task_of_outcome(&outcome);
     task.context_id = case;
+    if let Some(history_length) = params
+        .configuration
+        .as_ref()
+        .and_then(|configuration| configuration.history_length)
+    {
+        let records = server
+            .runtime
+            .journal()
+            .read(outcome.run_id, 1)
+            .await
+            .map_err(|_| {
+                RpcError::new(code::INTERNAL_ERROR, "the task journal could not be read")
+            })?;
+        task.history = task_history(
+            outcome.run_id,
+            &records,
+            Some(history_length),
+            task.context_id.as_deref(),
+        );
+    }
     Ok(json!({ "task": task }))
 }
 
@@ -1049,7 +1112,7 @@ async fn task_context(server: &A2aServer, run: RunId) -> Result<Option<String>, 
         })
 }
 
-fn task_of_outcome(outcome: &crate::runtime::RunOutcome) -> A2aTask {
+pub(super) fn task_of_outcome(outcome: &crate::runtime::RunOutcome) -> A2aTask {
     let part = match outcome.output.clone().unwrap_or(Value::Null) {
         Value::String(text) => Part {
             text: Some(text),
@@ -1058,6 +1121,7 @@ fn task_of_outcome(outcome: &crate::runtime::RunOutcome) -> A2aTask {
             url: None,
             filename: None,
             media_type: Some("text/plain".to_owned()),
+            metadata: None,
         },
         data => Part {
             text: None,
@@ -1066,6 +1130,7 @@ fn task_of_outcome(outcome: &crate::runtime::RunOutcome) -> A2aTask {
             url: None,
             filename: None,
             media_type: Some("application/json".to_owned()),
+            metadata: None,
         },
     };
     A2aTask {
@@ -1079,7 +1144,11 @@ fn task_of_outcome(outcome: &crate::runtime::RunOutcome) -> A2aTask {
         artifacts: matches!(outcome.status, crate::runtime::RunStatus::Succeeded).then(|| {
             vec![A2aArtifact {
                 artifact_id: format!("{}-result", outcome.run_id),
+                name: None,
+                description: None,
                 parts: vec![part],
+                metadata: None,
+                extensions: Vec::new(),
             }]
         }),
         history: None,
@@ -1161,7 +1230,10 @@ async fn get_task(
         .iter()
         .find_map(|r| r.body.case.map(|c| c.to_string()));
 
-    Ok(json!({ "task": task_of(id, state, &detail, case) }))
+    let mut task = task_of(id, state, &detail, case.clone());
+    task.history = task_history(id, &records, params.history_length, case.as_deref());
+    task.artifacts = task_artifacts(&server.runtime, id, state).await;
+    Ok(json!({ "task": task }))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1180,18 +1252,12 @@ async fn list_tasks(
     headers: &HeaderMap,
     params: &CommonParams,
 ) -> Result<Value, RpcError> {
-    server.gate(headers, action::TASK_READ, "tasks").await?;
+    let caller = server.gate(headers, action::TASK_READ, "tasks").await?;
     let page_size = params.page_size.unwrap_or(50);
     if !(1..=100).contains(&page_size) {
         return Err(RpcError::new(
             code::INVALID_PARAMS,
             "pageSize must be between 1 and 100",
-        ));
-    }
-    if params.include_artifacts {
-        return Err(RpcError::new(
-            code::UNSUPPORTED_OPERATION,
-            "ListTasks cannot include artifacts: arbitrary skill outputs are not a journal projection; use GetTask or the blocking SendMessage response",
         ));
     }
     let after = params
@@ -1231,6 +1297,9 @@ async fn list_tasks(
         .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the task index could not be read"))?;
     let mut all = Vec::new();
     for (run, updated) in &recent {
+        if !server.permits(&caller, action::TASK_READ, &run.to_string()) {
+            continue;
+        }
         if after.is_some_and(|cutoff| {
             i64::try_from(*updated)
                 .ok()
@@ -1290,8 +1359,16 @@ async fn list_tasks(
     } else {
         String::new()
     };
+    let mut tasks = Vec::with_capacity(visible.len());
+    for (run, _, task) in visible {
+        let mut task = task.clone();
+        if params.include_artifacts {
+            task.artifacts = task_artifacts(&server.runtime, *run, task.status.state).await;
+        }
+        tasks.push(task);
+    }
     Ok(json!({
-        "tasks": visible.iter().map(|(_, _, task)| task).collect::<Vec<_>>(),
+        "tasks": tasks,
         "nextPageToken": next_page_token,
         "pageSize": page_size,
         "totalSize": total_size,
@@ -1341,7 +1418,20 @@ fn task_from_records(
                 .format(&time::format_description::well_known::Rfc3339)
                 .ok()
         });
-    let history = history_length.and_then(|limit| {
+    let history = task_history(run, records, history_length, case.as_deref());
+    let mut task = task_of(run, state, &detail, case);
+    task.status.timestamp = timestamp;
+    task.history = history;
+    task
+}
+
+fn task_history(
+    run: RunId,
+    records: &[crate::journal::Record],
+    history_length: Option<usize>,
+    case: Option<&str>,
+) -> Option<Vec<A2aMessage>> {
+    history_length.and_then(|limit| {
         if limit == 0 {
             return None;
         }
@@ -1349,10 +1439,20 @@ fn task_from_records(
             let RecordKind::RunAdmitted { input, .. } = record.kind() else {
                 return None;
             };
+            if let Some(message) = input.get("$a2a_message")
+                && let Ok(message) = serde_json::from_value::<A2aMessage>(message.clone())
+            {
+                return Some(vec![message]);
+            }
             let text = input
                 .get("text")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
+            let media_type = if text.is_some() {
+                "text/plain"
+            } else {
+                "application/json"
+            };
             Some(vec![A2aMessage {
                 message_id: format!("{run}-input"),
                 role: "ROLE_USER".to_owned(),
@@ -1362,18 +1462,32 @@ fn task_from_records(
                     raw: None,
                     url: None,
                     filename: None,
-                    media_type: Some("application/json".to_owned()),
+                    media_type: Some(media_type.to_owned()),
+                    metadata: None,
                 }],
-                context_id: case.clone(),
+                context_id: case.map(ToOwned::to_owned),
                 task_id: Some(run.to_string()),
                 metadata: None,
+                extensions: Vec::new(),
+                reference_task_ids: Vec::new(),
             }])
         })
-    });
-    let mut task = task_of(run, state, &detail, case);
-    task.status.timestamp = timestamp;
-    task.history = history;
-    task
+    })
+}
+
+pub(super) async fn task_artifacts(
+    runtime: &Runtime,
+    run: RunId,
+    state: TaskState,
+) -> Option<Vec<A2aArtifact>> {
+    if state != TaskState::Completed {
+        return None;
+    }
+    runtime
+        .replay(run, crate::runtime::Mode::Strict)
+        .await
+        .ok()
+        .and_then(|outcome| task_of_outcome(&outcome).artifacts)
 }
 
 /// A sealed run's outcome word, as an A2A state.
@@ -1473,10 +1587,13 @@ fn declined(skill: &str) -> A2aMessage {
             url: None,
             filename: None,
             media_type: Some("text/plain".to_owned()),
+            metadata: None,
         }],
         context_id: None,
         task_id: None,
         metadata: None,
+        extensions: Vec::new(),
+        reference_task_ids: Vec::new(),
     }
 }
 
@@ -1496,10 +1613,13 @@ pub(super) fn task_of(run: RunId, state: TaskState, detail: &str, case: Option<S
                     url: None,
                     filename: None,
                     media_type: Some("text/plain".to_owned()),
+                    metadata: None,
                 }],
                 context_id: None,
                 task_id: Some(run.to_string()),
                 metadata: None,
+                extensions: Vec::new(),
+                reference_task_ids: Vec::new(),
             }),
             timestamp: None,
         },
@@ -1509,156 +1629,16 @@ pub(super) fn task_of(run: RunId, state: TaskState, detail: &str, case: Option<S
     }
 }
 
-// ── Push notification configuration ─────────────────────────────────────────
-//
-// Every one of these authorizes against the **task**, not against the method.
-// A webhook registration is permission to be told about somebody's work, so the
-// question is "may this caller touch this task", and a caller that may not read
-// a task must not be able to attach a URL to it either.
-
-/// The push machinery, or the spec's refusal when this build has none.
-fn push_parts(
-    server: &A2aServer,
-) -> Result<(&Arc<dyn crate::push::PushStore>, &crate::push::PushSender), RpcError> {
-    server.push.as_ref().map(|p| (&p.0, &p.1)).ok_or_else(|| {
-        RpcError::new(
-            code::PUSH_NOT_SUPPORTED,
-            "this agent does not implement push notifications; its card \
-             advertises pushNotifications as false",
-        )
-    })
+async fn push_not_supported(server: &A2aServer, headers: &HeaderMap) -> Result<Value, RpcError> {
+    server.gate(headers, action::TASK_PUSH, "push").await?;
+    Err(push_not_supported_error())
 }
 
-/// The task a push request names, refusing one that does not exist.
-async fn push_task(server: &A2aServer, raw: Option<&str>) -> Result<RunId, RpcError> {
-    let Some(raw) = raw else {
-        return Err(RpcError::new(code::INVALID_PARAMS, "`taskId` is required"));
-    };
-    let id = RunId::parse(raw)
-        .map_err(|_| RpcError::new(code::TASK_NOT_FOUND, format!("no such task: {raw}")))?;
-    // Checked against the journal rather than taken on faith: registering a
-    // webhook for a task that does not exist would let a caller park a
-    // destination against an id somebody else is about to be issued.
-    let records = server
-        .runtime
-        .journal()
-        .read(id, 1)
-        .await
-        .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the journal could not be read"))?;
-    if records.is_empty() {
-        return Err(RpcError::new(
-            code::TASK_NOT_FOUND,
-            format!("no such task: {id}"),
-        ));
-    }
-    Ok(id)
-}
-
-async fn push_create(
-    server: &A2aServer,
-    headers: &HeaderMap,
-    params: CommonParams,
-) -> Result<Value, RpcError> {
-    let (store, _) = push_parts(server)?;
-    let task = push_task(server, params.push_task.as_deref()).await?;
-    server
-        .gate(headers, action::TASK_PUSH, &task.to_string())
-        .await?;
-
-    let Some(url) = params.url else {
-        return Err(RpcError::new(code::INVALID_PARAMS, "`url` is required"));
-    };
-
-    // Checked before anything is stored, so a caller learns now that its
-    // webhook will never be called — rather than waiting for a notification
-    // that silently never comes.
-    let (_, sender) = push_parts(server)?;
-    sender
-        .policy()
-        .check(&url)
-        .map_err(|e| RpcError::new(code::INVALID_PARAMS, e.to_string()))?;
-
-    let config = crate::push::PushConfig {
-        id: params.id.unwrap_or_else(|| format!("push-{task}")),
-        task,
-        url,
-        token: params.token.map(crate::core::Secret::new),
-    };
-    store
-        .put(&config)
-        .await
-        .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))?;
-    Ok(config.redacted())
-}
-
-async fn push_get(
-    server: &A2aServer,
-    headers: &HeaderMap,
-    params: &CommonParams,
-) -> Result<Value, RpcError> {
-    let (store, _) = push_parts(server)?;
-    let task = push_task(server, params.push_task.as_deref()).await?;
-    server
-        .gate(headers, action::TASK_PUSH, &task.to_string())
-        .await?;
-
-    let id = params
-        .id
-        .as_deref()
-        .ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "`id` is required"))?;
-    store
-        .get(task, id)
-        .await
-        .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))?
-        .map(|c| c.redacted())
-        .ok_or_else(|| {
-            RpcError::new(
-                code::TASK_NOT_FOUND,
-                format!("no push configuration '{id}' for task {task}"),
-            )
-        })
-}
-
-async fn push_list(
-    server: &A2aServer,
-    headers: &HeaderMap,
-    params: &CommonParams,
-) -> Result<Value, RpcError> {
-    let (store, _) = push_parts(server)?;
-    let task = push_task(server, params.push_task.as_deref()).await?;
-    server
-        .gate(headers, action::TASK_PUSH, &task.to_string())
-        .await?;
-
-    let configs = store
-        .list(task)
-        .await
-        .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))?;
-    Ok(json!({
-        "configs": configs.iter().map(crate::push::PushConfig::redacted).collect::<Vec<_>>()
-    }))
-}
-
-async fn push_delete(
-    server: &A2aServer,
-    headers: &HeaderMap,
-    params: &CommonParams,
-) -> Result<Value, RpcError> {
-    let (store, _) = push_parts(server)?;
-    let task = push_task(server, params.push_task.as_deref()).await?;
-    server
-        .gate(headers, action::TASK_PUSH, &task.to_string())
-        .await?;
-
-    let id = params
-        .id
-        .as_deref()
-        .ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "`id` is required"))?;
-    store
-        .delete(task, id)
-        .await
-        .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))?;
-    Ok(json!({}))
+fn push_not_supported_error() -> RpcError {
+    RpcError::new(
+        code::PUSH_NOT_SUPPORTED,
+        "this agent does not implement push notifications; its card advertises pushNotifications as false",
+    )
 }
 
 #[cfg(test)]

@@ -125,7 +125,7 @@ a2a = ["dep:reqwest"]
 # part of the protocol, and this server implements them unconditionally. A
 # feature that uses a module without declaring it is a feature that does not
 # build alone — which nothing noticed until every feature was built alone.
-a2a-server = ["http", "manifest", "push", "dep:async-stream"]
+a2a-server = ["http", "manifest", "dep:async-stream"]
 # Webhook delivery for A2A push notifications: a durable config store plus
 # SSRF-guarded outbound POSTs.
 push = ["dep:reqwest"]
