@@ -2421,9 +2421,19 @@ What enforces today, before dispatch:
 | `spec.models` | a completion names an undeclared provider/model | `effect:declared`, journaled |
 | `spec.tools` | a call names an ungranted `tool://server/tool` | `effect:declared`, journaled |
 | `spec.budgets` | the ledger reaches a ceiling | `Exhausted` |
-| `spec.capabilities.provides` | no registered skill provides it | panic at `build()` |
+| `spec.capabilities.provides` | no registered skill provides it | `BuildError`, before the first run |
 | `security.max_sensitivity_egress` | a labeled value exceeds the stricter of manifest and sink ceilings | `EgressCeiling` |
 | `security.max_delegation_depth` | the configured identity or a handoff chain exceeds the reviewed ceiling | build refusal or `DelegationDepth` |
+
+Build-time refusals are the same set through either entry point. `build()`
+panics with the diagnosis, which is right for a binary wiring its own skills —
+every one of them is a bug in code the author is looking at. `try_build()`
+returns the refusal as a typed `BuildError` instead, for a plane assembled from
+a manifest that arrived at *runtime*: resolved from a registry, read from disk,
+or supplied per tenant. There a bad declaration is an input rather than a bug,
+and a panic would report one tenant's typo by taking every other tenant's
+in-flight run down with it. One implementation underneath both, so they cannot
+come to disagree about what is refused.
 
 The refusal carries a **distinct action** from a Cedar denial, because the two
 accuse different parties: a policy denial is the deployment's rules saying no to

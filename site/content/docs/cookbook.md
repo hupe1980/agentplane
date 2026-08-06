@@ -553,7 +553,7 @@ because a field read by convention is two copies of one decision:
 |---|---|
 | `models`, `tools` | **enforced** — an effect naming one the file never listed is refused before dispatch and journaled under `effect:declared`; tool protected-field rules are digest-covered and must exactly match the live catalogue |
 | `budgets` | **enforced** by the ledger |
-| `capabilities.provides` | **enforced** — `build()` panics if no skill provides it |
+| `capabilities.provides` | **enforced** — the plane refuses to build if no skill provides it |
 | `max_sensitivity_egress` | **enforced** — every sink uses the stricter of its own ceiling and the manifest ceiling |
 | `max_delegation_depth` | **enforced** — checked against the configured identity and every delegating sink before dispatch |
 | `output.schema` | carried to the provider and effect key, then validated locally without external-reference I/O |
@@ -626,6 +626,44 @@ Prefer it anywhere the answer decides what an agent may do.
 
 `MemoryRegistry` is deliberately process-local. The `Registry` trait is the seam
 for a durable or remote implementation; no such implementation ships today.
+
+---
+
+## 🧯 Build a plane from a manifest you did not write
+
+`build()` panics on a wiring mistake, and for a binary wiring its own skills that
+is right: every refusal is a bug in code the author is looking at, and
+`?`-propagating it to a `main` that prints it is ceremony around an abort.
+
+A manifest resolved from a registry is different. It is an **input** — possibly
+one tenant's, in a process serving many — and there a panic reports one tenant's
+typo by taking down every other tenant's in-flight run. Use `try_build`:
+
+```rust
+use agentplane::runtime::{Agent, BuildError, Runtime};
+
+let plane = match Runtime::builder(store)
+    .agent(Agent::new(&resolved))
+    .provider("anthropic", driver)
+    .try_build()
+{
+    Ok(plane) => plane,
+    // The variant matters, not just the failure: "this tenant named a provider
+    // we do not have" is a message back to them, and a capability collision
+    // between two of their agents is a different message.
+    Err(BuildError::UnknownProvider { agent, provider }) => {
+        return Err(onboarding_error(agent, provider));
+    }
+    Err(other) => return Err(other.into()),
+};
+```
+
+Both entry points run the same checks — `build` is `try_build` with an `expect`,
+so the two cannot come to disagree about what is refused. Every variant is listed
+on `BuildError`, and each is a wiring mistake with a fix and no recovery: a
+capability nothing provides, two agents claiming one capability, two skills
+sharing a name, a catalogue laxer than a reviewed grant, a declarative agent
+naming an unregistered provider, or a plane whose store serves another tenant.
 
 ---
 
@@ -1419,6 +1457,34 @@ one canonical journaled completion. Events are labelled untrusted at the call's
 output sensitivity; opaque reasoning is never emitted and strict replay emits
 nothing live. Observers should enqueue quickly and enforce network backpressure
 outside the provider callback.
+
+The split is worth stating, because getting it backwards produces either a
+useless log or an unreplayable run. **The completion is the truth** — one
+record, one effect key, read back on replay — and deltas are never journaled: a
+partial answer is not evidence, and a chain holding a thousand of them answers
+exactly the same questions at a thousand times the verification cost. **The
+observer is a view**: not provider-visible, so not part of effect identity, so
+attaching or removing one cannot change a run's history.
+
+Strict replay therefore calls the observer **zero times**, and that is the
+honest interface rather than a gap. Replay is not a rerun; a framework that
+re-streamed from a cache would be reconstructing a live experience, which is a
+different claim from reproducing a run. `cargo run --example streaming_run`
+prints all three facts, including the deltas reassembling into the completion
+byte for byte.
+
+Testing your own observer needs a provider that streams, so `FakeProvider`
+does — call `.streaming()` and every scripted answer is emitted as text deltas
+followed by a usage snapshot, before the completion returns:
+
+```rust
+let provider = FakeProvider::new();
+provider.streaming().will_say("Settlement GB-4471 clears on Thursday.");
+```
+
+The chunking is whitespace with the separator kept on the preceding chunk, so
+concatenating every delta reproduces `Completion::text` exactly — which is the
+property an observer that appends into a buffer actually depends on.
 
 OpenAI and Anthropic declarative tool loops preserve reasoning automatically.
 `Completion::continuation` carries opaque OpenAI output items or Anthropic

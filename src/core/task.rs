@@ -375,3 +375,32 @@ impl Decision {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// `amend` attaches the amendment and disturbs nothing else.
+    ///
+    /// An approval's other three fields are what make it an approval — who, and
+    /// whether — so a builder that quietly reset one while adding an amount
+    /// would turn "approved by Rita, capped at 5000" into an unattributed yes.
+    /// The builder had no caller and no test, so nothing could tell.
+    #[test]
+    fn an_amendment_rides_along_without_disturbing_the_verdict() {
+        let plain = Decision::approve("rita", "within her limit");
+        let amended = Decision::approve("rita", "within her limit").amend(json!({"cap": 5000}));
+
+        assert_eq!(amended.amendment, json!({"cap": 5000}));
+        assert_eq!(plain.amendment, Value::Null, "the default carries none");
+        assert_eq!(amended.approved, plain.approved);
+        assert_eq!(amended.actor, plain.actor);
+        assert_eq!(amended.reason, plain.reason);
+
+        // A rejection may be amended too — "no, and here is what would pass".
+        let rejected = Decision::reject("rita", "over her limit").amend(json!({"cap": 5000}));
+        assert!(!rejected.approved, "amending must not approve");
+    }
+}

@@ -20,6 +20,7 @@ use crate::core::{
     Spend, StepId, Tainted, WallClock,
 };
 use crate::journal::{Append, JournalStore, Record, RecordKind, ReplayCursor, StepCursor};
+use crate::runtime::BuildError;
 
 use super::ctx::{CaseContext, Mode, StepCtx};
 use super::metrics;
@@ -2891,22 +2892,25 @@ fn recorded_step_refusal(records: &[Record]) -> Option<(StepId, String, String)>
 /// so the only signal was a `None` from `cx.manifest()` that a skill has no
 /// reason to check. That is a declaration reading as a control while governing
 /// nothing, which is the one shape this codebase refuses everywhere.
-fn assert_advertises_what_it_provides(m: &crate::manifest::Manifest, mine: &HashSet<Capability>) {
-    let missing: Vec<&String> = m
+fn check_advertises_what_it_provides(
+    m: &crate::manifest::Manifest,
+    mine: &HashSet<Capability>,
+) -> Result<(), BuildError> {
+    let missing: Vec<String> = m
         .spec
         .capabilities
         .provides
         .iter()
         .filter(|c| !mine.contains(&Capability::new(c.as_str())))
+        .cloned()
         .collect();
-    assert!(
-        missing.is_empty(),
-        "agent '{}' advertises capabilities none of its own skills provide: {missing:?}. \
-         A skill wired with `RuntimeBuilder::skill` is not governed by any agent — it runs \
-         under the plane's budget and no manifest gate. Register it on the agent instead: \
-         `.agent(Agent::new(&manifest).skill(MySkill))`",
-        m.metadata.name
-    );
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(BuildError::AdvertisesWhatItCannotProvide {
+        agent: m.metadata.name.clone(),
+        missing,
+    })
 }
 
 /// Add one skill to the plane's two lookup tables, refusing a collision.
@@ -2921,7 +2925,7 @@ fn assert_advertises_what_it_provides(m: &crate::manifest::Manifest, mine: &Hash
 ///
 /// Returns the skill's name, which is the key governance is recorded under.
 ///
-/// # Panics
+/// # Errors
 ///
 /// If another skill already holds this name, or another skill already claims one
 /// of its capabilities.
@@ -2929,34 +2933,29 @@ fn register_skill(
     skill: Arc<dyn Skill>,
     caps: &mut HashMap<Capability, String>,
     skills: &mut HashMap<String, Arc<dyn Skill>>,
-) -> String {
+) -> Result<String, BuildError> {
     let d = skill.descriptor();
-    if let Some(existing) = skills.get(&d.name) {
+    if let Some(existing) = skills.get(&d.name)
         // Registering the *same* `Arc` twice is idempotent rather than a
         // mistake; two distinct skills under one name is the collision.
-        assert!(
-            Arc::ptr_eq(existing, &skill),
-            "two skills on this plane are both named '{}'. A skill name is how a capability \
-             resolves to an implementation and how a run names what it dispatched, so two of \
-             them make both answers arbitrary — rename one",
-            d.name
-        );
+        && !Arc::ptr_eq(existing, &skill)
+    {
+        return Err(BuildError::DuplicateSkillName { name: d.name });
     }
     for cap in d.provides {
-        assert!(
-            caps.get(&cap).is_none_or(|first| first == &d.name),
-            "capability '{}' is claimed by two agents on this plane: '{}' and '{}'. Dispatch \
-             resolves a capability to one skill and to the manifest governing it, so the second \
-             claim would silently take the first's work out from under the first's budget and \
-             grants. Give them distinct capabilities, or put them on separate planes",
-            cap.0,
-            caps[&cap],
-            d.name,
-        );
+        if let Some(first) = caps.get(&cap)
+            && first != &d.name
+        {
+            return Err(BuildError::CapabilityClaimedTwice {
+                capability: cap.0,
+                first: first.clone(),
+                second: d.name,
+            });
+        }
         caps.insert(cap, d.name.clone());
     }
     skills.insert(d.name.clone(), skill);
-    d.name
+    Ok(d.name)
 }
 
 /// Not derived from a hostname or PID: containers reuse both. Randomness is the
@@ -3894,36 +3893,40 @@ impl RuntimeBuilder {
     /// Every agent, not the first: a plane may host several, and a tool granted
     /// to none of them is still a tool this binary can be asked for.
     ///
-    /// # Panics
+    /// # Errors
     ///
     /// If the box and any agent's manifest disagree. A build-time
-    /// misconfiguration is a programmer error, and it is treated the way the
-    /// tenant mismatch beside it is: loudly, before anything runs.
+    /// misconfiguration has a fix and no recovery, and it is refused the way the
+    /// tenant mismatch beside it is: before anything runs.
     #[cfg(feature = "manifest")]
-    fn settle_toolbox(&mut self) {
+    fn settle_toolbox(&mut self) -> Result<(), BuildError> {
         let servers = std::mem::take(&mut self.tool_servers);
         let tools = self.toolbox.take();
         if tools.is_none() && servers.is_empty() {
-            return;
+            return Ok(());
         }
         let tools = tools.unwrap_or_default();
         let remote_servers: std::collections::BTreeSet<String> =
             servers.iter().map(|(name, _)| name.clone()).collect();
-        assert!(
-            remote_servers.len() == servers.len(),
-            "a tool server is registered twice — registration order would decide \
-             which transport carries a call"
-        );
+        if remote_servers.len() != servers.len() {
+            // The set lost an entry, so some name appears twice. Naming it beats
+            // reporting a count a reader then has to go and diff by hand.
+            let mut seen = std::collections::BTreeSet::new();
+            let duplicate = servers
+                .iter()
+                .map(|(name, _)| name)
+                .find(|name| !seen.insert((*name).clone()))
+                .cloned()
+                .unwrap_or_default();
+            return Err(BuildError::DuplicateToolServer { server: duplicate });
+        }
         // Both forms wired is not a merge and must not silently be one. The
         // hand-built catalogue is the operator saying something deliberate; the
         // derived one is the agent's declaration. Overwriting either with the
         // other would run a plane under grants nobody chose.
-        assert!(
-            self.tools.is_none(),
-            "this plane wires tools twice — `tools(..)` states the catalogue \
-             explicitly and `toolbox(..)` derives it from the agents, so one of \
-             them would silently replace the other's grants"
-        );
+        if self.tools.is_some() {
+            return Err(BuildError::ToolsWiredTwice);
+        }
         let mut catalog = crate::tools::ToolCatalog::new();
         let mut declared = 0usize;
         // Which agent's declaration a tool's catalogue entry came from, so a
@@ -3946,25 +3949,21 @@ impl RuntimeBuilder {
                 continue;
             };
             declared += 1;
-            if let Err(problems) = tools.check_against(manifest, &remote_servers) {
-                panic!(
-                    "the tools this binary implements and the manifest of agent \
-                     '{}' disagree — the declaration a reviewer approved no longer \
-                     describes the agent:\n  {}",
-                    manifest.metadata.name,
-                    problems.join("\n  ")
-                );
-            }
+            tools
+                .check_against(manifest, &remote_servers)
+                .map_err(|problems| BuildError::ToolDrift {
+                    agent: manifest.metadata.name.clone(),
+                    problems,
+                })?;
             for (id, safety) in crate::tools::ToolCatalog::from_manifest(manifest).entries() {
                 if let Some((first, existing)) = source.get(&id) {
-                    assert!(
-                        existing == &safety,
-                        "agents '{first}' and '{}' both grant '{}' and declare it \
-                         differently — a plane has one catalogue, so one of the two \
-                         reviewed declarations would silently not be the one enforced",
-                        manifest.metadata.name,
-                        id.reference()
-                    );
+                    if existing != &safety {
+                        return Err(BuildError::ToolDeclaredTwoWays {
+                            tool: id.reference(),
+                            first: first.clone(),
+                            second: manifest.metadata.name.clone(),
+                        });
+                    }
                     continue;
                 }
                 source.insert(id.clone(), (manifest.metadata.name.clone(), safety.clone()));
@@ -3974,11 +3973,9 @@ impl RuntimeBuilder {
         // A box with nothing to be coherent *with* is the same defect one step
         // earlier: tools wired to a plane where no declaration admits them, so
         // nothing a reviewer reads describes what this binary can reach.
-        assert!(
-            declared > 0,
-            "tools were wired to a plane with no declared agent — a grant is an \
-             agent's declaration, so there is nothing here that admits them"
-        );
+        if declared == 0 {
+            return Err(BuildError::ToolsWithoutDeclaration);
+        }
         // The typed argument type is the schema source. Overlay its
         // presentation only after every manifest has been checked, so the
         // model sees exactly what the body will deserialize rather than the
@@ -4004,6 +4001,7 @@ impl RuntimeBuilder {
             Arc::new(catalog),
             Arc::new(router) as Arc<dyn crate::tools::ToolClient>,
         ));
+        Ok(())
     }
 
     /// Settle the tool catalogue: derive it if asked, then hold it to the
@@ -4015,9 +4013,9 @@ impl RuntimeBuilder {
     /// stated one, where operator and manifest could. Whichever way the
     /// catalogue arrived, it is checked before anything runs.
     #[cfg(feature = "manifest")]
-    fn settle_tools(&mut self) {
-        self.settle_toolbox();
-        self.assert_catalogue_not_laxer_than_grants();
+    fn settle_tools(&mut self) -> Result<(), BuildError> {
+        self.settle_toolbox()?;
+        self.check_catalogue_not_laxer_than_grants()
     }
 
     /// Refuse a stated catalogue that is **laxer** than a reviewed grant.
@@ -4044,9 +4042,9 @@ impl RuntimeBuilder {
     /// is a wiring mistake with a fix and no recovery. It is refused here,
     /// beside the rest of them.
     #[cfg(feature = "manifest")]
-    fn assert_catalogue_not_laxer_than_grants(&self) {
+    fn check_catalogue_not_laxer_than_grants(&self) -> Result<(), BuildError> {
         let Some((catalog, _)) = self.tools.as_ref() else {
-            return;
+            return Ok(());
         };
         let mut problems = Vec::new();
         for agent in &self.agents {
@@ -4069,23 +4067,29 @@ impl RuntimeBuilder {
                 }
             }
         }
-        assert!(
-            problems.is_empty(),
-            "the stated tool catalogue is laxer than a reviewed manifest grant — \
-             a read-only entry exempts the tool from the whole-value taint gate \
-             and makes a timed-out call retryable:\n  {}",
-            problems.join("\n  ")
-        );
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(BuildError::CatalogueLaxerThanGrant { problems })
+        }
     }
 
-    /// Assemble the runtime.
+    /// Assemble the runtime, or panic naming the wiring mistake.
+    ///
+    /// The ordinary entry point. Every refusal below is a bug in code the author
+    /// is looking at, so propagating it through `?` to a `main` that prints it
+    /// is ceremony around an abort — and each is caught here at startup rather
+    /// than at dispatch, in production, where the cost is a run that has already
+    /// begun.
+    ///
+    /// Use [`try_build`](Self::try_build) where a manifest arrives at *runtime*
+    /// — read from disk, pinned by a registry, or supplied per tenant. There a
+    /// bad declaration is an input rather than a bug, and a panic would take
+    /// every other tenant in the process down to report it.
     ///
     /// # Panics
     ///
-    /// On any of four wiring mistakes. Each is a bug in the embedder's own code
-    /// with no recovery, only a fix, which is why these are panics and not a
-    /// `Result` — and each is caught here at startup rather than at dispatch, in
-    /// production, where the cost is a run that has already begun.
+    /// On any [`BuildError`]:
     ///
     /// * A manifest declares a capability in `spec.capabilities.provides` that
     ///   no registered skill provides. **An agent has skills**, so a declaration
@@ -4110,13 +4114,35 @@ impl RuntimeBuilder {
     ///   another's keyspace while every erasure and every policy request names
     ///   the right one.
     #[must_use]
+    pub fn build(self) -> Arc<Runtime> {
+        // Not `expect`. That formats the error with `Debug`, which would print
+        // `AdvertisesWhatItCannotProvide { agent: "…", missing: [...] }` — the
+        // variant's *shape* — while the sentence explaining what to do about it
+        // lives in `Display`. Panicking with `{error}` keeps the two entry
+        // points telling one story, which is the whole point of `build` being
+        // `try_build` underneath.
+        match self.try_build() {
+            Ok(runtime) => runtime,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// Assemble the runtime, or say why it cannot be.
+    ///
+    /// The same checks as [`build`](Self::build), returned rather than raised.
+    /// One implementation behind both, so they cannot come to disagree about
+    /// what is refused.
+    ///
+    /// # Errors
+    ///
+    /// Any [`BuildError`] — see [`build`](Self::build) for what each means.
     // `mut` is for `settle_toolbox`, which only exists when manifests do.
     #[cfg_attr(not(feature = "manifest"), allow(unused_mut))]
     #[allow(clippy::too_many_lines)]
-    pub fn build(mut self) -> Arc<Runtime> {
-        assert_same_tenant(self.store.as_ref(), self.blobs.as_ref(), &self.tenant);
+    pub fn try_build(mut self) -> Result<Arc<Runtime>, BuildError> {
+        check_same_tenant(self.store.as_ref(), self.blobs.as_ref(), &self.tenant)?;
         #[cfg(feature = "manifest")]
-        self.settle_tools();
+        self.settle_tools()?;
 
         let mut skills = HashMap::new();
         let mut by_capability = HashMap::new();
@@ -4130,7 +4156,7 @@ impl RuntimeBuilder {
         // own budget. That is a legitimate shape — not every agent needs a
         // manifest — and it is why `skill()` still exists beside `agent()`.
         for s in self.skills {
-            register_skill(s, &mut by_capability, &mut skills);
+            register_skill(s, &mut by_capability, &mut skills)?;
         }
 
         #[cfg(feature = "manifest")]
@@ -4140,7 +4166,7 @@ impl RuntimeBuilder {
             }
             let Some(m) = agent.manifest.clone() else {
                 for s in agent.skills {
-                    register_skill(s, &mut by_capability, &mut skills);
+                    register_skill(s, &mut by_capability, &mut skills)?;
                 }
                 continue;
             };
@@ -4150,7 +4176,7 @@ impl RuntimeBuilder {
             let mut mine: HashSet<Capability> = HashSet::new();
             for s in agent.skills {
                 mine.extend(s.descriptor().provides);
-                let name = register_skill(s, &mut by_capability, &mut skills);
+                let name = register_skill(s, &mut by_capability, &mut skills)?;
                 governed_by.insert(name, Arc::clone(&m));
             }
 
@@ -4162,29 +4188,25 @@ impl RuntimeBuilder {
                     .models
                     .as_ref()
                     .and_then(|x| x.privileged.as_ref())
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "agent '{}' declares execution but no privileged model — a \
-                             declarative agent has nothing to call",
-                            m.metadata.name
-                        )
+                    .ok_or_else(|| BuildError::DeclarativeWithoutModel {
+                        agent: m.metadata.name.clone(),
+                    })?;
+                // Named rather than defaulted. Falling back to some other
+                // registered driver would run the agent on a model its own
+                // declaration does not name.
+                let provider = self
+                    .providers
+                    .get(&model.provider)
+                    .map(Arc::clone)
+                    .ok_or_else(|| BuildError::UnknownProvider {
+                        agent: m.metadata.name.clone(),
+                        provider: model.provider.clone(),
+                    })?;
+                if m.spec.capabilities.provides.is_empty() {
+                    return Err(BuildError::DeclarativeProvidesNothing {
+                        agent: m.metadata.name.clone(),
                     });
-                let Some(provider) = self.providers.get(&model.provider).map(Arc::clone) else {
-                    // Named rather than defaulted. Falling back to some other
-                    // registered driver would run the agent on a model its own
-                    // declaration does not name.
-                    panic!(
-                        "agent '{}' names provider '{}', which no driver is registered for. \
-                         Call RuntimeBuilder::provider(\"{}\", ..)",
-                        m.metadata.name, model.provider, model.provider
-                    );
-                };
-                assert!(
-                    !m.spec.capabilities.provides.is_empty(),
-                    "agent '{}' declares execution but provides no capability — a \
-                     declarative agent nothing can call is a file that does nothing",
-                    m.metadata.name
-                );
+                }
                 for cap in &m.spec.capabilities.provides {
                     let skill: Arc<dyn Skill> = Arc::new(super::declarative::Declarative::new(
                         execution.kind,
@@ -4195,15 +4217,15 @@ impl RuntimeBuilder {
                         execution.max_turns,
                     ));
                     mine.insert(Capability::new(cap.as_str()));
-                    let name = register_skill(skill, &mut by_capability, &mut skills);
+                    let name = register_skill(skill, &mut by_capability, &mut skills)?;
                     governed_by.insert(name, Arc::clone(&m));
                 }
             }
 
-            assert_advertises_what_it_provides(&m, &mine);
+            check_advertises_what_it_provides(&m, &mine)?;
         }
 
-        Arc::new_cyclic(|self_ref| Runtime {
+        Ok(Arc::new_cyclic(|self_ref| Runtime {
             self_ref: self_ref.clone(),
             signer: self.signer,
             store: self.store,
@@ -4233,7 +4255,7 @@ impl RuntimeBuilder {
             calendar: self.calendar.unwrap_or_else(|| Arc::new(WallClock)),
             #[cfg(feature = "manifest")]
             governed_by,
-        })
+        }))
     }
 }
 
@@ -4243,32 +4265,26 @@ impl RuntimeBuilder {
 /// tenant's runs into another's keyspace while every key-scoped erasure and
 /// every policy request names the right one. The two are set separately, so the
 /// mismatch is easy to make and invisible once made.
-fn assert_same_tenant(
+fn check_same_tenant(
     store: &dyn JournalStore,
     blobs: Option<&Arc<dyn crate::blob::BlobStore>>,
     tenant: &crate::core::TenantId,
-) {
-    if let Some(blobs) = blobs {
-        assert!(
-            blobs.tenant() == tenant.as_str(),
-            "this plane runs as tenant '{}' but its blob store serves '{}'. \
-             Blobs are content-addressed, so a shared store means two tenants' \
-             identical bytes are one object — and erasing it for one destroys \
-             it for the other while reporting both requests discharged",
-            tenant,
-            blobs.tenant(),
-        );
+) -> Result<(), BuildError> {
+    if let Some(blobs) = blobs
+        && blobs.tenant() != tenant.as_str()
+    {
+        return Err(BuildError::BlobStoreTenant {
+            plane: tenant.to_string(),
+            store: blobs.tenant().to_owned(),
+        });
     }
-    assert!(
-        store.tenant() == tenant.as_str(),
-        "this plane runs as tenant '{}' but its store serves '{}'. The two are \
-         set separately — `RuntimeBuilder::tenant` scopes data keys and the \
-         policy request, and `for_tenant` scopes the store's keys — and a plane \
-         whose store is scoped elsewhere writes its runs into another tenant's \
-         keyspace",
-        tenant,
-        store.tenant(),
-    );
+    if store.tenant() != tenant.as_str() {
+        return Err(BuildError::JournalStoreTenant {
+            plane: tenant.to_string(),
+            store: store.tenant().to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Inbound event delivery.

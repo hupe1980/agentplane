@@ -266,3 +266,24 @@ pub struct DeadLetter {
     pub received_at: Timestamp,
     pub reason: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `resumed_run` names the run only when one actually resumed.
+    ///
+    /// The three delivery outcomes are easy to conflate at a call site — all
+    /// three mean "the event was accepted" — and only one of them means a run
+    /// moved. A caller that treated `Buffered` as a resumption would report
+    /// progress for a message nobody has claimed yet, which is precisely the
+    /// failure the buffered state exists to make visible.
+    #[test]
+    fn only_a_resumed_delivery_names_a_run() {
+        let run = RunId::generate();
+
+        assert_eq!(Delivery::Resumed { run }.resumed_run(), Some(run));
+        assert_eq!(Delivery::Buffered.resumed_run(), None);
+        assert_eq!(Delivery::Duplicate.resumed_run(), None);
+    }
+}

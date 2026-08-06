@@ -341,3 +341,16 @@ missing_errors_doc      = "allow"
 missing_panics_doc      = "allow"
 must_use_candidate      = "allow"
 
+
+# The A2A server has a full test suite and, until now, nothing a reader could
+# run. `tower::oneshot` drives the router in-process, so the round trip is real
+# without a port, a key, or a second process.
+[[example]]
+name              = "a2a_peer"
+required-features = ["redb", "a2a-server", "manifest"]
+
+# Live deltas beside a single journaled completion — the one part of the model
+# seam a fake could not reach until `FakeProvider::streaming`.
+[[example]]
+name              = "streaming_run"
+required-features = ["redb", "testkit"]

@@ -220,6 +220,33 @@ mod tests {
         );
     }
 
+    /// `without_jitter` turns jitter off and changes nothing else.
+    ///
+    /// Every existing schedule test builds `RetryPolicy` by struct literal with
+    /// `jitter: false`, so the builder a caller actually reaches for had no test
+    /// at all — and a `without_jitter` that set the wrong field would leave the
+    /// schedule non-deterministic while reading as though it had fixed it.
+    #[test]
+    fn without_jitter_makes_the_schedule_reproducible() {
+        let jittered = RetryPolicy::default();
+        let fixed = RetryPolicy::default().without_jitter();
+
+        assert!(jittered.jitter, "the default is jittered");
+        assert!(!fixed.jitter);
+        assert_eq!(
+            fixed.max_attempts, jittered.max_attempts,
+            "turning jitter off must not move the attempt ceiling"
+        );
+        assert_eq!(fixed.initial_backoff, jittered.initial_backoff);
+        assert_eq!(fixed.max_backoff, jittered.max_backoff);
+
+        // The property jitter removal is *for*: two runs of the same effect now
+        // wait the same amount. With jitter on, the run id decorrelates them.
+        let key = key();
+        let (a, b) = (RunId::generate(), RunId::generate());
+        assert_eq!(fixed.backoff(a, key, 3), fixed.backoff(b, key, 3));
+    }
+
     #[test]
     fn backoff_grows_and_then_stops_at_the_ceiling() {
         let p = RetryPolicy {

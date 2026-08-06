@@ -1319,6 +1319,37 @@ mod tests {
         }
     }
 
+    /// `with_retry` replaces the policy, and the default declines to retry.
+    ///
+    /// The default is `never` on purpose: a model call that reached the provider
+    /// and died mid-stream is `Landed`, so repeating it buys a second bill for
+    /// the same question. A deployment that has decided otherwise sets its own
+    /// policy here — and the builder had no caller and no test, so a `with_retry`
+    /// that dropped the value on the floor would have left every such deployment
+    /// silently on the default.
+    #[test]
+    fn with_retry_replaces_a_deliberately_unretrying_default() {
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(RecordingProvider(Arc::new(AtomicUsize::new(0))));
+        let plain = ModelCall::new(
+            Arc::clone(&provider),
+            ModelId::new("custom", "m"),
+            json!({"q": "hi"}),
+        );
+        assert_eq!(
+            Effect::retry(&plain).max_attempts,
+            RetryPolicy::never().max_attempts,
+            "a model call must not retry by default — a died-mid-stream call already landed"
+        );
+
+        let insistent = ModelCall::new(provider, ModelId::new("custom", "m"), json!({"q": "hi"}))
+            .with_retry(RetryPolicy::default());
+        assert_eq!(
+            Effect::retry(&insistent).max_attempts,
+            RetryPolicy::default().max_attempts
+        );
+    }
+
     /// The effect boundary protects custom providers, not only the built-ins.
     #[tokio::test]
     async fn a_model_call_refuses_provider_side_media_before_any_provider() {

@@ -360,6 +360,91 @@ fn two_skills_on_one_plane_may_not_share_a_name() {
         .build();
 }
 
+/// The same refusals, returned rather than raised.
+///
+/// A manifest is a **file**. `Registry` pins digests, the CLI reads YAML from
+/// disk, and a multi-tenant host may assemble a plane per tenant from
+/// declarations it did not write — so a bad declaration is an *input* there, not
+/// a bug in the embedder's code. `build()` panicking on it takes every other
+/// tenant in the process down to report one tenant's typo.
+///
+/// `try_build` returns the same refusal as a typed value. The variant matters,
+/// not just the failure: a host that must tell "this tenant named a provider we
+/// do not have" from "two of this tenant's agents collide" cannot do it by
+/// matching on a message string.
+#[cfg(feature = "redb")]
+#[test]
+fn try_build_returns_the_refusal_that_build_would_panic_on() {
+    use agentplane::runtime::{Agent, BuildError, Runtime};
+
+    fn store() -> std::sync::Arc<dyn agentplane::journal::JournalStore> {
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"))
+    }
+
+    let m = Manifest::parse(GOOD).expect("parse");
+    assert!(
+        matches!(
+            Runtime::builder(store())
+                .agent(Agent::new(&m))
+                .try_build()
+                .unwrap_err(),
+            BuildError::AdvertisesWhatItCannotProvide { .. }
+        ),
+        "an agent advertising a capability no skill provides was not reported as such"
+    );
+
+    let one = Manifest::parse(BOUND).expect("parse");
+    let two = Manifest::parse(&BOUND.replace("bound-agent", "rival-agent")).expect("parse");
+    assert!(
+        matches!(
+            Runtime::builder(store())
+                .agent(Agent::new(&one).skill(Claims("worker-a", "work.do")))
+                .agent(Agent::new(&two).skill(Claims("worker-b", "work.do")))
+                .try_build()
+                .unwrap_err(),
+            BuildError::CapabilityClaimedTwice { .. }
+        ),
+        "two agents claiming one capability was not reported as such"
+    );
+
+    let other = Manifest::parse(
+        &BOUND
+            .replace("bound-agent", "rival-agent")
+            .replace("work.do", "work.other"),
+    )
+    .expect("parse");
+    assert!(
+        matches!(
+            Runtime::builder(store())
+                .agent(Agent::new(&one).skill(Claims("worker", "work.do")))
+                .agent(Agent::new(&other).skill(Claims("worker", "work.other")))
+                .try_build()
+                .unwrap_err(),
+            BuildError::DuplicateSkillName { .. }
+        ),
+        "two skills sharing a name was not reported as such"
+    );
+}
+
+/// A well-wired plane builds through the fallible path too.
+///
+/// Without this the three refusals above would all pass against a `try_build`
+/// that simply returned `Err` for everything.
+#[cfg(feature = "redb")]
+#[test]
+fn try_build_accepts_a_coherent_plane() {
+    use agentplane::runtime::{Agent, Runtime};
+
+    let m = Manifest::parse(BOUND).expect("parse");
+    let store: std::sync::Arc<dyn agentplane::journal::JournalStore> =
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+
+    Runtime::builder(store)
+        .agent(Agent::new(&m).skill(Claims("worker", "work.do")))
+        .try_build()
+        .expect("a coherent plane builds");
+}
+
 /// The journal says which declaration governed a run.
 ///
 /// A digest that pins a manifest is worth nothing to an auditor if no run ever

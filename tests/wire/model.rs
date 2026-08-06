@@ -135,6 +135,98 @@ async fn live_model_stream_is_labelled_and_strict_replay_is_silent() {
     );
 }
 
+/// The fake streams, and its deltas reassemble the answer exactly.
+///
+/// `FakeProvider` could not stream at all, so the only exercise of the observer
+/// seam in this repository was the stub-HTTP test above — which proves the SSE
+/// *parser* works and says nothing about the seam an embedder writes against.
+/// Anyone building a live view had nothing to test their observer with.
+///
+/// The property under test is byte-exactness, not chunk count. An observer's
+/// job is almost always to append deltas into a buffer and show it, so a split
+/// that dropped or duplicated a separator would put that buffer permanently out
+/// of step with the canonical `Completion::text` — and an assertion on how many
+/// chunks arrived would not notice.
+#[tokio::test]
+async fn the_fake_provider_streams_deltas_that_reassemble_exactly() {
+    use agentplane::testkit::FakeProvider;
+
+    const ANSWER: &str = "Settlement GB-4471 clears on Thursday,  once  confirmed.";
+
+    let provider = FakeProvider::new();
+    provider.streaming().will_say(ANSWER);
+
+    let capture = Arc::new(StreamCapture::default());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(StreamsFake {
+            provider: Arc::clone(&provider),
+            capture: Arc::clone(&capture),
+        })
+        .build();
+
+    let live = runtime.run("streams-fake", json!("when?")).await.unwrap();
+
+    let events = capture.0.lock().unwrap();
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event.peek() {
+            ModelStreamEvent::TextDelta(delta) => Some(delta.clone()),
+            ModelStreamEvent::Usage(_) => None,
+        })
+        .collect();
+    assert_eq!(
+        text, ANSWER,
+        "the deltas do not reassemble into the completion the run was given"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.peek(), ModelStreamEvent::Usage(_))),
+        "a stream that never reports usage lets a token ceiling read zero"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.label().trust == Trust::Untrusted),
+        "a delta is unfinished model output; it cannot be more trusted than the completion"
+    );
+    drop(events);
+
+    assert_eq!(live.output.as_ref().unwrap(), &json!(ANSWER));
+}
+
+/// Streams whatever the fake produces, so the fake's own behaviour is the test.
+#[derive(Debug)]
+struct StreamsFake {
+    provider: Arc<agentplane::testkit::FakeProvider>,
+    capture: Arc<StreamCapture>,
+}
+
+#[async_trait::async_trait]
+impl Skill for StreamsFake {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("streams-fake").provides("streams-fake")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let call = ModelCall::new(
+            Arc::clone(&self.provider) as Arc<dyn agentplane::model::ModelProvider>,
+            model(),
+            input.peek().clone(),
+        )
+        .streaming_to(Arc::clone(&self.capture) as Arc<dyn ModelStreamObserver>);
+        let completion = cx.sink(call, &input).await?;
+        Ok(Outcome::done(
+            completion.map(|completion| json!(completion.text)),
+        ))
+    }
+}
+
 // ── The meter ───────────────────────────────────────────────────────────────
 
 #[test]

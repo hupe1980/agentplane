@@ -33,7 +33,8 @@ use serde_json::{Value, json};
 #[cfg(test)]
 use crate::model::ModelCall;
 use crate::model::{
-    Completion, ModelError, ModelId, ModelProvider, ReasoningEffort, Request, Usage,
+    Completion, ModelError, ModelId, ModelProvider, ModelStreamEvent, ReasoningEffort, Request,
+    Usage,
 };
 
 /// What the fake was asked.
@@ -62,6 +63,8 @@ pub struct FakeProvider {
     scripted: Mutex<std::collections::VecDeque<Result<Completion, ModelError>>>,
     /// Every call, in order.
     asked: Mutex<Vec<Ask>>,
+    /// Whether to emit text deltas to a caller's observer before answering.
+    streaming: Mutex<bool>,
 }
 
 impl FakeProvider {
@@ -135,6 +138,27 @@ impl FakeProvider {
         })
     }
 
+    /// Emit the answer as text deltas before returning it whole.
+    ///
+    /// Streaming is the one provider behaviour a fake could not reach, and its
+    /// absence had a cost: an embedder building a live view had nothing to test
+    /// against, so the only exercise of the observer path in this repository ran
+    /// against a stub HTTP server — which tests the SSE parser, not the seam.
+    ///
+    /// The split is deliberately **not** a tokenizer. Whitespace with the
+    /// separator kept on the preceding chunk means the concatenation of every
+    /// delta is byte-identical to [`Completion::text`], which is the property an
+    /// observer actually depends on and the one a clever split would break.
+    ///
+    /// What this does not fake is timing. Deltas are delivered synchronously,
+    /// before the completion returns, because the alternative is a fake whose
+    /// output order depends on the scheduler — and a non-deterministic fake
+    /// destroys the property under test.
+    pub fn streaming(&self) -> &Self {
+        *self.streaming.lock().expect("fake") = true;
+        self
+    }
+
     /// Everything it was asked, in order.
     #[must_use]
     pub fn asked(&self) -> Vec<Ask> {
@@ -156,6 +180,30 @@ impl FakeProvider {
     pub fn script_exhausted(&self) -> bool {
         self.scripted.lock().expect("fake").is_empty()
     }
+}
+
+/// Chunk text so that concatenating every chunk reproduces it exactly.
+///
+/// The separator stays on the chunk before it. That is the whole trick: an
+/// observer's job is usually to append deltas into a buffer, so a split that
+/// dropped or duplicated a space would make the buffer disagree with the
+/// canonical `Completion::text` in a way no assertion on chunk *count* notices.
+fn split_for_stream(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        current.push(ch);
+        if ch.is_whitespace() {
+            chunks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// Deterministic token counts, so budgets are exercised rather than bypassed.
@@ -255,7 +303,27 @@ impl ModelProvider for FakeProvider {
         // across a suspension is held on the thread, and this one is taken on
         // every model call in the suite.
         let scripted = self.scripted.lock().expect("fake").pop_front();
-        scripted.unwrap_or_else(|| Ok(echo(&request)))
+        let answer = scripted.unwrap_or_else(|| Ok(echo(&request)));
+
+        // Deltas first, then the whole answer — the order a real driver
+        // produces, so an observer that assumes it is exercised rather than
+        // assumed. Only on the success path: a call that failed before
+        // generating has no text to have streamed.
+        if *self.streaming.lock().expect("fake")
+            && let (Ok(completion), Some((observer, label))) = (&answer, request.stream)
+        {
+            for delta in split_for_stream(&completion.text) {
+                observer.event(crate::core::Tainted::with_label(
+                    ModelStreamEvent::TextDelta(delta),
+                    label.clone(),
+                ));
+            }
+            observer.event(crate::core::Tainted::with_label(
+                ModelStreamEvent::Usage(completion.usage),
+                label.clone(),
+            ));
+        }
+        answer
     }
 }
 

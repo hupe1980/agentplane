@@ -78,6 +78,14 @@ cargo run --example mcp_tools --features redb,testkit,manifest,mcp
 
 # Three agents — an orchestrator and two specialists — each with its own manifest.
 cargo run --example blog_room --features redb,testkit,manifest
+
+# This plane served as an A2A 1.0 agent, called the way a peer would call it:
+# a public card, authenticated methods, and a message that arrives untrusted.
+cargo run --example a2a_peer --features redb,a2a-server,manifest
+
+# Live tokens for a human, one journaled completion for the machine — and a
+# replay that performs neither.
+cargo run --example streaming_run --features redb,testkit
 ```
 
 Or skip Rust entirely — a file and a key are the whole agent:
@@ -143,7 +151,7 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | 🏢 | **Multi-tenancy in the key, not in a filter** — the tenant leads every stored key on both backends, so a query that forgets it returns *nothing* rather than another tenant's rows. Blob paths lead with it too: content addressing otherwise puts two tenants' identical bytes in one object, and erasing it for one destroys the other's data while reporting both requests done. One process serves many tenants, resolving the plane from the caller's credential — never from the request — and refusing a tenant it does not serve rather than falling back to a default |
 | 📊 | **Per-tenant metrics without leaking tenants** — the label is opt-in, off by default, and bounded by *configuration* rather than data: it is the plane's own tenant, so no request can grow the cardinality. There is no pseudonymous mode, deliberately: the tenant already appears in store keys, blob paths and a publicly served Agent Card, so hashing it in one place would invite the belief that it is contained |
 | 🚦 | **Ceilings that survive scaling out** — a budget bounds one run; a tenant that can start runs can start a thousand. Per-tenant limits on concurrent runs and spend are accounted **in the store**, because an in-process counter fails *open*: it silently doubles the moment a second instance starts, which is exactly when it was needed. Refusals are back-pressure, distinct from a policy denial — one means *not right now*, the other *never* |
-| 🛰️ | **One plane, several agents** — a runtime owns the journal, the drivers and the process identity; an agent owns a manifest and its skills. Each agent on a plane is separately declared, bounded and answerable, and two of them claiming one capability is *refused at startup* rather than silently resolved. `StepCtx::commission` hands work to a peer as a **journaled effect**, so a replay reassembles the room without waking it, the label travels with the answer, and the specialist's spend is billed to the run that asked |
+| 🛰️ | **One plane, several agents** — a runtime owns the journal, the drivers and the process identity; an agent owns a manifest and its skills. Each agent on a plane is separately declared, bounded and answerable, and two of them claiming one capability is *refused at startup* rather than silently resolved — as a panic naming the mistake when a binary wired itself, or a typed `BuildError` from `try_build` when the manifest arrived from a registry or a tenant, where a bad declaration is an input rather than a bug and a panic would take every other tenant's in-flight run down with it. `StepCtx::commission` hands work to a peer as a **journaled effect**, so a replay reassembles the room without waking it, the label travels with the answer, and the specialist's spend is billed to the run that asked |
 
 Full inventory, including what is **not** built →
 **[docs/status.md](https://hupe1980.github.io/agentplane/docs/status/)**

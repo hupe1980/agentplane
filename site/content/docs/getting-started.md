@@ -146,7 +146,7 @@ agentplane = { version = "0.3", features = ["postgres", "http", "mcp", "provider
 | `opendal` | content-addressed blob storage on S3, GCS, Azure or a filesystem — where bytes too large for the journal go |
 | `keyring` | envelope encryption for payload bytes, and the cryptographic erasure it makes provable — destroying a key erases every copy, including backups |
 | `keyring-vault` | a key ring that is somebody else: HashiCorp Vault's transit engine over its HTTP API, so the wrapping key never leaves Vault |
-| `testkit` | fault injection, store conformance, a fake model provider |
+| `testkit` | fault injection, store conformance, and a fake model provider that can stream — so an observer is testable without a key or a network |
 
 ## 3. Write a skill 🛠️
 
@@ -313,6 +313,18 @@ answered differently each time would make every replay test a coin-toss, and one
 that reported zero usage would let every budget test pass over a runtime that had
 stopped counting.
 
+It can stream, too, which is what makes a live view testable:
+
+```rust
+provider.streaming().will_say("approved");
+// every scripted answer now arrives as text deltas and a usage snapshot
+// before the completion returns
+```
+
+Chunking keeps the separator on the preceding chunk, so concatenating every delta
+reproduces the completion byte for byte — the property an observer appending into
+a buffer depends on, and the one an assertion on chunk *count* would miss.
+
 ## Where next 🧭
 
 Pick the example for the question you have; none needs credentials or network:
@@ -328,6 +340,8 @@ Pick the example for the question you have; none needs credentials or network:
 | How do governed media capabilities materialize without entering the journal? | `media_run` |
 | Can prompt, model, schema and ceilings be one digest-covered file? | `manifest_run` |
 | How are separate agents and handoffs bounded? | `blog_room` |
+| What does another organisation's agent see when it calls this one? | `a2a_peer` |
+| How do live tokens coexist with a journal that must replay exactly? | `streaming_run` |
 
 | | |
 |---|---|

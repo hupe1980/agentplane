@@ -241,18 +241,16 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "two agents declaring one tool differently merge by registration order "
         "instead of being refused",
         """                if let Some((first, existing)) = source.get(&id) {
-                    assert!(
-                        existing == &safety,""",
+                    if existing != &safety {""",
         """                if let Some((first, existing)) = source.get(&id) {
-                    assert!(
-                        existing == &safety || true,""",
+                    if false {""",
     ),
     "AStatedCatalogueMayRelaxAGrant": (
         "src/runtime/executor.rs",
         "a_stated_catalogue_may_not_relax_a_reviewed_mutating_grant",
         "a hand-written catalogue laxer than the reviewed manifest builds anyway",
-        "        self.assert_catalogue_not_laxer_than_grants();",
-        "        let _ = Self::assert_catalogue_not_laxer_than_grants;",
+        "        self.check_catalogue_not_laxer_than_grants()",
+        "        let _ = Self::check_catalogue_not_laxer_than_grants;\n        Ok(())",
     ),
     "ReadOnlyProtectedFieldsIgnored": (
         "src/runtime/ctx.rs",
@@ -1103,8 +1101,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a declarative agent falls back to whatever driver is registered when "
         "the one its manifest names is absent, running the agent on a model its "
         "own declaration never mentioned",
-        "            let Some(provider) = self.providers.get(&model.provider).map(Arc::clone) else {",
-        "            let Some(provider) = self.providers.values().next().map(Arc::clone) else {",
+        "                let provider = self\n                    .providers\n                    .get(&model.provider)",
+        "                let provider = self\n                    .providers\n                    .values()\n                    .next()\n                    .map(|p| p)",
     ),
     "AFencedCallerCanReleaseTheLease": (
         "src/store/redb.rs",
@@ -1761,14 +1759,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the fake answers differently each call, so every replay test becomes a "
         "coin-toss that mostly passes",
         '        let scripted = self.scripted.lock().expect("fake").pop_front();\n'
-        "        scripted.unwrap_or_else(|| Ok(echo(&request)))",
+        "        let answer = scripted.unwrap_or_else(|| Ok(echo(&request)));",
         '        let scripted = self.scripted.lock().expect("fake").pop_front();\n'
         "        let n = self.calls();\n"
-        "        scripted.unwrap_or_else(|| {\n"
+        "        let answer = scripted.unwrap_or_else(|| {\n"
         "            let mut c = echo(&request);\n"
         '            c.text = format!("{} #{n}", c.text);\n'
         "            Ok(c)\n"
-        "        })",
+        "        });",
     ),
     "TheFakeScriptRunsBackwards": (
         "src/testkit/fake_model.rs",
@@ -1798,15 +1796,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "two_agents_may_not_claim_the_same_capability",
         "a second agent's claim on a capability silently displaces the first, "
         "moving its work out from under its own budget and grants",
-        "            caps.get(&cap).is_none_or(|first| first == &d.name),",
-        "            true,",
+        "        if let Some(first) = caps.get(&cap)\n            && first != &d.name\n        {",
+        "        if let Some(first) = caps.get(&cap)\n            && false\n        {",
     ),
     "TwoSkillsShareAName": (
         "src/runtime/executor.rs",
         "two_skills_on_one_plane_may_not_share_a_name",
         "two skills share a name, so the second inherits the first's manifest",
-        "    if let Some(existing) = skills.get(&d.name) {",
-        "    if let Some(existing) = None::<&Arc<dyn Skill>> {",
+        "    if let Some(existing) = skills.get(&d.name)",
+        "    if let Some(existing) = None::<&Arc<dyn Skill>>",
     ),
     "TheJournalForgetsWhoGoverned": (
         "src/runtime/executor.rs",
@@ -2057,8 +2055,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a plane starts over a store scoped to a different tenant, so its runs "
         "land in another tenant's keyspace while every key-scoped erasure and "
         "policy request names the right one",
-        "        store.tenant() == tenant.as_str(),",
-        "        store.tenant() != \"never\",",
+        "    if store.tenant() != tenant.as_str() {",
+        "    if store.tenant() == \"never\" {",
     ),
     "TheCardMisspellsItsBinding": (
         "src/peers/card.rs",
@@ -2088,8 +2086,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_plane_will_not_start_over_another_tenants_blobs",
         "a plane starts over a blob store scoped to a different tenant, so its "
         "artifacts land in another tenant's erasure unit",
-        "        assert!(\n            blobs.tenant() == tenant.as_str(),",
-        "        assert!(\n            blobs.tenant() != \"never\",",
+        "    if let Some(blobs) = blobs\n        && blobs.tenant() != tenant.as_str()",
+        "    if let Some(blobs) = blobs\n        && blobs.tenant() == \"never\"",
     ),
     "ASummaryDropsItsSensitivity": (
         "src/runtime/ctx.rs",
@@ -2471,8 +2469,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "deployer must remember to call it — and a control a caller may forget "
         "is advice that reads like a control, which is the one thing I12 says a "
         "declared control may never be",
-        "        self.settle_toolbox();\n        self.assert_catalogue_not_laxer_than_grants();",
-        "",
+        "        self.settle_toolbox()?;\n        self.check_catalogue_not_laxer_than_grants()",
+        "        Ok(())",
     ),
     "OnlyTheFirstAgentIsChecked": (
         "src/runtime/executor.rs",
@@ -2481,9 +2479,9 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a plane hosting several agents enforces one declaration and ignores the "
         "rest — and the ignored ones are exactly where a second team's manifest "
         "drifts unnoticed",
-        "            if let Err(problems) = tools.check_against(manifest, &remote_servers) {",
+        "            tools\n                .check_against(manifest, &remote_servers)",
         "            if declared > 1 {\n                continue;\n            }\n"
-        "            if let Err(problems) = tools.check_against(manifest, &remote_servers) {",
+        "            tools\n                .check_against(manifest, &remote_servers)",
     ),
     "EmbeddingIsComputedNotObserved": (
         "src/runtime/ctx.rs",
@@ -2660,8 +2658,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a plane that wires tools twice takes one silently — the derived "
         "catalogue replaces the operator's explicit one, so the plane runs under "
         "grants nobody chose and nothing says which won",
-        "        assert!(\n            self.tools.is_none(),",
-        "        assert!(\n            true || self.tools.is_none(),",
+        "        if self.tools.is_some() {",
+        "        if false {",
     ),
     "AToolboxNeedsNoDeclaration": (
         "src/runtime/executor.rs",
@@ -2669,8 +2667,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "tools may be wired to a plane with no declared agent, so the coherence "
         "check passes by having nothing to compare against — enforcement that is "
         "satisfied by the absence of the thing it enforces against",
-        "        assert!(\n            declared > 0,",
-        "        assert!(\n            true || declared > 0,",
+        "        if declared == 0 {",
+        "        if false {",
     ),
     "MetricsLeakTheTenantByDefault": (
         "src/runtime/metrics.rs",

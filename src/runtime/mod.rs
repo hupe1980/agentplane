@@ -1,6 +1,7 @@
 //! Execution: the step context, the effect protocol, and the executor.
 
 pub mod batch;
+mod build_error;
 mod ctx;
 #[cfg(feature = "manifest")]
 mod declarative;
@@ -12,6 +13,7 @@ mod sweeper;
 pub mod telemetry;
 
 pub use batch::BatchSpec;
+pub use build_error::BuildError;
 pub use ctx::{Mode, StepCtx};
 #[cfg(feature = "manifest")]
 pub use executor::Agent;

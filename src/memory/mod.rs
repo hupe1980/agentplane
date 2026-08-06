@@ -668,6 +668,49 @@ pub trait MemoryStore: Send + Sync + Debug {
 }
 
 #[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    /// The two lifecycle builders set their own field and no other.
+    ///
+    /// Fixed expiry and sliding retention answer opposite questions — "this
+    /// stops being recallable on Thursday whatever happens" versus "this stays
+    /// as long as it keeps being read" — and a memory carrying both by accident
+    /// is one whose disposal date nobody can state. The store paths were tested
+    /// through YAML and direct field assignment; the builders a caller reaches
+    /// for had no test, so a swapped assignment would have been invisible.
+    #[test]
+    fn each_lifecycle_builder_sets_only_what_it_names() {
+        let plain = MemoryWrite::new("m-1", "account-1", "support");
+        assert_eq!(plain.expires_at, None, "neither is set by default");
+        assert_eq!(plain.access_retention_seconds, None);
+
+        let sliding = MemoryWrite::new("m-1", "account-1", "support").retain_after_access(600);
+        assert_eq!(sliding.access_retention_seconds, Some(600));
+        assert_eq!(
+            sliding.expires_at, None,
+            "a sliding window is not also a fixed expiry"
+        );
+
+        let at = Timestamp::UNIX_EPOCH;
+        let fixed = MemoryWrite::new("m-1", "account-1", "support").expires_at(at);
+        assert_eq!(fixed.expires_at, Some(at));
+        assert_eq!(
+            fixed.access_retention_seconds, None,
+            "a fixed expiry is not also a sliding window"
+        );
+
+        // Identity is untouched by either: the id, subject and purpose are what
+        // erasure and retrieval key on.
+        for built in [&sliding, &fixed] {
+            assert_eq!(built.id, plain.id);
+            assert_eq!(built.subject, plain.subject);
+            assert_eq!(built.purpose, plain.purpose);
+        }
+    }
+}
+
+#[cfg(test)]
 mod semantic_tests {
     use super::*;
 
