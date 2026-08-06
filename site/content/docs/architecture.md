@@ -1621,6 +1621,19 @@ forged card survivable — the worst it can do is waste a request.
 The other half, and a different problem: everything arriving here was written by
 somebody else.
 
+A reader arriving from A2A should be handed the vocabulary rather than left to
+derive it, because the two sets of nouns overlap without matching:
+
+| A2A says | this runtime means | why they differ |
+|---|---|---|
+| `Task` | a **run** — one journaled, replayable execution | A2A's Task is the wire view of a run's lifecycle |
+| `contextId` | a **case** — the long-lived matter many runs share | which is why every task carries one, and why a server needs a case layer to serve A2A at all |
+| *(no equivalent)* | a **human task** — a worklist item awaiting a person | "task" is already three protocols' word; this one never crosses the A2A wire |
+
+The mapping is deliberately at the adapter and not in the core's names:
+protocols are wire contracts, and renaming the engine after one of several
+adapters would make `task` mean three things in one codebase.
+
 It is a **separate router**, not routes on the operator API. That surface's
 invariant is that every route authenticates, and an Agent Card is public by
 definition — it is what a caller reads *before* it has credentials. Adding one

@@ -40,6 +40,10 @@ pub mod bedrock;
 #[cfg(feature = "bedrock")]
 mod bedrock_stream;
 #[cfg(feature = "providers")]
+pub mod chat_completions;
+#[cfg(feature = "providers")]
+mod chat_completions_stream;
+#[cfg(feature = "providers")]
 pub mod openai;
 #[cfg(feature = "providers")]
 mod openai_stream;

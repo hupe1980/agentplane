@@ -264,6 +264,170 @@ pub struct Part {
     pub metadata: Option<Value>,
 }
 
+impl Part {
+    /// A text part.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+            data: None,
+            raw: None,
+            url: None,
+            filename: None,
+            media_type: Some("text/plain".to_owned()),
+            metadata: None,
+        }
+    }
+
+    /// A structured-data part.
+    #[must_use]
+    pub fn data(data: Value) -> Self {
+        Self {
+            text: None,
+            data: Some(data),
+            raw: None,
+            url: None,
+            filename: None,
+            media_type: Some("application/json".to_owned()),
+            metadata: None,
+        }
+    }
+
+    /// A file part carrying its bytes inline, base64-encoded per `ProtoJSON`.
+    #[must_use]
+    pub fn file_raw(
+        raw_base64: impl Into<String>,
+        media_type: impl Into<String>,
+        filename: impl Into<String>,
+    ) -> Self {
+        Self {
+            text: None,
+            data: None,
+            raw: Some(raw_base64.into()),
+            url: None,
+            filename: Some(filename.into()),
+            media_type: Some(media_type.into()),
+            metadata: None,
+        }
+    }
+
+    /// A file part referring to bytes by URL.
+    #[must_use]
+    pub fn file_url(
+        url: impl Into<String>,
+        media_type: impl Into<String>,
+        filename: impl Into<String>,
+    ) -> Self {
+        Self {
+            text: None,
+            data: None,
+            raw: None,
+            url: Some(url.into()),
+            filename: Some(filename.into()),
+            media_type: Some(media_type.into()),
+            metadata: None,
+        }
+    }
+}
+
+/// How a skill shapes its A2A answer, when the default projection is not it.
+///
+/// The default stands for most skills: a string output becomes a text part and
+/// anything else a data part, in one artifact. What that projection cannot say
+/// is *file content* — inline bytes or a URL with a filename — or that the
+/// answer is a quick, stateless `Message` rather than a task's artifact. Both
+/// are ordinary A2A response shapes a peer may expect.
+///
+/// A skill opts in by returning this value (via [`A2aReply::into_value`]) as
+/// its outcome. The runtime journals it as it journals any output — the shape
+/// is a *projection instruction* read at the protocol boundary, not a second
+/// channel around the journal.
+///
+/// ```no_run
+/// # use agentplane::api::a2a::{A2aReply, Part};
+/// # use agentplane::core::{Outcome, Tainted};
+/// // A task whose artifact is a file reference:
+/// let reply = A2aReply::artifact(vec![Part::file_url(
+///     "https://example.com/report.pdf",
+///     "application/pdf",
+///     "report.pdf",
+/// )]);
+/// # let _ = Outcome::done(Tainted::trusted(reply.into_value()));
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct A2aReply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<Vec<Part>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifacts: Option<Vec<Vec<Part>>>,
+}
+
+/// The output key an [`A2aReply`] travels under.
+///
+/// A `$`-prefixed marker, like `$a2a_message` on the inbound side: ordinary
+/// skill output is domain data this runtime never interprets, so the one shape
+/// it *does* interpret must be unmistakably deliberate rather than a field
+/// name a domain object happens to share.
+const REPLY_KEY: &str = "$a2a_reply";
+
+impl A2aReply {
+    /// Answer the blocking send with a direct `Message` instead of a task.
+    ///
+    /// Outside a blocking send — a spawned task, a stream, a later `GetTask` —
+    /// there is no message to deliver, and the parts become the task's
+    /// artifact instead: the content survives, only the envelope differs.
+    #[must_use]
+    pub const fn message(parts: Vec<Part>) -> Self {
+        Self {
+            message: Some(parts),
+            artifacts: None,
+        }
+    }
+
+    /// Answer with one artifact holding these parts.
+    #[must_use]
+    pub fn artifact(parts: Vec<Part>) -> Self {
+        Self {
+            message: None,
+            artifacts: Some(vec![parts]),
+        }
+    }
+
+    /// Answer with several artifacts.
+    #[must_use]
+    pub const fn artifacts(artifacts: Vec<Vec<Part>>) -> Self {
+        Self {
+            message: None,
+            artifacts: Some(artifacts),
+        }
+    }
+
+    /// The outcome value a skill returns.
+    #[must_use]
+    pub fn into_value(self) -> Value {
+        json!({ REPLY_KEY: self })
+    }
+
+    /// Read a reply back out of a journaled output, if one was declared.
+    pub(super) fn of_output(output: &Value) -> Option<Self> {
+        serde_json::from_value(output.get(REPLY_KEY)?.clone()).ok()
+    }
+
+    /// The message parts, when this reply is a direct `Message`.
+    pub(super) fn message_parts(&self) -> Option<Vec<Part>> {
+        self.message.clone()
+    }
+
+    /// Every part, for contexts that can only carry artifacts.
+    pub(super) fn artifact_parts(&self) -> Vec<Vec<Part>> {
+        match (&self.artifacts, &self.message) {
+            (Some(artifacts), _) => artifacts.clone(),
+            (None, Some(message)) => vec![message.clone()],
+            (None, None) => Vec::new(),
+        }
+    }
+}
+
 /// A2A's `Message`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -509,6 +673,51 @@ impl RpcError {
         self.id = id;
         self
     }
+
+    /// The machine-readable reason A2A 1.0's error-handling rules require
+    /// beside an A2A-specific code, as a `google.rpc.ErrorInfo` in
+    /// `error.data`.
+    ///
+    /// Derived from the code rather than declared per call site, because the
+    /// two are one fact: the spec's table maps each code to exactly one reason
+    /// token, and a site that could set them independently is a site that can
+    /// disagree with itself. Standard JSON-RPC codes carry no reason — the
+    /// spec assigns them none — so they return `None` and the error omits
+    /// `data` rather than inventing a token.
+    ///
+    /// This adds no information a prober does not already have: the reason is
+    /// a restatement of the code in the same response. The uniform-refusal
+    /// rule governs what a *model* is told; this is the protocol channel to an
+    /// authenticated peer.
+    const fn reason(&self) -> Option<&'static str> {
+        match self.code {
+            code::TASK_NOT_FOUND => Some("TASK_NOT_FOUND"),
+            code::TASK_NOT_CANCELABLE => Some("TASK_NOT_CANCELABLE"),
+            code::PUSH_NOT_SUPPORTED => Some("PUSH_NOTIFICATION_NOT_SUPPORTED"),
+            code::UNSUPPORTED_OPERATION => Some("UNSUPPORTED_OPERATION"),
+            code::CONTENT_TYPE_NOT_SUPPORTED => Some("CONTENT_TYPE_NOT_SUPPORTED"),
+            code::EXTENDED_CARD_NOT_CONFIGURED => Some("EXTENDED_AGENT_CARD_NOT_CONFIGURED"),
+            code::VERSION_NOT_SUPPORTED => Some("VERSION_NOT_SUPPORTED"),
+            _ => None,
+        }
+    }
+
+    /// The JSON-RPC error member, with the required `ErrorInfo` when one
+    /// applies.
+    fn body(&self) -> Value {
+        match self.reason() {
+            Some(reason) => json!({
+                "code": self.code,
+                "message": self.message,
+                "data": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "domain": "a2a-protocol.org",
+                    "reason": reason,
+                }],
+            }),
+            None => json!({ "code": self.code, "message": self.message }),
+        }
+    }
 }
 
 impl IntoResponse for RpcError {
@@ -523,7 +732,7 @@ impl IntoResponse for RpcError {
             Json(json!({
                 "jsonrpc": "2.0",
                 "id": self.id,
-                "error": { "code": self.code, "message": self.message },
+                "error": self.body(),
             })),
         )
             .into_response()
@@ -585,6 +794,13 @@ pub enum ServerSetupError {
          place that skips the gate"
     )]
     NoPolicy,
+    #[error(
+        "the runtime has no case layer, so this server cannot mint the \
+         contextId A2A 1.0 requires on every task — a generated contextId \
+         must be continuable, and continuation here is a case. Build the \
+         runtime with `.cases(store)`"
+    )]
+    NoCases,
     #[error("the agent card could not be derived: {0}")]
     Card(#[from] crate::manifest::ManifestError),
     #[error("push changes the signed Agent Card; configure it before calling signing_cards_with")]
@@ -610,6 +826,9 @@ impl A2aServer {
         url: impl Into<String>,
     ) -> Result<Self, ServerSetupError> {
         let policy = runtime.policy().ok_or(ServerSetupError::NoPolicy)?.clone();
+        if runtime.cases().is_none() {
+            return Err(ServerSetupError::NoCases);
+        }
         let url = url.into();
         let mut card = AgentCard::derive(manifest, url.clone())?;
         let mut extended = ExtendedAgentCard::derive(manifest, url)?;
@@ -700,10 +919,21 @@ impl A2aServer {
     /// The router.
     ///
     /// The card path is unauthenticated by design and everything else is not.
+    ///
+    /// The RPC endpoint answers with and without a trailing slash, and that is
+    /// an interoperability fact rather than a courtesy: mainstream HTTP clients
+    /// that take a base URL — httpx among them, which is what the official A2A
+    /// conformance kit and the reference Python SDK are built on — resolve a
+    /// request for `"/"` against the card's interface URL per RFC 3986, so the
+    /// wire carries `POST {interface}/`. A router that 404s the slash form
+    /// passes every test written here and fails the first real peer. Exactness
+    /// elsewhere (method names, version headers) guards protocol *semantics*;
+    /// a trailing slash is a client-side join artifact with none.
     pub fn router(self) -> Router {
         Router::new()
             .route(WELL_KNOWN_PATH, get(agent_card))
             .route("/a2a", post(rpc))
+            .route("/a2a/", post(rpc))
             .with_state(self)
     }
 
@@ -982,9 +1212,25 @@ async fn rpc(
     headers: HeaderMap,
     body: Result<Json<RpcRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Ok(Json(req)) = body else {
-        return RpcError::new(code::PARSE_ERROR, "the request body is not valid JSON-RPC")
-            .into_response();
+    let req = match body {
+        Ok(Json(req)) => req,
+        // The two refusals are different spec rows and must not share a code:
+        // a body that is not `application/json` is `ContentTypeNotSupported`
+        // (-32005) in A2A's own mapping table, while a body that *claims* JSON
+        // and is not is JSON-RPC's ParseError. Collapsing them tells a caller
+        // with a wrong header that its serializer is broken.
+        Err(rejection) => {
+            let error = match &rejection {
+                axum::extract::rejection::JsonRejection::MissingJsonContentType(_) => {
+                    RpcError::new(
+                        code::CONTENT_TYPE_NOT_SUPPORTED,
+                        "the request body must be application/json",
+                    )
+                }
+                _ => RpcError::new(code::PARSE_ERROR, "the request body is not valid JSON-RPC"),
+            };
+            return error.into_response();
+        }
     };
     let id = req.id.clone();
 
@@ -1401,6 +1647,28 @@ async fn send_message(
     };
 
     let case = task_context(server, outcome.run_id).await?;
+    // A declared `Message` reply answers the blocking send directly — A2A's
+    // response is a oneof for exactly this, and it is the only path with a
+    // caller still waiting to hand a message to. Returned before push
+    // registration, because a response with no task has no task to push about;
+    // the run and its journal exist either way.
+    if matches!(outcome.status, crate::runtime::RunStatus::Succeeded)
+        && let Some(reply) = outcome.output.as_ref().and_then(A2aReply::of_output)
+        && let Some(parts) = reply.message_parts()
+    {
+        return Ok(json!({
+            "message": A2aMessage {
+                message_id: format!("reply-{}", outcome.run_id),
+                role: "ROLE_AGENT".to_owned(),
+                parts,
+                context_id: case,
+                task_id: None,
+                metadata: None,
+                extensions: Vec::new(),
+                reference_task_ids: Vec::new(),
+            }
+        }));
+    }
     if let Some(push) = &inline_push {
         register_push(server, push, outcome.run_id, 1).await?;
     }
@@ -1441,21 +1709,22 @@ async fn run_a2a(
         })?;
         return server.runtime.run_tainted_in_case(skill, input, case).await;
     }
-    if server.runtime.cases().is_some() {
-        return server
-            .runtime
-            .run_tainted_correlated(
-                skill,
-                input,
-                "a2a.context",
-                &[crate::core::CorrelationKey::new(
-                    "a2a-message",
-                    message.message_id.clone(),
-                )],
-            )
-            .await;
-    }
-    server.runtime.run_tainted(skill, input).await
+    // Always correlated: `A2aServer::new` refuses a runtime without a case
+    // layer, so every task gets a real, continuable context — the contextId
+    // returned is one a client can send back, not a string that satisfies a
+    // schema and continues nothing.
+    server
+        .runtime
+        .run_tainted_correlated(
+            skill,
+            input,
+            "a2a.context",
+            &[crate::core::CorrelationKey::new(
+                "a2a-message",
+                message.message_id.clone(),
+            )],
+        )
+        .await
 }
 
 async fn spawn_a2a(
@@ -1473,21 +1742,19 @@ async fn spawn_a2a(
             .spawn_tainted_in_case(skill, input, case)
             .await;
     }
-    if server.runtime.cases().is_some() {
-        return server
-            .runtime
-            .spawn_tainted_correlated(
-                skill,
-                input,
-                "a2a.context",
-                &[crate::core::CorrelationKey::new(
-                    "a2a-message",
-                    message.message_id.clone(),
-                )],
-            )
-            .await;
-    }
-    server.runtime.spawn(skill, input).await
+    // Always correlated, for the reason `run_a2a` states.
+    server
+        .runtime
+        .spawn_tainted_correlated(
+            skill,
+            input,
+            "a2a.context",
+            &[crate::core::CorrelationKey::new(
+                "a2a-message",
+                message.message_id.clone(),
+            )],
+        )
+        .await
 }
 
 async fn task_context(server: &A2aServer, run: RunId) -> Result<Option<String>, RpcError> {
@@ -1505,25 +1772,15 @@ async fn task_context(server: &A2aServer, run: RunId) -> Result<Option<String>, 
 }
 
 pub(super) fn task_of_outcome(outcome: &crate::runtime::RunOutcome) -> A2aTask {
-    let part = match outcome.output.clone().unwrap_or(Value::Null) {
-        Value::String(text) => Part {
-            text: Some(text),
-            data: None,
-            raw: None,
-            url: None,
-            filename: None,
-            media_type: Some("text/plain".to_owned()),
-            metadata: None,
-        },
-        data => Part {
-            text: None,
-            data: Some(data),
-            raw: None,
-            url: None,
-            filename: None,
-            media_type: Some("application/json".to_owned()),
-            metadata: None,
-        },
+    let output = outcome.output.clone().unwrap_or(Value::Null);
+    // A declared reply carries its own parts; otherwise the default projection
+    // stands — a string is a text part, anything else a data part.
+    let artifacts_parts: Vec<Vec<Part>> = match A2aReply::of_output(&output) {
+        Some(reply) => reply.artifact_parts(),
+        None => vec![vec![match output {
+            Value::String(text) => Part::text(text),
+            data => Part::data(data),
+        }]],
     };
     A2aTask {
         id: outcome.run_id.to_string(),
@@ -1534,14 +1791,18 @@ pub(super) fn task_of_outcome(outcome: &crate::runtime::RunOutcome) -> A2aTask {
             timestamp: None,
         },
         artifacts: matches!(outcome.status, crate::runtime::RunStatus::Succeeded).then(|| {
-            vec![A2aArtifact {
-                artifact_id: format!("{}-result", outcome.run_id),
-                name: None,
-                description: None,
-                parts: vec![part],
-                metadata: None,
-                extensions: Vec::new(),
-            }]
+            artifacts_parts
+                .into_iter()
+                .enumerate()
+                .map(|(i, parts)| A2aArtifact {
+                    artifact_id: format!("{}-result-{i}", outcome.run_id),
+                    name: None,
+                    description: None,
+                    parts,
+                    metadata: None,
+                    extensions: Vec::new(),
+                })
+                .collect()
         }),
         history: None,
         metadata: None,

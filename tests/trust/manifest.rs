@@ -2712,11 +2712,13 @@ fn an_agent_card_is_derived_from_the_manifest() {
          to dispatch"
     );
     assert_eq!(
-        card.manifest_digest,
-        m.digest().expect("digest").to_hex(),
+        card.manifest_digest(),
+        Some(m.digest().expect("digest").to_hex().as_str()),
         "the card must name the declaration it came from: two cards with one \
          name and version are otherwise indistinguishable when the document \
-         behind them changed"
+         behind them changed. Carried as a declared extension, because the A2A \
+         schema forbids unknown top-level properties and the official \
+         conformance kit rejects a card that has any"
     );
 
     // **Nothing unimplemented is advertised, and nothing implemented is
@@ -2796,19 +2798,27 @@ fn the_extended_card_discloses_more_but_not_the_model() {
     let public = AgentCard::derive(&m, "https://plane/a2a").expect("public");
     let extended = ExtendedAgentCard::derive(&m, "https://plane/a2a").expect("extended");
 
+    // The extended card is the public one plus exactly one addition: the
+    // governance extension, in the spec's own slot for extras. Anything else
+    // differing means a peer reading both sees two different agents.
+    let mut stripped = extended.public.clone();
+    stripped
+        .capabilities
+        .extensions
+        .retain(|e| e.uri != agentplane::peers::EXT_GOVERNANCE);
     assert_eq!(
-        extended.public, public,
-        "the extended card must contain the public one unchanged, or a peer \
-         reading both sees two different agents"
+        stripped, public,
+        "the extended card must be the public one plus only the governance \
+         extension, or a peer reading both sees two different agents"
     );
     assert_eq!(
-        extended.tools.len(),
+        extended.tools().len(),
         m.spec.tools.len(),
         "an authenticated peer deciding whether to delegate needs to know what \
          the far side can reach"
     );
     assert!(
-        extended.tools.iter().any(|t| t.mutates),
+        extended.tools().iter().any(|t| t.mutates),
         "the fixture grants a mutating tool, and `mutates` is the field a peer \
          most needs: an agent that can only read is a different risk from one \
          that can move money"

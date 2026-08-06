@@ -155,6 +155,14 @@ test-memory:
 test-push:
     cargo test --features push,media,redb,testkit --test guards push::
 
+# the official A2A conformance kit against this server — the outside authority
+#
+# Every other A2A test drives this server with this crate's own client, which
+# proves symmetry, not conformance. Network-gated (clones and installs the
+# kit); needs `uv`. Two kit MUSTs are excluded with evidence — see the script.
+test-a2a-tck:
+    bash tools/a2a_tck.sh
+
 # being called: the public card, the 1.0 methods, and a client/server round trip
 test-a2a-server:
     cargo test --features a2a-server,a2a,signing,redb,testkit --test wire a2a_server::

@@ -58,7 +58,7 @@ pub struct CardSkill {
 /// capability by asking, because the caller who believes the card does not care
 /// who wrote it. Turning one on means editing this file, next to the code that
 /// implements it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CardCapabilities {
     /// Server-sent events for incremental results.
@@ -67,7 +67,41 @@ pub struct CardCapabilities {
     pub push_notifications: bool,
     /// A richer card for authenticated callers — see [`ExtendedAgentCard`].
     pub extended_agent_card: bool,
+    /// Declared protocol extensions, in the spec's own slot for them.
+    ///
+    /// This is where anything the A2A schema does not name belongs. The card
+    /// once carried this crate's extras (`manifestDigest`; the extended card's
+    /// tools and budget) as top-level fields, and the official conformance kit
+    /// rejected the document: `AgentCard` forbids unknown properties, so a
+    /// spec-conforming peer is entitled to refuse the whole card over them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<AgentExtension>,
 }
+
+/// One declared extension, as A2A 1.0 shapes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentExtension {
+    /// Identifies the extension. Stable, versioned, and documented at the URI.
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether a caller must understand the extension to use the agent.
+    ///
+    /// Everything this crate declares is `false`: the extras are disclosure,
+    /// and a peer that ignores them loses information rather than correctness.
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+/// The extension that carries the manifest digest on every derived card.
+pub const EXT_MANIFEST_PROVENANCE: &str =
+    "https://hupe1980.github.io/agentplane/a2a/ext/manifest-provenance/v1";
+
+/// The extension that carries tools, budget and topology on the extended card.
+pub const EXT_GOVERNANCE: &str = "https://hupe1980.github.io/agentplane/a2a/ext/governance/v1";
 
 impl CardCapabilities {
     /// What this crate can actually do.
@@ -81,6 +115,7 @@ impl CardCapabilities {
             // at-least-once delivery contract across process failure.
             push_notifications: false,
             extended_agent_card: true,
+            extensions: Vec::new(),
         }
     }
 }
@@ -212,13 +247,6 @@ pub struct AgentCard {
     /// which nobody can verify the card.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signatures: Vec<super::card_sig::CardSignature>,
-    /// The digest of the manifest this card was derived from.
-    ///
-    /// Not part of the A2A schema, and carried anyway: it is what lets a caller
-    /// tell two cards with the same name and version apart when the declaration
-    /// behind them changed. A version string is what an author remembered to
-    /// bump; a digest is what the document actually says.
-    pub manifest_digest: String,
 }
 
 impl AgentCard {
@@ -261,7 +289,20 @@ impl AgentCard {
             name: manifest.metadata.name.clone(),
             description,
             version: manifest.metadata.version.clone(),
-            capabilities: CardCapabilities::implemented(),
+            capabilities: {
+                let mut capabilities = CardCapabilities::implemented();
+                capabilities.extensions.push(AgentExtension {
+                    uri: EXT_MANIFEST_PROVENANCE.to_owned(),
+                    description: Some(
+                        "The digest of the manifest this card was derived from.".to_owned(),
+                    ),
+                    required: false,
+                    params: Some(serde_json::json!({
+                        "manifestDigest": manifest.digest()?.to_hex(),
+                    })),
+                });
+                capabilities
+            },
             supported_interfaces: vec![CardInterface {
                 url: url.into(),
                 protocol_binding: BINDING.to_owned(),
@@ -279,8 +320,29 @@ impl AgentCard {
             // absent field, so an unsigned card is not a card with an empty
             // promise on it.
             signatures: Vec::new(),
-            manifest_digest: manifest.digest()?.to_hex(),
         })
+    }
+
+    /// The digest of the manifest this card was derived from, when the card
+    /// declares one.
+    ///
+    /// Carried as a declared extension rather than a top-level field: the A2A
+    /// schema forbids unknown properties on a card, so a spec-conforming peer
+    /// could refuse the whole document over an extra key. The information
+    /// survives — it is what lets a caller tell two cards with the same name
+    /// and version apart when the declaration behind them changed. A version
+    /// string is what an author remembered to bump; a digest is what the
+    /// document actually says.
+    #[must_use]
+    pub fn manifest_digest(&self) -> Option<&str> {
+        self.capabilities
+            .extensions
+            .iter()
+            .find(|e| e.uri == EXT_MANIFEST_PROVENANCE)?
+            .params
+            .as_ref()?
+            .get("manifestDigest")?
+            .as_str()
     }
 }
 
@@ -306,20 +368,19 @@ impl AgentCard {
 /// map of where to push — both are disclosure that helps an attacker more than
 /// a caller. The tool *names* are here because a peer deciding whether to
 /// delegate genuinely needs to know what the far side can reach.
+/// # Where the extra detail lives
+///
+/// In the [`EXT_GOVERNANCE`] extension under `capabilities.extensions` — the
+/// spec's own slot for what its schema does not name — rather than as top-level
+/// fields, which the official conformance kit rejects outright. Injected at
+/// **derive** time, not at serialization, so a signature taken over the card
+/// covers the disclosure: an extension added after signing would be exactly the
+/// unverifiable claim the signature exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(transparent)]
 pub struct ExtendedAgentCard {
-    /// Everything the public card says, unchanged.
-    #[serde(flatten)]
+    /// The card, with the governance extension included.
     pub public: AgentCard,
-    /// The tools this agent may reach, by manifest reference.
-    pub tools: Vec<ExtendedTool>,
-    /// What it may spend on one run, when the manifest bounds it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub budget: Option<ExtendedBudget>,
-    /// Its part in a multi-agent arrangement, when one is declared.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub topology: Option<String>,
 }
 
 /// A tool an agent may reach, as an authenticated peer is told.
@@ -337,15 +398,41 @@ pub struct ExtendedTool {
 }
 
 /// What an agent may spend on one run.
+///
+/// The figures serialize as **strings**, for two reasons that happen to agree:
+/// `ProtoJSON` — the encoding A2A documents are defined in — renders 64-bit
+/// integers as strings, and a signed card must carry no JSON numbers because
+/// ECMAScript number formatting is the one JCS rule this crate does not
+/// implement (see `peers::card_sig`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtendedBudget {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_steps: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_effects: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, with = "stringly", skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<u64>,
+    #[serde(default, with = "stringly", skip_serializing_if = "Option::is_none")]
+    pub max_effects: Option<u64>,
+    #[serde(default, with = "stringly", skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+}
+
+/// `Option<u64>` as a decimal string, the `ProtoJSON` int64 convention.
+mod stringly {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        // `&Option<T>` is the signature `serde(with)` hands a field serializer;
+        // the idiomatic `Option<&T>` is not this seam's to choose.
+        match v {
+            Some(n) => s.serialize_str(&n.to_string()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        let raw: Option<String> = Option::deserialize(d)?;
+        raw.map(|v| v.parse().map_err(D::Error::custom)).transpose()
+    }
 }
 
 impl ExtendedAgentCard {
@@ -358,7 +445,7 @@ impl ExtendedAgentCard {
         manifest: &Manifest,
         url: impl Into<String>,
     ) -> Result<Self, crate::manifest::ManifestError> {
-        let tools = manifest
+        let tools: Vec<ExtendedTool> = manifest
             .spec
             .tools
             .iter()
@@ -370,8 +457,8 @@ impl ExtendedAgentCard {
             .collect();
 
         let budget = manifest.spec.budgets.as_ref().map(|b| ExtendedBudget {
-            max_steps: b.max_steps,
-            max_effects: b.max_effects,
+            max_steps: b.max_steps.map(|n| n as u64),
+            max_effects: b.max_effects.map(|n| n as u64),
             max_tokens: b.max_tokens,
         });
 
@@ -381,11 +468,64 @@ impl ExtendedAgentCard {
             .as_ref()
             .map(|t| format!("{:?}/{:?}", t.mode, t.role));
 
-        Ok(Self {
-            public: AgentCard::derive(manifest, url)?,
-            tools,
-            budget,
-            topology,
-        })
+        let mut public = AgentCard::derive(manifest, url)?;
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "tools".to_owned(),
+            serde_json::to_value(&tools).unwrap_or(serde_json::Value::Null),
+        );
+        if let Some(budget) = budget {
+            params.insert(
+                "budget".to_owned(),
+                serde_json::to_value(budget).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if let Some(topology) = topology {
+            params.insert("topology".to_owned(), serde_json::Value::String(topology));
+        }
+        public.capabilities.extensions.push(AgentExtension {
+            uri: EXT_GOVERNANCE.to_owned(),
+            description: Some(
+                "What this agent may reach and spend, for a peer deciding whether to delegate."
+                    .to_owned(),
+            ),
+            required: false,
+            params: Some(serde_json::Value::Object(params)),
+        });
+        Ok(Self { public })
+    }
+
+    /// The tools the governance extension discloses.
+    #[must_use]
+    pub fn tools(&self) -> Vec<ExtendedTool> {
+        self.governance("tools")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// The per-run budget the governance extension discloses, when one is.
+    #[must_use]
+    pub fn budget(&self) -> Option<ExtendedBudget> {
+        self.governance("budget")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// The declared topology, when one is.
+    #[must_use]
+    pub fn topology(&self) -> Option<String> {
+        self.governance("topology")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+    }
+
+    fn governance(&self, key: &str) -> Option<&serde_json::Value> {
+        self.public
+            .capabilities
+            .extensions
+            .iter()
+            .find(|e| e.uri == EXT_GOVERNANCE)?
+            .params
+            .as_ref()?
+            .get(key)
     }
 }

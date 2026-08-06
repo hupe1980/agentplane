@@ -100,7 +100,11 @@ is refused, exhausted or failed exits non-zero, because whoever scripts this
 needs the shell's own answer to "did it work".
 
 Keys come from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`), never
-from the file; Bedrock uses `AWS_REGION` and AWS's standard credential chain.
+from the file; Bedrock uses `AWS_REGION` and AWS's standard credential chain,
+and a local or Hugging Face model is `provider: chat-completions` with
+`CHAT_COMPLETIONS_BASE_URL` pointing at any OpenAI-compatible server — Ollama,
+TGI, vLLM, llama.cpp, or `https://router.huggingface.co/v1` with
+`CHAT_COMPLETIONS_API_KEY=$HF_TOKEN`.
 An agent's declaration must not change when its credential does. And only
 the providers the manifest *names* are registered — otherwise exporting the wrong
 variable would make the agent runnable on a model its declaration never named.

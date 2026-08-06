@@ -50,11 +50,18 @@ PROVIDERS
     The manifest names a provider; the key comes from the environment, never
     from the file — an agent's declaration must not change when its key does.
 
-      anthropic   ANTHROPIC_API_KEY
-    bedrock     AWS_REGION plus the standard AWS credential chain
-      openai      OPENAI_API_KEY
-      fake        no key. Answers deterministically without a network, so a
-                  manifest can be exercised before anyone pays for it.
+      anthropic         ANTHROPIC_API_KEY
+      bedrock           AWS_REGION plus the standard AWS credential chain
+      openai            OPENAI_API_KEY
+      chat-completions  CHAT_COMPLETIONS_BASE_URL, pointing at any
+                        OpenAI-compatible server — TGI, vLLM, Ollama,
+                        llama.cpp, or Hugging Face's hosted router — plus
+                        CHAT_COMPLETIONS_API_KEY when the server wants one.
+                        This is how a local or Hugging Face model runs under
+                        a governed manifest.
+      fake              no key. Answers deterministically without a network,
+                        so a manifest can be exercised before anyone pays
+                        for it.
 ";
 
 fn main() -> ExitCode {
@@ -270,12 +277,34 @@ async fn driver(name: &str) -> Result<Arc<dyn ModelProvider>, String> {
             agentplane::model::openai::OpenAi::new(key("OPENAI_API_KEY")?)
                 .map_err(|e| e.to_string())?,
         )),
+        // The OpenAI-compatible wire every self-hosted server speaks — TGI,
+        // vLLM, Ollama, llama.cpp, and Hugging Face's hosted router. The base
+        // URL is deployment wiring, so it comes from the environment like a
+        // key does; the token is optional because the common local server
+        // needs none.
+        #[cfg(feature = "providers")]
+        "chat-completions" => {
+            let base = key("CHAT_COMPLETIONS_BASE_URL").map_err(|_| {
+                "CHAT_COMPLETIONS_BASE_URL is not set, and the manifest names the \
+                 chat-completions provider. Point it at the server: Ollama is \
+                 http://localhost:11434, vLLM http://localhost:8000, TGI \
+                 http://localhost:8080, Hugging Face's router \
+                 https://router.huggingface.co/v1"
+                    .to_owned()
+            })?;
+            let mut driver = agentplane::model::chat_completions::ChatCompletions::new(base)
+                .map_err(|e| e.to_string())?;
+            if let Ok(token) = std::env::var("CHAT_COMPLETIONS_API_KEY") {
+                driver = driver.bearer(token);
+            }
+            Ok(Arc::new(driver))
+        }
         #[cfg(feature = "testkit")]
         "fake" => Ok(agentplane::testkit::FakeProvider::new()),
         other => Err(format!(
-            "no driver for provider '{other}'. This binary ships anthropic, bedrock, openai and fake; \
-             anything else is an embedder's own driver, registered through \
-             RuntimeBuilder::provider"
+            "no driver for provider '{other}'. This binary ships anthropic, bedrock, openai, \
+             chat-completions and fake; anything else is an embedder's own driver, registered \
+             through RuntimeBuilder::provider"
         )),
     }
 }

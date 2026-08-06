@@ -1216,6 +1216,14 @@ mod tests {
         let config = aws_sdk_bedrockruntime::Config::builder()
             .region(Region::new("eu-west-1"))
             .behavior_version_latest()
+            // A stub client, so no TLS provider is built: the default one
+            // eagerly reads the OS trust store, and under a fully parallel
+            // suite the macOS keychain read can transiently yield zero roots
+            // — a panic inside aws-smithy, in a test that asserts a JSON
+            // profile and never opens a connection.
+            .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
+                |_req| http::Response::builder().status(200).body("").unwrap(),
+            ))
             .build();
         let driver = Bedrock::from_client(Client::from_conf(config), "eu-west-1");
         assert_eq!(

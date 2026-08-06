@@ -227,6 +227,13 @@ aws-sdk-bedrockruntime = { version = "1.139.0", default-features = false, featur
 aws-smithy-types = { version = "1.6.1", optional = true }
 
 [dev-dependencies]
+# For the Bedrock unit tests: a stub HTTP client, so building an SDK `Config`
+# never constructs the default TLS provider. That provider reads the OS trust
+# store eagerly, and under a fully parallel test run the macOS keychain read
+# can transiently yield zero roots — which aws-smithy answers with a panic, in
+# a test that never needed a connection at all. Already in the tree
+# transitively; this only turns its test feature on for tests.
+aws-smithy-http-client = { version = "1", features = ["test-util"] }
 # For the streaming driver tests: the stub server hands axum a body stream of
 # `Bytes`, including one that errors partway so a severed response can be tested
 # without a real network.
@@ -347,6 +354,12 @@ must_use_candidate      = "allow"
 # without a port, a key, or a second process.
 [[example]]
 name              = "a2a_peer"
+required-features = ["redb", "a2a-server", "manifest"]
+
+# Serves the A2A surface for the official conformance kit — `just test-a2a-tck`
+# boots it and runs the kit's MUST battery against the live socket.
+[[example]]
+name              = "a2a_tck_live"
 required-features = ["redb", "a2a-server", "manifest"]
 
 # The ceiling that outlives a run, end to end: cumulative across runs,

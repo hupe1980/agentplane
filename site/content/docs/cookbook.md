@@ -686,6 +686,60 @@ reading nothing.
 The drivers stream by default precisely so a severed call can report what it
 burned. You do not have to do anything to get that.
 
+## 🏠 Run a Hugging Face model locally
+
+The de-facto wire of self-hosted inference is the `OpenAI`-compatible
+`/v1/chat/completions` endpoint — TGI (Hugging Face's own server), vLLM,
+Ollama, llama.cpp's server and LM Studio all speak it, and Hugging Face's
+hosted router *is* one. So one driver reaches every local host, and the model
+stays behind a process boundary where an inference engine belongs — the plane
+never carries weights, a GPU toolchain, or an engine's faults.
+
+```sh
+ollama pull llama3.2            # or: TGI, vLLM, llama-server, LM Studio…
+```
+
+```rust
+use agentplane::model::chat_completions::ChatCompletions;
+
+let local = ChatCompletions::new("http://localhost:11434")?;
+let runtime = Runtime::builder(store)
+    .provider("chat-completions", Arc::new(local))
+    .agent(Agent::new(&manifest).skill(Triage))
+    .build();
+```
+
+Or with no Rust at all — the same manifest runs against Ollama on a laptop,
+TGI on a GPU box, or Hugging Face's hosted router, and its digest never
+changes, because where a model is served is deployment wiring, not part of the
+declaration:
+
+```yaml
+  models:
+    privileged: { provider: chat-completions, model: "llama3.2" }
+```
+
+```sh
+CHAT_COMPLETIONS_BASE_URL=http://localhost:11434 \
+    agentplane run triage.yaml --input '{"ticket": "printer on fire"}'
+
+# The identical declaration against Hugging Face's hosted endpoint:
+CHAT_COMPLETIONS_BASE_URL=https://router.huggingface.co/v1 \
+CHAT_COMPLETIONS_API_KEY=$HF_TOKEN \
+    agentplane run triage.yaml --input '{"ticket": "printer on fire"}'
+```
+
+**The trap:** believing "compatible" covers semantics. Every compatible server
+implements the shape; not every one counts. Usage is metered **as reported** —
+a server that reports none meters zero, visibly, rather than being backfilled
+with a guess — and structured output defaults to the forced-tool fallback
+because whether a server honours `json_schema` is exactly what cannot be
+assumed. A deployment that knows its server enforces it opts up with
+`.structured_via(SchemaMode::Native)`. Two controls are refused outright
+rather than silently dropped: `reasoning_effort` (no neutral spelling on this
+wire) and governed media (a per-server dialect). Against `api.openai.com`
+itself, use the `openai` driver — Responses is the current primitive there.
+
 ## 🏷️ Send untrusted content without giving it authority
 
 Protect the fields that choose *what the world will do* rather than requiring

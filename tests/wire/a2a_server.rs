@@ -1621,7 +1621,8 @@ async fn a_named_tenant_is_advertised_and_required() {
             .for_tenant(TenantId::new("acme").expect("valid")),
     );
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(store as Arc<dyn CaseStore>)
         .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
         .tenant(TenantId::new("acme").expect("valid"))
         .skill(Echoes {
@@ -2256,7 +2257,8 @@ async fn a_client_discovers_verifies_and_calls_a_tenant_scoped_agent() {
             .for_tenant(tenant.clone()),
     );
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(store as Arc<dyn CaseStore>)
         .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
         .tenant(tenant)
         .skill(Echoes {

@@ -2040,8 +2040,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "an_agent_card_is_derived_from_the_manifest",
         "the published card advertises streaming and push notifications that do "
         "not exist, so a caller waits for events nobody will send",
-        "            capabilities: CardCapabilities::implemented(),",
-        "            capabilities: CardCapabilities {\n                streaming: true,\n                push_notifications: true,\n                extended_agent_card: true,\n            },",
+        "                let mut capabilities = CardCapabilities::implemented();",
+        "                let mut capabilities = CardCapabilities {\n                    streaming: true,\n                    push_notifications: true,\n                    extended_agent_card: true,\n                    extensions: Vec::new(),\n                };",
     ),
     "ACardsSkillsAreNotTheDeclaredCapabilities": (
         "src/peers/card.rs",
@@ -2056,8 +2056,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the_extended_card_discloses_more_but_not_the_model",
         "the authenticated card discloses which model an agent runs on, which "
         "is a fact about a supply chain rather than something a caller needs",
-        "            topology,\n        })",
-        "            topology: manifest\n                .spec\n                .models\n                .as_ref()\n                .and_then(|m| m.privileged.as_ref())\n                .map(|r| format!(\"{}/{}\", r.provider, r.model)),\n        })",
+        "        if let Some(topology) = topology {\n            params.insert(\"topology\".to_owned(), serde_json::Value::String(topology));\n        }",
+        "        if let Some(topology) = topology {\n            params.insert(\"topology\".to_owned(), serde_json::Value::String(topology));\n        }\n        if let Some(model) = manifest\n            .spec\n            .models\n            .as_ref()\n            .and_then(|m| m.privileged.as_ref())\n            .map(|r| format!(\"{}/{}\", r.provider, r.model))\n        {\n            params.insert(\"model\".to_owned(), serde_json::Value::String(model));\n        }",
     ),
     "EventsDeduplicateOnIdAlone": (
         "src/core/event.rs",
@@ -2229,6 +2229,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "from declaring a reversal while leaving something standing",
         "        if effect.mutates() {",
         "        if false {",
+    ),
+    "ASeveredLocalStreamIsCalledFree": (
+        "src/model/chat_completions.rs",
+        "chat_completions_a_stream_severed_after_generation_is_not_free_to_retry",
+        "a chat-completions stream severed after visible deltas is reported as "
+        "safe to repeat, so a retry loop against a flaky local server buys a "
+        "second generation for every question while the ceiling reads zero",
+        "    if acc.generated() {\n        return ModelError::Unaccounted {",
+        "    if false {\n        return ModelError::Unaccounted {",
     ),
     "ARefusalBecomesDoubt": (
         "src/runtime/ctx.rs",

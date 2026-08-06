@@ -171,9 +171,13 @@ async fn rpc(router: &axum::Router, token: Option<&str>, body: Value) -> (Status
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = Manifest::parse(CHECKER)?;
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
+    let store = Arc::new(RedbStore::open_in_memory()?);
 
-    let runtime = Runtime::builder(store)
+    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        // An A2A server refuses a runtime without a case layer: every task
+        // must carry a contextId a client can actually continue, and a
+        // continuable context here is a case.
+        .cases(store as Arc<dyn agentplane::case::CaseStore>)
         .policy(Arc::new(PermitPeers))
         .agent(Agent::new(&manifest).skill(Checks(Arc::clone(&seen))))
         .build();

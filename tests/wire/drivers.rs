@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use agentplane::core::{Delegation, Disposition, Principal, Scope};
 use agentplane::model::anthropic::Anthropic;
+use agentplane::model::chat_completions::ChatCompletions;
 use agentplane::model::openai::OpenAi;
 use agentplane::model::{
     ModelCall, ModelError, ModelId, ModelProvider, ReasoningEffort, SchemaMode,
@@ -66,6 +67,7 @@ async fn serve(canned: Canned) -> String {
         .route("/", post(handle))
         .route("/v1/messages", post(handle))
         .route("/v1/responses", post(handle))
+        .route("/v1/chat/completions", post(handle))
         .with_state(canned);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -82,7 +84,8 @@ async fn serve_hanging() -> String {
 
     let app = Router::new()
         .route("/v1/messages", post(hang))
-        .route("/v1/responses", post(hang));
+        .route("/v1/responses", post(hang))
+        .route("/v1/chat/completions", post(hang));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -2274,4 +2277,419 @@ fn a_retry_keeps_the_peers_duplicate_detection_key() {
     // retries, right for anything that never retries, and never silently absent.
     let bare = Provenance::new(run, attempt_one, "agent");
     assert_eq!(bare.dedupe_key(), attempt_one);
+}
+
+// ── The OpenAI-compatible Chat Completions wire ─────────────────────────────
+//
+// The de-facto wire of self-hosted inference — TGI, vLLM, Ollama, llama.cpp,
+// Hugging Face's router. Same discipline as the other drivers: what is under
+// test is the failure mapping and the usage arithmetic, because those are the
+// parts with consequences.
+
+fn cc_request<'a>(model: &'a ModelId, prompt: &'a Value) -> agentplane::model::Request<'a> {
+    agentplane::model::Request {
+        model,
+        prompt,
+        max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+        reasoning_effort: None,
+        schema: None,
+        tools: &[],
+        exchanges: &[],
+        continuation: None,
+        stream: None,
+    }
+}
+
+#[tokio::test]
+async fn chat_completions_maps_text_usage_and_the_request_shape() {
+    let (canned, seen, headers) = canned_observed(
+        200,
+        json!({
+            "choices": [{
+                "message": { "content": "Hello from a local model" },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 7,
+                "prompt_tokens_details": { "cached_tokens": 12 },
+            },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let model = ModelId::new("chat-completions", "llama-3.3-70b");
+    let prompt = json!({ "system": "Answer briefly.", "input": "hello" });
+
+    let completion = driver.complete(cc_request(&model, &prompt)).await.unwrap();
+    assert_eq!(completion.text, "Hello from a local model");
+    assert_eq!(completion.stop_reason.as_deref(), Some("stop"));
+    assert!(!completion.truncated);
+    // Cached tokens are a *subset* of prompt_tokens, exactly as Responses
+    // reports them — added back they would double-count.
+    assert_eq!(completion.usage.input_tokens, 20);
+    assert_eq!(completion.usage.output_tokens, 7);
+    assert_eq!(completion.usage.cache_read_tokens, 12);
+    assert_eq!(completion.usage.uncached_input_tokens(), 8);
+
+    let body = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(body["model"], "llama-3.3-70b");
+    assert_eq!(body["messages"][0]["role"], "system");
+    assert_eq!(body["messages"][0]["content"], "Answer briefly.");
+    assert_eq!(body["messages"][1]["role"], "user");
+    assert_eq!(body["messages"][1]["content"], "hello");
+    assert!(
+        body["max_tokens"].is_u64(),
+        "the per-call ceiling is missing"
+    );
+    assert!(
+        body.get("stream").is_none(),
+        "a buffered driver asked for a stream"
+    );
+    // No key was configured, and the common local server wants none — so no
+    // Authorization header may be invented.
+    let headers = headers.lock().unwrap().clone().unwrap();
+    assert!(
+        !headers.contains_key("authorization"),
+        "an Authorization header appeared with no key configured"
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_refuses_reasoning_effort_rather_than_dropping_it() {
+    // No server: the refusal must happen before anything is sent.
+    let driver = ChatCompletions::new("http://127.0.0.1:9").unwrap();
+    let model = ModelId::new("chat-completions", "m");
+    let prompt = json!("hello");
+    let mut request = cc_request(&model, &prompt);
+    request.reasoning_effort = Some(ReasoningEffort::High);
+
+    let error = driver.complete(request).await.unwrap_err();
+    assert!(
+        matches!(&error, ModelError::Refused { .. }),
+        "a declared control was not refused: {error}"
+    );
+    assert_eq!(error.disposition(), Disposition::DidNotHappen);
+}
+
+#[tokio::test]
+async fn chat_completions_truncation_is_a_typed_fact() {
+    let (canned, _seen) = canned(
+        200,
+        json!({
+            "choices": [{
+                "message": { "content": "an answer that was cut" },
+                "finish_reason": "length",
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 99 },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let model = ModelId::new("chat-completions", "m");
+    let prompt = json!("hello");
+
+    let completion = driver.complete(cc_request(&model, &prompt)).await.unwrap();
+    assert!(
+        completion.truncated,
+        "finish_reason 'length' must surface as `truncated`, not as a \
+         silently shortened string"
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_a_refusal_after_generation_is_metered() {
+    let (canned, _seen) = canned(
+        200,
+        json!({
+            "choices": [{
+                "message": { "content": null, "refusal": "I cannot help with that." },
+                "finish_reason": "stop",
+            }],
+            "usage": { "prompt_tokens": 9, "completion_tokens": 4 },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let model = ModelId::new("chat-completions", "m");
+    let prompt = json!("hello");
+
+    let error = driver
+        .complete(cc_request(&model, &prompt))
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, ModelError::Unusable { .. }), "{error}");
+    // It generated the decline, so the decline is billed.
+    assert_eq!(error.disposition(), Disposition::Landed);
+    assert_eq!(error.usage().output_tokens, 4);
+}
+
+#[tokio::test]
+async fn chat_completions_tool_calls_parse_and_a_malformed_one_is_loud() {
+    let good = json!({
+        "choices": [{
+            "message": {
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_7",
+                    "type": "function",
+                    "function": { "name": "lookup", "arguments": "{\"id\":\"x\"}" },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": { "prompt_tokens": 5, "completion_tokens": 3 },
+    });
+    let (canned_ok, _seen) = canned(200, good);
+    let url = serve(canned_ok).await;
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let model = ModelId::new("chat-completions", "m");
+    let prompt = json!("hello");
+
+    let completion = driver.complete(cc_request(&model, &prompt)).await.unwrap();
+    assert_eq!(completion.tool_calls.len(), 1);
+    assert_eq!(completion.tool_calls[0].id, "call_7");
+    assert_eq!(completion.tool_calls[0].arguments, json!({"id": "x"}));
+    // The continuation is the assistant turn exactly as the server sent it,
+    // ids included — a reconstructed turn is how an id gets rewritten.
+    let continuation = completion.continuation.expect("a tool turn continues");
+    assert_eq!(continuation.provider, "chat-completions");
+    assert_eq!(continuation.state[0]["tool_calls"][0]["id"], "call_7");
+
+    let (canned_bad, _seen) = canned(
+        200,
+        json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_8",
+                        "type": "function",
+                        "function": { "name": "lookup", "arguments": "{not json" },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3 },
+        }),
+    );
+    let url = serve(canned_bad).await;
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let error = driver
+        .complete(cc_request(&model, &prompt))
+        .await
+        .unwrap_err();
+    // A malformed call is a provider-protocol failure, not "no call":
+    // dropping it can turn one bad and one good side effect into permission
+    // for only the good one.
+    assert!(matches!(&error, ModelError::Unusable { .. }), "{error}");
+}
+
+#[tokio::test]
+async fn chat_completions_forces_a_tool_for_structured_output_by_default() {
+    let (canned, seen, _headers) = canned_observed(
+        200,
+        json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "agentplane_respond",
+                            "arguments": "{\"summary\":\"ok\"}",
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3 },
+        }),
+    );
+    let url = serve(canned).await;
+    // ForcedTool is the *default* here — the opposite of the OpenAI driver —
+    // because whether a compatible server honours `json_schema` at all is
+    // exactly what cannot be assumed.
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let model = ModelId::new("chat-completions", "m");
+    let prompt = json!("summarise");
+    let schema = json!({
+        "type": "object",
+        "properties": { "summary": { "type": "string" } },
+        "required": ["summary"],
+        "additionalProperties": false,
+    });
+    let mut request = cc_request(&model, &prompt);
+    request.schema = Some(&schema);
+
+    let completion = driver.complete(request).await.unwrap();
+    assert_eq!(completion.structured, Some(json!({"summary": "ok"})));
+    assert!(
+        completion.tool_calls.is_empty(),
+        "the forced respond tool is this crate's mechanism, not a tool call"
+    );
+
+    let body = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        body["tool_choice"]["function"]["name"], "agentplane_respond",
+        "structured output must be forced, not suggested"
+    );
+    // Nested under `function`, which is what this wire takes — the flat
+    // Responses shape here would be the mirror image of the war story in the
+    // OpenAI driver.
+    assert_eq!(body["tools"][0]["function"]["name"], "agentplane_respond");
+}
+
+#[tokio::test]
+async fn chat_completions_status_mapping_follows_the_shared_doctrine() {
+    let model = ModelId::new("chat-completions", "m");
+    let prompt = json!("hello");
+
+    let (refused, _seen) = canned(400, json!({"error": {"message": "bad request"}}));
+    let url = serve(refused).await;
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let error = driver
+        .complete(cc_request(&model, &prompt))
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, ModelError::Refused { .. }), "{error}");
+    assert_eq!(error.disposition(), Disposition::DidNotHappen);
+
+    let (unavailable, _seen) = canned(500, json!({"error": "boom"}));
+    let url = serve(unavailable).await;
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let error = driver
+        .complete(cc_request(&model, &prompt))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, ModelError::Unavailable { .. }),
+        "a 5xx did not say whether it generated: {error}"
+    );
+}
+
+/// Serve a fixed SSE body once, then close the connection.
+async fn serve_cc_sse(body: &'static str) -> String {
+    async fn sse(State(body): State<&'static str>) -> impl axum::response::IntoResponse {
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            body,
+        )
+    }
+    let app = Router::new()
+        .route("/v1/chat/completions", post(sse))
+        .with_state(body);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn chat_completions_streams_reassemble_and_meter_from_the_final_chunk() {
+    let url = serve_cc_sse(concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    ))
+    .await;
+    let driver = ChatCompletions::new(url).unwrap();
+    let model = ModelId::new("chat-completions", "m");
+    let prompt = json!("hello");
+
+    let completion = driver.complete(cc_request(&model, &prompt)).await.unwrap();
+    assert_eq!(completion.text, "Hello");
+    assert_eq!(completion.usage.input_tokens, 11);
+    assert_eq!(completion.usage.output_tokens, 2);
+    assert_eq!(completion.stop_reason.as_deref(), Some("stop"));
+}
+
+#[tokio::test]
+async fn chat_completions_a_stream_severed_after_generation_is_not_free_to_retry() {
+    // Deltas arrived; the terminal never did. The server generated tokens
+    // this driver cannot count — repeating buys a second bill.
+    let url = serve_cc_sse("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n").await;
+    let driver = ChatCompletions::new(url).unwrap();
+    let model = ModelId::new("chat-completions", "m");
+    let prompt = json!("hello");
+
+    let error = driver
+        .complete(cc_request(&model, &prompt))
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, ModelError::Unaccounted { .. }), "{error}");
+    assert_eq!(error.disposition(), Disposition::Landed);
+}
+
+#[tokio::test]
+async fn chat_completions_a_stream_severed_before_generation_is_safe_to_repeat() {
+    let url = serve_cc_sse("").await;
+    let driver = ChatCompletions::new(url).unwrap();
+    let model = ModelId::new("chat-completions", "m");
+    let prompt = json!("hello");
+
+    let error = driver
+        .complete(cc_request(&model, &prompt))
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, ModelError::Unavailable { .. }), "{error}");
+    assert_eq!(error.disposition(), Disposition::DidNotHappen);
+}
+
+#[tokio::test]
+async fn chat_completions_tool_turns_return_under_the_ids_the_model_issued() {
+    let (canned, seen, _headers) = canned_observed(
+        200,
+        json!({
+            "choices": [{
+                "message": { "content": "done" },
+                "finish_reason": "stop",
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 1 },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let model = ModelId::new("chat-completions", "m");
+    let prompt = json!("hello");
+
+    let call = agentplane::model::ToolCall {
+        id: "call_42".to_owned(),
+        name: "lookup".to_owned(),
+        arguments: json!({"id": "x"}),
+    };
+    let exchanges = vec![agentplane::model::ToolExchange {
+        call: call.clone(),
+        output: json!({"found": true}),
+        failed: false,
+    }];
+    let continuation = agentplane::model::ProviderContinuation::new(
+        "chat-completions",
+        json!([{
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_42",
+                "type": "function",
+                "function": { "name": "lookup", "arguments": "{\"id\":\"x\"}" },
+            }],
+        }]),
+    );
+    let mut request = cc_request(&model, &prompt);
+    request.exchanges = &exchanges;
+    request.continuation = Some(&continuation);
+
+    driver.complete(request).await.unwrap();
+    let body = seen.lock().unwrap().clone().unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    // user, assistant (exact echo, id included), tool result under that id.
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["tool_calls"][0]["id"], "call_42");
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_42");
 }
