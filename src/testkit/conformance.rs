@@ -1591,4 +1591,57 @@ pub async fn authority(store: Arc<dyn crate::authority::AuthorityStore>) {
             .expect("state")
             .is_none()
     );
+
+    // ── Concurrent carriers of ONE dispatch key all get the one receipt ──────
+    //
+    // The sequential retry case above cannot catch the racing form: a store
+    // that checks the receipt before taking its lock lets two carriers of the
+    // same key both pass the check, and the loser then re-evaluates the ceiling
+    // *after* the winner spent it — refusing `Exhausted` for a draw that
+    // stands, or tripping the receipt table's unique key. The ceiling here
+    // covers exactly one such draw, so any double-spend or spurious refusal is
+    // observable rather than absorbed by slack.
+    //
+    // The runtime's fencing cannot produce this race, which is exactly why the
+    // battery must: the trait promises idempotence by key without qualifying
+    // who carries it.
+    let id = AuthorityId::new("conformance-racing-retry");
+    store
+        .issue(&StandingAuthority::new(
+            "conformance-racing-retry",
+            "conformance",
+            Spend::money(500),
+        ))
+        .await
+        .expect("issue");
+
+    let carriers: Vec<_> = (0..8)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let id = id.clone();
+            tokio::spawn(async move { store.draw(&id, key(50), Spend::money(500), at).await })
+        })
+        .collect();
+    let mut receipts = Vec::new();
+    for carrier in carriers {
+        receipts.push(
+            carrier
+                .await
+                .expect("a carrier panicked")
+                .expect("every carrier of the one key must get the receipt, not a refusal"),
+        );
+    }
+    for r in &receipts {
+        assert_eq!(
+            *r, receipts[0],
+            "two carriers of one dispatch key were given different receipts"
+        );
+    }
+    let state = store.state(&id).await.expect("state").expect("issued");
+    assert_eq!(
+        state.drawn,
+        Spend::money(500),
+        "racing retries spent the authority more than once"
+    );
+    assert_eq!(state.draws, 1, "racing retries counted as several draws");
 }

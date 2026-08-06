@@ -1918,3 +1918,103 @@ async fn an_atomic_member_is_authorized_before_it_commits() {
         world.entries()
     );
 }
+
+/// A deferred member that fails after the atomic members committed cannot be
+/// reported as taken back whole.
+///
+/// The abort path's premise — "nothing has externalised, so the group can
+/// still be taken back whole" — stops being true the moment the journal's
+/// transaction commits: an atomic member's write is permanent, has no
+/// registered reversal, and *cannot* have one. Settling `Aborted` there makes
+/// the journal say "nothing is standing" while a ledger row stands, which is
+/// precisely the shape a quarantine exists to name.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_deferred_failure_after_an_atomic_commit_is_not_an_abort() {
+    #[derive(Debug)]
+    struct PostThenSend {
+        world: Arc<World>,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for PostThenSend {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("post-then-send").provides("post.then.send")
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let w = &self.world;
+            let mut g = cx
+                .group("post-then-send", ["inventory", "ledger", "notify"])
+                .await
+                .map_err(SkillError::Step)?;
+            g.reversible("inventory", Call::new("stock.hold", "held", w), |_| {
+                Call::new("stock.release", "released", w)
+            })
+            .await
+            .map_err(SkillError::Step)?;
+            g.atomic(
+                "ledger",
+                Arc::new(Posts {
+                    account: "AC-1".to_owned(),
+                    amount: 129,
+                    refuses: false,
+                    world: Arc::clone(w),
+                }),
+            )
+            .map_err(SkillError::Step)?;
+            // The first deferred member refuses cleanly. Before the atomic
+            // class existed, that genuinely meant nothing had externalised.
+            g.deferred("notify", Call::new("mail.send", "emailed", w))
+                .map_err(SkillError::Step)?;
+            g.commit(&[]).await.map_err(SkillError::Step)?;
+            Ok(Outcome::done(Tainted::trusted(json!("sent"))))
+        }
+    }
+
+    let (store, _redb) = staged();
+    let world = World::new();
+    world.fail("mail.send", Failure::DidNotHappen);
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(PostThenSend {
+            world: Arc::clone(&world),
+        })
+        .build();
+
+    let out = rt.run("post.then.send", json!({})).await.expect("run");
+
+    // The ledger row committed with the journal and cannot be taken back.
+    assert_eq!(
+        store.applied().len(),
+        1,
+        "the premise of this test is that the atomic member committed: {:?}",
+        store.applied()
+    );
+    assert!(
+        matches!(out.status, RunStatus::Quarantined(_)),
+        "a group whose atomic members had already committed reported {:?} — \
+         the journal says taken back whole while the ledger row stands",
+        out.status
+    );
+    let settled: Vec<String> = store
+        .read(out.run_id, 1)
+        .await
+        .expect("records")
+        .iter()
+        .filter_map(|r| match r.kind() {
+            agentplane::journal::RecordKind::GroupSettled { outcome, .. } => {
+                Some(outcome.as_str().to_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        settled,
+        vec!["quarantined".to_owned()],
+        "the settlement claims an outcome the ledger contradicts"
+    );
+}

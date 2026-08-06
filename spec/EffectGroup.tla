@@ -22,10 +22,13 @@
 (*     would make the most consequential outcome the one an author gets by    *)
 (*     writing nothing. The invariant is `NoSilentCommit`.                   *)
 (*                                                                          *)
-(*   * A deferred member that fails AFTER another has landed quarantines      *)
+(*   * A deferred member that fails AFTER something externalised — another    *)
+(*     deferred member, or the atomic members' transaction — quarantines      *)
 (*     rather than aborting. Reversing then would undo everything except the  *)
-(*     thing that actually happened. The invariant is                         *)
-(*     `NoUnwindPastAnExternalisedDeferred`.                                 *)
+(*     thing that actually happened, and an "aborted" settlement would claim  *)
+(*     the group was taken back whole while a permanent write stands. The     *)
+(*     invariants are `NoUnwindPastAnExternalisedDeferred` and                *)
+(*     `AbortIsComplete`.                                                    *)
 (*                                                                          *)
 (* Doubt is inherited from the saga unchanged: a group holding a member of    *)
 (* unknown outcome reverses nothing.                                         *)
@@ -35,10 +38,12 @@ EXTENDS Naturals, Sequences, FiniteSets
 CONSTANTS
     Reversibles,   (* Members that run eagerly and register a reversal.      *)
     Deferreds,     (* Members held at the gate until commit.                 *)
-    BadReversals,  (* Reversals that will not come back.                     *)
-    BadDeferreds,  (* Deferred members that fail when released.              *)
-    HasAtomic      (* Whether the group has members that commit with the
-                      journal, in its own transaction.                       *)
+    BadReversals,  (* Reversals that MAY not come back — a choice, like
+                      BadDeferreds, so the unwind that completes and the
+                      unwind that stops partway are both reachable.          *)
+    BadDeferreds   (* Deferred members that MAY fail when released — failure
+                      is nondeterministic, not fated, so one model reaches
+                      both the member sending and the member failing.        *)
 
 ASSUME Reversibles \in Nat /\ Reversibles > 0
 ASSUME Deferreds \in Nat /\ Deferreds >= 0
@@ -48,7 +53,6 @@ Gated    == 1 .. Deferreds
 
 ASSUME BadReversals \subseteq Members
 ASSUME BadDeferreds \subseteq Gated
-ASSUME HasAtomic \in BOOLEAN
 
 VARIABLES
     landed,      (* Seq of reversible members that ran, in landing order.    *)
@@ -60,7 +64,12 @@ VARIABLES
     doubt,       (* A member's outcome could not be established.             *)
     invariantsHold,
     txState,     (* The atomic members: "none", "pending", "committed".      *)
-    settled      (* "open" until the group ends; then its recorded outcome.  *)
+    settled      (* "open" while members run, "aborting" while the unwind    *)
+                 (* takes them back, then the recorded outcome. The        *)
+                 (* explicit unwinding state is load-bearing: encoding      *)
+                 (* "unwinding" as unwindPos alone conflates a finished     *)
+                 (* unwind with a run that never failed, and the forward    *)
+                 (* transitions fire again after a completed unwind.        *)
 
 vars == <<landed, reversed, sent, pos, gatePos, unwindPos, doubt,
           invariantsHold, txState, settled>>
@@ -68,7 +77,7 @@ vars == <<landed, reversed, sent, pos, gatePos, unwindPos, doubt,
 Contains(s, e) == \E i \in 1 .. Len(s) : s[i] = e
 
 TypeOK ==
-    /\ settled \in {"open", "committed", "aborted", "quarantined"}
+    /\ settled \in {"open", "aborting", "committed", "aborted", "quarantined"}
     /\ pos \in 1 .. (Reversibles + 1)
     /\ gatePos \in 1 .. (Deferreds + 1)
     /\ unwindPos \in 0 .. Reversibles
@@ -88,7 +97,12 @@ Init ==
     /\ unwindPos      = 0
     /\ doubt          = FALSE
     /\ invariantsHold \in BOOLEAN   (* Either way; the model explores both.  *)
-    /\ txState        = IF HasAtomic THEN "pending" ELSE "none"
+    (* "pending" is a group with atomic members, "none" one without. An       *)
+    (* initial-state choice rather than a constant, so one model run explores *)
+    (* both — a constant would leave whichever value the config omitted       *)
+    (* entirely unchecked, which is how the abort-after-commit hole survived  *)
+    (* its first model.                                                       *)
+    /\ txState        \in {"none", "pending"}
     /\ settled        = "open"
 
 -----------------------------------------------------------------------------
@@ -112,8 +126,8 @@ FailCleanly ==
     /\ unwindPos = 0
     /\ pos <= Reversibles
     /\ unwindPos' = Len(landed)
-    /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState,
-                   settled>>
+    /\ settled' = "aborting"
+    /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState>>
 
 (* A failure that leaves a member's outcome unknown. Nothing is reversed:     *)
 (* undoing a call that may or may not have landed is a coin flip with the      *)
@@ -128,13 +142,21 @@ FailInDoubt ==
 
 (* The step walks away without committing or aborting. The runtime settles     *)
 (* what the abandoned handle left standing — it does NOT commit.               *)
+(*                                                                             *)
+(* Guarded on the transaction NOT having committed, and that is a fact about   *)
+(* the implementation rather than a modelling convenience: `commit` consumes   *)
+(* the handle and settles on every path, so the only group an abandoned-handle *)
+(* sweep can ever see is one whose transaction has not run. An abandon past    *)
+(* the transaction would have to abort a group with permanent writes standing, *)
+(* which is the same false claim `DeferredFailsFirst` guards against.          *)
 Abandon ==
     /\ settled = "open"
     /\ unwindPos = 0
     /\ Len(sent) = 0
+    /\ txState # "committed"
     /\ unwindPos' = Len(landed)
-    /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState,
-                   settled>>
+    /\ settled' = "aborting"
+    /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState>>
 
 -----------------------------------------------------------------------------
 (*                             THE FRONTIER                                  *)
@@ -149,8 +171,8 @@ FrontierRefused ==
     /\ gatePos = 1
     /\ ~invariantsHold
     /\ unwindPos' = Len(landed)
-    /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState,
-                   settled>>
+    /\ settled' = "aborting"
+    /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState>>
 
 (* The atomic members commit, in the journal's own transaction, after the
    invariants and BEFORE the gate. Their write and the record that it happened
@@ -175,10 +197,12 @@ TransactionFails ==
     /\ invariantsHold
     /\ txState = "pending"
     /\ unwindPos' = Len(landed)
-    /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState,
-                   settled>>
+    /\ settled' = "aborting"
+    /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState>>
 
-(* Past the invariants, the gate opens one member at a time. *)
+(* Past the invariants, the gate opens one member at a time. A member in       *)
+(* BadDeferreds may fail instead — the two transitions below — so failure is   *)
+(* a choice the model explores, not a fate that forecloses the other endings.  *)
 ReleaseDeferred ==
     /\ settled = "open"
     /\ unwindPos = 0
@@ -186,13 +210,16 @@ ReleaseDeferred ==
     /\ invariantsHold
     /\ txState # "pending"
     /\ gatePos <= Deferreds
-    /\ gatePos \notin BadDeferreds
     /\ sent' = Append(sent, gatePos)
     /\ gatePos' = gatePos + 1
     /\ UNCHANGED <<landed, reversed, pos, unwindPos, doubt, invariantsHold, txState, settled>>
 
-(* A deferred member fails with NOTHING yet externalised, so the group can     *)
-(* still be taken back whole.                                                  *)
+(* A deferred member fails with NOTHING yet externalised — no deferred member  *)
+(* out, and no atomic members committed — so the group can still be taken back *)
+(* whole. The `txState` conjunct is the one the implementation forgot first:   *)
+(* an atomic member's write is permanent the moment its transaction commits,   *)
+(* has no registered reversal, and cannot have one, so "taken back whole" is   *)
+(* not a claim that survives it.                                               *)
 DeferredFailsFirst ==
     /\ settled = "open"
     /\ unwindPos = 0
@@ -201,12 +228,14 @@ DeferredFailsFirst ==
     /\ gatePos <= Deferreds
     /\ gatePos \in BadDeferreds
     /\ Len(sent) = 0
+    /\ txState # "committed"
     /\ unwindPos' = Len(landed)
-    /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState,
-                   settled>>
+    /\ settled' = "aborting"
+    /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState>>
 
-(* A deferred member fails AFTER another has already gone out. Reversing now   *)
-(* would undo everything except the thing that actually happened.              *)
+(* A deferred member fails AFTER something externalised — another deferred     *)
+(* member went out, or the atomic members committed. Reversing now would undo  *)
+(* everything except the thing that actually happened.                         *)
 DeferredFailsLate ==
     /\ settled = "open"
     /\ unwindPos = 0
@@ -214,7 +243,7 @@ DeferredFailsLate ==
     /\ invariantsHold
     /\ gatePos <= Deferreds
     /\ gatePos \in BadDeferreds
-    /\ Len(sent) > 0
+    /\ (Len(sent) > 0 \/ txState = "committed")
     /\ settled' = "quarantined"
     /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, unwindPos, doubt, invariantsHold,
                    txState>>
@@ -237,10 +266,13 @@ Commit ==
 Undoing == landed[unwindPos]
 
 (* Newest first: a later member may rest on an earlier one still being there. *)
+(* A member in BadReversals may also come back fine — `ReversalFails` is the  *)
+(* other branch — so a bad reversal does not foreclose the completed unwind,  *)
+(* without which `settled = "aborted"` is unreachable and `AbortIsComplete`   *)
+(* is true for want of an abort rather than because aborts are complete.      *)
 ReverseOne ==
-    /\ settled = "open"
+    /\ settled = "aborting"
     /\ unwindPos >= 1
-    /\ Undoing \notin BadReversals
     /\ ~Contains(reversed, Undoing)
     /\ reversed' = Append(reversed, Undoing)
     /\ unwindPos' = unwindPos - 1
@@ -249,7 +281,7 @@ ReverseOne ==
 (* A reversal that will not come back. The unwind STOPS: continuing would      *)
 (* take back members around one now in an unknown state.                       *)
 ReversalFails ==
-    /\ settled = "open"
+    /\ settled = "aborting"
     /\ unwindPos >= 1
     /\ Undoing \in BadReversals
     /\ settled' = "quarantined"
@@ -257,20 +289,9 @@ ReversalFails ==
                    txState>>
 
 FinishUnwind ==
-    /\ settled = "open"
+    /\ settled = "aborting"
     /\ unwindPos = 0
     /\ Len(reversed) = Len(landed)
-    /\ Len(landed) > 0
-    /\ settled' = "aborted"
-    /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, unwindPos, doubt, invariantsHold,
-                   txState>>
-
-(* Nothing had landed when the group was abandoned or refused. *)
-FinishEmptyUnwind ==
-    /\ settled = "open"
-    /\ unwindPos = 0
-    /\ Len(landed) = 0
-    /\ pos > 1
     /\ settled' = "aborted"
     /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, unwindPos, doubt, invariantsHold,
                    txState>>
@@ -292,7 +313,6 @@ Next ==
     \/ ReverseOne
     \/ ReversalFails
     \/ FinishUnwind
-    \/ FinishEmptyUnwind
     \/ (Terminal /\ UNCHANGED vars)
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
@@ -356,13 +376,17 @@ TransactionPrecedesTheGate ==
     (Len(sent) > 0) => (txState # "pending")
 
 (* An aborted group has nothing standing: every member that landed was taken   *)
-(* back, and no gated member ever ran. The converse of                         *)
-(* `ReversalFollowsLanding` — one direction stops a spurious undo, this one    *)
-(* stops a hold that nobody releases while the journal says discharged.        *)
+(* back, no gated member ever ran, and the atomic members never committed.     *)
+(* The converse of `ReversalFollowsLanding` — one direction stops a spurious   *)
+(* undo, this one stops a hold that nobody releases while the journal says     *)
+(* discharged. The third conjunct is the atomic form of the same lie: a        *)
+(* transaction's writes are permanent and unregistered, so an abort past them  *)
+(* is the journal saying "taken back whole" over a ledger row that stands.     *)
 AbortIsComplete ==
     (settled = "aborted") =>
         (/\ \A i \in 1 .. Len(landed) : Contains(reversed, landed[i])
-         /\ Len(sent) = 0)
+         /\ Len(sent) = 0
+         /\ txState # "committed")
 
 (* A committed group performed every gated member. "Committed" must not mean   *)
 (* "committed except the email".                                               *)

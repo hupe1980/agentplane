@@ -500,8 +500,9 @@ The frontier is specified in TLA+ and model-checked, because "several calls take
 together" is the kind of claim that reads as obviously true and has interleavings
 nobody thinks of. The invariants worth naming are that a gated member runs only
 past the frontier, that an aborted group has **nothing standing** — every member
-reversed, no gated member run — that a group nobody settled does not commit, and
-that once an irreversible member is out the group is never taken back.
+reversed, no gated member run, no transaction committed — that a group nobody
+settled does not commit, and that once an irreversible member is out the group
+is never taken back.
 
 Each is checked twice over: a mutant of the model must be caught by the invariant
 written for it, and every invariant is mapped to a test that checks the same
@@ -554,6 +555,16 @@ transaction is, since deferred members run afterwards and can still fail, and a
 attempted. And replay applies nothing — atomicity exempts no one from the effect
 protocol, and a transaction re-run on replay is a second real write made
 *reliable* rather than acceptable by being transactional.
+
+One consequence is enforced rather than left to be inferred: **once the
+transaction commits, the cheap abort is gone.** A deferred member that fails
+after it quarantines the group even when it was the first deferred member to
+fail — the abort path's premise is "nothing has externalised", and a committed
+transaction is an externalisation with no reversal registered and none
+possible. Settling `Aborted` there would put *taken back whole* in the journal
+over a ledger row that stands, which is precisely the claim the quarantine
+outcome exists to refuse. The TLA+ model's `AbortIsComplete` invariant carries
+the same conjunct, and a mutant restoring the old behaviour is caught by it.
 
 ### What a group is not
 

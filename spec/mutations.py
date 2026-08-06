@@ -87,14 +87,31 @@ MUTATIONS: dict[str, tuple[str, str, str, str, str]] = {
         "EffectGroup",
         "NoUnwindPastAnExternalisedDeferred",
         "a group unwinds after a gated member has already externalised",
-        """    /\\ Len(sent) > 0
+        """    /\\ (Len(sent) > 0 \\/ txState = "committed")
     /\\ settled' = "quarantined"
     /\\ UNCHANGED <<landed, reversed, sent, pos, gatePos, unwindPos, doubt, invariantsHold,
                    txState>>""",
-        """    /\\ Len(sent) > 0
+        """    /\\ (Len(sent) > 0 \\/ txState = "committed")
     /\\ unwindPos' = Len(landed)
-    /\\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState,
-                   settled>>""",
+    /\\ settled' = "aborting"
+    /\\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState>>""",
+    ),
+    # The bug the implementation actually had: a deferred member failing first
+    # takes the cheap abort path without asking whether the atomic members'
+    # transaction has committed. The journal then settles "aborted" — taken
+    # back whole — over a permanent write with no reversal registered and none
+    # possible.
+    "AbortAfterTheTransaction": (
+        "EffectGroup",
+        "AbortIsComplete",
+        "a deferred failure after the atomic members committed aborts anyway",
+        """    /\\ gatePos \\in BadDeferreds
+    /\\ Len(sent) = 0
+    /\\ txState # "committed"
+    /\\ unwindPos' = Len(landed)""",
+        """    /\\ gatePos \\in BadDeferreds
+    /\\ Len(sent) = 0
+    /\\ unwindPos' = Len(landed)""",
     ),
     # Committing a group nobody settled. The most consequential outcome becomes
     # the one an author gets by writing nothing at all.
@@ -102,30 +119,30 @@ MUTATIONS: dict[str, tuple[str, str, str, str, str]] = {
         "EffectGroup",
         "NoSilentCommit",
         "a group left open is committed rather than taken back",
-        """    /\\ Len(sent) = 0
+        """    /\\ unwindPos = 0
+    /\\ Len(sent) = 0
+    /\\ txState # "committed"
     /\\ unwindPos' = Len(landed)
-    /\\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState,
-                   settled>>""",
-        """    /\\ Len(sent) = 0
+    /\\ settled' = "aborting"
+    /\\ UNCHANGED <<landed, reversed, sent, pos, gatePos, doubt, invariantsHold, txState>>""",
+        """    /\\ unwindPos = 0
+    /\\ Len(sent) = 0
+    /\\ txState # "committed"
     /\\ settled' = "committed"
     /\\ UNCHANGED <<landed, reversed, sent, pos, gatePos, unwindPos, doubt, invariantsHold,
                    txState>>""",
     ),
-    # Reporting a group aborted while a member it landed is still standing.
-    # The journal says discharged; the hold is still there.
+    # Reporting a group aborted while a member it landed is still standing:
+    # a stopped unwind settled as a completed one. The journal says
+    # discharged; the hold is still there.
     "AbortLeavesAMemberStanding": (
         "EffectGroup",
         "AbortIsComplete",
-        "a group reports aborted with a landed member never taken back",
-        """FinishUnwind ==
-    /\\ settled = "open"
-    /\\ unwindPos = 0
-    /\\ Len(reversed) = Len(landed)
-    /\\ Len(landed) > 0""",
-        """FinishUnwind ==
-    /\\ settled = "open"
-    /\\ unwindPos = 0
-    /\\ Len(landed) > 0""",
+        "a stopped unwind reports aborted with a member never taken back",
+        """    /\\ Undoing \\in BadReversals
+    /\\ settled' = "quarantined\"""",
+        """    /\\ Undoing \\in BadReversals
+    /\\ settled' = "aborted\"""",
     ),
     # Opening the gate while the transaction is still pending. The gated member
     # announces work that may yet vanish -- and if the transaction then fails,

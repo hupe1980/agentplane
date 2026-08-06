@@ -2212,6 +2212,16 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if open.resources.iter().any(|r| r == resource) {\n            return Ok(());\n        }",
         "        if true {\n            let _ = resource;\n            return Ok(());\n        }",
     ),
+    "AnAtomicCommitIsForgottenByTheAbortPath": (
+        "src/runtime/group.rs",
+        "a_deferred_failure_after_an_atomic_commit_is_not_an_abort",
+        "a deferred member failing after the atomic members committed takes the "
+        "cheap abort path, so the journal settles the group as taken back whole "
+        "while the transaction's writes stand with no reversal registered and "
+        "none possible",
+        "                Err(e) if outputs.is_empty() && !atomic_committed && !in_doubt(&e) => {",
+        "                Err(e) if outputs.is_empty() && !in_doubt(&e) => {",
+    ),
     "AMutatingEffectPassesAsARead": (
         "src/runtime/group.rs",
         "a_mutating_effect_cannot_be_declared_a_group_read",
@@ -2334,8 +2344,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "atomic members are never applied, so a group reports committed while "
         "the ledger it was supposed to post to never moved — the quietest "
         "possible failure, because nothing errors",
-        "        if !atomic.is_empty()\n            && let Err(e) = self.cx.commit_atomic(&name, atomic).await\n        {",
-        "        if false\n            && let Err(e) = self.cx.commit_atomic(&name, atomic).await\n        {",
+        "        if atomic_committed && let Err(e) = self.cx.commit_atomic(&name, atomic).await {",
+        "        if false && let Err(e) = self.cx.commit_atomic(&name, atomic).await {",
     ),
     "AFailedTransactionQuarantines": (
         "src/runtime/group.rs",

@@ -388,11 +388,13 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
     ///
     /// # Errors
     ///
-    /// [`StepError::GroupAborted`] when an invariant fails or a deferred member
-    /// fails before any other has landed — in both cases every reversible
-    /// member has been taken back and nothing is standing.
-    /// [`StepError::GroupUnsettled`] when neither outcome could be established;
-    /// the run is quarantined.
+    /// [`StepError::GroupAborted`] when an invariant fails, when the atomic
+    /// members' transaction does not commit, or when a deferred member fails
+    /// before anything externalised — in every case every reversible member has
+    /// been taken back and nothing is standing.
+    /// [`StepError::GroupUnsettled`] when that claim cannot be made — a
+    /// deferred member failed after another landed or after the atomic members
+    /// committed, or its outcome is in doubt; the run is quarantined.
     pub async fn commit(self, invariants: &[Invariant]) -> Result<Vec<Tainted<Value>>, StepError> {
         if let Some(broken) = invariants.iter().find(|i| !i.holds) {
             let what = broken.what.clone();
@@ -422,9 +424,13 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
             .into_iter()
             .collect::<Vec<_>>()
             .join(", ");
-        if !atomic.is_empty()
-            && let Err(e) = self.cx.commit_atomic(&name, atomic).await
-        {
+        // Once the transaction below succeeds this is a fact about the outside
+        // world: the members' writes are permanent, have no registered reversal,
+        // and cannot have one. The deferred loop's cheap abort path is priced on
+        // "nothing has externalised", and this is the bit that says whether that
+        // price is still available.
+        let atomic_committed = !atomic.is_empty();
+        if atomic_committed && let Err(e) = self.cx.commit_atomic(&name, atomic).await {
             // A transaction that did not commit changed nothing, so the eager
             // members can still be reversed. That is the property this class
             // exists for, and it is why the failure path here is the *cheap*
@@ -440,22 +446,35 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
             let resource = member.resource.clone();
             match self.cx.effect(member.effect).await {
                 Ok(v) => outputs.push(v),
-                // Nothing else has externalised, so the group can still be
-                // taken back whole.
-                Err(e) if outputs.is_empty() && !in_doubt(&e) => {
+                // Nothing has externalised — no deferred member landed and no
+                // atomic member committed — so the group can still be taken
+                // back whole. The second conjunct is load-bearing: an atomic
+                // member's write is permanent the moment its transaction
+                // commits, has no registered reversal and cannot have one, so
+                // an `Aborted` settlement after it would be the journal saying
+                // "taken back whole" over a ledger row that stands.
+                Err(e) if outputs.is_empty() && !atomic_committed && !in_doubt(&e) => {
                     let what = format!("deferred member '{kind}' on '{resource}' failed: {e}");
                     self.cx.abort_open_group(&what).await?;
                     return Err(StepError::GroupAborted { what });
                 }
-                // A member already landed, or this one may have. Reversing now
-                // would undo everything except the thing that actually
-                // happened, which is the worst of the three answers available.
+                // A member already landed — deferred, atomic, or possibly this
+                // one. Reversing now would undo everything except the thing
+                // that actually happened, which is the worst of the three
+                // answers available.
                 Err(e) => {
+                    let landed = if atomic_committed {
+                        format!(
+                            "{} deferred and the atomic members on [{touched}]",
+                            outputs.len()
+                        )
+                    } else {
+                        outputs.len().to_string()
+                    };
                     let detail = format!(
-                        "deferred member '{kind}' on '{resource}' failed after {} landed: \
-                         {e} — reversing now would undo everything except the thing that \
-                         actually happened",
-                        outputs.len()
+                        "deferred member '{kind}' on '{resource}' failed after {landed} \
+                         landed: {e} — reversing now would undo everything except the \
+                         thing that actually happened",
                     );
                     self.cx
                         .settle_open_group(GroupOutcome::Quarantined, Some(&detail))

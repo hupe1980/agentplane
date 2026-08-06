@@ -191,6 +191,19 @@ impl AuthorityStore for PostgresStore {
             .await
             .map_err(|e| unavailable(&be(&e)))?;
 
+        // Checked again now that the row lock is held. The first check ran
+        // before the lock, so two carriers of the *same* dispatch key can both
+        // pass it; the loser then reaches this point only after the winner
+        // committed, and without this re-read it would be refused `Exhausted`
+        // for a draw that stands — or trip the receipt table's primary key.
+        // The runtime cannot produce that race (fencing keeps one executor per
+        // run, and intent is durable before dispatch), but the trait promises
+        // idempotence by key without that qualification, and a promise that
+        // depends on the caller's discipline is a check in the wrong place.
+        if let Some(prior) = receipt(&tx, &tenant, &name, &dispatch, id).await? {
+            return Ok(prior);
+        }
+
         let drawn = Spend {
             tokens: amount_of(balance.get(0)),
             minor_units: amount_of(balance.get(1)),
