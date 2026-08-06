@@ -709,14 +709,16 @@ Rust struct.
 
 #### What is still open
 
-* **Publishing.** A checkpoint that never leaves the operator's store is only as
-  trustworthy as the operator. It becomes evidence when compared against one they
-  handed over earlier — which means witnesses, and those are not built.
+* **Witness policy.** `HttpWitness` publishes to an independent C2SP
+  `tlog-witness`, so the transport is built. What remains a deployment decision
+  is how many cosignatures suffice and what happens while those witnesses are
+  unavailable. A checkpoint that is configured but never actually published is
+  still only as trustworthy as the operator.
 * **Split views** — one history to one auditor, a different one to another — are
   refused by a witness that remembers, because the second history cannot prove
-  it extends the first. The check exists; what does not is a witness run by
-  somebody other than the operator. Hosting your own proves nothing about you,
-  so treat this as ready-to-connect rather than closed.
+  it extends the first. The client and wire protocol exist; independence still
+  comes from choosing a witness run by somebody other than the operator.
+  Hosting your own proves nothing about you.
 Both backends maintain the log, and both keep their gaps. redb advances a
 counter row inside the sealing transaction; Postgres uses a **sequence**, because
 several instances seal concurrently there — that is the topology it exists for —
@@ -1496,11 +1498,17 @@ the budget is telling the truth.
 
 ### A2A, calling out (`a2a`)
 
-The built surface is deliberately exact: an A2A 1.0 JSON-RPC `SendMessage`
-client to an operator-pinned endpoint. It sends `A2A-Version: 1.0`, declares its
+The outbound effect is deliberately narrow: an A2A 1.0 JSON-RPC `SendMessage`
+call to an operator-pinned endpoint. It sends `A2A-Version: 1.0`, declares its
 extension in `A2A-Extensions`, uses ProtoJSON enum/part forms, and validates that
-the response contains exactly one `task` or `message`. Agent Card discovery and
-verification, interface selection, and polling are not built.
+the response contains exactly one `task` or `message`. `CardClient` separately
+provides SSRF-safe Agent Card discovery, optional mandatory verification, and
+binding/version/tenant-aware interface selection. The server provides
+`GetTask`, `ListTasks`, streaming/subscription, cancellation, durable push, and
+extended cards. The outbound `PeerClient` does not yet expose a first-class
+poll/subscribe handle for a returned remote task; callers needing that lifecycle
+must implement it as explicit effects rather than treating `SendMessage` as a
+complete long-running exchange.
 
 A2A tasks are long-running and stateful, so "did the peer act?" is not a detail.
 
@@ -1608,11 +1616,15 @@ unsupported before a skill runs, and a declared `mediaType` must agree with the
 chosen member. Inbound messages must have `ROLE_USER`. Previously unknown file
 fields or server-role messages could be accepted as ordinary input.
 
-**A context continues; a task does not mutate.** `contextId` maps to a durable
-case. Each follow-up is a new immutable task/run attached to that case, so
-history remains deploy-safe and auditable. `taskId` continuation is refused with
-guidance to use the task's context: extending a sealed run would contradict the
-runtime's chain and Merkle commitments.
+**Context continuation is supported; task continuation is not.** `contextId`
+maps to a durable case. Each follow-up is a new immutable task/run attached to
+that case, so history remains deploy-safe and auditable. A2A 1.0 also permits a
+follow-up carrying `taskId` and uses it to resume `INPUT_REQUIRED`; this server
+refuses that path with `UnsupportedOperationError` rather than silently starting
+over. That preserves the runtime's immutable-run model, but it means an
+interrupted task cannot currently be completed through standard A2A multi-turn.
+The card has no flag for this subset, so deployments must document it rather
+than describing the server as fully task-continuation complete.
 
 **The 1.0 method names only.** 1.0 renamed every method; `message/send` was 0.3.
 A server that answers both accepts clients which have silently lost half the
@@ -1826,6 +1838,12 @@ Details worth stating:
   accumulator reassembles thinking and signature deltas before tool results.
   A missing or wrong-provider state fails closed. No `previous_response_id` or
   provider-held conversation is replay truth.
+
+  OpenAI Responses also set `store: false` by default. Provider retention is an
+  explicit `OpenAi::retain_responses` opt-in and enters the provider profile and
+  effect identity, so changing data handling cannot silently reuse an old
+  completion. A retained response id remains an operational correlation handle,
+  never replay truth.
 
 * **Bedrock streams conservatively.** Converse text, governed inline
   images/documents, tools/results, signed or redacted reasoning continuation,

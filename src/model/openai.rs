@@ -59,6 +59,13 @@ pub struct OpenAi {
     http: reqwest::Client,
     key: Secret,
     base: String,
+    /// Whether `OpenAI` may retain Responses objects after the call.
+    ///
+    /// The API defaults to retention. This driver does not: provider-held
+    /// conversation state is neither replay truth nor a safe default for
+    /// prompts that may contain governed data. An operator can opt in when
+    /// response retrieval is part of its incident/accounting procedure.
+    retain_responses: bool,
     /// The mode to use for a model with no explicit entry.
     default_schema_mode: SchemaMode,
     /// Per-model overrides.
@@ -114,6 +121,7 @@ impl OpenAi {
             http,
             key: Secret::new(key),
             base: "https://api.openai.com".to_owned(),
+            retain_responses: false,
             default_schema_mode: SchemaMode::Native,
             schema_modes: std::collections::BTreeMap::new(),
             stream: true,
@@ -133,6 +141,19 @@ impl OpenAi {
     #[must_use]
     pub fn base(mut self, base: impl Into<String>) -> Self {
         self.base = base.into();
+        self
+    }
+
+    /// Permit `OpenAI` to retain response objects.
+    ///
+    /// Disabled by default. Retention can make a response id useful during an
+    /// accounting incident, but it also stores provider-side model inputs and
+    /// outputs. The choice is included in [`ModelProvider::request_profile`],
+    /// so changing it changes effect identity rather than silently changing a
+    /// run's data-handling behavior.
+    #[must_use]
+    pub const fn retain_responses(mut self) -> Self {
+        self.retain_responses = true;
         self
     }
 
@@ -603,6 +624,11 @@ impl OpenAi {
             "model": model.model,
             "max_output_tokens": max_output_tokens,
             "input": continue_with(input(prompt), exchanges, continuation),
+            // Responses are retained by API default. State held by a provider
+            // cannot be this runtime's replay truth, and retaining governed
+            // prompts is a deployment decision rather than an invisible SDK
+            // default.
+            "store": self.retain_responses,
         });
         if let Some(effort) = reasoning_effort {
             body["reasoning"] = json!({ "effort": effort.as_str() });
@@ -881,9 +907,10 @@ fn severed(model: &ModelId, acc: &openai_stream::Accumulator, detail: &str) -> M
         return ModelError::Unaccounted {
             model: model.clone(),
             detail: match acc.id() {
-                Some(id) => {
-                    format!("{detail} (response '{id}' can be read back to account for it)")
-                }
+                // The id is still valuable for provider support and billing
+                // correlation. It is not necessarily retrievable: private-by-
+                // default requests explicitly set `store: false`.
+                Some(id) => format!("{detail} (provider response id: '{id}')"),
                 None => detail.to_owned(),
             },
         };
@@ -904,6 +931,7 @@ impl ModelProvider for OpenAi {
         json!({
             "driver": "openai-responses/v1",
             "base": self.base,
+            "store": self.retain_responses,
             "schema_mode": schema_mode,
             "stream": self.stream,
             "timeout_ms": self.timeout.as_millis(),
@@ -999,6 +1027,41 @@ mod tests {
             native.descriptor(),
             forced.descriptor(),
             "native constrained output and forced-tool output reused one effect identity"
+        );
+    }
+
+    #[test]
+    fn provider_retention_is_private_by_default_and_replay_visible_when_enabled() {
+        let model = ModelId::new("openai", "gpt-x");
+        let private = driver()
+            .body(&model, &json!("sensitive"), None, &[], &[])
+            .expect("private body");
+        assert_eq!(
+            private["store"],
+            json!(false),
+            "omitting `store: false` opts into OpenAI's provider-side retention default"
+        );
+
+        let retained_driver = driver().retain_responses();
+        let retained = retained_driver
+            .body(&model, &json!("sensitive"), None, &[], &[])
+            .expect("retained body");
+        assert_eq!(retained["store"], json!(true));
+
+        let private_call = ModelCall::new(
+            std::sync::Arc::new(driver()),
+            model.clone(),
+            json!("sensitive"),
+        );
+        let retained_call = ModelCall::new(
+            std::sync::Arc::new(retained_driver),
+            model,
+            json!("sensitive"),
+        );
+        assert_ne!(
+            private_call.descriptor(),
+            retained_call.descriptor(),
+            "provider retention changed without changing effect identity"
         );
     }
 
