@@ -1314,6 +1314,9 @@ src/
              (feature `push`)
   quota/     per-tenant ceilings on concurrent work and spend, accounted in
              the store so they survive a second instance
+  authority/ standing authority: a ceiling bound to an authorization rather
+             than to a run or a billing period — revocable, drawn on as a
+             journaled effect, idempotent across retries
   store/     redb and Postgres backends, journal and cases alike
   blob/      content-addressed bytes kept out of the chain, and the erasure
              that retention needs

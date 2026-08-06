@@ -143,6 +143,10 @@ test-live:
     set -a; . ./.env; set +a
     AGENTPLANE_LIVE=1 cargo test --features providers,redb,testkit --test live -- --nocapture --test-threads=1
 
+# standing authority: cross-run ceilings, idempotent draws, revocation
+test-authority:
+    cargo test --features redb,testkit --test guards authority::
+
 # memory: provenance labelling, journaled recall, versioning and forgetting
 test-memory:
     cargo test --features redb,testkit --test guards memory::

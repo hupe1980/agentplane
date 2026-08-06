@@ -86,6 +86,7 @@
 #[cfg(feature = "http")]
 pub mod api;
 pub mod audit;
+pub mod authority;
 pub mod batch;
 pub mod blob;
 pub mod case;

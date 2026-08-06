@@ -79,6 +79,29 @@ async fn postgres_satisfies_the_journal_store_contract() {
     report.assert_conforms("PostgresStore");
 }
 
+/// Standing authority has the same semantics on the active-active backend.
+///
+/// This is the backend the guarantee is about. On redb a single writer
+/// serialises every draw for free; here two instances can draw on one authority
+/// at the same instant, and only the row lock the draw takes keeps them from
+/// both passing a check the other has already invalidated.
+#[tokio::test]
+async fn postgres_satisfies_the_authority_store_contract() {
+    use agentplane::authority::AuthorityStore;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let base = PostgresStore::connect(&url).await.expect("connect");
+    let tenant = agentplane::core::TenantId::new("authority-conformance").expect("tenant");
+    let store = Arc::new(base.for_tenant(tenant)) as Arc<dyn AuthorityStore>;
+
+    conformance::authority(store).await;
+}
+
 /// Governed memory has the same semantics on the active-active backend.
 #[tokio::test]
 async fn postgres_satisfies_the_memory_store_contract() {

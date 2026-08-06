@@ -113,6 +113,7 @@ pub(crate) struct Frame {
     pub timers: Option<Arc<dyn TimerStore>>,
     pub blobs: Option<Arc<dyn crate::blob::BlobStore>>,
     pub memories: Option<Arc<dyn crate::memory::MemoryStore>>,
+    pub authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
     pub meter: crate::runtime::metrics::Meter,
     #[cfg(feature = "keyring")]
     pub keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
@@ -162,6 +163,7 @@ pub struct StepCtx<'a> {
     timers: Option<Arc<dyn TimerStore>>,
     blobs: Option<Arc<dyn crate::blob::BlobStore>>,
     memories: Option<Arc<dyn crate::memory::MemoryStore>>,
+    authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
     meter: crate::runtime::metrics::Meter,
     #[cfg(feature = "keyring")]
     keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
@@ -205,6 +207,7 @@ impl<'a> StepCtx<'a> {
             timers,
             blobs,
             memories,
+            authorities,
             meter,
             #[cfg(feature = "keyring")]
             keyring,
@@ -232,6 +235,7 @@ impl<'a> StepCtx<'a> {
             timers,
             blobs,
             memories,
+            authorities,
             meter,
             #[cfg(feature = "keyring")]
             keyring,
@@ -2275,6 +2279,54 @@ impl StepCtx<'_> {
     /// deliberate loud failure, not an empty result: a memory that was forgotten
     /// makes the history that used it unreplayable, and saying so beats
     /// replaying a different memory.
+    /// Draw on a standing authority, or be refused.
+    ///
+    /// The ceiling that outlives a run: a customer's approved spend, a purchase
+    /// order, a subscription mandate. A [`Budget`](crate::core::Budget) bounds
+    /// this run and a [`TenantQuota`](crate::quota::TenantQuota) bounds a billing
+    /// period; neither can express an authorization somebody granted once and may
+    /// take back.
+    ///
+    /// Journaled, so a replay reads the receipt rather than consuming again, and
+    /// idempotent across retries of the same call — see
+    /// [`DrawOnAuthority`](crate::runtime::effects::DrawOnAuthority) for why the
+    /// deduplication key is the dispatch rather than the effect.
+    ///
+    /// Expiry is evaluated against this run's journaled clock, so a replay
+    /// reaches the verdict the live run did rather than today's.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError::Store`] when no authority store is wired, and the effect's
+    /// own error carrying whichever of the five refusals applies — unknown,
+    /// exhausted, out of draws, revoked, or expired.
+    pub async fn draw(
+        &mut self,
+        id: &crate::authority::AuthorityId,
+        amount: crate::core::Spend,
+    ) -> Result<crate::authority::Drawn, StepError> {
+        let authorities = self.authorities.clone().ok_or_else(|| {
+            StepError::Store(crate::core::StoreError::Backend(
+                "no standing-authority store is configured; \
+                 `Runtime::builder(..).authorities(..)` is what gives an agent a \
+                 ceiling that outlives one run"
+                    .to_owned(),
+            ))
+        })?;
+
+        let at = self.now().await?;
+        Ok(self
+            .effect(crate::runtime::effects::DrawOnAuthority {
+                authorities,
+                id: id.clone(),
+                amount,
+                at,
+                key: None,
+            })
+            .await?
+            .into_unlabelled())
+    }
+
     pub async fn recall(
         &mut self,
         mut query: crate::memory::Recall,

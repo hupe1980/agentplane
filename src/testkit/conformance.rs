@@ -1375,3 +1375,220 @@ async fn read_starts_where_it_is_told(fresh: Factory<'_>, r: &mut Report) {
         Err(e) => r.record("chaining", format!("read(from=3) failed: {e}")),
     }
 }
+
+/// The standing-authority contract, applied to any backend.
+///
+/// One battery for both stores, because the guarantees here are the sort that
+/// hold on a single-writer embedded store almost by accident and have to be
+/// *built* on a shared one. Running it against redb proves the semantics;
+/// running it against `PostgreSQL` proves the arbitration.
+///
+/// Panics with the property that failed, so a backend under development gets a
+/// sentence rather than a diff of two structs.
+///
+/// # Panics
+///
+/// If the store violates any part of the contract.
+#[allow(clippy::too_many_lines)]
+pub async fn authority(store: Arc<dyn crate::authority::AuthorityStore>) {
+    use crate::authority::{AuthorityError, AuthorityId, StandingAuthority};
+    use crate::core::{EffectKey, Spend, Timestamp};
+
+    let key = |n: u8| EffectKey::from_hex(&format!("{n:064x}")).expect("32 bytes of hex");
+    let at = Timestamp::UNIX_EPOCH;
+
+    // ── Draws accumulate, and the ceiling is cumulative ──────────────────────
+    let id = AuthorityId::new("conformance-accumulate");
+    store
+        .issue(&StandingAuthority::new(
+            "conformance-accumulate",
+            "conformance",
+            Spend::money(1_000),
+        ))
+        .await
+        .expect("issue");
+
+    let first = store
+        .draw(&id, key(1), Spend::money(600), at)
+        .await
+        .expect("a draw within the ceiling");
+    assert_eq!(
+        first.remaining,
+        Spend::money(400),
+        "the receipt must report what is left after this draw"
+    );
+
+    let refused = store
+        .draw(&id, key(2), Spend::money(500), at)
+        .await
+        .expect_err("the ceiling is cumulative across draws, not per draw");
+    assert!(
+        matches!(refused, AuthorityError::Exhausted { .. }),
+        "an over-draw must be Exhausted, not {refused:?}"
+    );
+
+    // A refusal consumes nothing, or probing the ceiling would drain it.
+    store
+        .draw(&id, key(3), Spend::money(400), at)
+        .await
+        .expect("exactly the remainder is still available after a refusal");
+
+    // ── A retry under one dispatch key consumes once ─────────────────────────
+    let id = AuthorityId::new("conformance-retry");
+    store
+        .issue(&StandingAuthority::new(
+            "conformance-retry",
+            "conformance",
+            Spend::money(1_000),
+        ))
+        .await
+        .expect("issue");
+
+    let original = store
+        .draw(&id, key(10), Spend::money(300), at)
+        .await
+        .expect("draw");
+    let repeat = store
+        .draw(&id, key(10), Spend::money(300), at)
+        .await
+        .expect("a retry is not a second draw");
+    assert_eq!(
+        original, repeat,
+        "a retried draw must return its original receipt"
+    );
+    let state = store.state(&id).await.expect("state").expect("issued");
+    assert_eq!(
+        state.drawn,
+        Spend::money(300),
+        "a retry spent the authority twice"
+    );
+    assert_eq!(state.draws, 1, "a retry counted as a second draw");
+
+    // ── Revocation refuses new draws and preserves landed ones ───────────────
+    store
+        .revoke(&id, "conformance withdrew it", at)
+        .await
+        .expect("revoke");
+    let after = store
+        .draw(&id, key(10), Spend::money(300), at)
+        .await
+        .expect("a draw that already landed must stay landed on retry");
+    assert_eq!(after, original);
+
+    let refused = store
+        .draw(&id, key(11), Spend::money(1), at)
+        .await
+        .expect_err("a new draw against a revoked authority");
+    assert!(
+        matches!(refused, AuthorityError::Revoked { .. }),
+        "revoked must be distinguishable from exhausted, got {refused:?}"
+    );
+
+    // Idempotent, and the first reason stands.
+    store
+        .revoke(&id, "a second, different reason", at)
+        .await
+        .expect("revoking twice is a retry");
+    let state = store.state(&id).await.expect("state").expect("issued");
+    let revocation = state.revoked.expect("revoked");
+    assert_eq!(
+        revocation.reason, "conformance withdrew it",
+        "the first reason must stand; overwriting loses why it was withdrawn"
+    );
+
+    // ── Terms are immutable ─────────────────────────────────────────────────
+    let terms = StandingAuthority::new("conformance-terms", "conformance", Spend::money(500));
+    store.issue(&terms).await.expect("issue");
+    store
+        .issue(&terms)
+        .await
+        .expect("an identical re-issue is a retried deploy");
+    let conflict = store
+        .issue(&StandingAuthority::new(
+            "conformance-terms",
+            "conformance",
+            Spend::money(999_999),
+        ))
+        .await
+        .expect_err("a ceiling must not be editable under whoever agreed to it");
+    assert!(
+        matches!(conflict, AuthorityError::AlreadyIssued(_)),
+        "got {conflict:?}"
+    );
+
+    // ── Expiry is evaluated against the instant handed in ───────────────────
+    store
+        .issue(
+            &StandingAuthority::new("conformance-expiry", "conformance", Spend::money(500))
+                .expires_at(Timestamp::from_unix_timestamp(1_000).expect("representable")),
+        )
+        .await
+        .expect("issue");
+    let id = AuthorityId::new("conformance-expiry");
+    store
+        .draw(
+            &id,
+            key(20),
+            Spend::money(1),
+            Timestamp::from_unix_timestamp(999).expect("representable"),
+        )
+        .await
+        .expect("before expiry the authority stands");
+    let expired = store
+        .draw(
+            &id,
+            key(21),
+            Spend::money(1),
+            Timestamp::from_unix_timestamp(2_000).expect("representable"),
+        )
+        .await
+        .expect_err("past its expiry");
+    assert!(
+        matches!(expired, AuthorityError::Expired { .. }),
+        "expiry must read the caller's instant, not a store clock; got {expired:?}"
+    );
+
+    // ── A draw ceiling bounds separately from a spend ceiling ───────────────
+    store
+        .issue(
+            &StandingAuthority::new("conformance-draws", "conformance", Spend::money(10_000))
+                .max_draws(1),
+        )
+        .await
+        .expect("issue");
+    let id = AuthorityId::new("conformance-draws");
+    store
+        .draw(&id, key(30), Spend::money(1), at)
+        .await
+        .expect("first");
+    let spent = store
+        .draw(&id, key(31), Spend::money(1), at)
+        .await
+        .expect_err("one draw was all it permitted");
+    assert!(
+        matches!(spent, AuthorityError::DrawsSpent { .. }),
+        "a draw ceiling must refuse with money still left; got {spent:?}"
+    );
+
+    // ── An unissued authority is Unknown, not a silent allow ────────────────
+    let unknown = store
+        .draw(
+            &AuthorityId::new("conformance-never-issued"),
+            key(40),
+            Spend::money(1),
+            at,
+        )
+        .await
+        .expect_err("never issued");
+    assert!(
+        matches!(unknown, AuthorityError::Unknown(_)),
+        "got {unknown:?}"
+    );
+    assert!(
+        store
+            .state(&AuthorityId::new("conformance-never-issued"))
+            .await
+            .expect("state")
+            .is_none()
+    );
+}

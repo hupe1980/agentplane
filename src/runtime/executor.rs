@@ -223,6 +223,7 @@ pub struct Runtime {
     lease_ttl: Duration,
     /// Where this plane's agents remember things, when a deployment wires one.
     memories: Option<Arc<dyn crate::memory::MemoryStore>>,
+    authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
     /// How this plane attributes its metrics.
     meter: super::metrics::Meter,
     /// Durable per-tenant ceilings, when a deployment wires them.
@@ -256,6 +257,7 @@ impl Runtime {
             owner: None,
             lease_ttl: LEASE_TTL,
             memories: None,
+            authorities: None,
             metric_tenant: super::metrics::TenantLabel::default(),
             quotas: None,
             quota: crate::quota::TenantQuota::default(),
@@ -2258,6 +2260,7 @@ impl Runtime {
                 timers: self.timers.clone(),
                 blobs: self.blobs.clone(),
                 memories: self.memories.clone(),
+                authorities: self.authorities.clone(),
                 meter: self.meter.clone(),
                 #[cfg(feature = "keyring")]
                 keyring: self.keyring.clone(),
@@ -2465,6 +2468,7 @@ impl Runtime {
                 timers: self.timers.clone(),
                 blobs: self.blobs.clone(),
                 memories: self.memories.clone(),
+                authorities: self.authorities.clone(),
                 meter: self.meter.clone(),
                 #[cfg(feature = "keyring")]
                 keyring: self.keyring.clone(),
@@ -3418,6 +3422,7 @@ pub struct RuntimeBuilder {
     owner: Option<String>,
     lease_ttl: Duration,
     memories: Option<Arc<dyn crate::memory::MemoryStore>>,
+    authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
     metric_tenant: super::metrics::TenantLabel,
     quotas: Option<Arc<dyn crate::quota::QuotaStore>>,
     quota: crate::quota::TenantQuota,
@@ -3548,6 +3553,23 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn memory(mut self, memories: Arc<dyn crate::memory::MemoryStore>) -> Self {
         self.memories = Some(memories);
+        self
+    }
+
+    /// Attach durable standing-authority accounting.
+    ///
+    /// The ceiling neither of the other two can express. A budget bounds one
+    /// run; a quota bounds a tenant over a billing period. A standing authority
+    /// bounds *an authorization* — what one customer approved, spanning as many
+    /// runs as it takes, revocable when they change their mind.
+    ///
+    /// Without one, [`StepCtx::draw`](crate::runtime::StepCtx::draw) refuses
+    /// rather than falling back to an in-process counter. That fallback would
+    /// fail **open** the moment a second instance started, which is exactly when
+    /// a shared ceiling was needed.
+    #[must_use]
+    pub fn authorities(mut self, authorities: Arc<dyn crate::authority::AuthorityStore>) -> Self {
+        self.authorities = Some(authorities);
         self
     }
 
@@ -4238,6 +4260,7 @@ impl RuntimeBuilder {
             owner: self.owner.unwrap_or_else(default_owner),
             lease_ttl: self.lease_ttl,
             memories: self.memories,
+            authorities: self.authorities,
             quotas: self.quotas,
             quota: self.quota,
             budget: self.budget,

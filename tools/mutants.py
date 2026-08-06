@@ -1743,6 +1743,55 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     # The two ways a fake provider makes the suite *worse* than having none. A
     # broken fake does not fail loudly; it makes the tests that depend on it pass
+    # ── Standing authority ──────────────────────────────────────────────────
+    #
+    # A ceiling that spans runs and can be revoked. Every one of these failures
+    # is silent in the ordinary case and only shows up under retry, after
+    # revocation, or on replay — which is why each gets a mutation rather than
+    # trusting the happy path to have covered it.
+    "ADrawIsNotIdempotent": (
+        "src/store/redb_authority.rs",
+        "a_repeated_draw_under_one_key_consumes_once",
+        "a retried draw takes the authority a second time, so one purchase "
+        "spends a customer's authorization twice — and only under retry, which "
+        "is the condition hardest to notice in testing",
+        """    if let Some(prior) = receipts
+        .get((tenant, name, key))
+        .map_err(|e| be(&e))?
+        .map(|v| v.value())
+    {""",
+        """    if let Some(prior) = None::<(u64, i64, u64, i64, u32)> {""",
+    ),
+    "OnlyOneAxisOfTheCeilingIsBounded": (
+        "src/authority/mod.rs",
+        "draws_accumulate_across_calls_until_the_ceiling_refuses",
+        "the ceiling is enforced on tokens and not on money, so an authority "
+        "issued in minor units bounds nothing at all — the failure is invisible "
+        "in any test whose amounts happen to be token-shaped",
+        "    if amount.tokens > remaining.tokens || amount.minor_units > remaining.minor_units {",
+        "    if amount.tokens > remaining.tokens {",
+    ),
+    "ARevokedAuthorityStillDraws": (
+        "src/authority/mod.rs",
+        "a_landed_draw_survives_a_later_revocation_on_retry",
+        "revocation is recorded and never consulted, so withdrawing an "
+        "authorization changes a stored field and nothing else — a control that "
+        "reads as enforced while permitting every later draw",
+        "    if let Some(reason) = revoked {",
+        "    if let Some(reason) = None::<&str> {",
+    ),
+    "AnExpiredAuthorityStillDraws": (
+        "src/authority/mod.rs",
+        "each_refusal_is_distinguishable_from_the_others",
+        "expiry is never checked, so an authority that ran out of time keeps "
+        "spending against a ceiling nobody is watching any more",
+        """    if let Some(expires) = authority.expires_at
+        && now >= expires.unix_timestamp()
+    {""",
+        """    if let Some(expires) = authority.expires_at
+        && false
+    {""",
+    ),
     # for the wrong reason, which is the exact failure mode this whole file
     # exists to catch. So the fake gets mutated like anything else.
     "TheFakeAnswersForFree": (

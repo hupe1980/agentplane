@@ -1022,7 +1022,7 @@ peer performed the operation and it failed*. `Rejected` means nothing was
 applied, and the only other `Landed` variant was a decode error. Hence
 `EffectError::Performed`.
 
-## 🚨 Refusals leak
+## Refusals leak
 
 Every mechanism above decides whether an action is permitted. What the agent is
 *told* when the answer is no is a separate question, and getting it wrong hands
@@ -1051,7 +1051,7 @@ often one run may be refused, checked **before** the policy is consulted, since 
 refusal is journaled as it happens and a ceiling applied afterwards bounds
 nothing an observer has not already seen.
 
-## 🕳️ What is not covered
+## What is not covered
 
 **Two runs touching one external resource.** Exactly-once here means *one run
 performs one effect once* — enforced by the store's effect key, and by a lease
@@ -1065,6 +1065,16 @@ fragmenting across cases, and case state is versioned so a lost update is
 refused rather than dropped silently. Neither orders the *external* effects. If
 two of your runs can touch one resource at once, the callee needs to be
 idempotent — which is what `ToolSafety` and the reconciliation path assume.
+
+**An approval shows arguments, not a diff.** `requires_approval: true` opens a
+task carrying the exact call about to be dispatched. For an ordinary tool call
+that *is* the change — `transfer(to: "GB-4471", amount: 12000)` tells an approver
+everything that will happen. It stops being so when one call changes many things
+at once: `archive(older_than: "2024-01-01")` shows the instruction and not the
+four thousand records it will touch. Producing that preview needs the tool itself
+to support a dry run, and nothing here requires or checks for one. Where an
+approver must see consequences rather than instructions, the tool has to compute
+them.
 
 **Remote media URLs.** The model effect and both built-in drivers still refuse
 provider-native image/document URL blocks before dispatch. Otherwise the model

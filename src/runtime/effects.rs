@@ -745,3 +745,89 @@ impl Effect for TransitionDeadline {
         Ok(before)
     }
 }
+
+/// Drawing on a standing authority, as an effect.
+///
+/// # Why this cannot be a plain call
+///
+/// The remaining balance is mutable state outside the journal. A skill that read
+/// it inside the deterministic zone would make replay depend on what the store
+/// happens to hold *now*: a run replayed after a later draw would see a
+/// different balance, take a different branch, and produce a history that
+/// disagrees with itself. Journaling the draw makes the receipt part of the
+/// record, so replay reads what the run actually got.
+///
+/// # The key it deduplicates on is `dispatch`, not `effect`
+///
+/// [`Provenance::effect`] hashes the attempt number, so a retry carries a
+/// *different* key — which is right for the journal and exactly wrong here. Two
+/// attempts at one draw must consume the authority once, so the store is keyed
+/// on [`Provenance::dispatch`], the identifier the crate defines as stable
+/// across retries of the same call. Getting this backwards spends a customer's
+/// authorization twice for one purchase, and only under retry, which is the
+/// hardest condition to notice in testing.
+///
+/// [`Provenance::effect`]: crate::core::Provenance::effect
+/// [`Provenance::dispatch`]: crate::core::Provenance::dispatch
+#[derive(Debug, Clone)]
+pub struct DrawOnAuthority {
+    pub(crate) authorities: std::sync::Arc<dyn crate::authority::AuthorityStore>,
+    pub(crate) id: crate::authority::AuthorityId,
+    pub(crate) amount: crate::core::Spend,
+    pub(crate) at: Timestamp,
+    /// Filled by [`Effect::attach`]; the runtime owns the key, not the caller.
+    pub(crate) key: Option<crate::core::EffectKey>,
+}
+
+#[async_trait]
+impl Effect for DrawOnAuthority {
+    type Output = crate::authority::Drawn;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "authority.draw",
+            json!({
+                "authority": self.id,
+                "amount": self.amount,
+                "at": self.at,
+            }),
+        )
+    }
+
+    fn attach(&mut self, provenance: &crate::core::Provenance) {
+        // `dispatch` when the runtime supplied one, `effect` otherwise. The
+        // fallback is the single-attempt case, where the two are the same call.
+        self.key = Some(provenance.dispatch.unwrap_or(provenance.effect));
+    }
+
+    /// It changes durable state that authorizes spending. Saying otherwise would
+    /// exempt it from the whole-value taint gate.
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    /// Safe to repeat, because the store deduplicates on the dispatch key and
+    /// returns the original receipt. Without that idempotence this would have to
+    /// be `Reconcile`, and every interrupted draw would wake an operator.
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    async fn perform(&self) -> Result<Self::Output, EffectError> {
+        let key = self.key.ok_or_else(|| {
+            // Unreachable through `StepCtx`, which always attaches. Loud rather
+            // than defaulting to some other key: a draw deduplicated on the
+            // wrong identifier is a double-spend, and guessing here would hide
+            // it behind a plausible success.
+            EffectError::Other(
+                "a draw reached the store without its dispatch key — deduplicating on \
+                 anything else would let a retry spend the authority twice"
+                    .to_owned(),
+            )
+        })?;
+        self.authorities
+            .draw(&self.id, key, self.amount, self.at)
+            .await
+            .map_err(|error| EffectError::Other(error.to_string()))
+    }
+}

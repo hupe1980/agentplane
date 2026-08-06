@@ -1295,6 +1295,77 @@ while writing it, so the invariant they misread is by construction the one with
 no test. The battery states the contract once and runs against every backend,
 including a racing check no sequential test can replace.
 
+## 💳 Bound what one authorization is good for
+
+Three ceilings exist and they answer different questions. A `Budget` bounds
+**one run**. A `TenantQuota` bounds **one tenant over a billing period**. Neither
+can say *this customer approved €500, across however many runs it takes, until
+they take it back* — that is an authorization rather than a throttle, and it is
+what `authority` is for.
+
+```rust
+use agentplane::authority::{AuthorityId, AuthorityStore, StandingAuthority};
+use agentplane::core::Spend;
+
+// Issued once, from wherever the approval actually happened.
+store.issue(
+    &StandingAuthority::new("mandate-42", "approval:SET-42", Spend::money(50_000))
+        .max_draws(10)
+        .expires_at(end_of_quarter),
+).await?;
+```
+
+Inside a skill, drawing is an ordinary journaled effect:
+
+```rust
+let drawn = cx.draw(&AuthorityId::new("mandate-42"), Spend::money(12_000)).await?;
+// drawn.remaining is what is left, from the receipt — not a second read
+```
+
+Four things make this different from a counter:
+
+**It is drawn on as an effect.** The balance is mutable state outside the
+journal, so a skill reading it directly would make replay depend on what the
+store holds *now* — a run replayed after a later draw would take a different
+branch than its own history records. Strict replay reads the receipt back and
+consumes nothing.
+
+**A retry spends once.** The store deduplicates on the *dispatch* identifier,
+which is stable across attempts, rather than the effect key, which deliberately
+is not. Getting that backwards double-spends a customer's authorization and only
+under retry — the condition hardest to notice in testing.
+
+**A draw that already landed stays landed.** Retrying it after revocation
+returns the original receipt rather than a refusal, because the money moved;
+reporting it as refused would make a caller compensate something that stands.
+New draws are refused, which is the half revocation is for.
+
+**Revoked and exhausted are different answers.** One may be followed by a larger
+authority; the other is a decision that has been taken back. `AuthorityError`
+keeps them apart, along with expired, out-of-draws and unknown, so a caller does
+not retry a decision that will never change.
+
+Terms are immutable once issued — re-issuing identical terms is a retried
+deploy and succeeds, differing terms are refused. A ceiling somebody agreed to
+must not be editable under them; changing it means revoking and issuing another,
+which leaves both on the record.
+
+The accounting is in the store rather than the process, for the same reason
+quotas are: an in-memory balance fails **open** the moment a second instance
+starts, which is exactly when a shared ceiling was needed.
+
+Both backends implement `AuthorityStore` against **one conformance battery**,
+and that is where they differ in kind rather than degree. redb has a single
+writer, so draws serialise for free. On `PostgreSQL` two instances can draw on
+one authority at the same instant, and only the row lock the draw takes stops
+both passing a check the other has already invalidated — which is why the
+balance is read `FOR UPDATE` and why the receipt and the balance commit in one
+transaction. A balance that advanced without its receipt would let the next
+retry draw again, which is the double-spend the receipt table exists to make
+impossible.
+
+---
+
 ## 🧠 Give an agent a memory
 
 ```rust
