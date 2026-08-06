@@ -41,7 +41,10 @@ mod mcp;
 mod typed;
 
 #[cfg(feature = "mcp")]
-pub use mcp::McpClient;
+pub use mcp::{
+    McpAccess, McpClient, McpDataSafety, McpPrompt, McpResource, McpTask, McpTaskCancel,
+    McpTaskPoll, McpTaskSnapshot, McpTaskState, McpTaskUpdate,
+};
 pub use typed::{Tool, ToolBox, ToolFailure};
 
 use std::collections::BTreeMap;

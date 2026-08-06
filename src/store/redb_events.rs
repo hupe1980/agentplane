@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::case::{BufferedEvent, EventStore};
+use crate::case::{BufferedEvent, EventStore, TargetedDelivery};
 use crate::core::{
     CaseId, CorrelationKey, DeadLetter, EffectKey, InboundEvent, RunId, StoreError, Subscription,
     Timestamp,
@@ -277,6 +277,7 @@ fn oldest_waiter(
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl EventStore for RedbStore {
     async fn buffer(&self, event: &InboundEvent, at: Timestamp) -> Result<bool, StoreError> {
         let tenant = self.tenant_name();
@@ -621,6 +622,146 @@ impl EventStore for RedbStore {
             };
             w.commit().map_err(|e| be(&e))?;
             Ok(found)
+        })
+        .await
+    }
+
+    async fn deliver_to(
+        &self,
+        target: RunId,
+        event: &InboundEvent,
+        at: Timestamp,
+    ) -> Result<TargetedDelivery, StoreError> {
+        let tenant = self.tenant_name();
+        let run = target.to_string();
+        let id = event.dedup_key();
+        let bare_id = event.id.clone();
+        let source = event.source.clone();
+        let kind = event.kind.clone();
+        let payload = serde_json::to_string(&event.payload)?;
+        let keys = event.correlation.clone();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let outcome = {
+                let mut events = w.open_table(EVENTS).map_err(|e| be(&e))?;
+                let existing_claim = events
+                    .get((tenant.as_str(), id.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|row| {
+                        let (_, _, _, _, _, claimed_by, _, has_claim, _, _) = row.value();
+                        (claimed_by.to_owned(), has_claim)
+                    });
+                let subs = w.open_table(SUBS).map_err(|e| be(&e))?;
+                let mut selected: Option<(String, String, u8, u32, String)> = None;
+                for row in subs
+                    .range(
+                        (tenant.as_str(), run.as_str(), "", "", "")
+                            ..=(tenant.as_str(), run.as_str(), MAX_STR, MAX_STR, MAX_STR),
+                    )
+                    .map_err(|e| be(&e))?
+                {
+                    let (key, value) = row.map_err(|e| be(&e))?;
+                    let (_, _, effect, namespace, value_key) = key.value();
+                    let (case, has_case, step, phase, event_kind, _) = value.value();
+                    if event_kind == kind
+                        && keys.iter().any(|candidate| {
+                            candidate.namespace == namespace && candidate.value == value_key
+                        })
+                    {
+                        selected = Some((
+                            effect.to_owned(),
+                            case.to_owned(),
+                            has_case,
+                            step,
+                            phase.to_owned(),
+                        ));
+                        break;
+                    }
+                }
+
+                let Some((effect, case, has_case, step, phase)) = selected else {
+                    drop(subs);
+                    drop(events);
+                    w.commit().map_err(|e| be(&e))?;
+                    return Ok(if existing_claim.is_some() {
+                        TargetedDelivery::Duplicate
+                    } else {
+                        TargetedDelivery::NotWaiting
+                    });
+                };
+
+                let mut correlation = Vec::new();
+                for row in subs
+                    .range(
+                        (tenant.as_str(), run.as_str(), effect.as_str(), "", "")
+                            ..=(
+                                tenant.as_str(),
+                                run.as_str(),
+                                effect.as_str(),
+                                MAX_STR,
+                                MAX_STR,
+                            ),
+                    )
+                    .map_err(|e| be(&e))?
+                {
+                    let (key, _) = row.map_err(|e| be(&e))?;
+                    let (_, _, _, namespace, value) = key.value();
+                    correlation.push(CorrelationKey::new(namespace.to_owned(), value.to_owned()));
+                }
+                drop(subs);
+
+                let subscription = Subscription {
+                    run: target,
+                    case: if has_case == 1 {
+                        Some(CaseId::parse(&case).map_err(|e| StoreError::Corrupt {
+                            seq: 0,
+                            detail: format!("bad case id '{case}': {e}"),
+                        })?)
+                    } else {
+                        None
+                    },
+                    effect: EffectKey::from_hex(&effect).map_err(|e| StoreError::Corrupt {
+                        seq: 0,
+                        detail: format!("bad effect key '{effect}': {e}"),
+                    })?,
+                    step: crate::core::StepId(step),
+                    phase: phase_from(&phase),
+                    kind: kind.clone(),
+                    correlation,
+                };
+
+                if let Some((claimed_by, has_claim)) = existing_claim {
+                    drop(events);
+                    if has_claim == 1 && claimed_by == run {
+                        TargetedDelivery::Matched(subscription)
+                    } else {
+                        TargetedDelivery::Duplicate
+                    }
+                } else {
+                    events
+                        .insert(
+                            (tenant.as_str(), id.as_str()),
+                            (
+                                source.as_str(),
+                                bare_id.as_str(),
+                                kind.as_str(),
+                                payload.as_str(),
+                                ts(at),
+                                run.as_str(),
+                                ts(at),
+                                1u8,
+                                0u8,
+                                "",
+                            ),
+                        )
+                        .map_err(|e| be(&e))?;
+                    drop(events);
+                    index_correlation(&w, &tenant, &id, &keys, ts(at))?;
+                    TargetedDelivery::Matched(subscription)
+                }
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(outcome)
         })
         .await
     }

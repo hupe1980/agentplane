@@ -986,6 +986,7 @@ impl<'a> StepCtx<'a> {
     /// reads its result from the journal, so editing a manifest cannot re-judge
     /// a run that already happened.
     #[cfg(feature = "manifest")]
+    #[allow(clippy::too_many_lines)]
     async fn declared(
         &mut self,
         key: EffectKey,
@@ -1028,6 +1029,50 @@ impl<'a> StepCtx<'a> {
                     {
                         Some(format!(
                             "manifest '{}' and the live catalogue disagree about protected fields for '{reference}' — authority-bearing argument policy must be digest-covered and exact",
+                            manifest.metadata.name
+                        ))
+                    }
+                    Some(_) => None,
+                }
+            }
+            "mcp.prompt/get" => {
+                let server = descriptor.args["server"].as_str().unwrap_or_default();
+                let name = descriptor.args["name"].as_str().unwrap_or_default();
+                match manifest.prompt_grant(server, name) {
+                    None => Some(format!(
+                        "manifest '{}' does not grant MCP prompt '{server}/{name}'",
+                        manifest.metadata.name
+                    )),
+                    Some(grant)
+                        if descriptor.args.get("max_input_sensitivity")
+                            != serde_json::to_value(grant.max_input_sensitivity)
+                                .ok()
+                                .as_ref()
+                            || descriptor.args.get("output_sensitivity")
+                                != serde_json::to_value(grant.output_sensitivity).ok().as_ref() =>
+                    {
+                        Some(format!(
+                            "manifest '{}' and the MCP prompt catalogue disagree about sensitivity for '{server}/{name}'",
+                            manifest.metadata.name
+                        ))
+                    }
+                    Some(_) => None,
+                }
+            }
+            "mcp.resource/read" => {
+                let server = descriptor.args["server"].as_str().unwrap_or_default();
+                let uri = descriptor.args["uri"].as_str().unwrap_or_default();
+                match manifest.resource_grant(server, uri) {
+                    None => Some(format!(
+                        "manifest '{}' does not grant MCP resource '{server}/{uri}'",
+                        manifest.metadata.name
+                    )),
+                    Some(grant)
+                        if descriptor.args.get("output_sensitivity")
+                            != serde_json::to_value(grant.output_sensitivity).ok().as_ref() =>
+                    {
+                        Some(format!(
+                            "manifest '{}' and the MCP resource catalogue disagree about sensitivity for '{server}/{uri}'",
                             manifest.metadata.name
                         ))
                     }

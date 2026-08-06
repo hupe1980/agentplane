@@ -15,6 +15,21 @@ pub struct BufferedEvent {
     pub received_at: Timestamp,
 }
 
+/// Result of delivering an event to one explicitly named waiting run.
+///
+/// A2A continuation carries a `taskId`, so ordinary correlation matching is
+/// too weak: two tasks may legitimately wait on the same business key. The
+/// store must insert and claim in one transaction, against that exact run.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TargetedDelivery {
+    /// The event was durably claimed for this subscription.
+    Matched(Subscription),
+    /// The same `(source, id)` was already accepted.
+    Duplicate,
+    /// The named run has no matching live subscription.
+    NotWaiting,
+}
+
 /// Durable inbound-event handling.
 ///
 /// The ordering rule that makes this correct, stated once:
@@ -55,6 +70,20 @@ pub trait EventStore: Send + Sync + Debug {
         event: &InboundEvent,
         at: Timestamp,
     ) -> Result<Option<Subscription>, StoreError>;
+
+    /// Atomically buffer `event` and claim it for the matching subscription of
+    /// exactly `run`.
+    ///
+    /// Unlike [`buffer`](Self::buffer) followed by
+    /// [`match_waiter`](Self::match_waiter), a failed targeted delivery leaves
+    /// no unclaimed event behind for another run to consume. Implementations
+    /// must decide duplicate/not-waiting/matched in one transaction.
+    async fn deliver_to(
+        &self,
+        run: RunId,
+        event: &InboundEvent,
+        at: Timestamp,
+    ) -> Result<TargetedDelivery, StoreError>;
 
     /// Drop a subscription once it has been satisfied.
     async fn unsubscribe(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError>;

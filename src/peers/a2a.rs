@@ -228,6 +228,82 @@ impl A2aClient {
             }
         })
     }
+
+    fn get_task_body(task_id: &str, tenant: Option<&str>) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "GetTask",
+            "params": {
+                "tenant": tenant,
+                "id": task_id,
+            }
+        })
+    }
+
+    async fn rpc(
+        &self,
+        peer: &PeerId,
+        body: &Value,
+        credential: Option<&PeerCredential>,
+    ) -> Result<Value, PeerError> {
+        // Before the request is built: a refused destination must reach
+        // nothing and must be `DidNotHappen`.
+        if let Some(egress) = &self.egress {
+            let host = reqwest::Url::parse(&self.endpoint.url)
+                .ok()
+                .and_then(|url| url.host_str().map(ToOwned::to_owned));
+            if let Err(error) = egress.permits(host.as_deref()) {
+                return Err(PeerError::Refused {
+                    peer: peer.clone(),
+                    detail: error.to_string(),
+                });
+            }
+        }
+
+        let mut request = self
+            .http
+            .post(&self.endpoint.url)
+            .header("A2A-Version", PROTOCOL_VERSION)
+            .header("A2A-Extensions", EXTENSION_URI)
+            .json(body);
+        if let Some(credential) = credential {
+            request = request.bearer_auth(credential.expose());
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|error| classify_transport(peer, &error))?;
+        let status = response.status();
+        let parsed: Result<RpcResponse, _> = response.json().await;
+        let Ok(rpc) = parsed else {
+            return Err(classify_status(peer, status));
+        };
+        if !status.is_success() && rpc.jsonrpc.is_none() {
+            return Err(classify_status(peer, status));
+        }
+        if rpc.jsonrpc.as_deref() != Some("2.0") || rpc.id.as_ref() != Some(&json!(1)) {
+            return Err(invalid_response(
+                peer,
+                "JSON-RPC response has the wrong version or does not correlate to request id 1",
+            ));
+        }
+        let result = match (rpc.result, rpc.error) {
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(invalid_response(
+                    peer,
+                    "JSON-RPC response must contain exactly one of 'result' or 'error'",
+                ));
+            }
+            (None, Some(error)) => return Err(classify_rpc(peer, &error)),
+            (Some(result), None) => result,
+        };
+        if !status.is_success() {
+            return Err(classify_status(peer, status));
+        }
+        Ok(result)
+    }
 }
 
 /// A JSON-RPC error as it comes back.
@@ -402,78 +478,51 @@ impl PeerClient for A2aClient {
         credential: Option<&PeerCredential>,
         provenance: Option<&crate::core::Provenance>,
     ) -> Result<Value, PeerError> {
-        // Before the request is built: a refused destination must reach nothing
-        // and must be `DidNotHappen`, so the runtime knows the peer never saw it.
-        if let Some(egress) = &self.egress {
-            let host = reqwest::Url::parse(&self.endpoint.url)
-                .ok()
-                .and_then(|u| u.host_str().map(ToOwned::to_owned));
-            if let Err(e) = egress.permits(host.as_deref()) {
-                return Err(PeerError::Refused {
-                    peer: peer.clone(),
-                    detail: e.to_string(),
-                });
-            }
-        }
-
-        let mut req = self
-            .http
-            .post(&self.endpoint.url)
-            .header("A2A-Version", PROTOCOL_VERSION)
-            .header("A2A-Extensions", EXTENSION_URI)
-            .json(&Self::body(
-                capability,
-                payload,
-                acting_as,
-                provenance,
-                self.endpoint.tenant.as_deref(),
-            ));
-
-        // The credential is audience-bound before it reaches here — the registry
-        // refuses to hand over one minted for somebody else — so presenting it
-        // cannot arm this peer to replay it elsewhere.
-        if let Some(c) = credential {
-            req = req.bearer_auth(c.expose());
-        }
-
-        let response = req.send().await.map_err(|e| classify_transport(peer, &e))?;
-
-        let status = response.status();
-        // Read the body before deciding: a JSON-RPC error carried inside a 200
-        // is the normal case, and a 4xx may still carry one worth reporting.
-        let body: Result<RpcResponse, _> = response.json().await;
-
-        let Ok(rpc) = body else {
-            return Err(classify_status(peer, status));
-        };
-        // Ordinary HTTP errors are not JSON-RPC envelopes. Do not reinterpret
-        // a 401/404 as a malformed agent response merely because serde can
-        // deserialize an unrelated JSON object into an all-optional struct.
-        if !status.is_success() && rpc.jsonrpc.is_none() {
-            return Err(classify_status(peer, status));
-        }
-        if rpc.jsonrpc.as_deref() != Some("2.0") || rpc.id.as_ref() != Some(&json!(1)) {
-            return Err(invalid_response(
+        let result = self
+            .rpc(
                 peer,
-                "JSON-RPC response has the wrong version or does not correlate to request id 1",
-            ));
-        }
-        let result = match (rpc.result, rpc.error) {
-            (Some(_), Some(_)) | (None, None) => {
-                return Err(invalid_response(
-                    peer,
-                    "JSON-RPC response must contain exactly one of 'result' or 'error'",
-                ));
-            }
-            (None, Some(e)) => return Err(classify_rpc(peer, &e)),
-            (Some(result), None) => result,
-        };
-        if !status.is_success() {
-            return Err(classify_status(peer, status));
-        }
+                &Self::body(
+                    capability,
+                    payload,
+                    acting_as,
+                    provenance,
+                    self.endpoint.tenant.as_deref(),
+                ),
+                credential,
+            )
+            .await?;
         let result = send_message_result(peer, &result)?;
         if let Some(failure) = task_failure(peer, &result) {
             return Err(failure);
+        }
+        Ok(result)
+    }
+
+    async fn get_task(
+        &self,
+        peer: &PeerId,
+        task_id: &str,
+        credential: Option<&PeerCredential>,
+    ) -> Result<Value, PeerError> {
+        let result = self
+            .rpc(
+                peer,
+                &Self::get_task_body(task_id, self.endpoint.tenant.as_deref()),
+                credential,
+            )
+            .await?;
+        if !result.is_object()
+            || result.get("id").and_then(Value::as_str) != Some(task_id)
+            || result
+                .get("status")
+                .and_then(|status| status.get("state"))
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            return Err(invalid_response(
+                peer,
+                "GetTask result is not the requested Task object",
+            ));
         }
         Ok(result)
     }

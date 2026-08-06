@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use crate::batch::{BatchStore, ItemOutcome};
-use crate::case::{CaseStore, ClaimError, EventStore, TaskStore, TimerStore};
+use crate::case::{CaseStore, ClaimError, EventStore, TargetedDelivery, TaskStore, TimerStore};
 use crate::core::{
     BatchId, CaseId, CaseVersion, CorrelationKey, EffectKey, InboundEvent, Justification, OnExpiry,
     Phase, Priority, RunId, Spend, StepId, StoreError, Subscription, Task, TaskId, TaskState,
@@ -405,7 +405,83 @@ pub async fn check_events(store: &Arc<dyn EventStore>, r: &mut Report) {
     a_repeated_event_id_is_not_buffered_twice(store, r).await;
     an_event_is_claimed_by_one_waiter_only(store, r).await;
     a_waiter_is_matched_by_one_event_only(store, r).await;
+    a_targeted_event_resumes_only_its_named_run(store, r).await;
     a_claimed_event_is_never_retired(store, r).await;
+}
+
+/// A protocol carrying a task id must not fall back to ordinary correlation.
+async fn a_targeted_event_resumes_only_its_named_run(store: &Arc<dyn EventStore>, r: &mut Report) {
+    r.checked += 1;
+    let first = RunId::generate();
+    let target = RunId::generate();
+    let waiting = |run, n| Subscription {
+        run,
+        case: None,
+        effect: effect(n),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "continue".into(),
+        correlation: keys("E-TARGET"),
+    };
+    let a = waiting(first, 13);
+    let b = waiting(target, 14);
+    let _ = store.subscribe(&a, ts(1_000)).await;
+    let _ = store.subscribe(&b, ts(1_001)).await;
+
+    let event = InboundEvent {
+        source: "urn:a2a:peer-a".to_owned(),
+        id: "message-1".into(),
+        kind: "continue".into(),
+        correlation: keys("E-TARGET"),
+        payload: serde_json::json!({"answer": 42}),
+    };
+    match store.deliver_to(target, &event, ts(1_002)).await {
+        Ok(TargetedDelivery::Matched(sub)) if sub.run == target => {}
+        Ok(other) => {
+            r.record(
+                "targeted delivery",
+                format!("an event for {target} was not claimed by that run: {other:?}"),
+            );
+            return;
+        }
+        Err(error) => {
+            r.record("targeted delivery", format!("delivery failed: {error}"));
+            return;
+        }
+    }
+    if !matches!(
+        store.deliver_to(target, &event, ts(1_003)).await,
+        Ok(TargetedDelivery::Matched(_))
+    ) {
+        r.record(
+            "targeted delivery",
+            "retrying a claimed event with a live subscription did not recover the prior claim",
+        );
+    }
+
+    let absent = InboundEvent {
+        id: "message-no-waiter".into(),
+        ..event
+    };
+    if !matches!(
+        store
+            .deliver_to(RunId::generate(), &absent, ts(1_004))
+            .await,
+        Ok(TargetedDelivery::NotWaiting)
+    ) {
+        r.record(
+            "targeted delivery",
+            "a task with no subscription did not report NotWaiting",
+        );
+    }
+    // NotWaiting must not buffer the message. If it did, this ordinary buffer
+    // would see a duplicate and another correlated run could consume it.
+    if !matches!(store.buffer(&absent, ts(1_005)).await, Ok(true)) {
+        r.record(
+            "targeted delivery",
+            "a failed targeted delivery left an orphan event in the shared buffer",
+        );
+    }
 }
 
 /// A delivered message is not garbage.

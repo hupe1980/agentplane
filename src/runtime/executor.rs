@@ -4314,6 +4314,49 @@ impl Runtime {
             return Ok(Delivery::Buffered);
         };
 
+        self.resume_subscription(events, sub, event).await
+    }
+
+    /// Deliver an inbound event to exactly `run`.
+    ///
+    /// This is the task-addressed counterpart to [`Runtime::deliver`]. It is
+    /// used by protocols such as A2A where a follow-up carries a concrete task
+    /// id. Correlation alone is insufficient there: two tasks may wait on the
+    /// same business key, and resuming the oldest would violate the request.
+    ///
+    /// The event store atomically inserts and claims the event for this run. A
+    /// run that is not waiting leaves no buffered event behind for another run.
+    pub async fn deliver_to(
+        &self,
+        run: RunId,
+        event: &InboundEvent,
+    ) -> Result<Delivery, RuntimeError> {
+        let events = self.events.as_ref().ok_or_else(|| {
+            RuntimeError::PlanContract(
+                "this runtime has no event store — build it with `.events(store)`".into(),
+            )
+        })?;
+        match events
+            .deliver_to(run, event, now_for_admission())
+            .await
+            .map_err(RuntimeError::from_store)?
+        {
+            crate::case::TargetedDelivery::Duplicate => Ok(Delivery::Duplicate),
+            crate::case::TargetedDelivery::NotWaiting => Err(RuntimeError::PlanContract(format!(
+                "run {run} is not waiting for this input"
+            ))),
+            crate::case::TargetedDelivery::Matched(sub) => {
+                self.resume_subscription(events, sub, event).await
+            }
+        }
+    }
+
+    async fn resume_subscription(
+        &self,
+        events: &Arc<dyn crate::case::EventStore>,
+        sub: crate::core::Subscription,
+        event: &InboundEvent,
+    ) -> Result<Delivery, RuntimeError> {
         // Record the event as the awaited effect's result, then let replay do
         // the rest: the resumed run reads it back like any other completed
         // effect, and none of the suspension machinery exists twice.
@@ -4323,33 +4366,45 @@ impl Runtime {
             .await
             .map_err(RuntimeError::from_store)?;
 
-        self.store
-            .append(
-                lease.epoch,
-                vec![{
-                    let mut a = Append::new(
-                        sub.run,
-                        RecordKind::EffectDone {
-                            output: event.payload.clone(),
-                            // The sender, so a replayed run rebuilds the same
-                            // provenance this delivery gave the value.
-                            source: Some(event.source.clone()),
-                            spend: crate::core::Spend::default(),
-                        },
-                    )
-                    .effect(sub.effect)
-                    .step(sub.step)
-                    .phase(sub.phase);
-                    // Every record of a case-bound run carries its case, and a
-                    // record written from outside the run is no exception.
-                    if let Some(c) = sub.case {
-                        a = a.case(c);
-                    }
-                    a
-                }],
-            )
+        let already_recorded = self
+            .store
+            .read(sub.run, 1)
             .await
-            .map_err(RuntimeError::from_store)?;
+            .map_err(RuntimeError::from_store)?
+            .iter()
+            .any(|record| {
+                record.effect_key() == Some(sub.effect)
+                    && matches!(record.kind(), RecordKind::EffectDone { .. })
+            });
+        if !already_recorded {
+            self.store
+                .append(
+                    lease.epoch,
+                    vec![{
+                        let mut a = Append::new(
+                            sub.run,
+                            RecordKind::EffectDone {
+                                output: event.payload.clone(),
+                                // The sender, so a replayed run rebuilds the same
+                                // provenance this delivery gave the value.
+                                source: Some(event.source.clone()),
+                                spend: crate::core::Spend::default(),
+                            },
+                        )
+                        .effect(sub.effect)
+                        .step(sub.step)
+                        .phase(sub.phase);
+                        // Every record of a case-bound run carries its case, and a
+                        // record written from outside the run is no exception.
+                        if let Some(c) = sub.case {
+                            a = a.case(c);
+                        }
+                        a
+                    }],
+                )
+                .await
+                .map_err(RuntimeError::from_store)?;
+        }
 
         events
             .unsubscribe(sub.run, sub.effect)

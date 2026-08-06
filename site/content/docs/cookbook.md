@@ -1054,6 +1054,39 @@ let rt = Runtime::builder(store)
     .build();
 ```
 
+Initialize `service` with `McpClient::host_info()` rather than rmcp's empty
+default client handler. That profile negotiates the Tasks extension and nothing
+else: elicitation, sampling, roots and subscriptions stay absent until a
+governed runtime callback exists.
+
+MCP context is available without turning it into a tool. Exact grants may live
+in the manifest:
+
+```yaml
+context:
+    prompts:
+        - server: templates
+            name: summarize
+            max_input_sensitivity: internal
+    resources:
+        - server: knowledge
+            uri: kb://support/rules
+            output_sensitivity: internal
+```
+
+Derive the deployment catalogue with
+`McpAccess::from_manifest("templates", &manifest)`, then use
+`McpClient::prompt` or `McpClient::resource` and dispatch the returned value via
+`cx.effect` (or `cx.sink` for prompt arguments). Both results are untrusted and
+strict replay performs no second MCP request.
+
+An asynchronous tool result is not flattened into an apparent answer.
+`McpTask::from_result` preserves its handle; `client.task(handle)` prepares a
+journaled `tasks/get` effect. `update_task` binds the exact labelled input
+responses and defaults to operator recovery, while `cancel_task` is an
+idempotent cooperative request followed by another poll. The cancellation ack
+is never presented as evidence that the server stopped.
+
 The manifest grants both the same way, because a reference names *which tool*
 and never which wire carries it:
 

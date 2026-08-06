@@ -4,7 +4,7 @@ mod events;
 mod tasks;
 mod timers;
 
-pub use events::{BufferedEvent, EventStore};
+pub use events::{BufferedEvent, EventStore, TargetedDelivery};
 pub use tasks::{ClaimError, TaskStore};
 pub use timers::TimerStore;
 

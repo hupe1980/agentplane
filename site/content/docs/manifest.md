@@ -245,6 +245,33 @@ a mutating tool with **no** protected fields refuses untrusted arguments
 outright, and declaring which fields a model may influence is how you permit the
 useful part without permitting the dangerous part.
 
+## `spec.context`
+
+Exact MCP context reads, separate from action-granting tools. They remain
+untrusted data, but which external prompt/resource may enter an agent and at
+what sensitivity is still a reviewed, digest-covered decision.
+
+```yaml
+context:
+  prompts:
+    - server: templates
+      name: summarize
+      max_input_sensitivity: internal
+      output_sensitivity: internal
+  resources:
+    - server: knowledge
+      uri: kb://support/rules
+      output_sensitivity: internal
+```
+
+Prompt arguments are outbound data and `max_input_sensitivity` bounds them.
+`output_sensitivity` raises the returned label when the server may disclose
+classified content; neither field can make server output trusted. Duplicate or
+blank grants are refused. URIs are exact — no wildcard whose interpretation can
+disagree with the MCP server's URI parser. Use
+`McpAccess::from_manifest(server, manifest)` to avoid restating these grants in
+code.
+
 ## `spec.output`
 
 | Field | Notes |

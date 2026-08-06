@@ -368,6 +368,224 @@ pub trait PeerClient: Send + Sync + Debug {
         credential: Option<&PeerCredential>,
         provenance: Option<&crate::core::Provenance>,
     ) -> Result<Value, PeerError>;
+
+    /// Read one previously accepted remote task.
+    ///
+    /// A default refusal keeps non-task peer transports honest. Implementors
+    /// must override this only when the wire has a stable task handle and an
+    /// idempotent read operation.
+    async fn get_task(
+        &self,
+        peer: &PeerId,
+        task_id: &str,
+        credential: Option<&PeerCredential>,
+    ) -> Result<Value, PeerError> {
+        let _ = (task_id, credential);
+        Err(PeerError::Refused {
+            peer: peer.clone(),
+            detail: "this peer transport does not support task lookup".to_owned(),
+        })
+    }
+}
+
+/// A stable handle returned by a remote peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerTask {
+    pub peer: PeerId,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+}
+
+impl PeerTask {
+    /// Extract a task handle from a peer response, or `None` for a direct
+    /// message response.
+    pub fn from_response(peer: PeerId, response: &Value) -> Result<Option<Self>, PeerError> {
+        if response.get("role").is_some() {
+            return Ok(None);
+        }
+        let id = response.get("id").and_then(Value::as_str).ok_or_else(|| {
+            PeerError::InvalidResponse {
+                peer: peer.clone(),
+                detail: "task response has no string id".to_owned(),
+            }
+        })?;
+        if response
+            .get("status")
+            .and_then(|status| status.get("state"))
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            return Err(PeerError::InvalidResponse {
+                peer,
+                detail: "task response has no status.state".to_owned(),
+            });
+        }
+        Ok(Some(Self {
+            peer,
+            id: id.to_owned(),
+            context_id: response
+                .get("contextId")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+        }))
+    }
+}
+
+/// A2A's task lifecycle, normalized for callers that need to decide whether to
+/// poll, provide input, or consume the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PeerTaskState {
+    Submitted,
+    Working,
+    Completed,
+    Failed,
+    Canceled,
+    Rejected,
+    InputRequired,
+    AuthRequired,
+}
+
+impl PeerTaskState {
+    fn parse(peer: &PeerId, value: &Value) -> Result<Self, PeerError> {
+        match value
+            .get("status")
+            .and_then(|status| status.get("state"))
+            .and_then(Value::as_str)
+        {
+            Some("TASK_STATE_SUBMITTED") => Ok(Self::Submitted),
+            Some("TASK_STATE_WORKING") => Ok(Self::Working),
+            Some("TASK_STATE_COMPLETED") => Ok(Self::Completed),
+            Some("TASK_STATE_FAILED") => Ok(Self::Failed),
+            Some("TASK_STATE_CANCELED") => Ok(Self::Canceled),
+            Some("TASK_STATE_REJECTED") => Ok(Self::Rejected),
+            Some("TASK_STATE_INPUT_REQUIRED") => Ok(Self::InputRequired),
+            Some("TASK_STATE_AUTH_REQUIRED") => Ok(Self::AuthRequired),
+            Some(other) => Err(PeerError::InvalidResponse {
+                peer: peer.clone(),
+                detail: format!("task response has unknown state '{other}'"),
+            }),
+            None => Err(PeerError::InvalidResponse {
+                peer: peer.clone(),
+                detail: "task response has no status.state".to_owned(),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Canceled | Self::Rejected
+        )
+    }
+}
+
+/// One journaled observation of a remote task.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerTaskSnapshot {
+    pub task: PeerTask,
+    pub state: PeerTaskState,
+    pub value: Value,
+}
+
+/// A journaled, idempotent read of a remote task.
+#[derive(Debug)]
+pub struct PeerTaskCall {
+    task: PeerTask,
+    grant: PeerGrant,
+    credential: Option<PeerCredential>,
+    client: Arc<dyn PeerClient>,
+}
+
+impl PeerTaskCall {
+    /// Prepare a task read under the same peer grant and audience-bound
+    /// credential as the call that created it.
+    pub fn prepare(
+        registry: &PeerRegistry,
+        client: Arc<dyn PeerClient>,
+        task: PeerTask,
+    ) -> Result<Self, PeerError> {
+        let Some(grant) = registry.grant(&task.peer).cloned() else {
+            return Err(PeerError::Unknown {
+                peer: task.peer.clone(),
+            });
+        };
+        let credential = registry.credential_for(&task.peer)?.cloned();
+        Ok(Self {
+            task,
+            grant,
+            credential,
+            client,
+        })
+    }
+}
+
+#[async_trait]
+impl Effect for PeerTaskCall {
+    type Output = PeerTaskSnapshot;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "a2a.task/get",
+            serde_json::json!({
+                "peer": self.task.peer.0,
+                "task_id": self.task.id,
+                "context_id": self.task.context_id,
+            }),
+        )
+    }
+
+    fn mutates(&self) -> bool {
+        false
+    }
+
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    fn retry(&self) -> RetryPolicy {
+        self.grant.retry
+    }
+
+    fn output_sensitivity(&self) -> Sensitivity {
+        self.grant.output_sensitivity
+    }
+
+    fn trust(&self) -> Trust {
+        Trust::Untrusted
+    }
+
+    async fn perform(&self) -> Result<Self::Output, EffectError> {
+        let value = self
+            .client
+            .get_task(&self.task.peer, &self.task.id, self.credential.as_ref())
+            .await
+            .map_err(|error| {
+                let detail = error.to_string();
+                match error.disposition() {
+                    Disposition::DidNotHappen => EffectError::Rejected(detail),
+                    Disposition::InDoubt => EffectError::Interrupted {
+                        driver: self.task.peer.to_string(),
+                        detail,
+                    },
+                    Disposition::Landed => EffectError::Performed(detail),
+                }
+            })?;
+        let state = PeerTaskState::parse(&self.task.peer, &value).map_err(|error| {
+            EffectError::Interrupted {
+                driver: self.task.peer.to_string(),
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(PeerTaskSnapshot {
+            task: self.task.clone(),
+            state,
+            value,
+        })
+    }
 }
 
 /// The peers this plane may call, and what each is granted.

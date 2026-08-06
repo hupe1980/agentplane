@@ -20,9 +20,10 @@ use std::sync::{Arc, Mutex};
 
 use agentplane::api::a2a::{A2aPushWorker, A2aServer, ServerSetupError, TaskState, action, code};
 use agentplane::api::{AuthError, Authenticator, Caller};
+use agentplane::case::{CaseStore, EventStore};
 use agentplane::core::{
-    Digest, Outcome, PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest, RunId,
-    Skill, SkillDescriptor, SkillError, Tainted, TenantId,
+    AwaitSpec, CorrelationKey, DeadlineSpec, Digest, Outcome, PolicyBundleIdentity, PolicyDecision,
+    PolicyEngine, PolicyRequest, RunId, Skill, SkillDescriptor, SkillError, Tainted, TenantId,
 };
 use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
@@ -232,6 +233,52 @@ impl PushTransport for RecordingPush {
 
 fn fixture() -> Fixture {
     fixture_from(ONE_SKILL, Arc::new(Recording::default()))
+}
+
+#[derive(Debug)]
+struct NeedsInput;
+
+#[async_trait::async_trait]
+impl Skill for NeedsInput {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("needs-input").provides("settlement.check")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.deadline("reply", &DeadlineSpec::days(1), None).await?;
+        let reply = cx
+            .await_event(
+                &AwaitSpec::new("a2a.task.input", "reply")
+                    .correlate(CorrelationKey::new("task", "settlement")),
+            )
+            .await?;
+        cx.meet_deadline("reply").await?;
+        Ok(Outcome::done(reply))
+    }
+}
+
+fn continuation_fixture() -> Fixture {
+    let manifest = Manifest::parse(ONE_SKILL).expect("parse");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let policy = Arc::new(Recording::default());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .events(Arc::clone(&store) as Arc<dyn EventStore>)
+        .policy(policy.clone() as Arc<dyn PolicyEngine>)
+        .skill(NeedsInput)
+        .build();
+    Fixture {
+        rt,
+        store,
+        policy,
+        seen,
+        manifest,
+    }
 }
 
 fn card_security() -> CardSecurity {
@@ -1212,25 +1259,81 @@ async fn list_tasks_omits_tasks_the_caller_cannot_read() {
 }
 
 #[tokio::test]
-async fn unsupported_multi_turn_continuations_are_not_silently_restarted() {
-    let f = fixture();
-    let (_, body) = send(
-        &f.router(),
+async fn task_id_continues_the_exact_input_required_task() {
+    let f = continuation_fixture();
+    let router = f.router();
+    let (_, first) = send(
+        &router,
         rpc(
             "SendMessage",
             &json!({"message": {
-                "messageId": "m-followup",
+                "messageId": "m-initial",
                 "role": "ROLE_USER",
-                "taskId": "run_01KZ8000000000000000000000",
-                "contextId": "case-7",
-                "parts": [{"text": "continue"}]
+                "parts": [{"text": "begin"}]
             }}),
             Some("peer-a"),
         ),
     )
     .await;
-    assert_eq!(err_code(&body), i64::from(code::UNSUPPORTED_OPERATION));
-    assert!(f.seen.lock().unwrap().is_empty());
+    assert_eq!(
+        first["result"]["task"]["status"]["state"],
+        "TASK_STATE_INPUT_REQUIRED"
+    );
+    let task = first["result"]["task"]["id"]
+        .as_str()
+        .expect("task id")
+        .to_owned();
+    let context = first["result"]["task"]["contextId"]
+        .as_str()
+        .expect("context id")
+        .to_owned();
+
+    // `contextId` is intentionally omitted: A2A requires the server to infer
+    // it from taskId. The response and reconstructed history carry it.
+    let continuation = json!({
+        "message": {
+            "messageId": "m-followup",
+            "taskId": task,
+            "role": "ROLE_USER",
+            "parts": [{"data": {"approved": true}, "mediaType": "application/json"}]
+        },
+        "configuration": {"historyLength": 10}
+    });
+    let (_, completed) = send(&router, rpc("SendMessage", &continuation, Some("peer-a"))).await;
+    assert_eq!(
+        completed["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{completed:#}"
+    );
+    assert_eq!(completed["result"]["task"]["contextId"], context);
+    let history = completed["result"]["task"]["history"]
+        .as_array()
+        .expect("history");
+    assert_eq!(
+        history.len(),
+        2,
+        "both client turns must survive: {history:#?}"
+    );
+    assert_eq!(history[0]["messageId"], "m-initial");
+    assert_eq!(history[1]["messageId"], "m-followup");
+    assert_eq!(history[1]["taskId"], task);
+    assert_eq!(history[1]["contextId"], context);
+    assert!(
+        f.policy
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|action| action == action::TASK_CONTINUE),
+        "continuation never reached its task-specific policy gate"
+    );
+
+    // A transport retry with the same messageId is idempotent even though the
+    // first delivery completed and sealed the task.
+    let (_, duplicate) = send(&router, rpc("SendMessage", &continuation, Some("peer-a"))).await;
+    assert_eq!(
+        duplicate["result"]["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
 }
 
 /// A blocking call returns the answer as a task artifact.
@@ -1290,12 +1393,18 @@ async fn get_task_honors_history_length_and_reconstructs_artifacts() {
         ),
     )
     .await;
+    assert_eq!(got["result"]["history"].as_array().unwrap().len(), 1);
     assert_eq!(
-        got["result"]["task"]["history"].as_array().unwrap().len(),
-        1
+        got["result"]["history"][0]["messageId"],
+        message["messageId"]
     );
-    assert_eq!(got["result"]["task"]["history"][0], message);
-    assert!(got["result"]["task"]["artifacts"].is_array());
+    assert_eq!(got["result"]["history"][0]["parts"], message["parts"]);
+    assert_eq!(got["result"]["history"][0]["taskId"], id);
+    assert_eq!(
+        got["result"]["history"][0]["contextId"],
+        got["result"]["contextId"]
+    );
+    assert!(got["result"]["artifacts"].is_array());
 
     let (_, without_history) = send(
         &router,
@@ -1306,7 +1415,7 @@ async fn get_task_honors_history_length_and_reconstructs_artifacts() {
         ),
     )
     .await;
-    assert!(without_history["result"]["task"].get("history").is_none());
+    assert!(without_history["result"].get("history").is_none());
 
     let (_, blocking_history) = send(
         &router,
@@ -1699,7 +1808,7 @@ async fn a_policy_denial_is_a_decline_not_a_server_fault() {
 async fn this_planes_client_can_call_this_planes_server() {
     use agentplane::core::{Delegation, Principal, Scope};
     use agentplane::peers::a2a::{A2aClient, Endpoint};
-    use agentplane::peers::{PeerClient, PeerCredential, PeerId};
+    use agentplane::peers::{PeerClient, PeerCredential, PeerId, PeerTask};
 
     let f = fixture();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1732,6 +1841,15 @@ async fn this_planes_client_can_call_this_planes_server() {
         answer.is_object(),
         "the client got something it could not read back: {answer:#}"
     );
+    let task = PeerTask::from_response(peer.clone(), &answer)
+        .expect("valid response")
+        .expect("the server returned a task");
+    let polled = client
+        .get_task(&peer, &task.id, Some(&credential))
+        .await
+        .expect("GetTask through the same client");
+    assert_eq!(polled["id"], task.id);
+    assert_eq!(polled["status"]["state"], "TASK_STATE_COMPLETED");
 
     // And the server really ran the skill, with the peer's identity as
     // provenance — the round trip carried the credential end to end.
@@ -1790,7 +1908,7 @@ async fn a_non_blocking_send_returns_a_task_that_already_exists() {
         "the task id returned by a non-blocking send cannot be read back, so \
          the caller was handed a handle to nothing: {got:#}"
     );
-    assert_eq!(got["result"]["task"]["id"], id);
+    assert_eq!(got["result"]["id"], id);
 }
 
 /// Blocking is the default, and unset means blocking.

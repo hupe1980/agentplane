@@ -174,7 +174,10 @@ async fn connect() -> McpClient {
             let _ = running.waiting().await;
         }
     });
-    let service = ().serve((cr, cw)).await.expect("client initialises");
+    let service = McpClient::host_info()
+        .serve((cr, cw))
+        .await
+        .expect("client initialises");
     McpClient::new("tickets", Arc::new(service))
 }
 

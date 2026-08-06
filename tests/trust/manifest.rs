@@ -3519,3 +3519,122 @@ spec:
          prompt would be uncovered after all"
     );
 }
+
+#[test]
+fn context_grants_are_strict_unique_and_digest_covered() {
+    let yaml = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: researcher, version: "1" }
+spec:
+  budgets: {}
+  context:
+    prompts:
+      - { server: templates, name: summarize, max_input_sensitivity: internal }
+    resources:
+      - { server: knowledge, uri: "kb://rules", output_sensitivity: confidential }
+"#;
+    let manifest = Manifest::parse(yaml).expect("context grants");
+    assert!(manifest.prompt_grant("templates", "summarize").is_some());
+    assert!(manifest.resource_grant("knowledge", "kb://rules").is_some());
+    let before = manifest.digest().unwrap();
+    let mut changed = manifest.clone();
+    changed.spec.context.resources[0].output_sensitivity = agentplane::core::Sensitivity::Secret;
+    assert_ne!(before, changed.digest().unwrap());
+
+    let duplicate = yaml.replace(
+        "resources:\n      - { server: knowledge",
+        "prompts:\n      - { server: templates, name: summarize }\n    resources:\n      - { server: knowledge",
+    );
+    assert!(Manifest::parse(&duplicate).is_err());
+}
+
+#[tokio::test]
+async fn a_manifest_refuses_an_unlisted_context_read_before_it_runs() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use agentplane::core::{
+        Effect, EffectDescriptor, EffectError, Outcome, Recovery, Skill, SkillDescriptor,
+        SkillError, Tainted,
+    };
+    use agentplane::journal::JournalStore;
+    use agentplane::runtime::{Agent, RunStatus, Runtime, StepCtx};
+    use serde_json::json;
+
+    #[derive(Debug)]
+    struct ReadsContext(Arc<AtomicUsize>);
+
+    #[derive(Debug)]
+    struct ContextRead(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Effect for ContextRead {
+        type Output = serde_json::Value;
+
+        fn descriptor(&self) -> EffectDescriptor {
+            EffectDescriptor::new(
+                "mcp.resource/read",
+                json!({
+                    "server": "knowledge",
+                    "uri": "kb://ungranted",
+                    "output_sensitivity": "public",
+                }),
+            )
+        }
+
+        fn mutates(&self) -> bool {
+            false
+        }
+
+        fn recovery(&self) -> Recovery {
+            Recovery::Retry
+        }
+
+        async fn perform(&self) -> Result<Self::Output, EffectError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"leaked": true}))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for ReadsContext {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("reader").provides("context.read")
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<serde_json::Value>,
+        ) -> Result<Outcome, SkillError> {
+            let output = cx.effect(ContextRead(Arc::clone(&self.0))).await?;
+            Ok(Outcome::done(output))
+        }
+    }
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: reader, version: "1" }
+spec:
+  budgets: {}
+  capabilities: { provides: [context.read] }
+  context:
+    resources:
+      - { server: knowledge, uri: "kb://granted" }
+"#,
+    )
+    .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let outcome = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .agent(Agent::new(&manifest).skill(ReadsContext(Arc::clone(&calls))))
+        .build()
+        .run("context.read", json!({}))
+        .await
+        .unwrap();
+    assert!(matches!(outcome.status, RunStatus::Failed(_)));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}

@@ -131,7 +131,7 @@ agentplane = { version = "0.3", features = ["postgres", "http", "mcp", "provider
 | `redb` *(default)* | journal + case store, single node, embedded |
 | `postgres` | the same contract, for several plane instances sharing a store |
 | `http` | the operator surface: worklist, decisions, run status |
-| `mcp` | MCP tool transport |
+| `mcp` | MCP host: governed prompts, resources, tools, and asynchronous Tasks |
 | `a2a` | A2A peer transport — calling other agents |
 | `a2a-server` | being called: the public Agent Card and the A2A 1.0 JSON-RPC methods |
 | `push` | Persistent A2A registration cursors, retrying worker API, and SSRF-guarded webhook delivery; `a2a-server` includes it |

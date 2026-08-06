@@ -23,7 +23,8 @@ use agentplane::core::{
     Scope, Trust,
 };
 use agentplane::peers::{
-    PeerCall, PeerClient, PeerCredential, PeerError, PeerGrant, PeerId, PeerRegistry,
+    PeerCall, PeerClient, PeerCredential, PeerError, PeerGrant, PeerId, PeerRegistry, PeerTask,
+    PeerTaskCall,
 };
 use serde_json::{Value, json};
 
@@ -31,6 +32,7 @@ use serde_json::{Value, json};
 #[derive(Debug, Default)]
 struct Spy {
     sent: Mutex<Vec<(String, Option<String>, usize)>>,
+    task_reads: Mutex<Vec<(String, String, Option<String>)>>,
     answer: Mutex<Option<PeerError>>,
 }
 
@@ -54,6 +56,25 @@ impl PeerClient for Spy {
             Some(e) => Err(e),
             None => Ok(json!({ "reviewed": true })),
         }
+    }
+
+    async fn get_task(
+        &self,
+        peer: &PeerId,
+        task_id: &str,
+        credential: Option<&PeerCredential>,
+    ) -> Result<Value, PeerError> {
+        self.task_reads.lock().unwrap().push((
+            peer.to_string(),
+            task_id.to_owned(),
+            credential.map(|value| value.expose().to_owned()),
+        ));
+        Ok(json!({
+            "id": task_id,
+            "contextId": "matter-1",
+            "status": {"state": "TASK_STATE_COMPLETED"},
+            "artifacts": [{"parts": [{"data": {"reviewed": true}}]}]
+        }))
     }
 }
 
@@ -550,6 +571,91 @@ async fn a_credential_is_presented_to_the_peer_and_never_written_to_the_journal(
             r.kind().kind_str()
         );
     }
+}
+
+#[derive(Debug)]
+struct PollsRemoteTask {
+    registry: PeerRegistry,
+    client: Arc<Spy>,
+}
+
+#[async_trait::async_trait]
+impl Skill for PollsRemoteTask {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("poll-remote").provides("peer.poll")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let call = PeerTaskCall::prepare(
+            &self.registry,
+            Arc::clone(&self.client) as Arc<dyn PeerClient>,
+            PeerTask {
+                peer: reviewer(),
+                id: "remote-task-42".to_owned(),
+                context_id: Some("matter-1".to_owned()),
+            },
+        )
+        .map_err(|error| SkillError::Other(error.to_string()))?;
+        let snapshot = cx.effect(call).await?;
+        Ok(Outcome::done(snapshot.map(|value| {
+            serde_json::to_value(value).expect("task snapshot serializes")
+        })))
+    }
+}
+
+#[tokio::test]
+async fn a_remote_task_poll_is_journaled_and_replay_does_not_poll_again() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Arc::new(Spy::default());
+    let registry = PeerRegistry::new().allow(
+        reviewer(),
+        PeerGrant::new(Scope::of(["audit.check"]))
+            .read_only()
+            .with_credential(
+                &reviewer(),
+                PeerCredential::for_audience(reviewer(), SECRET),
+            ),
+    );
+    let trust_probe = PeerTaskCall::prepare(
+        &registry,
+        Arc::clone(&client) as Arc<dyn PeerClient>,
+        PeerTask {
+            peer: reviewer(),
+            id: "trust-probe".to_owned(),
+            context_id: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(trust_probe.trust(), Trust::Untrusted);
+    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(PollsRemoteTask {
+            registry,
+            client: Arc::clone(&client),
+        })
+        .build();
+
+    let live = runtime.run("peer.poll", json!({})).await.unwrap();
+    assert_eq!(live.status, RunStatus::Succeeded);
+    assert_eq!(client.task_reads.lock().unwrap().len(), 1);
+    assert_eq!(
+        client.task_reads.lock().unwrap()[0].2.as_deref(),
+        Some(SECRET),
+        "the task read did not use the audience-bound peer credential"
+    );
+    let replayed = runtime
+        .replay(live.run_id, agentplane::runtime::Mode::Strict)
+        .await
+        .unwrap();
+    assert_eq!(replayed.status, RunStatus::Succeeded);
+    assert_eq!(
+        client.task_reads.lock().unwrap().len(),
+        1,
+        "strict replay polled the remote peer again"
+    );
 }
 
 // ── Freshness ───────────────────────────────────────────────────────────────

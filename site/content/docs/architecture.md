@@ -850,6 +850,14 @@ machine.
 admission and result-application follow, so a plan's stopping point does not
 depend on its schedule.
 
+This is the useful part of Pregel — a bulk-synchronous ready set with parallel
+work and deterministic state application — without importing cyclic mutable
+channels. A cycle would execute one step id more than once, collide with its
+effect-key/journal slice, and make authorization depend on data observed after
+the plan was frozen. Dynamic control flow therefore remains an explicit,
+versioned replan with lineage. A graph algorithm that is itself deterministic
+can still live inside one skill; it does not redefine the runtime protocol.
+
 **Completion is structural**: every terminal node must have run. A workload
 asserting it finished is not evidence.
 
@@ -1496,6 +1504,31 @@ Two drivers ship, both off by default and both thin. What each carries is a
 commodity, the mapping decides whether a request may be sent again and whether
 the budget is telling the truth.
 
+### MCP, context and tools (`mcp`)
+
+`McpClient` is a host, not only a tool transport. It uses one explicit
+`host_info()` capability profile: Tasks are negotiated; elicitation, sampling,
+roots and subscriptions are absent because the runtime has no governed callback
+path for them. Advertising a callback and then handling it inside `perform`
+would put nondeterministic human/model/filesystem work inside one effect and off
+the journal.
+
+Three data paths are built:
+
+* `McpPrompt` performs an exact-granted `prompts/get`; arguments, server, name
+  and sensitivity contract are in effect identity.
+* `McpResource` performs an exact-granted `resources/read`; text and blobs stay
+  typed protocol JSON and arrive untrusted.
+* a tool may return `resultType: task`; `McpTaskPoll`, `McpTaskUpdate` and
+  `McpTaskCancel` expose `tasks/get`, `tasks/update` and `tasks/cancel` as
+  separate effects. Polling is a replayable read, updates bind the exact
+  labelled responses and default to operator recovery, and cooperative cancel
+  is idempotent but never mistaken for proof that work stopped.
+
+For manifested agents, `spec.context.prompts/resources` is the review artifact
+and `McpAccess::from_manifest` is the deployment catalogue. Server discovery is
+still only a diff: an MCP server cannot grant itself a prompt, resource or tool.
+
 ### A2A, calling out (`a2a`)
 
 The outbound effect is deliberately narrow: an A2A 1.0 JSON-RPC `SendMessage`
@@ -1505,10 +1538,12 @@ the response contains exactly one `task` or `message`. `CardClient` separately
 provides SSRF-safe Agent Card discovery, optional mandatory verification, and
 binding/version/tenant-aware interface selection. The server provides
 `GetTask`, `ListTasks`, streaming/subscription, cancellation, durable push, and
-extended cards. The outbound `PeerClient` does not yet expose a first-class
-poll/subscribe handle for a returned remote task; callers needing that lifecycle
-must implement it as explicit effects rather than treating `SendMessage` as a
-complete long-running exchange.
+extended cards. A returned Task becomes a typed `PeerTask`; `PeerTaskCall` polls
+it as an untrusted journaled effect under the same peer grant and
+audience-bound credential. Strict replay reads the recorded snapshot and never
+polls again. Subscription remains a server-side journal view rather than a
+second client event channel; outbound callers use explicit polling or an
+application webhook mapped into the existing inbound-event boundary.
 
 A2A tasks are long-running and stateful, so "did the peer act?" is not a detail.
 
@@ -1616,15 +1651,15 @@ unsupported before a skill runs, and a declared `mediaType` must agree with the
 chosen member. Inbound messages must have `ROLE_USER`. Previously unknown file
 fields or server-role messages could be accepted as ordinary input.
 
-**Context continuation is supported; task continuation is not.** `contextId`
-maps to a durable case. Each follow-up is a new immutable task/run attached to
-that case, so history remains deploy-safe and auditable. A2A 1.0 also permits a
-follow-up carrying `taskId` and uses it to resume `INPUT_REQUIRED`; this server
-refuses that path with `UnsupportedOperationError` rather than silently starting
-over. That preserves the runtime's immutable-run model, but it means an
-interrupted task cannot currently be completed through standard A2A multi-turn.
-The card has no flag for this subset, so deployments must document it rather
-than describing the server as fully task-continuation complete.
+**Context continues with a new task; task input continues the same run.** A
+message carrying only `contextId` opens another immutable run in the same case.
+A message carrying `taskId` must name an `INPUT_REQUIRED` run and completes the
+exact journaled wait effect on which it stopped. The event store inserts and
+claims that message for the named run in one backend transaction; ordinary
+correlation matching would be wrong because two tasks may wait on the same
+business key. The authenticated peer and stable `messageId` form the dedup
+identity, a supplied `contextId` must match, and retrying the message after it
+completed the task returns the current Task rather than applying it twice.
 
 **The 1.0 method names only.** 1.0 renamed every method; `message/send` was 0.3.
 A server that answers both accepts clients which have silently lost half the

@@ -26,7 +26,7 @@ use deadpool_postgres::Pool;
 use tokio_postgres::error::SqlState;
 
 use crate::batch::{BatchCensus, BatchStore, ItemOutcome, ItemRecord};
-use crate::case::{BufferedEvent, ClaimError};
+use crate::case::{BufferedEvent, ClaimError, TargetedDelivery};
 use crate::case::{CaseCensus, CaseStore, Correlation, EventStore, TaskStore, TimerStore};
 use crate::core::{
     BatchId, Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, DeadLetter, Deadline,
@@ -828,6 +828,7 @@ fn deadline_from(row: &tokio_postgres::Row) -> Result<Deadline, StoreError> {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl EventStore for PostgresStore {
     async fn buffer(&self, event: &InboundEvent, at: Timestamp) -> Result<bool, StoreError> {
         let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
@@ -1013,6 +1014,137 @@ impl EventStore for PostgresStore {
         }
         tx.commit().await.map_err(|e| be(&e))?;
         Ok(None)
+    }
+
+    async fn deliver_to(
+        &self,
+        target: RunId,
+        event: &InboundEvent,
+        at: Timestamp,
+    ) -> Result<TargetedDelivery, StoreError> {
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        let tenant = self.tenant_name();
+        let event_id = event.dedup_key();
+
+        let existing_claim: Option<Option<String>> = tx
+            .query_opt(
+                "SELECT claimed_by FROM inbound_events
+                  WHERE tenant = $1 AND event_id = $2 FOR UPDATE",
+                &[&tenant, &event_id],
+            )
+            .await
+            .map_err(|e| be(&e))?
+            .map(|row| row.get(0));
+
+        // Lock this run's candidate subscription rows. Two continuations for
+        // one task then serialize before either can insert its event.
+        let rows = tx
+            .query(
+                "SELECT effect_key, case_id, step, phase, namespace, value
+                   FROM subscriptions
+                  WHERE tenant = $1 AND run_id = $2 AND event_kind = $3
+                  ORDER BY created_at ASC
+                  FOR UPDATE",
+                &[&tenant, &target.to_string(), &event.kind],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let Some(selected) = rows.iter().find(|row| {
+            let namespace: String = row.get(4);
+            let value: String = row.get(5);
+            event
+                .correlation
+                .iter()
+                .any(|key| key.namespace == namespace && key.value == value)
+        }) else {
+            tx.commit().await.map_err(|e| be(&e))?;
+            return Ok(TargetedDelivery::NotWaiting);
+        };
+
+        let effect: String = selected.get(0);
+        let case: Option<String> = selected.get(1);
+        let step: i64 = selected.get(2);
+        let phase: String = selected.get(3);
+        let subscription = Subscription {
+            run: target,
+            case: case
+                .map(|value| CaseId::parse(&value))
+                .transpose()
+                .map_err(|e| corrupt("bad case id", e))?,
+            effect: EffectKey::from_hex(&effect).map_err(|e| corrupt("bad effect key", e))?,
+            step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
+            phase: phase_from(&phase),
+            kind: event.kind.clone(),
+            correlation: rows
+                .iter()
+                .filter(|row| row.get::<_, String>(0) == effect)
+                .map(|row| CorrelationKey::new(row.get::<_, String>(4), row.get::<_, String>(5)))
+                .collect(),
+        };
+
+        if let Some(claimed_by) = existing_claim {
+            tx.commit().await.map_err(|e| be(&e))?;
+            return Ok(
+                if claimed_by.as_deref() == Some(target.to_string().as_str()) {
+                    TargetedDelivery::Matched(subscription)
+                } else {
+                    TargetedDelivery::Duplicate
+                },
+            );
+        }
+
+        let inserted = tx
+            .execute(
+                "INSERT INTO inbound_events
+                   (event_id, source, bare_id, kind, payload, received_at,
+                    claimed_by, claimed_at, tenant)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8)
+                 ON CONFLICT (tenant, event_id) DO NOTHING",
+                &[
+                    &event_id,
+                    &event.source,
+                    &event.id,
+                    &event.kind,
+                    &event.payload.to_string(),
+                    &at.unix_timestamp(),
+                    &target.to_string(),
+                    &tenant,
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if inserted == 0 {
+            let claimed_by: Option<String> = tx
+                .query_one(
+                    "SELECT claimed_by FROM inbound_events
+                      WHERE tenant = $1 AND event_id = $2",
+                    &[&tenant, &event_id],
+                )
+                .await
+                .map_err(|e| be(&e))?
+                .get(0);
+            tx.commit().await.map_err(|e| be(&e))?;
+            return Ok(
+                if claimed_by.as_deref() == Some(target.to_string().as_str()) {
+                    TargetedDelivery::Matched(subscription)
+                } else {
+                    TargetedDelivery::Duplicate
+                },
+            );
+        }
+        for key in &event.correlation {
+            tx.execute(
+                "INSERT INTO inbound_correlation (event_id, namespace, value, tenant)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                &[&event_id, &key.namespace, &key.value, &tenant],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(TargetedDelivery::Matched(subscription))
     }
 
     async fn unsubscribe(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError> {

@@ -103,6 +103,13 @@ pub struct Spec {
     /// Tools this agent may call. An empty list grants nothing.
     #[serde(default)]
     pub tools: Vec<ToolGrant>,
+    /// External context this agent may retrieve.
+    ///
+    /// Separate from tools because reads of prompts/resources do not grant an
+    /// action, but they still cross a trust and data-egress boundary and must
+    /// not be invisible in a manifested agent's review artifact.
+    #[serde(default, skip_serializing_if = "ContextGrants::is_empty")]
+    pub context: ContextGrants,
     /// Whether a human decides before this agent's answer is returned.
     ///
     /// Only meaningful with [`execution`](Self::execution): a hand-written skill
@@ -151,6 +158,42 @@ pub struct Spec {
     /// Form bounded durable facts from each declarative agent answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_formation: Option<MemoryFormation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextGrants {
+    #[serde(default)]
+    pub prompts: Vec<ContextPrompt>,
+    #[serde(default)]
+    pub resources: Vec<ContextResource>,
+}
+
+impl ContextGrants {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.prompts.is_empty() && self.resources.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextPrompt {
+    pub server: String,
+    pub name: String,
+    #[serde(default = "public_sensitivity")]
+    pub max_input_sensitivity: Sensitivity,
+    #[serde(default = "public_sensitivity")]
+    pub output_sensitivity: Sensitivity,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextResource {
+    pub server: String,
+    pub uri: String,
+    #[serde(default = "public_sensitivity")]
+    pub output_sensitivity: Sensitivity,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -781,6 +824,7 @@ impl Manifest {
         self.validate_oversight()?;
         self.validate_tool_approval()?;
         self.validate_tool_grants()?;
+        self.validate_context_grants()?;
         self.validate_topology()?;
         self.validate_models()?;
         self.validate_output()?;
@@ -820,6 +864,34 @@ impl Manifest {
         }
         if self.spec.budgets.is_none() {
             return Err(ManifestError::Unbounded);
+        }
+        Ok(())
+    }
+
+    fn validate_context_grants(&self) -> Result<(), ManifestError> {
+        let mut prompts = std::collections::BTreeSet::new();
+        for grant in &self.spec.context.prompts {
+            if grant.server.trim().is_empty() || grant.name.trim().is_empty() {
+                return Err(ManifestError::Empty("spec.context.prompts[].server/name"));
+            }
+            if !prompts.insert((&grant.server, &grant.name)) {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.context.prompts contains duplicate '{}/{}'",
+                    grant.server, grant.name
+                )));
+            }
+        }
+        let mut resources = std::collections::BTreeSet::new();
+        for grant in &self.spec.context.resources {
+            if grant.server.trim().is_empty() || grant.uri.trim().is_empty() {
+                return Err(ManifestError::Empty("spec.context.resources[].server/uri"));
+            }
+            if !resources.insert((&grant.server, &grant.uri)) {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.context.resources contains duplicate '{}/{}'",
+                    grant.server, grant.uri
+                )));
+            }
         }
         Ok(())
     }
@@ -1151,6 +1223,24 @@ impl Manifest {
     #[must_use]
     pub fn tool_grant(&self, reference: &str) -> Option<&ToolGrant> {
         self.spec.tools.iter().find(|g| g.reference == reference)
+    }
+
+    #[must_use]
+    pub fn prompt_grant(&self, server: &str, name: &str) -> Option<&ContextPrompt> {
+        self.spec
+            .context
+            .prompts
+            .iter()
+            .find(|grant| grant.server == server && grant.name == name)
+    }
+
+    #[must_use]
+    pub fn resource_grant(&self, server: &str, uri: &str) -> Option<&ContextResource> {
+        self.spec
+            .context
+            .resources
+            .iter()
+            .find(|grant| grant.server == server && grant.uri == uri)
     }
 
     /// The declared output schema, if there is one.

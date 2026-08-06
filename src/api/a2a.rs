@@ -41,12 +41,13 @@
 //! to infer and it is used; when it advertises several and none was named, the
 //! call is refused rather than guessed.
 //!
-//! # The unsupported part says so
+//! # Optional capabilities say what is wired
 //!
 //! Streaming and non-terminal task subscription are durable journal views.
-//! Push notifications are not implemented: safe transport primitives are not a
-//! transactional outbox and retrying worker. Every push method therefore uses
-//! `PushNotificationNotSupportedError`, and the card advertises false.
+//! Push is advertised only after `with_push` supplies durable registration
+//! storage and a retrying transport worker; without that wiring every push
+//! method uses `PushNotificationNotSupportedError` and the card advertises
+//! false.
 
 use std::sync::Arc;
 
@@ -79,7 +80,7 @@ pub mod method {
     pub const CANCEL_TASK: &str = "CancelTask";
     pub const GET_EXTENDED_CARD: &str = "GetExtendedAgentCard";
 
-    /// Defined by the protocol, not implemented here.
+    /// Optional operations implemented by this server.
     pub const SEND_STREAMING: &str = "SendStreamingMessage";
     pub const SUBSCRIBE: &str = "SubscribeToTask";
     pub const LIST_TASKS: &str = "ListTasks";
@@ -110,6 +111,7 @@ pub mod code {
 pub mod action {
     pub const MESSAGE_SEND: &str = "a2a:message.send";
     pub const TASK_READ: &str = "a2a:task.read";
+    pub const TASK_CONTINUE: &str = "a2a:task.continue";
     pub const TASK_CANCEL: &str = "a2a:task.cancel";
     pub const CARD_EXTENDED: &str = "a2a:card.extended";
     /// Registering, reading or removing a webhook for a task.
@@ -120,6 +122,7 @@ pub mod action {
     pub const ALL: &[&str] = &[
         MESSAGE_SEND,
         TASK_READ,
+        TASK_CONTINUE,
         TASK_CANCEL,
         CARD_EXTENDED,
         TASK_PUSH,
@@ -1057,49 +1060,45 @@ async fn stream_method(
         };
         message.validate_parts()?;
         if message.task_id.is_some() {
-            return Err(RpcError::new(
-                code::UNSUPPORTED_OPERATION,
-                "continue the conversation with contextId; this server does not mutate an existing task run",
-            ));
-        }
-        let skill = resolve_skill(&server, &message)?;
-        let caller = server.gate(&headers, action::MESSAGE_SEND, &skill).await?;
-        if let Some(push) = params
-            .configuration
-            .as_ref()
-            .and_then(|configuration| configuration.task_push_notification_config.as_ref())
-        {
-            validate_inline_push(&server, &headers, &skill, push).await?;
-        }
-        // Admitted before the stream opens. A stream that begins and *then*
-        // reports a refusal has already told the client the work started —
-        // and an SSE body cannot carry a JSON-RPC error the client is looking
-        // for at that point.
-        let input = Tainted::from_source(
-            message.to_input(),
-            SourceId::new(format!("peer:{}", caller.actor)),
-        );
-        match spawn_a2a(&server, &skill, input, &message).await {
-            Ok(run) => {
-                if let Some(push) = params
-                    .configuration
-                    .as_ref()
-                    .and_then(|configuration| configuration.task_push_notification_config.as_ref())
-                {
-                    register_push(&server, push, run, 1).await?;
+            continue_task(&server, &headers, &message).await?
+        } else {
+            let skill = resolve_skill(&server, &message)?;
+            let caller = server.gate(&headers, action::MESSAGE_SEND, &skill).await?;
+            if let Some(push) = params
+                .configuration
+                .as_ref()
+                .and_then(|configuration| configuration.task_push_notification_config.as_ref())
+            {
+                validate_inline_push(&server, &headers, &skill, push).await?;
+            }
+            // Admitted before the stream opens. A stream that begins and *then*
+            // reports a refusal has already told the client the work started —
+            // and an SSE body cannot carry a JSON-RPC error the client is looking
+            // for at that point.
+            let input = Tainted::from_source(
+                message.to_input(),
+                SourceId::new(format!("peer:{}", caller.actor)),
+            );
+            match spawn_a2a(&server, &skill, input, &message).await {
+                Ok(run) => {
+                    if let Some(push) = params.configuration.as_ref().and_then(|configuration| {
+                        configuration.task_push_notification_config.as_ref()
+                    }) {
+                        register_push(&server, push, run, 1).await?;
+                    }
+                    run
                 }
-                run
+                Err(crate::core::RuntimeError::PolicyDenied(_)) => {
+                    return Err(RpcError::new(
+                        code::UNSUPPORTED_OPERATION,
+                        "this agent declined the request",
+                    ));
+                }
+                Err(crate::core::RuntimeError::QuotaExceeded(why)) => {
+                    return Err(RpcError::new(code::UNSUPPORTED_OPERATION, why.to_string()));
+                }
+                Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
             }
-            Err(crate::core::RuntimeError::PolicyDenied(_)) => {
-                return Err(RpcError::new(
-                    code::UNSUPPORTED_OPERATION,
-                    "this agent declined the request",
-                ));
-            }
-            Err(crate::core::RuntimeError::QuotaExceeded(why)) => {
-                return Err(RpcError::new(code::UNSUPPORTED_OPERATION, why.to_string()));
-            }
-            Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
         }
     };
 
@@ -1145,9 +1144,6 @@ async fn dispatch(
         method::CANCEL_TASK => cancel_task(server, headers, params).await,
         method::GET_EXTENDED_CARD => get_extended_card(server, headers).await,
 
-        // Defined by the protocol and not implemented. The spec's own codes,
-        // so a caller can tell "this agent cannot" from "you spelled it wrong"
-        // — and these are exactly the operations the card advertises as false.
         // Streaming is handled before dispatch; reaching here means the router
         // changed and this arm did not.
         method::SEND_STREAMING | method::SUBSCRIBE => Err(RpcError::new(
@@ -1184,6 +1180,116 @@ fn parse_params(value: &Value) -> Result<CommonParams, RpcError> {
     })
 }
 
+/// Continue one interrupted A2A task with a client message.
+///
+/// The run remains append-only: the message becomes the output of the exact
+/// `event.await` effect on which the task stopped, then ordinary resume replay
+/// carries execution forward. `EventStore::deliver_to` is task-addressed and
+/// atomic, so another run sharing the same business correlation key cannot
+/// consume this message.
+async fn continue_task(
+    server: &A2aServer,
+    headers: &HeaderMap,
+    message: &A2aMessage,
+) -> Result<RunId, RpcError> {
+    let raw = message
+        .task_id
+        .as_deref()
+        .ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "`taskId` is required"))?;
+    let run = RunId::parse(raw)
+        .map_err(|_| RpcError::new(code::TASK_NOT_FOUND, format!("no such task: {raw}")))?;
+    let caller = server
+        .gate(headers, action::TASK_CONTINUE, &run.to_string())
+        .await?;
+    let records = server
+        .runtime
+        .journal()
+        .read(run, 1)
+        .await
+        .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the journal could not be read"))?;
+    let Some(last) = records.last() else {
+        return Err(RpcError::new(
+            code::TASK_NOT_FOUND,
+            format!("no such task: {run}"),
+        ));
+    };
+    if matches!(
+        last.kind(),
+        RecordKind::RunSuspended {
+            reason: crate::core::SuspendReason::AwaitingTime { .. }
+        }
+    ) {
+        return Err(RpcError::new(
+            code::UNSUPPORTED_OPERATION,
+            "this task is sleeping until a timer fires and cannot accept input",
+        ));
+    }
+    if !matches!(
+        last.kind(),
+        RecordKind::RunSuspended { .. } | RecordKind::RunSealed { .. }
+    ) {
+        return Err(RpcError::new(
+            code::UNSUPPORTED_OPERATION,
+            "this task is not waiting for input",
+        ));
+    }
+    // Search history rather than only the last record so a transport retry of
+    // the message that completed a task can still be recognized as the same
+    // `(source, messageId)` and return the current task instead of a spurious
+    // terminal-task error. A different message id finds no live subscription
+    // and remains refused.
+    let (kind, correlation) = records
+        .iter()
+        .rev()
+        .find_map(|record| match record.kind() {
+            RecordKind::RunSuspended {
+                reason:
+                    crate::core::SuspendReason::AwaitingEvent {
+                        kind, correlation, ..
+                    },
+            } => Some((kind.clone(), correlation.clone())),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            RpcError::new(
+                code::UNSUPPORTED_OPERATION,
+                "this task has no input wait to continue",
+            )
+        })?;
+    let context = records
+        .iter()
+        .find_map(|record| record.body.case.map(|case| case.to_string()));
+    if let Some(sent) = message.context_id.as_deref()
+        && context.as_deref() != Some(sent)
+    {
+        return Err(RpcError::new(
+            code::INVALID_PARAMS,
+            "message.contextId does not match the referenced task",
+        ));
+    }
+
+    let event = crate::core::InboundEvent {
+        source: format!("a2a:peer:{}", caller.actor),
+        id: message.message_id.clone(),
+        kind,
+        correlation,
+        payload: message.to_input(),
+    };
+    match server.runtime.deliver_to(run, &event).await {
+        Ok(crate::core::Delivery::Resumed { .. } | crate::core::Delivery::Duplicate) => Ok(run),
+        Ok(crate::core::Delivery::Buffered) => Err(RpcError::new(
+            code::INTERNAL_ERROR,
+            "targeted task input was unexpectedly buffered",
+        )),
+        Err(crate::core::RuntimeError::PlanContract(_)) => Err(RpcError::new(
+            code::UNSUPPORTED_OPERATION,
+            "this task is no longer waiting for input",
+        )),
+        Err(error) => Err(RpcError::new(code::INTERNAL_ERROR, error.to_string())),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 async fn send_message(
     server: &A2aServer,
     headers: &HeaderMap,
@@ -1204,11 +1310,22 @@ async fn send_message(
     };
     message.validate_parts()?;
     if message.task_id.is_some() {
-        return Err(RpcError::new(
-            code::UNSUPPORTED_OPERATION,
-            "this server keeps each task as one immutable run; continue the conversation with \
-             contextId to create a new task in the same context",
-        ));
+        let history_length = params
+            .configuration
+            .as_ref()
+            .and_then(|configuration| configuration.history_length);
+        let run = continue_task(server, headers, &message).await?;
+        return get_task(
+            server,
+            headers,
+            CommonParams {
+                id: Some(run.to_string()),
+                history_length,
+                ..CommonParams::default()
+            },
+        )
+        .await
+        .map(|task| json!({ "task": task }));
     }
     let skill = resolve_skill(server, &message)?;
     let caller = server.gate(headers, action::MESSAGE_SEND, &skill).await?;
@@ -1480,6 +1597,14 @@ async fn get_task(
         .gate(headers, action::TASK_READ, &id.to_string())
         .await?;
 
+    load_task(server, id, params.history_length).await
+}
+
+async fn load_task(
+    server: &A2aServer,
+    id: RunId,
+    history_length: Option<usize>,
+) -> Result<Value, RpcError> {
     let records = server
         .runtime
         .journal()
@@ -1506,11 +1631,12 @@ async fn get_task(
         .find_map(|r| r.body.case.map(|c| c.to_string()));
 
     let mut task = task_of(id, state, &detail, case.clone());
-    task.history = task_history(id, &records, params.history_length, case.as_deref());
+    task.history = task_history(id, &records, history_length, case.as_deref());
     task.artifacts = task_artifacts(&server.runtime, id, state)
         .await
         .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
-    Ok(json!({ "task": task }))
+    serde_json::to_value(task)
+        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1714,43 +1840,59 @@ fn task_history(
         if limit == 0 {
             return None;
         }
-        records.iter().find_map(|record| {
-            let RecordKind::RunAdmitted { input, .. } = record.kind() else {
-                return None;
+        let mut history = Vec::new();
+        for record in records {
+            let input = match record.kind() {
+                RecordKind::RunAdmitted { input, .. } => Some(input),
+                RecordKind::EffectDone { output, .. } if output.get("$a2a_message").is_some() => {
+                    Some(output)
+                }
+                _ => None,
             };
+            let Some(input) = input else { continue };
             if let Some(message) = input.get("$a2a_message")
-                && let Ok(message) = serde_json::from_value::<A2aMessage>(message.clone())
+                && let Ok(mut message) = serde_json::from_value::<A2aMessage>(message.clone())
             {
-                return Some(vec![message]);
+                message.task_id = Some(run.to_string());
+                if message.context_id.is_none() {
+                    message.context_id = case.map(ToOwned::to_owned);
+                }
+                history.push(message);
+                continue;
             }
-            let text = input
-                .get("text")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            let media_type = if text.is_some() {
-                "text/plain"
-            } else {
-                "application/json"
-            };
-            Some(vec![A2aMessage {
-                message_id: format!("{run}-input"),
-                role: "ROLE_USER".to_owned(),
-                parts: vec![Part {
-                    data: text.is_none().then(|| input.clone()),
-                    text,
-                    raw: None,
-                    url: None,
-                    filename: None,
-                    media_type: Some(media_type.to_owned()),
+            // Non-A2A admission retained for old/directly-created tasks.
+            if history.is_empty() {
+                let text = input
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let media_type = if text.is_some() {
+                    "text/plain"
+                } else {
+                    "application/json"
+                };
+                history.push(A2aMessage {
+                    message_id: format!("{run}-input"),
+                    role: "ROLE_USER".to_owned(),
+                    parts: vec![Part {
+                        data: text.is_none().then(|| input.clone()),
+                        text,
+                        raw: None,
+                        url: None,
+                        filename: None,
+                        media_type: Some(media_type.to_owned()),
+                        metadata: None,
+                    }],
+                    context_id: case.map(ToOwned::to_owned),
+                    task_id: Some(run.to_string()),
                     metadata: None,
-                }],
-                context_id: case.map(ToOwned::to_owned),
-                task_id: Some(run.to_string()),
-                metadata: None,
-                extensions: Vec::new(),
-                reference_task_ids: Vec::new(),
-            }])
-        })
+                    extensions: Vec::new(),
+                    reference_task_ids: Vec::new(),
+                });
+            }
+        }
+        let keep_from = history.len().saturating_sub(limit);
+        (!history.is_empty()).then(|| history.split_off(keep_from))
     })
 }
 
@@ -1822,9 +1964,13 @@ async fn cancel_task(
     // Still `WORKING`, deliberately. The request is durable, and the run stops
     // at its next step boundary — reporting `CANCELED` here would claim it had
     // already stopped and unwound, which is exactly what has not happened yet.
-    Ok(json!({
-        "task": task_of(id, TaskState::Working, "cancellation requested", None)
-    }))
+    serde_json::to_value(task_of(
+        id,
+        TaskState::Working,
+        "cancellation requested",
+        None,
+    ))
+    .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))
 }
 
 async fn get_extended_card(server: &A2aServer, headers: &HeaderMap) -> Result<Value, RpcError> {

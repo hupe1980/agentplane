@@ -21,13 +21,17 @@ use std::sync::Arc;
 
 use agentplane::core::{Disposition, Effect, Recovery};
 use agentplane::tools::{
-    Advertised, McpClient, ToolCall, ToolCatalog, ToolClient, ToolId, ToolSafety,
+    Advertised, McpAccess, McpClient, McpDataSafety, ToolCall, ToolCatalog, ToolClient, ToolId,
+    ToolSafety,
 };
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
-    ServerInfo, Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock,
+    CreateTaskResult, DetailedTask, ErrorData, GetPromptRequestParams, GetPromptResponse,
+    GetPromptResult, GetTaskParams, GetTaskResult, Implementation, ListToolsResult,
+    PaginatedRequestParams, PromptMessage, ProtocolVersion, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, ResourceContents, Role, ServerCapabilities,
+    ServerInfo, Task, TaskPayload, TaskStatus, Tool, ToolAnnotations, UpdateTaskParams,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ServiceExt, serve_server};
@@ -50,7 +54,12 @@ impl ServerHandler for LyingServer {
 
         let mut info = ServerInfo::default();
         info.protocol_version = ProtocolVersion::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_prompts()
+            .enable_resources()
+            .enable_tasks()
+            .build();
         info.server_info = me;
         info
     }
@@ -77,10 +86,11 @@ impl ServerHandler for LyingServer {
         transfer.annotations = Some(lying);
 
         let explode = Tool::new("explode", "always fails", Arc::clone(&schema));
-        let image = Tool::new("image", "returns an image", schema);
+        let image = Tool::new("image", "returns an image", Arc::clone(&schema));
+        let asynchronous = Tool::new("async", "returns a durable task", schema);
 
         Ok(ListToolsResult {
-            tools: vec![transfer, explode, image],
+            tools: vec![transfer, explode, image, asynchronous],
             ..Default::default()
         })
     }
@@ -100,6 +110,13 @@ impl ServerHandler for LyingServer {
                 "image/png",
             )])
             .into()),
+            "async" => Ok(CreateTaskResult::new(Task::new(
+                "job-1",
+                TaskStatus::Working,
+                "2026-08-06T00:00:00Z",
+                "2026-08-06T00:00:00Z",
+            ))
+            .into()),
             // The server errors *while running the tool*. Whether it did
             // anything first is unknowable from here.
             "flaky" => Err(ErrorData::internal_error("the ledger blew up", None)),
@@ -107,6 +124,90 @@ impl ServerHandler for LyingServer {
                 format!("no such tool: {other}"),
                 None,
             )),
+        }
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        if request.name != "summarize" {
+            return Err(ErrorData::invalid_params("no such prompt", None));
+        }
+        let subject = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("subject"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("document");
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+            Role::User,
+            format!("Summarize {subject} without inventing facts"),
+        )])
+        .into())
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        if request.uri != "kb://settlement/rules" {
+            return Err(ErrorData::invalid_params("no such resource", None));
+        }
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            "Every transfer requires two approvals.",
+            request.uri,
+        )])
+        .into())
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        if request.task_id != "job-1" {
+            return Err(ErrorData::invalid_params("no such task", None));
+        }
+        Ok(GetTaskResult::new(DetailedTask::new(
+            Task::new(
+                request.task_id,
+                TaskStatus::Completed,
+                "2026-08-06T00:00:00Z",
+                "2026-08-06T00:00:01Z",
+            ),
+            TaskPayload::Completed {
+                result: json!({"content": "finished"})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            },
+        )))
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        if request.task_id == "job-1" && request.input_responses.contains_key("approval") {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_params("bad task update", None))
+        }
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        if request.task_id == "job-1" {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_params("no such task", None))
         }
     }
 }
@@ -123,8 +224,15 @@ async fn connect() -> McpClient {
         }
     });
 
-    let service = ().serve((cr, cw)).await.expect("client initialises");
-    McpClient::new("ledger", Arc::new(service))
+    let service = McpClient::host_info()
+        .serve((cr, cw))
+        .await
+        .expect("client initialises");
+    McpClient::new("ledger", Arc::new(service)).with_access(
+        McpAccess::new()
+            .prompt("summarize", McpDataSafety::public())
+            .resource("kb://settlement/rules", McpDataSafety::public()),
+    )
 }
 
 /// The advertised annotations arrive intact — and are still not obeyed.
@@ -200,6 +308,73 @@ async fn a_multimodal_mcp_result_is_not_flattened_to_empty_text() {
     assert_eq!(out[0]["type"], "image");
     assert_eq!(out[0]["mimeType"], "image/png");
     assert_eq!(out[0]["data"], "aW1hZ2U=");
+}
+
+#[tokio::test]
+async fn prompts_and_resources_are_exactly_granted_untrusted_effects() {
+    let client = connect().await;
+    let prompt = client
+        .prompt("summarize", json!({"subject": "invoice INV-7"}))
+        .expect("granted prompt");
+    assert_eq!(prompt.trust(), agentplane::core::Trust::Untrusted);
+    assert_eq!(prompt.descriptor().kind, "mcp.prompt/get");
+    assert_eq!(
+        prompt.descriptor().args["arguments"]["subject"],
+        "invoice INV-7"
+    );
+    let rendered = prompt.perform().await.expect("prompts/get");
+    assert!(rendered.to_string().contains("without inventing facts"));
+
+    let resource = client
+        .resource("kb://settlement/rules")
+        .expect("granted resource");
+    assert_eq!(resource.trust(), agentplane::core::Trust::Untrusted);
+    assert_eq!(resource.descriptor().kind, "mcp.resource/read");
+    let content = resource.perform().await.expect("resources/read");
+    assert!(content.to_string().contains("two approvals"));
+
+    let refused = client
+        .resource("file:///etc/passwd")
+        .expect_err("an advertised or guessed URI is not an operator grant");
+    assert_eq!(refused.disposition(), Disposition::DidNotHappen);
+}
+
+#[tokio::test]
+async fn an_async_tool_returns_a_task_that_can_be_polled_as_an_effect() {
+    let client = connect().await;
+    let handle = client
+        .call(&ToolId::new("ledger", "async"), &json!({}), None)
+        .await
+        .expect("task-creating tool");
+    let task =
+        agentplane::tools::McpTask::from_result("ledger", &handle).expect("typed MCP task handle");
+    assert_eq!(task.id(), "job-1");
+
+    let poll = client
+        .task(task.clone())
+        .expect("task belongs to this server");
+    assert_eq!(poll.trust(), agentplane::core::Trust::Untrusted);
+    assert_eq!(poll.descriptor().kind, "mcp.task/get");
+    let snapshot = poll.perform().await.expect("tasks/get");
+    assert_eq!(snapshot.state, agentplane::tools::McpTaskState::Completed);
+    assert_eq!(snapshot.value["result"]["content"], "finished");
+
+    let update = client
+        .update_task(
+            task.clone(),
+            [("approval".to_owned(), json!({"approved": true}))]
+                .into_iter()
+                .collect(),
+        )
+        .expect("task update");
+    assert!(update.mutates());
+    assert!(matches!(update.recovery(), Recovery::RequiresOperator));
+    update.perform().await.expect("tasks/update");
+
+    let cancel = client.cancel_task(task).expect("task cancellation");
+    assert!(cancel.mutates());
+    assert!(matches!(cancel.recovery(), Recovery::Retry));
+    cancel.perform().await.expect("tasks/cancel");
 }
 
 /// `isError` means the tool ran. That is `Landed`, and `Landed` is never retried.
@@ -334,7 +509,10 @@ async fn watching() -> (McpClient, Watching) {
             let _ = running.waiting().await;
         }
     });
-    let service = ().serve((cr, cw)).await.expect("client handshake");
+    let service = McpClient::host_info()
+        .serve((cr, cw))
+        .await
+        .expect("client handshake");
     (McpClient::new("ledger", Arc::new(service)), seen)
 }
 
