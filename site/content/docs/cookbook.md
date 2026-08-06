@@ -192,6 +192,46 @@ is that it does not need to be.
 Most agents need neither. `rt.run(capability, input)` is one capability and no
 graph, which is what nine of the twelve examples use.
 
+### Fan out to several specialists at once
+
+The unit of concurrency is the **plan node**, not the call. Nodes with no edge
+between them are one ready set and are dispatched together, each with its own
+journal slice — so "ask every relevant specialist, then decide" is one plan:
+
+```rust
+let plan = PlanIR::fan_out(
+    ["billing.anomaly", "billing.regulatory"],   // run concurrently
+    "billing.decide",                            // then combine
+);
+let out = rt.run_plan(plan, document).await?;
+```
+
+The aggregator receives one argument per branch, **keyed by the capability that
+produced it** — so adding a specialist cannot silently renumber what it reads,
+which hand-wiring by `StepId` does.
+
+Everything stays inside one run: one run id, one budget ledger, one case
+binding, and a strict replay that reassembles the whole fan-out without waking a
+single specialist.
+
+Two things it deliberately does not do:
+
+* **It does not set `topology`.** Whether a fan-out is collaboration depends on
+  whether the branches are other *agents* or this agent's own skills, and the
+  plan cannot tell. Declare it if it is: `parallel-disjoint` is for branches over
+  genuinely disjoint inputs — a fan-out over one shared input is *not* that, and
+  the validator will say so — while `distinct-authority` is the reason that fits
+  independent opinions from differently-privileged specialists.
+* **There is no `race`.** First-wins-cancel-the-rest is the one shape this
+  runtime refuses, and not for want of plumbing: abandoning an in-flight branch
+  leaves an announced effect with no terminal record, which is exactly the
+  unknown outcome the effect protocol exists to prevent. It would also make a
+  crash mid-race unrecoverable — some losers announced, no winner recorded, and
+  nothing safe to do on resume — and it would make the answer depend on which
+  machine was less loaded that day. Every branch runs to completion and every
+  outcome is on the record. That costs more, and it is the only version that can
+  be replayed.
+
 **The trap:** letting untrusted text become the instruction. A model reads its
 order and its data as the same undifferentiated text, so a document saying
 *"ignore previous instructions"* is obeyed like one if it lands in `/system`.

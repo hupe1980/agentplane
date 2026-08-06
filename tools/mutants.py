@@ -2607,6 +2607,34 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                mine.extend(s.descriptor().provides);",
         "",
     ),
+    "ACaseWriteReachesPolicyAsARead": (
+        "src/runtime/effects.rs",
+        "policy_sees_a_case_read_as_a_read_and_a_case_write_as_a_mutation",
+        "a versioned case-state write declares that it does not mutate, so it "
+        "reaches the policy engine as a read and every rule keyed on "
+        "`context.mutates` silently stops applying to it — including the taint "
+        "gate published on the security page",
+        "    /// It changes state other runs can observe. That is what mutating means.\n    fn mutates(&self) -> bool {\n        true\n    }",
+        "    fn mutates(&self) -> bool {\n        false\n    }",
+    ),
+    "ADeadlineTransitionReadsAnotherDeadline": (
+        "src/runtime/effects.rs",
+        "a_deadline_transition_records_the_state_that_deadline_moved_from",
+        "a deadline transition looks up some other obligation's state and "
+        "journals that as the one it moved from, so the record says a deadline "
+        "moved from a state it was never in",
+        "            .find(|d| d.name == self.name)",
+        "            .find(|d| d.name != self.name)",
+    ),
+    "ACaseStatusChangeReachesPolicyAsARead": (
+        "src/runtime/effects.rs",
+        "policy_sees_a_case_read_as_a_read_and_a_case_write_as_a_mutation",
+        "closing a case reaches the policy engine as a read, so a rule that "
+        "gates mutations of shared state does not apply to the one that ends "
+        "the matter",
+        "    /// It changes state other runs observe.\n    fn mutates(&self) -> bool {\n        true\n    }",
+        "    fn mutates(&self) -> bool {\n        false\n    }",
+    ),
     "McpDispatchesAnyServersTool": (
         "src/tools/mcp.rs",
         "a_tool_from_another_server_is_refused_rather_than_run_here",

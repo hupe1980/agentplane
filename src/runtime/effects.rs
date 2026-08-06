@@ -57,10 +57,23 @@ impl Effect for Clock {
     }
 }
 
-/// A test/demo effect that records an externally visible action.
+/// A test fixture standing in for an externally visible action.
 ///
 /// Counts its own invocations so tests can assert the property the whole design
 /// exists for: **replay does not perform it again**.
+///
+/// `#[doc(hidden)]` because it is public for the test suite's benefit and is not
+/// part of the API. It would be a poor model for a real effect: it declares that
+/// it mutates and still asks to be **retried** after an unknown outcome, which
+/// is the combination every real mutating effect must not have — the trait's own
+/// default gives a mutating effect `RequiresOperator` for exactly that reason.
+/// The override is here so the engine's retry paths have something retryable to
+/// exercise, and nowhere else.
+///
+/// It lives here rather than in `testkit` because `just test-default` runs the
+/// durability and recovery suites under the default feature set, and moving it
+/// behind a feature would quietly stop those from running there.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct Recorded {
     pub name: String,

@@ -1156,3 +1156,136 @@ async fn the_label_authorization_consulted_is_journaled() {
         "every effect recorded a label, including those that present none: {labels:?}"
     );
 }
+
+/// **A case read is not a mutation; a case write is** — as policy sees it.
+///
+/// `context.mutates` is what a deployment writes its taint gate against — the
+/// worked rule on the security page is literally
+/// `forbid ... when { context.mutates && context.label.trust == "untrusted" }`.
+/// So the flag has to be right on the effects that carry it, and nothing pinned
+/// it: a mutation sweep flipped `WriteCaseState::mutates` to `false` and the
+/// whole suite stayed green. Under that mutation a case-state write of untrusted
+/// data reaches policy as a *read*, and every rule keyed on `context.mutates`
+/// silently stops applying to it.
+///
+/// Both directions are asserted, because only one of them is dangerous and the
+/// other is what makes the assertion mean anything: a test that merely required
+/// `mutates == true` somewhere would pass with it hard-coded true everywhere.
+#[tokio::test]
+async fn policy_sees_a_case_read_as_a_read_and_a_case_write_as_a_mutation() {
+    use agentplane::case::CaseStore;
+    use agentplane::core::{CorrelationKey, PolicyEngine};
+
+    /// Records `(resource, mutates)` for every authorization request.
+    #[derive(Debug, Default)]
+    struct Watching(Mutex<Vec<(String, bool)>>);
+
+    impl PolicyEngine for Watching {
+        fn authorize(&self, r: &PolicyRequest<'_>) -> PolicyDecision {
+            let mutates = r
+                .context
+                .get("mutates")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            self.0
+                .lock()
+                .unwrap()
+                .push((r.resource.to_owned(), mutates));
+            PolicyDecision::Permit
+        }
+        fn bundle(&self) -> PolicyBundleIdentity {
+            test_bundle(b"watching")
+        }
+    }
+
+    #[derive(Debug)]
+    struct TouchesCase;
+
+    #[async_trait::async_trait]
+    impl Skill for TouchesCase {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("touches").provides("demo.touch")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let (_state, at) = cx.case_state().await?;
+            cx.put_case_state(at, json!({ "seen": true })).await?;
+            // The other two case mutations, so the same assertion covers every
+            // effect that changes state other runs observe.
+            cx.deadline("window", &agentplane::core::DeadlineSpec::days(1), None)
+                .await?;
+            cx.meet_deadline("window").await?;
+            cx.set_case_status(agentplane::core::CaseStatus::Closed)
+                .await?;
+            Ok(Outcome::done(Tainted::trusted(json!({}))))
+        }
+    }
+
+    let watching = Arc::new(Watching::default());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .policy(Arc::clone(&watching) as Arc<dyn PolicyEngine>)
+        .skill(TouchesCase)
+        .build()
+        .run_in_case(
+            "demo.touch",
+            json!({}),
+            "demo",
+            &[CorrelationKey::new("doc", "C-1")],
+        )
+        .await
+        .expect("run");
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    let seen = watching.0.lock().unwrap().clone();
+    let read = seen
+        .iter()
+        .find(|(r, _)| r == "case.read_state")
+        .unwrap_or_else(|| panic!("no case read reached policy: {seen:?}"));
+    let write = seen
+        .iter()
+        .find(|(r, _)| r == "case.write_state")
+        .unwrap_or_else(|| panic!("no case write reached policy: {seen:?}"));
+
+    assert!(
+        !read.1,
+        "a case-state read reached policy as a mutation, so a rule that gates \
+         mutations would fire on every read"
+    );
+    assert!(
+        write.1,
+        "a case-state write reached policy as a read, so every rule keyed on \
+         `context.mutates` silently stops applying to it — including the taint \
+         gate published on the security page"
+    );
+
+    // The other two mutations of shared state, for the same reason.
+    for resource in ["case.set_status", "case.transition_deadline"] {
+        let (_, mutates) = seen
+            .iter()
+            .find(|(r, _)| r == resource)
+            .unwrap_or_else(|| panic!("no {resource} reached policy: {seen:?}"));
+        assert!(
+            *mutates,
+            "{resource} reached policy as a read; it changes state other runs \
+             observe, so a rule gating mutations must see it as one"
+        );
+    }
+
+    // And a deadline *resolution* is not itself a mutation — it computes an
+    // instant. Without this the assertions above would pass with `mutates`
+    // hard-coded true for everything.
+    let (_, resolve) = seen
+        .iter()
+        .find(|(r, _)| r == "deadline.resolve")
+        .unwrap_or_else(|| panic!("no deadline resolution reached policy: {seen:?}"));
+    assert!(
+        !resolve,
+        "resolving a deadline reached policy as a mutation, so a rule gating \
+         mutations would fire on a calculation"
+    );
+}

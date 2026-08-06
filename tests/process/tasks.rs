@@ -15,7 +15,7 @@ use agentplane::core::{
     CaseStatus, CorrelationKey, DeadlineSpec, DeadlineState, Decision, Justification, OnExpiry,
     Outcome, Priority, Skill, SkillDescriptor, SkillError, Tainted, TaskSpec, TaskState, Timestamp,
 };
-use agentplane::journal::JournalStore;
+use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
@@ -993,4 +993,111 @@ spec:
         0,
         "a refused call was dispatched anyway"
     );
+}
+
+/// A deadline transition journals the state it moved **from**, for that deadline.
+///
+/// `meet_deadline` and `cancel_deadline` both discard the prior state, so it
+/// looks dead — but the effect's output is journaled, which is what lets an
+/// auditor read *this obligation was Pending when it was met* rather than only
+/// that it is Met now. Nothing tested it: a mutation flipping the lookup from
+/// `d.name == name` to `!=` — picking some **other** deadline's state — survived
+/// the whole suite.
+///
+/// Two obligations on one case, in different states, so the wrong lookup gives a
+/// visibly wrong answer. With one deadline the mutation is unobservable, which
+/// is exactly the fixture mistake that let it survive.
+#[tokio::test]
+async fn a_deadline_transition_records_the_state_that_deadline_moved_from() {
+    use agentplane::core::DeadlineState;
+
+    #[derive(Debug)]
+    struct TwoWindows;
+
+    #[async_trait::async_trait]
+    impl Skill for TwoWindows {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("two-windows").provides("demo.windows")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            cx.deadline("first", &DeadlineSpec::days(1), None).await?;
+            cx.deadline("second", &DeadlineSpec::days(2), None).await?;
+            // Move `first` out of Pending, so the two differ.
+            cx.cancel_deadline("first").await?;
+            // Now meet `second`: its prior state must be Pending, not
+            // `first`'s Cancelled.
+            cx.meet_deadline("second").await?;
+            Ok(Outcome::done(Tainted::trusted(json!({}))))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(store.clone() as Arc<dyn TaskStore>)
+        .skill(TwoWindows)
+        .build();
+
+    let out = rt
+        .run_in_case("demo.windows", json!({}), "windows", &[key("W-1")])
+        .await
+        .expect("run");
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    // The journaled outputs of the two transitions, in order.
+    let records = store.read(out.run_id, 1).await.expect("read");
+    // `EffectDone` carries the output; the *kind* is on the `EffectStarted`
+    // that precedes it, so walk in order and attribute each completion to the
+    // announcement it answers.
+    let mut priors: Vec<DeadlineState> = Vec::new();
+    let mut pending_kind: Option<String> = None;
+    for record in &records {
+        match record.kind() {
+            RecordKind::EffectStarted { descriptor, .. } => {
+                pending_kind = Some(descriptor.kind.clone());
+            }
+            RecordKind::EffectDone { output, .. } => {
+                if pending_kind.as_deref() == Some("case.transition_deadline")
+                    && let Ok(state) = serde_json::from_value::<DeadlineState>(output.clone())
+                {
+                    priors.push(state);
+                }
+                pending_kind = None;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        priors,
+        vec![DeadlineState::Pending, DeadlineState::Pending],
+        "each transition must record the prior state of *its own* obligation; \
+         reading another's makes the journal say a deadline moved from a state \
+         it was never in"
+    );
+
+    let deadlines = store
+        .deadlines(
+            store
+                .correlate(&[key("W-1")])
+                .await
+                .expect("correlate")
+                .expect("case"),
+        )
+        .await
+        .expect("deadlines");
+    let state = |name: &str| {
+        deadlines
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("no deadline {name}"))
+            .state
+    };
+    assert_eq!(state("first"), DeadlineState::Cancelled);
+    assert_eq!(state("second"), DeadlineState::Met);
 }
