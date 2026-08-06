@@ -202,7 +202,7 @@ decision that has to be visible — declare `budgets: {}` to mean it.
 | `max_steps` | steps |
 | `max_effects` | effects |
 | `max_tokens` | tokens, across every model call in the run |
-| `max_minor_units` | money in **minor units** — cents, not euros. A float would make a budget that fails to bind by a rounding error |
+| `max_minor_units` | money in **minor units** — cents, not euros. A float would make a budget that fails to bind by a rounding error, and it is **unsigned**, so a negative ceiling is a parse failure rather than a ceiling that un-spends itself |
 | `max_replans` | replans |
 | `max_wallclock_secs` | seconds, named for its unit so a manifest cannot mean minutes |
 

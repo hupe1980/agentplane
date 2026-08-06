@@ -530,6 +530,23 @@ pub struct Record {
     raw: Vec<u8>,
 }
 
+/// What a record attestation is taken over: the chain hash under the record
+/// domain.
+///
+/// A free function rather than two call sites, because signing and verifying
+/// must agree byte for byte and the two live 130 lines apart. Signing a labelled
+/// digest and verifying a bare one rejects every genuine signature, which is
+/// loud; doing it the other way round accepts a signature made for something
+/// else, which is not.
+///
+/// The label matters because the plane's workload key also seals
+/// [`Provenance`](crate::core::Provenance) blocks that travel to tool servers
+/// and peers. Without it those two signatures are the same shape over the same
+/// key, and nothing in either says which question it answered.
+fn record_signing_input(hash: Digest) -> Digest {
+    crate::core::signing_hash(crate::core::DOMAIN_RECORD, &hash)
+}
+
 impl Record {
     /// Serialize canonically and link into the chain.
     pub fn seal(body: RecordBody, prev_hash: Digest) -> Result<Self, StoreError> {
@@ -572,7 +589,7 @@ impl Record {
             body,
             prev_hash,
             hash,
-            attestation: signer.map(|s| s.attest(&hash)),
+            attestation: signer.map(|s| s.attest(&record_signing_input(hash))),
             raw,
         })
     }
@@ -699,7 +716,14 @@ impl Record {
         let head = Self::verify_chain(records, from)?;
         for r in records {
             match &r.attestation {
-                Some(a) if verifier.verify(&a.key_id, &r.hash, &a.signature) => {}
+                // Under the same domain `seal_signed` signed it. Verifying the
+                // bare chain hash here while signing a labelled one there would
+                // reject every genuine signature — and getting it backwards, so
+                // that a *labelled* signature verified against a bare digest,
+                // would silently restore the confusion the label exists to
+                // prevent. One helper, called from both, is why neither happens.
+                Some(a)
+                    if verifier.verify(&a.key_id, &record_signing_input(r.hash), &a.signature) => {}
                 Some(a) => {
                     return Err(StoreError::Corrupt {
                         seq: r.seq(),

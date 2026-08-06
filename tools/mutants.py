@@ -811,7 +811,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/journal/record.rs",
         "a_signature_from_the_wrong_key_is_refused",
         "a record signed by the wrong key is accepted",
-        "                Some(a) if verifier.verify(&a.key_id, &r.hash, &a.signature) => {}",
+        """                Some(a)
+                    if verifier.verify(&a.key_id, &record_signing_input(r.hash), &a.signature) => {}""",
         "                Some(_) => {}",
     ),
     "StrictVerificationTakesUnsigned": (

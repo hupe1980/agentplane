@@ -17,7 +17,7 @@ const BATCHES: TableDefinition<(&str, &str), (&str, u8)> = TableDefinition::new(
 /// interrupted item findable: a crash leaves no outcome beside a run id that can
 /// be replayed.
 /// `(run_id, outcome, has_outcome, detail, tokens, minor)`.
-type ItemRow<'a> = (&'a str, &'a str, u8, &'a str, i64, i64);
+type ItemRow<'a> = (&'a str, &'a str, u8, &'a str, u64, u64);
 
 const ITEMS: TableDefinition<(&str, &str, &str), ItemRow<'static>> =
     TableDefinition::new("batch_items");
@@ -138,7 +138,7 @@ impl BatchStore for RedbStore {
                 {
                     t.insert(
                         (tenant.as_str(), batch_key.as_str(), item.as_str()),
-                        (run_id.as_str(), "", 0u8, "", 0i64, 0i64),
+                        (run_id.as_str(), "", 0u8, "", 0u64, 0u64),
                     )
                     .map_err(|e| be(&e))?;
                 }
@@ -167,7 +167,7 @@ impl BatchStore for RedbStore {
                     })?,
                     outcome: outcome_from_row(has, &outcome, &detail),
                     spend: Spend {
-                        tokens: u64::try_from(tokens).unwrap_or(0),
+                        tokens,
                         minor_units: minor,
                     },
                 }
@@ -188,7 +188,7 @@ impl BatchStore for RedbStore {
         let tenant = self.tenant_name();
         let (batch_key, item) = (batch.to_string(), key.to_owned());
         let (state, detail) = outcome_to_row(outcome);
-        let tokens = i64::try_from(spend.tokens).unwrap_or(i64::MAX);
+        let tokens = spend.tokens;
         let minor = spend.minor_units;
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -271,7 +271,7 @@ impl BatchStore for RedbStore {
                     // Reserved, no outcome recorded.
                     c.in_flight += 1;
                 }
-                c.spend.tokens += u64::try_from(tokens).unwrap_or(0);
+                c.spend.tokens += tokens;
                 c.spend.minor_units += minor;
             }
             Ok(c)
@@ -306,7 +306,7 @@ impl BatchStore for RedbStore {
                     })?,
                     outcome: outcome_from_row(has, outcome, detail),
                     spend: Spend {
-                        tokens: u64::try_from(tokens).unwrap_or(0),
+                        tokens,
                         minor_units: minor,
                     },
                 });

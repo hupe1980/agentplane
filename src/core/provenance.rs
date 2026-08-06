@@ -164,10 +164,26 @@ impl Provenance {
         Digest::of(canon::value_bytes(&claim).as_slice())
     }
 
+    /// What the signature is actually taken over: the payload under this
+    /// crate's provenance domain.
+    ///
+    /// Separate from [`payload`](Self::payload) so the payload stays the thing a
+    /// reader can recompute and compare, while the signing input is the thing
+    /// that cannot be lifted onto another kind of signature — the plane's
+    /// workload key also attests journal records, and a bare digest makes those
+    /// two signatures the same shape.
+    #[must_use]
+    fn signing_input(&self, target: &str, arguments: &Value) -> Digest {
+        crate::core::signing_hash(
+            crate::core::DOMAIN_PROVENANCE,
+            &self.payload(target, arguments),
+        )
+    }
+
     /// Sign this block for one specific call.
     #[must_use]
     pub fn seal(mut self, signer: &dyn Signer, target: &str, arguments: &Value) -> Self {
-        self.attestation = Some(signer.attest(&self.payload(target, arguments)));
+        self.attestation = Some(signer.attest(&self.signing_input(target, arguments)));
         self
     }
 
@@ -181,7 +197,11 @@ impl Provenance {
         let Some(a) = &self.attestation else {
             return false;
         };
-        verifier.verify(&a.key_id, &self.payload(target, arguments), &a.signature)
+        verifier.verify(
+            &a.key_id,
+            &self.signing_input(target, arguments),
+            &a.signature,
+        )
     }
 
     /// The wire form: a `_meta`-shaped object.

@@ -25,13 +25,23 @@
 //! keys are sorted at serialization time, so the output is identical whether
 //! `Map` is ordered or not.
 //!
-//! Keys sort by Rust's `str` ordering, which is UTF-8 byte order. RFC 8785 (JSON
-//! Canonicalization Scheme) specifies UTF-16 code-unit order, and the two differ
-//! only for characters outside the Basic Multilingual Plane. That is noted
-//! rather than fixed because nothing here interoperates with another
-//! implementation's canonical bytes — what matters is that *this* crate is
-//! self-consistent and deterministic. If cross-implementation canonicalization
-//! is ever needed, this is the function to change and the digests are what move.
+//! # Keys sort by UTF-16 code unit, per RFC 8785
+//!
+//! Not by Rust's `str` ordering, which compares UTF-8 bytes. The two agree
+//! throughout the Basic Multilingual Plane and disagree above it, so every ASCII
+//! test passes under either — which is what made the UTF-8 version survive as
+//! long as it did.
+//!
+//! It stopped being an internal detail once a signed Agent Card left the
+//! process. That signature is over bytes canonicalized per RFC 8785 and checked
+//! by verifiers nobody here writes, so UTF-8 ordering would have produced a card
+//! that verifies against this crate and nothing else. `utf16_order` is the fix
+//! and `keys_sort_by_utf16_code_unit_not_utf8_byte` is the vector that
+//! distinguishes them.
+//!
+//! One JCS rule is deliberately not implemented: ECMAScript number formatting.
+//! A guard asserts the card carries no numbers, which is the honest way to hold
+//! a partial implementation — see `peers::card_sig`.
 
 use serde::Serialize;
 use serde_json::Value;

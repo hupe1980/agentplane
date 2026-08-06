@@ -36,7 +36,7 @@ const TERMS: TableDefinition<(&str, &str), &str> = TableDefinition::new("authori
 /// back as standing. That is not a hypothetical; it is what the first version of
 /// this table did, and the revocation test caught it. A sentinel that overlaps
 /// the domain it guards is a bug waiting for the one caller who uses that value.
-type BalanceRow<'a> = (u64, i64, u32, bool, i64, &'a str);
+type BalanceRow<'a> = (u64, u64, u32, bool, i64, &'a str);
 
 /// `(tenant, authority) -> `[`BalanceRow`].
 ///
@@ -48,7 +48,7 @@ const BALANCE: TableDefinition<(&str, &str), BalanceRow<'static>> =
 
 /// `(drawn tokens, drawn minor units, remaining tokens, remaining minor units,
 /// the draw ordinal this receipt was)`.
-type ReceiptRow = (u64, i64, u64, i64, u32);
+type ReceiptRow = (u64, u64, u64, u64, u32);
 
 /// `(tenant, authority, dispatch key) -> `[`ReceiptRow`].
 ///
@@ -97,7 +97,7 @@ impl AuthorityStore for RedbStore {
                             balance
                                 .insert(
                                     (tenant.as_str(), id.as_str()),
-                                    (0u64, 0i64, 0u32, false, 0i64, ""),
+                                    (0u64, 0u64, 0u32, false, 0i64, ""),
                                 )
                                 .map_err(|e| be(&e))?;
                             Ok(())

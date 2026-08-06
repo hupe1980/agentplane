@@ -257,6 +257,40 @@ fn pool_err(e: &impl std::fmt::Display) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
+/// `BIGINT` out of the database, `u64` in the type.
+///
+/// Every counted quantity this crate stores — tokens, minor units, item counts,
+/// draw ordinals — is unsigned, because a negative one reverses an accumulation
+/// and un-spends whichever ceiling is comparing against it. `PostgreSQL` has no
+/// unsigned integer, so the column is a `BIGINT` with a `CHECK` and this is the
+/// boundary that reads it back.
+///
+/// Clamping rather than wrapping: a row edited around the `CHECK` should read as
+/// *nothing left* rather than as billions, since only one of those two keeps a
+/// ceiling closed. Here once rather than at each of the six call sites it had,
+/// which were three spellings of the same conversion and would have stayed in
+/// step only by luck.
+pub(super) const fn amount_of(v: i64) -> u64 {
+    if v < 0 { 0 } else { v.cast_unsigned() }
+}
+
+/// `u64` in the type, `BIGINT` into the database.
+///
+/// Saturating for the reason [`Spend::plus`](crate::core::Spend::plus) is: a
+/// figure past `i64::MAX` minor units is not one any deployment holds, and
+/// clamping at the ceiling keeps a ceiling closed where a wrap would open one.
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "guarded above: values past i64::MAX clamp rather than wrapping"
+)]
+pub(super) const fn sql_amount(v: u64) -> i64 {
+    if v > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        v as i64
+    }
+}
+
 /// Seconds since the epoch, for lease bookkeeping only.
 ///
 /// Never enters the journal and never influences a replayed decision — it is

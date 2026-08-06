@@ -211,7 +211,7 @@ pub struct Usage {
     /// Priced by the driver rather than derived here: rates change, differ per
     /// model, and are a deployment's contract with its provider, not this
     /// crate's guess.
-    pub minor_units: i64,
+    pub minor_units: u64,
 }
 
 impl Usage {

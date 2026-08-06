@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use crate::core::{RunId, Spend, StoreError, Timestamp};
 use crate::quota::{QuotaError, QuotaStore};
 
-use super::postgres::PostgresStore;
+use super::postgres::{PostgresStore, amount_of, sql_amount};
 
 fn be(e: &tokio_postgres::Error) -> StoreError {
     StoreError::Backend(e.to_string())
@@ -175,8 +175,8 @@ impl QuotaStore for PostgresStore {
                 &[
                     &self.tenant_name(),
                     &period.to_owned(),
-                    &i64::try_from(spend.tokens).unwrap_or(i64::MAX),
-                    &spend.minor_units,
+                    &sql_amount(spend.tokens),
+                    &sql_amount(spend.minor_units),
                 ],
             )
             .await
@@ -195,8 +195,8 @@ impl QuotaStore for PostgresStore {
             .await
             .map_err(|e| be(&e))?;
         Ok(row.map_or_else(Spend::default, |r| Spend {
-            tokens: u64::try_from(r.get::<_, i64>(0)).unwrap_or(0),
-            minor_units: r.get::<_, i64>(1),
+            tokens: amount_of(r.get::<_, i64>(0)),
+            minor_units: amount_of(r.get::<_, i64>(1)),
         }))
     }
 

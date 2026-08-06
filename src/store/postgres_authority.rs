@@ -20,7 +20,7 @@ use crate::authority::{
 };
 use crate::core::{EffectKey, Spend, StoreError, Timestamp};
 
-use super::postgres::PostgresStore;
+use super::postgres::{PostgresStore, amount_of, sql_amount};
 
 /// Terms, balance and receipts, keyed by tenant throughout.
 ///
@@ -48,9 +48,9 @@ CREATE TABLE IF NOT EXISTS authority_terms (
 CREATE TABLE IF NOT EXISTS authority_balance (
     tenant      TEXT    NOT NULL,
     authority   TEXT    NOT NULL,
-    tokens      BIGINT  NOT NULL DEFAULT 0,
-    minor_units BIGINT  NOT NULL DEFAULT 0,
-    draws       BIGINT  NOT NULL DEFAULT 0,
+    tokens      BIGINT  NOT NULL DEFAULT 0 CHECK (tokens      >= 0),
+    minor_units BIGINT  NOT NULL DEFAULT 0 CHECK (minor_units >= 0),
+    draws       BIGINT  NOT NULL DEFAULT 0 CHECK (draws       >= 0),
     revoked     BOOLEAN NOT NULL DEFAULT FALSE,
     revoked_at  BIGINT  NOT NULL DEFAULT 0,
     reason      TEXT    NOT NULL DEFAULT '',
@@ -67,11 +67,11 @@ CREATE TABLE IF NOT EXISTS authority_receipt (
     tenant        TEXT   NOT NULL,
     authority     TEXT   NOT NULL,
     dispatch      TEXT   NOT NULL,
-    tokens        BIGINT NOT NULL,
-    minor_units   BIGINT NOT NULL,
-    rem_tokens    BIGINT NOT NULL,
-    rem_minor     BIGINT NOT NULL,
-    draw_ordinal  BIGINT NOT NULL,
+    tokens        BIGINT NOT NULL CHECK (tokens       >= 0),
+    minor_units   BIGINT NOT NULL CHECK (minor_units  >= 0),
+    rem_tokens    BIGINT NOT NULL CHECK (rem_tokens   >= 0),
+    rem_minor     BIGINT NOT NULL CHECK (rem_minor    >= 0),
+    draw_ordinal  BIGINT NOT NULL CHECK (draw_ordinal >= 0),
     PRIMARY KEY (tenant, authority, dispatch)
 );
 ";
@@ -82,14 +82,6 @@ fn be(e: &tokio_postgres::Error) -> StoreError {
 
 fn unavailable(e: &impl std::fmt::Display) -> AuthorityError {
     AuthorityError::Unavailable(e.to_string())
-}
-
-/// `i64` out of the database, `u64` in the type. Negative is impossible by
-/// construction — every write is a saturating add of two non-negatives — so a
-/// negative here means the row was edited outside this code, and clamping is
-/// the honest response rather than a wrap into billions.
-const fn tokens_of(v: i64) -> u64 {
-    if v < 0 { 0 } else { v.cast_unsigned() }
 }
 
 #[async_trait]
@@ -200,8 +192,8 @@ impl AuthorityStore for PostgresStore {
             .map_err(|e| unavailable(&be(&e)))?;
 
         let drawn = Spend {
-            tokens: tokens_of(balance.get(0)),
-            minor_units: balance.get(1),
+            tokens: amount_of(balance.get(0)),
+            minor_units: amount_of(balance.get(1)),
         };
         let taken: i64 = balance.get(2);
         let revoked: bool = balance.get(3);
@@ -229,8 +221,8 @@ impl AuthorityStore for PostgresStore {
             &[
                 &tenant,
                 &name,
-                &i64::try_from(amount.tokens).unwrap_or(i64::MAX),
-                &amount.minor_units,
+                &sql_amount(amount.tokens),
+                &sql_amount(amount.minor_units),
                 &ordinal,
             ],
         )
@@ -246,10 +238,10 @@ impl AuthorityStore for PostgresStore {
                 &tenant,
                 &name,
                 &dispatch,
-                &i64::try_from(amount.tokens).unwrap_or(i64::MAX),
-                &amount.minor_units,
-                &i64::try_from(left.tokens).unwrap_or(i64::MAX),
-                &left.minor_units,
+                &sql_amount(amount.tokens),
+                &sql_amount(amount.minor_units),
+                &sql_amount(left.tokens),
+                &sql_amount(left.minor_units),
                 &ordinal,
             ],
         )
@@ -345,8 +337,8 @@ impl AuthorityStore for PostgresStore {
         Ok(Some(AuthorityState {
             authority,
             drawn: Spend {
-                tokens: tokens_of(row.get(1)),
-                minor_units: row.get(2),
+                tokens: amount_of(row.get(1)),
+                minor_units: amount_of(row.get(2)),
             },
             draws: u32::try_from(draws).unwrap_or(u32::MAX),
             revoked: revoked.then(|| Revocation {
@@ -385,12 +377,12 @@ async fn receipt(
     Ok(Some(Drawn {
         authority: id.clone(),
         amount: Spend {
-            tokens: tokens_of(row.get(0)),
-            minor_units: row.get(1),
+            tokens: amount_of(row.get(0)),
+            minor_units: amount_of(row.get(1)),
         },
         remaining: Spend {
-            tokens: tokens_of(row.get(2)),
-            minor_units: row.get(3),
+            tokens: amount_of(row.get(2)),
+            minor_units: amount_of(row.get(3)),
         },
         draws: u32::try_from(ordinal).unwrap_or(u32::MAX),
     }))

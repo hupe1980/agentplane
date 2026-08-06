@@ -2251,34 +2251,6 @@ impl StepCtx<'_> {
         Ok((Tainted::with_label(snapshot.state, label), snapshot.version))
     }
 
-    /// Recall what this agent remembers about a subject.
-    ///
-    /// # Every item comes back labelled from its **provenance**
-    ///
-    /// Never from its content. Text asserting its own reliability is the
-    /// cheapest thing an attacker can write, so a memory derived from a model,
-    /// a peer or an inbound message stays untrusted however many times it is
-    /// re-read — and reaching a mutating sink with it takes the same journaled
-    /// release as any other untrusted value.
-    ///
-    /// That is the defence against the attack this whole module is shaped by: a
-    /// poisoned write becomes a standing instruction only if something later
-    /// treats it as one.
-    ///
-    /// # Journaled, and replayed by version
-    ///
-    /// The **selection** is recorded — ids, versions, content digests — and a
-    /// replay re-materialises exactly those versions rather than re-running the
-    /// search. So a run replayed after the corpus changed reads what it read,
-    /// not what a fresh ranking would return now.
-    ///
-    /// # Errors
-    ///
-    /// [`StepError`] if this plane has no memory store, if the recall fails, or
-    /// if a version this run read can no longer be reproduced — which is a
-    /// deliberate loud failure, not an empty result: a memory that was forgotten
-    /// makes the history that used it unreplayable, and saying so beats
-    /// replaying a different memory.
     /// Draw on a standing authority, or be refused.
     ///
     /// The ceiling that outlives a run: a customer's approved spend, a purchase
@@ -2327,6 +2299,34 @@ impl StepCtx<'_> {
             .into_unlabelled())
     }
 
+    /// Recall what this agent remembers about a subject.
+    ///
+    /// # Every item comes back labelled from its **provenance**
+    ///
+    /// Never from its content. Text asserting its own reliability is the
+    /// cheapest thing an attacker can write, so a memory derived from a model,
+    /// a peer or an inbound message stays untrusted however many times it is
+    /// re-read — and reaching a mutating sink with it takes the same journaled
+    /// release as any other untrusted value.
+    ///
+    /// That is the defence against the attack this whole module is shaped by: a
+    /// poisoned write becomes a standing instruction only if something later
+    /// treats it as one.
+    ///
+    /// # Journaled, and replayed by version
+    ///
+    /// The **selection** is recorded — ids, versions, content digests — and a
+    /// replay re-materialises exactly those versions rather than re-running the
+    /// search. So a run replayed after the corpus changed reads what it read,
+    /// not what a fresh ranking would return now.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError`] if this plane has no memory store, if the recall fails, or
+    /// if a version this run read can no longer be reproduced — which is a
+    /// deliberate loud failure, not an empty result: a memory that was forgotten
+    /// makes the history that used it unreplayable, and saying so beats
+    /// replaying a different memory.
     pub async fn recall(
         &mut self,
         mut query: crate::memory::Recall,
@@ -2797,28 +2797,6 @@ impl StepCtx<'_> {
         Ok(written)
     }
 
-    /// Store bytes in the blob store and record that this case produced them.
-    ///
-    /// The reason this lives on the context rather than on the blob store: the
-    /// runtime knows which case is running and the blob store deliberately does
-    /// not — it is content-addressed, and a digest cannot be reversed to find
-    /// the matter it belonged to. Writing through here means the association is
-    /// made at the only moment it is knowable, so an erasure request can later
-    /// be answered by case, which is the only unit anybody actually asks about.
-    /// The association is made before the blob write: a crash can leave a
-    /// harmless dangling link, repaired by retry, but never durable bytes that
-    /// case erasure cannot discover.
-    ///
-    /// Deliberately **not** a journaled effect. The digest is a pure function of
-    /// the bytes, so a replay that re-derives it gets the same answer without
-    /// re-performing anything, and writing content-addressed bytes twice is the
-    /// same write. What *is* journaled is whatever the skill does with the
-    /// digest next — a tool call carrying it, a case-state write recording it.
-    ///
-    /// # Errors
-    ///
-    /// If no blob store is configured, if the write fails, or if this step is
-    /// not running inside a case.
     /// The blob store for this run, sealed to its case.
     ///
     /// **Use this rather than a store held from the builder.** With a key ring
@@ -2892,6 +2870,28 @@ impl StepCtx<'_> {
         Ok(blobs)
     }
 
+    /// Store bytes in the blob store and record that this case produced them.
+    ///
+    /// The reason this lives on the context rather than on the blob store: the
+    /// runtime knows which case is running and the blob store deliberately does
+    /// not — it is content-addressed, and a digest cannot be reversed to find
+    /// the matter it belonged to. Writing through here means the association is
+    /// made at the only moment it is knowable, so an erasure request can later
+    /// be answered by case, which is the only unit anybody actually asks about.
+    /// The association is made before the blob write: a crash can leave a
+    /// harmless dangling link, repaired by retry, but never durable bytes that
+    /// case erasure cannot discover.
+    ///
+    /// Deliberately **not** a journaled effect. The digest is a pure function of
+    /// the bytes, so a replay that re-derives it gets the same answer without
+    /// re-performing anything, and writing content-addressed bytes twice is the
+    /// same write. What *is* journaled is whatever the skill does with the
+    /// digest next — a tool call carrying it, a case-state write recording it.
+    ///
+    /// # Errors
+    ///
+    /// If no blob store is configured, if the write fails, or if this step is
+    /// not running inside a case.
     pub async fn store_blob(&mut self, bytes: &[u8]) -> Result<crate::core::Digest, StepError> {
         let cx = self.case_ctx()?.clone();
         let digest = crate::core::Digest::of(bytes);
@@ -3500,7 +3500,7 @@ struct Commission {
 struct Commissioned {
     answer: Value,
     tokens: u64,
-    minor_units: i64,
+    minor_units: u64,
 }
 
 #[async_trait::async_trait]

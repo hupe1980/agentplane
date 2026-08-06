@@ -511,3 +511,183 @@ fn every_example_is_run_by_the_examples_recipe() {
          notices when they stop working: {missing:?}"
     );
 }
+
+/// No rustdoc block carries two of the same top-level section.
+///
+/// The shape this catches is a doc comment that has silently absorbed the one
+/// below it, which happens when a new method is inserted *between* an existing
+/// doc block and the function it belonged to. Nothing in the toolchain says a
+/// word: the block is valid rustdoc, the orphaned function compiles, and the
+/// only symptom is that one published page describes the wrong operation while
+/// another describes nothing.
+///
+/// It happened here. `StepCtx::draw` was inserted above `StepCtx::recall`'s doc
+/// comment, so `draw` — the method that spends a customer's standing
+/// authorization — was published under "Recall what this agent remembers about a
+/// subject", with two `# Errors` sections, one of them about a missing memory
+/// store. `recall` was published with no documentation at all.
+///
+/// A duplicated `# Errors` (or `# Panics`, or `# Examples`) is the mechanical
+/// fingerprint of that merge, because each is a section a single item has at
+/// most one of. Cheaper and far more precise than `missing_docs`, which fires
+/// 1124 times on this crate — mostly on builder methods whose names already say
+/// everything, where a doc comment would restate the code rather than explain
+/// it.
+#[test]
+fn no_doc_comment_has_absorbed_the_one_below_it() {
+    const SECTIONS: [&str; 4] = ["# Errors", "# Panics", "# Examples", "# Safety"];
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut checked = 0usize;
+    let mut merged: Vec<String> = Vec::new();
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![root.join("src")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("src is readable").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("readable");
+        let rel = file
+            .strip_prefix(root)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+
+        // One block is a maximal run of consecutive `///` lines. `//!` is
+        // excluded: a module header legitimately has several sections and is
+        // not attached to an item.
+        let mut block: Vec<&str> = Vec::new();
+        let mut start = 0usize;
+        for (i, line) in text.lines().chain(std::iter::once("")).enumerate() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("///") {
+                if block.is_empty() {
+                    start = i + 1;
+                }
+                block.push(rest.trim());
+                continue;
+            }
+            if !block.is_empty() {
+                checked += 1;
+                for section in SECTIONS {
+                    let n = block.iter().filter(|l| **l == section).count();
+                    if n > 1 {
+                        merged.push(format!(
+                            "{rel}:{start} has {n} `{section}` sections — this block \
+                             has absorbed the doc comment of the item below it"
+                        ));
+                    }
+                }
+                block.clear();
+            }
+        }
+    }
+
+    assert!(
+        checked > 1_000,
+        "only {checked} doc blocks were scanned — the `///` scan stopped \
+         matching and this guard is now inert"
+    );
+    assert!(merged.is_empty(), "{}", merged.join("\n"));
+}
+
+/// Every published YAML block is well-formed YAML, whole manifest or fragment.
+///
+/// `every_documented_manifest_parses` above checks blocks containing
+/// `apiVersion`, which is the right check for a complete agent and covers none
+/// of the **fragments** — a `spec:` excerpt showing one section, which is most
+/// of what the cookbook and manifest reference publish. A fragment is what a
+/// reader copies *into* a manifest they already have, so a broken one fails in
+/// their editor rather than in ours.
+///
+/// One was broken: the cookbook's protected-fields excerpt had
+/// `protected_fields:` indented past the sibling keys of its own list item, and
+/// the item keys under it indented past `path`. Both are YAML errors, and
+/// nothing read the block because it named no `apiVersion`.
+///
+/// Parsed as plain YAML rather than as a `Manifest`, because a fragment is by
+/// definition not a whole document — the question is whether the *shape* the
+/// page shows is syntactically real, not whether an excerpt is a complete
+/// agent.
+#[test]
+// `serde_yaml_ng` is the `manifest` feature's parser, and gating on the
+// feature rather than vendoring a second YAML crate keeps the guard reading
+// these blocks with the same parser that will read them for real.
+#[cfg(feature = "manifest")]
+fn every_published_yaml_fragment_is_well_formed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<std::path::PathBuf> = vec![root.join("README.md")];
+    let mut stack = vec![root.join("site/content")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("readable").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut checked = 0usize;
+    let mut broken: Vec<String> = Vec::new();
+
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("readable");
+        let rel = file
+            .strip_prefix(root)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        for (index, block) in text.split("```").enumerate() {
+            // Odd segments are inside a fence; the first line is its language.
+            if index % 2 == 0 {
+                continue;
+            }
+            let Some((lang, body)) = block.split_once('\n') else {
+                continue;
+            };
+            if lang.trim() != "yaml" {
+                continue;
+            }
+            checked += 1;
+            // A fragment is indented under a parent this excerpt does not show,
+            // so the common leading indentation is stripped before parsing —
+            // otherwise every excerpt fails for a reason that is not a defect.
+            let indent = body
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.len() - l.trim_start().len())
+                .min()
+                .unwrap_or(0);
+            let dedented: String = body
+                .lines()
+                .map(|l| if l.len() >= indent { &l[indent..] } else { l })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Err(error) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&dedented) {
+                broken.push(format!("{rel}: {error}\n---\n{dedented}"));
+            }
+        }
+    }
+
+    assert!(
+        checked > 10,
+        "only {checked} yaml fences were found — the fence scan stopped matching \
+         and this guard is now inert"
+    );
+    assert!(
+        broken.is_empty(),
+        "a reader copying these gets a parse error:\n{}",
+        broken.join("\n\n")
+    );
+}

@@ -657,7 +657,7 @@ pub struct Budgets {
     /// budget that fails to bind by a rounding error, and money is the one
     /// number nobody accepts "approximately" for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_minor_units: Option<i64>,
+    pub max_minor_units: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_replans: Option<u32>,
     /// Seconds. Named for its unit so a manifest cannot mean minutes.

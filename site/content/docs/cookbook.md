@@ -512,11 +512,11 @@ spec:
     - ref: "tool://validator/apply_correction"
       mutates: true
       max_sensitivity: internal
-            protected_fields:
-                - path: /target
-                    require_trusted: true
-                - path: /correction
-                    allowed_sources: [effect:model.complete]
+      protected_fields:
+        - path: /target
+          require_trusted: true
+        - path: /correction
+          allowed_sources: [effect:model.complete]
   budgets:
     max_tokens: 120000
     max_minor_units: 250      # cents, never a float
@@ -1102,14 +1102,14 @@ in the manifest:
 
 ```yaml
 context:
-    prompts:
-        - server: templates
-            name: summarize
-            max_input_sensitivity: internal
-    resources:
-        - server: knowledge
-            uri: kb://support/rules
-            output_sensitivity: internal
+  prompts:
+    - server: templates
+      name: summarize
+      max_input_sensitivity: internal
+  resources:
+    - server: knowledge
+      uri: kb://support/rules
+      output_sensitivity: internal
 ```
 
 Derive the deployment catalogue with
@@ -1353,6 +1353,19 @@ which leaves both on the record.
 The accounting is in the store rather than the process, for the same reason
 quotas are: an in-memory balance fails **open** the moment a second instance
 starts, which is exactly when a shared ceiling was needed.
+
+`cargo run --example standing_authority --features redb,testkit` runs all of
+this end to end: one envelope spent across two separate runs, a draw over the
+ceiling that consumes nothing, a revocation, and the terms still readable
+afterwards — because an authority that vanished on revocation would take with it
+the record of what the draws already taken were authorized by.
+
+There is deliberately no refund. `Spend` is unsigned, so no draw can un-spend a
+ceiling — a negative amount reverses the accumulation every ceiling here is
+built on, and one would have removed the per-run budget and the tenant quota
+alongside this. Restoring headroom means issuing another authority, which leaves
+both decisions on the record rather than netting them out to a number nobody can
+explain.
 
 Both backends implement `AuthorityStore` against **one conformance battery**,
 and that is where they differ in kind rather than degree. redb has a single

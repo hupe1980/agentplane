@@ -29,8 +29,8 @@ mod task;
 mod tenant;
 
 pub use attest::{
-    AttestError, Attestation, CheckpointSigner, DOMAIN_MANIFEST, KeyId, SignError, Signer,
-    Verifier, signing_hash,
+    AttestError, Attestation, CheckpointSigner, DOMAIN_MANIFEST, DOMAIN_PROVENANCE, DOMAIN_RECORD,
+    KeyId, SignError, Signer, Verifier, signing_hash,
 };
 pub use budget::{Budget, BudgetExceeded, Consumed, Ledger, Spend};
 pub use calendar::{Calendar, CalendarError, WallClock};

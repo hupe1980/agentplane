@@ -71,7 +71,7 @@ pub struct TenantQuota {
     /// Tokens this tenant may spend in one period.
     pub max_tokens_per_period: Option<u64>,
     /// Money, in minor units, this tenant may spend in one period.
-    pub max_minor_units_per_period: Option<i64>,
+    pub max_minor_units_per_period: Option<u64>,
     /// How long a spend period lasts.
     pub period: Period,
 }
@@ -139,8 +139,8 @@ pub enum QuotaError {
         tenant: String,
         period: String,
         unit: &'static str,
-        spent: i64,
-        limit: i64,
+        spent: u64,
+        limit: u64,
     },
 
     /// An operator stopped this tenant from starting new work.
@@ -273,8 +273,8 @@ pub fn check_spend(
             tenant: tenant.to_owned(),
             period: period.to_owned(),
             unit: "tokens",
-            spent: i64::try_from(spent.tokens).unwrap_or(i64::MAX),
-            limit: i64::try_from(limit).unwrap_or(i64::MAX),
+            spent: spent.tokens,
+            limit,
         });
     }
     if let Some(limit) = quota.max_minor_units_per_period

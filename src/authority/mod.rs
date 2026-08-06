@@ -39,16 +39,27 @@
 //!
 //! [`StepCtx::draw`]: crate::runtime::StepCtx::draw
 //!
-//! # Idempotent by effect key, not by amount
+//! # Idempotent by *dispatch* identifier — not by effect key, and not by amount
 //!
 //! A draw is a mutation, so a retry has to be safe. The store keys each draw by
-//! the [`EffectKey`] that made it and returns the original receipt for a repeat
-//! — the same shape as the journal's own exactly-once guarantee, and for the
-//! same reason: a read-then-write leaves a window two instances draw through,
-//! and the window is the whole guarantee when the ceiling is nearly spent.
+//! the identifier of the logical call that made it and returns the original
+//! receipt for a repeat, which is the same shape as the journal's own
+//! exactly-once guarantee and works for the same reason: a read-then-write
+//! leaves a window two instances draw through, and that window is the whole
+//! guarantee when a ceiling is nearly spent.
 //!
-//! Deduplicating on *amount* instead would be wrong in the obvious way: two
-//! legitimate €20 draws against one authority are not a duplicate.
+//! Which identifier is load-bearing, and the two wrong answers are instructive.
+//!
+//! * **The effect key** hashes the attempt number — it must, or a retry would
+//!   collide with the journaled failure before it and replay would read back the
+//!   failure. That makes it exactly wrong here: two attempts at one draw would
+//!   carry two keys and consume the authority twice. The type below is still an
+//!   [`EffectKey`], because [`Provenance::dispatch`] is one — it is the same key
+//!   with the attempt pinned to zero. Same type, different question.
+//! * **The amount** would collapse two legitimate €20 draws against one
+//!   authority into one.
+//!
+//! [`Provenance::dispatch`]: crate::core::Provenance::dispatch
 //!
 //! # What this is not
 //!
@@ -208,8 +219,7 @@ impl AuthorityState {
                 .authority
                 .ceiling
                 .minor_units
-                .saturating_sub(self.drawn.minor_units)
-                .max(0),
+                .saturating_sub(self.drawn.minor_units),
         }
     }
 }
@@ -455,8 +465,7 @@ pub fn permits(
         minor_units: authority
             .ceiling
             .minor_units
-            .saturating_sub(drawn.minor_units)
-            .max(0),
+            .saturating_sub(drawn.minor_units),
     };
     // Both axes, and either one exceeding refuses the whole draw. A draw that
     // took the money and declined the tokens would leave the caller having spent

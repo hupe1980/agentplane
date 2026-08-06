@@ -23,7 +23,7 @@ use super::redb::{MAX_STR, RedbStore, be, begin_write};
 const RUNNING: TableDefinition<(&str, &str), i64> = TableDefinition::new("quota_running");
 
 /// `(tenant, period) -> (tokens, minor_units)`.
-const SPENT: TableDefinition<(&str, &str), (u64, i64)> = TableDefinition::new("quota_spent");
+const SPENT: TableDefinition<(&str, &str), (u64, u64)> = TableDefinition::new("quota_spent");
 
 /// `tenant -> reason`. The emergency stop.
 ///

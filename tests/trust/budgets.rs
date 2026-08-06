@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 struct Metered {
     name: String,
     tokens: u64,
-    minor_units: i64,
+    minor_units: u64,
     calls: Arc<AtomicUsize>,
 }
 
@@ -39,7 +39,7 @@ impl Metered {
         }
     }
 
-    fn money(mut self, minor_units: i64) -> Self {
+    fn money(mut self, minor_units: u64) -> Self {
         self.minor_units = minor_units;
         self
     }
@@ -98,7 +98,7 @@ impl Skill for Noop {
 struct Spends {
     n: usize,
     tokens: u64,
-    minor_units: i64,
+    minor_units: u64,
     calls: Arc<AtomicUsize>,
 }
 

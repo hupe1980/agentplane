@@ -175,6 +175,7 @@ examples:
     cargo run --example mcp_tools --features redb,testkit,manifest,mcp
     cargo run --example blog_room --features redb,testkit,manifest
     cargo run --example a2a_peer --features redb,a2a-server,manifest
+    cargo run --example standing_authority --features redb,testkit
     cargo run --example streaming_run --features redb,testkit
 
 # the binary is never exercised by `cargo test` — it only compiles

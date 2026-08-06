@@ -34,7 +34,7 @@ use crate::core::{
     Subscription, Task, TaskId, TaskState, Timer, Timestamp,
 };
 
-use super::postgres::PostgresStore;
+use super::postgres::{PostgresStore, amount_of, sql_amount};
 
 pub(super) const CASE_SCHEMA: &str = "
 -- Every table here leads with the tenant, for the reason the journal schema
@@ -1777,8 +1777,8 @@ impl BatchStore for PostgresStore {
                     &key.to_owned(),
                     &state,
                     &detail,
-                    &i64::try_from(spend.tokens).unwrap_or(i64::MAX),
-                    &spend.minor_units,
+                    &sql_amount(spend.tokens),
+                    &sql_amount(spend.minor_units),
                     &self.tenant_name(),
                 ],
             )
@@ -1841,7 +1841,7 @@ impl BatchStore for PostgresStore {
             let n: i64 = row.get(1);
             let tokens: i64 = row.get(2);
             let minor: i64 = row.get(3);
-            let n = u64::try_from(n).unwrap_or(0);
+            let n = amount_of(n);
             match outcome.as_deref() {
                 Some("succeeded") => c.succeeded = n,
                 Some("failed") => c.failed = n,
@@ -1849,8 +1849,8 @@ impl BatchStore for PostgresStore {
                 Some("suspended") => c.suspended = n,
                 _ => c.in_flight = n,
             }
-            c.spend.tokens += u64::try_from(tokens).unwrap_or(0);
-            c.spend.minor_units += minor;
+            c.spend.tokens += amount_of(tokens);
+            c.spend.minor_units += amount_of(minor);
         }
         Ok(c)
     }
@@ -1878,8 +1878,8 @@ impl BatchStore for PostgresStore {
                     .map_err(|e| corrupt("bad run id", e))?,
                 outcome: outcome_from(row.get::<_, Option<String>>(2), row.get(3)),
                 spend: Spend {
-                    tokens: u64::try_from(row.get::<_, i64>(4)).unwrap_or(0),
-                    minor_units: row.get(5),
+                    tokens: amount_of(row.get::<_, i64>(4)),
+                    minor_units: amount_of(row.get::<_, i64>(5)),
                 },
             });
         }
@@ -1905,8 +1905,8 @@ fn item_from(row: &tokio_postgres::Row, key: &str) -> Result<ItemRecord, StoreEr
         run: RunId::parse(&run).map_err(|e| corrupt("bad run id", e))?,
         outcome: outcome_from(row.get::<_, Option<String>>(1), row.get(2)),
         spend: Spend {
-            tokens: u64::try_from(row.get::<_, i64>(3)).unwrap_or(0),
-            minor_units: row.get(4),
+            tokens: amount_of(row.get::<_, i64>(3)),
+            minor_units: amount_of(row.get::<_, i64>(4)),
         },
     })
 }

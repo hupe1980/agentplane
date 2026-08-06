@@ -46,8 +46,26 @@ pub struct Spend {
     ///
     /// Integer rather than float: money that rounds differently on two machines
     /// is money that produces two different budget verdicts.
-    #[serde(default, skip_serializing_if = "is_zero_i64")]
-    pub minor_units: i64,
+    ///
+    /// **Unsigned, and that is a security property rather than tidiness.** Every
+    /// ceiling in this crate — a [`Budget`], a [`TenantQuota`], a
+    /// [`StandingAuthority`] — is enforced by comparing an accumulated `Spend`
+    /// against a limit. A *negative* amount reverses the accumulation, so a
+    /// single one un-spends everything before it and the ceiling stops being
+    /// one. That was reachable while this was an `i64`: a €500 standing
+    /// authority could be drawn to zero, drawn again for −€400, and then drawn
+    /// for a further €400 — €900 against a €500 mandate, with every check
+    /// passing. Refusing negatives in each of the three enforcement paths would
+    /// have been three places to remember; making the state unrepresentable is
+    /// none.
+    ///
+    /// A refund or a credit is therefore not a `Spend`. It is a new
+    /// authorization, which is what leaves both decisions on the record.
+    ///
+    /// [`TenantQuota`]: crate::quota::TenantQuota
+    /// [`StandingAuthority`]: crate::authority::StandingAuthority
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub minor_units: u64,
 }
 
 impl Spend {
@@ -67,11 +85,6 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero_i64(v: &i64) -> bool {
-    *v == 0
-}
-
 impl Spend {
     #[must_use]
     pub const fn tokens(n: u64) -> Self {
@@ -82,7 +95,7 @@ impl Spend {
     }
 
     #[must_use]
-    pub const fn money(minor_units: i64) -> Self {
+    pub const fn money(minor_units: u64) -> Self {
         Self {
             tokens: 0,
             minor_units,
@@ -138,7 +151,7 @@ pub struct Budget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_minor_units: Option<i64>,
+    pub max_minor_units: Option<u64>,
     /// How many times a run may change its plan.
     ///
     /// A run that replans without bound is a run that has stopped making
@@ -201,7 +214,7 @@ impl Budget {
     }
 
     #[must_use]
-    pub const fn minor_units(mut self, n: i64) -> Self {
+    pub const fn minor_units(mut self, n: u64) -> Self {
         self.max_minor_units = Some(n);
         self
     }
@@ -283,7 +296,7 @@ pub enum BudgetExceeded {
     Tokens { allowed: u64, used: u64 },
 
     #[error("cost budget exhausted: {allowed} minor units permitted, {used} spent")]
-    Money { allowed: i64, used: i64 },
+    Money { allowed: u64, used: u64 },
 
     #[error("time budget exhausted: {allowed}s permitted, {used}s elapsed")]
     Wallclock { allowed: u64, used: u64 },
@@ -580,16 +593,51 @@ mod tests {
         ));
     }
 
+    /// A negative amount must not be *representable*, not merely refused.
+    ///
+    /// Every ceiling in this crate is an accumulate-and-compare, so one negative
+    /// figure un-spends everything before it. When `minor_units` was an `i64`
+    /// that was reachable and demonstrated: a €500 standing authority drawn to
+    /// zero, drawn again for −€400, then drawn for a further €400 — €900 against
+    /// a €500 mandate, with the ceiling check passing at every step.
+    ///
+    /// The fix was the type, so the compiler covers every caller and the three
+    /// enforcement paths need no rule of their own. What the compiler does *not*
+    /// cover is the deserialization boundary — a journal record, a stored row, a
+    /// manifest — and that is what this pins. Flip the field back to a signed
+    /// integer and these parse successfully instead of failing, which is the
+    /// only externally visible difference the change makes.
+    #[test]
+    fn a_negative_amount_does_not_deserialize() {
+        serde_json::from_str::<Spend>(r#"{"minor_units":-1}"#)
+            .expect_err("a negative spend un-spends every ceiling comparing against it");
+        serde_json::from_str::<Budget>(r#"{"max_minor_units":-1}"#)
+            .expect_err("a negative ceiling is not a ceiling");
+
+        // The positive half, so a refuse-everything change cannot pass: the
+        // ordinary forms still parse, and to the value they name.
+        assert_eq!(
+            serde_json::from_str::<Spend>(r#"{"minor_units":250}"#).expect("an ordinary spend"),
+            Spend::money(250)
+        );
+        assert_eq!(
+            serde_json::from_str::<Budget>(r#"{"max_minor_units":250}"#)
+                .expect("an ordinary ceiling")
+                .max_minor_units,
+            Some(250)
+        );
+    }
+
     /// A wrapping meter would silently re-open a budget that was already blown.
     #[test]
     fn spend_saturates_rather_than_wrapping() {
         let huge = Spend {
             tokens: u64::MAX,
-            minor_units: i64::MAX,
+            minor_units: u64::MAX,
         };
         let sum = huge.plus(Spend::tokens(10)).plus(Spend::money(10));
         assert_eq!(sum.tokens, u64::MAX);
-        assert_eq!(sum.minor_units, i64::MAX);
+        assert_eq!(sum.minor_units, u64::MAX);
     }
 
     /// The same journaled figures produce the same verdict — the property that

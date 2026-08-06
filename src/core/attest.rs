@@ -118,14 +118,23 @@ pub trait Signer: Send + Sync + Debug {
 /// a prefix of another with the boundary landing inside the payload — the same
 /// reason canonical encodings length-prefix their fields.
 ///
-/// **Not yet universal, and said plainly rather than implied.** Record
-/// attestations and witness cosignatures predate this and still sign their
-/// digest directly; unifying them is a known follow-up. The practical risk today
-/// is nil — confusing the two would need a *preimage*, since a manifest's digest
-/// is a hash of its own content and cannot be steered onto a chosen chain hash —
-/// but that argument is exactly the kind that stops holding when somebody adds a
-/// surface where the signer's input is more attacker-shaped. New surfaces use
-/// this.
+/// **Universal for every signature this crate defines**, which it was not when
+/// it was written: manifests used it and record attestations and provenance
+/// seals signed their digest directly. The caveat recorded here at the time said
+/// the argument for leaving them — that confusing two would need a preimage —
+/// "stops holding when somebody adds a surface where the signer's input is more
+/// attacker-shaped". Provenance sealing was then added and is exactly that
+/// surface: its payload carries a caller-chosen `target` and an arguments
+/// digest, and the sealed block travels to third-party tool servers and peers.
+/// So the three are separated rather than argued about.
+///
+/// The **one** signature deliberately not routed through here is the checkpoint
+/// cosignature. Its input is a C2SP `signed-note` body, which is an
+/// interoperable artifact: what a signature over it must cover is the format's
+/// business and not this crate's, so adding a label of ours would be this crate
+/// unilaterally redefining somebody else's wire. Separation there comes from the
+/// note's own structure — an origin line, a size and a root hash — rather than
+/// from a prefix, and the encoding is pinned by its own tests.
 #[must_use]
 pub fn signing_hash(domain: &str, payload: &Digest) -> Digest {
     let mut bytes = Vec::with_capacity(domain.len() + 33);
@@ -137,6 +146,22 @@ pub fn signing_hash(domain: &str, payload: &Digest) -> Digest {
 
 /// The domain a manifest signature is made under.
 pub const DOMAIN_MANIFEST: &str = "io.github.hupe1980.agentplane/manifest/v1";
+
+/// The domain a journal record's attestation is made under.
+///
+/// Answers *this key appended this record to this chain*. Distinct from
+/// [`DOMAIN_PROVENANCE`] because the two are signed by the **same** workload key
+/// on the same plane, and an attestation lifted from one to the other would say
+/// something nobody attested to.
+pub const DOMAIN_RECORD: &str = "io.github.hupe1980.agentplane/record/v1";
+
+/// The domain a provenance seal is made under.
+///
+/// Answers *this plane made this call, for this run, with these arguments*. The
+/// most exposed of the three: the sealed block is handed to tool servers and A2A
+/// peers, so its verifier is often somebody else's code and its payload contains
+/// values a caller chose.
+pub const DOMAIN_PROVENANCE: &str = "io.github.hupe1980.agentplane/provenance/v1";
 
 /// Signs the rare, high-value things: checkpoints and cosignatures.
 ///
@@ -240,4 +265,62 @@ pub enum AttestError {
         seq: crate::core::Seq,
         key_id: KeyId,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No two signature kinds share a signing input.
+    ///
+    /// The point of [`signing_hash`] is that a signature says *which question it
+    /// answered*, and a bare digest does not. Three surfaces sign with the same
+    /// key on the same plane — a manifest, a journal record, a provenance block
+    /// — so if any two produced the same input for the same payload, a signature
+    /// made for one would verify as the other.
+    ///
+    /// This is a *known-answer* comparison rather than a round trip: a round
+    /// trip would pass identically if `signing_hash` ignored its domain and
+    /// returned the payload unchanged, which is precisely the regression that
+    /// removing the separation would be.
+    #[test]
+    fn the_domains_do_not_collide_and_none_is_the_bare_payload() {
+        let payload = Digest::of(b"the same bytes under three questions");
+
+        let inputs = [
+            signing_hash(DOMAIN_MANIFEST, &payload),
+            signing_hash(DOMAIN_RECORD, &payload),
+            signing_hash(DOMAIN_PROVENANCE, &payload),
+        ];
+
+        for (i, a) in inputs.iter().enumerate() {
+            assert_ne!(
+                *a, payload,
+                "domain {i} signs the bare payload, so its signatures are \
+                 interchangeable with any surface that does not separate at all"
+            );
+            for b in &inputs[i + 1..] {
+                assert_ne!(
+                    a, b,
+                    "two domains produce one signing input, so a signature made \
+                     under one verifies under the other"
+                );
+            }
+        }
+    }
+
+    /// The `0x00` boundary is what stops one domain being a prefix of another.
+    ///
+    /// Without it, `".../record/v1"` followed by a payload and `".../record/v1x"`
+    /// followed by a shorter one could serialize to the same bytes. Concatenation
+    /// without a separator is the classic way a domain label stops separating.
+    #[test]
+    fn a_domain_cannot_be_extended_into_another() {
+        let payload = Digest::of(b"payload");
+        assert_ne!(
+            signing_hash("a", &payload),
+            signing_hash("a\u{0}", &payload),
+            "the label and the payload run together, so the boundary is guessable"
+        );
+    }
 }

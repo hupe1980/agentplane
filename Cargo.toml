@@ -349,6 +349,12 @@ must_use_candidate      = "allow"
 name              = "a2a_peer"
 required-features = ["redb", "a2a-server", "manifest"]
 
+# The ceiling that outlives a run, end to end: cumulative across runs,
+# exhausted, then revoked — with the terms still readable afterwards.
+[[example]]
+name              = "standing_authority"
+required-features = ["redb", "testkit"]
+
 # Live deltas beside a single journaled completion — the one part of the model
 # seam a fake could not reach until `FakeProvider::streaming`.
 [[example]]
