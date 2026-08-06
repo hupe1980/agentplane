@@ -95,6 +95,13 @@ This exact file uses the deterministic fake driver, so the first run needs
 file (that intentionally changes its digest), install the `providers` feature,
 and export the matching key.
 
+A file may hold **several** manifests separated by `---`, exactly as
+Kubernetes packages resources — so a multi-agent room (an orchestrator
+granted its specialists as `tool://agent/...` tools) deploys and runs as one
+file with no Rust anywhere. Each document keeps its own digest: the file is
+packaging, not identity. `agentplane run room.yaml` starts at the room's one
+declared orchestrator; say `--capability` when the file leaves any doubt.
+
 The answer goes to stdout and everything else to stderr, so it pipes. A run that
 is refused, exhausted or failed exits non-zero, because whoever scripts this
 needs the shell's own answer to "did it work".

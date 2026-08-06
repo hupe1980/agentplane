@@ -39,6 +39,23 @@ if "${BIN[@]}" run "$tmp" >/dev/null 2>&1; then
 fi
 echo "ok: refused, and said why"
 
+echo "── a room in one file: three agents, three digests, one run ──"
+ROOM=examples/room.yaml
+lines="$("${BIN[@]}" digest "$ROOM" | wc -l | tr -d ' ')"
+[[ "$lines" == "3" ]] || { echo "FAIL: a room of three printed $lines digests"; exit 1; }
+# No --capability: the desk is the room's one orchestrator, so the entry is
+# unambiguous and declared rather than guessed.
+"${BIN[@]}" run "$ROOM" --input '{"topic":"durable execution"}' >/dev/null
+echo "ok: the room ran, starting at its declared orchestrator"
+
+echo "── an ambiguous entry is refused, not guessed ──"
+if out="$("${BIN[@]}" run "$ROOM" --capability nothing.here 2>&1 >/dev/null)"; then
+    echo "FAIL: an unknown capability ran something"; exit 1
+fi
+echo "$out" | grep -q 'blog.desk' || {
+    echo "FAIL: the refusal did not list the candidates: $out"; exit 1; }
+echo "ok: refused, listing what the file provides"
+
 echo "── a failed run exits non-zero ──"
 if "${BIN[@]}" run "$YAML" --input 'not json' >/dev/null 2>&1; then
     echo "FAIL: bad input exited zero; a script could not tell it went wrong"

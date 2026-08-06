@@ -433,7 +433,10 @@ fn every_documented_manifest_parses() {
                 continue;
             }
             checked += 1;
-            if let Err(error) = Manifest::parse(body) {
+            // `parse_all`, not `parse`: a published block may be a whole
+            // room (documents separated by `---`), and each document is held
+            // to the same validation a single manifest is.
+            if let Err(error) = Manifest::parse_all(body).map(|_| ()) {
                 panic!(
                     "the manifest published in {} is refused by this crate's own \
                      parser, so a reader copying it gets an error rather than an \

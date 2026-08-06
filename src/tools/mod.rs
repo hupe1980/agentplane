@@ -90,6 +90,20 @@ pub struct ToolId {
 /// real MCP server in production, which a transport-bearing reference forbids.
 pub const TOOL_SCHEME: &str = "tool://";
 
+/// The reserved server that names **agents on this plane** rather than a
+/// transport.
+///
+/// A grant spelled `tool://agent/<capability>` offers another agent's
+/// capability to a tool-calling model. Dispatch is `StepCtx::commission`, not
+/// a wire: the consultation is a journaled delegation effect, so it replays,
+/// the label travels, the sub-run's spend bills the run that asked, and the
+/// specialist's own manifest still governs everything it does. The server
+/// component is reserved — wiring a remote transport or a typed tool under
+/// this name is refused at build, because a name that could mean either "an
+/// agent here" or "somebody's server" would let a deployment change which one
+/// answers without changing any reviewed document.
+pub const AGENT_SERVER: &str = "agent";
+
 impl ToolId {
     pub fn new(server: impl Into<String>, tool: impl Into<String>) -> Self {
         Self {
@@ -145,12 +159,18 @@ impl ToolId {
     }
 }
 
-/// Escape the one byte reserved by the model-name separator.
+/// Escape the separator byte, and the one byte providers refuse.
 ///
-/// Every input underscore becomes `_u`; therefore encoded components contain
-/// no `__`, and concatenating two of them with `__` is injective.
+/// Every input underscore becomes `_u`, so encoded components contain no `__`
+/// and concatenating two of them with `__` is injective. Dots become `_d` for
+/// a different reason: providers restrict function names to letters, digits,
+/// underscore and hyphen, and **capabilities are conventionally dotted**
+/// (`research.summarise`) — so an agent offered as a tool would otherwise be
+/// declared under a name the provider rejects before the model ever sees it.
+/// The escapes stay injective together because both rewrite into `_`-prefixed
+/// pairs after every original `_` has been escaped.
 fn wire_component(value: &str) -> String {
-    value.replace('_', "_u")
+    value.replace('_', "_u").replace('.', "_d")
 }
 
 impl std::fmt::Display for ToolId {

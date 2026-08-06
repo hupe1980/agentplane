@@ -2230,6 +2230,35 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if effect.mutates() {",
         "        if false {",
     ),
+    "ARoomMayDeclareOneAgentTwice": (
+        "src/manifest/mod.rs",
+        "a_bundle_declaring_one_agent_twice_is_refused",
+        "one file declaring the same agent twice parses as a room, so which "
+        "declaration governs is decided by registration order — a reviewed "
+        "disagreement resolved by accident",
+        "            if let Some(twin) = manifests\n"
+        "                .iter()\n"
+        "                .find(|prior| prior.metadata.name == m.metadata.name)\n"
+        "            {",
+        "            if let Some(twin) = manifests\n"
+        "                .iter()\n"
+        "                .find(|_prior| false)\n"
+        "            {",
+    ),
+    "AnAgentGrantNobodyProvidesIsAccepted": (
+        "src/runtime/executor.rs",
+        "an_agent_grant_naming_no_capability_refuses_the_build",
+        "an agent grant naming a capability no agent provides builds anyway, so "
+        "the model is offered a consultation that fails when chosen — paid for "
+        "and refused, on every run, instead of refused once at build",
+        "                    if !by_capability.contains_key(&Capability::new(id.tool.as_str())) {\n"
+        "                        return Err(BuildError::AgentToolUnknownCapability {\n"
+        "                            agent: m.metadata.name.clone(),\n"
+        "                            capability: id.tool,\n"
+        "                        });\n"
+        "                    }",
+        "",
+    ),
     "ASeveredLocalStreamIsCalledFree": (
         "src/model/chat_completions.rs",
         "chat_completions_a_stream_severed_after_generation_is_not_free_to_retry",

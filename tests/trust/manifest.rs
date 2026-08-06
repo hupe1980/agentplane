@@ -3733,3 +3733,353 @@ spec:
     assert!(matches!(outcome.status, RunStatus::Failed(_)));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
+
+// ── Agents as tools ─────────────────────────────────────────────────────────
+//
+// `tool://agent/<capability>` offers another agent's capability to a
+// tool-calling model. Dispatch is `commission`, so the consultation is a
+// journaled delegation: it replays without waking the specialist, the label
+// travels, the sub-run's spend bills the run that asked, and the depth
+// ceiling sees the hop. These tests hold the three surfaces separately: the
+// parse rules, the build-time capability check, and the dispatch itself.
+
+const ROOM_RESEARCHER: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: researcher, version: "1.0.0" }
+spec:
+  identity:
+    role: "Summarise a topic in one paragraph."
+  topology: { mode: single, role: specialist }
+  security:
+    # A commissioned input arrives Internal at least — the consulting model's
+    # own output — so a specialist whose ceiling stayed at the Public default
+    # would refuse every consultation. The design working, not a formality.
+    max_sensitivity_egress: internal
+  capabilities: { provides: [research.summarise] }
+  models: { privileged: { provider: fake, model: researcher-1 } }
+  execution: { kind: completion }
+  budgets: {}
+"#;
+
+const ROOM_EDITOR: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: editor, version: "1.0.0" }
+spec:
+  identity:
+    role: "Consult the researcher, then assemble the report."
+  topology:
+    mode: collaborative
+    role: orchestrator
+    reason: distinct-authority
+  security:
+    max_delegation_depth: 1
+    # The researcher's answer is Internal, and it rides the editor's next
+    # model turn — a Public ceiling would refuse the room's whole point.
+    max_sensitivity_egress: internal
+  capabilities: { provides: [blog.report] }
+  models: { privileged: { provider: fake, model: editor-1 } }
+  tools:
+    - ref: tool://agent/research.summarise
+      description: Ask the researcher to summarise a topic.
+      arguments:
+        type: object
+        properties:
+          topic: { type: string }
+        required: [topic]
+  execution: { kind: tool-calling, max_turns: 4 }
+  budgets: {}
+"#;
+
+/// The whole room, from two files and zero Rust — and a strict replay that
+/// reassembles it without waking anyone.
+#[tokio::test]
+async fn an_agent_is_consulted_as_a_granted_tool_and_replay_wakes_nobody() {
+    use agentplane::runtime::{Agent, Mode, RunStatus, Runtime};
+
+    let researcher = Manifest::parse(ROOM_RESEARCHER).expect("researcher");
+    let editor = Manifest::parse(ROOM_EDITOR).expect("editor");
+
+    let provider = agentplane::testkit::FakeProvider::new();
+    // Editor turn 1: consult the researcher. The wire name escapes the dot,
+    // because providers refuse function names containing one — a capability
+    // offered under its raw spelling would never reach the model at all.
+    provider.will_call_tool(
+        "call_1",
+        "agent__research_dsummarise",
+        serde_json::json!({ "topic": "printer fires" }),
+    );
+    // The researcher's one completion.
+    provider.will_say("Printers catch fire when the fuser jams.");
+    // Editor turn 2: the report.
+    provider.will_say("Room report: fuser jams cause printer fires.");
+
+    let store: std::sync::Arc<dyn agentplane::journal::JournalStore> =
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    // No toolbox and no tool server: the catalogue is derived from the
+    // declaration and the consultation needs no transport.
+    let rt = Runtime::builder(std::sync::Arc::clone(&store))
+        .provider(
+            "fake",
+            std::sync::Arc::clone(&provider)
+                as std::sync::Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&researcher))
+        .agent(Agent::new(&editor))
+        .build();
+
+    let out = rt
+        .run(
+            "blog.report",
+            serde_json::json!({ "q": "why do printers burn?" }),
+        )
+        .await
+        .expect("run");
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "the room did not finish: {:?}",
+        out.status
+    );
+    let answer = out.output.expect("an answer").to_string();
+    assert!(
+        answer.contains("Room report"),
+        "the editor's report is missing: {answer}"
+    );
+
+    // The model was called exactly three times: editor, researcher, editor —
+    // and the editor's second turn was handed the researcher's actual answer.
+    let asked = provider.asked();
+    assert_eq!(asked.len(), 3, "the room made {} model calls", asked.len());
+    assert!(
+        asked[2].exchanges[0]
+            .output
+            .to_string()
+            .contains("fuser jams"),
+        "the researcher's answer did not reach the editor's next turn: {:?}",
+        asked[2].exchanges[0].output
+    );
+
+    // Strict replay reassembles the room from the journal. The scripted
+    // provider is exhausted, so any model call here would fail loudly — the
+    // pass *is* the proof that nobody was woken.
+    let replayed = rt.replay(out.run_id, Mode::Strict).await.expect("replay");
+    assert!(
+        matches!(replayed.status, RunStatus::Succeeded),
+        "strict replay diverged: {:?}",
+        replayed.status
+    );
+    assert_eq!(
+        provider.asked().len(),
+        3,
+        "strict replay called a model — a consultation was performed again"
+    );
+}
+
+/// Every field an agent grant cannot back is refused at parse, with the
+/// baseline passing so a refuse-everything change cannot hide.
+#[test]
+fn an_agent_grant_carries_no_control_the_commission_path_cannot_enforce() {
+    Manifest::parse(ROOM_EDITOR).expect("the baseline agent grant parses");
+
+    let declared_read_only = ROOM_EDITOR.replace(
+        "      description: Ask the researcher to summarise a topic.",
+        "      mutates: false\n      description: Ask the researcher to summarise a topic.",
+    );
+    assert!(
+        matches!(
+            Manifest::parse(&declared_read_only),
+            Err(ManifestError::Unenforceable { field, .. }) if field == "spec.tools[].mutates"
+        ),
+        "an agent consultation declared read-only is a claim this manifest cannot back"
+    );
+
+    let with_protected_fields = ROOM_EDITOR.replace(
+        "      description: Ask the researcher to summarise a topic.",
+        "      protected_fields: [{ path: /topic, require_trusted: true }]\n      description: Ask the researcher to summarise a topic.",
+    );
+    assert!(
+        matches!(
+            Manifest::parse(&with_protected_fields),
+            Err(ManifestError::Unenforceable { field, .. }) if field == "spec.tools[].protected_fields"
+        ),
+        "a protected-field rule on the commission path would be reviewed and never checked"
+    );
+
+    let with_ceiling = ROOM_EDITOR.replace(
+        "      description: Ask the researcher to summarise a topic.",
+        "      max_sensitivity: internal\n      description: Ask the researcher to summarise a topic.",
+    );
+    assert!(
+        matches!(
+            Manifest::parse(&with_ceiling),
+            Err(ManifestError::Unenforceable { field, .. }) if field == "spec.tools[].max_sensitivity"
+        ),
+        "a sensitivity ceiling on the commission path would be reviewed and never checked"
+    );
+
+    // Consulting an agent is delegation, and the default topology is a lone
+    // specialist — so the arrangement must be declared.
+    let undeclared = ROOM_EDITOR
+        .replace(
+            "  topology:\n    mode: collaborative\n    role: orchestrator\n    reason: distinct-authority\n",
+            "",
+        );
+    assert!(
+        matches!(Manifest::parse(&undeclared), Err(ManifestError::Syntax(s)) if s.contains("orchestrator")),
+        "an agent grant without a declared orchestrator role must be refused"
+    );
+}
+
+/// A consultation that could never dispatch is refused before anything runs.
+#[tokio::test]
+async fn an_agent_grant_naming_no_capability_refuses_the_build() {
+    use agentplane::runtime::{Agent, BuildError, Runtime};
+
+    let editor = Manifest::parse(ROOM_EDITOR).expect("editor");
+    let provider = agentplane::testkit::FakeProvider::new();
+    let store: std::sync::Arc<dyn agentplane::journal::JournalStore> =
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+
+    // No researcher on the plane.
+    let err = Runtime::builder(store)
+        .provider(
+            "fake",
+            provider as std::sync::Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&editor))
+        .try_build()
+        .expect_err("a consultation nothing provides must refuse the build");
+    assert!(
+        matches!(
+            &err,
+            BuildError::AgentToolUnknownCapability { agent, capability }
+                if agent == "editor" && capability == "research.summarise"
+        ),
+        "wrong refusal: {err}"
+    );
+}
+
+/// An agent consulting itself is a loop wearing a grant.
+#[tokio::test]
+async fn an_agent_granting_its_own_capability_refuses_the_build() {
+    use agentplane::runtime::{Agent, BuildError, Runtime};
+
+    let narcissist = ROOM_EDITOR.replace(
+        "tool://agent/research.summarise",
+        "tool://agent/blog.report",
+    );
+    let manifest = Manifest::parse(&narcissist).expect("parses — the loop is a plane property");
+    let provider = agentplane::testkit::FakeProvider::new();
+    let store: std::sync::Arc<dyn agentplane::journal::JournalStore> =
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+
+    let err = Runtime::builder(store)
+        .provider(
+            "fake",
+            provider as std::sync::Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .try_build()
+        .expect_err("self-consultation must refuse the build");
+    assert!(
+        matches!(&err, BuildError::AgentToolSelfReference { .. }),
+        "wrong refusal: {err}"
+    );
+}
+
+/// The `agent` server name is reserved for agents on this plane.
+#[tokio::test]
+async fn the_agent_tool_server_name_is_reserved() {
+    use agentplane::runtime::{BuildError, Runtime};
+
+    #[derive(Debug)]
+    struct Nobody;
+    #[async_trait::async_trait]
+    impl agentplane::tools::ToolClient for Nobody {
+        async fn call(
+            &self,
+            _tool: &agentplane::tools::ToolId,
+            _arguments: &serde_json::Value,
+            _p: Option<&agentplane::core::Provenance>,
+        ) -> Result<serde_json::Value, agentplane::tools::ToolError> {
+            unreachable!("a reserved server must never be dialled")
+        }
+    }
+
+    let store: std::sync::Arc<dyn agentplane::journal::JournalStore> =
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let err = Runtime::builder(store)
+        .tool_server("agent", std::sync::Arc::new(Nobody))
+        .try_build()
+        .expect_err("a transport under the reserved name must refuse the build");
+    assert!(
+        matches!(&err, BuildError::ReservedToolServer),
+        "wrong refusal: {err}"
+    );
+}
+
+// ── One file, several manifests ─────────────────────────────────────────────
+
+/// `parse_all` is Kubernetes-style packaging: documents separated by `---`,
+/// stray separators skipped, every document held to full validation, and —
+/// the property that matters — **identity stays per-agent**: a document's
+/// digest inside a bundle equals its digest alone, so packaging two agents
+/// together moves neither's identity.
+#[test]
+fn a_file_may_hold_a_room_and_the_file_is_packaging_not_identity() {
+    let bundle = format!("---\n{ROOM_EDITOR}\n---\n{ROOM_RESEARCHER}\n---\n");
+    let room = Manifest::parse_all(&bundle).expect("the bundle parses");
+    assert_eq!(room.len(), 2, "stray separators became phantom agents");
+    assert_eq!(room[0].metadata.name, "editor");
+    assert_eq!(room[1].metadata.name, "researcher");
+
+    let alone = Manifest::parse(ROOM_RESEARCHER).expect("alone");
+    assert_eq!(
+        room[1].digest().expect("digest"),
+        alone.digest().expect("digest"),
+        "packaging changed an agent's identity — pinning and signing would \
+         depend on which file an agent happened to travel in"
+    );
+}
+
+/// Every document is validated, and the refusal names which one.
+#[test]
+fn a_bundle_with_one_broken_document_is_refused_whole() {
+    // An absent budget is the parse-level refusal every manifest is held to.
+    let broken = ROOM_RESEARCHER.replace("  budgets: {}\n", "");
+    let bundle = format!("{ROOM_EDITOR}\n---\n{broken}");
+    let err = Manifest::parse_all(&bundle).expect_err("two thirds of a room must not deploy");
+    // The first document is fine; the second is not — whatever the specific
+    // validation error, the file as a whole is refused.
+    drop(err);
+
+    let unparseable = format!("{ROOM_EDITOR}\n---\nnot: [valid: yaml");
+    let err = Manifest::parse_all(&unparseable).expect_err("syntax");
+    assert!(
+        err.to_string().contains("document 2"),
+        "the refusal did not say which document is broken: {err}"
+    );
+}
+
+/// One file declaring the same agent twice is a merge conflict, not a room.
+#[test]
+fn a_bundle_declaring_one_agent_twice_is_refused() {
+    let bundle = format!("{ROOM_RESEARCHER}\n---\n{ROOM_RESEARCHER}");
+    let err = Manifest::parse_all(&bundle).expect_err("a duplicate agent");
+    assert!(
+        err.to_string().contains("a second time"),
+        "wrong refusal: {err}"
+    );
+}
+
+/// A file with nothing in it is refused, not answered with an empty room.
+#[test]
+fn a_bundle_with_no_documents_is_refused() {
+    for empty in ["", "---\n", "---\n---\n"] {
+        assert!(
+            Manifest::parse_all(empty).is_err(),
+            "an empty file parsed as a room of nobody: {empty:?}"
+        );
+    }
+}

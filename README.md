@@ -76,7 +76,8 @@ cargo run --example manifest_run --features redb,testkit,manifest
 # reaching both, and a strict replay that calls neither.
 cargo run --example mcp_tools --features redb,testkit,manifest,mcp
 
-# Three agents — an orchestrator and two specialists — each with its own manifest.
+# Four agents, one plane: a coded editor that dictates the sequence, and a
+# YAML desk that consults the same specialists as tool://agent/... grants.
 cargo run --example blog_room --features redb,testkit,manifest
 
 # This plane served as an A2A 1.0 agent, called the way a peer would call it:
@@ -92,11 +93,15 @@ cargo run --example streaming_run --features redb,testkit
 cargo run --example standing_authority --features redb,testkit
 ```
 
-Or skip Rust entirely — a file and a key are the whole agent:
+Or skip Rust entirely — a file and a key are the whole agent, and a file may
+hold a whole **room**: several manifests separated by `---`, the Kubernetes
+packaging convention. Each document keeps its own digest — the file is
+packaging, not identity — and a run starts at the room's declared orchestrator:
 
 ```sh
 cargo install agentplane --features cli
 agentplane run examples/summariser.yaml --input '{"ticket": "printer on fire"}'
+agentplane run examples/room.yaml       --input '{"topic": "durable execution"}'
 ```
 
 `durable_pipeline` prints the whole claim in four steps: a live run, a strict

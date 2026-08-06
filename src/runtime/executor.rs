@@ -3930,6 +3930,16 @@ impl RuntimeBuilder {
         let tools = tools.unwrap_or_default();
         let remote_servers: std::collections::BTreeSet<String> =
             servers.iter().map(|(name, _)| name.clone()).collect();
+        // `agent` names agents on this plane, and only them. A transport or a
+        // typed tool under that name would let a deployment decide whether a
+        // reviewed grant means "an agent here" or "somebody's server".
+        if remote_servers.contains(crate::tools::AGENT_SERVER)
+            || tools
+                .servers()
+                .any(|server| server == crate::tools::AGENT_SERVER)
+        {
+            return Err(BuildError::ReservedToolServer);
+        }
         if remote_servers.len() != servers.len() {
             // The set lost an entry, so some name appears twice. Naming it beats
             // reporting a count a reader then has to go and diff by hand.
@@ -4229,13 +4239,33 @@ impl RuntimeBuilder {
                         agent: m.metadata.name.clone(),
                     });
                 }
+                // A plane whose only tools are agents needs no toolbox and no
+                // transport: the catalogue is derived from the declaration and
+                // dispatch is `commission`. The empty router is deliberate —
+                // an agent-server call never reaches it, and anything else
+                // arriving there is refused as unreachable rather than
+                // silently absorbed.
+                let tools = self.tools.clone().or_else(|| {
+                    let all_agent = !m.spec.tools.is_empty()
+                        && m.spec.tools.iter().all(|g| {
+                            crate::tools::ToolId::parse(&g.reference)
+                                .is_some_and(|id| id.server == crate::tools::AGENT_SERVER)
+                        });
+                    all_agent.then(|| {
+                        (
+                            Arc::new(crate::tools::ToolCatalog::from_manifest(&m)),
+                            Arc::new(crate::tools::ToolRouter::new())
+                                as Arc<dyn crate::tools::ToolClient>,
+                        )
+                    })
+                });
                 for cap in &m.spec.capabilities.provides {
                     let skill: Arc<dyn Skill> = Arc::new(super::declarative::Declarative::new(
                         execution.kind,
                         cap.clone(),
                         m.metadata.name.clone(),
                         Arc::clone(&provider),
-                        self.tools.clone(),
+                        tools.clone(),
                         execution.max_turns,
                     ));
                     mine.insert(Capability::new(cap.as_str()));
@@ -4245,6 +4275,39 @@ impl RuntimeBuilder {
             }
 
             check_advertises_what_it_provides(&m, &mine)?;
+        }
+
+        // Agent grants are validated against the finished plane, because the
+        // capability they name may belong to an agent registered *later* — a
+        // check inside the loop would pass or fail on registration order.
+        #[cfg(feature = "manifest")]
+        {
+            let mut checked = std::collections::BTreeSet::new();
+            for m in governed_by.values() {
+                if !checked.insert(m.metadata.name.clone()) {
+                    continue;
+                }
+                for grant in &m.spec.tools {
+                    let Some(id) = crate::tools::ToolId::parse(&grant.reference) else {
+                        continue;
+                    };
+                    if id.server != crate::tools::AGENT_SERVER {
+                        continue;
+                    }
+                    if m.spec.capabilities.provides.contains(&id.tool) {
+                        return Err(BuildError::AgentToolSelfReference {
+                            agent: m.metadata.name.clone(),
+                            capability: id.tool,
+                        });
+                    }
+                    if !by_capability.contains_key(&Capability::new(id.tool.as_str())) {
+                        return Err(BuildError::AgentToolUnknownCapability {
+                            agent: m.metadata.name.clone(),
+                            capability: id.tool,
+                        });
+                    }
+                }
+            }
         }
 
         Ok(Arc::new_cyclic(|self_ref| Runtime {

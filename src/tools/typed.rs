@@ -400,6 +400,12 @@ impl ToolBox {
             }
         }
         for id in granted.keys() {
+            // Agent grants have no implementation *here* by design: dispatch is
+            // `commission`, and whether the capability exists is checked at
+            // build against the plane's registered agents.
+            if id.server == super::AGENT_SERVER {
+                continue;
+            }
             if !self.tools.contains_key(id) && !remote_servers.contains(&id.server) {
                 problems.push(format!(
                     "'{id}' is granted but nothing implements it and no transport is \

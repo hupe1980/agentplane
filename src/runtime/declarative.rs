@@ -251,13 +251,6 @@ impl Declarative {
                 }
 
                 let reference = id.reference();
-                let prepared = crate::tools::ToolCall::prepare(
-                    &catalog,
-                    Arc::clone(&client),
-                    id,
-                    asked.arguments.clone(),
-                )
-                .map_err(|e| SkillError::Other(e.to_string()))?;
 
                 // The arguments *are* part of the completion, so they carry
                 // the completion's own label rather than one invented
@@ -313,6 +306,44 @@ impl Declarative {
                         continue;
                     }
                 }
+
+                // An agent consulted as a tool dispatches through `commission`,
+                // never through a transport: the consultation is a journaled
+                // delegation effect, so it replays without waking the
+                // specialist, the label travels with the answer, the sub-run's
+                // spend bills this run, and the depth ceiling sees the hop.
+                // Placed **after** the approval gate above, so a grant that
+                // requires a person applies to consultations exactly as it
+                // does to transported calls — a reviewer sees the capability
+                // and the arguments before any specialist runs.
+                if id.server == crate::tools::AGENT_SERVER {
+                    match cx.commission(&id.tool, args).await {
+                        Ok(answer) => {
+                            conversation_label = conversation_label.join(answer.label());
+                            exchanges
+                                .push(crate::model::ToolExchange::ok(asked, answer.peek().clone()));
+                        }
+                        Err(e) => match model_facing(&e) {
+                            Some(detail) => {
+                                exchanges.push(crate::model::ToolExchange::failed(asked, detail));
+                            }
+                            // Not something to tell the model and carry on —
+                            // the specialist may have acted before failing, and
+                            // the executor reaches its own verdict, exactly as
+                            // it would for a transported call in doubt.
+                            None => return Err(e.into()),
+                        },
+                    }
+                    continue;
+                }
+
+                let prepared = crate::tools::ToolCall::prepare(
+                    &catalog,
+                    Arc::clone(&client),
+                    id,
+                    asked.arguments.clone(),
+                )
+                .map_err(|e| SkillError::Other(e.to_string()))?;
 
                 match cx.sink(prepared, &args).await {
                     Ok(result) => {

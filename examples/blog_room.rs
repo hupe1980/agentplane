@@ -11,7 +11,7 @@
 //! **One plane, three agents.** A runtime is not an agent: it owns the journal,
 //! the drivers and the process identity, and *runs* whichever agents are
 //! registered on it. Each of the three here — `blog-editor.yaml`,
-//! `blog-researcher.yaml`, `blog-writer.yaml` — keeps its own manifest, prompt,
+//! `room.yaml`'s desk, researcher and writer — keeps its own manifest, prompt,
 //! model and ceilings, and is separately answerable. What they share is
 //! infrastructure, which is what infrastructure is for.
 //!
@@ -27,6 +27,14 @@
 //! 4. Budgets compose: the specialists' spend is billed to the run that
 //!    commissioned it, because a delegation is an effect and effects report
 //!    what they cost.
+//! 5. The same room again with **nobody writing an orchestrator**: a
+//!    `tool-calling` desk (`room.yaml`, first document) is granted the specialists as
+//!    `tool://agent/...` tools, and the model decides whom to consult. The
+//!    choice between the two shapes is the real lesson — the coded `Editor`
+//!    *dictates* the sequence (the writer always receives the researcher's
+//!    claims, because code says so), while the desk leaves consultation to
+//!    the model's judgement. A sequence that is policy belongs in code or a
+//!    plan; a consultation that is a judgement call can be a grant.
 //!
 //! Point 3 is what makes this more than a function call. `cx.commission` is an
 //! **effect**: journaled under a key, so a replay reads the answer back instead
@@ -51,8 +59,11 @@ use agentplane::testkit::FakeProvider;
 use serde_json::{Value, json};
 
 const EDITOR: &str = include_str!("blog-editor.yaml");
-const RESEARCHER: &str = include_str!("blog-researcher.yaml");
-const WRITER: &str = include_str!("blog-writer.yaml");
+/// The YAML room: desk, researcher and writer in **one file**, separated by
+/// `---` — the Kubernetes packaging convention, and what lets the `agentplane`
+/// CLI run this same room with no Rust at all. The file is packaging; each
+/// document keeps its own digest.
+const ROOM: &str = include_str!("room.yaml");
 
 // ── The orchestrator ────────────────────────────────────────────────────────
 
@@ -106,7 +117,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
 
     let provider = FakeProvider::new();
-    let (research_m, write_m) = (parse(RESEARCHER), parse(WRITER));
+    // One file, three documents. `parse_all` validates every document — a
+    // room two-thirds of which deploys is worse than one that refuses whole.
+    let room = Manifest::parse_all(ROOM).expect("the room parses");
+    let by_name = |name: &str| {
+        room.iter()
+            .find(|m| m.metadata.name == name)
+            .cloned()
+            .expect("the room names it")
+    };
+    let (desk_m, research_m, write_m) = (
+        by_name("blog-desk"),
+        by_name("blog-researcher"),
+        by_name("blog-writer"),
+    );
 
     // **One plane, three agents.** A runtime is not an agent: it owns the
     // journal, the drivers and the process identity, and runs whichever agents
@@ -118,6 +142,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .agent(Agent::new(&research_m))
         .agent(Agent::new(&write_m))
         .agent(Agent::new(&editor_m).skill(Editor))
+        // The fourth agent needs no skill at all: its manifest grants the
+        // specialists as tools, and the runtime supplies the loop.
+        .agent(Agent::new(&desk_m))
         .build();
 
     println!("the room, each with its own declaration:");
@@ -161,13 +188,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(post.output, replayed.output, "the room replays exactly");
 
     // ── 3. A specialist may not grant itself a handoff ─────────────────────
-    let overreaching = RESEARCHER.replace("max_delegation_depth: 0", "max_delegation_depth: 1");
-    match Manifest::parse(&overreaching) {
+    let overreaching = ROOM.replace("max_delegation_depth: 0", "max_delegation_depth: 1");
+    match Manifest::parse_all(&overreaching).map(|_| ()) {
         Err(ManifestError::IncoherentTopology { .. }) => {
             println!("\n3. specialist granting itself delegation → refused at parse");
         }
         Err(e) => panic!("wrong refusal: {e}"),
-        Ok(_) => panic!(
+        Ok(()) => panic!(
             "a specialist declared a delegation ceiling above zero, which the \
              role forbids"
         ),
@@ -211,5 +238,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store.verify(run).await?;
     }
 
+    yaml_room(&plane, &provider, &store, brief).await?;
+
+    Ok(())
+}
+
+/// The same room, from files alone — see the module docs, point 5.
+async fn yaml_room(
+    plane: &Runtime,
+    provider: &FakeProvider,
+    store: &Arc<dyn JournalStore>,
+    brief: Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // ── 5. The same room, from files alone ─────────────────────────────────
+    // `blog-desk.yaml` grants the specialists as `tool://agent/...` tools, so
+    // the orchestrator is a file too — the model chooses whom to consult, and
+    // every consultation is the same journaled commission the coded editor
+    // used. Scripted here because a fake model has no judgement to exercise;
+    // the order below is one a real model would plausibly choose.
+    provider.will_call_tool(
+        "call_research",
+        "agent__blog_dresearch",
+        json!({ "topic": "why durable execution beats a retry loop" }),
+    );
+    provider.will_say("Retries repeat work; journals replay it."); // the researcher
+    provider.will_call_tool(
+        "call_draft",
+        "agent__blog_ddraft",
+        json!({
+            "brief": "why durable execution beats a retry loop",
+            "claims": "Retries repeat work; journals replay it.",
+        }),
+    );
+    provider.will_say("Draft: a retry loop forgets; a journal remembers."); // the writer
+    provider.will_say("Final: a retry loop forgets; a journal remembers.");
+
+    let before = provider.calls();
+    let desked = plane.run("blog.desk", brief).await?;
+    println!("\n5. the YAML room   → {:?}", desked.status);
+    println!(
+        "   provider calls: {} — three desk turns and two specialists",
+        provider.calls() - before
+    );
+    assert_eq!(provider.calls() - before, 5);
+    assert!(
+        desked.spend.tokens > 0,
+        "the desk's ledger must carry the specialists' spend, exactly as the \
+         coded editor's did"
+    );
+
+    let desked_again = plane.replay(desked.run_id, Mode::Strict).await?;
+    assert_eq!(
+        desked.output, desked_again.output,
+        "the YAML room replays exactly"
+    );
+    assert_eq!(
+        provider.calls() - before,
+        5,
+        "a strict replay woke the room"
+    );
+    println!(
+        "   strict replay      → {:?} — nobody woken",
+        desked_again.status
+    );
+    store.verify(desked.run_id).await?;
     Ok(())
 }

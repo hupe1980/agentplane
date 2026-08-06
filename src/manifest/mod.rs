@@ -783,6 +783,62 @@ impl Manifest {
         Ok(m)
     }
 
+    /// Parse a file holding **several** manifests, separated by `---`.
+    ///
+    /// The Kubernetes packaging convention, adopted for the same reason it won
+    /// there: a multi-agent room is one deployable thing, and three files that
+    /// only make sense together are three chances to deploy two of them.
+    ///
+    /// **The file is packaging; identity stays per-agent.** Each document
+    /// keeps its own digest, so pinning, signing and "a model swap is a
+    /// version bump" are unchanged — a bundle digest would make one agent's
+    /// prompt edit move its neighbours' identities. Empty documents (a stray
+    /// leading or trailing `---`) are skipped, as Kubernetes skips them; a
+    /// file with *no* manifest in it is refused rather than answered with an
+    /// empty room.
+    ///
+    /// # Errors
+    ///
+    /// [`ManifestError::Syntax`] naming the failing document's position, the
+    /// same validation errors [`Manifest::parse`] raises per document, and a
+    /// refusal for two documents sharing one `metadata.name` — one file
+    /// declaring the same agent twice is a merge conflict, not a room.
+    pub fn parse_all(yaml: &str) -> Result<Vec<Self>, ManifestError> {
+        use serde::Deserialize as _;
+
+        let mut manifests: Vec<Self> = Vec::new();
+        for (index, document) in serde_yaml_ng::Deserializer::from_str(yaml).enumerate() {
+            let ordinal = index + 1;
+            let value = serde_yaml_ng::Value::deserialize(document)
+                .map_err(|e| ManifestError::Syntax(format!("document {ordinal}: {e}")))?;
+            if value.is_null() {
+                continue;
+            }
+            let mut m: Self = serde_yaml_ng::from_value(value)
+                .map_err(|e| ManifestError::Syntax(format!("document {ordinal}: {e}")))?;
+            m.normalize();
+            m.validate()?;
+            if let Some(twin) = manifests
+                .iter()
+                .find(|prior| prior.metadata.name == m.metadata.name)
+            {
+                return Err(ManifestError::Syntax(format!(
+                    "document {ordinal} declares agent '{}' a second time (first at \
+                     version {}) — one file declaring the same agent twice is a merge \
+                     conflict, not a room",
+                    m.metadata.name, twin.metadata.version
+                )));
+            }
+            manifests.push(m);
+        }
+        if manifests.is_empty() {
+            return Err(ManifestError::Syntax(
+                "the file contains no manifest documents".to_owned(),
+            ));
+        }
+        Ok(manifests)
+    }
+
     fn normalize(&mut self) {
         for grant in &mut self.spec.tools {
             grant
@@ -824,6 +880,7 @@ impl Manifest {
         self.validate_oversight()?;
         self.validate_tool_approval()?;
         self.validate_tool_grants()?;
+        self.validate_agent_grants()?;
         self.validate_context_grants()?;
         self.validate_topology()?;
         self.validate_models()?;
@@ -930,6 +987,77 @@ impl Manifest {
                      guesses, and a guessed call is refused at the field check after it has \
                      been paid for",
                     grant.reference
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The rules an `agent`-server grant must satisfy, checked at parse.
+    ///
+    /// A grant spelled `tool://agent/<capability>` consults another agent via
+    /// the commission effect, which is a dispatch path the ordinary tool
+    /// safety machinery never sees. Every field that would be enforced on the
+    /// transport path and silently unenforced here is refused rather than
+    /// accepted as decoration — no declared control may be advisory:
+    ///
+    /// * `mutates: false` is a claim this manifest cannot make. The
+    ///   consultation runs another agent, and what *it* does to the world is
+    ///   governed by its own declaration, not by this one's optimism.
+    /// * `protected_fields` and `max_sensitivity` act at the sink-binding
+    ///   gate, which the commission path does not take. Accepting them would
+    ///   put a field-provenance rule in a reviewed file that nothing checks.
+    /// * The granting agent must declare `topology.role: orchestrator`.
+    ///   Consulting an agent **is** delegation; a specialist may not delegate,
+    ///   and the default topology is a lone specialist — so reaching for
+    ///   another agent requires declaring the arrangement, exactly as it does
+    ///   for a hand-written skill calling `commission`.
+    fn validate_agent_grants(&self) -> Result<(), ManifestError> {
+        for grant in &self.spec.tools {
+            let Some(rest) = grant.reference.strip_prefix("tool://agent/") else {
+                continue;
+            };
+            let reference = &grant.reference;
+            if rest.is_empty() {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.tools: '{reference}' names no capability"
+                )));
+            }
+            if !grant.mutates {
+                return Err(ManifestError::Unenforceable {
+                    field: "spec.tools[].mutates",
+                    detail: "an agent consulted as a tool runs under its own declaration, \
+                             and what it does to the world is its manifest's statement to \
+                             make — `mutates: false` here is a claim this document cannot \
+                             back",
+                });
+            }
+            if !grant.protected_fields.is_empty() {
+                return Err(ManifestError::Unenforceable {
+                    field: "spec.tools[].protected_fields",
+                    detail: "an agent consultation dispatches through `commission`, not \
+                             through the sink-binding gate — a protected-field rule here \
+                             would be reviewed and never checked",
+                });
+            }
+            if grant.max_sensitivity.is_some() {
+                return Err(ManifestError::Unenforceable {
+                    field: "spec.tools[].max_sensitivity",
+                    detail: "an agent consultation dispatches through `commission`, not \
+                             through the sink gate that enforces a sensitivity ceiling — \
+                             declare ceilings on the consulted agent instead",
+                });
+            }
+            if self
+                .spec
+                .topology
+                .as_ref()
+                .is_none_or(|t| t.role != Role::Orchestrator)
+            {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.tools: '{reference}' consults another agent, which is delegation \
+                     — declare `topology.role: orchestrator`, because a specialist may not \
+                     delegate and the default topology is a lone specialist"
                 )));
             }
         }

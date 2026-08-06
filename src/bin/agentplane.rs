@@ -2,9 +2,14 @@
 //!
 //! ```sh
 //! agentplane run agent.yaml --input '{"ticket": "printer on fire"}'
-//! agentplane validate agent.yaml
-//! agentplane digest agent.yaml
+//! agentplane run room.yaml  --input '{"topic": "durable execution"}'
+//! agentplane validate room.yaml
+//! agentplane digest room.yaml
 //! ```
+//!
+//! A file may hold **several** manifests separated by `---`, the Kubernetes
+//! packaging convention — so a multi-agent room deploys as one file with no
+//! Rust anywhere. The file is packaging: each agent keeps its own digest.
 //!
 //! This binary is the last step of the declarative tier. A manifest with
 //! `spec.execution` already needs no skill, but it still needed a `main` to
@@ -39,9 +44,16 @@ USAGE
     agentplane validate <manifest.yaml>
     agentplane digest <manifest.yaml>
 
+    A file may hold several manifests separated by `---` (the Kubernetes
+    convention), so a whole multi-agent room deploys as one file. Each
+    document keeps its own digest — the file is packaging, not identity.
+
 OPTIONS
     --input <JSON>       the run's input; defaults to {}
     --input-file <PATH>  read the input from a file instead
+    --capability <CAP>   which capability to run. Optional when the file leaves
+                         no doubt: a single capability runs itself, and a room
+                         with exactly one orchestrator starts at its desk
     --store <PATH>       journal on disk; defaults to memory, which keeps nothing
     --replay <RUN_ID>    re-execute a recorded run instead of starting one
     --strict             with --replay: verify rather than resume
@@ -91,22 +103,38 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
 
     // Parsed before anything else, for every verb. A manifest that does not
-    // validate is not a thing to run, digest, or reason about.
-    let manifest = Manifest::parse(&text).map_err(|e| e.to_string())?;
+    // validate is not a thing to run, digest, or reason about — and in a
+    // multi-document file every document is held to that, because deploying
+    // two thirds of a room is worse than deploying none of it.
+    let manifests = Manifest::parse_all(&text).map_err(|e| e.to_string())?;
 
     match verb {
         "validate" => {
-            println!(
-                "ok: {} {}",
-                manifest.metadata.name, manifest.metadata.version
-            );
+            for m in &manifests {
+                println!("ok: {} {}", m.metadata.name, m.metadata.version);
+            }
             Ok(ExitCode::SUCCESS)
         }
         "digest" => {
-            println!("{}", manifest.digest().map_err(|e| e.to_string())?.to_hex());
+            // One document prints the bare digest, so scripts that pin a single
+            // agent keep working; a room prints one line per agent, because a
+            // bundle digest would make one agent's edit move its neighbours'
+            // identities.
+            if let [only] = manifests.as_slice() {
+                println!("{}", only.digest().map_err(|e| e.to_string())?.to_hex());
+            } else {
+                for m in &manifests {
+                    println!(
+                        "{}  {} {}",
+                        m.digest().map_err(|e| e.to_string())?.to_hex(),
+                        m.metadata.name,
+                        m.metadata.version
+                    );
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
-        "run" => execute(&manifest, &Options::parse(&args[2..])?),
+        "run" => execute(&manifests, &Options::parse(&args[2..])?),
         other => Err(format!("unknown command `{other}`. See --help")),
     }
 }
@@ -115,6 +143,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 struct Options {
     input: Option<String>,
     input_file: Option<String>,
+    capability: Option<String>,
     store: Option<String>,
     replay: Option<String>,
     strict: bool,
@@ -136,6 +165,7 @@ impl Options {
             match flag.as_str() {
                 "--input" => o.input = Some(value()?),
                 "--input-file" => o.input_file = Some(value()?),
+                "--capability" => o.capability = Some(value()?),
                 "--store" => o.store = Some(value()?),
                 "--replay" => o.replay = Some(value()?),
                 "--strict" => o.strict = true,
@@ -158,14 +188,16 @@ impl Options {
     }
 }
 
-fn execute(manifest: &Manifest, opts: &Options) -> Result<ExitCode, String> {
-    if manifest.spec.execution.is_none() {
-        return Err(format!(
-            "manifest '{}' declares no `spec.execution`, so its behaviour is a skill somebody \
-             wrote and there is nothing here for this binary to run. Register it in your own \
-             binary with `RuntimeBuilder::agent(Agent::new(&manifest).skill(YourSkill))` instead",
-            manifest.metadata.name
-        ));
+fn execute(manifests: &[Manifest], opts: &Options) -> Result<ExitCode, String> {
+    for manifest in manifests {
+        if manifest.spec.execution.is_none() {
+            return Err(format!(
+                "manifest '{}' declares no `spec.execution`, so its behaviour is a skill somebody \
+                 wrote and there is nothing here for this binary to run. Register it in your own \
+                 binary with `RuntimeBuilder::agent(Agent::new(&manifest).skill(YourSkill))` instead",
+                manifest.metadata.name
+            ));
+        }
     }
 
     // Current-thread on purpose. A CLI runs one agent and exits, so a work
@@ -186,10 +218,14 @@ fn execute(manifest: &Manifest, opts: &Options) -> Result<ExitCode, String> {
             Arc::new(RedbStore::open_in_memory().map_err(|e| e.to_string())?)
         };
 
-        let builder = with_providers(Runtime::builder(Arc::clone(&store)), manifest).await?;
-        let agent = builder
-            .agent(agentplane::runtime::Agent::new(manifest))
-            .build();
+        let mut builder = with_providers(Runtime::builder(Arc::clone(&store)), manifests).await?;
+        for manifest in manifests {
+            builder = builder.agent(agentplane::runtime::Agent::new(manifest));
+        }
+        // `try_build`, because everything on this plane arrived as input: a
+        // wiring mistake in a file somebody handed us is a refusal with a
+        // sentence, not a programmer error worth a crash.
+        let agent = builder.try_build().map_err(|e| e.to_string())?;
 
         let outcome = if let Some(id) = &opts.replay {
             let run = agentplane::core::RunId::parse(id)
@@ -201,13 +237,8 @@ fn execute(manifest: &Manifest, opts: &Options) -> Result<ExitCode, String> {
             };
             agent.replay(run, mode).await
         } else {
-            let capability = manifest
-                .spec
-                .capabilities
-                .provides
-                .first()
-                .ok_or("the manifest provides no capability to run")?;
-            agent.run(capability, opts.read_input()?).await
+            let capability = entry_capability(manifests, opts.capability.as_deref())?;
+            agent.run(&capability, opts.read_input()?).await
         }
         .map_err(|e| e.to_string())?;
 
@@ -235,25 +266,84 @@ fn execute(manifest: &Manifest, opts: &Options) -> Result<ExitCode, String> {
 /// exports the wrong variable.
 async fn with_providers(
     builder: RuntimeBuilder,
-    manifest: &Manifest,
+    manifests: &[Manifest],
 ) -> Result<RuntimeBuilder, String> {
-    let Some(models) = &manifest.spec.models else {
-        return Ok(builder);
-    };
     let mut builder = builder;
     let mut seen: Vec<String> = Vec::new();
 
-    for m in [models.privileged.as_ref(), models.quarantined.as_ref()]
-        .into_iter()
-        .flatten()
-    {
-        if seen.contains(&m.provider) {
+    for manifest in manifests {
+        let Some(models) = &manifest.spec.models else {
             continue;
+        };
+        for m in [models.privileged.as_ref(), models.quarantined.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if seen.contains(&m.provider) {
+                continue;
+            }
+            seen.push(m.provider.clone());
+            builder = builder.provider(m.provider.clone(), driver(&m.provider).await?);
         }
-        seen.push(m.provider.clone());
-        builder = builder.provider(m.provider.clone(), driver(&m.provider).await?);
     }
     Ok(builder)
+}
+
+/// Which capability a `run` starts, when the file holds a room.
+///
+/// Explicit beats implicit, and implicit is allowed only where the file leaves
+/// no doubt: `--capability` always wins; a file providing exactly one
+/// capability runs it; and a room with exactly one agent declaring
+/// `topology.role: orchestrator` — whose declaration provides exactly one
+/// capability — starts there, because the topology *is* the file saying where
+/// the room begins. Anything else is a refusal that lists the candidates,
+/// never a guess.
+fn entry_capability(manifests: &[Manifest], asked: Option<&str>) -> Result<String, String> {
+    let all: Vec<(&str, &str)> = manifests
+        .iter()
+        .flat_map(|m| {
+            m.spec
+                .capabilities
+                .provides
+                .iter()
+                .map(move |c| (m.metadata.name.as_str(), c.as_str()))
+        })
+        .collect();
+
+    if let Some(asked) = asked {
+        if all.iter().any(|(_, c)| *c == asked) {
+            return Ok(asked.to_owned());
+        }
+        return Err(format!(
+            "no agent in this file provides '{asked}'. It provides: {}",
+            all.iter().map(|(_, c)| *c).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if let [(_, only)] = all.as_slice() {
+        return Ok((*only).to_owned());
+    }
+    let orchestrators: Vec<&Manifest> = manifests
+        .iter()
+        .filter(|m| {
+            m.spec
+                .topology
+                .as_ref()
+                .is_some_and(|t| t.role == agentplane::manifest::Role::Orchestrator)
+        })
+        .collect();
+    if let [desk] = orchestrators.as_slice()
+        && let [only] = desk.spec.capabilities.provides.as_slice()
+    {
+        return Ok(only.clone());
+    }
+    Err(format!(
+        "this file provides several capabilities and no single orchestrator to \
+         start at — say which one with --capability. It provides: {}",
+        all.iter()
+            .map(|(agent, c)| format!("{c} ({agent})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 async fn driver(name: &str) -> Result<Arc<dyn ModelProvider>, String> {

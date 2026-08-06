@@ -1094,6 +1094,66 @@ the first.
 **The trap:** believing the type is the security boundary. It is not — it is the
 *shape*. The manifest still declares what this deployment permits.
 
+## 🤝 Consult another agent, from a file
+
+A grant spelled `tool://agent/<capability>` offers another agent's capability
+to a tool-calling model — so a multi-agent room needs no Rust at all:
+
+```yaml
+# editor.yaml — the only agent permitted to delegate, and it says why
+spec:
+  topology: { mode: collaborative, role: orchestrator, reason: distinct-authority }
+  security: { max_delegation_depth: 1, max_sensitivity_egress: internal }
+  capabilities: { provides: [blog.report] }
+  models: { privileged: { provider: chat-completions, model: "llama3.2" } }
+  tools:
+    - ref: tool://agent/research.summarise
+      description: Ask the researcher to summarise a topic.
+      arguments:
+        type: object
+        properties: { topic: { type: string } }
+        required: [topic]
+  execution: { kind: tool-calling, max_turns: 4 }
+  budgets: {}
+```
+
+```yaml
+# researcher.yaml — a specialist, structurally unable to delegate further
+spec:
+  topology: { mode: single, role: specialist }
+  security: { max_sensitivity_egress: internal }
+  capabilities: { provides: [research.summarise] }
+  models: { privileged: { provider: chat-completions, model: "llama3.2" } }
+  execution: { kind: completion }
+  budgets: {}
+```
+
+Dispatch is `commission`, not a transport: the consultation is a journaled
+delegation effect, so a strict replay reassembles the whole room without
+waking anyone, the researcher's answer arrives labelled untrusted, its spend
+bills the editor's run, and the depth ceiling sees the hop. The `agent` server
+name is reserved — wiring a transport under it is refused at build, and a
+grant naming a capability no agent on the plane provides refuses the build
+too, rather than offering the model a consultation that fails when chosen.
+
+The `blog_room` example runs both shapes side by side — a coded editor that
+*dictates* the sequence, and this desk, on one plane. And the whole YAML room
+lives in **one file**: `examples/room.yaml` holds all three manifests
+separated by `---`, so the CLI runs it directly —
+`agentplane run examples/room.yaml --input '{"topic": "..."}'` — starting at
+the room's one declared orchestrator. Each document keeps its own digest; the
+file is packaging, not identity.
+
+**The trap:** treating the grant like a transported tool. It is not one, and
+the parser says so: `mutates: false` is refused (what the specialist does to
+the world is *its* declaration's statement to make), and `protected_fields` /
+`max_sensitivity` are refused because the commission path never passes the
+sink gate those act at — declare ceilings on the consulted agent instead. Two
+ceilings interact by design: a commissioned input is `Internal` at least, so
+both agents need `max_sensitivity_egress: internal` or the room refuses its
+own point. `requires_approval: true` works exactly as on any grant — a person
+sees the capability and the arguments before any specialist runs.
+
 ## 🧱 Where are the built-in tools?
 
 There are none, and the reason is worth two paragraphs because every other

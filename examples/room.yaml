@@ -1,0 +1,164 @@
+# One file, one room — three agents separated by `---`, the Kubernetes
+# packaging convention. The file is packaging: each document keeps its own
+# digest, so pinning and signing stay per-agent and editing one agent's prompt
+# moves nobody else's identity.
+#
+# Run the whole room with no Rust at all (the desk is the room's one
+# orchestrator, so `--capability` is optional):
+#
+#   agentplane run examples/room.yaml --input '{"topic": "durable execution"}'
+#
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+
+metadata:
+  name: blog-desk
+  version: "1.0.0"
+
+# The same room as `blog-editor.yaml` + `Editor`, with one difference that is
+# the whole point: nobody wrote an orchestrator. The specialists are granted
+# as tools, and the model decides whom to consult and in what order. Choose
+# this shape when consultation is a judgement call; keep the coded editor when
+# the sequence is policy — a writer that must always receive the researcher's
+# claims is a rule, and rules belong in code or a plan, not in a model's
+# discretion.
+spec:
+  identity:
+    role: "Editorial desk for a technical blog"
+    constraints: "Consult the researcher before the writer. Never write copy yourself."
+
+  topology:
+    mode: collaborative
+    role: orchestrator
+    reason: distinct-authority
+
+  security:
+    # A consultation's answer arrives Internal at least — it is a model's
+    # output — and it rides this desk's next turn, so a Public ceiling would
+    # refuse the room's own point.
+    max_sensitivity_egress: internal
+    max_delegation_depth: 1
+
+  capabilities:
+    provides: [blog.desk]
+
+  models:
+    privileged: { provider: fake, model: desk-1 }
+
+  # The specialists, offered to the model as tools. Dispatch is `commission`:
+  # journaled, replayable, spend-billed to this run, depth-visible. The parser
+  # refuses every field that path cannot enforce — no `mutates: false`, no
+  # `protected_fields`, no `max_sensitivity` here; ceilings belong on the
+  # consulted agents' own declarations.
+  tools:
+    - ref: tool://agent/blog.research
+      description: Ask the researcher for grounded claims about a topic.
+      arguments:
+        type: object
+        properties:
+          topic: { type: string }
+        required: [topic]
+    - ref: tool://agent/blog.draft
+      description: Ask the writer for a draft, handing over the brief and the claims.
+      arguments:
+        type: object
+        properties:
+          brief: { type: string }
+          claims: { type: string }
+        required: [brief, claims]
+
+  execution: { kind: tool-calling, max_turns: 5 }
+
+  budgets:
+    max_tokens: 60000
+    max_effects: 12
+
+---
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+
+metadata:
+  name: blog-researcher
+  version: "1.0.0"
+
+spec:
+  # No Rust. The runtime supplies the behaviour, so this file *is* the agent —
+  # and the manifest digest therefore covers all of it, not just its boundary.
+  execution:
+    kind: completion
+
+  identity:
+    role: "Research assistant for a technical blog"
+    constraints: "Gather claims and cite them. Do not draft prose."
+
+  # A specialist hands off to nobody. Declaring depth 0 is not decoration:
+  # a specialist with a depth above zero is refused at parse.
+  topology:
+    mode: single
+    role: specialist
+
+  security:
+    max_sensitivity_egress: internal
+    max_delegation_depth: 0
+
+  capabilities:
+    provides: [blog.research]
+
+  models:
+    # A cheap model, because reading sources is not the expensive judgement.
+    privileged: { provider: fake, model: research-1 }
+
+  output:
+    schema:
+      type: object
+      required: [claims]
+      properties:
+        claims: { type: array }
+
+  budgets:
+    max_tokens: 50000
+    max_steps: 3
+
+---
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+
+metadata:
+  name: blog-writer
+  version: "1.0.0"
+
+spec:
+  # No Rust. The runtime supplies the behaviour, so this file *is* the agent —
+  # and the manifest digest therefore covers all of it, not just its boundary.
+  execution:
+    kind: completion
+
+  identity:
+    role: "Staff writer for a technical blog"
+    constraints: "Write from the supplied claims only. Invent nothing."
+
+  topology:
+    mode: single
+    role: specialist
+
+  security:
+    max_sensitivity_egress: internal
+    max_delegation_depth: 0
+
+  capabilities:
+    provides: [blog.draft]
+
+  models:
+    privileged: { provider: fake, model: writer-1 }
+
+  output:
+    schema:
+      type: object
+      required: [title, body]
+      properties:
+        title: { type: string }
+        body:  { type: string }
+
+  budgets:
+    max_tokens: 80000
+    max_steps: 3

@@ -53,6 +53,32 @@ pub enum BuildError {
     )]
     JournalStoreTenant { plane: String, store: String },
 
+    /// A tool server took the name reserved for agents on this plane.
+    #[error(
+        "tool server 'agent' is reserved: `tool://agent/<capability>` names an \
+         agent on this plane and dispatches through `commission`. A transport \
+         under that name would let a deployment change whether a grant means \
+         \"an agent here\" or \"somebody's server\" without changing any \
+         reviewed document — rename the server"
+    )]
+    ReservedToolServer,
+
+    /// An agent grant names a capability no agent on this plane provides.
+    #[error(
+        "agent '{agent}' grants 'tool://agent/{capability}', and no agent on \
+         this plane provides '{capability}' — the model would be offered a \
+         consultation that fails when chosen"
+    )]
+    AgentToolUnknownCapability { agent: String, capability: String },
+
+    /// An agent grant names the granting agent's own capability.
+    #[error(
+        "agent '{agent}' grants 'tool://agent/{capability}', which it provides \
+         itself — an agent consulting itself is a loop wearing a grant, and \
+         the delegation ceiling would only bound how long it spins"
+    )]
+    AgentToolSelfReference { agent: String, capability: String },
+
     /// One tool server name was registered twice.
     #[error(
         "tool server '{server}' is registered twice — registration order would \
