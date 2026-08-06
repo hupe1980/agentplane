@@ -53,7 +53,7 @@ Read those five lines slowly, because they are the product:
 
 ```toml
 [dependencies]
-agentplane = "0.2"
+agentplane = "0.3"
 ```
 
 ## An agent with no Rust
@@ -111,7 +111,7 @@ your build. Everything else is opt-in:
 
 ```toml
 [dependencies]
-agentplane   = "0.2"
+agentplane   = "0.3"
 serde_json   = "1"
 # A `Skill` is an async trait, and the runtime is async. Both are yours to
 # choose, so neither is re-exported — but the snippets below will not compile

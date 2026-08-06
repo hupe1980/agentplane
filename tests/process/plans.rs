@@ -69,6 +69,60 @@ fn a_cycle_is_refused() {
     ));
 }
 
+/// A deep plan is refused or accepted — never an abort.
+///
+/// Validation used to recurse once per dependency edge, so the stack depth was
+/// whatever the plan's longest chain happened to be. Fifty thousand nodes
+/// overflowed it, and a stack overflow is not an error a caller can catch: the
+/// process takes `SIGABRT` and every other tenant's in-flight run goes with it.
+/// A validator whose entire job is refusing malformed plans has to survive the
+/// malformed plan.
+///
+/// Ordering matters and is the reason this ran green for so long. Ascending ids
+/// close each node before the next one reaches it, so the walk never nests;
+/// only a chain visited from its deep end recurses all the way down. That is
+/// not an exotic input — it is the same graph, serialized in a different order.
+#[test]
+fn a_deep_plan_is_validated_without_exhausting_the_stack() {
+    const DEPTH: u32 = 100_000;
+
+    let mut nodes = vec![PlanNode::new(0, "fetch").arg("input", ArgSource::run_input())];
+    for id in 1..DEPTH {
+        nodes.push(PlanNode::new(id, "fetch").arg("input", ArgSource::node(StepId(id - 1))));
+    }
+    let deepest = nodes.pop().expect("the chain has a last node");
+    nodes.push(deepest.terminal());
+    // Deepest first: the walk descends the whole chain before closing anything.
+    nodes.reverse();
+
+    validate(&PlanIR::new(nodes), &contract()).expect("a deep but acyclic plan is well formed");
+}
+
+/// The same depth, with a cycle at the bottom, is still a diagnosis.
+///
+/// The iterative walk has to report `Cycle` rather than run out of anything —
+/// a check that only survives well-formed input is not a check.
+#[test]
+fn a_cycle_at_the_end_of_a_deep_chain_is_still_named() {
+    const DEPTH: u32 = 100_000;
+
+    let mut nodes = vec![
+        PlanNode::new(0, "fetch")
+            .arg("input", ArgSource::run_input())
+            // Closes the loop back onto the far end of the chain.
+            .arg("loop", ArgSource::node(StepId(DEPTH - 1))),
+    ];
+    for id in 1..DEPTH {
+        nodes.push(PlanNode::new(id, "fetch").arg("input", ArgSource::node(StepId(id - 1))));
+    }
+    nodes.reverse();
+
+    assert!(matches!(
+        validate(&PlanIR::new(nodes), &contract()).unwrap_err(),
+        PlanError::Cycle(_)
+    ));
+}
+
 /// Without a terminal node nothing declares the plan finished.
 #[test]
 fn a_plan_with_no_terminal_is_refused() {

@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#-license)
 [![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#-status)
-[![MSRV](https://img.shields.io/badge/rustc-1.94%2B-lightgrey)](#-status)
+[![MSRV](https://img.shields.io/badge/rustc-1.94.1%2B-lightgrey)](#-status)
 
 Not a prompt framework. Not an agent library. The layer *beneath* those — the
 thing that makes an agent's actions survivable, auditable, and governable when it
@@ -229,7 +229,7 @@ records.
 **Pre-alpha, pre-release, no API stability.** Breaking changes land without
 deprecation. The journal record format and the storage schema will change.
 
-Rust **1.94+**. `#![forbid(unsafe_code)]`. One crate, feature-gated: an embedded
+Rust **1.94.1+**. `#![forbid(unsafe_code)]`. One crate, feature-gated: an embedded
 [redb](https://github.com/cberner/redb) store by default — pure Rust, two crates
 deep, no C toolchain — with everything else opt-in.
 

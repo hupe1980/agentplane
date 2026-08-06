@@ -113,25 +113,26 @@ enum Mark {
     Closed,
 }
 
-fn visit(
-    id: StepId,
-    deps: &BTreeMap<StepId, &[StepId]>,
-    marks: &mut BTreeMap<StepId, Mark>,
-) -> Result<(), PlanError> {
-    match marks.get(&id) {
-        Some(Mark::Closed) => return Ok(()),
-        Some(Mark::Open) => return Err(PlanError::Cycle(id)),
-        None => {}
-    }
-    marks.insert(id, Mark::Open);
-    for d in deps.get(&id).copied().unwrap_or(&[]) {
-        visit(*d, deps, marks)?;
-    }
-    marks.insert(id, Mark::Closed);
-    Ok(())
-}
-
 /// A cycle means the run can never finish, and would sit there looking busy.
+///
+/// # Why this is an explicit stack rather than recursion
+///
+/// The obvious depth-first walk recurses once per edge, so its stack depth is
+/// the length of the longest dependency chain — a number the plan chooses. A
+/// linear plan of fifty thousand nodes overflowed the stack and aborted the
+/// process, and *aborted* is the operative word: a stack overflow is not a
+/// `PlanError` a caller can catch and refuse, it is `SIGABRT` taking the plane
+/// and every other tenant's in-flight run down with it.
+///
+/// [`Contract::max_steps`] does not save this, for two reasons. It is optional,
+/// so the default configuration is the vulnerable one; and it is the caller's
+/// declaration of how big a plan it wants, not a bound the validator may assume
+/// when deciding whether it is safe to look at one. A validator whose job is to
+/// refuse malformed input must survive the malformed input.
+///
+/// So the traversal carries its own stack on the heap, where depth costs memory
+/// that fails gracefully rather than address space that does not. Node ids are
+/// pushed and popped explicitly; a node is closed when its last child is done.
 fn check_acyclic(plan: &PlanIR) -> Result<(), PlanError> {
     let deps: BTreeMap<StepId, &[StepId]> = plan
         .nodes
@@ -139,8 +140,38 @@ fn check_acyclic(plan: &PlanIR) -> Result<(), PlanError> {
         .map(|n| (n.id, n.depends_on.as_slice()))
         .collect();
     let mut marks: BTreeMap<StepId, Mark> = BTreeMap::new();
-    for n in &plan.nodes {
-        visit(n.id, &deps, &mut marks)?;
+
+    // Each frame is a node being explored and how far through its dependencies
+    // the walk has got. Popping a frame is what recursion's return did.
+    let mut stack: Vec<(StepId, usize)> = Vec::new();
+
+    for root in plan.nodes.iter().map(|n| n.id) {
+        if marks.get(&root) == Some(&Mark::Closed) {
+            continue;
+        }
+        marks.insert(root, Mark::Open);
+        stack.push((root, 0));
+
+        while let Some(&mut (id, ref mut next)) = stack.last_mut() {
+            let children = deps.get(&id).copied().unwrap_or(&[]);
+            let Some(&child) = children.get(*next) else {
+                marks.insert(id, Mark::Closed);
+                stack.pop();
+                continue;
+            };
+            *next += 1;
+            match marks.get(&child) {
+                Some(Mark::Closed) => {}
+                // Reaching a node still on the current path closes a loop.
+                // Naming the node reached, not the one that reached it, so the
+                // message points at the step a reader has to break.
+                Some(Mark::Open) => return Err(PlanError::Cycle(child)),
+                None => {
+                    marks.insert(child, Mark::Open);
+                    stack.push((child, 0));
+                }
+            }
+        }
     }
     Ok(())
 }

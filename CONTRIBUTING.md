@@ -26,9 +26,18 @@ the pipeline is right and you find out late; the justfile exists so they cannot.
 |---|---|---|
 | `just anchors` | milliseconds | constantly — after any refactor |
 | `just test` | seconds | while working |
+| `just audit` | seconds | before pushing; part of `just ci` |
 | `just ci` | ~2 minutes | before pushing |
 | `just mutants` | ~25 minutes | before a release, or after touching a guarantee |
 | `just specs` | ~2 minutes | after changing the effect protocol, sagas, fencing, or authorization |
+
+`just audit` needs `cargo-audit` (`cargo install cargo-audit`, or
+`brew install cargo-audit`). It is in `just ci` rather than the release gate
+because an advisory published this morning is a fact about today's tree — and
+because this crate's assurance layers all govern code we wrote, while the
+finding that prompted the check was in code we merely linked: the AWS SDK's
+default TLS feature pinned a `rustls-webpki` with three advisories against
+certificate validation.
 
 `just mutants` is deliberately **not** an inner-loop check — it rebuilds the
 library once per mutation. `just anchors` is the one that belongs in your muscle

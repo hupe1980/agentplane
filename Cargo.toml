@@ -2,7 +2,7 @@
 name         = "agentplane"
 version      = "0.3.0"
 edition      = "2024"
-rust-version = "1.94"
+rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
 description  = "Durable, replayable agent runtime — the journal is the plan of record"
 repository   = "https://github.com/hupe1980/agentplane"
@@ -214,9 +214,17 @@ ed25519-dalek = { version = "3", default-features = false, features = ["alloc", 
 # report for a severed response is "cost unknown", and the budget ceiling that
 # exists to bound a runaway provider reads zero while it spends.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "http2", "charset", "stream"], optional = true }
-aws-config = { version = "1.8.18", optional = true }
-aws-sdk-bedrockruntime = { version = "1.135.0", optional = true }
-aws-smithy-types = { version = "1.5.0", optional = true }
+# Default features are declined on both AWS crates for one reason: the SDK's
+# `rustls` feature is `legacy-rustls-ring`, which pins `rustls` 0.21 and with it
+# `rustls-webpki` 0.101 — three live RUSTSEC advisories against the code that
+# validates certificates (name-constraint bypass twice, and a reachable panic in
+# CRL parsing). `default-https-client` selects the maintained `rustls-aws-lc`
+# stack instead. A TLS client is the one dependency this crate must not take on
+# whatever a transitive default happens to pick, so the choice is written down
+# here and `just audit` is what keeps it honest.
+aws-config = { version = "1.10.1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"], optional = true }
+aws-sdk-bedrockruntime = { version = "1.139.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"], optional = true }
+aws-smithy-types = { version = "1.6.1", optional = true }
 
 [dev-dependencies]
 # For the streaming driver tests: the stub server hands axum a body stream of

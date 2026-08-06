@@ -831,6 +831,83 @@ mod tests {
             "unreleased content still taints"
         );
     }
+
+    /// Each of the three scopes moves the dimensions it names, and no others.
+    ///
+    /// Only `trust()` had a test. The other two were reachable public API with
+    /// nothing that could tell a correct implementation from one that set the
+    /// wrong field — and these are the declassification primitives, so a scope
+    /// that quietly improved trust when it was asked for sensitivity would be
+    /// granting authority nobody wrote down.
+    #[test]
+    fn each_release_scope_moves_exactly_what_it_names() {
+        let secret = Label::untrusted(src("model")).with_sensitivity(Sensitivity::Secret);
+
+        let trust_only = apply_release_scope(&secret, ReleaseScope::trust());
+        assert_eq!(trust_only.trust, Trust::Trusted);
+        assert_eq!(
+            trust_only.sensitivity,
+            Sensitivity::Secret,
+            "improving trust must not also declassify"
+        );
+
+        let sensitivity_only =
+            apply_release_scope(&secret, ReleaseScope::sensitivity(Sensitivity::Internal));
+        assert_eq!(
+            sensitivity_only.trust,
+            Trust::Untrusted,
+            "lowering sensitivity must not also confer belief"
+        );
+        assert_eq!(sensitivity_only.sensitivity, Sensitivity::Internal);
+
+        let both = apply_release_scope(
+            &secret,
+            ReleaseScope::trust_and_sensitivity(Sensitivity::Internal),
+        );
+        assert_eq!(both.trust, Trust::Trusted);
+        assert_eq!(both.sensitivity, Sensitivity::Internal);
+    }
+
+    /// A release declassifies; it never reclassifies upward.
+    ///
+    /// The scope names a *ceiling*, not an assignment. Handing a `Public` value
+    /// to a release written for `Secret` data must leave it `Public` — an
+    /// assignment would silently relabel ordinary data as secret and trip every
+    /// egress ceiling downstream, which reads as the gate working and is not.
+    #[test]
+    fn a_release_never_raises_sensitivity() {
+        let public = Label::untrusted(src("model")).with_sensitivity(Sensitivity::Public);
+
+        let released = apply_release_scope(&public, ReleaseScope::sensitivity(Sensitivity::Secret));
+
+        assert_eq!(
+            released.sensitivity,
+            Sensitivity::Public,
+            "a release named a higher classification and the label followed it upward"
+        );
+    }
+
+    /// Provenance survives every scope.
+    ///
+    /// Trust and sensitivity are judgements a policy may revise. Where the value
+    /// came from is a fact, and a release that dropped it would erase the
+    /// evidence that the release was needed in the first place.
+    #[test]
+    fn no_release_scope_erases_provenance() {
+        let from_model = Label::untrusted(src("model")).with_sensitivity(Sensitivity::Secret);
+
+        for scope in [
+            ReleaseScope::trust(),
+            ReleaseScope::sensitivity(Sensitivity::Public),
+            ReleaseScope::trust_and_sensitivity(Sensitivity::Public),
+        ] {
+            assert_eq!(
+                apply_release_scope(&from_model, scope).provenance,
+                BTreeSet::from([src("model")]),
+                "a release dropped the provenance it was granted against"
+            );
+        }
+    }
 }
 
 /// Every rule `Release::validate` enforces, each with the case it rejects.

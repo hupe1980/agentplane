@@ -186,7 +186,7 @@ docs:
 
 # the crate still builds on the declared minimum Rust
 msrv:
-    cargo +1.94.0 check --all-features
+    cargo +1.94.1 check --all-features
 
 # ── The assurance gate ──────────────────────────────────────────────────────
 
@@ -253,13 +253,27 @@ package:
 publish-dry:
     cargo publish --dry-run
 
+# no dependency in the tree has a known advisory against it
+#
+# This crate forbids `unsafe`, models its protocol in TLA+ and mutation-tests its
+# own guarantees — and none of that reaches the 480-odd crates it links. The gap
+# was not hypothetical: the AWS SDK's default `rustls` feature is
+# `legacy-rustls-ring`, which pinned `rustls-webpki` 0.101 and three live
+# advisories against certificate validation into every `bedrock` build. Nothing
+# in the pipeline could see it, because nothing in the pipeline was looking.
+#
+# In `ci` rather than `ci-full`: an advisory published this morning is a fact
+# about today's tree, and finding out at release time is finding out late.
+audit:
+    cargo audit --deny warnings
+
 # ── What CI runs ────────────────────────────────────────────────────────────
 
 # `mutants` and `specs` are their own CI jobs because they rebuild repeatedly;
 # run them before a release, not on every save.
 
 # everything CI runs, minus the two slow layers
-ci: lint features anchors test test-default test-minimal examples cli-smoke doc-examples docs package
+ci: lint features anchors audit test test-default test-minimal examples cli-smoke doc-examples docs package
 
 # everything, including the slow layers — what a release must pass
 ci-full: ci specs mutants

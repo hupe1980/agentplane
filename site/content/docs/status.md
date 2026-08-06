@@ -195,6 +195,7 @@ remaining design pressure is.
 ```sh
 just anchors    # every mutation still anchors in the code it names
 just features   # every optional feature compiles on its own
+just audit      # no dependency in the tree has a known advisory
 just ci         # lint, feature configurations, examples, docs, packaging
 just ci-full    # the above, plus TLA+ specs and the full mutation sweep
 
