@@ -408,9 +408,28 @@ impl A2aReply {
         json!({ REPLY_KEY: self })
     }
 
-    /// Read a reply back out of a journaled output, if one was declared.
-    pub(super) fn of_output(output: &Value) -> Option<Self> {
-        serde_json::from_value(output.get(REPLY_KEY)?.clone()).ok()
+    /// Read a reply back out of a run's output, **if the run may declare one**.
+    ///
+    /// A projection instruction is authority: it decides whether the answer is
+    /// a task artifact or a direct `Message`, and what parts it carries —
+    /// including a file part naming a URL. Skill output routinely *contains*
+    /// untrusted data: a summariser quotes its input, a declarative agent's
+    /// answer is a model's words, and an echoing skill returns a peer's own
+    /// bytes. So the marker is honoured only from a **trusted** output.
+    ///
+    /// This was not hypothetical. Before the check, a peer could put the
+    /// marker in its message, have an ordinary echoing skill return it, and
+    /// choose the envelope its own reply arrived in — a file URL of the
+    /// attacker's naming, presented as the agent's answer. Model output is a
+    /// proposal, never authority; so is a peer's message.
+    ///
+    /// An untrusted answer still reaches the caller — as the artifact content
+    /// it is, rather than as an instruction about the envelope.
+    pub(super) fn of_output(output: &crate::core::Tainted<Value>) -> Option<Self> {
+        if output.label().is_untrusted() {
+            return None;
+        }
+        serde_json::from_value(output.peek().get(REPLY_KEY)?.clone()).ok()
     }
 
     /// The message parts, when this reply is a direct `Message`.
@@ -1772,16 +1791,20 @@ async fn task_context(server: &A2aServer, run: RunId) -> Result<Option<String>, 
 }
 
 pub(super) fn task_of_outcome(outcome: &crate::runtime::RunOutcome) -> A2aTask {
-    let output = outcome.output.clone().unwrap_or(Value::Null);
     // A declared reply carries its own parts; otherwise the default projection
     // stands — a string is a text part, anything else a data part.
-    let artifacts_parts: Vec<Vec<Part>> = match A2aReply::of_output(&output) {
-        Some(reply) => reply.artifact_parts(),
-        None => vec![vec![match output {
-            Value::String(text) => Part::text(text),
-            data => Part::data(data),
-        }]],
-    };
+    let artifacts_parts: Vec<Vec<Part>> =
+        match outcome.output.as_ref().and_then(A2aReply::of_output) {
+            Some(reply) => reply.artifact_parts(),
+            None => vec![vec![match outcome
+                .output
+                .as_ref()
+                .map_or(Value::Null, |o| o.peek().clone())
+            {
+                Value::String(text) => Part::text(text),
+                data => Part::data(data),
+            }]],
+        };
     A2aTask {
         id: outcome.run_id.to_string(),
         context_id: None,

@@ -288,11 +288,9 @@ impl Declarative {
                     };
                     cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)
                         .await?;
-                    let proposed = json!({
-                        "tool": reference,
-                        "arguments": asked.arguments.clone(),
-                    });
-                    let decision = cx.task(&spec.with_action(proposed)).await?;
+                    let decision = cx
+                        .task(&spec.approve_call(&reference, &asked.arguments))
+                        .await?;
                     if !decision.approved {
                         // Reported to the model the way every other refused call
                         // is, and without the reviewer's words. A human's free
@@ -411,7 +409,7 @@ impl Declarative {
                 .await?;
             // The proposal shown is the answer itself, not a description of it —
             // a reviewer who cannot see what will happen is not reviewing.
-            let decision = cx.task(&spec.with_action(answer.peek().clone())).await?;
+            let decision = cx.task(&spec.approve_answer(answer.peek().clone())).await?;
             if !decision.approved {
                 // Named and quoted, because "the agent failed" is not something
                 // an operator can act on and "Carol refused, because X" is.
@@ -640,10 +638,31 @@ impl Proposal {
         matches!(self.approval, crate::manifest::Approval::Required)
     }
 
-    fn with_action(&self, action: Value) -> crate::core::TaskSpec {
+    /// The task shown when a reviewer must approve the agent's **answer**.
+    fn approve_answer(&self, answer: Value) -> crate::core::TaskSpec {
+        self.task("agent.approve", "approve this agent's answer", answer)
+    }
+
+    /// The task shown when a reviewer must approve a **tool call**.
+    ///
+    /// A separate summary, and separate because the two are different
+    /// questions: one asks *may this reply go out*, the other *may this call
+    /// happen*. A reviewer told "approve this agent's answer" while the thing
+    /// in front of them moves money is being asked to vet the wrong artifact —
+    /// the exact conflation `oversight.approval: tools-only` exists to
+    /// prevent, reintroduced in the sentence the reviewer actually reads.
+    fn approve_call(&self, reference: &str, arguments: &Value) -> crate::core::TaskSpec {
+        self.task(
+            "agent.approve_call",
+            format!("approve this agent's call to {reference}"),
+            json!({ "tool": reference, "arguments": arguments }),
+        )
+    }
+
+    fn task(&self, kind: &str, summary: impl Into<String>, action: Value) -> crate::core::TaskSpec {
         let mut spec = crate::core::TaskSpec::new(
-            "agent.approve",
-            crate::core::Justification::new("approve this agent's answer", action),
+            kind,
+            crate::core::Justification::new(summary, action),
             self.deadline.name.clone(),
         );
         spec.candidate_roles.clone_from(&self.approvers);

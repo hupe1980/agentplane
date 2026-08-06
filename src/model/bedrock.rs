@@ -141,6 +141,89 @@ pub struct Bedrock {
     timeout: Duration,
     schema_mode: SchemaMode,
     stream: bool,
+    /// The deployment's Bedrock guardrail, when it has one.
+    ///
+    /// Passed through rather than reimplemented. Content classification is a
+    /// specialist's job — this crate ships no policy evaluator and no tracing
+    /// exporter for the same reason — and a deployment on Bedrock already owns
+    /// a guardrail, versioned and administered where its compliance people can
+    /// see it. What the runtime owns is everything *around* it: the choice is
+    /// in the request profile, so it is digest-covered and replay-visible, and
+    /// an intervention is a **metered refusal** rather than an answer.
+    guardrail: Option<Guardrail>,
+}
+
+/// Which Bedrock guardrail to apply, and whether to ask for its trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Guardrail {
+    pub identifier: String,
+    /// Pinned, never `DRAFT`-by-default: a guardrail version is part of what
+    /// governed this call, and a floating pointer would make two runs under
+    /// "the same" configuration mean different things.
+    pub version: String,
+    /// Ask Bedrock to return why it intervened.
+    ///
+    /// Off by default. The trace names the policy and the matched category,
+    /// which is exactly the classification the gate protects — useful in a
+    /// journal an operator reads, and a map for a prober if it ever reaches a
+    /// model. It never does: an intervention leaves this driver as an error.
+    pub trace: bool,
+}
+
+impl Guardrail {
+    #[must_use]
+    pub fn new(identifier: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            identifier: identifier.into(),
+            version: version.into(),
+            trace: false,
+        }
+    }
+
+    /// Ask for the intervention trace, which is journaled and never shown to a
+    /// model.
+    #[must_use]
+    pub const fn with_trace(mut self) -> Self {
+        self.trace = true;
+        self
+    }
+
+    /// The streaming form.
+    ///
+    /// `SYNCHRONOUS` deliberately, which is Bedrock's *blocking* mode: the
+    /// service assesses each chunk before releasing it. The alternative,
+    /// `ASYNCHRONOUS`, streams first and intervenes afterwards — lower
+    /// latency, and it means blocked content has already reached the caller
+    /// by the time the guardrail objects. A control that arrives after the
+    /// thing it was installed to prevent is not one.
+    fn stream_config(&self) -> aws_sdk_bedrockruntime::types::GuardrailStreamConfiguration {
+        use aws_sdk_bedrockruntime::types::{
+            GuardrailStreamConfiguration, GuardrailStreamProcessingMode, GuardrailTrace,
+        };
+        GuardrailStreamConfiguration::builder()
+            .guardrail_identifier(&self.identifier)
+            .guardrail_version(&self.version)
+            .trace(if self.trace {
+                GuardrailTrace::Enabled
+            } else {
+                GuardrailTrace::Disabled
+            })
+            .stream_processing_mode(GuardrailStreamProcessingMode::Sync)
+            .build()
+    }
+
+    fn config(&self) -> aws_sdk_bedrockruntime::types::GuardrailConfiguration {
+        use aws_sdk_bedrockruntime::types::{GuardrailConfiguration, GuardrailTrace};
+        GuardrailConfiguration::builder()
+            .guardrail_identifier(&self.identifier)
+            .guardrail_version(&self.version)
+            .trace(if self.trace {
+                GuardrailTrace::Enabled
+            } else {
+                GuardrailTrace::Disabled
+            })
+            .build()
+    }
 }
 
 impl std::fmt::Debug for Bedrock {
@@ -150,6 +233,7 @@ impl std::fmt::Debug for Bedrock {
             .field("timeout", &self.timeout)
             .field("schema_mode", &self.schema_mode)
             .field("stream", &self.stream)
+            .field("guardrail", &self.guardrail)
             .finish_non_exhaustive()
     }
 }
@@ -177,7 +261,23 @@ impl Bedrock {
             timeout: Duration::from_mins(5),
             schema_mode: SchemaMode::Native,
             stream: true,
+            guardrail: None,
         }
+    }
+
+    /// Apply a Bedrock guardrail to every call this driver makes.
+    ///
+    /// Passed through rather than reimplemented: content classification is a
+    /// specialist's job, and a deployment on Bedrock already owns a guardrail
+    /// administered where its compliance people can see it. What the runtime
+    /// owns is everything around it — the choice enters
+    /// [`ModelProvider::request_profile`], so it is digest-covered and
+    /// replay-visible, and an intervention is a **metered refusal** rather
+    /// than an answer.
+    #[must_use]
+    pub fn guardrail(mut self, guardrail: Guardrail) -> Self {
+        self.guardrail = Some(guardrail);
+        self
     }
 
     /// Bound the complete Converse operation.
@@ -422,7 +522,11 @@ impl Bedrock {
                     .build(),
             )
             .set_tool_config(tools)
-            .set_output_config(output_config);
+            .set_output_config(output_config)
+            // Both paths, or the control is one a `stream: true` deployment
+            // silently loses — the same rule written twice is the shape where
+            // only the half nobody exercises is wrong.
+            .set_guardrail_config(self.guardrail.as_ref().map(Guardrail::stream_config));
         if let Some(system) = prompt.get("system") {
             let text = system.as_str().ok_or_else(|| {
                 Self::refused(model, "Bedrock's system instruction must be a string")
@@ -472,6 +576,23 @@ impl Bedrock {
             accumulator.event(event);
         }
 
+        if accumulator.stop_reason()
+            == Some(&aws_sdk_bedrockruntime::types::StopReason::GuardrailIntervened)
+        {
+            // Metered and landed, exactly as on the buffered path: the model
+            // was invoked and the assessment was billed. A streamed
+            // intervention has usually already emitted deltas to a live
+            // observer — advisory by contract, and the journal keeps the
+            // refusal that is canonical.
+            return Err(ModelError::Unusable {
+                model: model.clone(),
+                // Whatever the stream reported before it was stopped. A
+                // guardrail assessed the call, and an assessment is billed —
+                // reporting zero would tell the ceiling it was free.
+                usage: accumulator.usage().unwrap_or_default(),
+                detail: "a Bedrock guardrail intervened on this call".to_owned(),
+            });
+        }
         let Some(stop_reason) = accumulator.stop_reason().cloned() else {
             return Err(severed_stream(
                 model,
@@ -667,6 +788,16 @@ impl ModelProvider for Bedrock {
                 SchemaMode::ForcedTool => "forced-tool",
             },
             "timeout_ms": self.timeout.as_millis(),
+            // Identity, not decoration: turning a guardrail on, off, or to
+            // another version changes what governed the call, so a replay of
+            // history written under the old configuration reports divergence
+            // rather than answering under the new one. The identifier and
+            // version only — a guardrail id is configuration, not a secret,
+            // and the trace flag changes no request semantics.
+            "guardrail": self.guardrail.as_ref().map(|g| json!({
+                "id": g.identifier,
+                "version": g.version,
+            })),
         })
     }
 
@@ -723,7 +854,11 @@ impl ModelProvider for Bedrock {
                     .build(),
             )
             .set_tool_config(tools)
-            .set_output_config(output_config);
+            .set_output_config(output_config)
+            // Both paths, or the control is one a `stream: true` deployment
+            // silently loses — the same rule written twice is the shape where
+            // only the half nobody exercises is wrong.
+            .set_guardrail_config(self.guardrail.as_ref().map(Guardrail::config));
         if let Some(system) = prompt.get("system") {
             let text = system.as_str().ok_or_else(|| {
                 Self::refused(model, "Bedrock's system instruction must be a string")
@@ -1211,6 +1346,54 @@ mod tests {
         }
     }
 
+    /// A guardrail is part of what governed the call, so it is part of
+    /// identity — and its two forms agree about which guardrail they name.
+    #[test]
+    fn a_guardrail_is_effect_identity_and_both_paths_send_the_same_one() {
+        let config = aws_sdk_bedrockruntime::Config::builder()
+            .region(Region::new("eu-west-1"))
+            .behavior_version_latest()
+            .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
+                |_req| http::Response::builder().status(200).body("").unwrap(),
+            ))
+            .build();
+        let client = Client::from_conf(config);
+        let plain = Bedrock::from_client(client.clone(), "eu-west-1");
+        let model = ModelId::new("bedrock", "m");
+        let guarded =
+            Bedrock::from_client(client, "eu-west-1").guardrail(Guardrail::new("gr-7", "3"));
+
+        assert_eq!(plain.request_profile(&model)["guardrail"], Value::Null);
+        assert_eq!(
+            guarded.request_profile(&model)["guardrail"],
+            json!({ "id": "gr-7", "version": "3" }),
+            "a guardrail that does not enter the request profile can be turned \
+             off between a run and its replay with nothing on the record"
+        );
+        assert_ne!(
+            plain.request_profile(&model),
+            guarded.request_profile(&model),
+            "guarded and unguarded calls shared one effect identity"
+        );
+
+        // The buffered and streaming forms must name the same guardrail: a
+        // control applied on one path only is one a `stream: true` deployment
+        // silently loses.
+        let g = Guardrail::new("gr-7", "3");
+        assert_eq!(g.config().guardrail_identifier(), "gr-7");
+        assert_eq!(g.stream_config().guardrail_identifier(), "gr-7");
+        assert_eq!(g.config().guardrail_version(), "3");
+        assert_eq!(g.stream_config().guardrail_version(), "3");
+        // Synchronous: the alternative streams blocked content to the caller
+        // and objects afterwards, which is a control arriving after the thing
+        // it exists to prevent.
+        assert_eq!(
+            g.stream_config().stream_processing_mode().as_str(),
+            "sync",
+            "an asynchronous guardrail releases content before assessing it"
+        );
+    }
+
     #[test]
     fn request_profile_commits_to_region_and_buffering() {
         let config = aws_sdk_bedrockruntime::Config::builder()
@@ -1234,6 +1417,10 @@ mod tests {
                 "stream": true,
                 "schema_mode": "native",
                 "timeout_ms": 300_000,
+                // Present and null when unguarded: an absent key and a null
+                // one are the same to a reader and different to a digest, so
+                // the profile states the answer rather than omitting it.
+                "guardrail": Value::Null,
             })
         );
 

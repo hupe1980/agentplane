@@ -140,7 +140,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     println!("run      {} → {:?}", out.run_id, out.status);
-    println!("answer   {}", out.output.clone().unwrap_or(Value::Null));
+    println!(
+        "answer   {}",
+        out.output
+            .as_ref()
+            .map_or(&Value::Null, agentplane::Tainted::peek)
+    );
     println!(
         "spend    {} tokens, {} calls to OpenAI",
         out.spend.tokens,

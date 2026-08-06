@@ -181,7 +181,7 @@ async fn openai_returns_an_answer_in_the_declared_schema() {
         .await
         .expect("the live run failed");
 
-    let answer = out.output.expect("no output");
+    let answer = out.output.expect("no output").peek().clone();
     let severity = answer["severity"]
         .as_str()
         .unwrap_or_else(|| panic!("the answer is not schema-shaped: {answer}"));

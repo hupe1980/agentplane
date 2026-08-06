@@ -171,7 +171,7 @@ async fn a_run_can_change_its_plan_and_finish_on_the_new_one() {
         "the planner was asked once"
     );
     assert_eq!(
-        out.output.as_ref().and_then(|v| v.get("step")),
+        out.output.as_ref().and_then(|v| v.peek().get("step")),
         Some(&json!("expensive")),
         "the successor's terminal step produced the result"
     );

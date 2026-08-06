@@ -979,6 +979,19 @@ spec:
         shown["arguments"]["amount"], 250_000,
         "the reviewer was not shown the exact arguments: {shown}"
     );
+    // The summary must describe what is *actually* being approved. A tool
+    // approval that says "approve this agent's answer" tells the reviewer they
+    // are vetting a reply while the thing in front of them is a call that will
+    // move money — the exact conflation `oversight.approval: tools-only`
+    // exists to prevent.
+    assert!(
+        task.justification
+            .summary
+            .contains("tool://ledger/transfer"),
+        "the reviewer is told what they are approving by the summary, and it \
+         does not name the call: {:?}",
+        task.justification.summary
+    );
 
     rt.decide_task(
         task.id,

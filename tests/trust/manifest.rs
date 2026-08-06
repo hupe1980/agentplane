@@ -3591,7 +3591,9 @@ spec:
     let answer = out
         .output
         .clone()
-        .unwrap_or_else(|| panic!("no answer; status {:?}", out.status));
+        .unwrap_or_else(|| panic!("no answer; status {:?}", out.status))
+        .peek()
+        .clone();
     let prompt = answer["prompt"].as_str().expect("a prompt");
     assert!(
         prompt.contains("twelve-month mean"),
@@ -3841,7 +3843,7 @@ async fn an_agent_is_consulted_as_a_granted_tool_and_replay_wakes_nobody() {
         "the room did not finish: {:?}",
         out.status
     );
-    let answer = out.output.expect("an answer").to_string();
+    let answer = out.output.expect("an answer").peek().clone().to_string();
     assert!(
         answer.contains("Room report"),
         "the editor's report is missing: {answer}"

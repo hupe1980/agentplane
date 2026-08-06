@@ -746,7 +746,7 @@ async fn exhausting_the_attempts_keeps_the_driver_s_verdict() {
 
     let out = rt.run("demo.reports", json!({})).await.unwrap();
     assert_eq!(
-        out.output.expect("output")["disposition"],
+        out.output.expect("output").peek()["disposition"],
         format!("{:?}", Disposition::DidNotHappen),
         "the retry wrapper laundered a refusal into doubt — everything that \
          decides whether it is safe to unwind now has the wrong answer"

@@ -172,7 +172,7 @@ async fn messages_sharing_a_key_join_one_case() {
 
     assert_eq!(first.status, RunStatus::Succeeded);
     assert_eq!(
-        second.output,
+        second.output.map(|o| o.peek().clone()),
         Some(json!({ "seen": 2 })),
         "state carried across runs"
     );
@@ -559,7 +559,7 @@ async fn a_strict_replay_reads_case_state_from_the_journal_not_the_store() {
         .run_in_case("accumulates", json!("first"), "m", &keys)
         .await
         .unwrap();
-    assert_eq!(out.output.as_ref().unwrap()["seen"], json!(1));
+    assert_eq!(out.output.as_ref().unwrap().peek()["seen"], json!(1));
 
     // Somebody else moves the case on: another run, an operator, a repair.
     let case_id = store.correlate(&keys).await.unwrap().unwrap();
@@ -571,7 +571,7 @@ async fn a_strict_replay_reads_case_state_from_the_journal_not_the_store() {
 
     let replayed = rt.replay(out.run_id, Mode::Strict).await.unwrap();
     assert_eq!(
-        replayed.output.as_ref().unwrap()["seen"],
+        replayed.output.as_ref().unwrap().peek()["seen"],
         json!(1),
         "the replayed run saw a different case state than the live run did, so \
          the run's own logic reached a different answer from the same journal"
@@ -794,7 +794,7 @@ async fn case_state_does_not_launder_untrusted_data() {
         .await
         .expect("run");
 
-    let trust = out.output.as_ref().unwrap()["trust_on_readback"]
+    let trust = out.output.as_ref().unwrap().peek()["trust_on_readback"]
         .as_str()
         .unwrap()
         .to_owned();

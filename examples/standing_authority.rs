@@ -82,19 +82,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let first = runtime
         .run("procurement.purchase", json!({"cents": 30_000}))
         .await?;
-    assert_eq!(first.output.as_ref().unwrap()["remaining"], json!(20_000));
+    assert_eq!(
+        first.output.as_ref().unwrap().peek()["remaining"],
+        json!(20_000)
+    );
 
     let second = runtime
         .run("procurement.purchase", json!({"cents": 15_000}))
         .await?;
-    assert_eq!(second.output.as_ref().unwrap()["remaining"], json!(5_000));
+    assert_eq!(
+        second.output.as_ref().unwrap().peek()["remaining"],
+        json!(5_000)
+    );
 
     // 2. Over the ceiling is `Exhausted`, and a refused draw consumes nothing —
     //    otherwise a caller probing the remainder would drain it.
     let over = runtime
         .run("procurement.purchase", json!({"cents": 10_000}))
         .await?;
-    let message = over.output.as_ref().unwrap()["refused"].as_str().unwrap();
+    let message = over.output.as_ref().unwrap().peek()["refused"]
+        .as_str()
+        .unwrap();
     assert!(message.contains("does not replenish"), "got: {message}");
     assert_eq!(
         store
@@ -120,7 +128,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let after = runtime
         .run("procurement.purchase", json!({"cents": 1_000}))
         .await?;
-    let message = after.output.as_ref().unwrap()["refused"].as_str().unwrap();
+    let message = after.output.as_ref().unwrap().peek()["refused"]
+        .as_str()
+        .unwrap();
     assert!(message.contains("was revoked"), "got: {message}");
 
     // The terms survive revocation. An authority that vanished would take with

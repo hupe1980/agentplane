@@ -372,7 +372,7 @@ async fn a_deferred_member_runs_last_and_only_on_commit() {
         "the gated member did not run last, or ran when it should not have"
     );
     assert_eq!(
-        out.output.as_ref().expect("output")["deferred"],
+        out.output.as_ref().expect("output").peek()["deferred"],
         1,
         "commit did not return the deferred member's output"
     );

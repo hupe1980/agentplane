@@ -193,7 +193,7 @@ async fn the_fake_provider_streams_deltas_that_reassemble_exactly() {
     );
     drop(events);
 
-    assert_eq!(live.output.as_ref().unwrap(), &json!(ANSWER));
+    assert_eq!(live.output.as_ref().unwrap().peek(), &json!(ANSWER));
 }
 
 /// Streams whatever the fake produces, so the fake's own behaviour is the test.

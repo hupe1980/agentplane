@@ -750,7 +750,9 @@ async fn taint_survives_a_handoff_between_agents() {
         .await
         .expect("run");
 
-    let seen = out.output.as_ref().unwrap()["trust"].as_str().unwrap();
+    let seen = out.output.as_ref().unwrap().peek()["trust"]
+        .as_str()
+        .unwrap();
     assert_eq!(
         seen, "Untrusted",
         "a specialist's untrusted answer arrived at the next agent as {seen}: taint \

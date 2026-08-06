@@ -1051,6 +1051,54 @@ often one run may be refused, checked **before** the policy is consulted, since 
 refusal is journaled as it happens and a ceiling applied afterwards bounds
 nothing an observer has not already seen.
 
+## Content guardrails
+
+This crate ships no content classifier, for the reason it ships no policy
+evaluator and no tracing exporter: a deployment that needs one already has a
+better one than this project would write, administered where its compliance
+people can see it.
+
+What it does is **pass the deployment's own through**, and own everything
+around it. On Bedrock:
+
+```rust
+use agentplane::model::bedrock::{Bedrock, Guardrail};
+
+let driver = Bedrock::from_env("eu-west-1")
+    .await?
+    .guardrail(Guardrail::new("gr-7f2", "3"));
+```
+
+Four properties, each one a rule from elsewhere in this document applied here:
+
+- **The guardrail is effect identity.** Its identifier and version go into the
+  request profile, so turning it off, or moving it to another version, is
+  replay divergence rather than a quiet change to what governed a call. A
+  control you can disable between a run and its replay with nothing on the
+  record is not evidence of anything.
+- **An intervention is a metered refusal, not an answer.** Bedrock replies
+  `200` with whatever text survived redaction, so a driver that read
+  `stop_reason` as decoration would hand a caller a blocked reply as the
+  model's words — the failure that looks like success, on the one path a
+  deployment installed to stop something. It is `Unusable`: **landed** and
+  **billed**, because the model was invoked and the assessment was paid for.
+- **Streaming assesses before releasing.** The configuration is
+  `SYNCHRONOUS`. Bedrock's asynchronous mode streams first and intervenes
+  afterwards, which means blocked content has already reached the caller when
+  the guardrail objects.
+- **Both request paths carry it.** A guardrail applied only to the buffered
+  builder is a control a `stream: true` deployment silently loses, which is
+  the same rule written twice with only the unexercised half wrong.
+
+The trace is opt-in (`Guardrail::new(..).with_trace()`) and never reaches a
+model: it names the policy and matched category, which is the classification
+the gate protects, so it belongs in the journal an operator reads rather than
+in a refusal a prober can map.
+
+Providers without a native guardrail get **no emulation**. That is the same
+honest smaller contract as reasoning effort on Converse: a control this
+runtime cannot actually apply is not one it will claim.
+
 ## What is not covered
 
 **Two runs touching one external resource.** Exactly-once here means *one run

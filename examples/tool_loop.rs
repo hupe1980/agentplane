@@ -193,7 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         read.parameters["properties"]["account"]["type"], "string",
         "the model was not shown the schema derived from ReadBalance"
     );
-    println!("   answered: {}", out.output.as_ref().unwrap());
+    println!("   answered: {}", out.output.as_ref().unwrap().peek());
 
     // Every turn is a journaled effect, so the conversation is reconstructable
     // without asking anyone anything.

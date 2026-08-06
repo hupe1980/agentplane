@@ -176,7 +176,7 @@ async fn an_event_arriving_before_the_wait_is_not_lost() {
         "the buffered event must satisfy the wait immediately"
     );
     assert_eq!(
-        out.output,
+        out.output.map(|o| o.peek().clone()),
         Some(json!({ "status": "early" })),
         "the run must receive the event that arrived early"
     );

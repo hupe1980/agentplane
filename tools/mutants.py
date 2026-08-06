@@ -2230,6 +2230,29 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if effect.mutates() {",
         "        if false {",
     ),
+    "AGuardrailIsNotEffectIdentity": (
+        "src/model/bedrock.rs",
+        "a_guardrail_is_effect_identity_and_both_paths_send_the_same_one",
+        "the guardrail a call ran under is left out of the request profile, so "
+        "it can be turned off, or moved to another version, between a run and "
+        "its replay with nothing on the record — the one control a deployment "
+        "installed to stop something, silently absent from what governed the call",
+        '            "guardrail": self.guardrail.as_ref().map(|g| json!({\n'
+        '                "id": g.identifier,\n'
+        '                "version": g.version,\n'
+        '            })),',
+        '            "guardrail": Value::Null,',
+    ),
+    "AnUntrustedAnswerMayChooseItsEnvelope": (
+        "src/api/a2a.rs",
+        "a_peer_cannot_smuggle_a_reply_envelope_through_untrusted_output",
+        "an A2A reply projection is honoured from untrusted output, so a peer "
+        "that puts the marker in its own message and has an ordinary echoing "
+        "skill return it chooses the envelope its reply arrives in — a file "
+        "URL of the attacker's naming, presented as the agent's answer",
+        "        if output.label().is_untrusted() {\n            return None;\n        }",
+        "",
+    ),
     "ARoomMayDeclareOneAgentTwice": (
         "src/manifest/mod.rs",
         "a_bundle_declaring_one_agent_twice_is_refused",

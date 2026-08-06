@@ -222,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     assert_eq!(out.status, RunStatus::Succeeded);
-    println!("   answered: {}", out.output.as_ref().unwrap());
+    println!("   answered: {}", out.output.as_ref().unwrap().peek());
 
     // ── 3. The server component is load-bearing ────────────────────────────
     //

@@ -65,7 +65,16 @@ pub struct RunOutcome {
     pub spend: Spend,
     /// Terminal hash of the run's chain — what a signature would cover.
     pub chain_head: Digest,
-    pub output: Option<Value>,
+    /// What the run produced, **with its label**.
+    ///
+    /// Labelled rather than bare, and the difference is not cosmetic: a
+    /// caller acting on a run's answer needs to know whether a model, a peer
+    /// or a person wrote it. The label was stripped here until an A2A reply
+    /// projection read a marker key out of an untrusted answer and let a
+    /// remote peer choose the envelope its own reply arrived in — a
+    /// confused-deputy reachable because the one fact that would have refused
+    /// it had been dropped at the boundary.
+    pub output: Option<Tainted<Value>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2604,7 +2613,7 @@ impl Runtime {
             spend,
             // The caller is outside the lattice, so the label is dropped at the
             // boundary rather than inside the graph.
-            output: output.map(|t| t.peek().clone()),
+            output,
         })
     }
 }

@@ -120,12 +120,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         )
         .await?;
-    assert_eq!(learned.output, Some(json!(["Customer prefers German"])));
+    assert_eq!(
+        learned.output.as_ref().map(|o| o.peek().clone()),
+        Some(json!(["Customer prefers German"]))
+    );
 
     let recalled = runtime
         .run("support.memory", json!({"action": "recall"}))
         .await?;
-    assert_eq!(recalled.output, learned.output);
+    assert_eq!(
+        recalled.output.map(|o| o.peek().clone()),
+        learned.output.map(|o| o.peek().clone())
+    );
 
     let stored: MemoryItem = store
         .version("team-support-language", 1)
@@ -158,7 +164,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .skill(SemanticMemory(retriever))
         .build();
     let ranked = semantic.run("support.semantic-memory", json!({})).await?;
-    assert_eq!(ranked.output, Some(json!("Customer prefers German")));
+    assert_eq!(
+        ranked.output.map(|o| o.peek().clone()),
+        Some(json!("Customer prefers German"))
+    );
 
     store.set_legal_hold("team-support-language", true).await?;
     let after_expiry = Timestamp::from_unix_timestamp(4_102_444_801)?;

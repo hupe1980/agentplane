@@ -181,7 +181,7 @@ async fn a_probe_that_finds_it_landed_completes_the_effect_without_repeating_it(
     assert_eq!(f.calls.load(Ordering::SeqCst), 1, "sent exactly once");
     assert_eq!(f.probes.load(Ordering::SeqCst), 1, "and asked once");
     assert_eq!(
-        out.output.as_ref().and_then(|v| v.get("via")),
+        out.output.as_ref().and_then(|v| v.peek().get("via")),
         Some(&json!("probe")),
         "the result is the one recovered from the provider"
     );

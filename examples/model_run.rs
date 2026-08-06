@@ -113,7 +113,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let live = rt.run("support.triage", ticket.clone()).await?;
     println!("1. live run       → {:?}", live.status);
     println!("   provider calls: {}", provider.calls());
-    println!("   answer:         {}", render(live.output.as_ref()));
+    println!(
+        "   answer:         {}",
+        render(live.output.as_ref().map(agentplane::Tainted::peek))
+    );
     println!("   spend:          {} tokens", live.spend.tokens);
 
     // ── 2. Replay reads the journal, not the model ─────────────────────────

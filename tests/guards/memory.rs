@@ -641,7 +641,10 @@ async fn a_replayed_recall_does_not_search_again() {
 
     let out = rt.run("recalls", json!({})).await.expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
-    assert_eq!(out.output.as_ref().expect("output")["recalled"][0], "m-1");
+    assert_eq!(
+        out.output.as_ref().expect("output").peek()["recalled"][0],
+        "m-1"
+    );
     assert_eq!(
         searches.load(Ordering::SeqCst),
         1,
@@ -793,7 +796,7 @@ async fn a_replayed_expiry_sweep_does_not_erase_again() {
         .await
         .expect("live sweep");
     assert_eq!(live.status, RunStatus::Succeeded);
-    assert_eq!(live.output.as_ref().unwrap()["removed"], 1);
+    assert_eq!(live.output.as_ref().unwrap().peek()["removed"], 1);
     assert_eq!(sweeps.load(Ordering::SeqCst), 1);
     let replay = rt
         .replay(live.run_id, Mode::Strict)
@@ -1564,7 +1567,7 @@ async fn a_replayed_run_reads_its_embedding_back_rather_than_asking_again() {
     assert_eq!(live.status, RunStatus::Succeeded);
     assert_eq!(embedder.0.load(Ordering::SeqCst), 1);
     assert_eq!(
-        live.output.as_ref().expect("an answer")["embedding"],
+        live.output.as_ref().expect("an answer").peek()["embedding"],
         json!([1.0, 0.0]),
     );
 

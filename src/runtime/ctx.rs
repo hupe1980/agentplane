@@ -370,7 +370,20 @@ impl<'a> StepCtx<'a> {
                 depth,
             })
             .await?;
-        Ok(commissioned.map(|c| c.answer))
+        // Raised, never lowered — the same rule the effect layer applies to a
+        // declared sensitivity, applied here because only now is the figure
+        // known. A specialist that handled `Confidential` data must not have
+        // its answer arrive as `Internal` merely because it crossed a
+        // delegation boundary.
+        let sensitivity = commissioned.peek().sensitivity;
+        let label = commissioned
+            .label()
+            .clone()
+            .with_sensitivity(commissioned.label().sensitivity.max(sensitivity));
+        Ok(Tainted::with_label(
+            commissioned.into_unlabelled().answer,
+            label,
+        ))
     }
 
     /// The declaration this agent runs under.
@@ -3501,6 +3514,27 @@ struct Commissioned {
     answer: Value,
     tokens: u64,
     minor_units: u64,
+    /// How sensitive the sub-run said its answer was.
+    ///
+    /// Journaled with the answer rather than re-read afterwards, because the
+    /// label a replay applies has to come from history — asking the specialist
+    /// again would make the same run label the same value differently.
+    ///
+    /// It exists because [`Effect::output_sensitivity`] is a *static*
+    /// declaration, evaluated before the effect performs, so a commission
+    /// cannot declare what it does not yet know. Without it every commissioned
+    /// answer arrived at the default `Internal` floor, which silently
+    /// downgrades a specialist that handled anything above it — delegation as
+    /// a laundering primitive, reached without anyone writing a release.
+    /// Absent in history written before this field existed, which reads back
+    /// as the floor an untrusted effect output already carries — the old
+    /// behaviour exactly, rather than a guess that could raise a ceiling.
+    #[serde(default = "internal_floor")]
+    sensitivity: crate::core::Sensitivity,
+}
+
+const fn internal_floor() -> crate::core::Sensitivity {
+    crate::core::Sensitivity::Internal
 }
 
 #[async_trait::async_trait]
@@ -3581,7 +3615,8 @@ impl Effect for Commission {
                 detail: format!("'{}' finished without producing output", self.capability),
             })?;
         Ok(Commissioned {
-            answer,
+            sensitivity: answer.label().sensitivity,
+            answer: answer.into_unlabelled(),
             tokens: out.spend.tokens,
             minor_units: out.spend.minor_units,
         })

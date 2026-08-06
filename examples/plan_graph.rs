@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .run_plan(plan.clone(), json!({ "meter": "51238696781" }))
         .await?;
     println!("run              → {}", out.status.as_str());
-    println!("output           → {}", out.output.as_ref().unwrap());
+    println!("output           → {}", out.output.as_ref().unwrap().peek());
 
     // ── 2. Every step is journaled under its own id ────────────────────────
     let records = store.read(out.run_id, 1).await?;

@@ -246,7 +246,7 @@ fn execute(manifests: &[Manifest], opts: &Options) -> Result<ExitCode, String> {
         if let Some(output) = &outcome.output {
             // The answer on stdout and everything else on stderr, so this
             // composes with a pipe instead of needing a flag to be quiet.
-            println!("{output}");
+            println!("{}", output.peek());
         }
 
         // A refused, exhausted or failed run must not exit zero: whoever scripts

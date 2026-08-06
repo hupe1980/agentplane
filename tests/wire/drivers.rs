@@ -2693,3 +2693,98 @@ async fn chat_completions_tool_turns_return_under_the_ids_the_model_issued() {
     assert_eq!(messages[2]["role"], "tool");
     assert_eq!(messages[2]["tool_call_id"], "call_42");
 }
+
+/// Two tool turns accumulate the transcript exactly once.
+///
+/// The failure this rules out is silent and expensive: a continuation that
+/// re-appends a prior turn makes every turn re-send the whole conversation
+/// twice over, and one that *drops* a turn asks the model to answer without
+/// the result it just received. Both look like a working loop until somebody
+/// reads the bill or the answer.
+#[tokio::test]
+async fn chat_completions_two_tool_turns_accumulate_the_transcript_exactly_once() {
+    let assistant = |id: &str| {
+        json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": "lookup", "arguments": "{}" },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 1 },
+        })
+    };
+    let model = ModelId::new("chat-completions", "m");
+    let prompt = json!({ "system": "Be brief.", "input": "start" });
+    let exchange = |id: &str| agentplane::model::ToolExchange {
+        call: agentplane::model::ToolCall {
+            id: id.to_owned(),
+            name: "lookup".to_owned(),
+            arguments: json!({}),
+        },
+        output: json!({ "n": id }),
+        failed: false,
+    };
+
+    // Turn 1 → the model asks for a tool.
+    let (canned, _seen) = canned(200, assistant("call_1"));
+    let url = serve(canned).await;
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let first = driver.complete(cc_request(&model, &prompt)).await.unwrap();
+    let state1 = first.continuation.expect("turn 1 continues");
+
+    // Turn 2 → carrying turn 1's result, the model asks again.
+    let (canned, seen2, _h) = canned_observed(200, assistant("call_2"));
+    let url = serve(canned).await;
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let exchanges1 = vec![exchange("call_1")];
+    let mut request = cc_request(&model, &prompt);
+    request.exchanges = &exchanges1;
+    request.continuation = Some(&state1);
+    let second = driver.complete(request).await.unwrap();
+    let state2 = second.continuation.expect("turn 2 continues");
+
+    let sent2 = seen2.lock().unwrap().clone().unwrap();
+    let m2 = sent2["messages"].as_array().unwrap();
+    assert_eq!(
+        m2.len(),
+        4,
+        "turn 2 should send system, user, assistant-1, tool-1 — got {m2:#?}"
+    );
+
+    // Turn 3 → carrying turn 2's result, the model answers.
+    let (canned, seen3, _h) = canned_observed(
+        200,
+        json!({
+            "choices": [{ "message": { "content": "done" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 1 },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let exchanges2 = vec![exchange("call_2")];
+    let mut request = cc_request(&model, &prompt);
+    request.exchanges = &exchanges2;
+    request.continuation = Some(&state2);
+    driver.complete(request).await.unwrap();
+
+    let sent3 = seen3.lock().unwrap().clone().unwrap();
+    let m3 = sent3["messages"].as_array().unwrap();
+    assert_eq!(
+        m3.len(),
+        6,
+        "turn 3 should send system, user, assistant-1, tool-1, assistant-2, \
+         tool-2 — a transcript that grew faster re-sent a turn, one that grew \
+         slower dropped one: {m3:#?}"
+    );
+    // Every tool result sits under the id the model actually issued, in order.
+    assert_eq!(m3[3]["tool_call_id"], "call_1");
+    assert_eq!(m3[5]["tool_call_id"], "call_2");
+    assert_eq!(m3[2]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(m3[4]["tool_calls"][0]["id"], "call_2");
+}
