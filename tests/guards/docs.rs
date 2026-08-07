@@ -949,3 +949,44 @@ fn every_tabulated_manifest_field_exists() {
         real.len()
     );
 }
+
+/// **The TLS trust anchor is the one this crate says it is.**
+///
+/// `reqwest`'s feature list carried `webpki-roots` for a while, which reads as
+/// *this build pins Mozilla's root bundle* and did nothing of the kind. reqwest
+/// 0.13 has no such feature: it declares `webpki-roots` as an **optional
+/// dependency** and never writes `dep:webpki-roots` in its own `[features]`, so
+/// Cargo synthesises an implicit feature of that name. Enabling it resolves,
+/// compiles, and links the whole bundle in — while the actual verifier stays
+/// `rustls-platform-verifier`, reading the operating system's store.
+///
+/// That is the worst shape a dead declaration can take. It is not merely unused:
+/// it is a security-relevant belief, and an operator reading the manifest would
+/// conclude their trust anchors are pinned and independent of the host when they
+/// are neither.
+///
+/// Checked against the **lock file**, because that is what says which crates a
+/// build actually contains — the manifest says what was asked for, and the
+/// entire failure here was the gap between the two. Both directions are
+/// asserted, so a change that swapped the verifier out is caught as loudly as
+/// one that brought the bundle back.
+#[test]
+fn the_tls_trust_anchor_is_the_platform_verifier_and_not_a_pinned_bundle() {
+    let lock = read("Cargo.lock");
+    assert!(
+        lock.contains("name = \"rustls-platform-verifier\""),
+        "the TLS verifier is gone from the lock file: this crate's trust anchor is \
+         the operating system's store, deliberately, because the operator already \
+         administers a CA policy and a runtime that ignored it would break every \
+         corporate inspection proxy while claiming to be safer"
+    );
+    assert!(
+        !lock.contains("name = \"webpki-roots\""),
+        "`webpki-roots` is back in the tree. reqwest has no feature of that name — \
+         Cargo synthesises one from its optional dependency — so asking for it \
+         links Mozilla's whole root bundle into every build and changes the trust \
+         anchor not at all. If pinned roots are genuinely wanted, that is \
+         `rustls-no-provider` plus an explicit `ClientConfig`, and it is a \
+         decision to make on purpose rather than a word in a feature list"
+    );
+}

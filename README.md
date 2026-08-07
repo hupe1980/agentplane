@@ -137,7 +137,7 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | 🕰️ | **The sweeper is audited too** — breaching an obligation and escalating a case happen on a clock, with no run to explain them, so a tick that decides anything writes its decisions into a sealed run of its own. State cannot tell *the sweep breached this at 02:00* from *somebody set it*, and no human was there to remember |
 | 🔦 | **A finding you can find** — every conclusion the runtime reaches is queryable by whoever must clear it, including its own worst one: `GET /runs?outcome=quarantined`. A status returned to a caller that already returned, an event on a stream nobody reads, and a counter with no alert are all detection without delivery — the failure production studies of agent runtimes report most |
 | 🛡️ | **Your guardrail, not ours** — this crate ships no content classifier, for the same reason it ships no policy evaluator: a deployment that needs one already has a better one, administered where its compliance people can see it. `Bedrock::guardrail(..)` passes the deployment's own through and owns everything around it — the guardrail's id and version are **effect identity**, so disabling it between a run and its replay is divergence rather than a silent change; an intervention is a **metered refusal** rather than an answer, because Bedrock returns 200 with whatever survived redaction; streaming assesses *before* releasing; and both request paths carry it, since a control on one path is one a streaming deployment loses |
-| 🔌 | **Model drivers included** — `OpenAI` Responses, Anthropic Messages, a separately gated AWS Bedrock Converse driver, and a `chat-completions` driver for the OpenAI-compatible wire every self-hosted server speaks (TGI, vLLM, Ollama, llama.cpp — and with it the Hugging Face catalogue, local or hosted), so adopting this does not mean keeping your provider plumbing. Streaming, native structured output, reasoning continuation across tool turns and cached-token accounting are in each one; OpenAI provider retention is explicitly off by default and replay-visible when enabled. What makes a driver work is not the transport but the **failure mapping**: every error is reduced to whether the call landed, and guessing that wrong is how a payment happens twice |
+| 🔌 | **Model drivers included** — `OpenAI` Responses, Anthropic Messages, Google Gemini `generateContent`, a separately gated AWS Bedrock Converse driver, and a `chat-completions` driver for the OpenAI-compatible wire every self-hosted server speaks (TGI, vLLM, Ollama, llama.cpp — and with it the Hugging Face catalogue, local or hosted), so adopting this does not mean keeping your provider plumbing. Streaming, native structured output, reasoning continuation across tool turns and cached-token accounting are in each one; OpenAI provider retention is explicitly off by default and replay-visible when enabled. What makes a driver work is not the transport but the **failure mapping**: every error is reduced to whether the call landed, and guessing that wrong is how a payment happens twice |
 | 🔌 | **Real context, tool and peer wires** — a genuine MCP host for exact-granted prompts, resources, tools and async Tasks, several servers beside typed in-process tools, and an A2A 1.0 JSON-RPC client/server with typed remote-task handles and journaled polling. Each maps wire outcomes conservatively into recovery; elicitation is not advertised because no server may open an ungoverned human loop inside an effect |
 | 🪪 | **Agent Cards derived, not written** — an A2A v1.0 card built from the manifest, so what an agent advertises and what it is permitted cannot drift. Its skills are exactly the declared capabilities, and unimplemented transports are advertised as **absent** rather than aspirational |
 | 📡 | **A2A 1.0 task lifecycles on both sides** — blocking/non-blocking tasks, direct normative `GetTask`, journal-backed status/artifact streaming, cursor-paginated `ListTasks`, context-based new tasks, exact `taskId` continuation of `INPUT_REQUIRED`, cancellation, durable push and extended cards. Continuation atomically targets the named wait, carries the authenticated peer as provenance, reconstructs every turn in history, and deduplicates transport retries. Outbound `PeerTask`/`PeerTaskCall` preserve handles and journal each poll |
@@ -220,13 +220,18 @@ crate's own client, which proves symmetry, not conformance — a client and
 server written from the same misreading agree everywhere. The kit's first run
 found five defects no in-repo test could reach.
 
-**🌐 Tests against a real provider.** `just test-live` runs the OpenAI driver
-against the actual API. They are gated twice — an explicit `AGENTPLANE_LIVE=1`
+**🌐 Tests against a real provider.** `just test-live` runs the OpenAI and
+Gemini drivers against the actual APIs. They are gated twice — an explicit `AGENTPLANE_LIVE=1`
 *and* a key — because a credential being available is not a decision to spend
 money with it, and they are never part of `ci`. They exist because a stubbed
 provider is structurally unable to have the defects a real one finds: it never
 rejects a malformed request and never returns a shape the driver mis-reads.
-Writing them found two, both of which every offline test had passed.
+Writing them found two, both of which every offline test had passed. The Gemini
+battery is the sharpest case: a **thought signature** is minted and validated by
+Google, so a canned server accepts whatever a fixture tells it to and says
+nothing about whether Gemini takes the signature back — the one check that
+distinguishes a driver carrying the model's turn verbatim from one rebuilding
+it, which is where the rest of the ecosystem has been losing this.
 
 **🧬 Mutation testing over the code.** Every load-bearing guarantee is broken on
 purpose, and the test *named for each one* must fail. A mutation caught by some other test is

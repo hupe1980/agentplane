@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.5.0"
+version      = "0.6.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -213,7 +213,26 @@ ed25519-dalek = { version = "3", default-features = false, features = ["alloc", 
 # what a call burned *before* the connection died. Without it the only honest
 # report for a severed response is "cost unknown", and the budget ceiling that
 # exists to bound a runaway provider reads zero while it spends.
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "http2", "charset", "stream"], optional = true }
+# `rustls` and not `native-tls`: one TLS stack, in Rust, so a deployment's
+# threat model does not have to include OpenSSL's.
+#
+# The **trust anchor is the operating system's store**, supplied by
+# `rustls-platform-verifier`, which reqwest's `rustls` feature wires in. That is
+# a decision rather than a default, and it is the same one this crate makes
+# about policy engines, content classifiers and tracing exporters: the operator
+# already administers a CA policy, and a runtime that ignored it would break
+# every corporate inspection proxy while claiming to be more secure.
+#
+# This list previously also carried `webpki-roots`, which looked like pinning
+# Mozilla's bundle and did nothing of the kind. reqwest 0.13 has no such
+# feature — it declares `webpki-roots` as an *optional dependency* and never
+# writes `dep:webpki-roots` in its own `[features]`, so Cargo synthesises an
+# implicit feature of that name. Enabling it therefore resolves, compiles, and
+# links the entire root bundle into every build, while the verifier stays the
+# platform one. A declaration that does nothing, in the one place where
+# believing it changes what an operator thinks their trust anchors are. The
+# guard in `tests/guards/docs.rs` keeps it gone.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "charset", "stream"], optional = true }
 # Default features are declined on both AWS crates for one reason: the SDK's
 # `rustls` feature is `legacy-rustls-ring`, which pins `rustls` 0.21 and with it
 # `rustls-webpki` 0.101 — three live RUSTSEC advisories against the code that

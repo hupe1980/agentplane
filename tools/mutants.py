@@ -3306,6 +3306,97 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if self.spec.execution.is_some() && self.spec.capabilities.provides.len() > 1 {",
         "        if false {",
     ),
+    "GeminiFileUriReachesTheProvider": (
+        "src/model/mod.rs",
+        "gemini_refuses_a_provider_side_file_uri",
+        "a Gemini `fileData.fileUri` is not recognised as a provider-side fetch, "
+        "so Google dereferences a caller-named URL from its own network — "
+        "outside this plane's egress allowlist, DNS pinning, size and type "
+        "ceilings, and journal, which is the whole of what governed media replaces",
+        '            for key in ["fileData", "file_data"] {',
+        '            for key in [] as [&str; 0] {',
+    ),
+    "GeminiStreamsWithoutAltSse": (
+        "src/model/gemini.rs",
+        "gemini_streams_reassemble_and_keep_the_signature",
+        "the streaming path drops `alt=sse`, so Gemini answers with a chunked "
+        "JSON array the SSE decoder reads as no events at all — every streamed "
+        "call reported as never having generated, and retried forever against a "
+        "provider that answered correctly every time",
+        '            "streamGenerateContent?alt=sse"',
+        '            "streamGenerateContent"',
+    ),
+    "GeminiStreamMergesEverySignedPart": (
+        "src/model/gemini_stream.rs",
+        "gemini_streams_reassemble_and_keep_the_signature",
+        "reassembly merges every part as text rather than only the text-only "
+        "ones, so a `thoughtSignature` arriving on a function-call part is "
+        "flattened away and the next turn is a 400 — the failure appears on the "
+        "second tool turn, never the first",
+        "        .is_some_and(|object| object.len() == 1 && object.contains_key(\"text\"))",
+        "        .is_some_and(|object| object.contains_key(\"text\"))",
+    ),
+    "GeminiSafetyIsNotEffectIdentity": (
+        "src/model/gemini.rs",
+        "gemini_passes_the_deployments_safety_thresholds_and_puts_them_in_identity",
+        "the declared safety thresholds stay out of the request profile, so "
+        "loosening one to BLOCK_NONE between a run and its replay is a silent "
+        "change in what governed the call rather than divergence",
+        '            "safety": (!self.safety.is_empty()).then(|| self.safety.profile()),',
+        '            "safety": Value::Null,',
+    ),
+    "GeminiRebuildsTheModelsTurn": (
+        "src/model/gemini.rs",
+        "gemini_returns_the_models_turn_verbatim_including_its_thought_signature",
+        "the model's turn is rebuilt from the function calls this driver parsed "
+        "instead of being carried verbatim, so the `thoughtSignature` Gemini 3 "
+        "requires back is dropped — a 400 on the second tool turn, and the exact "
+        "bug the ecosystem worked around by smuggling signatures into tool-call ids",
+        "            Some(state) if state.provider == PROVIDER => array.push(state.state.clone()),",
+        "            Some(state) if state.provider == PROVIDER => {\n"
+        "                let _ = &state;\n"
+        "                array.push(json!({ \"role\": \"model\", \"parts\": [] }));\n"
+        "            }",
+    ),
+    "GeminiThinkingTokensAreFree": (
+        "src/model/gemini.rs",
+        "gemini_maps_the_request_shape_usage_and_the_system_instruction",
+        "thinking tokens are dropped from the output count, so a reasoning-heavy "
+        "run under-reports most of its bill — Gemini reports them beside the "
+        "candidate count rather than inside it, so omitting them is silent",
+        '            output_tokens: count("candidatesTokenCount") + count("thoughtsTokenCount"),',
+        '            output_tokens: count("candidatesTokenCount"),',
+    ),
+    "GeminiEffortIsCollapsedNotRefused": (
+        "src/model/gemini.rs",
+        "gemini_maps_the_thinking_levels_it_has_and_refuses_the_rest",
+        "an effort Gemini cannot express is folded into the nearest level it "
+        "can, so a run declaring `max` is answered at `high` — a substitution on "
+        "a digest-covered value that exists to say what governed the call",
+        "            ReasoningEffort::None | ReasoningEffort::XHigh | ReasoningEffort::Max => {",
+        '            ReasoningEffort::XHigh | ReasoningEffort::Max => "high",\n'
+        "            ReasoningEffort::None => {",
+    ),
+    "TheStreamedToolCallLosesItsExtension": (
+        "src/model/chat_completions_stream.rs",
+        "chat_completions_streaming_carries_an_unknown_tool_call_field_too",
+        "reassembling a stream drops every tool-call field this driver does not "
+        "itself understand, so a `thought_signature` is lost on the **default** "
+        "path while the buffered one keeps it — a fix that holds exactly where "
+        "nobody runs it",
+        '                if !matches!(key.as_str(), "index" | "id" | "type" | "function") {',
+        '                if false {',
+    ),
+    "TheAssistantTurnIsRebuiltNotCarried": (
+        "src/model/chat_completions.rs",
+        "chat_completions_carries_an_unknown_tool_call_field_into_the_continuation",
+        "the continuation is rebuilt from the fields this driver understands "
+        "rather than carried verbatim, so anything an OpenAI-compatible server "
+        "attached is dropped — including the `thought_signature` Gemini 3 "
+        "requires back and rejects the turn without",
+        "            let mut message = choice.message.raw.clone();",
+        "            let mut message = Value::Null;",
+    ),
     "NovaEffortIsCollapsedNotRefused": (
         "src/model/bedrock.rs",
         "nova_refuses_an_effort_it_has_no_counterpart_for",

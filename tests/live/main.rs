@@ -5,7 +5,10 @@
 //! Every test here skips unless **both** are set:
 //!
 //! * `AGENTPLANE_LIVE=1` — the deliberate opt-in;
-//! * `OPENAI_API_KEY` — the credential.
+//! * the provider's credential — `OPENAI_API_KEY`, `GEMINI_API_KEY`.
+//!
+//! Each module skips on its own credential, so a machine holding one key runs
+//! that provider's battery and loudly skips the rest.
 //!
 //! Two signals rather than one, and the second is the API key on purpose. A
 //! developer with `OPENAI_API_KEY` exported in their shell — which is most
@@ -31,4 +34,5 @@
 //! *accepts* what this crate sends, and that what it sends back is read the way
 //! the crate claims.
 
+mod gemini;
 mod openai;

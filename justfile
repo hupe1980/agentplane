@@ -131,13 +131,19 @@ test-drivers:
 # Tests that call a real provider and therefore cost money.
 #
 # Never part of `ci`, and gated twice: this recipe supplies AGENTPLANE_LIVE=1,
-# and the key comes from .env (gitignored). An exported OPENAI_API_KEY alone
+# and the keys come from .env (gitignored). An exported OPENAI_API_KEY alone
 # does nothing — a credential being available is not a decision to spend it.
+#
+# Each provider's battery skips on its own key, so one key runs one battery and
+# the rest say so loudly. The Gemini one carries the load here: a thought
+# signature is minted and validated by Google, so a canned server accepts
+# whatever a fixture tells it to and proves nothing about whether Gemini takes
+# the signature back.
 test-live:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -f .env ]; then
-        echo "no .env — put OPENAI_API_KEY in it, or export it and set AGENTPLANE_LIVE=1" >&2
+        echo "no .env — put OPENAI_API_KEY and/or GEMINI_API_KEY in it, or export them and set AGENTPLANE_LIVE=1" >&2
         exit 1
     fi
     set -a; . ./.env; set +a

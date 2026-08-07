@@ -362,6 +362,13 @@ async fn driver(name: &str) -> Result<Arc<dyn ModelProvider>, String> {
             )
             .await?,
         )),
+        // `GEMINI_API_KEY`, falling back to `GOOGLE_API_KEY`: both are in wide
+        // use, and a deployment that exported the other one would otherwise
+        // meet an authentication failure naming neither.
+        #[cfg(feature = "providers")]
+        "gemini" => Ok(Arc::new(
+            agentplane::model::gemini::Gemini::from_env().map_err(|e| e.to_string())?,
+        )),
         #[cfg(feature = "providers")]
         "openai" => Ok(Arc::new(
             agentplane::model::openai::OpenAi::new(key("OPENAI_API_KEY")?)
@@ -392,9 +399,9 @@ async fn driver(name: &str) -> Result<Arc<dyn ModelProvider>, String> {
         #[cfg(feature = "testkit")]
         "fake" => Ok(agentplane::testkit::FakeProvider::new()),
         other => Err(format!(
-            "no driver for provider '{other}'. This binary ships anthropic, bedrock, openai, \
-             chat-completions and fake; anything else is an embedder's own driver, registered \
-             through RuntimeBuilder::provider"
+            "no driver for provider '{other}'. This binary ships anthropic, bedrock, gemini, \
+             openai, chat-completions and fake; anything else is an embedder's own driver, \
+             registered through RuntimeBuilder::provider"
         )),
     }
 }

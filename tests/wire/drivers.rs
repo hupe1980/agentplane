@@ -24,9 +24,11 @@ use std::sync::Arc;
 use agentplane::core::{Delegation, Disposition, Principal, Scope};
 use agentplane::model::anthropic::Anthropic;
 use agentplane::model::chat_completions::ChatCompletions;
+use agentplane::model::gemini::Gemini;
 use agentplane::model::openai::OpenAi;
 use agentplane::model::{
-    ModelCall, ModelError, ModelId, ModelProvider, ReasoningEffort, SchemaMode,
+    ModelCall, ModelError, ModelId, ModelProvider, ProviderContinuation, ReasoningEffort, Request,
+    SchemaMode, ToolDeclaration, ToolExchange,
 };
 use agentplane::peers::a2a::{A2aClient, EXTENSION_URI, Endpoint, PROTOCOL_VERSION};
 use agentplane::peers::{PeerClient, PeerError, PeerId};
@@ -68,6 +70,8 @@ async fn serve(canned: Canned) -> String {
         .route("/v1/messages", post(handle))
         .route("/v1/responses", post(handle))
         .route("/v1/chat/completions", post(handle))
+        // Gemini names the method in the path, and the model in it.
+        .route("/v1beta/models/{model}", post(handle))
         .with_state(canned);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2787,4 +2791,939 @@ async fn chat_completions_two_tool_turns_accumulate_the_transcript_exactly_once(
     assert_eq!(m3[5]["tool_call_id"], "call_2");
     assert_eq!(m3[2]["tool_calls"][0]["id"], "call_1");
     assert_eq!(m3[4]["tool_calls"][0]["id"], "call_2");
+}
+
+/// **A provider's assistant turn is carried back verbatim, not rebuilt.**
+///
+/// The continuation exists so the next request returns exactly what the server
+/// emitted. It was built by copying four fields out of the parsed response —
+/// `id`, `type`, `function.name`, `function.arguments` — and the comment above
+/// it said "the assistant turn exactly as the server sent it", which it was
+/// not. Anything else the server attached was dropped by `serde` on the way in
+/// and could not have been re-emitted anyway.
+///
+/// That is not hypothetical, and the ecosystem has the scars. Gemini 3 returns
+/// an encrypted `thought_signature` on every tool call and **rejects** a
+/// follow-up turn that does not carry it back; through the OpenAI-compatible
+/// endpoint it rides in `tool_calls[].extra_content.google.thought_signature`.
+/// `LiteLLM`, which normalises every provider into this same shape, had nowhere
+/// to put it and resorted to smuggling it inside the tool-call **id** — which
+/// then leaked into requests to other providers, and still degenerates
+/// multi-turn tool calling when the signature arrives on a thought part rather
+/// than a function-call part.
+///
+/// The fix is not to learn Gemini's field. It is to stop rebuilding a message
+/// this driver does not own: an OpenAI-compatible server may attach anything,
+/// and a driver that re-emits only the fields it happens to know about is one
+/// that breaks on every field added after it was written.
+#[tokio::test]
+async fn chat_completions_carries_an_unknown_tool_call_field_into_the_continuation() {
+    let (canned, _seen, _headers) = canned_observed(
+        200,
+        json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "lookup", "arguments": "{\"q\":\"x\"}" },
+                        // Not a field this driver knows, and not one it may drop.
+                        "extra_content": { "google": { "thought_signature": "SIGNATURE" } },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3 },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = ChatCompletions::new(url).unwrap().buffered();
+    let model = ModelId::new("chat-completions", "gemini-3.5-flash");
+    let prompt = json!({ "input": "look it up" });
+
+    let completion = driver.complete(cc_request(&model, &prompt)).await.unwrap();
+    assert_eq!(completion.tool_calls.len(), 1, "the tool call was lost");
+
+    let state = completion
+        .continuation
+        .as_ref()
+        .expect("a tool call must produce a continuation")
+        .state
+        .clone();
+
+    assert_eq!(
+        state[0]["tool_calls"][0]["extra_content"]["google"]["thought_signature"], "SIGNATURE",
+        "the server's own field was dropped rebuilding the assistant turn, so the \
+         next request cannot return it — which is a 4xx on Gemini 3 and a \
+         degenerating tool loop on anything else that signs its reasoning: {state}"
+    );
+}
+
+// ── Gemini ──────────────────────────────────────────────────────────────────
+
+fn gemini_request<'a>(
+    model: &'a ModelId,
+    prompt: &'a Value,
+    tools: &'a [ToolDeclaration],
+    exchanges: &'a [ToolExchange],
+    continuation: Option<&'a ProviderContinuation>,
+) -> Request<'a> {
+    Request {
+        model,
+        prompt,
+        max_output_tokens: 1024,
+        reasoning_effort: None,
+        schema: None,
+        tools,
+        exchanges,
+        continuation,
+        stream: None,
+    }
+}
+
+/// The request shape Gemini actually takes, asserted field by field.
+///
+/// A known answer rather than a round trip: this driver's own reader would
+/// agree with a wrong spelling, and Gemini answers most misspellings with a
+/// 400 whose text does not name the offending key.
+#[tokio::test]
+async fn gemini_maps_the_request_shape_usage_and_the_system_instruction() {
+    let (canned, seen, headers) = canned_observed(
+        200,
+        json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "Hello from Gemini" }] },
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 20,
+                "candidatesTokenCount": 7,
+                "thoughtsTokenCount": 5,
+                "cachedContentTokenCount": 12,
+            },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!({ "system": "Answer briefly.", "messages": [
+        { "role": "user", "parts": [{ "text": "hello" }] }
+    ]});
+
+    let completion = driver
+        .complete(gemini_request(&model, &prompt, &[], &[], None))
+        .await
+        .unwrap();
+    assert_eq!(completion.text, "Hello from Gemini");
+    assert_eq!(completion.stop_reason.as_deref(), Some("STOP"));
+    assert!(!completion.truncated);
+
+    // Thinking tokens are billed as output and reported *beside* the candidate
+    // count, so they are added. A driver that ignored them would under-report a
+    // reasoning-heavy run by most of its bill.
+    assert_eq!(completion.usage.output_tokens, 12, "7 answer + 5 thinking");
+    // Cached input is a *subset* of the prompt count, so it is recorded rather
+    // than added — adding it would double-count the cached portion.
+    assert_eq!(completion.usage.input_tokens, 20);
+    assert_eq!(completion.usage.cache_read_tokens, 12);
+    assert_eq!(completion.usage.uncached_input_tokens(), 8);
+
+    let body = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(body["contents"][0]["role"], "user");
+    assert_eq!(body["contents"][0]["parts"][0]["text"], "hello");
+    // Top-level, not a turn: Gemini has no `system` role, and an instruction
+    // left in `contents` is shown to the model as part of the question.
+    assert_eq!(
+        body["systemInstruction"]["parts"][0]["text"],
+        "Answer briefly."
+    );
+    assert!(
+        body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["role"] != "system"),
+        "the instruction was left in the turns: {body}"
+    );
+    assert_eq!(body["generationConfig"]["maxOutputTokens"], 1024);
+    assert!(
+        body["generationConfig"].get("thinkingConfig").is_none(),
+        "no reasoning was asked for and a thinking config was sent anyway"
+    );
+
+    // The key rides in a header, never the URL: a URL reaches proxies, traces
+    // and error text, and a credential in any of those cannot be un-leaked.
+    let headers = headers.lock().unwrap().clone().unwrap();
+    assert_eq!(headers["x-goog-api-key"], "k");
+}
+
+/// **The model's turn is carried back verbatim, signature and all.**
+///
+/// This is the reason the driver exists rather than deferring to Google's
+/// OpenAI-compatible endpoint. Gemini 3 attaches an encrypted `thoughtSignature`
+/// to the parts it emits and **rejects** a follow-up turn that does not return
+/// it. A driver that rebuilt the turn from the fields it understands could not
+/// return what it never kept — which is the bug `LiteLLM` has been carrying, and
+/// which it worked around by smuggling the signature inside the tool-call id.
+///
+/// So the assertion is not "the signature is preserved" as a property of this
+/// driver's cleverness. It is that the driver keeps the provider's own document
+/// and hands it straight back.
+#[tokio::test]
+async fn gemini_returns_the_models_turn_verbatim_including_its_thought_signature() {
+    let (canned, seen, _headers) = canned_observed(
+        200,
+        json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": { "name": "lookup", "args": { "q": "x" } },
+                        "thoughtSignature": "SIGNATURE",
+                    }],
+                },
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 3 },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("look it up");
+    let tools = [ToolDeclaration {
+        name: "lookup".to_owned(),
+        description: "Look something up.".to_owned(),
+        parameters: json!({ "type": "object", "properties": {} }),
+    }];
+
+    let first = driver
+        .complete(gemini_request(&model, &prompt, &tools, &[], None))
+        .await
+        .unwrap();
+    assert_eq!(first.tool_calls.len(), 1);
+    assert_eq!(first.tool_calls[0].name, "lookup");
+    // Gemini need not issue an id and the runtime keys results by one, so it is
+    // derived from the position — stable across a replay of the same recorded
+    // response, which a generated id would not be.
+    assert_eq!(first.tool_calls[0].id, "lookup-0");
+
+    let continuation = first.continuation.clone().expect("a continuation");
+    assert_eq!(
+        continuation.state["parts"][0]["thoughtSignature"], "SIGNATURE",
+        "the signature was dropped on the way in: {:?}",
+        continuation.state
+    );
+
+    // The second turn: the model's own document goes back untouched.
+    let exchanges = [ToolExchange {
+        call: first.tool_calls[0].clone(),
+        output: json!({ "found": true }),
+        failed: false,
+    }];
+    let _ = driver
+        .complete(gemini_request(
+            &model,
+            &prompt,
+            &tools,
+            &exchanges,
+            Some(&continuation),
+        ))
+        .await;
+
+    let body = seen.lock().unwrap().clone().unwrap();
+    let contents = body["contents"].as_array().expect("contents");
+    assert_eq!(
+        contents[1]["parts"][0]["thoughtSignature"], "SIGNATURE",
+        "the follow-up turn did not return the signature, which Gemini 3 answers \
+         with a 400: {body}"
+    );
+    assert_eq!(contents[1]["role"], "model");
+    // The result goes back as a functionResponse user turn, named by the tool.
+    assert_eq!(contents[2]["role"], "user");
+    assert_eq!(
+        contents[2]["parts"][0]["functionResponse"]["name"],
+        "lookup"
+    );
+    assert_eq!(
+        contents[2]["parts"][0]["functionResponse"]["response"]["output"]["found"],
+        true
+    );
+}
+
+/// Reasoning effort renders as a thinking level, or is refused — never bent.
+#[tokio::test]
+async fn gemini_maps_the_thinking_levels_it_has_and_refuses_the_rest() {
+    use ReasoningEffort as E;
+
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("hi");
+
+    for (effort, expected) in [
+        (E::Minimal, "minimal"),
+        (E::Low, "low"),
+        (E::Medium, "medium"),
+        (E::High, "high"),
+    ] {
+        let (canned, seen, _h) = canned_observed(
+            200,
+            json!({
+                "candidates": [{
+                    "content": { "role": "model", "parts": [{ "text": "ok" }] },
+                    "finishReason": "STOP",
+                }],
+                "usageMetadata": { "promptTokenCount": 1, "candidatesTokenCount": 1 },
+            }),
+        );
+        let url = serve(canned).await;
+        let driver = Gemini::new("k").unwrap().base(url).buffered();
+        let mut request = gemini_request(&model, &prompt, &[], &[], None);
+        request.reasoning_effort = Some(effort);
+        driver.complete(request).await.unwrap();
+        let body = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            expected,
+            "the {} level did not render as Gemini names it",
+            effort.as_str()
+        );
+    }
+
+    // Refused rather than collapsed. `max` answered with `high` would be a
+    // substitution on a digest-covered value whose whole job is to say what
+    // governed the call; and Google documents that thinking cannot be switched
+    // off on the Gemini 3 models, so `none` is not expressible either.
+    for effort in [E::None, E::XHigh, E::Max] {
+        let driver = Gemini::new("k").unwrap().buffered();
+        let mut request = gemini_request(&model, &prompt, &[], &[], None);
+        request.reasoning_effort = Some(effort);
+        let text = driver
+            .complete(request)
+            .await
+            .expect_err("an effort Gemini cannot express must be refused")
+            .to_string();
+        assert!(
+            text.contains(effort.as_str()) && text.contains("minimal, low, medium and high"),
+            "the refusal must name the effort and the levels that exist: {text}"
+        );
+    }
+}
+
+/// A schema is enforced during generation, not checked afterwards.
+#[tokio::test]
+async fn gemini_asks_for_a_native_response_schema() {
+    let (canned, seen, _headers) = canned_observed(
+        200,
+        json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "{\"id\":\"abc\"}" }] },
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 4 },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("give me an id");
+    let schema = json!({
+        "type": "object",
+        "properties": { "id": { "type": "string" } },
+        "required": ["id"],
+    });
+    let mut request = gemini_request(&model, &prompt, &[], &[], None);
+    request.schema = Some(&schema);
+
+    let completion = driver.complete(request).await.unwrap();
+    assert_eq!(completion.structured, Some(json!({ "id": "abc" })));
+
+    let body = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        body["generationConfig"]["responseMimeType"],
+        "application/json"
+    );
+    assert_eq!(body["generationConfig"]["responseJsonSchema"], schema);
+}
+
+/// A stop that is not an answer is metered, because deciding cost money.
+#[tokio::test]
+async fn gemini_a_safety_stop_is_metered_not_free() {
+    let (canned, _seen, _headers) = canned_observed(
+        200,
+        json!({
+            "candidates": [{ "content": { "role": "model", "parts": [] }, "finishReason": "SAFETY" }],
+            "usageMetadata": { "promptTokenCount": 11, "candidatesTokenCount": 2 },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("something");
+
+    let error = driver
+        .complete(gemini_request(&model, &prompt, &[], &[], None))
+        .await
+        .expect_err("a safety stop is not an answer");
+    assert_eq!(
+        error.usage().output_tokens,
+        2,
+        "a decline was billed as free"
+    );
+    assert!(error.to_string().contains("SAFETY"), "{error}");
+}
+
+/// A prompt blocked before generating is a refusal that says why.
+#[tokio::test]
+async fn gemini_a_blocked_prompt_names_its_reason_and_costs_nothing() {
+    let (canned, _seen, _headers) = canned_observed(
+        200,
+        json!({ "promptFeedback": { "blockReason": "SAFETY" } }),
+    );
+    let url = serve(canned).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("something");
+
+    let error = driver
+        .complete(gemini_request(&model, &prompt, &[], &[], None))
+        .await
+        .expect_err("a blocked prompt is not an answer");
+    assert_eq!(
+        error.disposition(),
+        agentplane::core::Disposition::DidNotHappen
+    );
+    assert!(error.to_string().contains("SAFETY"), "{error}");
+}
+
+/// Truncation is a typed fact, never a silently shortened string.
+#[tokio::test]
+async fn gemini_truncation_is_a_typed_fact() {
+    let (canned, _seen, _headers) = canned_observed(
+        200,
+        json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "half an ans" }] },
+                "finishReason": "MAX_TOKENS",
+            }],
+            "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 4 },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("write an essay");
+
+    let completion = driver
+        .complete(gemini_request(&model, &prompt, &[], &[], None))
+        .await
+        .unwrap();
+    assert!(completion.truncated, "a cut-off answer read as a whole one");
+    assert_eq!(completion.stop_reason.as_deref(), Some("MAX_TOKENS"));
+}
+
+/// Provider state is opaque *and* provider-bound.
+#[tokio::test]
+async fn gemini_refuses_another_providers_continuation() {
+    let driver = Gemini::new("k").unwrap().buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("hi");
+    let foreign = ProviderContinuation::new("openai", json!([{ "type": "reasoning" }]));
+    let exchanges = [ToolExchange {
+        call: agentplane::model::ToolCall {
+            id: "c1".to_owned(),
+            name: "lookup".to_owned(),
+            arguments: json!({}),
+        },
+        output: json!({}),
+        failed: false,
+    }];
+    let text = driver
+        .complete(gemini_request(
+            &model,
+            &prompt,
+            &[],
+            &exchanges,
+            Some(&foreign),
+        ))
+        .await
+        .expect_err("another provider's state must never be replayed here")
+        .to_string();
+    assert!(text.contains("openai"), "{text}");
+}
+
+/// The transport contract is in effect identity.
+#[test]
+fn gemini_request_profile_commits_to_the_transport() {
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let streamed = Gemini::new("k").unwrap();
+    let buffered = Gemini::new("k").unwrap().buffered();
+    assert_ne!(
+        streamed.request_profile(&model),
+        buffered.request_profile(&model),
+        "buffered and streamed calls shared one effect identity"
+    );
+    let profile = buffered.request_profile(&model);
+    assert_eq!(profile["driver"], "google-gemini-generatecontent/v1");
+    assert_eq!(profile["api_version"], "v1beta");
+    assert_eq!(profile["schema_mode"], "native");
+    assert!(
+        !profile.to_string().contains('k') || profile.get("key").is_none(),
+        "a key reached the request profile, which is journaled"
+    );
+}
+
+/// **The deployment's own safety thresholds, and nothing invented.**
+///
+/// The Bedrock guardrail's posture, on the provider that spells it differently:
+/// this crate ships no classifier, Google's is configured here, and what the
+/// runtime owns is that the choice is effect identity. A threshold moved from
+/// `BLOCK_LOW_AND_ABOVE` to `BLOCK_NONE` between a run and its replay must be
+/// divergence, not a silent change in what governed the call — so the profile
+/// carries the pairs rather than a bare "safety was on".
+#[tokio::test]
+async fn gemini_passes_the_deployments_safety_thresholds_and_puts_them_in_identity() {
+    use agentplane::model::gemini::{HarmBlockThreshold, HarmCategory, SafetySettings};
+
+    let (canned, seen, _headers) = canned_observed(
+        200,
+        json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "ok" }] },
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": { "promptTokenCount": 1, "candidatesTokenCount": 1 },
+        }),
+    );
+    let url = serve(canned).await;
+    let settings = SafetySettings::new()
+        .block(
+            HarmCategory::DangerousContent,
+            HarmBlockThreshold::LowAndAbove,
+        )
+        .block(HarmCategory::CivicIntegrity, HarmBlockThreshold::None);
+    let driver = Gemini::new("k")
+        .unwrap()
+        .base(url)
+        .buffered()
+        .safety(settings.clone());
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("hi");
+
+    driver
+        .complete(gemini_request(&model, &prompt, &[], &[], None))
+        .await
+        .unwrap();
+
+    let body = seen.lock().unwrap().clone().unwrap();
+    let sent = body["safetySettings"].as_array().expect("safetySettings");
+    assert_eq!(sent.len(), 2, "{body}");
+    // Ordered by category, so two deployments that configured the same
+    // thresholds in a different order produce the same bytes — and therefore
+    // the same effect identity, rather than a spurious divergence.
+    assert_eq!(sent[0]["category"], "HARM_CATEGORY_DANGEROUS_CONTENT");
+    assert_eq!(sent[0]["threshold"], "BLOCK_LOW_AND_ABOVE");
+    assert_eq!(sent[1]["category"], "HARM_CATEGORY_CIVIC_INTEGRITY");
+    assert_eq!(sent[1]["threshold"], "BLOCK_NONE");
+
+    // Identity: unconfigured, one threshold, and a *looser* threshold are three
+    // different requests, and the middle-to-last change is the one worth
+    // catching — it is the direction somebody makes to get a run unstuck.
+    let plain = Gemini::new("k").unwrap().buffered();
+    let strict = Gemini::new("k").unwrap().buffered().safety(settings);
+    let loose = Gemini::new("k").unwrap().buffered().safety(
+        SafetySettings::new()
+            .block(HarmCategory::DangerousContent, HarmBlockThreshold::None)
+            .block(HarmCategory::CivicIntegrity, HarmBlockThreshold::None),
+    );
+    assert_eq!(plain.request_profile(&model)["safety"], Value::Null);
+    assert_ne!(
+        strict.request_profile(&model),
+        loose.request_profile(&model),
+        "loosening a threshold left effect identity unchanged"
+    );
+}
+
+/// **No sampling parameter is ever sent.**
+///
+/// `temperature`, `topP`, `topK` and `seed` are absent from `Request`, so they
+/// cannot enter the effect key — and a knob that changes what the provider does
+/// without changing effect identity is one a replay cannot account for. `seed`
+/// is the tempting one: replay here never calls the model again, so it buys
+/// nothing and would imply a reproducibility guarantee no provider makes.
+///
+/// Asserted on the wire rather than trusted, because adding one is a one-line
+/// change that looks like an improvement.
+#[tokio::test]
+async fn gemini_sends_no_sampling_parameter() {
+    let (canned, seen, _headers) = canned_observed(
+        200,
+        json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "ok" }] },
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": { "promptTokenCount": 1, "candidatesTokenCount": 1 },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("hi");
+
+    driver
+        .complete(gemini_request(&model, &prompt, &[], &[], None))
+        .await
+        .unwrap();
+
+    let config = &seen.lock().unwrap().clone().unwrap()["generationConfig"];
+    for knob in [
+        "temperature",
+        "topP",
+        "topK",
+        "seed",
+        "candidateCount",
+        "stopSequences",
+        "responseModalities",
+    ] {
+        assert!(
+            config.get(knob).is_none(),
+            "`{knob}` reached the wire: it is not in `Request`, so it cannot be in \
+             the effect key, and a knob outside effect identity is one a replay \
+             cannot account for — {config}"
+        );
+    }
+}
+
+/// **Every harm category and threshold spells itself the way Gemini reads it.**
+///
+/// A known-answer table taken from Google's `SafetySetting` reference, not a
+/// round trip: this driver's own reader would agree with a wrong spelling, and
+/// Gemini does not reject an unknown category — it **ignores** it. So the
+/// failure being pinned is a deployment that configured a threshold, was
+/// answered 200, and was governed by nothing, with the setting sitting in its
+/// manifest looking applied.
+///
+/// Every variant is listed rather than a representative few, because the point
+/// of the enum is that a category cannot be misspelled, and a variant no test
+/// constructs is one whose spelling nothing checks. Written without a `use ...
+/// as` alias on purpose: the dead-variant guard matches on the declared type
+/// name, so an alias here would hide these constructions from it and the
+/// variants would read as dead again.
+#[test]
+fn gemini_safety_categories_and_thresholds_use_the_documented_spellings() {
+    use agentplane::model::gemini::{HarmBlockThreshold, HarmCategory, SafetySettings};
+
+    for (category, expected) in [
+        (HarmCategory::Harassment, "HARM_CATEGORY_HARASSMENT"),
+        (HarmCategory::HateSpeech, "HARM_CATEGORY_HATE_SPEECH"),
+        (
+            HarmCategory::SexuallyExplicit,
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        ),
+        (
+            HarmCategory::DangerousContent,
+            "HARM_CATEGORY_DANGEROUS_CONTENT",
+        ),
+        (
+            HarmCategory::CivicIntegrity,
+            "HARM_CATEGORY_CIVIC_INTEGRITY",
+        ),
+        (HarmCategory::Jailbreak, "HARM_CATEGORY_JAILBREAK"),
+    ] {
+        assert_eq!(category.as_str(), expected, "{category:?}");
+    }
+
+    for (threshold, expected) in [
+        (HarmBlockThreshold::LowAndAbove, "BLOCK_LOW_AND_ABOVE"),
+        (HarmBlockThreshold::MediumAndAbove, "BLOCK_MEDIUM_AND_ABOVE"),
+        (HarmBlockThreshold::OnlyHigh, "BLOCK_ONLY_HIGH"),
+        (HarmBlockThreshold::None, "BLOCK_NONE"),
+    ] {
+        assert_eq!(threshold.as_str(), expected, "{threshold:?}");
+    }
+
+    // And each pair reaches the request in that spelling, so the enum's job is
+    // checked end to end rather than only at its own boundary.
+    let settings = SafetySettings::new()
+        .block(HarmCategory::Harassment, HarmBlockThreshold::MediumAndAbove)
+        .block(HarmCategory::HateSpeech, HarmBlockThreshold::OnlyHigh)
+        .block(
+            HarmCategory::SexuallyExplicit,
+            HarmBlockThreshold::LowAndAbove,
+        )
+        .block(HarmCategory::Jailbreak, HarmBlockThreshold::None);
+    assert!(!settings.is_empty());
+}
+
+/// Serve a fixed Gemini SSE body, recording the query the driver asked with.
+///
+/// The query is captured because `alt=sse` is load-bearing and invisible in the
+/// body: without it `streamGenerateContent` answers with a chunked JSON
+/// **array**, which an SSE decoder reads as no events at all.
+async fn serve_gemini_sse(body: &'static str) -> (String, SeenQuery) {
+    type State2 = (&'static str, SeenQuery);
+    async fn sse(
+        State((body, seen)): State<State2>,
+        request: axum::extract::Request,
+    ) -> impl axum::response::IntoResponse {
+        *seen.lock().unwrap() = request.uri().query().map(ToOwned::to_owned);
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            body,
+        )
+    }
+    let seen: SeenQuery = Arc::new(std::sync::Mutex::new(None));
+    let app = Router::new()
+        .route("/v1beta/models/{model}", post(sse))
+        .with_state((body, Arc::clone(&seen)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), seen)
+}
+
+type SeenQuery = Arc<std::sync::Mutex<Option<String>>>;
+
+/// **The default path, end to end.** Streaming is what a Gemini deployment
+/// actually runs, and until this existed only `.buffered()` had been exercised
+/// through the driver — the accumulator had unit tests, the *path* had none.
+///
+/// The assertion that earns its place is the signature: it arrives on a
+/// function-call part in its own chunk, and it has to reach the continuation
+/// through reassembly. Merging text is the obvious thing to do to every part
+/// and is right for only one of them, so this is where getting that wrong
+/// shows up.
+#[tokio::test]
+async fn gemini_streams_reassemble_and_keep_the_signature() {
+    let (url, query) = serve_gemini_sse(concat!(
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Loo\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"king\"}]}}]}\n\n",
+        // A **signed text** part. Google documents that on a turn without
+        // function calls the signature rides the final content part — text or
+        // inlineData — so a part can be text *and* carry something that must
+        // survive. This is the case the merge predicate exists for, and the one
+        // a fixture of only unsigned text cannot see: merging by "has a text
+        // key" passes such a fixture and destroys this.
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" it\",\"thoughtSignature\":\"TEXTSIG\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"x\"}},\"thoughtSignature\":\"SIG\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":2,\"thoughtsTokenCount\":6}}\n\n",
+    ))
+    .await;
+    let driver = Gemini::new("k").unwrap().base(url);
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("look it up");
+
+    let completion = driver
+        .complete(gemini_request(&model, &prompt, &[], &[], None))
+        .await
+        .unwrap();
+
+    // The signed text part contributes its text to the answer and keeps its
+    // own place in the parts array — both, not either.
+    assert_eq!(completion.text, "Looking it", "text deltas were not joined");
+    assert_eq!(completion.stop_reason.as_deref(), Some("STOP"));
+    assert_eq!(completion.tool_calls.len(), 1);
+    assert_eq!(completion.tool_calls[0].name, "lookup");
+    // Thinking tokens are billed as output on this path too. A driver that
+    // counted them only when buffering would under-report every real
+    // deployment, since streaming is the default.
+    assert_eq!(completion.usage.output_tokens, 8, "2 answer + 6 thinking");
+    assert_eq!(completion.usage.input_tokens, 11);
+
+    let state = completion.continuation.expect("a continuation").state;
+    assert_eq!(state["parts"][0]["text"], "Looking", "{state}");
+    // Kept whole rather than merged into the run of text before it: a signature
+    // on a text part is destroyed by exactly the merge that is correct for an
+    // unsigned one.
+    assert_eq!(state["parts"][1]["text"], " it", "{state}");
+    assert_eq!(
+        state["parts"][1]["thoughtSignature"], "TEXTSIG",
+        "a signature on a *text* part was flattened away by the merge: {state}"
+    );
+    assert_eq!(
+        state["parts"][2]["thoughtSignature"], "SIG",
+        "the signature did not survive reassembly, so the next turn is a 400: {state}"
+    );
+
+    // `alt=sse` is load-bearing and invisible in the body. Without it
+    // `streamGenerateContent` answers with a chunked JSON *array*, which this
+    // driver's SSE decoder reads as no events at all — a stream reported as
+    // never having generated, and therefore retried forever against a provider
+    // that answered correctly every time.
+    assert_eq!(
+        query.lock().unwrap().as_deref(),
+        Some("alt=sse"),
+        "the streaming path did not ask for server-sent events"
+    );
+}
+
+/// A stream that stopped after generating is not free to retry.
+#[tokio::test]
+async fn gemini_a_stream_severed_after_generation_is_not_free_to_retry() {
+    let (url, _q) = serve_gemini_sse(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+    )
+    .await;
+    let driver = Gemini::new("k").unwrap().base(url);
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("hello");
+
+    let error = driver
+        .complete(gemini_request(&model, &prompt, &[], &[], None))
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, ModelError::Unaccounted { .. }), "{error}");
+    assert_eq!(error.disposition(), Disposition::Landed);
+}
+
+/// A stream that never generated is safe to repeat.
+///
+/// The pair with the test above is the whole judgement, and getting it backwards
+/// is expensive in both directions: calling this one `Landed` strands a run that
+/// could simply be retried, and calling *that* one `DidNotHappen` buys a second
+/// bill for tokens the provider already generated.
+#[tokio::test]
+async fn gemini_a_stream_severed_before_generation_is_safe_to_repeat() {
+    let (url, _q) = serve_gemini_sse("").await;
+    let driver = Gemini::new("k").unwrap().base(url);
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("hello");
+
+    let error = driver
+        .complete(gemini_request(&model, &prompt, &[], &[], None))
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, ModelError::Unavailable { .. }), "{error}");
+    assert_eq!(error.disposition(), Disposition::DidNotHappen);
+    assert_eq!(
+        error.usage().spend().tokens,
+        0,
+        "nothing was generated and something was billed"
+    );
+}
+
+/// **Gemini's provider-side URL form is refused before dispatch.**
+///
+/// `fileData.fileUri` is how Gemini is told to fetch bytes *itself* — a Files
+/// API URI or a remote URL. That is a world-visible fetch from the provider's
+/// network, outside this plane's egress allowlist, its DNS pinning, its size
+/// and type ceilings, and its journal: the exact thing the governed-media path
+/// exists to replace. Every other driver refuses its own provider's spelling
+/// of this before anything is sent, and a spelling the shared check does not
+/// know is a hole in a control every other driver has.
+#[tokio::test]
+async fn gemini_refuses_a_provider_side_file_uri() {
+    // An unroutable base, so a regression cannot pass by reaching the real
+    // endpoint and being refused for some unrelated reason — which is how the
+    // first version of this test passed while the hole was wide open.
+    let driver = Gemini::new("k")
+        .unwrap()
+        .base("http://127.0.0.1:1")
+        .buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!({ "messages": [{
+        "role": "user",
+        "parts": [
+            { "text": "describe this" },
+            { "fileData": { "mimeType": "image/png", "fileUri": "https://attacker.example/x.png" } },
+        ],
+    }]});
+
+    let error = driver
+        .complete(gemini_request(&model, &prompt, &[], &[], None))
+        .await
+        .expect_err("a provider-side fetch must be refused before dispatch");
+    // Asserted on the *reason*, not the variant. `Refused` is also what a 4xx
+    // maps to, and this driver's default base is Google's real endpoint — so a
+    // variant-only assertion would pass just as happily on a 401 from an
+    // unauthenticated call that did reach the network, which is the opposite of
+    // what is being claimed.
+    assert!(
+        error
+            .to_string()
+            .contains("refused before dispatch: the model provider would fetch it"),
+        "the refusal did not come from the provider-side media check, so this test \
+         proves nothing about it: {error}"
+    );
+
+    // Google's REST surface accepts camelCase and snake_case interchangeably, so
+    // a control that knows only one is one an author bypasses by writing the
+    // other without meaning to.
+    let snake = json!({ "messages": [{
+        "role": "user",
+        "parts": [{ "file_data": { "mime_type": "image/png", "file_uri": "https://attacker.example/x.png" } }],
+    }]});
+    let error = driver
+        .complete(gemini_request(&model, &snake, &[], &[], None))
+        .await
+        .expect_err("the snake_case spelling reaches the same provider fetch");
+    assert!(
+        error
+            .to_string()
+            .contains("refused before dispatch: the model provider would fetch it"),
+        "the snake_case spelling was not refused: {error}"
+    );
+
+    // The positive half: inline bytes are the governed path and must still work,
+    // or this check would be a refuse-everything change that passes its own test.
+    let inline = json!({ "messages": [{
+        "role": "user",
+        "parts": [{ "inlineData": { "mimeType": "image/png", "data": "iVBORw0KGgo=" } }],
+    }]});
+    let error = driver
+        .complete(gemini_request(&model, &inline, &[], &[], None))
+        .await
+        .expect_err("the unroutable base still fails, but not as a media refusal");
+    assert!(
+        !error
+            .to_string()
+            .contains("refused before dispatch: the model provider would fetch it"),
+        "inline governed bytes were refused as a provider-side fetch: {error}"
+    );
+}
+
+/// **The streaming path carries an extension too — and it is the default.**
+///
+/// The buffered path was fixed first, which covered the path this driver does
+/// *not* take unless told to. `ChatCompletions` streams by default, so a fix
+/// that stopped at `.buffered()` would be correct where it was looked for and
+/// absent where it runs — the worst shape a fix can have.
+///
+/// Same subject as the buffered test: Gemini through Google's compatibility
+/// endpoint puts its encrypted `thought_signature` in
+/// `tool_calls[].extra_content`, and rejects the follow-up turn without it.
+#[tokio::test]
+async fn chat_completions_streaming_carries_an_unknown_tool_call_field_too() {
+    let url = serve_cc_sse(concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"},\"extra_content\":{\"google\":{\"thought_signature\":\"STREAMSIG\"}}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":9}}\n\n",
+        "data: [DONE]\n\n",
+    ))
+    .await;
+    let driver = ChatCompletions::new(url).unwrap();
+    let model = ModelId::new("chat-completions", "gemini-3.5-flash");
+    let prompt = json!("look it up");
+
+    let completion = driver.complete(cc_request(&model, &prompt)).await.unwrap();
+    assert_eq!(completion.tool_calls.len(), 1);
+    // The arguments still reassemble from their fragments: keeping the
+    // extension must not cost the concatenation the wire actually needs.
+    assert_eq!(completion.tool_calls[0].arguments, json!({ "q": "x" }));
+
+    let state = completion
+        .continuation
+        .as_ref()
+        .expect("a tool call must produce a continuation")
+        .state
+        .clone();
+    assert_eq!(
+        state[0]["tool_calls"][0]["extra_content"]["google"]["thought_signature"], "STREAMSIG",
+        "the server's own field was dropped reassembling the stream, so the next \
+         request cannot return it — and this is the path the driver takes by \
+         default: {state}"
+    );
 }

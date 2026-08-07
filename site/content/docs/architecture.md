@@ -1871,12 +1871,23 @@ closed connection and cannot recover from one that never ends.
 
 ### Model providers (`providers`, `bedrock`)
 
-The `providers` feature ships Anthropic Messages and OpenAI **Responses** —
-Responses rather than Chat Completions because it is the current primitive and
-reports both usage and completeness directly. They exist mostly to prove the seam
-is right: that a driver can report *what a failure consumed*. The separate
-`bedrock` feature ships Amazon Bedrock Runtime Converse through the AWS SDK;
-separate gating avoids imposing its dependency graph on either HTTP driver.
+The `providers` feature ships four HTTP drivers: Anthropic Messages, OpenAI
+**Responses** — Responses rather than Chat Completions because it is the current
+primitive and reports both usage and completeness directly — Google Gemini
+`generateContent`, and a `chat-completions` driver for the OpenAI-compatible
+wire every self-hosted server speaks. The separate `bedrock` feature ships
+Amazon Bedrock Runtime Converse through the AWS SDK; separate gating avoids
+imposing its dependency graph on the HTTP drivers.
+
+They exist partly to prove the seam is right — that a driver can report *what a
+failure consumed* — and partly because the thing a driver must not get wrong is
+not the transport. Three of the four now carry provider-owned continuation
+state (OpenAI's encrypted reasoning items, Anthropic's signed thinking blocks,
+Gemini's thought signatures), and all three do it the same way: **the provider's
+own turn, verbatim and opaque**. That is a shape rather than three
+accommodations. A driver that normalises the assistant turn into a neutral
+representation has nowhere to keep what it does not understand, and what it does
+not understand is exactly what the next request has to return.
 
 Status classification is shared between them, in `model::wire`, because it is
 doctrine rather than vendor detail:

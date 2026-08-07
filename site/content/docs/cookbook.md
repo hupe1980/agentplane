@@ -605,7 +605,7 @@ model cannot be — the behaviour is a `Skill`, and the manifest governs its
 **boundary**: which model, which tools, what it may spend.
 
 ```toml
-agentplane = { version = "0.5", features = ["manifest"] }
+agentplane = { version = "0.6", features = ["manifest"] }
 ```
 
 Everything in the zero-Rust manifest above applies; drop `spec.execution` and add what a coded agent needs:
@@ -825,7 +825,7 @@ For real deployments, `OpenDalBlobs` puts them on anything
 [OpenDAL](https://opendal.apache.org) reaches — filesystem, S3, GCS, Azure:
 
 ```toml
-agentplane = { version = "0.5", features = ["opendal"] }
+agentplane = { version = "0.6", features = ["opendal"] }
 ```
 
 ```rust
@@ -967,6 +967,50 @@ on `BuildError`, and each is a wiring mistake with a fix and no recovery: a
 capability nothing provides, two agents claiming one capability, two skills
 sharing a name, a catalogue laxer than a reviewed grant, a declarative agent
 naming an unregistered provider, or a plane whose store serves another tenant.
+
+---
+
+## ✨ Use Google Gemini
+
+```rust
+let gemini = Gemini::from_env()?                      // GEMINI_API_KEY, or GOOGLE_API_KEY
+    .safety(SafetySettings::new().block(
+        HarmCategory::DangerousContent,
+        HarmBlockThreshold::LowAndAbove,
+    ));
+
+Runtime::builder(store).provider("gemini", Arc::new(gemini)).build();
+```
+
+```yaml
+models:
+  privileged: { provider: gemini, model: "gemini-3.5-flash" }
+```
+
+It speaks `generateContent`/`streamGenerateContent` natively rather than
+Google's `OpenAI`-compatible endpoint, and the difference is not cosmetic.
+Gemini's thinking models attach an encrypted **thought signature** to the parts
+they emit and reject a follow-up turn that does not carry it back. This driver
+keeps the model's turn *verbatim* as opaque continuation state — the same way
+the `OpenAI` driver carries encrypted reasoning and Anthropic carries signed
+thinking — so there is no field to know about and none to lose.
+
+`reasoning_effort` maps to Gemini's thinking levels: `minimal`, `low`, `medium`
+and `high` exactly, and `none`, `xhigh` and `max` are **refused** rather than
+bent to the nearest one that exists — Google documents that thinking cannot be
+switched off on the Gemini 3 models. Schemas go to `responseJsonSchema` and are
+enforced during generation, never rewritten into Gemini's trimmed dialect.
+
+`safety(..)` passes the deployment's own thresholds through, exactly as
+`Bedrock::guardrail(..)` does: this crate ships no classifier, and what the
+runtime owns is that the thresholds are **effect identity** — loosening one
+between a run and its replay is divergence — and that an intervention is a
+*metered refusal* rather than an answer. A blocked prompt names its reason; a
+`SAFETY` stop carries the tokens it burned.
+
+No sampling parameter (`temperature`, `topP`, `topK`, `seed`) is ever sent:
+none is in `Request`, so none could be in the effect key, and a knob outside
+effect identity is one a replay cannot account for.
 
 ---
 

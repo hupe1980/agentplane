@@ -220,7 +220,10 @@ between agents is an agent of its own, granted as `tool://agent/<capability>`.
 | `quarantined` | The model that reads untrusted material and holds no authority. |
 
 Both are `{ provider, model }`, where `provider` is the name a driver was
-registered under — `openai`, `anthropic`, `bedrock`, or your own. The pair is
+registered under. The `agentplane` binary ships `openai`, `anthropic`, `gemini`,
+`bedrock`, `chat-completions` and `fake`; an embedder registers its own with
+`RuntimeBuilder::provider`, and a name nothing was registered under is refused
+at build rather than at the first call. The pair is
 **refused when both roles name the same provider and model**: two roles behind
 one model keeps the label and removes the control it stands for.
 

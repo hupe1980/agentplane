@@ -37,6 +37,22 @@ struct PartialCall {
     id: String,
     name: String,
     arguments: String,
+    /// Every key on the fragment this accumulator does not itself understand.
+    ///
+    /// Kept for the reason the buffered path keeps the whole message:
+    /// "OpenAI-compatible" is a wire servers **extend**, and the extension is
+    /// exactly what the next request has to return. Gemini through Google's
+    /// compatibility endpoint puts its encrypted `thought_signature` in
+    /// `extra_content` and rejects a follow-up turn without it, so an
+    /// accumulator that rebuilt a call from the three fields it knows would
+    /// drop it — and would do so only on the **streaming** path, which is this
+    /// driver's default. That is the worst version of the bug: fixed where it
+    /// was looked for, live where it actually runs.
+    ///
+    /// Whole values rather than concatenated fragments, because these are not
+    /// deltas — a server sends an extension once, complete. Last writer wins, so
+    /// a server that repeats it on every chunk is harmless.
+    extra: serde_json::Map<String, Value>,
 }
 
 impl Accumulator {
@@ -88,6 +104,15 @@ impl Accumulator {
                     call.arguments.push_str(arguments);
                 }
             }
+            // Anything else the server attached. `index` is this wire's own
+            // framing and `type` is re-emitted as the constant it must be, so
+            // neither is carried; everything beyond them belongs to the server
+            // and is not this driver's to discard.
+            for (key, value) in fragment.as_object().into_iter().flatten() {
+                if !matches!(key.as_str(), "index" | "id" | "type" | "function") {
+                    call.extra.insert(key.clone(), value.clone());
+                }
+            }
             self.generated = true;
         }
         let text = delta.get("content").and_then(Value::as_str)?;
@@ -120,11 +145,21 @@ impl Accumulator {
                 "message": {
                     "content": self.content,
                     "refusal": if self.refusal.is_empty() { Value::Null } else { Value::String(self.refusal) },
-                    "tool_calls": self.calls.into_values().map(|c| json!({
-                        "id": c.id,
-                        "type": "function",
-                        "function": { "name": c.name, "arguments": c.arguments },
-                    })).collect::<Vec<_>>(),
+                    "tool_calls": self.calls.into_values().map(|c| {
+                        let mut call = json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": { "name": c.name, "arguments": c.arguments },
+                        });
+                        // Re-attached at the top level, where the server put
+                        // them, so the envelope this produces is the one a
+                        // buffered call returns — which is what lets the driver
+                        // keep one parser and one interpretation for both paths.
+                        if let Some(object) = call.as_object_mut() {
+                            object.extend(c.extra);
+                        }
+                        call
+                    }).collect::<Vec<_>>(),
                 },
                 "finish_reason": self.finish_reason,
             }],

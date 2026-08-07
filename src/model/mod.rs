@@ -44,6 +44,10 @@ pub mod chat_completions;
 #[cfg(feature = "providers")]
 mod chat_completions_stream;
 #[cfg(feature = "providers")]
+pub mod gemini;
+#[cfg(feature = "providers")]
+mod gemini_stream;
+#[cfg(feature = "providers")]
 pub mod openai;
 #[cfg(feature = "providers")]
 mod openai_stream;
@@ -120,6 +124,21 @@ fn provider_side_media_reference(value: &Value) -> Option<&'static str> {
             }
             if kind == Some("input_file") && remote_url(object.get("file_url")) {
                 return Some("an OpenAI file URL");
+            }
+
+            // Gemini: `fileData { fileUri }`, the form that tells Google to
+            // fetch the bytes itself — a Files API URI or a plain remote URL,
+            // and both are a fetch from the provider's network rather than
+            // this plane's. Google's REST surface accepts camelCase and
+            // snake_case interchangeably, so both spellings are checked: a
+            // control that only knows one of two accepted spellings is one an
+            // author bypasses by writing the other, without meaning to.
+            for key in ["fileData", "file_data"] {
+                if let Some(file) = object.get(key).and_then(Value::as_object)
+                    && (remote_url(file.get("fileUri")) || remote_url(file.get("file_uri")))
+                {
+                    return Some("a Gemini fileData URI");
+                }
             }
 
             object.values().find_map(provider_side_media_reference)

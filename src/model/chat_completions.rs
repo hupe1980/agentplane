@@ -266,15 +266,54 @@ struct ApiToolCall {
     function: ApiFunction,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 struct ApiMessage {
-    #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
     tool_calls: Vec<ApiToolCall>,
     /// The model's own decline, as the newer compatible servers spell it.
-    #[serde(default)]
     refusal: Option<String>,
+    /// The message **exactly as the server sent it**.
+    ///
+    /// Kept because the continuation is this value, not a copy of the fields
+    /// this driver happens to understand. "OpenAI-compatible" is a wire many
+    /// servers extend, and a driver that re-emits only the keys it knows breaks
+    /// on every key added after it was written — silently, because `serde`
+    /// discards the rest on the way in and the rebuilt message still looks
+    /// well-formed.
+    ///
+    /// The concrete case is Gemini through Google's compatibility endpoint. Its
+    /// thinking models attach an encrypted `thought_signature` to each tool
+    /// call — `tool_calls[].extra_content.google.thought_signature` — and
+    /// **reject** the follow-up turn that does not carry it back. `LiteLLM`,
+    /// which normalises every provider into this shape, had nowhere to keep it
+    /// and ended up smuggling it inside the tool-call `id`; that leaked into
+    /// requests to other providers and still degenerates multi-turn tool
+    /// calling. The lesson is not to learn one vendor's field. It is that a
+    /// provider's own turn is not this driver's to reconstruct.
+    raw: Value,
+}
+
+impl<'de> Deserialize<'de> for ApiMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            #[serde(default)]
+            content: Option<String>,
+            #[serde(default)]
+            tool_calls: Vec<ApiToolCall>,
+            #[serde(default)]
+            refusal: Option<String>,
+        }
+        let raw = Value::deserialize(deserializer)?;
+        let fields: Fields =
+            serde_json::from_value(raw.clone()).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            content: fields.content,
+            tool_calls: fields.tool_calls,
+            refusal: fields.refusal,
+            raw,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -575,24 +614,41 @@ impl ChatCompletions {
             (text, parsed_schema)
         };
 
-        // The continuation is the assistant turn exactly as the server sent
-        // it, so the next request returns the ids the model issued.
+        // The continuation is the assistant turn exactly as the server sent it
+        // — the whole message, byte for byte, not a copy of the fields this
+        // driver understands. See `ApiMessage::raw` for what rebuilding it
+        // costs; the short version is that an extension this driver has never
+        // heard of is exactly the thing the next request has to return.
+        //
+        // The `role` is asserted rather than echoed: a server that omits it, or
+        // sends something other than `assistant`, would produce a history entry
+        // the next request cannot use, and the message's own position in the
+        // conversation is this driver's fact rather than the server's.
         let continuation = (!calls.is_empty()).then(|| {
-            super::ProviderContinuation::new(
-                PROVIDER,
-                json!([{
-                    "role": "assistant",
-                    "content": choice.message.content,
-                    "tool_calls": choice.message.tool_calls.iter().map(|c| json!({
-                        "id": c.id,
-                        "type": "function",
-                        "function": {
-                            "name": c.function.name,
-                            "arguments": c.function.arguments,
-                        },
-                    })).collect::<Vec<_>>(),
-                }]),
-            )
+            let mut message = choice.message.raw.clone();
+            match message.as_object_mut() {
+                Some(object) => {
+                    object.insert("role".to_owned(), json!("assistant"));
+                }
+                // A message that is not an object cannot be replayed as one.
+                // Fall back to the shape the wire requires, which loses any
+                // extension but keeps the ids the model issued.
+                None => {
+                    message = json!({
+                        "role": "assistant",
+                        "content": choice.message.content,
+                        "tool_calls": choice.message.tool_calls.iter().map(|c| json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": {
+                                "name": c.function.name,
+                                "arguments": c.function.arguments,
+                            },
+                        })).collect::<Vec<_>>(),
+                    });
+                }
+            }
+            super::ProviderContinuation::new(PROVIDER, json!([message]))
         });
 
         Ok(Completion {

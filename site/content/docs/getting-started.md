@@ -53,7 +53,7 @@ Read those five lines slowly, because they are the product:
 
 ```toml
 [dependencies]
-agentplane = "0.5"
+agentplane = "0.6"
 ```
 
 ## An agent with no Rust
@@ -106,8 +106,8 @@ The answer goes to stdout and everything else to stderr, so it pipes. A run that
 is refused, exhausted or failed exits non-zero, because whoever scripts this
 needs the shell's own answer to "did it work".
 
-Keys come from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`), never
-from the file; Bedrock uses `AWS_REGION` and AWS's standard credential chain,
+Keys come from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY` — or `GOOGLE_API_KEY`), never from the file; Bedrock uses `AWS_REGION` and AWS's standard credential chain,
 and a local or Hugging Face model is `provider: chat-completions` with
 `CHAT_COMPLETIONS_BASE_URL` pointing at any OpenAI-compatible server — Ollama,
 TGI, vLLM, llama.cpp, or `https://router.huggingface.co/v1` with
@@ -122,7 +122,7 @@ your build. Everything else is opt-in:
 
 ```toml
 [dependencies]
-agentplane   = "0.5"
+agentplane   = "0.6"
 serde_json   = "1"
 # A `Skill` is an async trait, and the runtime is async. Both are yours to
 # choose, so neither is re-exported — but the snippets below will not compile
@@ -134,7 +134,7 @@ tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
 Everything beyond a single-node runtime is opt-in:
 
 ```toml
-agentplane = { version = "0.5", features = ["postgres", "http", "mcp", "providers", "bedrock", "media", "cedar", "signing"] }
+agentplane = { version = "0.6", features = ["postgres", "http", "mcp", "providers", "bedrock", "media", "cedar", "signing"] }
 ```
 
 | feature | gives you |
@@ -146,7 +146,7 @@ agentplane = { version = "0.5", features = ["postgres", "http", "mcp", "provider
 | `a2a` | A2A peer transport — calling other agents |
 | `a2a-server` | being called: the public Agent Card and the A2A 1.0 JSON-RPC methods |
 | `push` | Persistent A2A registration cursors, retrying worker API, and SSRF-guarded webhook delivery; `a2a-server` includes it |
-| `providers` | Anthropic and OpenAI model drivers |
+| `providers` | Anthropic, OpenAI, Google Gemini and OpenAI-compatible model drivers |
 | `bedrock` | Amazon Bedrock Runtime Converse through the AWS SDK; separate because the dependency graph is substantial |
 | `media` | governed remote-media fetch: exact grants, SSRF-safe pinned DNS, redirects, limits, validation, digest and retention |
 | `cedar` | Cedar as the authorization engine |

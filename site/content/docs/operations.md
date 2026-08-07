@@ -506,8 +506,9 @@ for, which is why the check is over every plane rather than the first.
 
 ### Checking a driver against the real thing
 
-`just test-live` exercises the OpenAI driver against the actual API, loading a
-key from `.env`. It is gated twice — `AGENTPLANE_LIVE=1` **and** the key — and is
+`just test-live` exercises the OpenAI and Gemini drivers against the actual
+APIs, loading keys from `.env`. Each provider's battery skips on its own key, so
+one key runs one battery and the rest say so. It is gated twice — `AGENTPLANE_LIVE=1` **and** the key — and is
 never part of `just ci`: a developer with `OPENAI_API_KEY` exported would
 otherwise be billed for running the test suite, and would find out at the end of
 the month.
