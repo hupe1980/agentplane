@@ -291,6 +291,10 @@ name              = "planned_run"
 required-features = ["redb", "testkit", "manifest"]
 
 [[example]]
+name              = "sealed_run"
+required-features = ["redb", "testkit", "keyring"]
+
+[[example]]
 name              = "clearing_case"
 required-features = ["redb"]
 

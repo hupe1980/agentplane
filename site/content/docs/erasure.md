@@ -68,11 +68,22 @@ outputs — under the same per-case scope `erase_case` already destroys, so a
 single erasure reaches blobs and journal alike:
 
 ```rust
-let store = SealedJournal::wrap(store, keys);
-let cases = SealedCases::wrap(cases, keys, tenant);   // the case store's own copy
-let tasks = SealedTasks::wrap(tasks, keys, tenant);  // the worklist's copy
-let events = SealedEvents::wrap(events, keys, tenant); // the buffer's copy
+Runtime::builder(store).cases(cases).events(events).tasks(tasks)
+    .keyring(keys)   // seals all of them, and blob payloads
+    .build()
 ```
+
+Run it: `cargo run --example sealed_run --features redb,testkit,keyring`
+writes a claimant's details, shows them sealed in the store, erases the case,
+and verifies the chain afterwards.
+
+One call, one guarantee. The wrapping happens at `build()`, so the order you
+write the builder in cannot lose it — registering a store *after* the key ring
+seals it just the same. The decorators (`SealedJournal`, `SealedCases`,
+`SealedTasks`, `SealedEvents`) are public for embedders wiring stores by hand,
+but a plane should not need four correct decisions where one will do: a
+control that can be forgotten four times is one where forgetting looks exactly
+like remembering.
 
 Two properties make it worth having rather than merely present. Only the
 *payload* is sealed: `seq`, `run`, `case`, `effect_key` and the record's own

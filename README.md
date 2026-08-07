@@ -66,6 +66,9 @@ cargo run --example tool_loop --features redb,testkit,manifest
 cargo run --example planned_run --features redb,testkit,manifest
                                         # plan once, execute without the model —
                                         # a prompt injection with no reader
+cargo run --example sealed_run --features redb,testkit,keyring
+                                        # erase a case: every copy unreadable,
+                                        # and the chain still verifies
 
 # Calls a model and replays without calling it again — no API key, no network.
 cargo run --example model_run --features redb,testkit

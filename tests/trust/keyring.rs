@@ -919,3 +919,90 @@ async fn a_buffered_event_payload_is_sealed_and_erasable_on_its_own() {
     // Still listed, so the wrong-correlation-key signal survives the erasure.
     assert_eq!(after[0].event.id, "MSG-7");
 }
+
+/// **One call seals every store the plane holds.**
+///
+/// `keyring` used to seal blob payloads and nothing else — honest while blobs
+/// were the only sealable surface, and a trap the moment they were not: a
+/// deployer configuring a key ring reads it as *this plane is encrypted*.
+/// Five independent wrapping calls is a control that can be forgotten four
+/// times, and forgetting looks exactly like remembering.
+#[tokio::test]
+async fn configuring_a_key_ring_seals_every_store() {
+    use agentplane::case::{CaseStore, EventStore, TaskStore};
+    use agentplane::core::{CorrelationKey, Label, RunId, Timestamp};
+    use agentplane::journal::{Append, JournalStore, RecordKind, payload};
+    use agentplane::runtime::Runtime;
+
+    let raw = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let keys = Arc::new(MemoryKeyRing::default());
+
+    // Deliberately registered *before* the key ring: wrapping happens at
+    // build, so the order a deployer happens to write cannot lose it.
+    let rt = Runtime::builder(Arc::clone(&raw) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&raw) as Arc<dyn CaseStore>)
+        .events(Arc::clone(&raw) as Arc<dyn EventStore>)
+        .tasks(Arc::clone(&raw) as Arc<dyn TaskStore>)
+        .keyring(Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>)
+        .build();
+
+    let at = Timestamp::from_unix_timestamp(1_760_000_000).expect("time");
+    let case = rt
+        .cases()
+        .expect("cases")
+        .correlate_or_open("claim", &[CorrelationKey::new("claim", "CLM-1")], at)
+        .await
+        .expect("open")
+        .case_id();
+    let current = rt
+        .cases()
+        .expect("c")
+        .case(case)
+        .await
+        .expect("r")
+        .expect("e");
+    rt.cases()
+        .expect("c")
+        .put_state(case, current.version, serde_json::json!({ "who": "Ada" }))
+        .await
+        .expect("state");
+
+    let run = RunId::generate();
+    let lease = rt
+        .journal()
+        .acquire(run, "t", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    rt.journal()
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "c".into(),
+                    governed_by: None,
+                    input_label: Label::trusted(),
+                    input: serde_json::json!({ "who": "Ada" }),
+                    policy_bundle: None,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+
+    // Straight from the underlying store: both sealed, from one `.keyring(..)`.
+    let stored_case = raw.case(case).await.expect("r").expect("e");
+    assert!(
+        payload::is_sealed(&stored_case.state),
+        "case state was not sealed by the plane's key ring: {}",
+        stored_case.state
+    );
+    let stored = raw.read(run, 1).await.expect("read");
+    match stored[0].kind() {
+        RecordKind::RunAdmitted { input, .. } => assert!(
+            payload::is_sealed(input),
+            "the journal was not sealed by the plane's key ring: {input}"
+        ),
+        other => panic!("unexpected record: {other:?}"),
+    }
+}

@@ -3315,6 +3315,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        sealed.justification.proposed_action = payload::wrap(&envelope);",
         "        let _ = &envelope;",
     ),
+    "AKeyRingSealsOnlyBlobs": (
+        "src/runtime/executor.rs",
+        "configuring_a_key_ring_seals_every_store",
+        "a configured key ring seals blob payloads and leaves the journal, "
+        "case store, worklist and event buffer in the clear — a plane that "
+        "reads as encrypted and is one fifth encrypted",
+        "        self.seal_stores();",
+        "",
+    ),
     "AnEventPayloadIsNotSealed": (
         "src/keyring/events.rs",
         "a_buffered_event_payload_is_sealed_and_erasable_on_its_own",

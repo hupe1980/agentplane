@@ -4012,6 +4012,54 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Wrap every store a key ring can seal, at **build** time.
+    ///
+    /// One call, one guarantee. Before this, `keyring` sealed blob payloads
+    /// and nothing else — which was honest when blobs were the only sealable
+    /// surface and became a trap the moment they were not: a deployer who
+    /// configured a key ring would reasonably read it as *this plane is
+    /// encrypted* while the journal, the case store, the worklist and the
+    /// event buffer stayed in the clear. Five independent wrapping calls is a
+    /// control that can be forgotten four times, and forgetting looks exactly
+    /// like remembering.
+    ///
+    /// Wrapped here rather than inside `keyring()` for the reason the tool
+    /// catalogue is checked here: a wrap applied when the ring is supplied
+    /// would cover only the stores registered so far, so `keyring(..)` before
+    /// `cases(..)` would silently seal less than `keyring(..)` after it. An
+    /// enforcement a reordering can lose is one a reformatter can delete.
+    #[cfg(feature = "keyring")]
+    fn seal_stores(&mut self) {
+        let Some(keys) = self.keyring.clone() else {
+            return;
+        };
+        let tenant = self.tenant.clone();
+        self.store =
+            crate::keyring::SealedJournal::wrap(Arc::clone(&self.store), Arc::clone(&keys));
+        if let Some(cases) = self.cases.take() {
+            self.cases = Some(crate::keyring::SealedCases::wrap(
+                cases,
+                Arc::clone(&keys),
+                tenant.clone(),
+            ));
+        }
+        if let Some(events) = self.events.take() {
+            self.events = Some(crate::keyring::SealedEvents::wrap(
+                events,
+                Arc::clone(&keys),
+                tenant.clone(),
+            ));
+        }
+        if let Some(tasks) = self.tasks.take() {
+            self.tasks = Some(crate::keyring::SealedTasks::wrap(tasks, keys, tenant));
+        }
+    }
+
+    /// Without the `keyring` feature there is nothing to seal.
+    #[cfg(not(feature = "keyring"))]
+    #[allow(clippy::unused_self)]
+    fn seal_stores(&mut self) {}
+
     /// Supply the store that tracks batch items.
     ///
     /// Only needed for [`Runtime::run_batch`]; a plane that runs no batches does
@@ -4331,6 +4379,7 @@ impl RuntimeBuilder {
     #[allow(clippy::too_many_lines)]
     pub fn try_build(mut self) -> Result<Arc<Runtime>, BuildError> {
         check_same_tenant(self.store.as_ref(), self.blobs.as_ref(), &self.tenant)?;
+        self.seal_stores();
         #[cfg(feature = "manifest")]
         self.settle_tools()?;
 
