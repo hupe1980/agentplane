@@ -664,6 +664,23 @@ pub struct Security {
     /// with the sink's own ceiling at dispatch; the stricter limit wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sensitivity_egress: Option<Sensitivity>,
+    /// The highest sensitivity a value may reach an effect **whose arguments
+    /// the journal records**.
+    ///
+    /// A different question from [`max_sensitivity_egress`](Self::max_sensitivity_egress),
+    /// and the one that decides whether personal data in a run can ever be
+    /// erased. The journal is append-only and its rows are not encrypted, so an
+    /// argument recorded there — a model prompt, a tool call's arguments — is
+    /// permanent: beyond deletion, and beyond destroying a wrapping key. Egress
+    /// asks *may this leave*; this asks *may this be written down forever*.
+    ///
+    /// Absent means unbounded, which is the behaviour every deployment had
+    /// before this field existed. Setting it makes the permanent mistake a
+    /// refusal at dispatch rather than a discovery at an erasure request:
+    /// bytes above the ceiling belong in a blob, with the chain committing to
+    /// the digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sensitivity_journaled: Option<Sensitivity>,
     /// How far authority may be re-delegated. Checked both against the runtime's
     /// configured identity and against every delegating sink before dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]

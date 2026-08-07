@@ -458,6 +458,28 @@ pub enum PolicyError {
     #[error("invalid release: {detail}")]
     InvalidRelease { detail: String },
 
+    /// A value's sensitivity exceeds what this agent may write into the
+    /// journal.
+    ///
+    /// Distinct from [`EgressCeiling`](Self::EgressCeiling), and the
+    /// distinction is the whole point: egress asks *may this leave*, this asks
+    /// *may this be written down forever*. The journal is append-only and its
+    /// rows are not encrypted, so an argument recorded there — a prompt, a
+    /// tool call's arguments — outlives deletion and outlives destroying a
+    /// wrapping key. A deployment with an erasure obligation declares the
+    /// ceiling and gets a refusal at dispatch instead of an impossibility at
+    /// the erasure request.
+    #[error(
+        "sensitivity {actual:?} exceeds the journal ceiling {ceiling:?} for sink \
+         '{sink}' — the journal is append-only and unencrypted, so this argument \
+         could never be erased. Put the bytes in a blob and pass the digest"
+    )]
+    JournalCeiling {
+        sink: String,
+        actual: crate::core::Sensitivity,
+        ceiling: crate::core::Sensitivity,
+    },
+
     /// A value's sensitivity exceeds what the sink is allowed to receive. This
     /// is the exfiltration path that matters: not the network, but a
     /// legitimate-looking tool call carrying a secret read three steps ago.

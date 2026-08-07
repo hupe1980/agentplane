@@ -441,3 +441,181 @@ async fn a_parse_shortfall_fails_the_run_rather_than_guessing() {
         other => panic!("a shortfall parse answered anyway: {other:?}"),
     }
 }
+
+// ── Break-glass: the designed exception to tenancy ──────────────────────────
+
+/// An operator crossing the tenant boundary is recorded in **that tenant's**
+/// journal, in a sealed run, before any data is served.
+///
+/// Every other row of the isolation table makes a cross-tenant read
+/// unspellable. This is the exception, and an exception with no record is
+/// indistinguishable from the breach it is meant to be — so the tenant whose
+/// data was reached can see who crossed, under what roles, and why, from its
+/// own history, without being told break-glass exists.
+#[tokio::test]
+async fn break_glass_is_recorded_in_the_crossed_tenants_journal() {
+    use agentplane::journal::RecordKind;
+
+    let store: Arc<dyn JournalStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&store)).build();
+
+    let run = rt
+        .record_break_glass(
+            "carol@ops",
+            &["incident-commander".to_owned()],
+            "INC-42: customer reports a stuck settlement",
+        )
+        .await
+        .expect("the crossing is recorded");
+
+    let records = store.read(run, 1).await.expect("read");
+    let entry = records
+        .iter()
+        .find_map(|r| match r.kind() {
+            RecordKind::BreakGlass {
+                actor,
+                roles,
+                reason,
+            } => Some((actor.clone(), roles.clone(), reason.clone())),
+            _ => None,
+        })
+        .expect("the journal holds the crossing");
+    assert_eq!(entry.0, "carol@ops");
+    assert_eq!(entry.1, vec!["incident-commander".to_owned()]);
+    assert!(
+        entry.2.contains("INC-42"),
+        "the reason is not on the record"
+    );
+
+    // Sealed, so it enters the Merkle log and the offline audit checks it
+    // like any other run rather than needing to know what break-glass is.
+    assert!(
+        store.inclusion_proof(run).await.expect("proof").is_some(),
+        "the break-glass run did not enter the log, so no checkpoint covers it"
+    );
+    assert!(
+        store
+            .runs_by_outcome("broke-glass", 10)
+            .await
+            .expect("by outcome")
+            .contains(&run),
+        "the crossing is not findable by how it ended"
+    );
+}
+
+/// An unexplained crossing is refused rather than recorded blank.
+#[tokio::test]
+async fn break_glass_without_a_reason_is_refused() {
+    let store: Arc<dyn JournalStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&store)).build();
+
+    let refused = rt.record_break_glass("carol@ops", &[], "   ").await;
+    assert!(
+        refused.is_err(),
+        "a blank reason was accepted — the record exists to make the exception \
+         explicable, and an empty one explains nothing"
+    );
+    assert!(
+        store.recent_runs().await.expect("recent").is_empty(),
+        "a refused crossing still wrote a run"
+    );
+}
+
+// ── The journal ceiling: what may be written down forever ───────────────────
+
+const JOURNALLED: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: intake, version: "1.0.0" }
+spec:
+  capabilities: { provides: [intake.record] }
+  identity: { role: "Record an intake" }
+  security:
+    max_sensitivity_egress: secret
+    max_sensitivity_journaled: internal
+  models:
+    privileged: { provider: fake, model: planner-1 }
+  tools:
+    - ref: tool://crm/lookup
+      mutates: false
+      description: Look up a customer record.
+      max_sensitivity: secret
+      arguments:
+        type: object
+        properties:
+          id: { type: string }
+        required: [id]
+  execution: { kind: planned, max_turns: 2 }
+  budgets: {}
+"#;
+
+/// Data above the journal ceiling is refused **at dispatch**, before it can be
+/// written into a chain that cannot forget it.
+///
+/// Egress asks *may this leave*; this asks *may this be written down forever*.
+/// The manifest below is cleared to send `secret` outward, so the refusal
+/// cannot be the egress ceiling wearing a different name.
+#[tokio::test]
+async fn data_above_the_journal_ceiling_is_refused_before_it_is_recorded() {
+    let manifest = Manifest::parse(JOURNALLED).expect("parse");
+    let provider = agentplane::testkit::FakeProvider::new();
+    let client = Arc::new(Recorder::default());
+    let rt = wired(&manifest, &provider, read_only_catalog(), &client);
+
+    let input = agentplane::core::Tainted::with_label(
+        json!({ "customer": "AC-1" }),
+        agentplane::core::Label::trusted()
+            .with_sensitivity(agentplane::core::Sensitivity::Confidential),
+    );
+    let out = rt.run_tainted("intake.record", input).await.expect("run");
+
+    match out.status {
+        RunStatus::Failed(reason) => {
+            assert!(
+                reason.contains("journal ceiling"),
+                "refused for the wrong reason — the egress ceiling permits \
+                 `secret`, so this must be the journal ceiling: {reason}"
+            );
+            assert!(
+                reason.contains("blob"),
+                "the refusal does not tell the author what to do instead: {reason}"
+            );
+        }
+        other => panic!("confidential data was written into the chain: {other:?}"),
+    }
+    assert_eq!(
+        provider.asked().len(),
+        0,
+        "the planning call happened, so the arguments were already journaled"
+    );
+}
+
+/// Data at or below the ceiling still runs.
+///
+/// The positive half: without it a change that refused everything would pass
+/// the test above, and the ceiling would be a ban rather than a boundary.
+#[tokio::test]
+async fn data_within_the_journal_ceiling_still_runs() {
+    let manifest = Manifest::parse(JOURNALLED).expect("parse");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_answer(plan(json!({
+        "steps": [{ "tool": "crm__lookup", "args": { "id": "$input/customer" } }]
+    })));
+    let client = Arc::new(Recorder::default());
+    let rt = wired(&manifest, &provider, read_only_catalog(), &client);
+
+    let input = agentplane::core::Tainted::with_label(
+        json!({ "customer": "AC-1" }),
+        agentplane::core::Label::trusted()
+            .with_sensitivity(agentplane::core::Sensitivity::Internal),
+    );
+    let out = rt.run_tainted("intake.record", input).await.expect("run");
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "internal data was refused by a ceiling set at internal: {:?}",
+        out.status
+    );
+    assert_eq!(client.calls().len(), 1, "the step did not dispatch");
+}

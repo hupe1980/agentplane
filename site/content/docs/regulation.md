@@ -92,11 +92,22 @@ cover.
 
 The journal *is* the log, it verifies offline, and it exports in a portable form.
 
-**Erasure is possible without breaking the record.** `BlobStore::expire` drops a
-blob's bytes and leaves a tombstone; the hash chain still verifies afterwards
-because it only ever committed to the digest. So you can prove *what happened*
-and *that the record is unaltered* without retaining the personal data — which
-is what makes Art. 26 and Art. 17 compatible rather than opposed.
+**Erasure is possible without breaking the record — for data you kept out of
+the chain.** `BlobStore::expire` drops a blob's bytes and leaves a tombstone;
+the hash chain still verifies afterwards because it only ever committed to the
+digest. So you can prove *what happened* and *that the record is unaltered*
+without retaining those bytes, which is what makes Art. 26 and Art. 17
+compatible rather than opposed.
+
+The condition in that sentence is load-bearing, and it decides whether an
+Art. 17 request can be discharged at all. The journal is append-only and its
+rows are **not** encrypted, so anything recorded in it — the run's input, every
+effect's canonical arguments, and therefore **model prompts and tool
+arguments**, plus every effect's output — is beyond both deletion and key
+destruction. Personal data that must be erasable has to reach a blob and leave
+only its digest in the chain. [Erasure and keys](@/docs/erasure.md#what-lands-where-and-what-can-be-erased)
+partitions this row by row; a deployment that puts customer records into
+prompts has made them permanent, and no later request can undo it.
 
 **Erasure is answered by case**, which is the unit a request actually names.
 `erase_case` tombstones every blob that case produced and leaves other cases

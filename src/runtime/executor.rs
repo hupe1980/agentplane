@@ -522,6 +522,94 @@ impl Runtime {
         &self.meter
     }
 
+    /// Record an operator deliberately crossing into this tenant, and return
+    /// the run that holds the record.
+    ///
+    /// Every other tenancy control makes a cross-tenant read *unspellable*.
+    /// This is the designed exception, and the rule for it is that an
+    /// exception without a record is indistinguishable from the breach it is
+    /// meant to be. So the access is written into **this** tenant's journal —
+    /// the one whose data is about to be reached — in a sealed run of its own,
+    /// exactly as a sweep writes its decisions. It therefore inherits the hash
+    /// chain, the per-record signature and the Merkle inclusion, and the
+    /// offline audit tool reports it without being taught that break-glass
+    /// exists.
+    ///
+    /// **The record is written before any data is served, and a failure to
+    /// write it is a failure to access.** That direction is the whole control:
+    /// the alternative — serve first, record best-effort — is a break-glass
+    /// that works exactly as well when its own evidence is lost.
+    ///
+    /// # Errors
+    ///
+    /// If `reason` is blank, or if the record cannot be written. An
+    /// unexplained exception is the thing this record exists to prevent, so it
+    /// is refused rather than stored empty.
+    pub async fn record_break_glass(
+        &self,
+        actor: &str,
+        roles: &[String],
+        reason: &str,
+    ) -> Result<RunId, RuntimeError> {
+        if reason.trim().is_empty() {
+            return Err(RuntimeError::PlanContract(
+                "break-glass needs a reason: an unexplained crossing of the tenant \
+                 boundary is what this record exists to prevent"
+                    .to_owned(),
+            ));
+        }
+        let run = RunId::generate();
+        let epoch = BREAK_GLASS_EPOCH;
+        self.store
+            .append(
+                epoch,
+                vec![Append::new(
+                    run,
+                    RecordKind::BreakGlass {
+                        actor: actor.to_owned(),
+                        roles: roles.to_vec(),
+                        reason: reason.to_owned(),
+                    },
+                )],
+            )
+            .await
+            .map_err(RuntimeError::from_store)?;
+        // Concluded and closed like any other terminal run, so the outcome is
+        // in the chain and the run enters the Merkle log. `broke-glass` rather
+        // than a run status: it neither succeeded nor failed at a goal, which
+        // is the same reason a sweep seals as `swept`.
+        let head = self
+            .store
+            .head(run)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        self.store
+            .append(
+                epoch,
+                vec![Append::new(
+                    run,
+                    RecordKind::RunSealed {
+                        outcome: BREAK_GLASS_OUTCOME.to_owned(),
+                        chain_head: head.hash,
+                    },
+                )],
+            )
+            .await
+            .map_err(RuntimeError::from_store)?;
+        self.store
+            .seal(run, epoch, BREAK_GLASS_OUTCOME)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        tracing::warn!(
+            tenant = %self.tenant(),
+            %actor,
+            %run,
+            reason,
+            "break-glass: an operator crossed the tenant boundary"
+        );
+        Ok(run)
+    }
+
     pub fn journal(&self) -> &Arc<dyn JournalStore> {
         &self.store
     }
@@ -3390,6 +3478,18 @@ fn recorded_canceller(records: &[Record]) -> Option<String> {
 fn now_for_admission() -> crate::core::Timestamp {
     crate::core::Timestamp::now_utc()
 }
+
+/// The epoch a break-glass record is written under.
+///
+/// A break-glass run has no competing writer to fence against — it is created,
+/// written and sealed in one call — so a constant is honest here for the same
+/// reason it is in the sweeper.
+const BREAK_GLASS_EPOCH: crate::core::Epoch = 1;
+
+/// How a break-glass run ends. Not a run status: it neither succeeded nor
+/// failed at a goal, which is why a sweep seals as `swept` rather than
+/// borrowing one.
+const BREAK_GLASS_OUTCOME: &str = "broke-glass";
 
 /// One governed identity: a declaration and the skills that serve it.
 ///

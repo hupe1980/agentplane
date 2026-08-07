@@ -12,6 +12,63 @@ For the trust model those keys sit inside, see [security](@/docs/security.md).
 
 ---
 
+## What lands where, and what can be erased
+
+Decide this before personal data reaches a run. The journal is append-only and
+hash-chained: a record cannot be deleted without breaking the chain, and
+**journal rows are not encrypted**, so cryptographic erasure does not reach
+them either. Whatever enters the chain is permanent for the life of the store.
+
+| Data | Where it lands | Erasable |
+|---|---|---|
+| Run input | journal — `RunAdmitted.input`, verbatim | **no** |
+| **Model prompts** | journal — inside `EffectStarted.descriptor.args`, verbatim, because the prompt is part of effect identity | **no** |
+| **Tool call arguments** | journal — same field, same reason | **no** |
+| Effect outputs — completions, tool results | journal — `EffectDone.output`, verbatim | **no** |
+| Case state writes, status changes, deadline transitions | journal (the effect) **and** the case store, both plaintext | **no** |
+| Memory item content | `MemoryStore` | **yes** — `forget`, `forget_cascading`, expiry sweep; and unreadable everywhere with `EncryptedMemoryStore` |
+| Blob bytes — `cx.store_blob`, fetched media | blob store | **yes** — expiry leaves a tombstone; and unreadable everywhere with `EncryptedBlobs` |
+| Blob digest and classification | journal | no, and it does not need to be — a digest is not the bytes |
+
+**The rule this forces: keep erasable personal data out of the chain.** Put the
+bytes in a blob and let the journal commit to the digest:
+
+```rust
+let digest = cx.store_blob(document_bytes).await?;  // erasable, linked to the case
+// The chain records the digest and the classification, never the bytes.
+```
+
+Prompts are the hard case, because the prompt *is* effect identity — replay
+reconstructs a run by re-deriving the same key, so a prompt cannot be redacted
+after the fact without making the run unreplayable. A prompt built from a
+customer record puts that record in the chain permanently. Pass a reference or
+a digest and materialize the bytes at dispatch, as governed media already does,
+or treat the run as retained data with a retention period on the whole store.
+
+**Declare the ceiling and the runtime enforces it.** `spec.security.max_sensitivity_journaled`
+refuses, at dispatch, any argument more sensitive than a deployment is willing
+to make permanent — so the mistake is a refusal naming the blob pattern rather
+than a discovery at the first erasure request:
+
+```yaml
+spec:
+  security:
+    max_sensitivity_egress:    secret     # what may leave
+    max_sensitivity_journaled: internal   # what may be written down forever
+```
+
+Absent means unbounded, which is what every deployment had before the field
+existed.
+
+**Not built:** envelope encryption of journal rows and case state. The design
+requires it; today only blob payloads and memory item content are sealed, so
+destroying a wrapping key makes *those* unreadable and leaves the chain
+readable. Deployments whose erasure obligation covers prompts or tool arguments
+must minimize at the boundary — the table above — rather than plan on shredding
+the journal later.
+
+---
+
 ## Erasure that reaches the backups
 
 Dropping a payload's bytes leaves the hash chain intact, because the chain only

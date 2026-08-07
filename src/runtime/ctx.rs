@@ -193,6 +193,16 @@ pub struct StepCtx<'a> {
     /// with `?` drops the handle without settling, and `Drop` cannot run an
     /// async reversal. The executor settles what the handle abandoned.
     open_group: Option<super::group::OpenGroup>,
+    /// Whether the effect being dispatched right now *is* a group member.
+    ///
+    /// A group's `Aborted` settlement claims the world was taken back whole.
+    /// An ordinary mutating effect performed while a group is open falsifies
+    /// that claim: it is journaled, gated and metered like any other, but it
+    /// registers no reversal and survives the unwind. So an open group refuses
+    /// them — and the runtime has to tell a member's own dispatch apart from
+    /// an ambient one, because members reach the world through the same two
+    /// methods everything else does.
+    member_dispatch: bool,
 }
 
 impl<'a> StepCtx<'a> {
@@ -250,6 +260,7 @@ impl<'a> StepCtx<'a> {
             signer,
             reversing: false,
             open_group: None,
+            member_dispatch: false,
         }
     }
 
@@ -328,6 +339,22 @@ impl<'a> StepCtx<'a> {
 
     pub(crate) fn take_open_group(&mut self) -> Option<super::group::OpenGroup> {
         self.open_group.take()
+    }
+
+    /// Dispatch an effect **as a group member**, exempt from the ambient
+    /// refusal above.
+    ///
+    /// Scoped rather than sticky: the flag is cleared on the way out whatever
+    /// the effect did, so a member that fails cannot leave the group open to
+    /// ambient mutations for the rest of the step.
+    pub(crate) async fn effect_as_member<E: Effect>(
+        &mut self,
+        effect: E,
+    ) -> Result<Tainted<E::Output>, StepError> {
+        self.member_dispatch = true;
+        let out = self.effect(effect).await;
+        self.member_dispatch = false;
+        out
     }
 
     /// Commission another agent on this plane, and journal that you did.
@@ -567,6 +594,25 @@ impl<'a> StepCtx<'a> {
         let trust = effect.trust();
         let declared = effect.output_sensitivity();
         let kind = effect.descriptor().kind;
+        // A mutation beside an open group, rather than inside it. Refused:
+        // the group's `Aborted` outcome says *taken back whole*, and this
+        // write would still be standing when it was written. Reads are
+        // untouched — a read changes nothing there is to take back — and a
+        // member's own dispatch sets `member_dispatch` on the way through.
+        if let Some(open) = self.open_group.as_ref()
+            && !self.member_dispatch
+            && effect.mutates()
+        {
+            return Err(StepError::GroupFootprint {
+                group: open.name.clone(),
+                detail: format!(
+                    "'{kind}' mutates and is not a member of the open group — it \
+                     would survive an abort that claims the world was taken back \
+                     whole. Register it with the group, or perform it before the \
+                     group opens or after it settles"
+                ),
+            });
+        }
         let output = self.effect_unlabelled(effect, outbound).await?;
 
         let labelled = match trust {
@@ -1660,6 +1706,30 @@ impl<'a> StepCtx<'a> {
                 sink: sink_name,
                 actual: label.sensitivity,
                 ceiling,
+            }
+            .into());
+        }
+
+        // What may be *written down* is a different question from what may
+        // leave, and it is the one that decides whether a run's personal data
+        // can ever be erased: this effect's canonical arguments are about to
+        // enter an append-only, unencrypted chain, where they outlive both
+        // deletion and the destruction of any wrapping key. Checked here,
+        // before the announcement, so the refusal costs nothing — and absent
+        // by default, because every deployment before this field had no
+        // ceiling and silence must not start refusing their traffic.
+        #[cfg(feature = "manifest")]
+        if let Some(journal_ceiling) = self
+            .manifest
+            .as_ref()
+            .filter(|_| manifest_gates)
+            .and_then(|m| m.spec.security.max_sensitivity_journaled)
+            && label.sensitivity > journal_ceiling
+        {
+            return Err(PolicyError::JournalCeiling {
+                sink: sink_name,
+                actual: label.sensitivity,
+                ceiling: journal_ceiling,
             }
             .into());
         }

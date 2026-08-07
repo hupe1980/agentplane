@@ -467,6 +467,15 @@ registering a reversal because it has nothing to take back, and an effect that
 took that exemption while leaving something standing is exactly the member the
 unwind would miss.
 
+**Nor can a mutation happen beside the group rather than inside it.** The
+footprint used to bound members only, so a skill holding an open group could
+reach the world through the ordinary effect path — journaled, gated and
+metered like anything else, and no member: no reversal registered, and still
+standing after an unwind that settled `Aborted`, which claims the world was
+taken back whole. A mutating effect dispatched while a group is open is now
+refused unless it is a member's own dispatch. Reads are untouched, because a
+read leaves nothing to take back.
+
 Nor can a member bind its own outbound arguments. Anything exposing
 `sink_arguments` must go through `cx.sink`, which checks a labelled value the
 group does not have on the member's behalf. A **deferred** member is refused

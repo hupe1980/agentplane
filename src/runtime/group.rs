@@ -243,7 +243,7 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
     {
         self.check_footprint(resource)?;
         let kind = effect.descriptor().kind;
-        let out = self.cx.effect(effect).await?;
+        let out = self.cx.effect_as_member(effect).await?;
         let undo = undo(out.peek());
         // A **quarantine**, not a refusal, and the difference is the whole
         // point: the forward member has already landed, and an undo that
@@ -293,7 +293,7 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
                 ),
             });
         }
-        self.cx.effect(effect).await
+        self.cx.effect_as_member(effect).await
     }
 
     /// Hold a member at the gate until the group commits.
@@ -468,7 +468,7 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
         for member in deferred {
             let kind = AnyEffect::descriptor(&*member.effect).kind;
             let resource = member.resource.clone();
-            match self.cx.effect(member.effect).await {
+            match self.cx.effect_as_member(member.effect).await {
                 Ok(v) => outputs.push(v),
                 // Nothing has externalised — no prior deferred member landed, no
                 // atomic member committed, and *this* member provably did not
@@ -726,7 +726,7 @@ impl<'a> StepCtx<'a> {
                 kind,
                 undo,
             } = member;
-            if let Err(e) = self.effect(undo).await {
+            if let Err(e) = self.effect_as_member(undo).await {
                 // Stop. Reversing further members around one that would not
                 // come back leaves a shape nobody declared and nobody can read.
                 return Err(format!(

@@ -236,6 +236,28 @@ The general rule is worth stating because it is easy to satisfy accidentally and
 easy to lose: a control that notices and does not deliver is closer to none than
 to half, because it also manufactures the belief that somebody was told.
 
+### Break-glass
+
+Reaching another tenant's data is the one exception to isolation, so it is
+recorded in **that tenant's** journal — actor, roles, and a reason that cannot
+be blank — before anything is served:
+
+```rust
+let run = plane.record_break_glass(&actor, &roles, "INC-42: stuck settlement").await?;
+```
+
+The crossing seals like any other run, so it enters the Merkle log, verifies
+offline, and lists with the rest:
+
+```sh
+curl -H "$AUTH" 'https://plane/runs?outcome=broke-glass'
+```
+
+Writing the record **before** the access is the control. A break-glass that
+serves first and records best-effort works exactly as well when its own
+evidence is lost, which is the state an incident is most likely to produce.
+Who may pull it is your policy engine's decision, not this crate's.
+
 ### One matter, one scan
 
 *Show me everything about this matter* is the question a regulated deployment

@@ -3306,6 +3306,54 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if self.spec.execution.is_some() && self.spec.capabilities.provides.len() > 1 {",
         "        if false {",
     ),
+    "TheJournalCeilingIsAdvisory": (
+        "src/runtime/ctx.rs",
+        "data_above_the_journal_ceiling_is_refused_before_it_is_recorded",
+        "a declared journal ceiling does not refuse, so data the deployment "
+        "said must stay erasable is written into an append-only chain that "
+        "cannot forget it",
+        """            && label.sensitivity > journal_ceiling
+        {""",
+        """            && label.sensitivity > journal_ceiling
+            && false
+        {""",
+    ),
+    "BreakGlassLeavesNoRecord": (
+        "src/runtime/executor.rs",
+        "break_glass_is_recorded_in_the_crossed_tenants_journal",
+        "an operator crosses the tenant boundary and the crossing is not "
+        "sealed into that tenant's journal, so the designed exception is "
+        "indistinguishable from the breach it is meant to be",
+        """        self.store
+            .seal(run, epoch, BREAK_GLASS_OUTCOME)
+            .await
+            .map_err(RuntimeError::from_store)?;""",
+        """        let _ = BREAK_GLASS_OUTCOME;""",
+    ),
+    "AnUnexplainedCrossingIsRecorded": (
+        "src/runtime/executor.rs",
+        "break_glass_without_a_reason_is_refused",
+        "a break-glass with no stated reason is accepted, recording an "
+        "exception that explains nothing",
+        "        if reason.trim().is_empty() {",
+        "        if false {",
+    ),
+    "AmbientMutationBesideAGroup": (
+        "src/runtime/ctx.rs",
+        "a_mutating_effect_beside_an_open_group_is_refused",
+        "a mutating effect performed beside an open group is admitted, so it "
+        "survives an abort that settles `Aborted` — the world taken back whole "
+        "over a write that is still standing",
+        """        if let Some(open) = self.open_group.as_ref()
+            && !self.member_dispatch
+            && effect.mutates()
+        {""",
+        """        if let Some(open) = self.open_group.as_ref()
+            && !self.member_dispatch
+            && effect.mutates()
+            && false
+        {""",
+    ),
     "AMetQuorumSilencesAFork": (
         "src/journal/witness.rs",
         "a_fork_report_survives_a_met_quorum",

@@ -163,6 +163,7 @@ impl Skill for Checkout {
         SkillDescriptor::new("checkout").provides("checkout")
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn invoke(
         &self,
         cx: &mut StepCtx<'_>,
@@ -183,6 +184,30 @@ impl Skill for Checkout {
                 .await
                 .expect_err("a member outside the footprint was admitted");
             return Err(SkillError::Step(err));
+        }
+
+        if script["ambient_mutation"].as_bool() == Some(true) {
+            // The handle goes out of use; the group does not. This is the
+            // shape the hole had: a skill that stops using the handle and
+            // reaches the world through the ordinary effect path.
+            let _ = g;
+            let err = cx
+                .effect(Call::new("ledger.post", "posted", w))
+                .await
+                .expect_err("a mutating effect beside an open group was admitted");
+            return Err(SkillError::Step(err));
+        }
+
+        if script["ambient_read"].as_bool() == Some(true) {
+            let _ = g;
+            // A read changes nothing there is to take back, so it stays legal.
+            cx.effect(Look {
+                world: Arc::clone(w),
+            })
+            .await
+            .map_err(SkillError::Step)?;
+            w.log.lock().expect("lock").push("looked".to_owned());
+            return Ok(Outcome::done(Tainted::trusted(json!("looked"))));
         }
 
         if script["mutating_read"].as_bool() == Some(true) {
@@ -2104,5 +2129,65 @@ async fn a_deferred_failure_after_an_atomic_commit_is_not_an_abort() {
         settled,
         vec!["quarantined".to_owned()],
         "the settlement claims an outcome the ledger contradicts"
+    );
+}
+
+/// A mutating effect performed *beside* an open group is refused.
+///
+/// The footprint governs members. It never governed the ambient surface, so a
+/// skill holding an open group could reach the world through the ordinary
+/// effect path: journaled, gated and metered like anything else, but no
+/// member — registering no reversal and surviving the unwind. The group would
+/// then settle `Aborted`, which claims the world was taken back whole, over a
+/// write that was still standing.
+#[tokio::test]
+async fn a_mutating_effect_beside_an_open_group_is_refused() {
+    let world = World::new();
+    let out = run(&world, json!({ "ambient_mutation": true })).await;
+
+    let RunStatus::Failed(why) = &out.status else {
+        panic!("expected a failure, got {:?}", out.status);
+    };
+    assert!(
+        why.contains("not a member of the open group"),
+        "the refusal did not name the reason: {why}"
+    );
+    assert!(
+        !world.did("posted"),
+        "the ambient mutation ran before it was refused: {:?}",
+        world.entries()
+    );
+}
+
+/// A **read** beside an open group stays legal.
+///
+/// The positive half, and it is what keeps the rule from being a blanket ban
+/// on touching anything while a group is open: a read changes nothing there is
+/// to take back, so an abort has nothing to apologise for. Without this half a
+/// refuse-everything change would pass the test above.
+#[tokio::test]
+async fn a_read_beside_an_open_group_is_allowed() {
+    let world = World::new();
+    let out = run(&world, json!({ "ambient_read": true })).await;
+
+    // The read runs. The run still fails, on the *older* rule that a step
+    // returning with a group open is reversed rather than allowed to commit
+    // by omission — so the assertion is about which rule spoke, not about the
+    // run succeeding.
+    assert!(
+        world.did("looked"),
+        "the read beside an open group did not happen: {:?}",
+        world.entries()
+    );
+    let RunStatus::Failed(why) = &out.status else {
+        panic!("expected the still-open failure, got {:?}", out.status);
+    };
+    assert!(
+        !why.contains("not a member of the open group"),
+        "a read was refused as an ambient mutation: {why}"
+    );
+    assert!(
+        why.contains("still open"),
+        "the run failed for an unexpected reason: {why}"
     );
 }

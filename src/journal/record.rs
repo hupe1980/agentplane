@@ -408,6 +408,27 @@ pub enum RecordKind {
         chain_head: Digest,
     },
 
+    /// An operator deliberately crossed the tenant boundary.
+    ///
+    /// Every other row in the isolation table makes a cross-tenant read
+    /// *unspellable*. This is the designed exception, and an exception with no
+    /// record is indistinguishable from the breach it is meant to be — so the
+    /// access is written into the journal of the tenant whose data was
+    /// reached, in a sealed run of its own, **before** any of it is served.
+    /// That tenant's own audit therefore shows who crossed, under what
+    /// authority, and why, without anyone having to be told that break-glass
+    /// exists.
+    BreakGlass {
+        /// The authenticated operator, from the credential — never a body.
+        actor: String,
+        /// The roles that credential carried, so an auditor can see which
+        /// grant was used rather than only which person.
+        roles: Vec<String>,
+        /// Why. Refused when blank: an unexplained exception is the thing
+        /// this record exists to prevent.
+        reason: String,
+    },
+
     /// Something the sweeper did to work nobody was watching.
     ///
     /// The sweeper acts on a clock rather than on a request, so there is no run
@@ -458,6 +479,7 @@ impl RecordKind {
             Self::Released { .. } => "Released",
             Self::RunCancelled { .. } => "RunCancelled",
             Self::RunSealed { .. } => "RunSealed",
+            Self::BreakGlass { .. } => "BreakGlass",
             Self::Swept { .. } => "Swept",
         }
     }
