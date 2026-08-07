@@ -2534,14 +2534,13 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     "AQuarantineIsUnfindable": (
         "src/store/redb.rs",
         "a_quarantined_run_can_be_found_afterwards",
-        "a sealed run is not indexed by how it ended, so the most serious "
+        "a concluded run is not indexed by how it ended, so the most serious "
         "conclusion this runtime reaches leaves a status, a log line and a "
         "counter — and no way to ask what is quarantined right now",
-        "                    w.open_table(RUN_BY_OUTCOME)\n"
-        "                        .map_err(|e| be(&e))?\n"
-        "                        .insert((tenant.as_str(), outcome.as_str(), next), key.as_str())\n"
-        "                        .map_err(|e| be(&e))?;",
-        "",
+        """                        by_outcome
+                            .insert((tenant.as_str(), outcome.as_str(), next), key.as_str())
+                            .map_err(|e| be(&e))?;""",
+        """                        let _ = &outcome;""",
     ),
     "TheGateReadsWhatTheRecordDoesNot": (
         "src/runtime/ctx.rs",
@@ -3286,6 +3285,82 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         .find(|r| matches!(r.kind(), RecordKind::RunSuspended { .. }))
         .or_else(|| records.last())
     else {""",
+    ),
+    # ── Seals and conclusions ───────────────────────────────────────────────
+    "SealedRunAcceptsAppends": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "a sealed run accepts appends, so the true head moves past the leaf "
+        "every checkpoint attests",
+        """                    if let Some(seal) = seals.get(key.as_str()).map_err(|e| be(&e))? {
+                        let (outcome, _, _) = seal.value();
+                        return Err(StoreError::RunSealed {
+                            run: key.clone(),
+                            outcome: outcome.to_owned(),
+                        });
+                    }""",
+        """                    if let Some(seal) = seals.get(key.as_str()).map_err(|e| be(&e))? {
+                        let (outcome, _, _) = seal.value();
+                        let _ = (outcome, &key);
+                    }""",
+    ),
+    "OutcomeIndexKeepsFirstConclusion": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "a re-conclusion accumulates a second index row instead of replacing "
+        "the first, so a resumed run stays listed as failed forever",
+        """                            by_outcome
+                                .remove((tenant.as_str(), prior.0.as_str(), prior.1))
+                                .map_err(|e| be(&e))?;""",
+        """                            let _ = &prior;""",
+    ),
+    "FailedRunSeals": (
+        "src/runtime/executor.rs",
+        "a_failed_run_is_findable_open_and_moves_on_resume",
+        "a failed run seals and enters the Merkle log, so its own resume grows "
+        "the history past the leaf a checkpoint attests",
+        """        matches!(
+            self,
+            Self::Succeeded | Self::Quarantined(_) | Self::Cancelled { .. }
+        )""",
+        """        matches!(
+            self,
+            Self::Succeeded | Self::Quarantined(_) | Self::Cancelled { .. } | Self::Failed(_)
+        )""",
+    ),
+    "UnknownOutcomeResumes": (
+        "src/runtime/executor.rs",
+        "an_unrecognised_recorded_outcome_refuses_resume",
+        "a recorded ending this build does not recognise is treated as "
+        "resumable — fail open instead of fail closed",
+        """        other => Some(RunStatus::Quarantined(format!(
+            "recorded as '{other}', which this build does not recognise as resumable"
+        ))),""",
+        """        _ => None,""",
+    ),
+    "FormationIgnoresQuarantined": (
+        "src/runtime/declarative.rs",
+        "formation_runs_on_the_quarantined_model_when_declared",
+        "memory extraction runs on the privileged model even when a quarantined "
+        "one is declared, so the role designated for untrusted contact governs "
+        "nothing in the declarative tier",
+        """        let model = cx
+            .manifest()
+            .and_then(|m| m.spec.models.as_ref())
+            .and_then(|models| models.quarantined.as_ref())
+            .map_or_else(|| model.clone(), |r| ModelId::new(&r.provider, &r.model));""",
+        """        let model = model.clone();""",
+    ),
+    "LostAckCheapAborts": (
+        "src/runtime/group.rs",
+        "a_lost_commit_acknowledgement_quarantines_the_group",
+        "a commit whose acknowledgement was lost takes the cheap abort, so the "
+        "journal settles 'taken back whole' over a write that may stand",
+        """            if matches!(
+                &e,
+                StepError::Store(crate::core::StoreError::CommitUnknown { .. })
+            ) {""",
+        """            if false {""",
     ),
 }
 

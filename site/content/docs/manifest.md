@@ -109,6 +109,13 @@ a bare name makes the model guess, and the guess is refused at the field check
 | `role` | yes if the block is present | Non-empty. What the agent is for, in one line. |
 | `constraints` | no | How it must behave. Separate from `role` because the two are reviewed by different people and change on different schedules. |
 
+A `workload_id` field ("the SPIFFE ID this agent runs as") was removed: nothing
+read it, so it was an identity claim in a reviewed file the runtime never
+checked — a reviewer would take it as binding while the plane ran the agent as
+whatever identity it actually held. Workload identity is configured on the
+plane and recorded in the journal (`IdentityBound`), where it is evidence
+rather than aspiration. Same cut as `capabilities.requires`.
+
 The prompt lives here so that rewording it is a **version bump** rather than a
 deploy nothing records. A prompt composed in Rust has no version at all: it
 changes, the journal records the run, and nothing connects the two.
@@ -128,6 +135,34 @@ at all.
 The block is optional because an embedder may compose its prompt in code — in
 which case the digest simply does not cover it, and the page says so rather than
 implying otherwise.
+
+**Where is my templating?** Every agent SDK this field gets compared against
+has one — the OpenAI Agents SDK takes a *function* that returns the
+instructions per call, CrewAI interpolates `{variables}` into role, goal and
+backstory, ADK substitutes `{state}` from the session — and this field is a
+plain string on purpose. Two reasons, and both are load-bearing rather than
+taste:
+
+* **A templated instruction has no reviewable identity.** The digest pins what
+  the reviewer read; an instruction assembled at run time from state is a
+  different prompt per run, so either the digest covers only the template —
+  and the words the model actually obeyed were never reviewed — or it covers
+  nothing. A dynamic-instructions callback is a prompt composed in code, which
+  is the exact thing this file exists to replace.
+* **The instruction slot is the trusted slot.** `/system` is a protected field:
+  an order must be trusted while content may not be, because a model reads
+  both as one undifferentiated text. State injection splices run-time values —
+  case fields, retrieved memories, tool output — into the one slot whose whole
+  point is that untrusted data cannot reach it. That is not a missing feature;
+  it is the laundering the label system refuses.
+
+What those templates are *for* still works — it just goes in the other slot.
+Per-run data arrives as the run's **input**, journaled and labelled, and the
+model sees it beside the instruction; recalled memories and case state arrive
+as labelled values through their own journaled effects. The difference is not
+what the model reads, it is what the record says: data presented *as data*
+keeps its label, while data spliced into the instruction would wear the
+instruction's trust.
 
 ## `spec.topology`
 
@@ -185,6 +220,23 @@ Both are `{ provider, model }`, where `provider` is the name a driver was
 registered under — `openai`, `anthropic`, `bedrock`, or your own. The pair is
 **refused when both roles name the same provider and model**: two roles behind
 one model keeps the label and removes the control it stands for.
+
+What the `quarantined` role does today, stated exactly so the YAML cannot claim
+more than the runtime executes: it is part of the reviewed model **allowlist**
+— an effect naming a model the manifest never declared is refused — and in the
+declarative tier, **memory formation runs on it when it is declared**.
+Formation is the dual-model pattern's quarantined job to the letter: it reads
+content derived from untrusted input, is offered no tools, and must answer in
+a bounded schema, so the model the reviewer designated for untrusted contact
+is the one that writes durable memory from it. The agent's *answer* stays on
+the privileged model — the quarantined role is for reading hostile text, not
+for speaking as the agent. The extraction also hands the privileged path
+nothing but success or failure: the runtime derives the ids and labels, and
+the answer never sees what was extracted — CaMeL restricts its quarantined
+model's feedback channel to one boolean for exactly this reason, because a
+richer channel is an injection vector back into the planner. What the runtime does **not** do is route ordinary
+completions between the two by content: a hand-written skill chooses, and the
+manifest bounds what it may choose.
 
 Absent means *wired in code*. `models: {}` means **no inference at all**,
 declared on purpose — a rules-only agent is a legitimate design, and saying so is
@@ -323,6 +375,15 @@ a declared `privileged` model.
 
 The model proposes bounded key/content pairs; the **runtime** derives ids, taint,
 provenance and retention. Trust is never taken from what the content says.
+
+The extraction runs on the **quarantined** model when `spec.models` declares
+one, and on the privileged model otherwise — see `spec.models` above for why.
+Write the `instruction` the way CaMeL's reference implementation writes its
+quarantined model's prompt: extraction only, with fabrication refused —
+*record stable facts stated in the source; do not infer addresses, dates or
+identifiers that are not literally present*. The instruction is the one part
+of this control the runtime cannot derive, because it is domain judgment; it
+is digest-covered so that judgment is reviewed.
 
 ## What is deliberately not in the format
 

@@ -220,7 +220,7 @@ pub trait JournalStore: Send + Sync + Debug {
     /// Read a run's records from `from` (inclusive, 1-based) onward.
     async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError>;
 
-    /// Sealed runs that ended a given way, oldest first.
+    /// Concluded runs whose *latest* conclusion is `outcome`, newest first.
     ///
     /// The question this exists for is *what is quarantined right now?* — and
     /// until it existed, the answer was "watch the logs". A quarantine is the
@@ -236,10 +236,15 @@ pub trait JournalStore: Send + Sync + Debug {
     /// backlog here is findable by whoever must clear it — escalated cases,
     /// overdue tasks, breached obligations. This one was not.
     ///
-    /// A **derived** index: the outcome's home is the chain, since the executor
-    /// appends `RunSealed` before sealing and tamper detection therefore covers
-    /// how a run ended. This can be rebuilt from the journal and is a
-    /// convenience, never an authority.
+    /// A **derived** index: the outcome's home is the chain — the store
+    /// maintains this index from the `RunSealed` record inside `append`, in
+    /// the same transaction, so it can be rebuilt from the journal and is a
+    /// convenience, never an authority. **The last conclusion wins**: a failed
+    /// run is listed while it stands failed, and moves to `succeeded` when a
+    /// resume concludes it again. An index that kept the first conclusion
+    /// would list a resumed run as failed for the rest of its life — a backlog
+    /// page that never drains, which is worse than no page, because a wrong
+    /// answer reads exactly like a right one.
     ///
     /// Bounded, and the bound is visible: `limit` results means *at least*
     /// that many, not exactly.
@@ -347,6 +352,16 @@ pub trait JournalStore: Send + Sync + Debug {
     }
 
     /// Close the chain and return its terminal hash — what a signature covers.
+    ///
+    /// A seal is a **freeze**, not a status report: the run enters the Merkle
+    /// log at its current head, and from that instant `append` refuses the run
+    /// with [`StoreError::RunSealed`] — even for the caller legitimately
+    /// holding the current epoch, because an append past the leaf would leave
+    /// every checkpoint attesting a prefix of a history that kept growing.
+    /// Only conclusions nothing may resume are sealed
+    /// (`RunStatus::seals`); a failed or exhausted run concludes without
+    /// sealing and stays open for resume. First seal wins; a re-seal changes
+    /// nothing.
     async fn seal(&self, run: RunId, epoch: Epoch, outcome: &str) -> Result<Digest, StoreError>;
 
     /// A commitment to the **set** of sealed runs.

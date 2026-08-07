@@ -139,21 +139,37 @@ CREATE TABLE IF NOT EXISTS run_seal (
     chain_head BYTEA  NOT NULL,
     log_index  BIGINT NOT NULL,
     sealed_at  BIGINT NOT NULL,
-    -- How the run ended. **Derived**, not authoritative: the executor appends
-    -- `RunSealed` before sealing, so tamper detection covers the outcome and
-    -- this column can be rebuilt from the chain. It exists so *what is
-    -- quarantined right now* is a query rather than a log search — a finding
-    -- nobody can find is one that never reached a human.
+    -- How the run ended *when it sealed*. Descriptive: the outcome index that
+    -- answers queries lives in run_outcome, fed by the chain's `RunSealed`
+    -- records, where the last conclusion wins.
     outcome    TEXT   NOT NULL,
     PRIMARY KEY (tenant, run_id),
     UNIQUE (tenant, log_index)
 );
 
+-- Conclusion ordering under concurrency, for the same reason as
+-- run_log_position: several instances conclude runs at once here.
+CREATE SEQUENCE IF NOT EXISTS run_conclusion_ordinal;
+
+-- Concluded runs by how they ended. **Derived**, not authoritative: fed by the
+-- `RunSealed` record inside `append`, in the same transaction, so the outcome's
+-- home stays the chain and this table can be rebuilt from it. The last
+-- conclusion wins — a run that failed, was resumed and then succeeded moves
+-- from `failed` to `succeeded`; an index fed by the seal would report the
+-- first conclusion forever, and a wrong answer reads exactly like a right one.
+CREATE TABLE IF NOT EXISTS run_outcome (
+    tenant  TEXT   NOT NULL,
+    run_id  TEXT   NOT NULL,
+    outcome TEXT   NOT NULL,
+    ordinal BIGINT NOT NULL,
+    PRIMARY KEY (tenant, run_id)
+);
+
 -- One outcome's backlog without touching another tenant's. Scanned **newest
 -- first** — see `JournalStore::runs_by_outcome` for why the direction is part
 -- of the contract rather than a detail of this index.
-CREATE INDEX IF NOT EXISTS run_seal_by_outcome
-    ON run_seal (tenant, outcome, log_index);
+CREATE INDEX IF NOT EXISTS run_outcome_by_outcome
+    ON run_outcome (tenant, outcome, ordinal);
 
 CREATE TABLE IF NOT EXISTS run_cancel (
     tenant       TEXT   NOT NULL,
@@ -406,6 +422,26 @@ impl PostgresStore {
         epoch: Epoch,
         batch: Vec<Append>,
     ) -> Result<Vec<Record>, StoreError> {
+        // Sealed is frozen. The Merkle leaf is the chain head at seal time, so
+        // an append past it — even by the epoch's rightful holder — advances
+        // the true head past what every checkpoint attests. Checked inside the
+        // caller's transaction like the fence, and it covers `append_atomic`
+        // too because both routes pass through here. The sealing appends
+        // themselves precede the seal row, so they never meet this check.
+        let sealed_row = tx
+            .query_opt(
+                "SELECT outcome FROM run_seal WHERE tenant = $1 AND run_id = $2",
+                &[&self.tenant_name(), &run.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if let Some(row) = sealed_row {
+            return Err(StoreError::RunSealed {
+                run: run.to_string(),
+                outcome: row.get(0),
+            });
+        }
+
         let head = tx
             .query_opt(
                 "SELECT seq, hash FROM journal
@@ -424,9 +460,13 @@ impl PostgresStore {
         };
 
         let mut sealed = Vec::with_capacity(batch.len());
+        let mut conclusion: Option<String> = None;
         for append in batch {
             seq += 1;
             let body = append.into_body(seq, epoch);
+            if let crate::journal::RecordKind::RunSealed { outcome, .. } = &body.kind {
+                conclusion = Some(outcome.clone());
+            }
             let record = Record::seal_signed(body, prev, self.signer.as_deref())?;
             prev = record.hash;
 
@@ -479,6 +519,21 @@ impl PostgresStore {
         )
         .await
         .map_err(|error| be(&error))?;
+
+        // The outcome index derives from the chain, here, in the same
+        // transaction as the record it derives from — and the last conclusion
+        // wins. See the schema comment on run_outcome.
+        if let Some(outcome) = conclusion {
+            tx.execute(
+                "INSERT INTO run_outcome (tenant, run_id, outcome, ordinal)
+                 VALUES ($1, $2, $3, nextval('run_conclusion_ordinal'))
+                 ON CONFLICT (tenant, run_id) DO UPDATE
+                    SET outcome = EXCLUDED.outcome, ordinal = EXCLUDED.ordinal",
+                &[&self.tenant_name(), &run.to_string(), &outcome],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        }
 
         Ok(sealed)
     }
@@ -555,9 +610,9 @@ impl JournalStore for PostgresStore {
                 // ascending order plus a page limit means a plane whose backlog
                 // already exceeds one page returns the same runs forever, and
                 // the quarantine that just happened never appears.
-                "SELECT run_id FROM run_seal
+                "SELECT run_id FROM run_outcome
                   WHERE tenant = $1 AND outcome = $2
-                  ORDER BY log_index DESC
+                  ORDER BY ordinal DESC
                   LIMIT $3",
                 &[
                     &self.tenant_name(),
@@ -1046,7 +1101,23 @@ impl AtomicJournal for PostgresStore {
             .map_err(|e| StoreError::Backend(e.to_string()))?;
 
         let sealed = self.append_within(&tx, run, epoch, batch).await?;
-        tx.commit().await.map_err(|e| be(&e))?;
+        // The one in-doubt window a native transaction keeps: the server
+        // *answering* is what distinguishes "refused,
+        // rolled back" from "may have landed". A database error is an answer —
+        // a serialization or constraint failure is a clean rollback and stays
+        // an ordinary backend error. Anything else — the connection dropping
+        // between sending COMMIT and receiving its acknowledgement — means the
+        // commit may be standing, and the caller must not treat it as taken
+        // back.
+        tx.commit().await.map_err(|e| {
+            if e.as_db_error().is_some() {
+                be(&e)
+            } else {
+                StoreError::CommitUnknown {
+                    detail: e.to_string(),
+                }
+            }
+        })?;
         Ok(sealed)
     }
 }

@@ -386,6 +386,17 @@ fn admitted(run: RunId) -> Append {
     )
 }
 
+/// The conclusion record the executor writes — what feeds the outcome index.
+fn concluded(run: RunId, outcome: &str) -> Append {
+    Append::new(
+        run,
+        RecordKind::RunSealed {
+            outcome: outcome.to_owned(),
+            chain_head: Digest::ZERO,
+        },
+    )
+}
+
 fn started(run: RunId, key: EffectKey) -> Append {
     Append::new(
         run,
@@ -436,6 +447,8 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     read_starts_where_it_is_told(fresh, &mut r).await;
     a_case_scan_selects_one_matter(fresh, &mut r).await;
     sealed_runs_are_findable_by_how_they_ended(fresh, &mut r).await;
+    the_outcome_index_follows_the_last_conclusion(fresh, &mut r).await;
+    a_sealed_run_refuses_appends(fresh, &mut r).await;
     a_stop_request_needs_no_lease(fresh, &mut r).await;
     the_first_asker_stays_on_the_record(fresh, &mut r).await;
     an_attestation_survives_the_round_trip(fresh, &mut r).await;
@@ -1242,7 +1255,11 @@ async fn sealed_runs_are_findable_by_how_they_ended(fresh: Factory<'_>, r: &mut 
             let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
                 return;
             };
-            let _ = store.append(lease.epoch, vec![admitted(run)]).await;
+            // The index derives from the chain's conclusion record, not from
+            // the seal — the executor writes the record, then seals.
+            let _ = store
+                .append(lease.epoch, vec![admitted(run), concluded(run, outcome)])
+                .await;
             if store.seal(run, lease.epoch, outcome).await.is_err() {
                 return;
             }
@@ -1297,6 +1314,138 @@ async fn sealed_runs_are_findable_by_how_they_ended(fresh: Factory<'_>, r: &mut 
             "outcome index",
             format!("runs_by_outcome(limit=1) failed: {e}"),
         ),
+    }
+}
+
+/// The outcome index follows the *last* conclusion, not the first.
+///
+/// A failed run is open: its conclusion is in the chain, so it must be
+/// findable by whoever clears failures — and when it is resumed and succeeds,
+/// it must *move*. An index that keeps the first conclusion lists a run as
+/// failed for the rest of its life, and a backlog page that never drains is
+/// worse than no page, because a wrong answer reads exactly like a right one.
+async fn the_outcome_index_follows_the_last_conclusion(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let run = RunId::generate();
+    let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+        return;
+    };
+
+    // A failed conclusion is indexed without any seal: failure leaves the run
+    // open and resumable, and openness must not cost findability.
+    if let Err(e) = store
+        .append(lease.epoch, vec![admitted(run), concluded(run, "failed")])
+        .await
+    {
+        r.record(
+            "outcome index",
+            format!("appending a conclusion failed: {e}"),
+        );
+        return;
+    }
+    match store.runs_by_outcome("failed", 10).await {
+        Ok(found) if found.contains(&run) => {}
+        Ok(_) => r.record(
+            "outcome index",
+            "a failed conclusion was not indexed — an unsealed run's failure is \
+             a finding nobody can find"
+                .to_owned(),
+        ),
+        Err(e) => r.record("outcome index", format!("runs_by_outcome failed: {e}")),
+    }
+
+    // The run resumes and succeeds: it must leave the failed listing and enter
+    // the succeeded one — one run, one row, the latest answer.
+    if let Err(e) = store
+        .append(lease.epoch, vec![concluded(run, "succeeded")])
+        .await
+    {
+        r.record("outcome index", format!("re-concluding failed: {e}"));
+        return;
+    }
+    let _ = store.seal(run, lease.epoch, "succeeded").await;
+
+    match store.runs_by_outcome("failed", 10).await {
+        Ok(found) if found.contains(&run) => r.record(
+            "outcome index",
+            "a run that later succeeded is still listed as failed — the backlog \
+             page never drains, and a wrong answer reads exactly like a right one"
+                .to_owned(),
+        ),
+        Ok(_) => {}
+        Err(e) => r.record("outcome index", format!("runs_by_outcome failed: {e}")),
+    }
+    match store.runs_by_outcome("succeeded", 10).await {
+        Ok(found) if found.contains(&run) => {}
+        Ok(_) => r.record(
+            "outcome index",
+            "the re-conclusion did not move the run into the succeeded listing".to_owned(),
+        ),
+        Err(e) => r.record("outcome index", format!("runs_by_outcome failed: {e}")),
+    }
+}
+
+/// A sealed run's journal is frozen — an append after the seal is refused.
+///
+/// The Merkle leaf is the chain head *at seal time*. The fence answers "who
+/// owns this run", and the caller that sealed it is exactly who still holds
+/// the current epoch — so without this check, that caller can advance the true
+/// head past the leaf every checkpoint attests, and an inclusion proof then
+/// vouches for a prefix of a history that kept growing. The executor's own
+/// refusal to resume a closed run is application logic a future caller can
+/// bypass; the store's refusal is the constraint that cannot be.
+async fn a_sealed_run_refuses_appends(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let run = RunId::generate();
+    let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+        return;
+    };
+    // Positive half: the same batch shape is accepted before the seal, so a
+    // store that refuses everything cannot pass by refusing this too.
+    if let Err(e) = store.append(lease.epoch, vec![admitted(run)]).await {
+        r.record("seal", format!("append before seal failed: {e}"));
+        return;
+    }
+    if let Err(e) = store.seal(run, lease.epoch, "succeeded").await {
+        r.record("seal", format!("seal failed: {e}"));
+        return;
+    }
+    let Ok(frozen) = store.head(run).await else {
+        r.record("seal", "head() failed after seal".to_owned());
+        return;
+    };
+
+    match store
+        .append(lease.epoch, vec![started(run, key(201))])
+        .await
+    {
+        Ok(_) => r.record(
+            "seal",
+            "a sealed run accepted an append under the current epoch — the true \
+             head has moved past the leaf every checkpoint attests"
+                .to_owned(),
+        ),
+        Err(crate::core::StoreError::RunSealed { .. }) => {}
+        Err(e) => r.record(
+            "seal",
+            format!(
+                "an append after seal was refused, but as '{e}' rather than \
+                 RunSealed — a caller cannot tell a frozen run from a store fault"
+            ),
+        ),
+    }
+
+    // And nothing was written: the refusal must leave the chain head exactly
+    // where the seal froze it, or the checkpoint still lies by one record.
+    match store.head(run).await {
+        Ok(after) if after.hash == frozen.hash && after.seq == frozen.seq => {}
+        Ok(_) => r.record(
+            "seal",
+            "the refused append still moved the chain head".to_owned(),
+        ),
+        Err(e) => r.record("seal", format!("head() failed after refusal: {e}")),
     }
 }
 

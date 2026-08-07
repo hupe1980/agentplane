@@ -573,6 +573,37 @@ pub enum StoreError {
         current: u64,
     },
 
+    /// A transaction's `COMMIT` was sent and no acknowledgement arrived.
+    ///
+    /// The one in-doubt window a native transaction keeps: the server either
+    /// committed or did not, but the *client's knowledge* of which was lost —
+    /// a connection dropped between sending `COMMIT` and receiving its answer.
+    /// A commit the server **refused** (a serialization or constraint failure,
+    /// returned as a database error) is not this; that is a clean rollback and
+    /// stays an ordinary [`Backend`](Self::Backend) error. The two must stay
+    /// distinguishable, because they call for opposite handling: a refusal is
+    /// a cheap abort, and an unknown outcome must be treated as a standing
+    /// write until somebody reconciles it — settling `Aborted` over it would
+    /// be the journal claiming *taken back whole* about a write that may
+    /// stand.
+    #[error(
+        "the transaction's outcome is unknown — COMMIT may or may not have \
+         been applied: {detail}"
+    )]
+    CommitUnknown { detail: String },
+
+    /// The run is sealed; its journal is frozen.
+    ///
+    /// A seal freezes the chain head the Merkle log's leaf commits to. An
+    /// append past it — even by the caller that legitimately holds the current
+    /// epoch — advances the true head past the leaf every checkpoint attests,
+    /// so the store refuses it inside the same transaction that would have
+    /// written it. The executor's own refusal to resume a closed run is
+    /// application logic a future caller can bypass; this is the constraint
+    /// that cannot be.
+    #[error("run {run} is sealed as '{outcome}'; a sealed journal accepts no appends")]
+    RunSealed { run: String, outcome: String },
+
     /// Another instance holds a *live* lease. Distinct from being fenced: this
     /// writer is not stale, it is simply not the owner yet. The correct response
     /// is to wait for expiry (or for an operator to force a takeover), which is

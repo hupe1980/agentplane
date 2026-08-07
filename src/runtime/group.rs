@@ -431,7 +431,31 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
         // price is still available.
         let atomic_committed = !atomic.is_empty();
         if atomic_committed && let Err(e) = self.cx.commit_atomic(&name, atomic).await {
-            // A transaction that did not commit changed nothing, so the eager
+            // A lost acknowledgement is not a refusal. The server either
+            // committed or did not, but this client's knowledge of which is
+            // gone — so the members' writes may be standing, permanent, with
+            // no reversal registered and none possible. Aborting here would
+            // settle the journal on *taken back whole* over a write nobody
+            // took back; the only honest settlement is quarantine, and an
+            // operator reconciles against the database itself.
+            if matches!(
+                &e,
+                StepError::Store(crate::core::StoreError::CommitUnknown { .. })
+            ) {
+                let detail = format!(
+                    "the atomic members on [{touched}] may have committed — the \
+                     acknowledgement was lost ({e}); aborting would claim 'taken \
+                     back whole' over a write that may stand"
+                );
+                self.cx
+                    .settle_open_group(GroupOutcome::Quarantined, Some(&detail))
+                    .await?;
+                return Err(StepError::GroupUnsettled {
+                    group: name,
+                    detail,
+                });
+            }
+            // A transaction the server refused changed nothing, so the eager
             // members can still be reversed. That is the property this class
             // exists for, and it is why the failure path here is the *cheap*
             // one rather than a quarantine.

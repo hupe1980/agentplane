@@ -12,9 +12,12 @@
 //! commit together, and then:
 //!
 //! * nothing is externalised and later reversed, so no reversal can fail;
-//! * there is no `InDoubt` state, because a transaction either committed or did
-//!   not — the undecidable window the effect protocol exists to survive is not
-//!   merely handled, it is absent;
+//! * the in-doubt window shrinks to one instant: a transaction either committed
+//!   or did not, but the *client's knowledge* of which can be lost when the
+//!   connection drops between `COMMIT` and its acknowledgement. That one case
+//!   is [`StoreError::CommitUnknown`](crate::core::StoreError::CommitUnknown),
+//!   and the group quarantines over it rather than aborting — a commit the
+//!   server *refused* is the clean rollback and takes the cheap abort;
 //! * an abort is a `ROLLBACK`, which is free and cannot itself fail halfway.
 //!
 //! Compensation that never has to run beats compensation that runs correctly.

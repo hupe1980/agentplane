@@ -1816,6 +1816,59 @@ async fn a_refused_atomic_member_leaves_nothing_behind() {
     );
 }
 
+/// A lost commit acknowledgement quarantines the group — the cheap abort is gone.
+///
+/// The fixture commits everything — statements applied, records appended — and
+/// then reports the outcome unknown, which is exactly what a connection dropped
+/// between `COMMIT` and its acknowledgement tells a database client. This is
+/// the world in which aborting is wrong twice over: the eager members would be
+/// reversed around a write that stands, and the journal would settle on *taken
+/// back whole* about work nobody took back. Doubt reverses nothing.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_lost_commit_acknowledgement_quarantines_the_group() {
+    let (store, _redb) = staged();
+    store.lose_commit_acknowledgement();
+    let world = World::new();
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Books {
+            world: Arc::clone(&world),
+            refuses: false,
+        })
+        .build();
+
+    let out = rt.run("books", json!({})).await.expect("run");
+    assert!(
+        matches!(out.status, RunStatus::Quarantined(_)),
+        "a commit whose acknowledgement was lost took the cheap abort — the \
+         journal now claims 'taken back whole' over a write that stands: {:?}",
+        out.status
+    );
+    assert!(
+        !world.did("released"),
+        "doubt reversed something: the eager member was taken back around a \
+         transaction that may be standing: {:?}",
+        world.entries()
+    );
+    let settled: Vec<String> = store
+        .read(out.run_id, 1)
+        .await
+        .expect("records")
+        .iter()
+        .filter_map(|r| match r.kind() {
+            agentplane::journal::RecordKind::GroupSettled { outcome, .. } => {
+                Some(outcome.as_str().to_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        settled,
+        vec!["quarantined".to_owned()],
+        "the journal did not record the group as quarantined"
+    );
+}
+
 /// A replayed run does not apply the statements a second time.
 ///
 /// Atomicity exempts nothing from the effect protocol: a transaction re-run on

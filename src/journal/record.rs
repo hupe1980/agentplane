@@ -392,8 +392,17 @@ pub enum RecordKind {
         reason: String,
     },
 
-    /// The chain is closed. The digest is the terminal hash, and it is what a
-    /// signature covers.
+    /// The run concluded. The digest is the chain head the conclusion was
+    /// drawn over, and the stores derive the outcome index from this record —
+    /// last conclusion wins.
+    ///
+    /// A conclusion is not always a closure. `succeeded`, `quarantined` and
+    /// `cancelled` are followed by the seal that freezes the journal and
+    /// enters the Merkle log (`RunStatus::seals`); `failed` and `exhausted`
+    /// leave the run open, because both may legitimately be resumed — a
+    /// resumed run reads its completed effects back from history, appends past
+    /// this record, and concludes again. That is why one chain may carry more
+    /// than one of these, and why the *last* one is the run's answer.
     RunSealed {
         outcome: String,
         chain_head: Digest,

@@ -134,6 +134,117 @@ async fn a_resumed_run_continues_instead_of_restarting() {
     );
 }
 
+/// A failed run is open: findable, resumable, and **not** in the Merkle log.
+///
+/// Failure is a conclusion, not a closure. It is indexed — whoever clears
+/// failures can find it — but no leaf is published for it, because a resume is
+/// permitted to grow the history and a checkpoint must never attest a prefix
+/// of a run that keeps moving. When the resume succeeds, the run moves out of
+/// the failed listing, into the succeeded one, and only then seals. An index
+/// that kept the first conclusion would list this run as failed for the rest
+/// of its life — a backlog page that never drains.
+#[tokio::test]
+async fn a_failed_run_is_findable_open_and_moves_on_resume() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let crash_at = Arc::new(AtomicUsize::new(0));
+    let calls = tally();
+    let rt = Runtime::builder(store.clone())
+        .skill(pipeline(&crash_at, &calls))
+        .build();
+
+    let first = rt.run("pipeline", json!({})).await.unwrap();
+    assert!(matches!(first.status, RunStatus::Failed(_)));
+
+    let failed = store.runs_by_outcome("failed", 10).await.unwrap();
+    assert!(
+        failed.contains(&first.run_id),
+        "a failed run must be findable by whoever clears failures"
+    );
+    assert!(
+        store.inclusion_proof(first.run_id).await.unwrap().is_none(),
+        "a failed run entered the Merkle log — the checkpoint now attests a \
+         prefix of a history its own resume is permitted to grow"
+    );
+
+    crash_at.store(NO_CRASH, Ordering::SeqCst);
+    let resumed = rt.replay(first.run_id, Mode::Resume).await.unwrap();
+    assert_eq!(resumed.status, RunStatus::Succeeded);
+
+    assert!(
+        !store
+            .runs_by_outcome("failed", 10)
+            .await
+            .unwrap()
+            .contains(&first.run_id),
+        "a run that later succeeded is still listed as failed — the backlog \
+         page never drains, and a wrong answer reads exactly like a right one"
+    );
+    assert!(
+        store
+            .runs_by_outcome("succeeded", 10)
+            .await
+            .unwrap()
+            .contains(&first.run_id),
+        "the re-conclusion did not move the run into the succeeded listing"
+    );
+    assert!(
+        store.inclusion_proof(first.run_id).await.unwrap().is_some(),
+        "the terminal conclusion did not seal — the run never entered the log"
+    );
+}
+
+/// A recorded ending this build does not recognise refuses to resume.
+///
+/// Fail closed: `swept`, a future outcome, a corrupted string — an unknown
+/// conclusion is not permission to continue. Only `failed` and `exhausted`
+/// resume, because those are the two a resume can honestly answer; everything
+/// else, known or unknown, stays ended.
+#[tokio::test]
+async fn an_unrecognised_recorded_outcome_refuses_resume() {
+    use agentplane::journal::{Append, RecordKind};
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let crash_at = Arc::new(AtomicUsize::new(0));
+    let calls = tally();
+    let rt = Runtime::builder(store.clone())
+        .skill(pipeline(&crash_at, &calls))
+        .build();
+
+    // A real journal whose run is still open (failure does not seal), with an
+    // ending appended that this build has no rule for.
+    let first = rt.run("pipeline", json!({})).await.unwrap();
+    assert!(matches!(first.status, RunStatus::Failed(_)));
+    let run = first.run_id;
+    let lease = store
+        .acquire(run, "test", std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+    store
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunSealed {
+                    outcome: "swept".to_owned(),
+                    chain_head: agentplane::core::Digest::ZERO,
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    store.release_lease(run, lease.epoch).await.unwrap();
+
+    crash_at.store(NO_CRASH, Ordering::SeqCst);
+    let out = rt.replay(run, Mode::Resume).await.unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Quarantined(_)),
+        "an outcome this build does not recognise was treated as resumable — \
+         continuing would graft new behaviour onto a history that says it \
+         ended: {:?}",
+        out.status
+    );
+}
+
 /// Resuming extends the same chain rather than starting a new history.
 #[tokio::test]
 async fn a_resumed_run_extends_the_existing_chain() {

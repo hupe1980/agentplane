@@ -240,15 +240,18 @@ pub struct Identity {
     pub role: String,
     /// How it must behave. Kept separate from [`role`](Self::role) because the
     /// two are reviewed by different people and change on different schedules.
+    ///
+    /// There is deliberately no third field. A `workload_id` ("the SPIFFE ID
+    /// this agent runs as") was removed: nothing read it, so it was an
+    /// identity claim in a reviewed file that the runtime never checked — a
+    /// reviewer would take it as binding while the plane ran the agent as
+    /// whatever identity it actually held. Workload identity is configured on
+    /// the plane and recorded in the journal (`IdentityBound`), where it is
+    /// evidence rather than aspiration. Same cut as `capabilities.requires`
+    /// and `security.pattern`: a control the runtime does not check is what a
+    /// reviewable file exists to eliminate.
     #[serde(default)]
     pub constraints: String,
-    /// The workload identity this agent runs as, e.g. a SPIFFE ID.
-    ///
-    /// Recorded, never minted: this crate does not issue identities, and a
-    /// manifest that claimed one it could not prove would be worse than a
-    /// manifest that stayed quiet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workload_id: Option<String>,
 }
 
 impl Identity {
@@ -557,7 +560,13 @@ pub enum Justification {
 ///
 /// The roles are not decoration: a hand-written skill can choose a quarantined
 /// model for untrusted material while the manifest keeps that model choice in
-/// the reviewed, digested allowlist.
+/// the reviewed, digested allowlist — and in the declarative tier, **memory
+/// formation runs on the quarantined model when one is declared**. Formation
+/// is the dual-model pattern's quarantined job to the letter: it reads content
+/// derived from untrusted input, is offered no tools, and must answer in a
+/// bounded schema, so the model designated for untrusted contact is the one
+/// that writes durable memory from it. The answer itself stays on the
+/// privileged model.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Models {

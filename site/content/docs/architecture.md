@@ -530,9 +530,16 @@ That member does not run when it is registered. It runs inside the transaction
 that buys is not a refinement:
 
 - **nothing is externalised and later reversed**, so no reversal can fail;
-- **there is no in-doubt state.** A transaction committed or it did not. The
-  undecidable window the whole effect protocol exists to survive is not handled
-  here, it is *absent*;
+- **the in-doubt window shrinks to one instant.** A transaction committed or it
+  did not — but the *client's knowledge* of which can still be lost, when the
+  connection drops between sending `COMMIT` and receiving its acknowledgement.
+  The two failures are kept distinguishable and handled oppositely: a commit
+  the server **refused** — a serialization or constraint failure, answered as a
+  database error — is a clean rollback and takes the cheap abort, while a
+  commit whose answer never arrived **quarantines the group**, because the
+  writes may be standing, permanent, with no reversal registered and none
+  possible, and settling `Aborted` over them would be the journal claiming
+  *taken back whole* about work nobody took back;
 - **an abort is a `ROLLBACK`**, which is free and cannot itself fail halfway.
 
 Compensation that never has to run beats compensation that runs correctly. DBOS
@@ -607,11 +614,24 @@ seq | kind              | effect_key | prev_hash | hash
 
 `hash = H(prev_hash ‖ record_bytes)`.
 
-A run that reaches a conclusion appends a `RunSealed` record *before* the chain
-closes over it, so how a run ended is covered by tamper detection and a resumed
-run reads its own outcome from the history it just verified. Sealing used to
-write only to a side table, which meant "is this run finished?" had to be
-inferred from the last step that happened to finish — see below.
+A run that reaches a conclusion appends a `RunSealed` record, so how a run
+ended is covered by tamper detection and a resumed run reads its own outcome
+from the history it just verified. Sealing used to write only to a side table,
+which meant "is this run finished?" had to be inferred from the last step that
+happened to finish — see below.
+
+A conclusion is not always a closure. Only conclusions nothing may resume —
+`succeeded`, `quarantined`, `cancelled` — **seal**: the journal freezes (the
+store refuses further appends as a constraint, not a convention) and the run
+enters the Merkle log below. `failed` and `exhausted` leave the run open,
+because both are conclusions a resume can honestly answer — completed effects
+are read back from history rather than performed again — and a leaf published
+for a run its own resume may grow would be a checkpoint attesting a prefix of
+a moving history. One chain can therefore carry more than one `RunSealed`
+record, and the *last* one is the run's answer; the outcome index the
+operator queries derives from it in the same transaction, so a failed run
+that is resumed and succeeds moves between listings rather than being listed
+as failed forever.
 
 ### What the chain proves, and what the signature adds
 

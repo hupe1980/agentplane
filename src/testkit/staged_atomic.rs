@@ -36,6 +36,7 @@ pub type Statement = (String, Vec<SqlValue>);
 pub struct StagedAtomic {
     inner: Arc<dyn JournalStore>,
     applied: Mutex<Vec<Statement>>,
+    lose_ack: std::sync::atomic::AtomicBool,
 }
 
 impl StagedAtomic {
@@ -44,7 +45,23 @@ impl StagedAtomic {
         Arc::new(Self {
             inner,
             applied: Mutex::new(Vec::new()),
+            lose_ack: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// From now on, every commit lands and its acknowledgement vanishes.
+    ///
+    /// Models the nastier half of the in-doubt window: the transaction
+    /// **committed** — statements applied, records appended — and the client
+    /// was never told. This is the world in which a cheap abort is wrong: the
+    /// writes are standing, permanent, with no reversal registered and none
+    /// possible, and a group that settles `Aborted` over them has the journal
+    /// claiming *taken back whole* about work nobody took back. The runtime's
+    /// only honest answer is quarantine, and this switch is how a test asks
+    /// the question.
+    pub fn lose_commit_acknowledgement(&self) {
+        self.lose_ack
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Statements that were actually applied, in order.
@@ -104,6 +121,14 @@ impl AtomicJournal for StagedAtomic {
             .lock()
             .expect("staged")
             .extend(staging.0.lock().expect("staging").drain(..));
+        if self.lose_ack.load(std::sync::atomic::Ordering::SeqCst) {
+            // Everything above happened — the "transaction" committed — and
+            // the caller is told only that the outcome is unknown, which is
+            // exactly what a dropped connection tells a database client.
+            return Err(StoreError::CommitUnknown {
+                detail: "the fixture dropped the acknowledgement".to_owned(),
+            });
+        }
         Ok(sealed)
     }
 }

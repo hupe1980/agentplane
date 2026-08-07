@@ -71,22 +71,32 @@ const RUN_LEASE: TableDefinition<&str, (&str, u64, u64)> = TableDefinition::new(
 /// `run_id -> (outcome, chain_head, sealed_at)`.
 const RUN_SEAL: TableDefinition<&str, (&str, &[u8], u64)> = TableDefinition::new("run_seal");
 
-/// `(tenant, outcome, log_index) -> run_id`: sealed runs by how they ended.
+/// `(tenant, outcome, ordinal) -> run_key`: concluded runs by how they ended.
 ///
 /// A **derived** index. The outcome's home is the chain — the executor appends
-/// `RunSealed` before sealing, so tamper detection covers how a run ended, which
-/// it would not if a side table were authoritative. This is a convenience for
-/// the one question the chain answers slowly: *what is quarantined right now?*
+/// `RunSealed` with the conclusion, so tamper detection covers how a run ended,
+/// which it would not if a side table were authoritative. This is a convenience
+/// for the one question the chain answers slowly: *what is quarantined right
+/// now?*
 ///
-/// It exists because a quarantine is the most serious thing this runtime can
-/// conclude, and until now it produced a status, a log line and a counter —
-/// none of which an operator can query. A finding nobody can find is a finding
-/// that never reached a human in actionable form, which is the failure mode
-/// production studies of agent runtimes report most often.
+/// Maintained by `append`, in the same transaction as the record it derives
+/// from, and **the last conclusion wins**: a run that failed, was resumed and
+/// then succeeded moves from `failed` to `succeeded`. Deriving it from the seal
+/// instead would freeze the *first* conclusion forever — a resumed run would be
+/// listed as failed for the rest of its life, which is worse than no index,
+/// because a wrong answer reads exactly like a right one.
 ///
-/// Ordered by seal position, so a scan yields oldest-first without a sort.
+/// The ordinal is a per-tenant conclusion counter, so a scan is oldest-first
+/// without a sort and a bounded reverse scan yields the newest conclusions.
 const RUN_BY_OUTCOME: TableDefinition<(&str, &str, u64), &str> =
     TableDefinition::new("run_by_outcome");
+
+/// `(tenant, run_key) -> (outcome, ordinal)`: the reverse of `RUN_BY_OUTCOME`.
+///
+/// What lets a re-conclusion *replace* its index row rather than accumulate a
+/// second one — without it, a failed-then-succeeded run would appear under both
+/// outcomes, and the failed listing would never drain.
+const RUN_OUTCOME: TableDefinition<(&str, &str), (&str, u64)> = TableDefinition::new("run_outcome");
 
 /// `(tenant, updated_at, run_id) -> ()`, every run by last durable append.
 const RUN_ACTIVITY: TableDefinition<(&str, u64, &str), ()> = TableDefinition::new("run_activity");
@@ -116,6 +126,13 @@ const RUN_CANCEL: TableDefinition<&str, (&str, &str, u64)> = TableDefinition::ne
 const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("counters");
 
 const NEXT_LOG_INDEX: &str = "next_log_index";
+
+/// The next conclusion ordinal to hand out, per tenant.
+///
+/// Separate from `NEXT_LOG_INDEX` because conclusions are not seals: a failed
+/// run concludes without entering the Merkle log, and interleaving the two
+/// sequences would leave the log with gaps that mean nothing.
+const NEXT_CONCLUSION: &str = "next_conclusion";
 
 /// An upper bound for a `&str` range end.
 ///
@@ -190,6 +207,7 @@ impl RedbStore {
             w.open_table(RUN_LEASE).map_err(|e| be(&e))?;
             w.open_table(RUN_SEAL).map_err(|e| be(&e))?;
             w.open_table(RUN_BY_OUTCOME).map_err(|e| be(&e))?;
+            w.open_table(RUN_OUTCOME).map_err(|e| be(&e))?;
             w.open_table(SEAL_LOG).map_err(|e| be(&e))?;
             w.open_table(RUN_CANCEL).map_err(|e| be(&e))?;
             w.open_table(COUNTERS).map_err(|e| be(&e))?;
@@ -364,10 +382,7 @@ impl RedbStore {
                     .map(|v| v.value().to_vec());
                 if let Some(bytes) = existing {
                     let row = Row::decode(&bytes)?;
-                    let tampered = Row {
-                        body,
-                        ..row.owned()
-                    };
+                    let tampered = Row { body, ..row };
                     t.insert((key.as_str(), seq), tampered.encode().as_slice())
                         .map_err(|e| be(&e))?;
                 }
@@ -430,10 +445,6 @@ struct Row {
 }
 
 impl Row {
-    fn owned(self) -> Self {
-        self
-    }
-
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.body.len() + 96);
         out.extend_from_slice(&self.prev_hash);
@@ -631,6 +642,25 @@ impl JournalStore for RedbStore {
                     }
                 }
 
+                // Sealed is frozen. The Merkle leaf is the chain head at seal
+                // time, so an append past it — even by the epoch's rightful
+                // holder — advances the true head past what every checkpoint
+                // attests. Checked inside the write transaction like the fence,
+                // because the executor's refusal to resume a closed run is
+                // logic a future caller can bypass, and this is the constraint
+                // that cannot be. The sealing appends themselves precede the
+                // seal row, so they never meet this check.
+                {
+                    let seals = w.open_table(RUN_SEAL).map_err(|e| be(&e))?;
+                    if let Some(seal) = seals.get(key.as_str()).map_err(|e| be(&e))? {
+                        let (outcome, _, _) = seal.value();
+                        return Err(StoreError::RunSealed {
+                            run: key.clone(),
+                            outcome: outcome.to_owned(),
+                        });
+                    }
+                }
+
                 let mut head = head_of(&journal, &key)?;
                 let mut sealed = Vec::with_capacity(batch.len());
 
@@ -639,6 +669,12 @@ impl JournalStore for RedbStore {
                     let body = append.into_body(head.seq + 1, epoch);
                     let is_start =
                         matches!(body.kind, crate::journal::RecordKind::EffectStarted { .. });
+                    let conclusion = match &body.kind {
+                        crate::journal::RecordKind::RunSealed { outcome, .. } => {
+                            Some(outcome.clone())
+                        }
+                        _ => None,
+                    };
                     let record = Record::seal_signed(body, head.hash, signer.as_deref())?;
                     let seq = record.seq();
 
@@ -679,6 +715,44 @@ impl JournalStore for RedbStore {
                                 ),
                                 (),
                             )
+                            .map_err(|e| be(&e))?;
+                    }
+
+                    // The outcome index derives from the chain, here, in the
+                    // same transaction as the record it derives from — and the
+                    // last conclusion wins. A failed run that is resumed and
+                    // succeeds moves between listings; an index fed by the seal
+                    // would keep saying "failed" forever, and a wrong answer
+                    // reads exactly like a right one.
+                    if let Some(outcome) = conclusion {
+                        let mut by_outcome = w.open_table(RUN_BY_OUTCOME).map_err(|e| be(&e))?;
+                        let mut outcomes = w.open_table(RUN_OUTCOME).map_err(|e| be(&e))?;
+                        let mut counters = w.open_table(COUNTERS).map_err(|e| be(&e))?;
+                        if let Some(prior) = outcomes
+                            .get((tenant.as_str(), key.as_str()))
+                            .map_err(|e| be(&e))?
+                            .map(|v| {
+                                let (o, ord) = v.value();
+                                (o.to_owned(), ord)
+                            })
+                        {
+                            by_outcome
+                                .remove((tenant.as_str(), prior.0.as_str(), prior.1))
+                                .map_err(|e| be(&e))?;
+                        }
+                        let counter = format!("{NEXT_CONCLUSION}/{tenant}");
+                        let next = counters
+                            .get(counter.as_str())
+                            .map_err(|e| be(&e))?
+                            .map_or(0, |v| v.value());
+                        by_outcome
+                            .insert((tenant.as_str(), outcome.as_str(), next), key.as_str())
+                            .map_err(|e| be(&e))?;
+                        outcomes
+                            .insert((tenant.as_str(), key.as_str()), (outcome.as_str(), next))
+                            .map_err(|e| be(&e))?;
+                        counters
+                            .insert(counter.as_str(), next + 1)
                             .map_err(|e| be(&e))?;
                     }
 
@@ -922,14 +996,10 @@ impl JournalStore for RedbStore {
                         .map_err(|e| be(&e))?
                         .insert((tenant.as_str(), next), key.as_str())
                         .map_err(|e| be(&e))?;
-                    // Derived from the outcome in the same transaction that
-                    // seals it, so the index cannot describe a run the log does
-                    // not hold. Keyed by seal position, so a scan is
-                    // oldest-first without a sort.
-                    w.open_table(RUN_BY_OUTCOME)
-                        .map_err(|e| be(&e))?
-                        .insert((tenant.as_str(), outcome.as_str(), next), key.as_str())
-                        .map_err(|e| be(&e))?;
+                    // The outcome index is *not* written here: it derives from
+                    // the `RunSealed` record inside `append`, where the last
+                    // conclusion wins. The seal freezes the journal and enters
+                    // the log — it is not the outcome's home.
                     counters
                         .insert(counter.as_str(), next + 1)
                         .map_err(|e| be(&e))?;

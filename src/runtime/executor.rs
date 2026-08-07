@@ -150,6 +150,29 @@ impl RunStatus {
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled { .. })
     }
+
+    /// Whether this conclusion freezes the journal and enters the Merkle log.
+    ///
+    /// Only conclusions that nothing may resume seal. A failed run may be
+    /// resumed — its completed effects are read back from history rather than
+    /// performed again, which is the point of having a journal — and an
+    /// exhausted run may continue once somebody raises the ceiling. Sealing
+    /// either would commit the Merkle log to a leaf its own resume is then
+    /// permitted to grow past: the checkpoint would attest a prefix of a
+    /// history that kept moving, and the store's refusal of appends after a
+    /// seal would turn every legitimate resume into an error.
+    ///
+    /// This is the **one** implementation of that rule. `resume_is_closed`
+    /// refuses exactly the outcomes this method seals — a test pins the
+    /// agreement — because two copies of one rule agree everywhere except the
+    /// boundary nobody probed.
+    #[must_use]
+    pub fn seals(&self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Quarantined(_) | Self::Cancelled { .. }
+        )
+    }
 }
 
 /// A run that exists but has not run.
@@ -2539,12 +2562,16 @@ impl Runtime {
         // A suspended run is not sealed: its chain is going to be extended the
         // moment whatever it waits for arrives.
         let chain_head = if writing && !status.is_suspended() {
-            // The conclusion goes *in* the chain before the chain is closed
-            // over it. Two things follow, and both were missing while the
-            // outcome lived only in a side table: tamper detection covers how
-            // the run ended, and a resumed run can read that fact from the same
-            // history it verifies rather than inferring it from the last step
-            // that happened to finish.
+            // The conclusion goes *in* the chain — before the chain is closed
+            // over it, where the conclusion is one that closes it. Two things
+            // follow, and both were missing while the outcome lived only in a
+            // side table: tamper detection covers how the run ended, and a
+            // resumed run can read that fact from the same history it verifies
+            // rather than inferring it from the last step that happened to
+            // finish. The stores also derive the outcome index from this
+            // record, last conclusion wins — which is what keeps a
+            // failed-then-resumed-then-succeeded run from being listed as
+            // failed forever.
             let before = self
                 .store
                 .head(run)
@@ -2560,15 +2587,25 @@ impl Runtime {
             if let Some(c) = case {
                 sealed = sealed.case(c);
             }
-            self.store
+            let concluded = self
+                .store
                 .append(epoch, vec![sealed])
                 .await
                 .map_err(RuntimeError::from_store)?;
 
-            self.store
-                .seal(run, epoch, status.as_str())
-                .await
-                .map_err(RuntimeError::from_store)?
+            // Only a conclusion nothing may resume freezes the journal and
+            // enters the Merkle log. A failed or exhausted run stays open: its
+            // conclusion is in the chain — indexed, findable, tamper-covered —
+            // but a leaf published for it would be a checkpoint attesting a
+            // history its own resume is permitted to grow past.
+            if status.seals() {
+                self.store
+                    .seal(run, epoch, status.as_str())
+                    .await
+                    .map_err(RuntimeError::from_store)?
+            } else {
+                concluded.last().map_or(before.hash, |r| r.hash)
+            }
         } else {
             self.store
                 .head(run)
@@ -3314,7 +3351,20 @@ fn resume_is_closed(records: &[Record]) -> Option<RunStatus> {
             actor: recorded_canceller(records).unwrap_or_else(|| "unknown".into()),
             reason: "recorded as cancelled; an operator stopped this run".into(),
         }),
-        _ => None,
+        // The two conclusions that deliberately do not close a run: a failed
+        // run resumes with its completed effects read back from history, and an
+        // exhausted one continues once somebody raises the ceiling. These are
+        // also the two that do not seal (`RunStatus::seals`) — the sets must
+        // stay equal, and a test pins the agreement.
+        "failed" | "exhausted" => None,
+        // Fail closed. An outcome this build does not recognise — a sweep's
+        // `swept`, a future variant, a corrupted string — is not permission to
+        // resume; it is a run whose recorded ending this code cannot interpret,
+        // and continuing it would graft new behaviour onto a history that says
+        // it ended.
+        other => Some(RunStatus::Quarantined(format!(
+            "recorded as '{other}', which this build does not recognise as resumable"
+        ))),
     }
 }
 

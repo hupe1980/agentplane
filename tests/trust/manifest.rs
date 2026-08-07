@@ -937,7 +937,6 @@ fn a_rendered_prompt_has_a_pinned_layout() {
     let full = Identity {
         role: "Automated data invariant auditor".into(),
         constraints: "Isolate structural failures.".into(),
-        workload_id: None,
     };
     assert_eq!(
         full.system_prompt(),
@@ -951,7 +950,6 @@ fn a_rendered_prompt_has_a_pinned_layout() {
     let bare = Identity {
         role: "  Automated data invariant auditor  ".into(),
         constraints: "   ".into(),
-        workload_id: None,
     };
     assert_eq!(bare.system_prompt(), "Automated data invariant auditor");
 }
@@ -2685,6 +2683,92 @@ spec:
         "formation discarded the source provenance"
     );
     assert_eq!(recalled[0].access_retention_seconds, Some(600));
+}
+
+/// Formation runs on the quarantined model when one is declared.
+///
+/// Formation is the dual-model pattern's quarantined job to the letter: it
+/// reads content derived from untrusted input, is offered no tools, and must
+/// answer in a bounded schema. Declaring `models.quarantined` is the reviewer
+/// designating a model for untrusted contact — and until this held, that
+/// declaration changed nothing in the declarative tier: the extraction ran on
+/// the privileged model, and the YAML was a control that governed nothing.
+/// The answer itself must stay on the privileged model: the quarantined role
+/// is for reading hostile text, not for speaking as the agent.
+#[cfg(all(feature = "redb", feature = "testkit"))]
+#[tokio::test]
+async fn formation_runs_on_the_quarantined_model_when_declared() {
+    use agentplane::memory::MemoryStore;
+    use agentplane::runtime::{Agent, Runtime};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: remembering, version: "1.0.0" }
+spec:
+  capabilities: { provides: [remember.answer] }
+  models:
+    privileged: { provider: fake, model: answerer-1 }
+    quarantined: { provider: fake, model: extractor-1 }
+  execution: { kind: completion }
+  memory_formation:
+    subject: team/support
+    purpose: learned-facts
+    instruction: Extract stable facts only.
+    max_items: 2
+    max_sensitivity: internal
+  budgets: {}
+"#,
+    )
+    .expect("formation manifest");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_say("answer");
+    provider.will_answer(agentplane::model::Completion {
+        text: r#"{"memories":[{"key":"language","content":"German"}]}"#.to_owned(),
+        structured: Some(json!({
+            "memories": [{"key": "language", "content": "German"}]
+        })),
+        tool_calls: Vec::new(),
+        usage: agentplane::model::Usage::default(),
+        stop_reason: Some("end_turn".to_owned()),
+        truncated: false,
+        continuation: None,
+    });
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>)
+        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .build();
+    let outcome = rt
+        .run("remember.answer", json!({"question": "language?"}))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome.status, agentplane::runtime::RunStatus::Succeeded),
+        "formation run failed: {:?}",
+        outcome.status
+    );
+
+    let asked = provider.asked();
+    assert_eq!(asked.len(), 2, "one answer call, one extraction call");
+    assert_eq!(
+        asked[0].model.to_string(),
+        "fake/answerer-1",
+        "the answer must stay on the privileged model"
+    );
+    assert_eq!(
+        asked[1].model.to_string(),
+        "fake/extractor-1",
+        "the extraction ran on the privileged model — the declared quarantined \
+         role governed nothing"
+    );
 }
 
 /// The published Agent Card is derived from the declaration, not written beside it.

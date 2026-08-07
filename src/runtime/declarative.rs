@@ -434,6 +434,19 @@ impl Declarative {
         let Some(declaration) = declaration else {
             return Ok(());
         };
+        // The extraction runs on the **quarantined** model when one is
+        // declared. Formation is the dual-model pattern's quarantined job to
+        // the letter — it reads content derived from untrusted input, is
+        // offered no tools, and must answer in a bounded schema — so the model
+        // the reviewer designated for untrusted contact is the one that should
+        // be writing durable memory from it, not the one holding the agent's
+        // authority. Falling back to the answer's model when no quarantined
+        // role is declared keeps the single-model manifest exactly as it was.
+        let model = cx
+            .manifest()
+            .and_then(|m| m.spec.models.as_ref())
+            .and_then(|models| models.quarantined.as_ref())
+            .map_or_else(|| model.clone(), |r| ModelId::new(&r.provider, &r.model));
         let expires_at = if let Some(seconds) = declaration.retention_seconds {
             let now = cx.now().await?;
             Some(now + time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX)))
@@ -452,7 +465,7 @@ impl Declarative {
             },
             answer,
             Arc::clone(&self.provider),
-            model.clone(),
+            model,
         )
         .await?;
         Ok(())
