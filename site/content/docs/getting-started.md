@@ -51,10 +51,15 @@ Read those five lines slowly, because they are the product:
 
 ## 2. Add the crate 📦
 
-```toml
-[dependencies]
-agentplane = "0.6"
+```sh
+cargo add agentplane
 ```
+
+Deliberately not a version number to copy. The version a reader should depend on
+is the latest **published** one, which is a fact this repository does not hold —
+`Cargo.toml` carries the version being *developed*, and the two differ for as
+long as a release takes. `cargo add` asks the registry, so the answer cannot go
+stale between a bump and a publish.
 
 ## An agent with no Rust
 
@@ -120,21 +125,20 @@ An embedded [redb](https://github.com/cberner/redb) store is the default backend
 — pure Rust, two crates deep, with a stable on-disk format and no C toolchain in
 your build. Everything else is opt-in:
 
-```toml
-[dependencies]
-agentplane   = "0.6"
-serde_json   = "1"
+```sh
+cargo add agentplane
+cargo add serde_json
 # A `Skill` is an async trait, and the runtime is async. Both are yours to
 # choose, so neither is re-exported — but the snippets below will not compile
 # without them.
-async-trait  = "0.1"
-tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
+cargo add async-trait
+cargo add tokio --features macros,rt-multi-thread
 ```
 
 Everything beyond a single-node runtime is opt-in:
 
-```toml
-agentplane = { version = "0.6", features = ["postgres", "http", "mcp", "providers", "bedrock", "media", "cedar", "signing"] }
+```sh
+cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,signing
 ```
 
 | feature | gives you |

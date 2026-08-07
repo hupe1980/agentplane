@@ -604,8 +604,8 @@ The other tier. When the agent does real work — a solver, a database, somethin
 model cannot be — the behaviour is a `Skill`, and the manifest governs its
 **boundary**: which model, which tools, what it may spend.
 
-```toml
-agentplane = { version = "0.6", features = ["manifest"] }
+```sh
+cargo add agentplane --features manifest
 ```
 
 Everything in the zero-Rust manifest above applies; drop `spec.execution` and add what a coded agent needs:
@@ -824,8 +824,8 @@ let call = ModelCall::new(provider, model, json!({
 For real deployments, `OpenDalBlobs` puts them on anything
 [OpenDAL](https://opendal.apache.org) reaches — filesystem, S3, GCS, Azure:
 
-```toml
-agentplane = { version = "0.6", features = ["opendal"] }
+```sh
+cargo add agentplane --features opendal
 ```
 
 ```rust

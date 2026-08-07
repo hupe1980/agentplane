@@ -35,24 +35,26 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="${TMPDIR:-/tmp}/agentplane-doc-examples"
 rm -rf "$WORK"; mkdir -p "$WORK/src"
 
-# Every version this crate names of itself agrees with `Cargo.toml`.
+# The MSRV agrees everywhere it is written down.
 #
-# This harness supplies its own manifest — it has to, since it builds against a
-# path dependency — so it proves the *code* compiles while saying nothing about
-# the dependency line the page tells a reader to write. That gap is not
-# theoretical: the two blocks on the getting-started page said `0.2` while the
-# crate was at `0.3`, so the very first thing a newcomer copied resolved to a
-# release without the API the same page went on to demonstrate.
+# It is a fact maintained in five places — `Cargo.toml`, the `msrv` recipe, the
+# CI toolchain pin, and two lines of README — and the pipeline pins an *exact*
+# toolchain, so a `rust-version` bump that misses `ci.yml` fails the msrv job
+# rather than quietly disagreeing. Compared exactly, because a patch release is
+# precisely what an MSRV can turn on.
 #
-# The MSRV is checked the same way and for a stronger reason: it is a fact
-# maintained in five places — `Cargo.toml`, the `msrv` recipe, the CI toolchain
-# pin, and two lines of README — and the pipeline pins an *exact* toolchain, so
-# a `rust-version` bump that misses `ci.yml` fails the msrv job rather than
-# quietly disagreeing.
+# There is deliberately **no crate-version check here any more**, and its
+# removal is the point rather than a gap. It compared the site's
+# `agentplane = "X.Y"` lines against `Cargo.toml`, which conflates two different
+# facts: `Cargo.toml` holds the version being *developed*, while a reader should
+# depend on the latest version *published*. Those legitimately differ for as
+# long as a release takes — so the check forced the docs to state something
+# false the moment the version was bumped, and a second guard was then added to
+# catch the falsehood the first one required. Two guards policing a duplicated
+# fact.
 #
-# Crate versions compare major.minor only: a patch bump is not something prose
-# should have to chase, and a caret requirement does not care. The MSRV compares
-# exactly, because a patch is precisely what an MSRV can turn on.
+# The fact is gone instead: the pages say `cargo add agentplane`, which asks the
+# registry and cannot be stale. Nothing to compare, nothing to drift.
 python3 - "$ROOT" <<'PY'
 import pathlib, re, sys
 
@@ -62,20 +64,22 @@ root = pathlib.Path(sys.argv[1])
 # way for the same reason.
 manifest = (root / "Cargo.toml").read_text()
 package = manifest[manifest.index("[package]") : manifest.index("\n[", manifest.index("[package]") + 1)]
-crate = re.search(r'^version\s*=\s*"([^"]+)"', package, re.M).group(1)
 msrv = re.search(r'^rust-version\s*=\s*"([^"]+)"', package, re.M).group(1)
-want = ".".join(crate.split(".")[:2])
-
-# `agentplane = "0.3"` and `agentplane = { version = "0.3", ... }`, both of
-# which appear, and both of which a reader copies verbatim.
-pattern = re.compile(r'agentplane\s*=\s*(?:\{[^}]*?version\s*=\s*)?"([0-9]+\.[0-9]+)[^"]*"')
 
 bad = []
+
+# No page may reintroduce a hand-written version. `cargo add` is the whole
+# remedy, and one `agentplane = "0.7"` slipping back in is how the drift starts
+# again — silently, because a version that happens to be current today reads as
+# correct.
+pattern = re.compile(r'agentplane\s*=\s*(?:\{[^}]*?version\s*=\s*)?"[0-9]+\.[0-9]+')
 for page in sorted((root / "site/content").rglob("*.md")) + [root / "README.md"]:
     for n, line in enumerate(page.read_text().splitlines(), 1):
-        for found in pattern.findall(line):
-            if found != want:
-                bad.append(f"{page.relative_to(root)}:{n}: says {found}, crate is {want}")
+        if pattern.search(line):
+            bad.append(
+                f"{page.relative_to(root)}:{n}: writes a crate version by hand; "
+                f"use `cargo add agentplane` so it cannot go stale"
+            )
 
 # Wherever a Rust version is pinned or advertised, it is this one. Each pattern
 # is anchored to its own file so a stray version number elsewhere — a dependency
@@ -93,10 +97,10 @@ for rel, pat, what in [
                 bad.append(f"{rel}:{n}: {what} says {found}, rust-version is {msrv}")
 
 if bad:
-    print("REFUSED: a documented version has drifted from Cargo.toml")
+    print("REFUSED:")
     print("\n".join("  " + b for b in bad))
     raise SystemExit(1)
-print(f"ok: every documented agentplane version says {want}, every MSRV says {msrv}")
+print(f"ok: no page pins a crate version by hand, every MSRV says {msrv}")
 PY
 
 cat > "$WORK/Cargo.toml" <<EOF

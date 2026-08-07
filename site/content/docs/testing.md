@@ -17,10 +17,9 @@ no clock, and still exercise the real path — because there is only one path.
 Everything here is behind the `testkit` feature, which is off by default and
 should never be in a production build.
 
-```toml
-[dev-dependencies]
-agentplane = { version = "0.6", features = ["redb", "testkit", "manifest"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```sh
+cargo add --dev agentplane --features redb,testkit,manifest
+cargo add --dev tokio --features macros,rt-multi-thread
 ```
 
 ## The golden run
