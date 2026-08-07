@@ -591,6 +591,27 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "",
     ),
     # ── Cedar adapter ───────────────────────────────────────────────────────
+    "ANullDeniesEverything": (
+        "src/policy/cedar.rs",
+        "a_null_inside_caller_arguments_does_not_deny_everything",
+        "the Cedar adapter hands the context straight to Cedar, which refuses "
+        "any document containing a JSON null — not the field, the whole record "
+        "— so every request carrying an unset optional is reported as malformed "
+        "and denied, while an operator reading 'denied' hunts for the rule",
+        "            without_nulls(r.context.clone()),",
+        "            r.context.clone(),",
+    ),
+    "AnAbsentPublisherIsNull": (
+        "src/runtime/executor.rs",
+        "a_declared_agent_sends_no_null_either",
+        "an unpublished manifest's absent publisher is sent as a JSON null "
+        "rather than omitted, which is the shape the adapter's own "
+        "documentation calls 'absent' and the shape Cedar cannot parse",
+        '            if let Some(publisher) = id.publisher.as_ref() {\n'
+        '                agent["publisher"] = serde_json::to_value(publisher)?;\n'
+        "            }",
+        '            agent["publisher"] = serde_json::to_value(&id.publisher)?;',
+    ),
     "CedarErrorsReadAsRefusals": (
         "src/policy/cedar.rs",
         "a_policy_that_fails_to_evaluate_is_reported_as_broken_not_as_a_refusal",
@@ -1395,7 +1416,48 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                if t.get(key.as_str()).map_err(|e| be(&e))?.is_some() {\n                    false",
         "                if false {\n                    false",
     ),
+    # ── How a failure reads ─────────────────────────────────────────────────
+    #
+    # A diagnostic is a control here for the same reason a refusal is: I13 asks
+    # whether a finding reaches somebody who can act on it, and a message nobody
+    # is shown fails that test as completely as one nobody wrote.
+    "ADerivedDebugHidesEveryMessage": (
+        "src/core/error.rs",
+        "a_failure_debugs_as_the_message_it_carries",
+        "the user-facing error types report through a structural Debug again, "
+        "so `fn main() -> Result<_, E>` — which prints Debug, not Display — "
+        "shows `NoProvider(\"demo.greet\")` and every message in the taxonomy "
+        "becomes unreachable on the first path a newcomer takes",
+        "                ::core::fmt::Display::fmt(self, f)",
+        '                f.write_str("RuntimeError")',
+    ),
+    "AnUnknownCapabilityListsNothing": (
+        "src/core/error.rs",
+        "an_unknown_capability_is_told_what_exists",
+        "the unknown-capability refusal stops naming what the plane does "
+        "provide, sending a reader back to their own source to reconstruct a "
+        "list the error was already holding",
+        "    if available.is_empty() {",
+        "    if true {",
+    ),
+    "ACappedListLooksComplete": (
+        "src/core/error.rs",
+        "a_capped_capability_list_admits_the_cap",
+        "a capped capability list stops saying it was capped, so a reader who "
+        "scans it and does not find theirs cannot tell 'it is not here' from "
+        "'the message stopped' — shape 12, in a diagnostic",
+        '        format!(", and {rest} more")',
+        '        String::new()',
+    ),
+
     # ── Wire drivers ────────────────────────────────────────────────────────
+    "AnyProviderAnswerSatisfiesItsSchema": (
+        "src/model/mod.rs",
+        "a_provider_answer_that_defies_its_schema_is_a_metered_failure",
+        "the effect boundary takes any provider's structured answer on trust",
+        "    let Some(schema) = schema else {\n        return Ok(());\n    };\n    if !completion.tool_calls.is_empty() {",
+        "    let Some(schema) = schema else {\n        return Ok(());\n    };\n    if true || !completion.tool_calls.is_empty() {",
+    ),
     "PeerInternalErrorIsARefusal": (
         "src/peers/a2a.rs",
         "an_internal_error_is_in_doubt_not_a_refusal",
@@ -1862,6 +1924,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         });""",
     ),
     # ── One plane, several agents ───────────────────────────────────────────
+    "AToolLoopWithNothingToReachBuilds": (
+        "src/runtime/executor.rs",
+        "a_tool_calling_agent_with_no_catalogue_refuses_the_build",
+        "a declarative tool loop with no tool catalogue assembles cleanly and "
+        "then fails identically on every single run — a wiring mistake known at "
+        "build, reported once per request instead of once",
+        "                if tools.is_none() {",
+        "                if false {",
+    ),
     "TwoAgentsShareACapability": (
         "src/runtime/executor.rs",
         "two_agents_may_not_claim_the_same_capability",
@@ -3465,13 +3536,18 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "match instead of the one every read-back path uses, so the same task "
         "reports one state to the client holding the response and another to the "
         "client that polled for it",
-        "fn state_of(status: &crate::runtime::RunStatus) -> TaskState {\n    sealed_state(status.as_str())\n}",
-        "fn state_of(status: &crate::runtime::RunStatus) -> TaskState {\n"
-        "    use crate::runtime::RunStatus;\n"
-        "    match status {\n"
-        "        RunStatus::Succeeded => TaskState::Working,\n"
-        "        _ => sealed_state(status.as_str()),\n"
-        "    }\n}",
+        "        RunStatus::Succeeded => TaskState::Completed,",
+        "        RunStatus::Succeeded => TaskState::Working,",
+    ),
+    "TheSealedAnswerHasItsOwnStateMapping": (
+        "src/api/a2a.rs",
+        "a_live_status_and_its_sealed_outcome_agree",
+        "the read-back paths derive their A2A state from a string match that has "
+        "drifted from the enum match the immediate response uses, so the same "
+        "task reports one state to the client that polled and another to the "
+        "client holding the response",
+        '        "cancelled" => TaskState::Canceled,',
+        '        "cancelled" => TaskState::Failed,',
     ),
     "TwoSpellingsOfTerminal": (
         "src/api/a2a.rs",

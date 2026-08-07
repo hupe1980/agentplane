@@ -10,8 +10,92 @@ use serde::{Deserialize, Serialize};
 use crate::core::Spend;
 use crate::core::{EffectKey, Sensitivity, Seq};
 
+/// Render an error's `Debug` as its `Display`, for the types user code holds.
+///
+/// # Why this is not gratuitous
+///
+/// `fn main() -> Result<(), E>` reports a failure with **`Debug`**, not
+/// `Display` — that is what `std`'s `Termination` impl does, and it is the shape
+/// every getting-started program in every Rust project uses. So a derived
+/// `Debug` throws away the entire error taxonomy at exactly the moment a
+/// newcomer meets it. Before this, the first failure anyone hit read:
+///
+/// ```text
+/// Error: NoProvider("demo.greet")
+/// ```
+///
+/// while the message written for that variant — *no skill provides capability
+/// 'demo.greet'* — was never shown to anybody. Every carefully-worded refusal in
+/// this crate was invisible on the one path that matters most, and the
+/// build-time diagnostics being excellent made the contrast worse rather than
+/// better: the same person got a paragraph of guidance from `build()` and a
+/// tuple from `run()`.
+///
+/// The same applies to `unwrap()`/`expect()` on a `Result`, which also print
+/// `Debug`, and to `assert!(matches!(..), "{err:?}")` in a user's own tests.
+///
+/// # Why `Display` alone is complete here
+///
+/// Every variant of every type below either interpolates its inner error into
+/// its own message (`"policy denied: {0}"`) or is `#[error(transparent)]`. There
+/// is therefore no information in the source chain that `Display` does not
+/// already print, and walking it as well would print the inner error twice for
+/// every transparent variant.
+///
+/// # What is deliberately unaffected
+///
+/// Programmatic inspection: these are `#[non_exhaustive]` enums and `matches!`
+/// on a variant is unchanged, which is how code should branch on a failure. This
+/// governs only how a failure *reads*. Applied to the types a user's own code
+/// holds — not to every error in the crate — because an inner error reached
+/// through `{0}` or `transparent` is already rendered by its holder.
+macro_rules! debug_is_display {
+    ($($t:ty),+ $(,)?) => {$(
+        impl ::core::fmt::Debug for $t {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                ::core::fmt::Display::fmt(self, f)
+            }
+        }
+    )+};
+}
+pub(crate) use debug_is_display;
+
+/// How many capabilities a refusal lists before it summarises the rest.
+///
+/// A bounded list shaped exactly like a complete one is the silent-truncation
+/// shape, so the message says how many it did not print rather than quietly
+/// stopping — the same rule `SweepReport::saturated` follows for a capped sweep.
+const LISTED_CAPABILITIES: usize = 10;
+
+fn no_provider_message(target: &str, available: &[String]) -> String {
+    if available.is_empty() {
+        return format!(
+            "no skill provides capability '{target}', and this plane has none at all — \
+             register one with `RuntimeBuilder::skill(..)`, or an agent's with \
+             `.agent(Agent::new(&manifest))`"
+        );
+    }
+    let shown = available
+        .iter()
+        .take(LISTED_CAPABILITIES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = available.len().saturating_sub(LISTED_CAPABILITIES);
+    let and_more = if rest == 0 {
+        String::new()
+    } else {
+        format!(", and {rest} more")
+    };
+    format!(
+        "no skill provides capability '{target}' — this plane provides: {shown}{and_more}. \
+         `run` takes a capability, not a skill name; a skill declares its own with \
+         `SkillDescriptor::new(..).provides(..)`"
+    )
+}
+
 /// Failures reaching the operator.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum RuntimeError {
     #[error("policy denied: {0}")]
@@ -30,8 +114,20 @@ pub enum RuntimeError {
         configured: Option<crate::core::Digest>,
     },
 
-    #[error("no skill provides capability '{0}'")]
-    NoProvider(String),
+    /// Nothing on this plane answers to the name `run` was given.
+    ///
+    /// Carries what the plane *does* provide, because the question a reader has
+    /// next is always "then what should I have asked for?" — and the plane is
+    /// the only party that can answer it. A refusal that names the missing thing
+    /// and not the available ones sends somebody back to their own source to
+    /// reconstruct a list this error was already holding.
+    #[error("{}", no_provider_message(target, available))]
+    NoProvider {
+        /// The capability (or skill name) that was asked for.
+        target: String,
+        /// Every capability this plane provides, sorted. Empty means no skills.
+        available: Vec<String>,
+    },
 
     /// The tenant is at a ceiling, so nothing was admitted.
     ///
@@ -254,7 +350,7 @@ impl EffectError {
 }
 
 /// Failure inside a skill.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum SkillError {
     #[error("input did not match the declared schema: {0}")]
@@ -282,7 +378,7 @@ pub enum SkillError {
 }
 
 /// Failure surfaced to a skill through [`StepCtx`](crate::runtime::StepCtx).
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum StepError {
     #[error(transparent)]
@@ -716,7 +812,7 @@ impl RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Disposition, RuntimeError};
+    use super::{Disposition, LISTED_CAPABILITIES, RuntimeError, SkillError, StepError};
 
     /// Two embedder-facing predicates, each of which was public, documented,
     /// and called by nothing — so a wrong `matches!` arm would have been
@@ -756,4 +852,78 @@ mod tests {
                 .is_terminal_for_owner()
         );
     }
+
+    // ── How a failure reads ─────────────────────────────────────────────────
+
+    /// `Debug` must render the message, because that is what `main` prints.
+    ///
+    /// `fn main() -> Result<(), E>` reports through `Debug`, not `Display`, so a
+    /// derived `Debug` on these types makes every message in this file
+    /// unreachable on the path a newcomer takes first. This is exactly the
+    /// deletable-in-silence shape: re-adding `#[derive(Debug)]` compiles, passes
+    /// every other test, and quietly returns the crate to printing
+    /// `NoProvider("demo.greet")` at the one moment guidance matters most.
+    #[test]
+    fn a_failure_debugs_as_the_message_it_carries() {
+        let e = RuntimeError::NoProvider {
+            target: "demo.greet".to_owned(),
+            available: vec!["demo.other".to_owned()],
+        };
+        assert_eq!(format!("{e:?}"), e.to_string());
+        assert!(
+            !format!("{e:?}").starts_with("NoProvider"),
+            "the derived Debug is back: {e:?}"
+        );
+
+        // Every type user code holds, not only the one that prompted this.
+        let skill = SkillError::Other("boom".to_owned());
+        assert_eq!(format!("{skill:?}"), skill.to_string());
+        let step = StepError::Encoding(serde_json::from_str::<i32>("x").unwrap_err());
+        assert_eq!(format!("{step:?}"), step.to_string());
+    }
+
+    /// A refusal names what the plane *does* provide.
+    #[test]
+    fn an_unknown_capability_is_told_what_exists() {
+        let e = RuntimeError::NoProvider {
+            target: "demo.greeet".to_owned(),
+            available: vec!["demo.greet".to_owned(), "demo.sum".to_owned()],
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("demo.greeet"), "{msg}");
+        assert!(msg.contains("demo.greet, demo.sum"), "{msg}");
+    }
+
+    /// An empty plane says so, rather than listing nothing and looking complete.
+    #[test]
+    fn an_empty_plane_says_it_has_no_skills() {
+        let e = RuntimeError::NoProvider {
+            target: "demo.greet".to_owned(),
+            available: Vec::new(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("has none at all"), "{msg}");
+        assert!(msg.contains("RuntimeBuilder::skill"), "{msg}");
+    }
+
+    /// A capped list says how many it did not print.
+    ///
+    /// A bounded result shaped exactly like a complete one is shape 12, and it
+    /// applies to a diagnostic as much as to a worklist: a reader who scans ten
+    /// capabilities and does not find theirs must be able to tell "it is not
+    /// here" from "the message stopped".
+    #[test]
+    fn a_capped_capability_list_admits_the_cap() {
+        let available: Vec<String> = (0..LISTED_CAPABILITIES + 3)
+            .map(|i| format!("cap.{i}"))
+            .collect();
+        let msg = RuntimeError::NoProvider {
+            target: "nope".to_owned(),
+            available,
+        }
+        .to_string();
+        assert!(msg.contains("and 3 more"), "{msg}");
+    }
 }
+
+debug_is_display!(RuntimeError, SkillError, StepError);

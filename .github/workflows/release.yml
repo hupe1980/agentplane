@@ -43,3 +43,177 @@ jobs:
       - run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
+
+  # The container image, so a YAML agent needs no Rust toolchain.
+  #
+  # Split from `release` rather than appended to it: crates.io is immutable and
+  # must go first, but an image build failing must not leave a tag half
+  # published. These jobs depend on the publish having succeeded and can be
+  # re-run on their own.
+  #
+  # Built **one architecture per native runner**, then joined into a manifest
+  # list. The obvious shape — one buildx step with
+  # `platforms: linux/amd64,linux/arm64` — emulates arm64 under QEMU, and a Rust
+  # release build of this graph (the AWS SDK alone is 78 crates) is slow enough
+  # emulated to dominate the release and risk the job timeout. `ubuntu-24.04-arm`
+  # is a real arm64 machine.
+  image:
+    needs: release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both dimensions here, deliberately. An `include` entry is merged into
+        # a combination only when it shares a key with it; one carrying just
+        # `platform`/`runner` shares none with a `variant`-only matrix, so it is
+        # applied to every combination and the last one wins — two amd64 builds
+        # and no arm64, with a green tick.
+        variant: [slim, full]
+        platform: [linux/amd64, linux/arm64]
+        include:
+          # `slim` is every model provider — Anthropic, OpenAI, Gemini, Bedrock,
+          # any OpenAI-compatible server, and the deterministic fake. An image
+          # that cannot reach somebody's model is not smaller, it is useless to
+          # them; the split is about *surface*, not size — the two are within a
+          # megabyte, and the point of slim is that it ships no HTTP server and
+          # no database client at all.
+          - variant: slim
+            features: cli
+          - variant: full
+            features: cli,mcp,mcp-stdio,a2a-server,http,cedar,keyring,media,opendal,signing,witness-http,postgres,push
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The image is proven before it is pushed, not after. `docker-smoke`
+      # builds it, runs a manifest read-only with no network, checks the digest
+      # it computes equals the host's, and refuses if a secret or the internal
+      # design document reached a layer. Run on the native runner, so each
+      # architecture is checked on the architecture it will be served to.
+      - name: The image does what it exists for
+        run: FEATURES='${{ matrix.features }}' IMAGE=agentplane:verify tools/docker-smoke.sh
+
+      # Pushed **by digest**, with no tag. Tags are applied once, by the merge
+      # job, so a half-finished matrix never leaves `:latest` pointing at one
+      # architecture.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            FEATURES=${{ matrix.features }}
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=${{ matrix.variant }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-${{ matrix.platform }}
+
+      - name: Hand the digest to the merge job
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ matrix.variant }}-${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.variant }}-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  # One manifest list per variant, then sign and attest it.
+  #
+  # Signing happens here rather than per-architecture because what a user pulls
+  # is the list: signing only the per-arch digests would leave the thing anybody
+  # actually verifies unsigned.
+  publish-image:
+    needs: image
+    permissions:
+      contents: read
+      packages: write
+      # `id-token` is what makes the signature keyless: cosign exchanges the
+      # Actions OIDC token for a short-lived Fulcio certificate, so there is no
+      # long-lived signing key in a repository secret to leak or rotate.
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        variant: [slim, full]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-${{ matrix.variant }}-*
+          path: /tmp/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # The version comes from the tag, which the `release` job has already
+          # checked against Cargo.toml. One source, checked once — a hand-kept
+          # image version would be the same duplicated-fact trap the site's
+          # `agentplane = "X.Y"` lines were.
+          tags: |
+            type=semver,pattern={{version}},suffix=-${{ matrix.variant }}
+            type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.variant }}
+            type=raw,value=${{ matrix.variant }}
+            type=raw,value=latest,enable=${{ matrix.variant == 'slim' }}
+
+      - name: Join the architectures under one tag set
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          refs=""
+          for f in ${{ matrix.variant }}-*; do
+            refs="$refs ghcr.io/${{ github.repository }}@sha256:${f##*-}"
+          done
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") $refs
+
+      - id: digest
+        run: |
+          d=$(docker buildx imagetools inspect --format '{{json .Manifest.Digest}}' \
+                "ghcr.io/${{ github.repository }}:${{ matrix.variant }}" | tr -d '"')
+          echo "value=$d" >> "$GITHUB_OUTPUT"
+
+      # This crate's whole argument is that history should be verifiable by
+      # someone who did not produce it. An unsigned image would be the most
+      # widely distributed artifact it ships and the least checkable thing about
+      # it — witnessed checkpoints and signed manifests inside, and "trust the
+      # registry" at the boundary.
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the manifest list, keylessly
+        run: cosign sign --yes "ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.value }}"
+
+      # SLSA build provenance, attached to the digest rather than to a tag,
+      # because a tag can be moved and a digest cannot.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.digest.outputs.value }}
+          push-to-registry: true

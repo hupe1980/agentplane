@@ -794,3 +794,148 @@ fn every_documented_cedar_policy_decides_against_the_real_context() {
          scan stopped matching them and this guard is now inert"
     );
 }
+
+// ── The context the runtime actually sends at admission ─────────────────────
+
+/// A JSON `null` reaches policy as an **absent attribute**, not as an outage.
+///
+/// Cedar has no `null`, and `Context::from_json_value` refuses a document
+/// containing one anywhere — not the field, the whole record. The consequence
+/// was severe and quiet: the request never reached a rule, so the answer was a
+/// clean `Deny`, and an operator reading "denied" hunted for the rule that said
+/// no while nothing had been evaluated at all.
+///
+/// The adapter now strips nulls, mapping them to Cedar's own idiom for optional
+/// data. Both halves are asserted: the request is **evaluable**, and a policy
+/// asking `has` gets the honest answer rather than a match on something
+/// unmatchable.
+#[test]
+fn a_null_reaches_policy_as_an_absent_attribute() {
+    // Permits only when the publisher is present, which is the rule an operator
+    // writes when they mean "only agents somebody vouched for".
+    let engine = CedarEngine::new(
+        "permit(principal, action, resource) when { context.agent has publisher };",
+    )
+    .expect("policy");
+
+    let unsigned =
+        json!({ "tenant": "default", "agent": { "digest": "abc", "publisher": Value::Null } });
+    let decision = ask(&engine, "p", ACTION_ADMIT, "r", &unsigned);
+    let PolicyDecision::Deny { reason } = decision else {
+        panic!("an absent publisher satisfied a rule that requires one: {decision:?}");
+    };
+    assert!(
+        !reason.contains("could not be expressed"),
+        "a null still makes the request unevaluable: {reason}"
+    );
+
+    // And the same rule permits once a publisher is there, so the test above is
+    // a rule answering honestly rather than an adapter refusing everything.
+    let signed = json!({ "tenant": "default", "agent": { "digest": "abc", "publisher": "key-1" } });
+    assert!(
+        matches!(
+            ask(&engine, "p", ACTION_ADMIT, "r", &signed),
+            PolicyDecision::Permit
+        ),
+        "a present publisher did not satisfy the rule"
+    );
+}
+
+/// The same, for a null the runtime cannot fix at the source.
+///
+/// `context.args` is the effect's own arguments — **arbitrary caller JSON**, and
+/// a model call's request profile carries `null` for every optional knob nobody
+/// set. This is why the fix lives in the adapter and not only at the producers:
+/// no amount of care upstream lets the runtime promise that data it did not
+/// author contains no nulls.
+#[test]
+fn a_null_inside_caller_arguments_does_not_deny_everything() {
+    let engine = CedarEngine::new(
+        "permit(principal, action, resource) when { context.args.amount <= 100 };",
+    )
+    .expect("policy");
+    let context = json!({
+        "tenant": "default",
+        "mutates": true,
+        "args": { "amount": 50, "memo": Value::Null, "tags": ["a", Value::Null, "b"] },
+    });
+    assert!(
+        matches!(
+            ask(&engine, "p", ACTION_PERFORM, "tool.call", &context),
+            PolicyDecision::Permit
+        ),
+        "a null in caller arguments denied a request the rule permits"
+    );
+}
+
+/// **An unsigned manifest must still reach a rule.**
+///
+/// The runtime describes the declaration to policy so a rule can bind to the
+/// **digest** rather than to a reusable name. One field it sends is `publisher`,
+/// the key that vouched for the manifest — and most manifests have none, because
+/// publisher attestation is opt-in.
+///
+/// `Option::None` serialized straight into the context put a JSON `null` there,
+/// which by the test above makes the entire request unevaluable. So **every run
+/// on a Cedar plane with an unsigned manifest was denied**, and the caller was
+/// told only that it was declined, since naming the reason to an external caller
+/// is precisely what this crate refuses to do. The adapter's own module
+/// documentation already said the field is *"or absent"*; only the code
+/// disagreed.
+///
+/// This test drives the runtime's real `authorize_admission` rather than a
+/// hand-built copy of its context, because a fixture written from the same
+/// misreading as the code passes forever.
+///
+/// Found by running `agentplane serve` against a permit-everything policy and
+/// reading the operator-side log — the only place the reason appears, and a
+/// place nothing was listening until the CLI installed a subscriber.
+#[tokio::test]
+async fn an_unsigned_manifest_still_reaches_a_rule_at_admission() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: summariser, version: "1.0.0" }
+spec:
+  execution: { kind: completion }
+  identity: { role: "Summarise", constraints: "One sentence." }
+  capabilities: { provides: [support.summarise] }
+  models: { privileged: { provider: fake, model: sum-1 } }
+  budgets: { max_tokens: 1000 }
+"#,
+    )
+    .expect("manifest");
+    // Deliberately never published: the publisher is plane state, set by
+    // `publish_signed`, and an agent registered straight from a file has none.
+    // That absence is the whole condition under test.
+
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_say("a summary");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(
+            Arc::new(CedarEngine::new("permit(principal, action, resource);").expect("policy"))
+                as Arc<dyn PolicyEngine>,
+        )
+        .provider(
+            "fake",
+            provider as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .build();
+
+    let outcome = rt
+        .run("support.summarise", json!({"ticket": "printer on fire"}))
+        .await;
+    assert!(
+        matches!(
+            outcome.as_ref().map(|o| &o.status),
+            Ok(RunStatus::Succeeded)
+        ),
+        "a permit-everything policy refused an unsigned manifest: {outcome:?}"
+    );
+}

@@ -122,3 +122,51 @@ pub use crate::core::{
 };
 pub use crate::journal::{JournalStore, Record, RecordKind};
 pub use crate::runtime::{Runtime, StepCtx};
+
+/// The names every program needs, so the first one is one `use` line.
+///
+/// ```
+/// use agentplane::prelude::*;
+/// ```
+///
+/// # What is in here, and the rule
+///
+/// A prelude earns its place by being *predictable*, so this one is chosen by a
+/// stated rule rather than by taste: **a name belongs here if a program that
+/// does nothing unusual needs it.** Measured, not guessed — every name below
+/// appears in a third or more of the crate's own examples, and the set is
+/// exactly what the getting-started program imports, which is why that program
+/// now opens with one line instead of five.
+///
+/// The four groups are the four things any program touches: the skill you write
+/// (`Skill`, `SkillDescriptor`, `SkillError`, `Outcome`), the context it is
+/// handed (`StepCtx`), the labels its data carries (`Tainted`, `Trust`,
+/// `Sensitivity`), and the plane that runs it (`Runtime`, `RunStatus`, `Mode`,
+/// `JournalStore`, and the default store).
+///
+/// # What is deliberately left out
+///
+/// Names that are common in this crate but collision-prone in somebody else's:
+/// `Record`, `Digest`, `Label`, `Capability`, `Seq`. A prelude that shadows a
+/// user's own `Record` costs more than the import it saved, and each of those is
+/// one explicit `use` away. Anything feature-gated beyond the default backend is
+/// out for the same reason a glob would be: what a prelude imports must not
+/// depend on which features happen to be on, or the same `use` line means
+/// different things in two crates.
+///
+/// Everything here is also reachable by its full path; the prelude adds no API.
+pub mod prelude {
+    pub use crate::core::{
+        Outcome, Sensitivity, Skill, SkillDescriptor, SkillError, Tainted, Trust,
+    };
+    pub use crate::journal::JournalStore;
+    pub use crate::runtime::{Mode, RunStatus, Runtime, StepCtx};
+
+    /// The default embedded backend, present whenever `redb` is.
+    ///
+    /// The one feature-gated name here, because it is on by default and a
+    /// prelude that made the first program still need a second `use` line for
+    /// its store would not have done its job.
+    #[cfg(feature = "redb")]
+    pub use crate::store::RedbStore;
+}

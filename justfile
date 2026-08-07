@@ -195,9 +195,36 @@ examples:
     cargo run --example standing_authority --features redb,testkit
     cargo run --example streaming_run --features redb,testkit
 
+FULL_FEATURES := "cli,mcp,mcp-stdio,a2a-server,http,cedar,keyring,media,opendal,signing,witness-http,postgres,push"
+
 # the binary is never exercised by `cargo test` — it only compiles
 cli-smoke:
     tools/cli-smoke.sh
+
+# the container image: builds it, then proves it does what it exists for
+#
+# Not covered by `cli-smoke`, and the two fail differently. A binary that works
+# can still be packaged into an image that cannot resolve a mounted path, cannot
+# run read-only, or ships a secret — `.dockerignore` is an allowlist, and an
+# allowlist is only as good as the check that it held. This is also the recipe
+# that caught `open_in_memory` needing a writable temp directory, which every
+# in-repo test missed because they all run on a writable filesystem.
+#
+# Needs Docker; not in `ci` for that reason. The release workflow runs it.
+docker-smoke features="cli":
+    FEATURES={{features}} tools/docker-smoke.sh
+
+# build both published variants locally, exactly as the registry gets them
+#
+# `slim` is every model provider — Anthropic, OpenAI, Gemini, Bedrock, any
+# OpenAI-compatible server, and the deterministic fake. An image that cannot
+# reach somebody's model is not smaller, it is useless to them. `full` adds the
+# surfaces: MCP, the A2A peer server, the operator HTTP API, Cedar, key rings,
+# governed media, blobs, Postgres.
+docker:
+    docker build --build-arg FEATURES=cli -t agentplane:slim .
+    docker build --build-arg FEATURES={{FULL_FEATURES}} -t agentplane:full .
+    @docker images agentplane
 
 # build the rustdoc a reader would land on
 #

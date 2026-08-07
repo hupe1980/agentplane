@@ -108,6 +108,131 @@ agentplane digest   summariser.yaml     # what a registry pins
 agentplane run      summariser.yaml --input '{"ticket": "printer on fire"}'
 ```
 
+Or with no Rust toolchain at all, which is rather the point of a tier whose
+premise is *a file and a key are the whole agent*:
+
+```sh
+docker run --rm --read-only --network none -v "$PWD:/work:ro" \
+  ghcr.io/hupe1980/agentplane \
+  run /work/summariser.yaml --input '{"ticket": "printer on fire"}'
+```
+
+`--read-only --network none` are not decoration — they are the check that the
+claim below is true. The default journal is in memory and the fake driver needs
+no network, so the first run needs neither a disk nor the internet; the image's
+own smoke test runs exactly this way, which is how it caught that "in memory"
+had been an unlinked file under `TMPDIR` all along.
+
+The image is distroless, nonroot, has no shell, and is published multi-arch,
+cosign-signed and with SLSA provenance and an SBOM bound to the digest.
+`:slim` — the default and `:latest` — carries every model provider; `:full`
+adds MCP, the A2A peer server, the operator HTTP surface, Cedar, key rings,
+governed media and Postgres. The split is about **surface**, not size: they are
+within a megabyte of each other, and the reason to run `:slim` is that it does
+not contain an HTTP server or a database client at all.
+
+### Tools, still without Rust
+
+`execution.kind: tool-calling` runs the loop from a file — but a loop needs
+tools, and until now reaching a tool server took a Rust program. The manifest
+grants `tool://tickets/read`; **which transport reaches `tickets`** is named on
+the command line, exactly as a model's base URL is:
+
+```sh
+agentplane run examples/tool-calling.yaml \
+  --input '{"ticket": "T-1"}' \
+  --mcp "tickets=python3 examples/mcp-server.py"
+```
+
+That split is deliberate. An agent's declaration — and therefore its digest —
+must not change when it moves between a laptop and a cluster, so grants are
+reviewed and wiring is deployed. A grant naming a server nobody wired is
+**refused at build**, in the same breath as a grant nothing implements:
+
+```text
+'tickets/read' is granted but nothing implements it and no transport is wired
+for server 'tickets' — the model will be offered a tool that fails when chosen
+```
+
+`--mcp` **runs a command**, and that is worth being explicit about: it is not an
+escalation over what the caller already had — the operator typed it on the same
+line as the manifest path — and nothing in a run's data path can reach it.
+A manifest, a model and an A2A peer all cannot choose a server; only argv can.
+The command is split on whitespace and no shell is involved: no globbing, no
+pipelines, no `$(...)`. Needs `--features cli,mcp-stdio`, or the `:full` image.
+
+**One constraint worth knowing before you reach for the image.** `:full` has
+`mcp-stdio` compiled in, and a distroless image has **no interpreter and no
+shell** — so the `npx`- and Python-based servers most of the MCP ecosystem
+publishes cannot run inside it. Only a statically linked server binary mounted
+into the container can. That is the price of a base image with no package
+manager, and it is a real trade rather than an oversight: run the CLI on a host
+that has the runtime your server needs, or ship your MCP server as a static
+binary. The container smoke test asserts the image has no interpreter, so if a
+base image ever gains one, that assumption fails loudly instead of drifting.
+
+### Hosting it, still without Rust
+
+A manifest can also be **served** — the A2A 1.0 peer surface that passes the
+protocol project's own conformance kit, started from the same file:
+
+```sh
+agentplane serve examples/served.yaml \
+  --url http://localhost:8080 \
+  --policy examples/serve-policy.cedar \
+  --tokens examples/serve-tokens.yaml \
+  --operator-addr 127.0.0.1:9090 \
+  --store ./served.redb
+
+curl http://localhost:8080/.well-known/agent-card.json
+curl "http://localhost:9090/runs?outcome=quarantined" -H 'authorization: Bearer …'
+```
+
+That second URL is the point of `--operator-addr`. Every conclusion this runtime
+reaches is meant to be *queryable by whoever must clear it* rather than merely
+emitted — and until a shipped binary could serve it, that guarantee needed a Rust
+program to reach. It is **off unless asked for and on its own listener**: the
+public address is the one a peer holds, and putting the worklist and task
+decisions behind it is one policy mistake away from a peer reading every run.
+
+The separation is enforced by **policy**, not by the port. In
+`serve-policy.cedar` the `peer` role reaches `a2a:*` and the `operator` role
+reaches `api:*`, so a peer token that reaches the operator socket is still
+refused — the separate port is defence in depth rather than the control itself.
+
+A served plane also **sweeps**: deadlines warn and breach, tasks expire, dead
+letters are retired, and due timers fire, every `--sweep-every` seconds (30 by
+default, `0` to drive it from your own scheduler). Without it an agent that calls
+`cx.sleep`, waits on an event, or opens a human task would be accepted and then
+never make progress — a suspended run is a row, and something has to come back
+for it.
+
+Four things are refused rather than defaulted, and each refusal is the design:
+
+- **`--policy`** — a Cedar policy set. A permissive engine and no engine are the
+  same behaviour, and only one of them looks governed.
+- **`--tokens`** — bearer tokens naming callers. A server that authenticates
+  nobody has no actor to record a decision against; an unknown credential is
+  refused rather than becoming an anonymous caller.
+- **`--store`** — a served task's id is a promise it can be fetched again, and
+  an in-memory journal breaks that promise at the next restart. `run` may
+  journal to memory because it exits with its answer.
+- **A room** — `serve` hosts one agent, because A2A's card path is well-known
+  and singular, so a bundle would advertise one document and quietly not serve
+  the rest.
+
+`served.yaml` differs from `summariser.yaml` by one line, and it is the
+interesting one: `security.max_sensitivity_egress: internal`. A message from a
+peer arrives labelled `Internal` — it came from outside — while `--input` on
+your own command line arrives `Public`. Without that line the peer's text cannot
+reach the model, and the run fails with *sensitivity Internal exceeds sink
+'model.complete' ceiling Public*. An agent that may talk to strangers says so in
+the reviewed file rather than acquiring the permission by being put behind a
+socket.
+
+Needs `--features cli,a2a-server,cedar`; a build without them says so and names
+the flag. The `:full` image is built with them.
+
 This exact file uses the deterministic fake driver, so the first run needs
 **no API key and no network**. To go live, change the provider and model in the
 file (that intentionally changes its digest), install the `providers` feature,
@@ -160,6 +285,7 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `postgres` | the same contract, for several plane instances sharing a store |
 | `http` | the operator surface: worklist, decisions, run status |
 | `mcp` | MCP host: governed prompts, resources, tools, and asynchronous Tasks |
+| `mcp-stdio` | reach an MCP server by **running** it — the stdio child process most published servers are. What lets `agentplane run`/`serve` execute a declarative `tool-calling` agent with no Rust |
 | `a2a` | A2A peer transport — calling other agents |
 | `a2a-server` | being called: the public Agent Card and the A2A 1.0 JSON-RPC methods |
 | `push` | Persistent A2A registration cursors, retrying worker API, and SSRF-guarded webhook delivery; `a2a-server` includes it |
@@ -181,9 +307,15 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 A skill is one unit of work. It gets a `StepCtx`, which is how it reaches
 anything non-deterministic.
 
+`agentplane::prelude::*` is the one import: the skill you write, the context it
+is handed, the labels its data carries, and the plane that runs it. Everything
+in it is also reachable by its full path — the prelude adds no API, it just
+stops the first program opening with five `use` lines. Names that are common
+here but likely to collide in your crate (`Record`, `Digest`, `Label`,
+`Capability`) are deliberately left out.
+
 ```rust
-use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted};
-use agentplane::runtime::StepCtx;
+use agentplane::prelude::*;
 use serde_json::{Value, json};
 
 #[derive(Debug)]
@@ -227,9 +359,7 @@ is exactly what makes replay possible.
 ## 4. Run it ▶️
 
 ```rust
-use agentplane::journal::JournalStore;
-use agentplane::runtime::{Mode, Runtime};
-use agentplane::store::RedbStore;
+// Everything below is already in scope from the prelude imported above.
 use std::sync::Arc;
 
 let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
@@ -250,6 +380,21 @@ assert_eq!(outcome.output, replayed.output);
 Note `run("demo.greet", …)` takes the **capability**, not the skill name. Plans
 bind capabilities to skills, so what a step needs is decoupled from who provides
 it.
+
+Get it wrong and the plane tells you what it *does* have, because it is the only
+party that knows:
+
+```text
+Error: no skill provides capability 'demo.greeet' — this plane provides:
+demo.greet. `run` takes a capability, not a skill name; a skill declares its own
+with `SkillDescriptor::new(..).provides(..)`
+```
+
+That is `Debug`, not `Display`, and the distinction is why it reads that way:
+`fn main() -> Result<_, E>` reports through `Debug`, so on the errors you
+actually hold this crate makes the two the same. Otherwise the message above
+would have been written, and never shown to anyone — you would have got
+`NoProvider("demo.greeet")`.
 
 This exact skill and run is on disk as a runnable file — `cargo run --example
 hello_skill` — so the shape above is something you execute, not only read.

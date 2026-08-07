@@ -1288,3 +1288,180 @@ async fn policy_sees_a_case_read_as_a_read_and_a_case_write_as_a_mutation() {
          mutations would fire on a calculation"
     );
 }
+
+// ── What the runtime puts in a context ──────────────────────────────────────
+
+/// An engine that refuses to see a JSON `null` in any request it is handed.
+///
+/// The `PolicyEngine` seam is public, and what an engine can accept is its own
+/// business — Cedar, notably, has no `null` at all and rejects a whole context
+/// containing one. So *the runtime* must not send a value it means as absent
+/// spelled as a null, whatever engine is wired in.
+///
+/// The Cedar adapter also strips nulls, which is the right belt for data the
+/// runtime does not author (an effect's own arguments are arbitrary caller
+/// JSON). This is the braces: it holds the runtime's *own* contexts to the same
+/// rule, so a fix that lives only in one adapter is not mistaken for a fix in
+/// the runtime — an embedder's engine gets a clean context too.
+#[derive(Debug, Default)]
+struct RefusesNulls {
+    seen: AtomicUsize,
+    offending: Mutex<Vec<String>>,
+}
+
+impl RefusesNulls {
+    fn walk(path: &str, value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Null => out.push(path.to_owned()),
+            Value::Object(map) => {
+                for (k, v) in map {
+                    Self::walk(&format!("{path}/{k}"), v, out);
+                }
+            }
+            Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    Self::walk(&format!("{path}/{i}"), v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl PolicyEngine for RefusesNulls {
+    fn authorize(&self, request: &PolicyRequest<'_>) -> PolicyDecision {
+        self.seen.fetch_add(1, Ordering::SeqCst);
+        let mut found = Vec::new();
+        // `args` is deliberately exempt, and the exemption is the finding rather
+        // than a hole in it. Those are the **effect's own arguments** — caller
+        // data, and part of the effect key, so the runtime must pass them
+        // through byte for byte rather than tidying them. A model call alone
+        // carries four legitimate nulls there (`schema`, `reasoning_effort`,
+        // `continuation`, `provider_profile`: every optional knob nobody set),
+        // and a tool's arguments may contain any JSON at all.
+        //
+        // That is precisely why the Cedar adapter strips nulls instead of the
+        // producers doing it: no amount of care upstream lets the runtime
+        // promise that data it did not author contains none. What the runtime
+        // *can* promise, and what this checks, is that the metadata it writes
+        // itself — the agent, the label, the tenant, the delegation chain —
+        // spells absent as absent.
+        for (key, value) in request.context.as_object().into_iter().flatten() {
+            if key == "args" {
+                continue;
+            }
+            Self::walk(&format!("{}:/{key}", request.action), value, &mut found);
+        }
+        self.offending.lock().unwrap().extend(found);
+        PolicyDecision::Permit
+    }
+
+    fn bundle(&self) -> PolicyBundleIdentity {
+        PolicyBundleIdentity::new(Digest::of(b"test.refuses-nulls"), "test/refuses-nulls-v1")
+    }
+}
+
+/// **The runtime sends no JSON `null` to a policy engine.**
+///
+/// A value the runtime means as *absent* must be spelled absent. It was not:
+/// `context.agent.publisher` is an `Option`, `None` serialized to `null`, and
+/// most manifests are unpublished — so on a Cedar plane every admission came
+/// back malformed and the whole plane denied everything, while the caller was
+/// told only that it was declined.
+///
+/// Asserted against an engine that inspects rather than one that parses, so the
+/// guarantee is about *what the runtime sends* and does not quietly become a
+/// test of one adapter's tolerance. The count assertion is there because an
+/// engine that was never called sees no nulls and would pass perfectly.
+#[tokio::test]
+async fn the_runtime_never_sends_a_null_to_policy() {
+    let engine = Arc::new(RefusesNulls::default());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(Arc::clone(&engine) as Arc<dyn PolicyEngine>)
+        .skill(Pays {
+            world: Arc::new(Mutex::new(Vec::new())),
+        })
+        .build();
+    // A run with a real effect in it, so the perform context is exercised and
+    // not only admission — the two are built in different places and only one
+    // of them had the defect.
+    let outcome = rt.run("pay", json!({})).await.unwrap();
+    assert!(
+        matches!(outcome.status, RunStatus::Succeeded),
+        "{outcome:?}"
+    );
+
+    assert!(
+        engine.seen.load(Ordering::SeqCst) >= 2,
+        "the engine was barely consulted, so seeing no nulls proves nothing"
+    );
+    let offending = engine.offending.lock().unwrap().clone();
+    assert!(
+        offending.is_empty(),
+        "the runtime sent JSON nulls to policy at {offending:?} — a value the \
+         runtime means as absent must be spelled absent, since an engine may \
+         have no null at all"
+    );
+}
+
+/// The same rule, for the context only a **declared** agent produces.
+///
+/// The test above runs a coded skill, so `governed_by` is `None` and the `agent`
+/// block — the one that carried the null — is never built at all. A guarantee
+/// checked only on the path that cannot reach the defect is the fixture-shaped
+/// failure this repository keeps a catalogue of, so the declarative path gets
+/// its own case.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_declared_agent_sends_no_null_either() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: summariser, version: "1.0.0" }
+spec:
+  execution: { kind: completion }
+  identity: { role: "Summarise", constraints: "One sentence." }
+  capabilities: { provides: [support.summarise] }
+  models: { privileged: { provider: fake, model: sum-1 } }
+  budgets: { max_tokens: 1000 }
+"#,
+    )
+    .expect("manifest");
+    // Never published, so `AgentIdentity::publisher` is `None` — the exact
+    // condition that produced `"publisher": null`.
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_say("a summary");
+    let engine = Arc::new(RefusesNulls::default());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(Arc::clone(&engine) as Arc<dyn PolicyEngine>)
+        .provider(
+            "fake",
+            provider as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .build();
+    let outcome = rt
+        .run("support.summarise", json!({"ticket": "printer on fire"}))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome.status, RunStatus::Succeeded),
+        "{outcome:?}"
+    );
+
+    assert!(
+        engine.seen.load(Ordering::SeqCst) >= 2,
+        "the engine was barely consulted, so seeing no nulls proves nothing"
+    );
+    let offending = engine.offending.lock().unwrap().clone();
+    assert!(
+        offending.is_empty(),
+        "a declared agent sent JSON nulls to policy at {offending:?}"
+    );
+}

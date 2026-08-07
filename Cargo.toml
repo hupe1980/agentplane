@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.7.0"
+version      = "0.8.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -42,6 +42,10 @@ include = [
     # The manifest example `include_str!`s this; without it the packaged
     # crate does not compile, and `cargo package --list` alone would not say so.
     "/examples/*.yaml",
+    # The served example's policy set. Named beside its manifest in the guides,
+    # so an unpacked tarball that had the agent and not the rules would document
+    # a command a reader cannot run.
+    "/examples/*.cedar",
     "/src/bin/*.rs",
     "/README.md",
     "/LICENSE-MIT",
@@ -71,7 +75,7 @@ redb = ["dep:redb"]
 # builder calls; the manifest is what makes those declarations reviewable.
 manifest = ["dep:serde_yaml_ng", "dep:base64", "dep:jsonschema"]
 # Everything the `agentplane` binary needs to run a declarative agent.
-cli = ["manifest", "redb", "providers", "bedrock", "testkit"]
+cli = ["manifest", "redb", "providers", "bedrock", "testkit", "dep:tracing-subscriber"]
 # Content-addressed blob storage on any backend OpenDAL reaches — filesystem,
 # S3, GCS, Azure. The other half of the journal's record-size limit: bytes too
 # big for the chain go here, and the chain commits to their digest.
@@ -107,10 +111,22 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 # is only the wire. Separate because the catalogue is what decides what a tool is
 # allowed to do, and that decision must not depend on which transport is linked.
 mcp = ["dep:rmcp"]
+
+# Reach an MCP server by **running it** — the stdio child process almost every
+# published server is. Separate from `mcp` because the host surface is
+# transport-agnostic on purpose (`McpClient::new` takes a connection somebody
+# else made: stdio, a child process, streamable HTTP), and this one costs 8
+# crates plus `tokio/process` that an embedder connecting over their own
+# transport should not pay for. It is what lets `agentplane run` and
+# `agentplane serve` execute a declarative `tool-calling` agent with no Rust.
+mcp-stdio = ["mcp", "rmcp/transport-child-process"]
 # HTTP surface for operators: the worklist, run status, event delivery. Off by
 # default — a library embedded in someone else's process should not open a port
 # unless asked.
-http = ["dep:axum"]
+# `tokio/net` and `rt-multi-thread` are what `agentplane serve` binds a socket
+# with. The base tokio features are `sync`/`rt`/`macros`/`time` — enough for a
+# library driving effects, and short of a server by exactly a listener.
+http = ["dep:axum", "tokio/net", "tokio/rt-multi-thread"]
 # Submitting checkpoints to a real witness — the half that makes the split-view
 # guarantee have a counterparty.
 witness-http = ["dep:reqwest"]
@@ -178,6 +194,14 @@ tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 async-stream = { version = "0.3", optional = true }
 tracing     = "0.1"
+# The binary's only reason for this: this crate keeps an operator-side channel on
+# purpose — an A2A decline tells the caller nothing and names the determining
+# policy in a `tracing` event instead, so a prober cannot map the authorization
+# vocabulary. With no subscriber installed that event reaches nobody, and
+# `agentplane serve` would refuse requests for reasons its operator can never
+# read. That is I13 — detection without delivery — reached by shipping a
+# server with no way to see what it decided.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "env-filter"], optional = true }
 redb        = { version = "3", optional = true }
 # The maintained fork of serde_yaml, which is deprecated. Ten crates deep.
 serde_yaml_ng = { version = "0.10", optional = true }

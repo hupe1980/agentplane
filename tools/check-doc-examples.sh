@@ -89,6 +89,12 @@ for rel, pat, what in [
     (".github/workflows/ci.yml", r'rust-toolchain@([0-9][0-9.]*)', "the CI toolchain pin"),
     ("README.md", r'rustc-([0-9][0-9.]*)%2B', "the MSRV badge"),
     ("README.md", r'Rust \*\*([0-9][0-9.]*)\+\*\*', "the prose MSRV"),
+    # The image builds with the declared minimum rather than "whatever stable
+    # is today", so the published binary is built by the toolchain this
+    # repository actually tests against. That makes the Dockerfile a fifth copy
+    # of the number — fine, because this line is what keeps it honest. The
+    # failure this project had was a copy nothing checked.
+    ("Dockerfile", r'ARG RUST_VERSION=([0-9][0-9.]*)', "the Dockerfile toolchain"),
 ]:
     path = root / rel
     for n, line in enumerate(path.read_text().splitlines(), 1):

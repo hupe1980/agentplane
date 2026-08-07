@@ -168,6 +168,63 @@ pub(crate) fn refuse_provider_side_media(
     })
 }
 
+/// Hold a completion to the schema its request declared.
+///
+/// The built-in drivers already validate: [`wire::structured`] parses and checks
+/// every answer they return. But the [`ModelProvider`] trait is public, and the
+/// runtime treats `structured` as *guaranteed to match the schema* — it indexes
+/// into the value it asked for rather than re-checking a contract it believes is
+/// already held. A provider this crate cannot inspect makes that belief a
+/// third party's promise.
+///
+/// So the check is repeated at the effect boundary, exactly as
+/// [`refuse_provider_side_media`] is: a control implemented once per driver is
+/// one a driver written elsewhere does not have. The cost is one validation of a
+/// value that is almost always already valid; the alternative is that a
+/// malformed answer reaches code with no way to reject it.
+///
+/// A completion carrying **tool calls** is exempt: choosing a tool is a
+/// legitimate answer to a schema-bearing request, and the schema governs the
+/// turn that finally answers.
+///
+/// Failure is [`ModelError::Unusable`] — **metered**, because the tokens were
+/// generated and the provider will bill for them however unusable the answer is.
+fn honour_declared_schema(
+    completion: &Completion,
+    schema: Option<&Value>,
+    model: &ModelId,
+) -> Result<(), ModelError> {
+    let Some(schema) = schema else {
+        return Ok(());
+    };
+    if !completion.tool_calls.is_empty() {
+        return Ok(());
+    }
+    let Some(value) = completion.structured.as_ref() else {
+        return Err(ModelError::Unusable {
+            model: model.clone(),
+            usage: completion.usage,
+            detail: "a schema was declared and the provider returned no structured value; \
+                     a driver must parse its own answer into `Completion::structured`, or \
+                     report the call unusable itself"
+                .to_owned(),
+        });
+    };
+    #[cfg(any(feature = "manifest", feature = "providers", feature = "bedrock"))]
+    validate_schema(schema, value).map_err(|detail| ModelError::Unusable {
+        model: model.clone(),
+        usage: completion.usage,
+        detail,
+    })?;
+    // Without `jsonschema` in the build there is no validator to run. The
+    // presence check above still holds, and it is the half that keeps the
+    // runtime from indexing into an absent value. Named rather than silenced,
+    // so a reader can see which half is missing and why.
+    #[cfg(not(any(feature = "manifest", feature = "providers", feature = "bedrock")))]
+    let _ = (schema, value);
+    Ok(())
+}
+
 /// Which model, from which provider.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ModelId {
@@ -1119,7 +1176,8 @@ impl Effect for ModelCall {
             self.model
         )));
         stream_label.sensitivity = self.output_sensitivity;
-        self.provider
+        let answered = self
+            .provider
             .complete(Request {
                 model: &self.model,
                 prompt: &prompt,
@@ -1134,30 +1192,40 @@ impl Effect for ModelCall {
                     .as_deref()
                     .map(|observer| (observer, &stream_label)),
             })
-            .await
-            .map_err(|e| {
-                let detail = e.to_string();
-                let spend = e.usage().spend();
-                // A failure that consumed nothing is an ordinary failure. One
-                // that generated tokens has to carry them, or the ceiling that
-                // exists to bound a runaway provider counts zero.
-                if spend.is_zero() {
-                    match e.disposition() {
-                        Disposition::DidNotHappen => EffectError::Rejected(detail),
-                        Disposition::InDoubt => EffectError::Interrupted {
-                            driver: self.model.to_string(),
-                            detail,
-                        },
-                        Disposition::Landed => EffectError::Performed(detail),
-                    }
-                } else {
-                    EffectError::Metered {
+            .await;
+
+        // The declared schema is a contract on the *answer*, and the runtime
+        // relies on it: `structured` is indexed into rather than re-checked.
+        // Held here as well as in each driver, for the reason stated above the
+        // media check — the provider trait is public.
+        let answered = answered.and_then(|completion| {
+            honour_declared_schema(&completion, self.schema.as_ref(), &self.model)?;
+            Ok(completion)
+        });
+
+        answered.map_err(|e| {
+            let detail = e.to_string();
+            let spend = e.usage().spend();
+            // A failure that consumed nothing is an ordinary failure. One
+            // that generated tokens has to carry them, or the ceiling that
+            // exists to bound a runaway provider counts zero.
+            if spend.is_zero() {
+                match e.disposition() {
+                    Disposition::DidNotHappen => EffectError::Rejected(detail),
+                    Disposition::InDoubt => EffectError::Interrupted {
+                        driver: self.model.to_string(),
                         detail,
-                        spend,
-                        disposition: e.disposition(),
-                    }
+                    },
+                    Disposition::Landed => EffectError::Performed(detail),
                 }
-            })
+            } else {
+                EffectError::Metered {
+                    detail,
+                    spend,
+                    disposition: e.disposition(),
+                }
+            }
+        })
     }
 }
 

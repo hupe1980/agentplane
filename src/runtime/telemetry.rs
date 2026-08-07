@@ -106,6 +106,17 @@ pub const OUTCOME: &str = "agentplane.outcome";
 pub const NONDETERMINISM: &str = "agentplane.run.nondeterminism_detected";
 /// A run was set aside for a human.
 pub const QUARANTINED: &str = "agentplane.run.quarantined";
+/// A run concluded `failed`, with the reason it gives an operator.
+///
+/// A failure is an ordinary conclusion here rather than an incident — it stays
+/// open, findable under `GET /runs?outcome=failed`, and resumable. But *ordinary*
+/// is not *invisible*: an operator running the shipped server had no way at all
+/// to learn why a run failed, because the outcome index needs the HTTP surface
+/// and the reason otherwise reached only the journal. That is I13's
+/// detection-without-delivery on the most common conclusion there is. The
+/// reason string is the same one the outcome index already hands an operator,
+/// so this discloses nothing new — it delivers it to somebody watching.
+pub const RUN_FAILED: &str = "agentplane.run.failed";
 /// An outcome could not be determined and guessing was forbidden.
 pub const UNDECIDABLE: &str = "agentplane.effect.undecidable";
 /// A probe was asked whether a call landed.

@@ -111,9 +111,84 @@ agentplane run examples/summariser.yaml --input '{"ticket": "printer on fire"}'
 agentplane run examples/room.yaml       --input '{"topic": "durable execution"}'
 ```
 
+Or without a Rust toolchain at all — needing one to run a YAML file rather
+defeats the point of the file:
+
+```sh
+docker run --rm -v "$PWD/examples:/work:ro" ghcr.io/hupe1980/agentplane \
+  run /work/summariser.yaml --input '{"ticket": "printer on fire"}'
+```
+
+Distroless, nonroot, no shell. It runs `--read-only --network none` because the
+default journal is genuinely in memory and the example's provider is the
+deterministic fake — so the first run needs neither a disk nor the internet.
+`:slim` (the default, and `:latest`) carries every model provider — Anthropic,
+OpenAI, Gemini, Bedrock, any OpenAI-compatible server; `:full` adds MCP, the A2A
+peer server, the operator HTTP API, Cedar, key rings, governed media and
+Postgres. Both are multi-arch, cosign-signed keylessly, and carry SLSA build
+provenance and an SBOM attached to the digest:
+
+```sh
+cosign verify ghcr.io/hupe1980/agentplane:slim \
+  --certificate-identity-regexp 'https://github.com/hupe1980/agentplane/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+gh attestation verify oci://ghcr.io/hupe1980/agentplane:slim -R hupe1980/agentplane
+```
+
 `durable_pipeline` prints the whole claim in four steps: a live run, a strict
 replay that touches nothing, a crash that resumes without repeating work, and a
 changed build that is **quarantined instead of quietly rewriting history**.
+
+A first program is one import and about forty lines:
+
+```rust
+use agentplane::prelude::*;
+```
+
+And when it goes wrong, the plane answers with what it *does* have rather than
+with a variant name — `fn main()` reports through `Debug`, so on the errors you
+hold, `Debug` is the message:
+
+```text
+Error: no skill provides capability 'demo.greeet' — this plane provides:
+demo.greet. `run` takes a capability, not a skill name; a skill declares its own
+with `SkillDescriptor::new(..).provides(..)`
+```
+
+A declarative **tool loop** runs from a file too — the manifest grants
+`tool://tickets/read`, and which transport reaches `tickets` is deployment
+wiring rather than part of the reviewed declaration:
+
+```sh
+agentplane run examples/tool-calling.yaml --input '{"ticket": "T-1"}' \
+  --mcp "tickets=python3 examples/mcp-server.py"
+```
+
+A grant naming a server nobody wired is refused at **build**, not on every run.
+Needs `--features cli,mcp-stdio`, or the `:full` image.
+
+And an agent can be **hosted** from the same file — the A2A 1.0 server that
+passes the protocol project's own conformance kit, started without writing Rust:
+
+```sh
+agentplane serve examples/served.yaml \
+  --url http://localhost:8080 \
+  --policy examples/serve-policy.cedar \
+  --tokens examples/serve-tokens.yaml \
+  --store ./served.redb
+```
+
+Add `--operator-addr 127.0.0.1:9090` and the worklist, task decisions and
+`GET /runs?outcome=quarantined` are served too — on their **own** listener, off
+unless asked for, and separated from the peer surface by *policy* (`peer` reaches
+`a2a:*`, `operator` reaches `api:*`) rather than by the port. A served plane also
+sweeps deadlines, task expiry, dead letters and due timers, so a run that sleeps
+or waits actually wakes up.
+
+Both `--policy` and `--tokens` are required and have no defaults. That is the
+design rather than an inconvenience: a permissive engine and no engine are the
+same behaviour, and a server that authenticates nobody has no actor to record a
+decision against. Needs `--features cli,a2a-server,cedar`, or the `:full` image.
 
 New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/docs/getting-started/)**
 

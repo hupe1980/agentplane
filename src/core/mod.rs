@@ -14,7 +14,7 @@ mod calendar;
 pub(crate) mod canon;
 mod case;
 mod effect;
-mod error;
+pub(crate) mod error;
 mod event;
 mod id;
 mod identity;

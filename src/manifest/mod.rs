@@ -487,6 +487,21 @@ pub enum ExecutionKind {
     Planned,
 }
 
+impl ExecutionKind {
+    /// The kind, spelled the way a manifest spells it.
+    ///
+    /// So a diagnostic quotes the word an author would search their own file
+    /// for, rather than a Rust variant name that appears nowhere in the YAML.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completion => "completion",
+            Self::ToolCalling => "tool-calling",
+            Self::Planned => "planned",
+        }
+    }
+}
+
 /// Where this agent sits in a multi-agent arrangement.
 ///
 /// The field's justification is a measurement: MAST finds **inter-agent

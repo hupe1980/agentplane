@@ -1,0 +1,33 @@
+# What enters the build context, stated as an allowlist.
+#
+# The same reasoning as `Cargo.toml`'s `include`, and for a sharper reason: a
+# denylist has to predict every file that must not ship, and Docker — unlike
+# Cargo — does **not** read `.gitignore`. Two files in this repository are
+# gitignored and would therefore have entered a build layer under a bare
+# `COPY . .`, then been pushed to a public registry:
+#
+#   * `.env`        — real credentials.
+#   * `CONCEPT.md`  — the internal design document, which `just package`
+#                     already refuses to put in the crates.io tarball.
+#
+# Both were invisible to every existing guard, because those guard the *tarball*
+# and this is a different pipeline shipping the same tree. An allowlist cannot
+# be surprised by the third one.
+#
+# A published image layer is as immutable as a crates.io publish: a digest that
+# has been pulled cannot be withdrawn, only untagged, with the content still
+# served to anyone holding the digest.
+*
+
+!Cargo.toml
+!Cargo.lock
+!src
+# Cargo resolves the declared `[[example]]` targets when it reads the manifest,
+# so the directory has to exist even though the binary needs none of it.
+!examples
+!clippy.toml
+# `Cargo.toml` names it as the package readme; a missing one is a build warning
+# that reads like a real problem.
+!README.md
+!LICENSE-MIT
+!LICENSE-APACHE

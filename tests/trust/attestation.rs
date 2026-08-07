@@ -248,6 +248,13 @@ async fn an_unsigned_plane_is_ordinary_not_broken() {
         .read(out.run_id, 1)
         .await
         .unwrap();
+    // The count first. `all()` over an empty slice is true, so a `read` that
+    // returned nothing — a real way for this to break — would satisfy the
+    // assertion below while proving nothing about attestation at all.
+    assert!(
+        !records.is_empty(),
+        "the run wrote no records; the attestation assertion below would pass vacuously"
+    );
     assert!(records.iter().all(|r| r.attestation.is_none()));
     // The chain still holds.
     (store as Arc<dyn JournalStore>)

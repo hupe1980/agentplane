@@ -172,27 +172,32 @@ impl RedbStore {
         Self::init(db)
     }
 
-    /// An ephemeral database — for tests and for the simulator.
+    /// An ephemeral database — for tests, for the simulator, and for the CLI's
+    /// default journal.
     ///
-    /// redb has no in-memory backend, so this is a file in a temporary
-    /// directory that is removed when the process exits. Named with a counter
-    /// rather than a random suffix because ambient randomness is denied
-    /// crate-wide; two stores in one process must still not collide.
+    /// **Actually in memory.** It was not, and the reason is a comment that
+    /// aged into a defect: it said *redb has no in-memory backend*, which was
+    /// true of redb 1 and false since the dependency moved to 3. So the
+    /// implementation created a file under [`std::env::temp_dir`] and unlinked
+    /// it — an anonymous file, which behaves like memory right up until there is
+    /// nowhere to put it.
+    ///
+    /// That is not a hypothetical. `agentplane run` journals here by default,
+    /// and the container image runs on a **read-only root filesystem** with no
+    /// writable temp directory, so the documented first command failed with
+    /// `Read-only file system (os error 30)` — a message naming neither the
+    /// journal nor the temp directory. The same failure waits in any hardened
+    /// deployment, a scratch container, or a sandbox with no `/tmp`.
+    ///
+    /// A name that says *in memory* should not need a filesystem to be true.
     ///
     /// # Errors
     ///
-    /// If the temporary file cannot be created.
+    /// If the database cannot be initialised.
     pub fn open_in_memory() -> Result<Self, StoreError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let path = std::env::temp_dir().join(format!("agentplane-{pid}-{n}.redb"));
-        let _ = std::fs::remove_file(&path);
-        let db = Database::create(&path).map_err(|e| be(&e))?;
-        // Unlinked immediately: the handle stays valid, so the file is reachable
-        // by this process and by nothing else, and it cannot outlive a crash.
-        let _ = std::fs::remove_file(&path);
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(|e| be(&e))?;
         Self::init(db)
     }
 

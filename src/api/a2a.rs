@@ -185,25 +185,38 @@ pub enum TaskState {
 /// the caller nothing happened, when something did.
 /// The A2A state a live run's status surfaces as.
 ///
-/// Delegates to [`sealed_state`] rather than matching again, and the reason is
-/// that these two are the **same question asked on two paths**: this one answers
-/// the caller who receives the immediate `SendMessage` response, and
+/// This and [`sealed_state`] are the **same question asked on two paths**: this
+/// one answers the caller who receives the immediate `SendMessage` response, and
 /// `sealed_state` answers everyone who reads the task back — `GetTask`,
-/// `SubscribeToTask`, and every streamed status update.
+/// `SubscribeToTask`, and every streamed status update. They must agree, and
+/// `a_live_status_and_its_sealed_outcome_agree` holds them to it over every
+/// variant.
 ///
-/// They used to be separate matches that happened to agree, and the agreement
-/// was luck rather than structure: `RunStatus::as_str` and this function are
-/// exhaustive over the enum, so the compiler forces both to grow a new variant,
-/// while `sealed_state` matches on strings behind a `_ => Failed` that nothing
-/// checks. A variant added for something that is not a failure — an
-/// authorization wait, a rejection — would have been surfaced correctly to the
-/// caller who got the response and as `Failed` to the caller who polled for it.
-/// The same task, two answers, decided by which path the client took.
+/// **This is the exhaustive one, and that is the point.** The two were unified
+/// once by making this function delegate to `sealed_state`, which reads as the
+/// tidier direction and is the wrong one: `sealed_state` matches *strings*
+/// behind a `_ => Failed`, so delegating to it deleted the only compile-time
+/// check on the mapping while leaving a comment claiming the compiler still
+/// enforced it. Adding a `RunStatus` variant for something that is **not** a
+/// failure — an authorization wait, a rejection — would then have compiled
+/// cleanly and reported `Failed` on both paths. That is not agreement; it is
+/// the same wrong answer twice, which is strictly harder to notice than two
+/// different ones.
 ///
-/// One implementation makes that unrepresentable. `as_str` stays the single
-/// enumeration point, and the compiler still refuses a variant with no string.
+/// So the enum match is the definition and the string match is checked against
+/// it. A new variant fails to compile *here*, which is where the decision
+/// belongs.
 fn state_of(status: &crate::runtime::RunStatus) -> TaskState {
-    sealed_state(status.as_str())
+    use crate::runtime::RunStatus;
+    match status {
+        RunStatus::Succeeded => TaskState::Completed,
+        RunStatus::Suspended(_) => TaskState::InputRequired,
+        RunStatus::Cancelled { .. } => TaskState::Canceled,
+        RunStatus::Failed(_)
+        | RunStatus::Exhausted(_)
+        | RunStatus::Quarantined(_)
+        | RunStatus::Replanning(_) => TaskState::Failed,
+    }
 }
 
 /// A2A's `TaskStatus`.
@@ -2227,7 +2240,17 @@ pub(super) async fn task_artifacts(
 /// A sealed run's outcome word, as an A2A state.
 ///
 /// The outcome is the same string [`RunStatus::as_str`](crate::runtime::RunStatus::as_str)
-/// produces, which is what the executor seals with.
+/// produces, which is what the executor seals with — so this is [`state_of`]
+/// reached through a string, and the two are held to agreement by
+/// `a_live_status_and_its_sealed_outcome_agree`.
+///
+/// The `_` arm is a *wire* decision rather than a modelling shortcut: an A2A
+/// client must be told some state, and a word this build cannot interpret is not
+/// something it may describe as completed or waiting. It is deliberately **not**
+/// how the runtime itself treats an unrecognised outcome — `resume_is_closed`
+/// quarantines on one, because refusing to guess is available there and is not
+/// available here. The agreement test is what keeps this arm from quietly
+/// swallowing a variant somebody added and forgot to map.
 pub(super) fn sealed_state(outcome: &str) -> TaskState {
     match outcome {
         "succeeded" => TaskState::Completed,
@@ -2578,6 +2601,66 @@ async fn push_delete(
         .await
         .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
     Ok(json!({}))
+}
+
+#[cfg(test)]
+mod state_agreement_tests {
+    use super::{TaskState, sealed_state, state_of};
+
+    /// The same task must not have two states depending on which path a client took.
+    ///
+    /// `state_of` answers the caller holding the immediate `SendMessage`
+    /// response; `sealed_state` answers `GetTask`, `SubscribeToTask` and every
+    /// streamed status update. They read the same run.
+    ///
+    /// The check runs over the crate's one `RunStatus` list, so adding a variant
+    /// fails to compile in `state_of` (the match is exhaustive) and, once
+    /// somebody maps it there, fails *here* until `sealed_state` is taught the
+    /// same answer. That is the ordering the defect needs: the enum decides, the
+    /// string agrees. Unifying them the other way — `state_of` delegating to
+    /// `sealed_state` — makes both paths return the `_ => Failed` fallback for a
+    /// new variant, with nothing to notice, and that is what this test exists to
+    /// stop being reintroduced as a tidy-up.
+    #[test]
+    fn a_live_status_and_its_sealed_outcome_agree() {
+        let statuses = crate::runtime::every_status();
+        assert_eq!(
+            statuses.len(),
+            7,
+            "a RunStatus variant was added or removed — decide which A2A state it \
+             surfaces as, in `state_of` and in `sealed_state` both"
+        );
+        for status in &statuses {
+            assert_eq!(
+                state_of(status),
+                sealed_state(status.as_str()),
+                "'{}' surfaces as one state live and another once sealed",
+                status.as_str()
+            );
+        }
+    }
+
+    /// And the mapping is not one answer for everything.
+    ///
+    /// Without this, `sealed_state` and `state_of` could both be changed to
+    /// return `Failed` unconditionally and the agreement test above would pass
+    /// perfectly — every A2A client would see every task as failed.
+    #[test]
+    fn the_mapping_distinguishes_more_than_failure() {
+        let seen: std::collections::BTreeSet<_> = crate::runtime::every_status()
+            .iter()
+            .map(|status| format!("{:?}", state_of(status)))
+            .collect();
+        assert!(
+            seen.len() >= 4,
+            "the run-status mapping collapsed to {seen:?}; a client cannot tell \
+             completed from cancelled from waiting"
+        );
+        assert_eq!(
+            state_of(&crate::runtime::RunStatus::Succeeded),
+            TaskState::Completed
+        );
+    }
 }
 
 #[cfg(test)]

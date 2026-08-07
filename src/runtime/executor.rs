@@ -808,7 +808,19 @@ impl Runtime {
         {
             return Ok(Arc::clone(s));
         }
-        Err(RuntimeError::NoProvider(target.to_owned()))
+        // Capabilities rather than skill names: `run` is documented to take the
+        // capability, and listing the names would answer a question nobody
+        // asked with vocabulary that does not work in the call that failed.
+        let mut available: Vec<String> = self
+            .by_capability
+            .keys()
+            .map(std::string::ToString::to_string)
+            .collect();
+        available.sort();
+        Err(RuntimeError::NoProvider {
+            target: target.to_owned(),
+            available,
+        })
     }
 
     /// Execute a fresh run with no case attached.
@@ -1099,15 +1111,33 @@ impl Runtime {
         // edited one may not" is otherwise inexpressible, and a name-only rule
         // keeps permitting an agent whose prompt and grants have since changed.
         if let Some(id) = governed_by {
-            context["agent"] = serde_json::json!({
+            let mut agent = serde_json::json!({
                 "name": id.name,
                 "version": id.version,
                 "digest": id.digest.to_hex(),
-                // The grouping a real rule binds to. `name` is beside it for
-                // readability and must not be authorized on: a file claims a
-                // name, but only the holder of a key can claim a publisher.
-                "publisher": id.publisher,
             });
+            // The grouping a real rule binds to. `name` is beside it for
+            // readability and must not be authorized on: a file claims a name,
+            // but only the holder of a key can claim a publisher.
+            //
+            // **Absent, never `null`.** An `Option` serialized straight into the
+            // context put a JSON `null` there for every unpublished manifest —
+            // which is most of them, since publisher attestation is opt-in — and
+            // Cedar refuses a context containing one: not the field, the whole
+            // record. So the request never reached a rule, came back
+            // `malformed`, and **every run on a Cedar plane with an unsigned
+            // manifest was denied**, with the caller told only that it was
+            // declined, because naming the reason to an external caller is
+            // precisely what this crate refuses to do. The adapter's own module
+            // documentation already said *"or absent"*; only the code disagreed.
+            //
+            // A policy asks `context.agent has publisher` and then reads it,
+            // which is Cedar's idiom for an optional attribute and is what the
+            // absent form supports.
+            if let Some(publisher) = id.publisher.as_ref() {
+                agent["publisher"] = serde_json::to_value(publisher)?;
+            }
+            context["agent"] = agent;
         }
         super::ctx::merge_identity(&mut context, self.identity.as_ref());
         // Who is acting, and what is being asked for. Passing one string as both
@@ -2647,6 +2677,15 @@ impl Runtime {
         case: Option<crate::core::CaseId>,
         spend: Spend,
     ) -> Result<RunOutcome, RuntimeError> {
+        // Loud toward the operator, ordinary toward the caller. A failed run is
+        // a conclusion a resume can honestly answer, so it is not an incident —
+        // but until this, nothing said why one failed except the journal and an
+        // index that needs the HTTP surface mounted, so `agentplane serve`
+        // reported "failed" to a peer and gave its own operator nothing.
+        if let RunStatus::Failed(reason) = &status {
+            tracing::warn!(target: telemetry::RUN_FAILED, %run, reason = %reason);
+        }
+
         // A suspended run is not sealed: its chain is going to be extended the
         // moment whatever it waits for arrives.
         let chain_head = if writing && !status.is_suspended() {
@@ -4505,6 +4544,34 @@ impl RuntimeBuilder {
                         )
                     })
                 });
+                // A tool loop with nothing to reach fails on every run with the
+                // same sentence, and the manifest that says so was read at
+                // build. `planned` only needs a catalogue when it has grants;
+                // `tool-calling` needs one to exist at all, since offering a
+                // model no tools is not a tool loop.
+                if tools.is_none() {
+                    let needs = match execution.kind {
+                        crate::manifest::ExecutionKind::ToolCalling => {
+                            Some(if m.spec.tools.is_empty() {
+                                "no tool grants".to_owned()
+                            } else {
+                                format!("{} tool grant(s)", m.spec.tools.len())
+                            })
+                        }
+                        crate::manifest::ExecutionKind::Planned if !m.spec.tools.is_empty() => {
+                            Some(format!("{} tool grant(s)", m.spec.tools.len()))
+                        }
+                        _ => None,
+                    };
+                    if let Some(grants) = needs {
+                        return Err(BuildError::DeclarativeToolsUnreachable {
+                            agent: m.metadata.name.clone(),
+                            kind: execution.kind.as_str(),
+                            grants,
+                        });
+                    }
+                }
+
                 for cap in &m.spec.capabilities.provides {
                     let skill: Arc<dyn Skill> = Arc::new(super::declarative::Declarative::new(
                         execution.kind,
@@ -4793,36 +4860,48 @@ impl Runtime {
     }
 }
 
+/// Every `RunStatus`, so adding one forces a decision everywhere one is owed.
+///
+/// Written out rather than derived, because Rust cannot enumerate a
+/// data-carrying enum — and a list is honest about that: the count assertion in
+/// each consumer fails the day a variant is added, which is exactly when
+/// somebody must decide whether it seals, whether it may resume, and which A2A
+/// state it surfaces as.
+///
+/// Crate-visible so those consumers share **one** list. Two copies would be two
+/// places to remember, and the second would be the one that went stale — which
+/// is the same failure the tests using it exist to catch.
+#[cfg(test)]
+pub(crate) fn every_status() -> Vec<RunStatus> {
+    use crate::core::{BudgetExceeded, CorrelationKey, SuspendReason, Timestamp};
+    vec![
+        RunStatus::Succeeded,
+        RunStatus::Failed("because".into()),
+        RunStatus::Suspended(SuspendReason::AwaitingEvent {
+            kind: "reply".into(),
+            correlation: vec![CorrelationKey::new("claim", "CLM-1")],
+            until: Timestamp::from_unix_timestamp(1_760_000_000).expect("time"),
+        }),
+        RunStatus::Exhausted(BudgetExceeded::Steps { allowed: 1 }),
+        RunStatus::Quarantined("unknown outcome".into()),
+        RunStatus::Replanning("try again".into()),
+        RunStatus::Cancelled {
+            actor: "ops".into(),
+            reason: "stop".into(),
+        },
+    ]
+}
+
 #[cfg(test)]
 mod resume_agreement_tests {
     use super::{RunStatus, resume_is_closed};
-    use crate::core::{BudgetExceeded, CorrelationKey, SuspendReason, Timestamp};
     use crate::journal::RecordKind;
 
-    /// Every `RunStatus`, so adding one forces a decision here.
-    ///
-    /// Written out rather than derived, because Rust cannot enumerate a
-    /// data-carrying enum — and a list is honest about that: the count
-    /// assertion below fails the day a variant is added, which is exactly when
-    /// somebody must decide whether it seals and whether it may resume.
-    fn every_status() -> Vec<RunStatus> {
-        vec![
-            RunStatus::Succeeded,
-            RunStatus::Failed("because".into()),
-            RunStatus::Suspended(SuspendReason::AwaitingEvent {
-                kind: "reply".into(),
-                correlation: vec![CorrelationKey::new("claim", "CLM-1")],
-                until: Timestamp::from_unix_timestamp(1_760_000_000).expect("time"),
-            }),
-            RunStatus::Exhausted(BudgetExceeded::Steps { allowed: 1 }),
-            RunStatus::Quarantined("unknown outcome".into()),
-            RunStatus::Replanning("try again".into()),
-            RunStatus::Cancelled {
-                actor: "ops".into(),
-                reason: "stop".into(),
-            },
-        ]
-    }
+    // Through the crate re-export rather than `super::`, so the one path both
+    // consumers use is exercised in every build. Reaching it directly here
+    // would leave the re-export unused whenever `a2a-server` is off — which is
+    // a lint failure in exactly the feature configuration nobody runs locally.
+    use crate::runtime::every_status;
 
     /// **A conclusion that sealed the journal may never be resumed.**
     ///

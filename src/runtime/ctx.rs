@@ -2827,20 +2827,35 @@ impl StepCtx<'_> {
             .expecting(schema);
         let completion = self.sink(call, &prompt).await?;
         let label = completion.label().join(&source_label);
+
+        // The schema above is enforced at the effect boundary, so a well-formed
+        // answer is the only one that reaches here. It is still read defensively
+        // rather than unwrapped: the boundary's *shape* check runs in every
+        // build but its full JSON Schema validation needs `jsonschema`, which a
+        // bare `testkit` build does not have. A model's answer is untrusted
+        // data, and untrusted data must never be able to abort the process —
+        // a panic here would unwind a run that has already announced effects,
+        // leaving exactly the terminal-record-less outcome I2 exists to prevent.
+        let unusable = |detail: &str| {
+            StepError::Effect(crate::core::EffectError::Rejected(format!(
+                "memory formation for subject `{}` could not read the model's answer: {detail}",
+                formation.subject
+            )))
+        };
         let value = completion
             .peek()
             .structured
             .as_ref()
-            .expect("formation requested structured output");
+            .ok_or_else(|| unusable("it carried no structured value"))?;
         let proposals = value["memories"]
             .as_array()
-            .expect("formation schema requires an array")
+            .ok_or_else(|| unusable("`memories` is not an array"))?
             .clone();
         let mut written = Vec::with_capacity(proposals.len());
         for proposal in proposals {
             let key = proposal["key"]
                 .as_str()
-                .expect("formation schema requires key");
+                .ok_or_else(|| unusable("a proposal carries no string `key`"))?;
             let id = format!(
                 "formed-{}",
                 crate::core::Digest::of(&crate::core::canon::value_bytes(&serde_json::json!({

@@ -4213,3 +4213,91 @@ fn a_bundle_with_no_documents_is_refused() {
         );
     }
 }
+
+/// **A tool loop with nothing to reach refuses the build, not every run.**
+///
+/// The manifest says the agent runs a tool loop; the plane says nothing reaches
+/// a tool server. Both facts are known at `build`, so the wiring mistake belongs
+/// there — it used to assemble cleanly and then fail *identically on every
+/// request*, which is a configuration error reported once per run instead of
+/// once. The message names both fixes, because `toolbox` and `tools` are
+/// genuinely different choices rather than one spelled two ways.
+#[tokio::test]
+async fn a_tool_calling_agent_with_no_catalogue_refuses_the_build() {
+    use agentplane::runtime::{Agent, BuildError, Runtime};
+
+    let desk = Manifest::parse(
+        r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: desk, version: '1.0.0' }
+spec:
+  execution: { kind: tool-calling, max_turns: 3 }
+  identity: { role: 'Answer using the ticket tool', constraints: 'Be brief.' }
+  capabilities: { provides: [support.answer] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  tools:
+    - ref: 'tool://tickets/read'
+      mutates: false
+      description: 'Read a ticket by id'
+      arguments:
+        type: object
+        required: [id]
+        properties: { id: { type: string } }
+  budgets: { max_tokens: 1000 }
+",
+    )
+    .expect("manifest");
+
+    let provider = agentplane::testkit::FakeProvider::new();
+    let store: std::sync::Arc<dyn agentplane::journal::JournalStore> =
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let err = Runtime::builder(store)
+        .provider(
+            "fake",
+            provider as std::sync::Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&desk))
+        .try_build()
+        .expect_err("a tool loop with no catalogue must refuse the build");
+    assert!(
+        matches!(
+            &err,
+            BuildError::DeclarativeToolsUnreachable { agent, kind, .. }
+                if agent == "desk" && *kind == "tool-calling"
+        ),
+        "wrong refusal: {err}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("toolbox") && message.contains("tool://agent/"),
+        "the refusal names neither the fix nor the exemption: {message}"
+    );
+}
+
+/// The positive half: a room whose grants are all agents needs no catalogue.
+///
+/// Without this, refusing *every* declarative agent that has no toolbox would
+/// pass the test above perfectly while breaking the one multi-agent shape the
+/// crate ships — `tool://agent/…` dispatches through `commission`, and its
+/// catalogue is derived from the declaration rather than wired.
+#[tokio::test]
+async fn a_room_of_agent_grants_still_builds_without_a_toolbox() {
+    use agentplane::runtime::{Agent, Runtime};
+
+    let room = std::fs::read_to_string("examples/room.yaml").expect("the shipped room");
+    let manifests = Manifest::parse_all(&room).expect("room parses");
+    let provider = agentplane::testkit::FakeProvider::new();
+    let store: std::sync::Arc<dyn agentplane::journal::JournalStore> =
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let mut builder = Runtime::builder(store).provider(
+        "fake",
+        provider as std::sync::Arc<dyn agentplane::model::ModelProvider>,
+    );
+    for m in &manifests {
+        builder = builder.agent(Agent::new(m));
+    }
+    builder
+        .try_build()
+        .expect("a room of agent grants needs no toolbox");
+}

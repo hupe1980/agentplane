@@ -1,0 +1,17 @@
+# Bearer tokens naming the callers this plane accepts. Compared in constant
+# time, and an unknown one is refused rather than becoming an anonymous caller:
+# a decision recorded against nobody is not a decision anybody can answer for.
+#
+# The roles are not grants. They are an input to the policy set, which is what
+# decides — `serve-policy.cedar` gives `peer` the A2A actions and `operator` the
+# API ones, so neither token can do the other's work even if it reaches the
+# other's port.
+#
+# Obviously demo values. A real deployment mounts this as a secret.
+- token: "a-long-random-string"
+  actor: peer-a
+  roles: [peer]
+
+- token: "another-long-random-string"
+  actor: ops-alice
+  roles: [operator]

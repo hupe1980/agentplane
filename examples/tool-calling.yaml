@@ -1,0 +1,34 @@
+# A declarative tool loop — no Rust, and the tools come from an MCP server the
+# operator names on the command line:
+#
+#   agentplane run examples/tool-calling.yaml \
+#     --input '{"ticket": "T-1"}' \
+#     --mcp "tickets=python3 examples/mcp-server.py"
+#
+# The manifest grants `tool://tickets/read`. **Which transport reaches
+# `tickets` is not in here**, and that is deliberate: an agent's declaration —
+# and therefore its digest — must not change when it moves between a laptop and
+# a cluster. Grants are reviewed; wiring is deployed.
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: ticket-desk, version: "1.0.0" }
+spec:
+  execution: { kind: tool-calling, max_turns: 3 }
+  identity:
+    role: "Answer a support question using the ticket tool"
+    constraints: "One sentence. Cite the ticket id."
+  capabilities: { provides: [support.answer] }
+  models:
+    privileged: { provider: fake, model: m-1 }
+  tools:
+    # `mutates: false` is a claim the *operator's* catalogue is held to as well:
+    # a server calling its own tool read-only cannot make it so, and a catalogue
+    # laxer than this grant refuses the build.
+    - ref: "tool://tickets/read"
+      mutates: false
+      description: "Read a ticket by id"
+      arguments:
+        type: object
+        required: [id]
+        properties: { id: { type: string } }
+  budgets: { max_tokens: 1000 }

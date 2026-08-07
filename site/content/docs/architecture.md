@@ -1377,6 +1377,8 @@ src/
   testkit/   fault injection, a fake model provider, and shared assertions
              (feature `testkit`, off by default) — for this crate's assurance
              layers and for embedders testing their own stores and skills
+  prelude    the names a program that does nothing unusual needs, so the first
+             one is a single `use` — re-exports only, no API of its own
 ```
 
 The one discipline to keep: `core/` has zero I/O dependencies. Keep it and an

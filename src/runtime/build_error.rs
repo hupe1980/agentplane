@@ -28,7 +28,7 @@
 //! [`try_build`]: crate::runtime::RuntimeBuilder::try_build
 
 /// A plane this crate will not assemble.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum BuildError {
     /// The plane and its blob store are scoped to different tenants.
@@ -62,6 +62,30 @@ pub enum BuildError {
          reviewed document — rename the server"
     )]
     ReservedToolServer,
+
+    /// A declarative agent needs a tool catalogue and the plane has none.
+    ///
+    /// Refused at build because it is knowable at build: the manifest says the
+    /// agent runs a tool loop, and the plane says nothing reaches a tool server.
+    /// It used to be a **per-run** failure — the plane assembled cleanly and
+    /// then every single run failed with the same message, which is a wiring
+    /// mistake reported once per request instead of once. The one shape that is
+    /// legitimately catalogue-free is an agent whose grants are *all*
+    /// `tool://agent/…`: those dispatch through `commission` and their
+    /// catalogue is derived from the declaration.
+    #[error(
+        "agent '{agent}' declares `execution.kind: {kind}` with {grants}, but this \
+         plane has no tool catalogue, so every run would fail identically. Wire one \
+         with `RuntimeBuilder::toolbox(..)` — which derives it from this very \
+         declaration — or state it with `.tools(catalog, client)`. Grants of the \
+         form `tool://agent/<capability>` need neither, because they dispatch \
+         through `commission` rather than a transport"
+    )]
+    DeclarativeToolsUnreachable {
+        agent: String,
+        kind: &'static str,
+        grants: String,
+    },
 
     /// An agent grant names a capability no agent on this plane provides.
     #[error(
@@ -197,3 +221,5 @@ pub enum BuildError {
     )]
     AdvertisesWhatItCannotProvide { agent: String, missing: Vec<String> },
 }
+
+crate::core::error::debug_is_display!(BuildError);

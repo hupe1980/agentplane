@@ -76,6 +76,8 @@ use cedar_policy::{
     Authorizer, Context, Entities, EntityUid, PolicySet, Request, Schema, ValidationMode, Validator,
 };
 
+use serde_json::Value;
+
 use crate::core::{
     Digest, PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest, canon,
 };
@@ -206,12 +208,75 @@ impl CedarEngine {
         let action = uid("Action", r.action)?;
         let resource = uid("Resource", r.resource)?;
         let context = Context::from_json_value(
-            r.context.clone(),
+            without_nulls(r.context.clone()),
             self.schema.as_ref().map(|schema| (schema, &action)),
         )
         .map_err(|e| format!("context is not a Cedar record: {e}"))?;
         Request::new(principal, action, resource, context, self.schema.as_ref())
             .map_err(|e| format!("request is not well formed: {e}"))
+    }
+}
+
+/// Cedar has no `null`, so an absent value must be spelled *absent*.
+///
+/// # Why this belongs in the adapter
+///
+/// `Context::from_json_value` refuses a document containing a JSON `null`
+/// anywhere — not the field, **the whole record** — and the consequence is
+/// severe and quiet: the request never reaches a rule, so the answer is a clean
+/// `Deny`, and an operator reading "denied" hunts for the rule that said no
+/// while nothing was evaluated at all. This adapter reports that as *malformed*
+/// rather than as a refusal precisely because the two are different situations.
+///
+/// It was not hypothetical. Two contexts the runtime sends carried nulls, and
+/// between them they denied everything a Cedar plane did:
+///
+/// * `context.agent.publisher` — `None` for every unpublished manifest, which
+///   is most of them, so **every admission** was malformed. Fixed at the source
+///   too, since the adapter's own documentation already said *"or absent"*.
+/// * `context.args` — the effect's own arguments, which are **arbitrary caller
+///   JSON**. A model call's request profile carries `null` for every optional
+///   knob nobody set. No amount of fixing at the source closes this one: the
+///   runtime cannot promise that data it did not author contains no nulls.
+///
+/// That second case is why the fix lives here rather than only at the callers.
+/// A control implemented once per producer is one the next producer does not
+/// have, and the producer here is *the user's own arguments*.
+///
+/// # What the mapping means
+///
+/// A null-valued object member becomes an **absent attribute**, which is
+/// Cedar's own idiom for optional data — `context.agent has publisher` is how a
+/// policy asks, and it now answers correctly instead of failing to parse.
+///
+/// This cannot weaken a rule. Cedar has no null literal, so no policy can match
+/// on one; stripping removes only values that were already unmatchable, and the
+/// sole observable change is that `has` answers `false` rather than the request
+/// being unevaluable.
+///
+/// # The one lossy case, stated
+///
+/// A `null` **inside an array** cannot become an absent attribute — there is no
+/// key to omit — so the element is dropped, which shortens the array and shifts
+/// what follows it. A policy indexing a fixed position in caller-supplied data
+/// is fragile regardless, and the alternative is refusing the request, which
+/// would reinstate the outage for data the runtime does not control.
+fn without_nulls(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k, without_nulls(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .filter(|v| !v.is_null())
+                .map(without_nulls)
+                .collect(),
+        ),
+        other => other,
     }
 }
 

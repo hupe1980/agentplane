@@ -15,10 +15,9 @@
 
 use std::sync::Arc;
 
-use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted};
-use agentplane::journal::JournalStore;
-use agentplane::runtime::{Mode, Runtime, StepCtx};
-use agentplane::store::RedbStore;
+// The getting-started page calls this "this exact skill", so it imports the way
+// that page does: one prelude line, which is the whole point of having one.
+use agentplane::prelude::*;
 use serde_json::{Value, json};
 
 #[derive(Debug)]

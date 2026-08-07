@@ -1019,3 +1019,142 @@ async fn an_untrusted_instruction_is_refused_before_the_model_sees_it() {
         }
     }
 }
+
+/// A provider that ignores the schema it was handed.
+///
+/// Not a hypothetical shape. [`ModelProvider`] is public and the built-in
+/// drivers are not the only implementations: an embedder wiring a gateway, a
+/// house model server, or a recorded fixture writes one of these, and nothing in
+/// the trait's signature says the answer must satisfy `request.schema`.
+#[derive(Debug)]
+struct IgnoresSchema(Option<Value>);
+
+#[async_trait::async_trait]
+impl ModelProvider for IgnoresSchema {
+    async fn complete(
+        &self,
+        _request: agentplane::model::Request<'_>,
+    ) -> Result<Completion, ModelError> {
+        Ok(Completion {
+            text: "{}".to_owned(),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                output_tokens: 7,
+                ..Default::default()
+            },
+            stop_reason: Some("stop".to_owned()),
+            truncated: false,
+            structured: self.0.clone(),
+            continuation: None,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct AsksForAnObject(Option<Value>);
+
+#[async_trait::async_trait]
+impl Skill for AsksForAnObject {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("asks-object").provides("asks-object")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let call = ModelCall::new(
+            Arc::new(IgnoresSchema(self.0.clone())),
+            model(),
+            input.peek().clone(),
+        )
+        .expecting(json!({
+            "type": "object",
+            "properties": { "items": { "type": "array" } },
+            "required": ["items"],
+            "additionalProperties": false
+        }));
+        let completion = cx.sink(call, &input).await?;
+        Ok(Outcome::done(
+            completion.map(|completion| json!(completion.structured)),
+        ))
+    }
+}
+
+async fn run_against(provider_answer: Option<Value>) -> agentplane::runtime::RunOutcome {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .owner("audit")
+        .skill(AsksForAnObject(provider_answer))
+        .build();
+    runtime.run("asks-object", json!({})).await.unwrap()
+}
+
+/// A declared schema binds the *answer*, and it is held at the effect boundary.
+///
+/// The runtime reads `Completion::structured` as a value that already satisfies
+/// the schema the request declared — `form_memories` indexes straight into it.
+/// That belief was held only by the built-in drivers, each of which validates
+/// its own answer, so a provider written elsewhere could hand the runtime a
+/// value of any shape at all. The check now sits beside the provider-side media
+/// refusal, for the reason stated there: the trait is public, and a control
+/// implemented once per driver is one a driver written elsewhere does not have.
+///
+/// The failure must be **metered**. The tokens were generated and the provider
+/// bills for them whatever the answer's shape, so a run that reported this free
+/// would let a retry loop against a misbehaving provider burn real money against
+/// a ceiling reading zero.
+#[tokio::test]
+async fn a_provider_answer_that_defies_its_schema_is_a_metered_failure() {
+    // Structurally wrong: `items` is a string where the schema demands an array.
+    let outcome = run_against(Some(json!({ "items": "not-an-array" }))).await;
+    let RunStatus::Failed(detail) = &outcome.status else {
+        panic!("a schema-defying answer was accepted: {:?}", outcome.status);
+    };
+    assert!(
+        detail.contains("does not satisfy the declared JSON Schema"),
+        "the refusal does not name the schema: {detail}"
+    );
+    assert_eq!(
+        outcome.spend.tokens, 7,
+        "an unusable answer was billed as free; the provider bills for it"
+    );
+
+    // Absent entirely: the shape the runtime would otherwise index into.
+    let outcome = run_against(None).await;
+    let RunStatus::Failed(detail) = &outcome.status else {
+        panic!(
+            "a missing structured value was accepted: {:?}",
+            outcome.status
+        );
+    };
+    assert!(
+        detail.contains("no structured value"),
+        "the refusal does not say what was missing: {detail}"
+    );
+    assert_eq!(
+        outcome.spend.tokens, 7,
+        "a missing answer was billed as free"
+    );
+}
+
+/// The positive half: an answer that *does* satisfy the schema is passed through.
+///
+/// Without this a refuse-everything change passes — the assertions above are all
+/// refusals, and a boundary check that rejected every structured answer would
+/// satisfy every one of them while making native structured output unusable.
+#[tokio::test]
+async fn a_conforming_answer_still_reaches_the_skill() {
+    let outcome = run_against(Some(json!({ "items": [1, 2] }))).await;
+    assert!(
+        matches!(outcome.status, RunStatus::Succeeded),
+        "a conforming answer was refused: {:?}",
+        outcome.status
+    );
+    assert_eq!(
+        outcome.output.as_ref().map(Tainted::peek),
+        Some(&json!({ "items": [1, 2] })),
+        "the structured answer did not reach the skill"
+    );
+}

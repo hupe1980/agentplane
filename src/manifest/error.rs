@@ -5,7 +5,7 @@
 /// Every variant is a refusal rather than a warning. A manifest is the document
 /// that says what an agent may do; running a version of it the crate had to
 /// guess at would make the declaration worth less than the code it replaced.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ManifestError {
     /// Not well-formed — which includes an **unknown field**.
     ///
@@ -68,3 +68,5 @@ pub enum ManifestError {
     )]
     Unbounded,
 }
+
+crate::core::error::debug_is_display!(ManifestError);

@@ -609,7 +609,10 @@ async fn a_failing_skill_does_not_succeed() {
 async fn an_unknown_target_is_refused_before_anything_happens() {
     let rt = Runtime::builder(store()).build();
     let err = rt.run("nonexistent", json!({})).await.unwrap_err();
-    assert!(matches!(err, agentplane::core::RuntimeError::NoProvider(_)));
+    assert!(matches!(
+        err,
+        agentplane::core::RuntimeError::NoProvider { .. }
+    ));
 }
 
 /// A skill is reachable by the capability it provides, not only by its name —
