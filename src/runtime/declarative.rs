@@ -311,8 +311,7 @@ impl Declarative {
                     Arc::clone(&client),
                     id,
                     asked.arguments.clone(),
-                )
-                .map_err(|e| SkillError::Other(e.to_string()))?;
+                )?;
 
                 match cx.sink(prepared, &args).await {
                     Ok(result) => {
@@ -655,8 +654,7 @@ impl Declarative {
                             Arc::clone(client),
                             id,
                             assembled.peek().clone(),
-                        )
-                        .map_err(|e| SkillError::Other(e.to_string()))?;
+                        )?;
                         cx.sink(prepared, &assembled).await?
                     };
                     outputs.push(out);

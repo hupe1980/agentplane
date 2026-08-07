@@ -499,7 +499,7 @@ async fn erasing_one_tenants_key_leaves_another_tenant_readable() {
 /// the erasure below survivable rather than self-defeating.
 #[tokio::test]
 async fn a_sealed_journal_hides_payloads_and_still_verifies_without_keys() {
-    use agentplane::core::{Digest, Label, RunId};
+    use agentplane::core::{Digest, Label, RunId, TenantId};
     use agentplane::journal::{Append, JournalStore, Record, RecordKind, payload};
     use agentplane::keyring::SealedJournal;
 
@@ -509,6 +509,7 @@ async fn a_sealed_journal_hides_payloads_and_still_verifies_without_keys() {
     let sealed = SealedJournal::wrap(
         Arc::clone(&plain),
         Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
+        TenantId::default(),
     );
 
     let run = RunId::generate();
@@ -572,7 +573,7 @@ async fn a_sealed_journal_hides_payloads_and_still_verifies_without_keys() {
 /// once: the data *and* the ability to show nothing had been altered.
 #[tokio::test]
 async fn erasing_the_key_leaves_the_chain_verifiable() {
-    use agentplane::core::{Digest, Label, RunId, Timestamp};
+    use agentplane::core::{Digest, Label, RunId, TenantId, Timestamp};
     use agentplane::journal::{Append, JournalStore, Record, RecordKind, payload};
     use agentplane::keyring::SealedJournal;
 
@@ -582,6 +583,7 @@ async fn erasing_the_key_leaves_the_chain_verifiable() {
     let sealed = SealedJournal::wrap(
         Arc::clone(&plain),
         Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
+        TenantId::default(),
     );
 
     let run = RunId::generate();
@@ -732,7 +734,8 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
 
     let cases_plain: Arc<dyn CaseStore> = Arc::clone(&raw) as Arc<dyn CaseStore>;
     let cases = SealedCases::wrap(Arc::clone(&cases_plain), Arc::clone(&ring), tenant.clone());
-    let journal = SealedJournal::wrap(Arc::clone(&raw) as Arc<dyn JournalStore>, Arc::clone(&ring));
+    let plain_journal = Arc::clone(&raw) as Arc<dyn JournalStore>;
+    let journal = SealedJournal::wrap(plain_journal, Arc::clone(&ring), tenant.clone());
 
     let at = Timestamp::from_unix_timestamp(1_760_000_000).expect("time");
     let case = cases

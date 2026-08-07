@@ -175,6 +175,15 @@ impl Release {
         Self::new(scope, fields, basis, destination, evidence)
     }
 
+    /// The one constructor, and it is checked by the one rule set.
+    ///
+    /// It used to restate [`validate`](Self::validate)'s five rules as asserts,
+    /// which is the *two representations of one fact* shape this crate treats as
+    /// a defect everywhere else: the constructor and the deserialization gate
+    /// could drift, and only the second has a mutation holding it. There is now
+    /// one list of rules, consulted from both directions — a safe constructor
+    /// panics on a programmer error, a deserialized value is refused as an
+    /// input, and neither can start disagreeing about which releases are legal.
     fn new(
         scope: ReleaseScope,
         fields: impl IntoIterator<Item = String>,
@@ -182,40 +191,19 @@ impl Release {
         destination: impl Into<String>,
         evidence: impl IntoIterator<Item = String>,
     ) -> Self {
-        let basis = basis.into();
-        let destination = destination.into();
-        let fields = fields.into_iter().collect::<BTreeSet<_>>();
-        let evidence = evidence.into_iter().collect::<BTreeSet<_>>();
-        assert!(
-            scope.trust || scope.sensitivity.is_some(),
-            "a release scope must improve trust, sensitivity, or both"
-        );
-        assert!(!basis.trim().is_empty(), "a release must state its basis");
-        assert!(
-            !destination.trim().is_empty(),
-            "a release must name its destination"
-        );
-        assert!(!fields.is_empty(), "a release must name at least one field");
-        assert!(
-            fields.len() == 1 || !fields.contains(""),
-            "a whole-value release cannot be mixed with field releases"
-        );
-        for path in &fields {
-            if !path.is_empty() {
-                assert_json_pointer(path);
-            }
-        }
-        assert!(
-            !evidence.is_empty() && evidence.iter().all(|item| !item.trim().is_empty()),
-            "a release must carry non-empty evidence"
-        );
-        Self {
+        let release = Self {
             scope,
-            basis,
-            destination,
-            fields,
-            evidence,
-        }
+            basis: basis.into(),
+            destination: destination.into(),
+            fields: fields.into_iter().collect::<BTreeSet<_>>(),
+            evidence: evidence.into_iter().collect::<BTreeSet<_>>(),
+        };
+        assert!(
+            release.validate().is_ok(),
+            "invalid release: {}",
+            release.validate().unwrap_err()
+        );
+        release
     }
 
     #[must_use]

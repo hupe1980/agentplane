@@ -103,8 +103,7 @@ impl Skill for Transfer {
             Arc::clone(&self.ledger) as Arc<dyn ToolClient>,
             transfer(),
             arguments.peek().clone(),
-        )
-        .map_err(|error| SkillError::Other(error.to_string()))?;
+        )?;
 
         // Tool calls cannot use `cx.effect`: carrying outbound arguments forces
         // them through `sink`, which binds the exact bytes to these labels.

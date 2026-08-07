@@ -235,6 +235,18 @@ doc-examples:
 site:
     cd site && zola build
 
+# every `agentplane = "X.Y"` on the site resolves on crates.io (needs network)
+#
+# `check-doc-examples.sh` holds those lines to `Cargo.toml`, which is the half
+# that cannot fail alone — one commit moves both. This is the other half, and it
+# is the one a reader actually meets: `release.yml` fires on a tag while
+# `pages.yml` fires on any `site/**` push, so nothing orders publishing the
+# crate before publishing the page that tells people to depend on it. Not in
+# `ci`, which must work offline and on a branch whose version is unpublished by
+# definition; it runs in the Pages workflow, before the site is deployed.
+published:
+    ./tools/check-published.sh
+
 # serve the docs site locally with live reload
 site-serve:
     cd site && zola serve

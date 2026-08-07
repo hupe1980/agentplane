@@ -31,9 +31,29 @@ pub struct SealedJournal {
 
 impl SealedJournal {
     /// Seal this store's payloads under `keys`.
+    ///
+    /// `tenant` must be the tenant the wrapped store serves, and it is taken as
+    /// an argument for the same reason [`SealedCases::wrap`](super::SealedCases::wrap)
+    /// takes one: the *write* scope and the scope `erase_case` destroys have to
+    /// agree byte for byte, so both are derived from one value supplied by one
+    /// caller.
+    ///
+    /// This used to read the name back out of `inner.tenant()` instead, which
+    /// looked like the safer shape — one fact, one source — and was not.
+    /// [`JournalStore`] is a public seam: an embedder's backend may return a
+    /// name [`TenantId`] refuses, and the fallback was `unwrap_or_default()`.
+    /// Under that, payloads sealed under `default/<case>` while `erase_case`
+    /// destroyed `<tenant>/<case>` — an erasure reporting success over readable
+    /// bytes, which is the one failure in this module that is silent by
+    /// construction. `RuntimeBuilder` already refuses a plane whose store is
+    /// scoped to another tenant, so the two agree there; this makes them agree
+    /// for a hand-wired store too.
     #[must_use]
-    pub fn wrap(inner: Arc<dyn JournalStore>, keys: Arc<dyn KeyRing>) -> Arc<Self> {
-        let tenant = TenantId::new(inner.tenant()).unwrap_or_default();
+    pub fn wrap(
+        inner: Arc<dyn JournalStore>,
+        keys: Arc<dyn KeyRing>,
+        tenant: TenantId,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
             keys,

@@ -15,25 +15,35 @@ For the trust model those keys sit inside, see [security](@/docs/security.md).
 ## What lands where, and what can be erased
 
 Decide this before personal data reaches a run. The journal is append-only and
-hash-chained: a record cannot be deleted without breaking the chain, and
-**journal rows are not encrypted**, so cryptographic erasure does not reach
-them either. Whatever enters the chain is permanent for the life of the store.
+hash-chained: a record cannot be deleted without breaking the chain, so nothing
+that enters it is ever *removed*. What decides whether it can be **erased** is
+whether a key ring is configured — without one the bytes are permanent for the
+life of the store, and with one they are ciphertext whose key `erase_case`
+destroys.
 
-| Data | Where it lands | Erasable |
-|---|---|---|
-| Run input | journal — `RunAdmitted.input`, verbatim | **no** |
-| **Model prompts** | journal — inside `EffectStarted.descriptor.args`, verbatim, because the prompt is part of effect identity | **no** |
-| **Tool call arguments** | journal — same field, same reason | **no** |
-| Effect outputs — completions, tool results | journal — `EffectDone.output`, verbatim | **no** |
-| Case state writes, status changes, deadline transitions | journal (the effect) **and** the case store | sealed in both, under the same per-case scope |
-| Inbound event payloads — a counterparty's message body | journal (the awaited effect's output) **and** the event store | sealed in both; the buffer's copy is its own erasure unit, keyed `(source, id)` |
-| Human task proposals — `Justification.proposed_action`, the exact thing a reviewer is shown | journal (the task effect) **and** the task store | sealed in both; the task's `summary` stays readable so a queue stays usable |
-| Memory item content | `MemoryStore` | **yes** — `forget`, `forget_cascading`, expiry sweep; and unreadable everywhere with `EncryptedMemoryStore` |
-| Blob bytes — `cx.store_blob`, fetched media | blob store | **yes** — expiry leaves a tombstone; and unreadable everywhere with `EncryptedBlobs` |
-| Blob digest and classification | journal | no, and it does not need to be — a digest is not the bytes |
+The **Erasable** column below is therefore two answers, and the difference is
+one builder call:
 
-**The rule this forces: keep erasable personal data out of the chain.** Put the
-bytes in a blob and let the journal commit to the digest:
+| Data | Where it lands | Erasable without `.keyring(..)` | with it |
+|---|---|---|---|
+| Run input | journal — `RunAdmitted.input` | **no**, verbatim | sealed, per-case scope |
+| **Model prompts** | journal — inside `EffectStarted.descriptor.args`, because the prompt is part of effect identity | **no**, verbatim | sealed, per-case scope |
+| **Tool call arguments** | journal — same field, same reason | **no**, verbatim | sealed, per-case scope |
+| Effect outputs — completions, tool results | journal — `EffectDone.output` | **no**, verbatim | sealed, per-case scope |
+| Case state writes, status changes, deadline transitions | journal (the effect) **and** the case store | **no** in the journal; the case store's copy is overwritten, not erased | sealed in both, one scope |
+| Inbound event payloads — a counterparty's message body | journal (the awaited effect's output) **and** the event store | **no** | sealed in both; the buffer's copy is its own unit, keyed `(source, id)` |
+| Human task proposals — `Justification.proposed_action`, the exact thing a reviewer is shown | journal (the task effect) **and** the task store | **no** | sealed in both; the task's `summary` stays readable so a queue stays usable |
+| Memory item content | `MemoryStore` | **yes** — `forget`, `forget_cascading`, expiry sweep | unreadable everywhere with an explicit `EncryptedMemoryStore` wrap — **not** covered by `.keyring(..)`, see below |
+| Blob bytes — `cx.store_blob`, fetched media | blob store | **yes** — expiry leaves a tombstone, in the live store only | unreadable everywhere, backups included |
+| Correlation keys, deadline names, task summaries, statuses | case / task store | no, and deliberately — they are what the store is asked questions *about* | unchanged: still readable |
+| Blob digest and classification | journal | no, and it does not need to be — a digest is not the bytes | unchanged |
+
+Read the first column as the floor and the second as what one call buys. Both
+are honest positions: a deployment that would rather **refuse** the data than
+seal it declares `max_sensitivity_journaled` and never reaches this table.
+
+**Without a key ring the rule is: keep erasable personal data out of the
+chain.** Put the bytes in a blob and let the journal commit to the digest:
 
 ```rust
 let digest = cx.store_blob(document_bytes).await?;  // erasable, linked to the case
@@ -62,7 +72,7 @@ spec:
 Absent means unbounded, which is what every deployment had before the field
 existed.
 
-**Or seal the journal itself.** `SealedJournal::wrap(store, keys)` seals the
+**Or seal the journal itself.** `SealedJournal::wrap(store, keys, tenant)` seals the
 payload fields — run input, effect arguments (prompts, tool calls) and effect
 outputs — under the same per-case scope `erase_case` already destroys, so a
 single erasure reaches blobs and journal alike:
@@ -84,6 +94,22 @@ seals it just the same. The decorators (`SealedJournal`, `SealedCases`,
 but a plane should not need four correct decisions where one will do: a
 control that can be forgotten four times is one where forgetting looks exactly
 like remembering.
+
+**Governed memory is the one store this call leaves alone, and the exclusion
+is forced rather than an oversight.** `EncryptedMemoryStore` serialises subject
+erasure against writes and legal-hold changes with a **process-local** mutex,
+so it holds its contract on a single-writer deployment and nowhere else.
+Wrapping it automatically would hand that adapter to an active-active
+`PostgreSQL` plane, where the mutex coordinates nothing and the hold race it
+exists to prevent is the result — a control that is worse than absent, because
+it reads as present. Its erasure unit differs too: `tenant/memory/<subject>`
+outlives every case, so `erase_case` was never the act that reaches it. Wrap it
+where you can see the deployment:
+
+```rust
+let memories = EncryptedMemoryStore::new_single_node(inner, Arc::clone(&keys), tenant.clone());
+Runtime::builder(store).memory(Arc::new(memories)).keyring(keys).build()
+```
 
 Two properties make it worth having rather than merely present. Only the
 *payload* is sealed: `seq`, `run`, `case`, `effect_key` and the record's own

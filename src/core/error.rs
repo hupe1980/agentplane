@@ -263,6 +263,20 @@ pub enum SkillError {
     #[error(transparent)]
     Step(#[from] StepError),
 
+    /// A tool call could not be prepared: the tool is not in the operator's
+    /// catalogue, or the arguments do not match what it declared.
+    ///
+    /// Here so that `?` works on `ToolCall::prepare`, which is the second thing
+    /// the getting-started page teaches and the first thing every skill that
+    /// touches the world does. Without it the published snippet did not compile
+    /// — *the trait `From<ToolError>` is not implemented for `SkillError`* — and
+    /// every real caller wrote the same
+    /// `.map_err(|e| SkillError::Other(e.to_string()))` incantation, which
+    /// throws the typed error away and leaves three copies of one decision.
+    /// A skill-facing operation deserves a skill-facing conversion.
+    #[error(transparent)]
+    Tool(#[from] crate::tools::ToolError),
+
     #[error("{0}")]
     Other(String),
 }
@@ -463,16 +477,23 @@ pub enum PolicyError {
     ///
     /// Distinct from [`EgressCeiling`](Self::EgressCeiling), and the
     /// distinction is the whole point: egress asks *may this leave*, this asks
-    /// *may this be written down forever*. The journal is append-only and its
-    /// rows are not encrypted, so an argument recorded there — a prompt, a
-    /// tool call's arguments — outlives deletion and outlives destroying a
-    /// wrapping key. A deployment with an erasure obligation declares the
-    /// ceiling and gets a refusal at dispatch instead of an impossibility at
-    /// the erasure request.
+    /// *may this be written down forever*. The journal is append-only, so an
+    /// argument recorded there — a prompt, a tool call's arguments — is never
+    /// removed. A deployment with an erasure obligation has two answers and
+    /// this ceiling is the first: **refuse** the data at dispatch, rather than
+    /// meet an impossibility at the erasure request. The second is to **seal**
+    /// it — `RuntimeBuilder::keyring` puts payloads under a per-case key that
+    /// `erase_case` destroys — and the two compose: a deployment may seal
+    /// everything and still refuse the classes it would rather never hold.
+    ///
+    /// The message names both, because a reader who has configured a key ring
+    /// and then meets this refusal would otherwise conclude the seal is not
+    /// working.
     #[error(
         "sensitivity {actual:?} exceeds the journal ceiling {ceiling:?} for sink \
-         '{sink}' — the journal is append-only and unencrypted, so this argument \
-         could never be erased. Put the bytes in a blob and pass the digest"
+         '{sink}' — the journal is append-only, so this argument could not be \
+         removed afterwards. Put the bytes in a blob and pass the digest, or \
+         configure a key ring so payloads are sealed under a key erasure destroys"
     )]
     JournalCeiling {
         sink: String,

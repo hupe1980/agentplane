@@ -29,6 +29,15 @@ jobs:
       # Zola fails the build on a broken internal link, which is the check the
       # prose most often gets wrong.
       - run: cd site && zola build
+
+      # Every `agentplane = "X.Y"` the site tells a reader to write is a version
+      # crates.io can actually resolve. Checked here rather than in `ci` because
+      # this is the boundary where the claim becomes public: `release.yml` fires
+      # on a tag and this workflow fires on any `site/**` push, so nothing
+      # otherwise orders "publish the crate" before "publish the page that tells
+      # people to depend on it". Skips itself if the index is unreachable — a
+      # docs deploy must not fail on somebody else's outage.
+      - run: ./tools/check-published.sh
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site/public

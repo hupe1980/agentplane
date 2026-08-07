@@ -189,7 +189,7 @@ confidence.
 | Field | Default | Notes |
 |---|---|---|
 | `max_sensitivity_egress` | unbounded | `public`, `internal`, `confidential`, `secret`. Combined with each sink's own ceiling at dispatch; the **stricter** wins. |
-| `max_sensitivity_journaled` | unbounded | The highest sensitivity an argument may reach an effect **whose arguments the journal records**. Egress asks *may this leave*; this asks *may this be written down forever*, and the journal is append-only and unencrypted. Refused at dispatch, before anything is recorded. |
+| `max_sensitivity_journaled` | unbounded | The highest sensitivity an argument may reach an effect **whose arguments the journal records**. Egress asks *may this leave*; this asks *may this be written down forever*, and a record is never removed from an append-only chain. Refused at dispatch, before anything is recorded. It is the *refuse it* answer to that question; `.keyring(..)` is the *seal it* answer, and a deployment may take either or both → [erasure and keys](@/docs/erasure.md). |
 | `max_delegation_depth` | role-dependent | Checked against the configured identity *and* against every delegating sink, including in-plane `commission`. |
 
 ## `spec.capabilities`

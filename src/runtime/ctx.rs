@@ -1713,11 +1713,13 @@ impl<'a> StepCtx<'a> {
         // What may be *written down* is a different question from what may
         // leave, and it is the one that decides whether a run's personal data
         // can ever be erased: this effect's canonical arguments are about to
-        // enter an append-only, unencrypted chain, where they outlive both
-        // deletion and the destruction of any wrapping key. Checked here,
-        // before the announcement, so the refusal costs nothing — and absent
-        // by default, because every deployment before this field had no
-        // ceiling and silence must not start refusing their traffic.
+        // enter an append-only chain, where no record is ever removed. This is
+        // the *refuse it* half; `RuntimeBuilder::keyring` is the *seal it* half,
+        // and they compose — a sealed record is still a record, and a key ring
+        // is still an operational dependency, so a deployment may want both.
+        // Checked here, before the announcement, so the refusal costs nothing —
+        // and absent by default, because every deployment before this field had
+        // no ceiling and silence must not start refusing their traffic.
         #[cfg(feature = "manifest")]
         if let Some(journal_ceiling) = self
             .manifest

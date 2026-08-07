@@ -669,16 +669,22 @@ pub struct Security {
     ///
     /// A different question from [`max_sensitivity_egress`](Self::max_sensitivity_egress),
     /// and the one that decides whether personal data in a run can ever be
-    /// erased. The journal is append-only and its rows are not encrypted, so an
-    /// argument recorded there — a model prompt, a tool call's arguments — is
-    /// permanent: beyond deletion, and beyond destroying a wrapping key. Egress
-    /// asks *may this leave*; this asks *may this be written down forever*.
+    /// erased. The journal is append-only, so an argument recorded there — a
+    /// model prompt, a tool call's arguments — is never removed. Egress asks
+    /// *may this leave*; this asks *may this be written down forever*.
+    ///
+    /// This is the **refuse it** answer. The **seal it** answer is
+    /// `RuntimeBuilder::keyring`, which puts the same payloads under a per-case
+    /// data key that `erase_case` destroys, reaching every copy including
+    /// backups. They compose rather than compete: a sealed deployment may still
+    /// declare a ceiling for the classes it would rather never hold at all,
+    /// since a sealed record is still a record and a key ring is still an
+    /// operational dependency.
     ///
     /// Absent means unbounded, which is the behaviour every deployment had
-    /// before this field existed. Setting it makes the permanent mistake a
-    /// refusal at dispatch rather than a discovery at an erasure request:
-    /// bytes above the ceiling belong in a blob, with the chain committing to
-    /// the digest.
+    /// before this field existed. Setting it makes the mistake a refusal at
+    /// dispatch rather than a discovery at an erasure request: bytes above the
+    /// ceiling belong in a blob, with the chain committing to the digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sensitivity_journaled: Option<Sensitivity>,
     /// How far authority may be re-delegated. Checked both against the runtime's

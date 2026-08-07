@@ -8,9 +8,27 @@
 # not compile is the worst first impression a crate can make, and it is exactly
 # the kind of rot that sets in silently after an API change.
 #
-# Only the *complete* blocks are checked: fragments that illustrate one call
-# have no imports and are not meant to stand alone. The rule is the file's, not
-# a guess — a block qualifies when it carries its own `use` lines.
+# Which blocks are checked, stated as what the code below actually does rather
+# than as a rule it does not implement. This comment used to claim "a block
+# qualifies when it carries its own `use` lines", and nothing enforced that: the
+# assembler picked exactly two blocks by searching for `impl Skill` and
+# `Runtime::builder`. The tool-call block carries `use` lines, was therefore
+# believed covered, and was not — it shipped for a while with `ToolCall::prepare(..)?`
+# in a function returning `SkillError`, which does not compile. A checker whose
+# comment overstates its own reach is worse than a narrower one, because it is
+# the reason nobody looks again.
+#
+# Three blocks are checked, each named by a marker unique to it:
+#
+#   * the skill        (`impl Skill`)      — self-contained
+#   * the wiring       (`Runtime::builder`) — self-contained
+#   * the tool call    (`ToolCall::prepare`) — a *fragment*, compiled inside a
+#     function that supplies its three free names. That coupling is deliberate
+#     and narrow: the harness states the contract in one place, and a page that
+#     renames one of them fails here rather than in a reader's editor.
+#
+# Anything else on the page is prose-adjacent illustration and is not compiled.
+# Adding a block does not silently add coverage — say so here, or it has none.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -100,23 +118,76 @@ root, work = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 gs = (root / "site/content/docs/getting-started.md").read_text()
 blocks = re.findall(r"```rust\n(.*?)```", gs, flags=re.S)
 
-skill = next(b for b in blocks if "impl Skill" in b)
-wiring = next(b for b in blocks if "Runtime::builder" in b)
+def one(marker):
+    """The single block carrying `marker`, or a loud failure.
 
-uses = "\n".join(l for l in wiring.splitlines() if l.startswith("use "))
-body = "\n".join("    " + l for l in wiring.splitlines() if not l.startswith("use "))
+    `next(...)` would silently take the first of several, which is how a page
+    that grows a second `Runtime::builder` block starts checking the wrong one.
+    """
+    found = [b for b in blocks if marker in b]
+    if len(found) != 1:
+        sys.exit(
+            f"REFUSED: expected exactly one getting-started block containing "
+            f"{marker!r}, found {len(found)}. Update this harness rather than "
+            f"letting it check whichever one comes first."
+        )
+    return found[0]
+
+skill = one("impl Skill")
+wiring = one("Runtime::builder")
+tool_call = one("ToolCall::prepare")
+
+
+def split_uses(block):
+    uses = "\n".join(l for l in block.splitlines() if l.startswith("use "))
+    body = "\n".join(l for l in block.splitlines() if not l.startswith("use "))
+    return uses, body
+
+
+wiring_uses, wiring_body = split_uses(wiring)
+tool_uses, tool_body = split_uses(tool_call)
+
+# The fragment's three free names are supplied as parameters so the block itself
+# is compiled **verbatim**. Rewriting it to fit would check a different program
+# from the one the page publishes, which is the failure mode a snippet harness
+# exists to prevent.
+#
+# The fragment lives in its own module so its `use` lines are compiled as the
+# page writes them without colliding with the skill block's — two snippets on
+# one page legitimately import the same name, and rewriting either to avoid that
+# would check a program the page does not publish.
+tool_fn = "\n".join("        " + l for l in tool_body.splitlines())
+tool_mod_uses = "\n".join("    " + l for l in tool_uses.splitlines())
+main_fn = "\n".join("    " + l for l in wiring_body.splitlines())
 
 (work / "src/main.rs").write_text(f"""{skill}
 
-{uses}
+{wiring_uses}
+
+/// The tool-call fragment, verbatim, with the three names the page leaves to the reader.
+#[allow(dead_code, unused_variables, unused_imports)]
+mod governed_tool_call {{
+{tool_mod_uses}
+    use serde_json::json;
+
+    pub async fn call(
+        cx: &mut agentplane::runtime::StepCtx<'_>,
+        client: std::sync::Arc<dyn agentplane::tools::ToolClient>,
+        model_written_memo: agentplane::core::Tainted<serde_json::Value>,
+    ) -> Result<(), agentplane::core::SkillError> {{
+{tool_fn}
+        let _ = result;
+        Ok(())
+    }}
+}}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {{
-{body}
+{main_fn}
     Ok(())
 }}
 """)
-print("assembled the getting-started skill + wiring")
+print("assembled the getting-started skill + wiring + tool call")
 PY
 
 cd "$WORK"

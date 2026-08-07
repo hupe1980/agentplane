@@ -4004,6 +4004,28 @@ impl RuntimeBuilder {
     /// shaped unit for keys would let the two disagree about what an erasure
     /// covered.
     ///
+    /// It also seals the stores the plane holds — the journal's payloads, case
+    /// state, task proposals and buffered event payloads — at
+    /// [`build`](Self::build), so the order they were registered in cannot lose
+    /// the guarantee — a store registered after this call is sealed just the
+    /// same.
+    ///
+    /// **Governed memory is the one store this does not reach.**
+    /// [`EncryptedMemoryStore`](crate::keyring::EncryptedMemoryStore)
+    /// serialises subject erasure against writes and legal-hold changes with a
+    /// process-local mutex, so it holds its contract on a single-writer
+    /// deployment and nowhere else; wrapping it here would hand that adapter to
+    /// an active-active `PostgreSQL` plane, where the mutex coordinates nothing
+    /// and the hold race it exists to prevent is the result. Its erasure unit
+    /// is `tenant/memory/<subject>` and outlives every case, so `erase_case`
+    /// was never the act that reaches it either. Wrap it yourself, where the
+    /// deployment's topology is visible:
+    ///
+    /// ```ignore
+    /// let memories = EncryptedMemoryStore::new_single_node(inner, keys.clone(), tenant.clone());
+    /// Runtime::builder(store).memory(Arc::new(memories)).keyring(keys).build()
+    /// ```
+    ///
     /// Without one, bytes are stored as given and erasure remains deletion.
     #[cfg(feature = "keyring")]
     #[must_use]
@@ -4028,14 +4050,22 @@ impl RuntimeBuilder {
     /// would cover only the stores registered so far, so `keyring(..)` before
     /// `cases(..)` would silently seal less than `keyring(..)` after it. An
     /// enforcement a reordering can lose is one a reformatter can delete.
+    ///
+    /// Every decorator is handed `self.tenant` rather than reading a name back
+    /// out of the store it wraps, so all four derive the erasure scope from one
+    /// value. `keyring()`'s own documentation names the one store deliberately
+    /// left out, and why.
     #[cfg(feature = "keyring")]
     fn seal_stores(&mut self) {
         let Some(keys) = self.keyring.clone() else {
             return;
         };
         let tenant = self.tenant.clone();
-        self.store =
-            crate::keyring::SealedJournal::wrap(Arc::clone(&self.store), Arc::clone(&keys));
+        self.store = crate::keyring::SealedJournal::wrap(
+            Arc::clone(&self.store),
+            Arc::clone(&keys),
+            tenant.clone(),
+        );
         if let Some(cases) = self.cases.take() {
             self.cases = Some(crate::keyring::SealedCases::wrap(
                 cases,

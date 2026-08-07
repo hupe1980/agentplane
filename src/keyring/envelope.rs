@@ -84,7 +84,17 @@ pub(super) async fn open(
     }
     let (len_bytes, rest) = envelope.split_at(4);
     let len = u32::from_be_bytes(len_bytes.try_into().unwrap_or([0; 4])) as usize;
-    if rest.len() < len + NONCE {
+    // `checked_add`, not `+`. The length is attacker-shaped — an envelope is
+    // read back from a store, a backup, or a restored replica — and `len` can
+    // be up to `u32::MAX`. A plain add is a debug panic and a release wrap on a
+    // 32-bit target, and the wrap makes the bounds check *pass*, so `split_at`
+    // below panics on the next line instead. A parser for untrusted bytes that
+    // aborts the process is a denial of service, and this crate forbids unsafe
+    // precisely so that failures stay recoverable.
+    let needed = len
+        .checked_add(NONCE)
+        .filter(|needed| rest.len() >= *needed);
+    if needed.is_none() {
         return Err(KeyError::Refused(
             "the envelope is shorter than its own header claims".to_owned(),
         ));

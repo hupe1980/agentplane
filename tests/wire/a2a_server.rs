@@ -2517,3 +2517,115 @@ async fn a_peer_cannot_smuggle_a_reply_envelope_through_untrusted_output() {
         "the answer should be projected as ordinary data: {parts:?}"
     );
 }
+
+/// A skill that declares its own reply: two artifacts, from **trusted** output.
+///
+/// `Outcome::done` over a trusted label is what makes the projection
+/// instruction authority rather than a proposal — the same distinction the
+/// smuggling test above holds from the other side.
+#[derive(Debug)]
+struct DeclaresTwoArtifacts;
+
+#[async_trait::async_trait]
+impl Skill for DeclaresTwoArtifacts {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("declares").provides("settlement.check")
+    }
+
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let reply = agentplane::api::a2a::A2aReply::artifacts(vec![
+            vec![agentplane::api::a2a::Part::text("the finding")],
+            vec![agentplane::api::a2a::Part::data(json!({ "ref": "SET-42" }))],
+        ]);
+        Ok(Outcome::done(Tainted::trusted(reply.into_value())))
+    }
+}
+
+/// **The positive half of `A2aReply`, which did not exist.** A skill that
+/// declares its answer's shape gets that shape on the wire, and several
+/// artifacts stay several.
+///
+/// Every other `A2aReply` test asserts a *refusal* — that a peer cannot choose
+/// the envelope its own reply arrives in. That is the important half and it is
+/// not the only half: with only refusals on the record, making `of_output`
+/// return `None` unconditionally leaves the whole declared-reply feature
+/// silently absent while the suite stays green, because "the reply was not
+/// applied" is exactly what the refusal tests assert. Checked by mutation
+/// rather than believed: `A2aReplyNeverApplies` in `tools/mutants.py` breaks it
+/// on purpose, and before this test nothing failed.
+///
+/// The **plural** constructor is the one exercised, deliberately. The singular
+/// `artifact` is the path the TCK example takes, so it has interoperability
+/// evidence; `artifacts` had no caller anywhere in the repository, and the
+/// thing a second artifact can get wrong — sharing the first one's
+/// `artifactId`, which makes two results read as one revised result — is
+/// invisible at a count of one.
+#[tokio::test]
+async fn a_skill_declares_several_artifacts_and_they_arrive_as_several() {
+    let manifest = Manifest::parse(ONE_SKILL).expect("parse");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .skill(DeclaresTwoArtifacts)
+        .build();
+    let router = A2aServer::new(
+        rt,
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("wired")
+    .router();
+
+    let (status, body) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({
+                "message": {
+                    "messageId": "m-declared",
+                    "role": "ROLE_USER",
+                    "parts": [{ "text": "settle it" }],
+                }
+            }),
+            Some("peer"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let artifacts = body["result"]["task"]["artifacts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the declared reply produced no artifacts: {body}"));
+    assert_eq!(
+        artifacts.len(),
+        2,
+        "a declared two-artifact reply collapsed on the wire: {artifacts:?}"
+    );
+
+    // The parts arrived in the declared shape, in the declared order — not
+    // merely in the declared number.
+    assert_eq!(
+        artifacts[0]["parts"][0]["text"], "the finding",
+        "{artifacts:?}"
+    );
+    assert_eq!(
+        artifacts[1]["parts"][0]["data"]["ref"], "SET-42",
+        "{artifacts:?}"
+    );
+
+    // Distinct ids, because A2A identifies an artifact by `artifactId` and a
+    // client that keys on it would treat two shared ids as one artifact
+    // revised — silently discarding a result rather than failing.
+    let ids: Vec<&str> = artifacts
+        .iter()
+        .map(|a| a["artifactId"].as_str().expect("an artifactId"))
+        .collect();
+    assert_ne!(ids[0], ids[1], "two artifacts share one id: {ids:?}");
+}

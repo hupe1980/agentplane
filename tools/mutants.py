@@ -3306,6 +3306,16 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if self.spec.execution.is_some() && self.spec.capabilities.provides.len() > 1 {",
         "        if false {",
     ),
+    "A2aReplyNeverApplies": (
+        "src/api/a2a.rs",
+        "a_skill_declares_several_artifacts_and_they_arrive_as_several",
+        "a skill's declared reply is never honoured, so `A2aReply` silently "
+        "stops shaping the answer — and every test that existed asserted a "
+        "*refusal* to honour one, so the whole feature could go missing with a "
+        "green suite",
+        "        if output.label().is_untrusted() {",
+        "        if true {",
+    ),
     "ATaskProposalIsNotSealed": (
         "src/keyring/tasks.rs",
         "a_task_proposal_is_sealed_in_the_worklist",
