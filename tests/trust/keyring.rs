@@ -707,3 +707,215 @@ async fn case_state_is_sealed_and_erasing_the_case_takes_it() {
     // Still listable and closable: a completed erasure is not an outage.
     assert_eq!(after.id, case);
 }
+
+/// **The composed claim, checked.** One `erase_case` makes every copy of a
+/// case's data unreadable — blobs, the journal's payloads, and the case
+/// store's state — while the hash chain still verifies.
+///
+/// Each decorator is tested alone above. This is the one that matters to a
+/// deployer, because it is the sentence the documentation actually makes:
+/// *one erasure reaches every copy*. Composition is where that kind of claim
+/// breaks — three mechanisms sharing a scope only work if they really do share
+/// it, and nothing but this test says they do.
+#[tokio::test]
+async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
+    use agentplane::blob::{BlobStore, MemoryBlobs};
+    use agentplane::case::CaseStore;
+    use agentplane::core::{CorrelationKey, Digest, Label, RunId, TenantId, Timestamp};
+    use agentplane::journal::{Append, JournalStore, Record, RecordKind, payload};
+    use agentplane::keyring::{EncryptedBlobs, SealedCases, SealedJournal};
+
+    let tenant = TenantId::default();
+    let keys = Arc::new(MemoryKeyRing::default());
+    let ring = Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>;
+    let raw = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+
+    let cases_plain: Arc<dyn CaseStore> = Arc::clone(&raw) as Arc<dyn CaseStore>;
+    let cases = SealedCases::wrap(Arc::clone(&cases_plain), Arc::clone(&ring), tenant.clone());
+    let journal = SealedJournal::wrap(Arc::clone(&raw) as Arc<dyn JournalStore>, Arc::clone(&ring));
+
+    let at = Timestamp::from_unix_timestamp(1_760_000_000).expect("time");
+    let case = cases
+        .correlate_or_open("claim", &[CorrelationKey::new("claim", "CLM-42")], at)
+        .await
+        .expect("open")
+        .case_id();
+
+    // Case state.
+    let opened_case = cases.case(case).await.expect("read").expect("exists");
+    cases
+        .put_state(
+            case,
+            opened_case.version,
+            serde_json::json!({ "claimant": "Ada Lovelace" }),
+        )
+        .await
+        .expect("state");
+
+    // A journal record bound to that case.
+    let run = RunId::generate();
+    let lease = journal
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    journal
+        .append(
+            lease.epoch,
+            vec![
+                Append::new(
+                    run,
+                    RecordKind::RunAdmitted {
+                        capability: "claim.assess".into(),
+                        governed_by: None,
+                        input_label: Label::trusted(),
+                        input: serde_json::json!({ "claimant": "Ada Lovelace" }),
+                        policy_bundle: None,
+                    },
+                )
+                .case(case),
+            ],
+        )
+        .await
+        .expect("append");
+
+    // A blob, linked to the case the way `cx.store_blob` links it.
+    let blobs = EncryptedBlobs::new(
+        Arc::new(MemoryBlobs::default()) as Arc<dyn BlobStore>,
+        Arc::clone(&ring),
+        agentplane::keyring::scope(&tenant, &case.to_string()),
+    );
+    let digest = blobs
+        .put(b"Ada Lovelace, 12 Acacia Avenue")
+        .await
+        .expect("blob");
+    cases_plain.link_blob(case, digest, at).await.expect("link");
+
+    // Everything readable before.
+    assert_eq!(
+        cases.case(case).await.expect("r").expect("e").state["claimant"],
+        "Ada Lovelace"
+    );
+    assert!(blobs.get(digest).await.is_ok());
+
+    // ── One erasure ─────────────────────────────────────────────────────────
+    agentplane::blob::erase_case(
+        &blobs,
+        cases_plain.as_ref(),
+        Some(ring.as_ref()),
+        &tenant,
+        case,
+        at,
+        "subject exercised the right to erasure",
+    )
+    .await
+    .expect("erase");
+
+    // Blob bytes: gone.
+    assert!(
+        blobs.get(digest).await.is_err(),
+        "the blob survived the erasure"
+    );
+    // Case state: sealed shut.
+    let after = cases.case(case).await.expect("r").expect("e");
+    assert!(
+        payload::is_sealed(&after.state),
+        "case state survived the erasure: {}",
+        after.state
+    );
+    // Journal payload: sealed shut, through the store that holds the ring.
+    let records = journal.read(run, 1).await.expect("read");
+    match records[0].kind() {
+        RecordKind::RunAdmitted { input, .. } => assert!(
+            payload::is_sealed(input),
+            "the journal payload survived the erasure: {input}"
+        ),
+        other => panic!("unexpected record: {other:?}"),
+    }
+
+    // ── And the history still proves itself ─────────────────────────────────
+    let stored = raw.read(run, 1).await.expect("raw");
+    Record::verify_chain(&stored, Digest::ZERO)
+        .expect("the erasure destroyed the tamper evidence along with the data");
+}
+
+/// A buffered event's payload is sealed — including the dead-letter copy,
+/// which is the one that outlives everything.
+///
+/// The erasure unit is the **event**, not the case, and that is forced rather
+/// than chosen: an event is buffered before any subscription matches it, and
+/// one that is never claimed becomes a dead letter, which by definition
+/// matched no case at all. `(source, id)` — the pair the buffer already
+/// deduplicates on — is the finest unit an erasure request about one message
+/// could name.
+#[tokio::test]
+async fn a_buffered_event_payload_is_sealed_and_erasable_on_its_own() {
+    use agentplane::case::EventStore;
+    use agentplane::core::{InboundEvent, TenantId, Timestamp};
+    use agentplane::journal::payload;
+    use agentplane::keyring::SealedEvents;
+
+    let plain: Arc<dyn EventStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let keys = Arc::new(MemoryKeyRing::default());
+    let tenant = TenantId::default();
+    let sealed = SealedEvents::wrap(
+        Arc::clone(&plain),
+        Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
+        tenant.clone(),
+    );
+
+    let at = Timestamp::from_unix_timestamp(1_760_000_000).expect("time");
+    let event = InboundEvent {
+        source: "bank.example".to_owned(),
+        id: "MSG-7".to_owned(),
+        kind: "payment.settled".to_owned(),
+        correlation: vec![agentplane::core::CorrelationKey::new("claim", "NOBODY")],
+        payload: serde_json::json!({ "payer": "Ada Lovelace", "amount": 4200 }),
+    };
+    assert!(sealed.buffer(&event, at).await.expect("buffer"));
+
+    // Nobody claims it, so it ages into the dead-letter list — the copy that
+    // persists indefinitely for an operator to find the wrong key by.
+    sealed
+        .sweep_unclaimed(
+            Timestamp::from_unix_timestamp(1_760_009_999).expect("time"),
+            "nobody was waiting",
+        )
+        .await
+        .expect("sweep");
+
+    // Through the wrapper: the operator can read it, which is the point of
+    // keeping dead letters at all.
+    let letters = sealed.dead_letters(10).await.expect("dead letters");
+    assert_eq!(letters.len(), 1);
+    assert_eq!(letters[0].event.payload["payer"], "Ada Lovelace");
+
+    // In the store: sealed, and the name is not in the bytes.
+    let raw = plain.dead_letters(10).await.expect("raw");
+    assert!(
+        payload::is_sealed(&raw[0].event.payload),
+        "an event payload reached the buffer in the clear: {}",
+        raw[0].event.payload
+    );
+    assert!(!raw[0].event.payload.to_string().contains("Lovelace"));
+    // The dedup identity and match keys stay readable, or the buffer could
+    // neither deduplicate nor match.
+    assert_eq!(raw[0].event.source, "bank.example");
+    assert_eq!(raw[0].event.kind, "payment.settled");
+
+    // One message, one scope: erasing this event erases exactly it.
+    keys.destroy(
+        &agentplane::keyring::scope(&tenant, "event/bank.example/MSG-7"),
+        at,
+        "subject exercised the right to erasure",
+    )
+    .await
+    .expect("destroy");
+    let after = sealed.dead_letters(10).await.expect("dead letters");
+    assert!(
+        payload::is_sealed(&after[0].event.payload),
+        "the payload opened after its key was destroyed"
+    );
+    // Still listed, so the wrong-correlation-key signal survives the erasure.
+    assert_eq!(after[0].event.id, "MSG-7");
+}

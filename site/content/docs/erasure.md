@@ -26,7 +26,7 @@ them either. Whatever enters the chain is permanent for the life of the store.
 | **Tool call arguments** | journal — same field, same reason | **no** |
 | Effect outputs — completions, tool results | journal — `EffectDone.output`, verbatim | **no** |
 | Case state writes, status changes, deadline transitions | journal (the effect) **and** the case store | sealed in both, under the same per-case scope |
-| Inbound event payloads — a counterparty's message body | journal (the awaited effect's output) **and** the event store | sealed in the journal; **plaintext in the event store** |
+| Inbound event payloads — a counterparty's message body | journal (the awaited effect's output) **and** the event store | sealed in both; the buffer's copy is its own erasure unit, keyed `(source, id)` |
 | Human task proposals — `Justification.proposed_action`, the exact thing a reviewer is shown | journal (the task effect) **and** the task store | sealed in both; the task's `summary` stays readable so a queue stays usable |
 | Memory item content | `MemoryStore` | **yes** — `forget`, `forget_cascading`, expiry sweep; and unreadable everywhere with `EncryptedMemoryStore` |
 | Blob bytes — `cx.store_blob`, fetched media | blob store | **yes** — expiry leaves a tombstone; and unreadable everywhere with `EncryptedBlobs` |
@@ -71,6 +71,7 @@ single erasure reaches blobs and journal alike:
 let store = SealedJournal::wrap(store, keys);
 let cases = SealedCases::wrap(cases, keys, tenant);   // the case store's own copy
 let tasks = SealedTasks::wrap(tasks, keys, tenant);  // the worklist's copy
+let events = SealedEvents::wrap(events, keys, tenant); // the buffer's copy
 ```
 
 Two properties make it worth having rather than merely present. Only the
@@ -81,14 +82,31 @@ and the chain keep working with no key at all. And the chain commits to the
 run whose payloads have been erased — hashing the plaintext would have tied
 the tamper evidence to the key and destroyed both together.
 
-What stays plaintext is **event payloads** in the event store. That one is not
-an oversight but an open question: an event is buffered *before* any
-subscription matches it, so at write time it belongs to no case — and the
-erasure unit everything else here uses is the case. Sealing events under the
-tenant instead would give at-rest protection while leaving `erase_case` unable
-to reach them, which is exactly the two-mechanisms-disagreeing shape the rest
-of this page avoids. Until that is settled, an event payload is journaled
-(sealed) and buffered (plaintext until claimed).
+**Events are the one thing not erased by the case, and that is forced.** An
+event is buffered *before* any subscription matches it, and one nobody claims
+becomes a **dead letter** — which by definition matched no case at all, and is
+kept indefinitely so an operator can find the wrong correlation key. There is
+no case to erase it with. So the event is its own unit, scoped by the
+`(source, id)` pair the buffer already deduplicates on, which is the finest
+granularity a request about one message could ask for:
+
+```rust
+keys.destroy(&scope(&tenant, "event/bank.example/MSG-7"), at, reason).await?;
+```
+
+Its *delivered* copy is a separate matter and already covered: claiming an
+event journals the payload under the awaiting effect, sealed under that run's
+case like every other journal payload.
+
+**The composed claim is tested, not merely asserted.** *One erasure reaches
+every copy* is a sentence about three mechanisms sharing one scope, and
+composition is where that kind of claim breaks — each decorator can be correct
+alone while sealing under a scope `erase_case` never destroys, which would
+report a successful erasure over readable data. A test wires all of it
+together, erases the case once, and asserts blobs, journal payloads and case
+state are all unreadable afterwards while the hash chain still verifies. A
+mutation that gives the case store a *different* scope is caught by that test
+and by nothing else.
 
 Correlation keys, deadline names, task summaries and statuses stay readable
 everywhere by design — they are what the stores are asked questions *about*.

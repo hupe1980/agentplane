@@ -215,6 +215,9 @@ mod envelope;
 mod cases;
 pub use cases::SealedCases;
 
+mod events;
+pub use events::SealedEvents;
+
 mod tasks;
 pub use tasks::SealedTasks;
 

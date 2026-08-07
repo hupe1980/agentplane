@@ -3315,6 +3315,24 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        sealed.justification.proposed_action = payload::wrap(&envelope);",
         "        let _ = &envelope;",
     ),
+    "AnEventPayloadIsNotSealed": (
+        "src/keyring/events.rs",
+        "a_buffered_event_payload_is_sealed_and_erasable_on_its_own",
+        "a buffered event payload is written in the clear, so a counterparty's "
+        "message stays readable in the dead-letter list that keeps it "
+        "indefinitely",
+        "        sealed.payload = payload::wrap(&envelope);",
+        "        let _ = &envelope;",
+    ),
+    "SealedCasesUseADifferentScope": (
+        "src/keyring/cases.rs",
+        "one_erasure_reaches_every_copy_and_the_chain_still_verifies",
+        "case state is sealed under a scope `erase_case` does not destroy, so "
+        "an erasure reports success and leaves the case's own state readable "
+        "— the two-mechanisms-disagreeing failure, silent by construction",
+        "        super::scope(&self.tenant, &case.to_string())",
+        "        super::scope(&self.tenant, &format!(\"cases/{case}\"))",
+    ),
     "CaseStateIsNotSealed": (
         "src/keyring/cases.rs",
         "case_state_is_sealed_and_erasing_the_case_takes_it",
