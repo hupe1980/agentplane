@@ -750,6 +750,12 @@ fn step_ctx_methods(root: &Path) -> std::collections::BTreeSet<String> {
 /// exist; it does not demand that every method be documented, because a page
 /// choosing what to teach is editorial and a guard that forced completeness
 /// would be answered by a table nobody reads.
+///
+/// One hazard comes with it: **prose describing this guard is scanned by it.**
+/// The status page's own row for this check cited two invented names as
+/// examples and failed the build. Describe the check without writing the
+/// literal call forms — the alternative is exempting a page, which would let
+/// real drift hide on whichever page carries the exemption.
 #[test]
 fn every_documented_step_ctx_method_exists() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -849,5 +855,97 @@ fn every_documented_step_ctx_method_exists() {
         "a page publishes a StepCtx method that does not exist, so a reader \
          copying it gets a compile error:\n  {}",
         bad.join("\n  ")
+    );
+}
+
+/// Every field the manifest reference tabulates is a field the parser knows.
+///
+/// The YAML-block guards above run published *examples* through the real
+/// parser, so a stale field inside a fenced block fails loudly. A stale field
+/// in a **table** fails nowhere: the reference's field-by-field tables are
+/// prose to every tool in the toolchain, and `deny_unknown_fields` means a
+/// reader who copies a renamed one gets a hard parse failure rather than a
+/// warning. That is the same shape as the `StepCtx` table next door, which
+/// shipped three method names that did not exist.
+///
+/// One-directional, for the same reason: it refuses a documented field that
+/// is gone, and does not demand that every field be tabulated.
+#[test]
+fn every_tabulated_manifest_field_exists() {
+    let source = read("src/manifest/mod.rs");
+
+    let mut real: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        // Struct fields as serde sees them: the declared name, plus any
+        // `rename` that changes what the YAML actually says.
+        if line.starts_with("    pub ")
+            && let Some(rest) = trimmed.strip_prefix("pub ")
+            && let Some((name, _)) = rest.split_once(':')
+            && name
+                .chars()
+                .all(|c| c.is_lowercase() || c.is_numeric() || c == '_')
+        {
+            real.insert(name.to_owned());
+        }
+        if let Some(at) = trimmed.find("rename = \"") {
+            let rest = &trimmed[at + 10..];
+            if let Some((name, _)) = rest.split_once('"') {
+                real.insert(name.to_owned());
+            }
+        }
+    }
+    assert!(
+        real.len() > 40,
+        "only {} manifest fields were found — the module moved and this guard \
+         is now inert",
+        real.len()
+    );
+
+    let page = read("site/content/docs/manifest.md");
+    let mut checked = 0usize;
+    let mut bad: Vec<String> = Vec::new();
+    for (n, line) in page.lines().enumerate() {
+        // A field row: the first cell is a single backticked identifier. A
+        // dotted path (`spec.tools[].ref`) is checked on its last segment,
+        // which is the part the parser names.
+        let Some(rest) = line.strip_prefix("| `") else {
+            continue;
+        };
+        let Some((cell, _)) = rest.split_once('`') else {
+            continue;
+        };
+        if !cell
+            .chars()
+            .all(|c| c.is_lowercase() || c.is_numeric() || "_.[]".contains(c))
+        {
+            continue;
+        }
+        let leaf = cell
+            .rsplit('.')
+            .next()
+            .unwrap_or(cell)
+            .trim_end_matches("[]");
+        checked += 1;
+        if !real.contains(leaf) {
+            bad.push(format!(
+                "manifest.md:{}: `{cell}` is not a manifest field",
+                n + 1
+            ));
+        }
+    }
+
+    assert!(
+        checked > 20,
+        "only {checked} field rows were found — the reference's tables changed \
+         shape and this guard is now inert"
+    );
+    assert!(
+        bad.is_empty(),
+        "the manifest reference tabulates a field the parser does not know, so \
+         a reader copying it gets a `deny_unknown_fields` failure:\n  {}\n  \
+         (checked against {} fields in src/manifest/mod.rs)",
+        bad.join("\n  "),
+        real.len()
     );
 }
