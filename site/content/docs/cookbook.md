@@ -1801,8 +1801,33 @@ Schema output with forced-tool fallback and exact reasoning-content
 continuation. It streams through `ConverseStream` by default and classifies
 partial failures according to whether generation and usage were observed;
 `.buffered()` is explicit. Region, stream mode, timeout and schema mode are in
-effect identity. Explicit `reasoning_effort` is refused because Converse has no
-portable mapping across its model families.
+effect identity.
+
+Explicit `reasoning_effort` is refused by default, because Converse has no
+portable mapping across its model families — one envelope covers Anthropic's
+adaptive thinking, Amazon Nova's `reasoningConfig`, and several families with no
+such control at all. Say which family this driver instance serves and it stops
+guessing:
+
+```rust
+let nova = Bedrock::from_env("us-east-1")
+    .await?
+    .reasoning(ReasoningDialect::Nova);   // us.amazon.nova-2-lite-v1:0
+```
+
+That renders a declared effort as Nova 2 documents it —
+`additionalModelRequestFields.reasoningConfig`, with `type: enabled` and a
+`maxReasoningEffort` of `low`, `medium` or `high` — on the buffered *and*
+streaming paths, and puts the dialect in the request profile so switching it is
+replay divergence rather than a quiet change in what governed the call.
+
+Two edges worth knowing. `ReasoningEffort::None` sends `type: disabled` rather
+than nothing, so *this call must not reason* is on the record. And `minimal`,
+`xhigh` and `max` are **refused** — Nova has three levels, and collapsing a
+request into the nearest one is a substitution nothing downstream could see.
+
+Nova models are Bedrock models, so there is no separate Nova driver to reach
+for.
 
 Attach an `Arc<dyn ModelStreamObserver>` with
 `ModelCall::streaming_to(observer)` to expose live visible text while retaining

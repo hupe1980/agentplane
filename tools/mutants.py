@@ -3306,6 +3306,33 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if self.spec.execution.is_some() && self.spec.capabilities.provides.len() > 1 {",
         "        if false {",
     ),
+    "NovaEffortIsCollapsedNotRefused": (
+        "src/model/bedrock.rs",
+        "nova_refuses_an_effort_it_has_no_counterpart_for",
+        "an effort Nova cannot express is folded into the nearest level it can, "
+        "so a run declaring `max` is answered at `high` — a substitution on a "
+        "digest-covered value whose whole purpose is to describe what governed "
+        "the call, and which nothing downstream can see",
+        '                    E::Minimal | E::XHigh | E::Max => {',
+        '                    E::Minimal => "low",\n'
+        '                    E::XHigh | E::Max => "high",\n'
+        '                    #[allow(unreachable_patterns)]\n'
+        '                    _ => {',
+    ),
+    "NovaReasoningNeverReachesTheWire": (
+        "src/model/bedrock.rs",
+        "nova_reasoning_effort_is_rendered_the_way_aws_documents_it",
+        "a declared reasoning effort is accepted and then dropped, so Bedrock "
+        "answers without extended thinking while the journal records the effort "
+        "as applied — the manifest's control becoming advisory, silently",
+        '                Ok(Some(document_from_json(&json!({\n'
+        '                    "reasoningConfig": { "type": "enabled", "maxReasoningEffort": level },\n'
+        "                }))))",
+        "                {\n"
+        "                    let _ = level;\n"
+        "                    Ok(None)\n"
+        "                }",
+    ),
     "A2aReplyNeverApplies": (
         "src/api/a2a.rs",
         "a_skill_declares_several_artifacts_and_they_arrive_as_several",

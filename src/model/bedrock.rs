@@ -151,6 +151,58 @@ pub struct Bedrock {
     /// in the request profile, so it is digest-covered and replay-visible, and
     /// an intervention is a **metered refusal** rather than an answer.
     guardrail: Option<Guardrail>,
+    /// Which model family's reasoning dialect this driver instance speaks.
+    ///
+    /// Absent by default, and absent means *refuse* — see
+    /// [`ReasoningDialect`].
+    reasoning: Option<ReasoningDialect>,
+}
+
+/// How a Bedrock model family spells "think harder".
+///
+/// Converse is a **provider-neutral** envelope over a model zoo that does not
+/// agree on this: Anthropic takes adaptive thinking, Nova 2 takes a
+/// `reasoningConfig` in `additionalModelRequestFields`, and several families
+/// have no such control at all. There is therefore no mapping this driver can
+/// derive from a Converse request, which is why an undeclared dialect refuses
+/// rather than guessing — silently sending a different effort than the one the
+/// manifest declared would make a digest-covered control advisory.
+///
+/// It is **declared, never sniffed from the model id**. Cross-region inference
+/// profiles prefix the id (`us.amazon.nova-2-lite-v1:0`), a substring match
+/// would bind behaviour to a naming convention AWS owns, and this crate already
+/// refuses to decide a control by matching on a string elsewhere. One driver
+/// instance therefore serves one family, exactly as a guardrail does.
+///
+/// The choice is in the **request profile**, so it is effect identity: moving a
+/// deployment from one dialect to another is replay divergence rather than a
+/// quiet change in what governed the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReasoningDialect {
+    /// Amazon Nova 2's extended thinking.
+    ///
+    /// Rendered as `additionalModelRequestFields.reasoningConfig`, with
+    /// `type: "enabled"` and `maxReasoningEffort` of `low`, `medium` or `high`
+    /// — the three levels AWS documents and the only three it accepts.
+    ///
+    /// [`ReasoningEffort::None`](crate::model::ReasoningEffort::None) sends
+    /// `type: "disabled"`, which is Nova's own default and is *not* the same as
+    /// sending nothing: it is a deployment stating that this call must not
+    /// reason, and stating it puts the fact in the journal.
+    ///
+    /// `Minimal`, `XHigh` and `Max` are **refused**, because Nova has no
+    /// counterpart and collapsing them into `low` or `high` is the silent
+    /// substitution this seam exists to prevent. That is the same rule the
+    /// Anthropic driver follows for the levels adaptive thinking cannot
+    /// express.
+    ///
+    /// One constraint AWS documents is satisfied here by construction: Nova
+    /// refuses `temperature`, `topP` and `topK` alongside `maxReasoningEffort:
+    /// "high"`, and this driver has never sent any of them — sampling
+    /// parameters are absent from the request profile, so they cannot be part
+    /// of effect identity, so they are not sent.
+    Nova,
 }
 
 /// Which Bedrock guardrail to apply, and whether to ask for its trace.
@@ -262,6 +314,7 @@ impl Bedrock {
             schema_mode: SchemaMode::Native,
             stream: true,
             guardrail: None,
+            reasoning: None,
         }
     }
 
@@ -278,6 +331,93 @@ impl Bedrock {
     pub fn guardrail(mut self, guardrail: Guardrail) -> Self {
         self.guardrail = Some(guardrail);
         self
+    }
+
+    /// Declare which model family's reasoning dialect this driver speaks.
+    ///
+    /// Without it, a request carrying a `reasoning_effort` is **refused**:
+    /// Converse is one envelope over families that spell reasoning differently
+    /// or not at all, so there is nothing for this driver to derive. See
+    /// [`ReasoningDialect`] for why it is declared rather than read off the
+    /// model id, and for which efforts each dialect can carry faithfully.
+    ///
+    /// The dialect enters [`ModelProvider::request_profile`], so changing it is
+    /// replay divergence rather than a quiet change in what governed the call.
+    #[must_use]
+    pub const fn reasoning(mut self, dialect: ReasoningDialect) -> Self {
+        self.reasoning = Some(dialect);
+        self
+    }
+
+    /// The `additionalModelRequestFields` this call's reasoning effort needs.
+    ///
+    /// `None` when the request asked for no reasoning at all, which is the
+    /// ordinary case and must send nothing — an empty `reasoningConfig` is not
+    /// the same request as no `reasoningConfig`.
+    ///
+    /// Built once and handed to **both** request paths. The guardrail above is
+    /// the precedent and the reason: a control rendered separately on the
+    /// buffered and streaming paths is one where only the half nobody exercises
+    /// is wrong, and a `stream: true` deployment loses it silently.
+    ///
+    /// # Errors
+    ///
+    /// If no dialect is declared, or the declared one cannot carry this effort
+    /// faithfully.
+    fn reasoning_config(
+        &self,
+        model: &ModelId,
+        effort: Option<super::ReasoningEffort>,
+    ) -> Result<Option<Document>, ModelError> {
+        use super::ReasoningEffort as E;
+
+        let Some(effort) = effort else {
+            return Ok(None);
+        };
+        let Some(dialect) = self.reasoning else {
+            return Err(Self::refused(
+                model,
+                "Bedrock Converse has no provider-neutral reasoning-effort mapping, because one \
+                 envelope covers families that spell reasoning differently or not at all. \
+                 Declare which one this driver speaks — `Bedrock::from_client(..).reasoning(\
+                 ReasoningDialect::Nova)` — rather than having the driver guess and silently \
+                 change the effort the manifest declared",
+            ));
+        };
+        match dialect {
+            ReasoningDialect::Nova => {
+                // Refused rather than collapsed. Nova documents exactly three
+                // levels, and folding `Max` into `high` would answer a request
+                // for the most thorough reasoning available with the third of
+                // three — a substitution nothing downstream could see, on a
+                // value that is digest-covered and therefore claims to describe
+                // what actually governed the call.
+                let level = match effort {
+                    E::None => {
+                        return Ok(Some(document_from_json(
+                            &json!({ "reasoningConfig": { "type": "disabled" } }),
+                        )));
+                    }
+                    E::Low => "low",
+                    E::Medium => "medium",
+                    E::High => "high",
+                    E::Minimal | E::XHigh | E::Max => {
+                        return Err(Self::refused(
+                            model,
+                            format!(
+                                "Amazon Nova extended thinking has no counterpart for reasoning \
+                                 effort '{}' — it accepts low, medium and high. Declare one of \
+                                 those, or none to disable reasoning explicitly",
+                                effort.as_str()
+                            ),
+                        ));
+                    }
+                };
+                Ok(Some(document_from_json(&json!({
+                    "reasoningConfig": { "type": "enabled", "maxReasoningEffort": level },
+                }))))
+            }
+        }
     }
 
     /// Bound the complete Converse operation.
@@ -507,6 +647,7 @@ impl Bedrock {
         max_tokens: i32,
         tools: Option<ToolConfiguration>,
         output_config: Option<OutputConfig>,
+        reasoning_config: Option<Document>,
         schema: Option<&Value>,
         observer: Option<(&dyn super::ModelStreamObserver, &crate::core::Label)>,
     ) -> Result<Completion, ModelError> {
@@ -526,7 +667,8 @@ impl Bedrock {
             // Both paths, or the control is one a `stream: true` deployment
             // silently loses — the same rule written twice is the shape where
             // only the half nobody exercises is wrong.
-            .set_guardrail_config(self.guardrail.as_ref().map(Guardrail::stream_config));
+            .set_guardrail_config(self.guardrail.as_ref().map(Guardrail::stream_config))
+            .set_additional_model_request_fields(reasoning_config);
         if let Some(system) = prompt.get("system") {
             let text = system.as_str().ok_or_else(|| {
                 Self::refused(model, "Bedrock's system instruction must be a string")
@@ -798,6 +940,14 @@ impl ModelProvider for Bedrock {
                 "id": g.identifier,
                 "version": g.version,
             })),
+            // Identity for the same reason the guardrail is. The dialect
+            // decides how a declared `reasoning_effort` is rendered, so moving
+            // a deployment from one to another changes what governed the call
+            // — and a replay of history written under the old one reports
+            // divergence rather than answering under the new.
+            "reasoning_dialect": self.reasoning.map(|d| match d {
+                ReasoningDialect::Nova => "nova",
+            }),
         })
     }
 
@@ -814,13 +964,7 @@ impl ModelProvider for Bedrock {
             stream,
         } = request;
         super::refuse_provider_side_media(prompt, model)?;
-        if reasoning_effort.is_some() {
-            return Err(Self::refused(
-                model,
-                "Bedrock Converse has no provider-neutral reasoning-effort mapping; configure a \
-                 model-specific Bedrock driver rather than silently changing the requested effort",
-            ));
-        }
+        let reasoning_config = self.reasoning_config(model, reasoning_effort)?;
         let max_tokens = i32::try_from(max_output_tokens)
             .map_err(|_| Self::refused(model, "max_output_tokens exceeds Bedrock's i32 limit"))?;
         let messages = Self::messages(model, prompt, exchanges, continuation)?;
@@ -835,6 +979,7 @@ impl ModelProvider for Bedrock {
                     max_tokens,
                     tools,
                     output_config,
+                    reasoning_config,
                     schema,
                     stream,
                 )
@@ -858,7 +1003,8 @@ impl ModelProvider for Bedrock {
             // Both paths, or the control is one a `stream: true` deployment
             // silently loses — the same rule written twice is the shape where
             // only the half nobody exercises is wrong.
-            .set_guardrail_config(self.guardrail.as_ref().map(Guardrail::config));
+            .set_guardrail_config(self.guardrail.as_ref().map(Guardrail::config))
+            .set_additional_model_request_fields(reasoning_config);
         if let Some(system) = prompt.get("system") {
             let text = system.as_str().ok_or_else(|| {
                 Self::refused(model, "Bedrock's system instruction must be a string")
@@ -1435,6 +1581,7 @@ mod tests {
                 // one are the same to a reader and different to a digest, so
                 // the profile states the answer rather than omitting it.
                 "guardrail": Value::Null,
+                "reasoning_dialect": Value::Null,
             })
         );
 
@@ -1444,6 +1591,156 @@ mod tests {
                 .buffered()
                 .request_profile(&ModelId::new("bedrock", "m")),
             "buffered and streamed Bedrock requests reused one effect identity"
+        );
+    }
+
+    fn stub_driver() -> Bedrock {
+        let config = aws_sdk_bedrockruntime::Config::builder()
+            .region(Region::new("eu-west-1"))
+            .behavior_version_latest()
+            .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
+                |_req| http::Response::builder().status(200).body("").unwrap(),
+            ))
+            .build();
+        Bedrock::from_client(Client::from_conf(config), "eu-west-1")
+    }
+
+    /// **Nova's reasoning dialect, rendered exactly as AWS documents it.**
+    ///
+    /// The shape is a known answer taken from Amazon's own Nova 2 extended-thinking
+    /// page, not from a round trip through this driver: `reasoningConfig` with a
+    /// `type` and a `maxReasoningEffort` of `low`, `medium` or `high`. A round
+    /// trip would agree with itself under any spelling at all, including a wrong
+    /// one, and Bedrock answers a misspelled `additionalModelRequestFields` key
+    /// by **ignoring it** — so the failure mode this pins is a deployment that
+    /// declared `high` effort, was billed for none, and had nothing on the record
+    /// to say so.
+    #[test]
+    fn nova_reasoning_effort_is_rendered_the_way_aws_documents_it() {
+        use super::super::ReasoningEffort as E;
+
+        let nova = stub_driver().reasoning(ReasoningDialect::Nova);
+        let model = ModelId::new("bedrock", "us.amazon.nova-2-lite-v1:0");
+
+        for (effort, expected) in [(E::Low, "low"), (E::Medium, "medium"), (E::High, "high")] {
+            let document = nova
+                .reasoning_config(&model, Some(effort))
+                .expect("a documented level maps")
+                .expect("an effort produces a config");
+            assert_eq!(
+                json_from_document(&document),
+                json!({ "reasoningConfig": { "type": "enabled", "maxReasoningEffort": expected } }),
+                "the {} level did not render as AWS documents it",
+                effort.as_str()
+            );
+        }
+
+        // `None` is a *statement*, not an omission: a deployment saying this
+        // call must not reason. Sending `disabled` puts that on the wire and in
+        // the journal; sending nothing would be indistinguishable from a
+        // deployment that never considered the question.
+        assert_eq!(
+            json_from_document(
+                &nova
+                    .reasoning_config(&model, Some(E::None))
+                    .expect("none maps")
+                    .expect("none is still a config")
+            ),
+            json!({ "reasoningConfig": { "type": "disabled" } })
+        );
+
+        // No effort asked for sends nothing at all. An empty `reasoningConfig`
+        // is a different request from no `reasoningConfig`.
+        assert!(
+            nova.reasoning_config(&model, None)
+                .expect("no effort is not an error")
+                .is_none()
+        );
+    }
+
+    /// **An effort Nova cannot carry is refused, never collapsed.**
+    ///
+    /// The positive half above would pass with a mapping that folded every
+    /// unknown level into `high` — and that mapping is the defect, because
+    /// `reasoning_effort` is digest-covered: it claims to describe what governed
+    /// the call. Answering a request for `max` with the third of three levels is
+    /// a substitution nothing downstream can see, on the one value that exists
+    /// to be seen.
+    ///
+    /// Same rule as the Anthropic driver, which refuses the levels adaptive
+    /// thinking cannot express rather than approximating them.
+    #[test]
+    fn nova_refuses_an_effort_it_has_no_counterpart_for() {
+        use super::super::ReasoningEffort as E;
+
+        let nova = stub_driver().reasoning(ReasoningDialect::Nova);
+        let model = ModelId::new("bedrock", "us.amazon.nova-2-lite-v1:0");
+
+        for effort in [E::Minimal, E::XHigh, E::Max] {
+            let error = nova
+                .reasoning_config(&model, Some(effort))
+                .expect_err("an effort Nova cannot express must be refused");
+            let text = error.to_string();
+            assert!(
+                text.contains(effort.as_str()) && text.contains("low, medium and high"),
+                "the refusal must name the effort and the levels that exist: {text}"
+            );
+        }
+    }
+
+    /// **An undeclared dialect still refuses, and the message says what to do.**
+    ///
+    /// The blanket refusal is the pre-existing behaviour and must survive:
+    /// Converse is one envelope over families that spell reasoning differently
+    /// or not at all, so a driver with no declared dialect has nothing to derive
+    /// and guessing is the failure. What changed is only that there is now a way
+    /// to answer it, and the message names that way.
+    #[test]
+    fn an_undeclared_dialect_refuses_rather_than_guessing() {
+        let plain = stub_driver();
+        let model = ModelId::new("bedrock", "m");
+        let text = plain
+            .reasoning_config(&model, Some(super::super::ReasoningEffort::Medium))
+            .expect_err("no dialect must refuse")
+            .to_string();
+        assert!(
+            text.contains("ReasoningDialect::Nova"),
+            "a refusal that does not name the remedy leaves the reader stuck: {text}"
+        );
+    }
+
+    /// **The dialect is effect identity, on both request paths.**
+    ///
+    /// Two properties, and the guardrail above is the precedent for each. The
+    /// dialect decides how a declared effort is rendered, so switching it
+    /// changes what governed the call and a replay of older history must report
+    /// divergence rather than answering under the new rendering. And the config
+    /// is built once and handed to `converse` and `converse_stream` alike,
+    /// because a control applied on one path only is one a `stream: true`
+    /// deployment silently loses.
+    #[test]
+    fn the_reasoning_dialect_is_effect_identity_and_reaches_both_paths() {
+        let model = ModelId::new("bedrock", "us.amazon.nova-2-lite-v1:0");
+        let plain = stub_driver();
+        let nova = stub_driver().reasoning(ReasoningDialect::Nova);
+
+        assert_eq!(
+            plain.request_profile(&model)["reasoning_dialect"],
+            Value::Null
+        );
+        assert_eq!(nova.request_profile(&model)["reasoning_dialect"], "nova");
+        assert_ne!(
+            plain.request_profile(&model),
+            nova.request_profile(&model),
+            "a driver that renders reasoning differently shared one effect identity"
+        );
+
+        // Buffered and streamed differ only in `stream`, so the dialect must
+        // survive that difference — the streaming path takes the config as an
+        // argument rather than rebuilding it, and this is what says so.
+        assert_eq!(
+            nova.clone().buffered().request_profile(&model)["reasoning_dialect"],
+            nova.request_profile(&model)["reasoning_dialect"],
         );
     }
 

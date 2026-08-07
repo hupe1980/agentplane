@@ -1945,8 +1945,13 @@ Details worth stating:
   provider profile. Access, validation and not-found errors are refusals;
   throttling and model-not-ready are retryable. Stream failures are
   `Unavailable` before generation, `Unaccounted` after generation without usage,
-  and `Interrupted` once usage is known. A universal reasoning-effort mapping
-  remains refused rather than guessed across model families.
+  and `Interrupted` once usage is known. A *universal* reasoning-effort mapping
+  remains refused rather than guessed across model families; a **declared** one
+  is rendered. `.reasoning(ReasoningDialect::Nova)` names the family a driver
+  instance serves and sends Amazon Nova 2 extended thinking as
+  `additionalModelRequestFields.reasoningConfig` — declared rather than read off
+  the model id, in the request profile so switching it is divergence, and
+  refusing the levels Nova has no counterpart for rather than collapsing them.
 
 * **Live deltas are labelled projections, not replay truth.** An optional
   `ModelStreamObserver` receives visible text and terminal usage while the
