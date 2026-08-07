@@ -211,11 +211,11 @@ recorded-value wrapper, and calendar resolution. None crosses a boundary.
 `Trusted` opts an effect out of the taint gate, the egress ceiling, *and* the
 refusal to replan on untrusted data — all at once, and silently.
 
-### The hole this closed
+### Why the label is not the author's to supply
 
-`cx.effect()` used to return a bare value. Every guarantee downstream of the
-label therefore depended on the skill author wrapping the result correctly — and
-the runtime's own fixtures wrapped tool results in `Tainted::trusted(..)`.
+`cx.effect()` returns a **labelled** value, not a bare one. Were it bare, every
+guarantee downstream of the label would rest on the skill author wrapping the
+result correctly — and `Tainted::trusted(..)` is the easy thing to write.
 
 That has a consequence worth being blunt about: **the refusal to replan on
 untrusted data was implemented, tested, and unfalsifiable.** Deleting it would

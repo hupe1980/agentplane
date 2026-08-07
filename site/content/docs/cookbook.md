@@ -579,8 +579,8 @@ that disagrees with itself. Those SDKs also derive the description from code,
 which is right when code is the declaration. Here the manifest is the reviewed,
 content-addressed declaration, so model-steering prose belongs there instead.
 
-`.toolbox(..)` is one call because it used to be three, and two of them were
-optional. It derives the catalogue from each agent's own declaration — the
+`.toolbox(..)` is one call rather than three, two of them optional. It derives
+the catalogue from each agent's own declaration — the
 grants, their ceilings and their protected fields, stated once — and it
 **refuses to build** if the tools this binary implements and the manifests a
 reviewer approved have drifted **in either direction**: a tool implemented but

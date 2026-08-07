@@ -55,6 +55,19 @@ Read those five lines slowly, because they are the product:
 cargo add agentplane
 ```
 
+**Check what you got.** The MSRV is **1.94.1**, and the patch component is the
+part that bites: a workspace declaring `rust-version = "1.94"` does not fail
+against it. Cargo silently resolves an *older* agentplane and says so in a line
+that is easy to lose in a build log:
+
+```
+warning: ignoring agentplane@0.6.0 (which requires rustc 1.94.1)
+         to maintain <your crate>'s rust-version of 1.94
+```
+
+The first sign is that the API does not match this page. `cargo tree -p
+agentplane` says which version you have; declare `1.94.1` in your own manifest.
+
 Deliberately not a version number to copy. The version a reader should depend on
 is the latest **published** one, which is a fact this repository does not hold —
 `Cargo.toml` carries the version being *developed*, and the two differ for as

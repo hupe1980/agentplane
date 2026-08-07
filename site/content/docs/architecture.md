@@ -309,9 +309,8 @@ of them stops.
 
 **Every success is recorded before the stop is reported.** A sibling that
 completed and mutated must be compensated, and `completed` is exactly what the
-unwind reverses. The first version of concurrent dispatch returned on the first
-non-success in ready order, which discarded later siblings' completions — their
-effects had been performed and would never be undone.
+unwind reverses. Returning on the first non-success in ready order would discard
+later siblings' completions — effects performed and never undone.
 
 **Severity beats ready order.** A suspension is the run working; a failure is the
 run over. If one sibling suspends on an approval and another fails after
@@ -468,10 +467,10 @@ took that exemption while leaving something standing is exactly the member the
 unwind would miss.
 
 **Nor can a mutation happen beside the group rather than inside it.** The
-footprint used to bound members only, so a skill holding an open group could
-reach the world through the ordinary effect path — journaled, gated and
-metered like anything else, and no member: no reversal registered, and still
-standing after an unwind that settled `Aborted`, which claims the world was
+footprint bounds the ambient surface, not only members. A skill holding an open
+group must not reach the world through the ordinary effect path — journaled,
+gated and metered like anything else, and no member: no reversal registered, and
+still standing after an unwind that settled `Aborted`, which claims the world was
 taken back whole. A mutating effect dispatched while a group is open is now
 refused unless it is a member's own dispatch. Reads are untouched, because a
 read leaves nothing to take back.
@@ -621,9 +620,8 @@ seq | kind              | effect_key | prev_hash | hash
 
 A run that reaches a conclusion appends a `RunSealed` record, so how a run
 ended is covered by tamper detection and a resumed run reads its own outcome
-from the history it just verified. Sealing used to write only to a side table,
-which meant "is this run finished?" had to be inferred from the last step that
-happened to finish — see below.
+from the history it just verified. A side table alone could not answer *is this
+run finished?* without inferring it from the last step that happened to finish.
 
 A conclusion is not always a closure. Only conclusions nothing may resume —
 `succeeded`, `quarantined`, `cancelled` — **seal**: the journal freezes (the
@@ -1408,9 +1406,9 @@ checked by deriving effect keys under both builds and diffing.
 
 Two consequences worth keeping:
 
-* **`tests/guards/layering.rs` no longer looks for `indexmap` in the lockfile.** That
-  question stopped being answerable the moment a legitimate dependency wanted the
-  feature. It now checks what would actually undo the fix: no code outside
+* **`tests/guards/layering.rs` does not look for `indexmap` in the lockfile.** That
+  question is unanswerable once a legitimate dependency wants the feature. It
+  checks what would actually undo the fix: no code outside
   `canon` may call `serde_json::to_vec`, because with `preserve_order` on such a
   call takes insertion order into a hash.
 * **CI runs the suite under default features *and* `--all-features`.** They are
@@ -1432,11 +1430,10 @@ Every other outward call this crate makes either happens or does not. A model
 call has a third state: it ran, generated four hundred tokens, and the stream
 died. The provider bills those tokens. The answer is unusable.
 
-The runtime used to charge `Spend::default()` on every failure. The comment said
-"a failed call still occupied a call", which is true and counts against
-`max_effects` — but the *token and cost* ceilings, the ones that exist to bound
-runaway spend, counted zero. A retry loop against a flaky provider would burn real
-money against a limit reading nothing.
+Charging `Spend::default()` on a failure counts the call against `max_effects`
+and counts **zero** against the token and cost ceilings — the ones that exist to
+bound runaway spend. A retry loop against a flaky provider would then burn real
+money against a limit reading nothing, so a failure is billed for what it burned.
 
 So `EffectError::Metered` carries what was consumed, the ledger charges it on the
 failure path, and `EffectFailed` records it — because without the record a
@@ -1454,13 +1451,13 @@ A refusal *before* generation — bad request, unknown model, rate limit — is
 `DidNotHappen` and costs nothing. Rate limiting is the one case in this crate
 where retrying is unambiguously safe.
 
-### A note on the test that nearly wasn't
+### Why the budget fixture calls twice
 
-The budget test originally used a fixture that made exactly one call, because an
-interrupted stream is `Landed` and therefore never retried. It passed with the
-billing reverted. The fixture now does what a real skill would — swallow the
-failure and ask again with a reworded prompt — so the second call is refused by
-the ceiling the first call's tokens consumed.
+A fixture making exactly one call passes whether or not the failure is billed,
+because an interrupted stream is `Landed` and therefore never retried. The
+fixture does what a real skill would — swallow the failure and ask again with a
+reworded prompt — so the second call is refused by the ceiling the first call's
+tokens consumed.
 
 ## Calling other agents
 
@@ -1681,9 +1678,9 @@ the invariant for the one route nobody would think to check.
 | anything else | `-32601`, method not found |
 
 **Blocking is the default, and unset means blocking** — the spec's rule. A
-successful blocking call returns the skill output as a text or data artifact;
-the old status-only completed Task discarded the answer and was not useful to
-an interoperable client.
+successful blocking call returns the skill output as a text or data artifact; a
+status-only completed Task would discard the answer and be useless to an
+interoperable client.
 `configuration.returnImmediately` switches to returning as soon as the task
 exists, leaving the caller to poll `GetTask`. Admission still happens before
 either returns: the policy gate, the lease and the admission records are written
@@ -1704,8 +1701,8 @@ operator schedules on each instance.
 **Parts are a oneof.** Exactly one of text, data, raw, or URL must be present.
 This server advertises text and JSON data; raw and URL file parts are refused as
 unsupported before a skill runs, and a declared `mediaType` must agree with the
-chosen member. Inbound messages must have `ROLE_USER`. Previously unknown file
-fields or server-role messages could be accepted as ordinary input.
+chosen member. Inbound messages must have `ROLE_USER`, so an unknown file field
+or a server-role message is refused rather than accepted as ordinary input.
 
 **Context continues with a new task; task input continues the same run.** A
 message carrying only `contextId` opens another immutable run in the same case.
@@ -2515,9 +2512,9 @@ something the agent was built to do; a manifest refusal is the agent doing
 something its own reviewed declaration never mentioned, which is a defect in the
 code rather than a tightening of the rules.
 
-There are no review-only security fields. Architectural injection-pattern labels
-were removed because arbitrary native skill code cannot be proven to follow one;
-keeping the label would manufacture confidence. `spec.output.schema` is carried
+There are no review-only security fields, and no architectural injection-pattern
+label: arbitrary native skill code cannot be proven to follow one, and such a
+label would manufacture confidence. `spec.output.schema` is carried
 to the provider and into the effect key, but is not validated a second time
 against a result.
 
@@ -2604,8 +2601,8 @@ whose outputs changed. `spec.models` puts the provider and model in the digest.
 The role names remain part of the allowlist and digest: a hand-written skill can
 route untrusted material to a separately declared quarantined model. The
 manifest does not claim that this architecture occurred. That would require
-proving the conduct of arbitrary native code, so the former `security.pattern`
-label was removed instead of being left as review-only intent.
+proving the conduct of arbitrary native code, so there is no `security.pattern`
+label rather than a review-only one.
 
 `models: {}` declares **no inference at all** — a rules-only agent is a
 legitimate design, and saying so out loud distinguishes it from one whose model
@@ -2677,9 +2674,9 @@ claiming one capability, and two skills sharing one name. Both are wiring
 mistakes with no recovery, so both are refused at startup rather than discovered
 at dispatch.
 
-The manifest does **not** describe an injection architecture. The former pattern
-field was removed because arbitrary native skill code cannot be proven to follow
-it; a security label without an enforcement point is worse than no label.
+The manifest does **not** describe an injection architecture. There is no
+pattern field, because arbitrary native skill code cannot be proven to follow
+one, and a security label without an enforcement point is worse than no label.
 
 It also does not set the lease **owner**. That identifies a process, and several
 instances of one agent are normal — see [operations](@/docs/operations.md).
@@ -2698,10 +2695,9 @@ says what it actually said, including the system prompt, which is inside it. A
 run served by a skill registered directly on the plane records `None`, which is a
 different answer from "governed by something nobody wrote down".
 
-The record names the capability separately, in a field called `capability`. It
-previously held one under the name `agent`, which read as an identity and was
-not — the stringly-typed mistake, in the one record where *who did this* is the
-question being asked.
+The record names the capability separately, in a field called `capability`.
+Naming it `agent` would read as an identity and not be one — the stringly-typed
+mistake, in the one record where *who did this* is the question being asked.
 
 The registry is built around three no-rewrite guarantees, and they are not
 redundant:
@@ -2795,11 +2791,11 @@ on an effect that was *safe* to repeat, failing in doubt on its final attempt,
 with no rule to apply. The implementation handled it; the rules as first written
 did not.
 
-`spec/EffectProtocol.tla` originally modelled "act" and "record" as one atomic
-step. TLC explored it exhaustively and found no errors — but the one state the
-protocol exists to survive, *the action landed and the process died before
-recording it*, was unreachable, so `ExactlyOnce` was true by construction. Green,
-and worthless.
+`spec/EffectProtocol.tla` models "act" and "record" as **separate** steps. As one
+atomic step TLC explores it exhaustively and finds no errors — but the one state
+the protocol exists to survive, *the action landed and the process died before
+recording it*, is unreachable, so `ExactlyOnce` holds by construction. Green, and
+worthless.
 
 So `spec/verify.sh` runs two passes. The first checks the specs. The second
 checks the check: each spec is re-run against deliberately broken copies of
@@ -2886,8 +2882,8 @@ and this codebase shipped one: see *The hole this closed* above. Running the
 sweep the first time immediately found a second, smaller instance — a test whose
 name claimed a property its body could not exercise.
 
-`tests/guards/layering.rs` checks that every test the table names actually exists,
-because five invented names cost a full rebuild each to discover the slow way.
+`tests/guards/layering.rs` checks that every test the table names actually
+exists — an invented name otherwise costs a full rebuild to discover.
 
 ### The model and the code are pinned to each other
 

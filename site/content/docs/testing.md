@@ -28,6 +28,17 @@ cargo add --dev tokio --features macros,rt-multi-thread
 construction, **never reports a call as free**, and refuses to answer as a real
 provider — so a journal it produced can never be mistaken for a genuine one.
 
+Two things to know:
+
+**`FakeProvider::new()` returns `Arc<Self>` already.** Wrapping it again gives
+`Arc<Arc<FakeProvider>>`, whose error reads as though the type does not
+implement `ModelProvider`. Pass `Arc::clone(&provider) as Arc<dyn ModelProvider>`.
+
+**`will_say` sets the completion's *text*.** Against an agent declaring
+`output.schema`, the fake parses that text and validates it, answering
+`Unusable` for prose — the same as a real driver. Give `will_say` the JSON
+document, or use `will_answer` with `structured` set.
+
 ```rust,ignore
 use agentplane::testkit::FakeProvider;
 use agentplane::runtime::{Mode, RunStatus, Runtime};

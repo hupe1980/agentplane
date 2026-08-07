@@ -50,6 +50,17 @@ let digest = cx.store_blob(document_bytes).await?;  // erasable, linked to the c
 // The chain records the digest and the classification, never the bytes.
 ```
 
+**`cx.store_blob` is the only way a value reaches a blob, and it is
+size-independent.** There is **no size-triggered spill**: the 1 MiB
+`Record::MAX_RECORD_BYTES` ceiling *refuses* a record and names the limit, it
+does not blob for you. Anything under it is journaled inline whatever it holds.
+
+That is deliberate. A size-triggered spill would make erasability depend on how
+long a value happened to be — the same field permanent for one customer and
+erasable for another. So **references are the intended shape**, not a
+workaround: journal a digest or an identifier, and fetch details through an
+authorised tool call.
+
 Prompts are the hard case, because the prompt *is* effect identity — replay
 reconstructs a run by re-deriving the same key, so a prompt cannot be redacted
 after the fact without making the run unreplayable. A prompt built from a
@@ -207,7 +218,7 @@ case; a store held from the builder writes in the clear, and the two would
 disagree about what erasing the case erased. A run under a key ring that belongs
 to no case is refused rather than quietly unsealed.
 
-Governed media is payload too, and takes the same route — scoped to its case, or to a named external retention policy when another lifecycle controller owns those bytes. Its own write path previously reached the raw store, which is the shape of hole worth naming: everything worked, the bytes were written, the run succeeded, and the erasure was quietly partial. A guard now holds the raw store to exactly one reader.
+Governed media is payload too, and takes the same route — scoped to its case, or to a named external retention policy when another lifecycle controller owns those bytes. A guard holds the raw store to **exactly one reader**, because a second write path reaching it directly is the shape of hole worth naming: everything works, the bytes are written, the run succeeds, and the erasure is quietly partial.
 
 `erase_case` writes every tombstone first and destroys the key last. The order
 matters in one direction only: a crash between them leaves bytes that are still

@@ -1803,13 +1803,34 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        input_tokens: (len / 4).max(1),\n        output_tokens: (len / 8).max(1),",
         "        input_tokens: 0,\n        output_tokens: 0,",
     ),
+    "TheFakeIsExemptFromTheMediaRefusal": (
+        "src/testkit/fake_model.rs",
+        "the_fake_refuses_a_provider_side_media_url_like_every_driver",
+        "the fake skips the provider-side media refusal every real driver makes, "
+        "so a test proving that a caller-named URL never reaches a provider "
+        "passes without the refusal existing — and an embedder concludes the "
+        "plane permits what production refuses",
+        "        crate::model::refuse_provider_side_media(request.prompt, request.model)?;",
+        "        let _ = &request.prompt;",
+    ),
+    "TheFakeIgnoresADeclaredSchema": (
+        "src/testkit/fake_model.rs",
+        "a_declared_schema_binds_the_fake_the_way_it_binds_a_driver",
+        "the fake records `output.schema` and ignores it, so a run scripted with "
+        "prose completes and yields Null where every real driver answers "
+        "Unusable — a stub passing tests no provider could pass",
+        "            .and_then(|completion| honour_schema(completion, request.schema, request.model));",
+        "            .map(|completion| completion);",
+    ),
     "TheFakeIsNotDeterministic": (
         "src/testkit/fake_model.rs",
         "the_same_question_gets_the_same_answer",
         "the fake answers differently each call, so every replay test becomes a "
         "coin-toss that mostly passes",
         '        let scripted = self.scripted.lock().expect("fake").pop_front();\n'
-        "        let answer = scripted.unwrap_or_else(|| Ok(echo(&request)));",
+        "        let answer = scripted\n"
+        "            .unwrap_or_else(|| Ok(echo(&request)))\n"
+        "            .and_then(|completion| honour_schema(completion, request.schema, request.model));",
         '        let scripted = self.scripted.lock().expect("fake").pop_front();\n'
         "        let n = self.calls();\n"
         "        let answer = scripted.unwrap_or_else(|| {\n"

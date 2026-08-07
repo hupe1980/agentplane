@@ -261,7 +261,11 @@ async fn yaml_room(
         "agent__blog_dresearch",
         json!({ "topic": "why durable execution beats a retry loop" }),
     );
-    provider.will_say("Retries repeat work; journals replay it."); // the researcher
+    // Schema-shaped, because `room.yaml`'s researcher declares `output.schema`.
+    // The fake enforces a declared schema exactly as a real driver does, so
+    // prose here is a metered `Unusable` rather than a run that quietly yields
+    // `Null` — which is what a real provider would have done all along.
+    provider.will_say(r#"{"claims": ["Retries repeat work; journals replay it."]}"#);
     provider.will_call_tool(
         "call_draft",
         "agent__blog_ddraft",
@@ -270,7 +274,10 @@ async fn yaml_room(
             "claims": "Retries repeat work; journals replay it.",
         }),
     );
-    provider.will_say("Draft: a retry loop forgets; a journal remembers."); // the writer
+    // The writer declares `{title, body}`; the desk's own answer is free text.
+    provider.will_say(
+        r#"{"title": "Journals over retries", "body": "A retry loop forgets; a journal remembers."}"#,
+    );
     provider.will_say("Final: a retry loop forgets; a journal remembers.");
 
     let before = provider.calls();

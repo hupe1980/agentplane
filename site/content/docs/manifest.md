@@ -22,6 +22,9 @@ Two rules apply to everything below, and they are the reason the file exists:
   expensive — an unbounded budget — it is refused. Where silence is an ordinary
   wiring decision — no declared model — it is allowed.
 
+In the tables below, **required** in the Default column means there is no
+default: omitting the field is a parse error.
+
 Every manifest on this site is parsed by the crate's own validator in CI, so
 nothing here is a snippet that has never been run.
 
@@ -80,7 +83,7 @@ reaches.
 
 | Field | Default | Notes |
 |---|---|---|
-| `kind` | — | `completion`, `tool-calling` or `planned`. |
+| `kind` | **required** | `completion`, `tool-calling` or `planned`. |
 | `max_turns` | `8` | The loop's turn ceiling, and a `planned` agent's step ceiling. A ceiling, not a suggestion: a budget also stops a runaway loop, but only *after* paying for every turn. |
 
 `kind` is a closed enum on purpose. A configuration format whose behaviours are
@@ -123,9 +126,9 @@ at the field check *after* the tokens are paid for.
 | `role` | yes if the block is present | Non-empty. What the agent is for, in one line. |
 | `constraints` | no | How it must behave. Separate from `role` because the two are reviewed by different people and change on different schedules. |
 
-A `workload_id` field was removed: nothing read it, so it was an identity
-claim the runtime never checked. Workload identity is configured on the plane
-and recorded in the journal (`IdentityBound`). Same cut as
+There is no `workload_id` field: nothing would read it, so it would be an
+identity claim the runtime never checks. Workload identity is configured on the
+plane and recorded in the journal (`IdentityBound`). Same reasoning as
 `capabilities.requires`.
 
 The prompt lives here so that rewording it is a **version bump** rather than a
@@ -160,7 +163,7 @@ labelled, beside the instruction.
 |---|---|---|
 | `mode` | `single` | `single`, `collaborative` |
 | `role` | `specialist` | `specialist`, `orchestrator` |
-| `reason` | — | `parallel-disjoint`, `distinct-authority` |
+| `reason` | **required** | `parallel-disjoint`, `distinct-authority` |
 
 Three combinations are refused, and each refusal is the point:
 
@@ -205,7 +208,7 @@ otherwise: the capability never reaches the prompt, so a second name would be
 a distinction nothing executes. Two capabilities are two documents in one
 room file.
 
-A `requires` twin was removed: it was parsed and digest-covered but never enforced, and a control the runtime does not check is exactly what a reviewable file exists to eliminate. A build-time check that every required capability is available on the plane is a well-formed future control; a field that only *documents* intent belongs in prose, not beside enforced ceilings.
+There is no `requires` twin. Parsed and digest-covered but never enforced, it would be a control the runtime does not check — exactly what a reviewable file exists to eliminate. A build-time check that every required capability is available on the plane is a well-formed future control; a field that only *documents* intent belongs in prose, not beside enforced ceilings.
 
 There is no `SKILL.md`, no `kind: Skill`, and no free-form `spec.config`:
 instructions live in `identity.constraints`, on-demand references are
@@ -262,10 +265,10 @@ sub-run's reported spend is billed to the run that ordered it.
 
 | Field | Default | Notes |
 |---|---|---|
-| `ref` | — | `tool://server/name`. Transport-neutral: which transport reaches `server` is a deployment decision made by `ToolRouter`, so one manifest runs against an in-process double in a test and a real MCP server in production. |
+| `ref` | **required** | `tool://server/name`. Transport-neutral: which transport reaches `server` is a deployment decision made by `ToolRouter`, so one manifest runs against an in-process double in a test and a real MCP server in production. |
 | `mutates` | `true` | Whether calling it changes the world. The cautious default. |
 | `max_sensitivity` | `public` | The highest sensitivity this tool may be *sent*. |
-| `description` | — | What the model is told. Required for a `tool-calling` agent. In the digest, because text that steers tool selection belongs where the system prompt does. |
+| `description` | **required** | What the model is told. Required for a `tool-calling` agent. In the digest, because text that steers tool selection belongs where the system prompt does. |
 | `arguments` | derived | JSON Schema. Omit it for a typed `Tool`: the schema comes from the Rust argument type, and stating it twice is refused because a second copy can only drift. |
 | `requires_approval` | `false` | A person approves **this call**, seeing the exact tool and arguments, before it is dispatched. Needs `spec.oversight` (which supplies approvers, the obligation bounding the wait, and what happens when it closes) and `execution.kind: tool-calling`; refused without either. |
 | `protected_fields` | none | See below. |
@@ -335,9 +338,9 @@ human is in the loop when none is.
 
 | Field | Default | Notes |
 |---|---|---|
-| `approval` | — | `required` gates every answer. `tools-only` gates only the grants that set `requires_approval`, leaving the answer unattended — the shape most deployments want, since gating a tool-calling agent's *answer* is a review that arrives after the tool already ran. Neither is a predicate: *"require approval when severity is high"* is one step from an `if`. |
+| `approval` | **required** | `required` gates every answer. `tools-only` gates only the grants that set `requires_approval`, leaving the answer unattended — the shape most deployments want, since gating a tool-calling agent's *answer* is a review that arrives after the tool already ran. Neither is a predicate: *"require approval when severity is high"* is one step from an `if`. |
 | `approvers` | anyone | Roles that may decide. Empty means anyone — worth choosing on purpose rather than by omission. |
-| `deadline` | — | The obligation that bounds the wait: `{ name, kind, params }`. The agent **registers** it, which is why the declaration carries more than a name — a file-only agent writes no code, so naming an obligation nothing registers made oversight fail outright. `kind` and `params` go to the deployment's `Calendar` unchanged, so "one working day" means whatever that domain says and this crate never guesses. |
+| `deadline` | **required** | The obligation that bounds the wait: `{ name, kind, params }`. The agent **registers** it, which is why the declaration carries more than a name — a file-only agent writes no code, so naming an obligation nothing registers made oversight fail outright. `kind` and `params` go to the deployment's `Calendar` unchanged, so "one working day" means whatever that domain says and this crate never guesses. |
 | `on_expiry` | deny | What happens when the window closes. |
 | `allow_unattended` | `false` | Explicit consent required for `on_expiry: proceed`, so acting with no human is a greppable decision somebody made rather than an enum variant they picked off a list. |
 
@@ -361,9 +364,9 @@ a declared `privileged` model.
 
 | Field | Default | Notes |
 |---|---|---|
-| `subject` | — | Sharing scope. An agent-private subject names one agent; a team subject is shared by several in one tenant. A naming convention, not an ACL — access is authorized as `memory.remember`/`memory.recall`. |
-| `purpose` | — | Mandatory retrieval partition. |
-| `instruction` | — | What the extraction model is asked to record. |
+| `subject` | **required** | Sharing scope. An agent-private subject names one agent; a team subject is shared by several in one tenant. A naming convention, not an ACL — access is authorized as `memory.remember`/`memory.recall`. |
+| `purpose` | **required** | Mandatory retrieval partition. |
+| `instruction` | **required** | What the extraction model is asked to record. |
 | `max_items` | `3` | Between 1 and 10. |
 | `retention_seconds` | none | Fixed expiry. |
 | `access_retention_seconds` | none | Sliding expiry, refreshed by an explicit journaled touch. |
@@ -382,8 +385,8 @@ identifiers that are not literally present*.
 
 * **An injection-pattern label.** A manifest may name an enforced pattern only if
   the runtime builds and verifies the corresponding graph. Arbitrary skill code
-  cannot be proven to follow one, so the field was removed rather than left as
-  review-only intent.
+  cannot be proven to follow one, so there is no such field rather than a
+  review-only one.
 * **`routed`/`router` topology**, and a **`fallback`** model role — both accepted
   YAML the runtime never executed.
 * **A model-capability matrix.** Schema mode is configured per model on the

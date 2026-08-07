@@ -302,8 +302,20 @@ impl ModelProvider for FakeProvider {
         // Scoped so the guard is gone before anything else happens: a lock held
         // across a suspension is held on the thread, and this one is taken on
         // every model call in the suite.
+        // The refusal every real driver makes, made here too.
+        //
+        // A stub that skipped it would let a test build a prompt carrying a
+        // provider-side media URL — an Anthropic `source: {type: "url"}`, an
+        // OpenAI `image_url`, a Gemini `fileData.fileUri` — watch it sail
+        // through, and conclude the plane permits what production refuses. The
+        // control exists so those URLs never reach a provider's network, and a
+        // harness exempt from it is a harness that cannot prove the control.
+        crate::model::refuse_provider_side_media(request.prompt, request.model)?;
+
         let scripted = self.scripted.lock().expect("fake").pop_front();
-        let answer = scripted.unwrap_or_else(|| Ok(echo(&request)));
+        let answer = scripted
+            .unwrap_or_else(|| Ok(echo(&request)))
+            .and_then(|completion| honour_schema(completion, request.schema, request.model));
 
         // Deltas first, then the whole answer — the order a real driver
         // produces, so an observer that assumes it is exercised rather than
@@ -325,6 +337,66 @@ impl ModelProvider for FakeProvider {
         }
         answer
     }
+}
+
+/// Apply a declared schema the way a real driver does.
+///
+/// Without this the fake was the one provider in the world that ignores
+/// `output.schema`: a run scripted with [`FakeProvider::will_say`] against a
+/// schema-declaring agent completed happily and yielded `Null`, while every
+/// real driver would have answered `Unusable`. That is the precise failure a
+/// stub is supposed not to have — a test passing on behaviour no provider can
+/// produce — and it cost an adopter an afternoon before it cost us anything.
+///
+/// The rule is the drivers': provider-constrained generation is the first line,
+/// and the answer is then parsed and validated locally as defence in depth, with
+/// a malformed answer reported as **metered** because it was still generated.
+/// A scripted completion that already carries `structured` is left alone: a test
+/// using [`FakeProvider::will_answer`] has said exactly what it means.
+///
+/// Validation needs `jsonschema`, which arrives with `manifest`, `providers` or
+/// `bedrock`. Under bare `testkit` the JSON parse still runs, because the case
+/// that actually bites — scripting prose against a schema — is caught by it.
+fn honour_schema(
+    completion: Completion,
+    schema: Option<&Value>,
+    model: &ModelId,
+) -> Result<Completion, ModelError> {
+    let Some(schema) = schema else {
+        return Ok(completion);
+    };
+    if completion.structured.is_some() || !completion.tool_calls.is_empty() {
+        return Ok(completion);
+    }
+
+    let value: Value =
+        serde_json::from_str(&completion.text).map_err(|error| ModelError::Unusable {
+            model: model.clone(),
+            usage: completion.usage,
+            detail: format!(
+                "a schema was required and the scripted answer is not JSON: {error}. \
+                 `will_say` sets the completion's *text*; an agent declaring \
+                 `output.schema` needs `will_answer` with `structured` set, or a \
+                 `will_say` whose text is the JSON document"
+            ),
+        })?;
+
+    #[cfg(any(feature = "manifest", feature = "providers", feature = "bedrock"))]
+    crate::model::validate_schema(schema, &value).map_err(|detail| ModelError::Unusable {
+        model: model.clone(),
+        usage: completion.usage,
+        detail,
+    })?;
+    // Under bare `testkit` there is no validator to run, and the parse above is
+    // the whole check. Named rather than silenced with an underscore in the
+    // signature, so the reader can see which half is missing and why.
+    #[cfg(not(any(feature = "manifest", feature = "providers", feature = "bedrock")))]
+    let _ = schema;
+
+    Ok(Completion {
+        structured: Some(value),
+        ..completion
+    })
 }
 
 #[cfg(test)]
@@ -351,6 +423,133 @@ mod tests {
             continuation: None,
             stream: None,
         }
+    }
+
+    /// **A declared schema binds the fake exactly as it binds a real driver.**
+    ///
+    /// This is the one way a stub can be worse than useless: not by failing a
+    /// test that should pass, but by *passing* one that no provider could. The
+    /// fake used to record `output.schema` and ignore it, so a run scripted with
+    /// `will_say("...")` against a schema-declaring agent completed and yielded
+    /// `Null` — while every real driver answers `Unusable`, because the answer
+    /// is not JSON. An adopter lost an afternoon to it before we did.
+    ///
+    /// Both halves are asserted. The refusal, because that is the behaviour that
+    /// was missing; and the acceptance, because a fake that refused *every*
+    /// schema-shaped answer would satisfy the first assertion while being just
+    /// as wrong in the other direction.
+    #[tokio::test]
+    async fn a_declared_schema_binds_the_fake_the_way_it_binds_a_driver() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "balance": { "type": "number" } },
+            "required": ["balance"],
+        });
+
+        // Prose against a schema: metered, and the refusal names the remedy.
+        let fake = FakeProvider::new();
+        fake.will_say("the balance is forty-two");
+        let error = fake
+            .complete(ask(Some(&schema)))
+            .await
+            .expect_err("prose against a declared schema is not an answer");
+        let text = error.to_string();
+        assert!(
+            text.contains("will_answer"),
+            "the refusal must name what to use instead, or it costs the reader \
+             the same afternoon it cost the adopter who reported this: {text}"
+        );
+
+        // The positive half: JSON that satisfies the schema is parsed and
+        // surfaced as `structured`, exactly as a real driver surfaces it.
+        let fake = FakeProvider::new();
+        fake.will_say(r#"{"balance": 42}"#);
+        let completion = fake
+            .complete(ask(Some(&schema)))
+            .await
+            .expect("a schema-shaped answer is an answer");
+        assert_eq!(completion.structured, Some(json!({ "balance": 42 })));
+
+        // And no schema means no opinion — the ordinary case must stay ordinary.
+        let fake = FakeProvider::new();
+        fake.will_say("just prose");
+        let completion = fake.complete(ask(None)).await.expect("no schema, no rule");
+        assert_eq!(completion.text, "just prose");
+        assert!(completion.structured.is_none());
+    }
+
+    /// **The fake refuses a provider-side media URL, exactly as a driver does.**
+    ///
+    /// The control exists so a caller-named URL is never handed to a provider to
+    /// dereference from *its* network — outside the plane's egress allowlist,
+    /// DNS pinning, size and type ceilings, and journal. Every shipped driver
+    /// refuses before dispatch.
+    ///
+    /// A fake exempt from it is worse than an untested control: an embedder
+    /// writing a test to prove the refusal happens would watch the URL sail
+    /// through and conclude the plane permits what production refuses. Both
+    /// halves are asserted, so a fake that refused every prompt would not pass.
+    #[tokio::test]
+    async fn the_fake_refuses_a_provider_side_media_url_like_every_driver() {
+        let fake = FakeProvider::new();
+
+        // One spelling per provider, because the check knows several and a fake
+        // that learned only one would be exempt from the rest.
+        for prompt in [
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "url", "url": "https://attacker.example/x.png"}}]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": "https://attacker.example/x.png"}]}]}),
+            json!({"messages": [{"role": "user", "parts": [
+                {"fileData": {"mimeType": "image/png", "fileUri": "https://attacker.example/x.png"}}]}]}),
+        ] {
+            let leaked: &'static Value = Box::leak(Box::new(prompt));
+            let model: &'static ModelId = Box::leak(Box::new(model()));
+            let request = Request {
+                model,
+                prompt: leaked,
+                max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+                reasoning_effort: None,
+                schema: None,
+                tools: &[],
+                exchanges: &[],
+                continuation: None,
+                stream: None,
+            };
+            let error = fake
+                .complete(request)
+                .await
+                .expect_err("a provider-side fetch must be refused before dispatch");
+            assert!(
+                error.to_string().contains("refused before dispatch"),
+                "the fake let a provider-side media URL through, so a test proving \
+                 the refusal would pass without the refusal existing: {error}"
+            );
+        }
+
+        // Inline bytes are the governed path and must still work, or this is a
+        // refuse-everything change that passes its own test.
+        let fake = FakeProvider::new();
+        fake.will_say("described");
+        let inline: &'static Value = Box::leak(Box::new(json!({"messages": [{"role": "user",
+            "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                         "data": "iVBORw0KGgo="}}]}]})));
+        let model: &'static ModelId = Box::leak(Box::new(model()));
+        let request = Request {
+            model,
+            prompt: inline,
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
+            schema: None,
+            tools: &[],
+            exchanges: &[],
+            continuation: None,
+            stream: None,
+        };
+        assert!(
+            fake.complete(request).await.is_ok(),
+            "inline governed bytes were refused as a provider-side fetch"
+        );
     }
 
     /// The property the whole crate rests on. A fake that broke it would make

@@ -144,10 +144,10 @@ Sequential checks prove the *result* is right, not that it is right for the righ
 reason — a `SELECT` then `INSERT` returns the correct answer every time it is
 called one at a time.
 
-So correlation also has a racing check, and the first version of it was useless.
-Two concurrent callers serialised often enough that **dropping the constraint
-that arbitrates correlation went undetected**. Only mutation-testing the battery
-found it; eight racers across four keys catches it on every run.
+So correlation also has a racing check, and it races **hard**: two concurrent
+callers serialise often enough that dropping the constraint which arbitrates
+correlation goes undetected. Eight racers across four keys catches it on every
+run, and mutation-testing the battery is what proves the check can fail.
 
 * **A race test that does not reliably race reports green** — an untested
   guarantee wearing a test's clothing.
