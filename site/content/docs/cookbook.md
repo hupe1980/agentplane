@@ -605,7 +605,7 @@ model cannot be — the behaviour is a `Skill`, and the manifest governs its
 **boundary**: which model, which tools, what it may spend.
 
 ```toml
-agentplane = { version = "0.4", features = ["manifest"] }
+agentplane = { version = "0.5", features = ["manifest"] }
 ```
 
 Everything in the zero-Rust manifest above applies; drop `spec.execution` and add what a coded agent needs:
@@ -825,7 +825,7 @@ For real deployments, `OpenDalBlobs` puts them on anything
 [OpenDAL](https://opendal.apache.org) reaches — filesystem, S3, GCS, Azure:
 
 ```toml
-agentplane = { version = "0.4", features = ["opendal"] }
+agentplane = { version = "0.5", features = ["opendal"] }
 ```
 
 ```rust
@@ -1943,6 +1943,40 @@ tenant has no plane is refused rather than served by a default.
 **The second trap:** counting concurrency in memory. That ceiling doubles the
 moment a second instance starts — and it fails open, so nothing tells you. The
 accounting belongs in the store, which is why `quota` takes one.
+
+## 🗝️ Erase a customer's data everywhere
+
+Deleting from the live store leaves every backup. Seal instead: one key ring on
+the builder seals the journal, the case store, the worklist, the event buffer
+and blob payloads.
+
+```rust
+let rt = Runtime::builder(store)
+    .cases(cases).events(events).tasks(tasks)
+    .keyring(keys)          // seals all of them
+    .build();
+```
+
+Erasing a case destroys its wrapping key, so every copy becomes unreadable at
+once — including the ones nobody can reach:
+
+```rust
+blob::erase_case(&blobs, cases.as_ref(), Some(keys.as_ref()), &tenant, case, at, reason).await?;
+```
+
+The chain still verifies afterwards, because it commits to the sealed bytes
+rather than the plaintext. An erasure costs the data, not the proof that
+nothing was altered. See it end to end with
+`cargo run --example sealed_run --features redb,testkit,keyring`.
+
+**The trap: assuming everything is erasable.** What a store is asked questions
+*about* stays readable — correlation keys, event `source`/`id`, task summaries,
+deadline names — because sealing them would leave a buffer that cannot
+deduplicate and a worklist nobody can read. And an inbound event is its own
+erasure unit rather than the case's: it is buffered before any subscription
+matches it, so an unclaimed one belongs to no case at all. Check
+[erasure and keys](@/docs/erasure.md#what-lands-where-and-what-can-be-erased)
+row by row before deciding what may enter a run.
 
 ## 🔎 Audit a store you do not trust
 

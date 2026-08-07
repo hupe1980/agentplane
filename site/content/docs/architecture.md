@@ -2419,9 +2419,11 @@ exact substitution this layer exists to prevent.
 `kind` is an enum, deliberately short, and every variant is a behaviour that is
 implemented and tested. A config format whose behaviours are open-ended is one
 nobody can review, because the reviewer would have to know what the string does.
-A tool-calling loop is the obvious next kind and is **not** built: the model
-layer does not yet surface tool calls from a completion, so a manifest asking for
-one would be a promise the crate cannot keep.
+Three exist: `completion` (one model call, answered in the declared shape),
+`tool-calling` (call tools until the model stops asking) and `planned` (plan
+once over trusted input, then execute with step outputs routed by reference
+rather than back through a model's context). A fourth would have to meet the
+same standard rather than being a string that happens to parse.
 
 ### Oversight, declared without a predicate
 

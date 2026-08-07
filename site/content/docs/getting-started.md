@@ -53,7 +53,7 @@ Read those five lines slowly, because they are the product:
 
 ```toml
 [dependencies]
-agentplane = "0.4"
+agentplane = "0.5"
 ```
 
 ## An agent with no Rust
@@ -122,7 +122,7 @@ your build. Everything else is opt-in:
 
 ```toml
 [dependencies]
-agentplane   = "0.4"
+agentplane   = "0.5"
 serde_json   = "1"
 # A `Skill` is an async trait, and the runtime is async. Both are yours to
 # choose, so neither is re-exported — but the snippets below will not compile
@@ -134,7 +134,7 @@ tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
 Everything beyond a single-node runtime is opt-in:
 
 ```toml
-agentplane = { version = "0.4", features = ["postgres", "http", "mcp", "providers", "bedrock", "media", "cedar", "signing"] }
+agentplane = { version = "0.5", features = ["postgres", "http", "mcp", "providers", "bedrock", "media", "cedar", "signing"] }
 ```
 
 | feature | gives you |
