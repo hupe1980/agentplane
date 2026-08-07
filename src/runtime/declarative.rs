@@ -101,36 +101,7 @@ impl Declarative {
             )
         })?;
 
-        // Offered exactly what the manifest grants, resolved through the
-        // operator's catalogue. A tool granted by a manifest but absent
-        // from the catalogue is not offered: the model would choose it,
-        // and the call would be refused after the tokens were paid for.
-        // Offered with the manifest's own words and argument shape. A bare name
-        // makes the model guess, and a guess is refused at the field check after
-        // it has been paid for — so the declaration is where the description
-        // belongs, reviewable and covered by the digest.
-        let offered: Vec<(crate::tools::ToolId, &crate::manifest::ToolGrant)> = granted
-            .iter()
-            .filter_map(|g| catalog.resolve_reference(&g.reference).map(|id| (id, g)))
-            .collect();
-        let declared: Vec<crate::model::ToolDeclaration> = offered
-            .iter()
-            .map(|(id, grant)| {
-                let (description, arguments) = catalog.declaration(id).map_or_else(
-                    || {
-                        (
-                            grant.description.clone().unwrap_or_default(),
-                            grant
-                                .arguments
-                                .clone()
-                                .unwrap_or_else(|| json!({ "type": "object" })),
-                        )
-                    },
-                    |(description, arguments)| (description.to_owned(), arguments.clone()),
-                );
-                crate::model::ToolDeclaration::new(id.wire_name(), description, arguments)
-            })
-            .collect();
+        let (offered, declared) = offered_tools(&catalog, &granted);
 
         // `Tainted::object`, not `input.map(...)`. The instruction comes from the
         // manifest — reviewed, and inside the digest — so it is trusted; the
@@ -442,11 +413,10 @@ impl Declarative {
         // be writing durable memory from it, not the one holding the agent's
         // authority. Falling back to the answer's model when no quarantined
         // role is declared keeps the single-model manifest exactly as it was.
-        let model = cx
-            .manifest()
-            .and_then(|m| m.spec.models.as_ref())
-            .and_then(|models| models.quarantined.as_ref())
-            .map_or_else(|| model.clone(), |r| ModelId::new(&r.provider, &r.model));
+        let model = match cx.manifest() {
+            Some(m) => untrusted_contact_model(m, model),
+            None => model.clone(),
+        };
         let expires_at = if let Some(seconds) = declaration.retention_seconds {
             let now = cx.now().await?;
             Some(now + time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX)))
@@ -469,6 +439,332 @@ impl Declarative {
         )
         .await?;
         Ok(())
+    }
+
+    /// Plan first over trusted input, then execute without the model.
+    ///
+    /// The `CaMeL` shape, on this runtime's machinery: one privileged call
+    /// fixes the control flow **before anything untrusted is read**, and from
+    /// then on data moves between steps by *reference* — `$step0/txn/id` is
+    /// resolved by the runtime with its labels intact, never pasted through a
+    /// model's context. A hostile tool output therefore cannot steer the
+    /// steps that follow it, and an argument bound by reference reaches the
+    /// protected-field gate carrying the provenance of the value it actually
+    /// names, which is what lets a rule like *recipient must come from the
+    /// CRM* be genuinely satisfiable rather than laundered through a model's
+    /// retyping.
+    ///
+    /// Everything here is an ordinary journaled effect — the planning call,
+    /// each tool call, each parse — so a strict replay reassembles the whole
+    /// plan without dispatching anything, which is the half of `CaMeL` their
+    /// own interpreter cannot offer.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn planned(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+        system: String,
+        model_role: (ModelId, Option<u32>, Option<crate::model::ReasoningEffort>),
+        egress: Option<crate::core::Sensitivity>,
+        granted: Vec<crate::manifest::ToolGrant>,
+        oversight: Option<Proposal>,
+        formation: Option<crate::manifest::MemoryFormation>,
+        output_schema: Option<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let (model, max_output_tokens, reasoning_effort) = model_role;
+
+        // The plan is this run's authorization order, and the planner reads
+        // the input to write it. Untrusted input authoring a plan is the
+        // attacker choosing the control flow — the thing I8 refuses for
+        // replanning, applied at step zero. Refused outright rather than
+        // degraded: hostile content reaches a planned agent through a tool
+        // or a parse step, where it arrives as data.
+        if input.label().trust != crate::core::Trust::Trusted {
+            return Err(SkillError::Other(
+                "a `planned` agent refuses untrusted input: the plan is compiled from \
+                 what the planner reads, and untrusted input authoring a plan is the \
+                 attacker choosing the control flow. Hand hostile content to this \
+                 agent through a tool or a parse step, or use `tool-calling`"
+                    .into(),
+            ));
+        }
+
+        let tools = match (granted.is_empty(), self.tools.clone()) {
+            (true, _) => None,
+            (false, Some(wired)) => Some(wired),
+            (false, None) => {
+                return Err(SkillError::Other(
+                    "this agent declares `planned` with tool grants but the plane has \
+                     no tool catalogue — `RuntimeBuilder::tools` is what lets a \
+                     declarative agent reach one"
+                        .into(),
+                ));
+            }
+        };
+        let (offered, declared) = tools
+            .as_ref()
+            .map(|(catalog, _)| offered_tools(catalog, &granted))
+            .unwrap_or_default();
+
+        // One planning call. The plan format travels in the response schema,
+        // not in prompt text — the instruction slot stays exactly the
+        // reviewed identity, and `CaMeL`'s reference implementation makes the
+        // same choice: "there is no need to specify the expected output
+        // format in the query itself".
+        let surface: Vec<Value> = declared
+            .iter()
+            .map(|t| {
+                json!({
+                    "tool": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                })
+            })
+            .collect();
+        let prompt = Tainted::object([
+            ("system".to_owned(), Tainted::trusted(json!(system))),
+            ("input".to_owned(), input.clone()),
+            ("tools".to_owned(), Tainted::trusted(json!(surface))),
+        ]);
+        let mut call = ModelCall::new(
+            Arc::clone(&self.provider),
+            model.clone(),
+            prompt.peek().clone(),
+        )
+        .with_output_sensitivity(prompt.label().sensitivity)
+        .expecting(plan_schema(self.max_turns));
+        if let Some(max_output_tokens) = max_output_tokens {
+            call = call.with_max_output_tokens(max_output_tokens);
+        }
+        if let Some(effort) = reasoning_effort {
+            call = call.with_reasoning_effort(effort);
+        }
+        if let Some(ceiling) = egress {
+            call = call.with_max_sensitivity(ceiling);
+        }
+        let completion = cx.sink(call, &prompt).await?;
+        // Everything the planner wrote is a model completion: plan literals
+        // carry this label, so a constant the planner invented arrives at
+        // every gate as untrusted model output — while a *reference* carries
+        // the label of the value it names.
+        let plan_label = completion.label().join(prompt.label()).clone();
+        let Some(plan_value) = completion.peek().structured.clone() else {
+            return Ok(Outcome::fail("the planner returned no structured plan"));
+        };
+        let plan: PlanDoc = match serde_json::from_value(plan_value) {
+            Ok(plan) => plan,
+            Err(e) => {
+                return Ok(Outcome::fail(format!(
+                    "the planner's output is not a plan: {e}"
+                )));
+            }
+        };
+        // The schema already bounds this; checked again here because the
+        // bound is a control, and a control enforced only by what a provider
+        // did with a schema is a control the next driver quietly loses.
+        if plan.steps.is_empty() || plan.steps.len() > self.max_turns as usize {
+            return Ok(Outcome::fail(format!(
+                "the plan has {} steps and this agent is bounded to {}",
+                plan.steps.len(),
+                self.max_turns
+            )));
+        }
+
+        let mut outputs: Vec<Tainted<Value>> = Vec::new();
+        for (index, step) in plan.steps.iter().enumerate() {
+            match (&step.tool, &step.parse) {
+                // ── A tool call, with arguments assembled by reference ────
+                (Some(name), None) => {
+                    let Some((catalog, client)) = tools.as_ref() else {
+                        return Ok(Outcome::fail(format!(
+                            "plan step {index} calls '{name}' but this agent grants no tools"
+                        )));
+                    };
+                    // Matched byte for byte against the grants, exactly as the
+                    // loop matches — a planner that names a near miss never
+                    // gets the tool it nearly named, and unlike the loop there
+                    // is no next turn to correct in, so the run fails.
+                    let Some((id, grant)) = catalog.resolve(name).and_then(|id| {
+                        offered
+                            .iter()
+                            .find(|(offered, _)| *offered == id)
+                            .map(|(_, grant)| (id, *grant))
+                    }) else {
+                        return Ok(Outcome::fail(format!(
+                            "plan step {index} calls '{name}', which is not granted to \
+                             this agent"
+                        )));
+                    };
+                    let Some(declaration) = declared.iter().find(|tool| &tool.name == name) else {
+                        return Ok(Outcome::fail(format!(
+                            "plan step {index}: '{name}' has no model-facing declaration"
+                        )));
+                    };
+                    let args = step.args.clone().unwrap_or_default();
+                    let assembled = match assemble_arguments(
+                        &Value::Object(args),
+                        &plan_label,
+                        &input,
+                        &outputs,
+                    ) {
+                        Ok(assembled) => assembled,
+                        Err(why) => {
+                            return Ok(Outcome::fail(format!("plan step {index}: {why}")));
+                        }
+                    };
+                    if let Err(detail) =
+                        crate::model::validate_schema(&declaration.parameters, assembled.peek())
+                    {
+                        return Ok(Outcome::fail(format!("plan step {index}: {detail}")));
+                    }
+
+                    let reference = id.reference();
+                    // A person sees the call before dispatch when the grant
+                    // asks for one — the same gate the loop applies, and a
+                    // refusal fails the run because there is no model turn to
+                    // report it to.
+                    if grant.requires_approval {
+                        let Some(spec) = oversight.as_ref() else {
+                            return Err(SkillError::Other(
+                                "a tool grant requires approval but the agent declares no \
+                                 oversight policy — there is nobody to ask"
+                                    .into(),
+                            ));
+                        };
+                        cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)
+                            .await?;
+                        let decision = cx
+                            .task(&spec.approve_call(&reference, assembled.peek()))
+                            .await?;
+                        if !decision.approved {
+                            return Ok(Outcome::fail(format!(
+                                "{} refused the call to {reference}: {}",
+                                decision.actor, decision.reason
+                            )));
+                        }
+                    }
+
+                    // Dispatch takes the same two paths the loop takes, and
+                    // errors leave the same way — the executor reaches its own
+                    // verdict, exactly as for a hand-written skill.
+                    let out = if id.server == crate::tools::AGENT_SERVER {
+                        cx.commission(&id.tool, assembled).await?
+                    } else {
+                        let prepared = crate::tools::ToolCall::prepare(
+                            catalog,
+                            Arc::clone(client),
+                            id,
+                            assembled.peek().clone(),
+                        )
+                        .map_err(|e| SkillError::Other(e.to_string()))?;
+                        cx.sink(prepared, &assembled).await?
+                    };
+                    outputs.push(out);
+                }
+
+                // ── A parse: the quarantined model, a bounded schema ───────
+                (None, Some(parse)) => {
+                    let source = match resolve_reference(&parse.from, &input, &outputs) {
+                        Ok(source) => source,
+                        Err(why) => {
+                            return Ok(Outcome::fail(format!("plan step {index}: {why}")));
+                        }
+                    };
+                    let Some(schema) = bounded_parse_schema(&parse.schema) else {
+                        return Ok(Outcome::fail(format!(
+                            "plan step {index}: a parse schema must be an object schema"
+                        )));
+                    };
+                    let parse_model = match cx.manifest() {
+                        Some(m) => untrusted_contact_model(m, &model),
+                        None => model.clone(),
+                    };
+                    let prompt = Tainted::object([
+                        (
+                            "system".to_owned(),
+                            Tainted::trusted(json!(PARSE_INSTRUCTION)),
+                        ),
+                        ("source".to_owned(), source.clone()),
+                    ]);
+                    let mut call = ModelCall::new(
+                        Arc::clone(&self.provider),
+                        parse_model,
+                        prompt.peek().clone(),
+                    )
+                    .with_output_sensitivity(prompt.label().sensitivity)
+                    .expecting(schema);
+                    if let Some(ceiling) = egress {
+                        call = call.with_max_sensitivity(ceiling);
+                    }
+                    let completion = cx.sink(call, &prompt).await?;
+                    let label = completion.label().join(prompt.label()).clone();
+                    let Some(mut value) = completion.peek().structured.clone() else {
+                        return Ok(Outcome::fail(format!(
+                            "plan step {index}: the parse returned nothing structured"
+                        )));
+                    };
+                    // The one thing a parse may say out of band, and it fails
+                    // the step: a parser short of information that answers
+                    // anyway produces wrong data nothing downstream can
+                    // detect, which is why the escape is a bit and not a
+                    // message — a message would be untrusted text steering
+                    // the plan.
+                    let enough = value
+                        .get("have_enough_information")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !enough {
+                        return Ok(Outcome::fail(format!(
+                            "plan step {index}: the parse declared the source does not \
+                             contain enough information — the plan must hand it more of \
+                             the source, not let a guess stand"
+                        )));
+                    }
+                    if let Some(map) = value.as_object_mut() {
+                        map.remove("have_enough_information");
+                    }
+                    // Schema-shaped is not trusted. The output joins the
+                    // source's label with the completion's, so it stays as
+                    // untrusted as the text it came from.
+                    outputs.push(Tainted::with_label(value, label));
+                }
+
+                _ => {
+                    return Ok(Outcome::fail(format!(
+                        "plan step {index} must name exactly one of `tool` or `parse`"
+                    )));
+                }
+            }
+        }
+
+        let answer = match plan.answer.as_deref() {
+            Some(reference) => match resolve_reference(reference, &input, &outputs) {
+                Ok(answer) => answer,
+                Err(why) => return Ok(Outcome::fail(format!("plan answer: {why}"))),
+            },
+            None => match outputs.last() {
+                Some(last) => last.clone(),
+                None => return Ok(Outcome::fail("the plan produced nothing to answer with")),
+            },
+        };
+        if let Some(schema) = output_schema
+            && let Err(detail) = crate::model::validate_schema(&schema, answer.peek())
+        {
+            return Ok(Outcome::fail(format!(
+                "the answer does not satisfy the declared output shape: {detail}"
+            )));
+        }
+
+        let formed_source = answer.clone();
+        self.settle(
+            cx,
+            answer,
+            formed_source,
+            oversight,
+            formation.as_ref(),
+            &model,
+        )
+        .await
     }
 }
 
@@ -612,6 +908,21 @@ impl Skill for Declarative {
                 )
                 .await
             }
+
+            ExecutionKind::Planned => {
+                self.planned(
+                    cx,
+                    input,
+                    system,
+                    (model, max_output_tokens, reasoning_effort),
+                    egress,
+                    granted,
+                    oversight,
+                    formation,
+                    schema,
+                )
+                .await
+            }
         }
     }
 }
@@ -683,6 +994,285 @@ impl Proposal {
         spec.allow_unattended = self.allow_unattended;
         spec
     }
+}
+
+/// The fixed instruction a `parse` step's model receives.
+///
+/// A constant, never planner text: a planner's output is a model completion
+/// and therefore untrusted, and `/system` is the trusted slot — so the one
+/// instruction a parse runs under is written here, exactly as `CaMeL`'s
+/// reference implementation fixes its quarantined model's prompt as a
+/// constant. Anti-fabrication is the load-bearing sentence: a parser that
+/// guesses an address produces wrong data nothing downstream can detect.
+const PARSE_INSTRUCTION: &str = "Extract the requested fields from the source. Record only \
+     what the source literally states: do not infer or invent email addresses, dates, \
+     identifiers, names or amounts that are not present. If the source does not contain \
+     enough information, set `have_enough_information` to false and every other field to \
+     an empty or zero value.";
+
+/// The shape a planner must answer in.
+///
+/// The plan format lives here, in the response schema, rather than in prompt
+/// text — so the instruction slot stays exactly the reviewed identity, and the
+/// format is versioned in code where changing it is a diff. The step bound is
+/// the manifest's `max_turns`, the same ceiling the loop spends per turn.
+fn plan_schema(max_steps: u32) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["steps"],
+        "properties": {
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": max_steps,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": {
+                            "type": "string",
+                            "description": "a granted tool to call, named exactly as offered"
+                        },
+                        "args": {
+                            "type": "object",
+                            "description": "the tool's arguments. A string beginning with '$' \
+                                 is a reference to earlier data, not a literal: '$input' is \
+                                 the run's input and '$step0' is the first step's output, \
+                                 and a JSON Pointer may follow the head, e.g. \
+                                 '$step1/customer/email'. Escape a literal leading '$' as \
+                                 '$$'. Prefer references over copying values: a reference \
+                                 carries the data's provenance, a copy does not"
+                        },
+                        "parse": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["from", "schema"],
+                            "properties": {
+                                "from": {
+                                    "type": "string",
+                                    "description": "reference to the value to extract from, \
+                                         e.g. '$step0/body'"
+                                },
+                                "schema": {
+                                    "type": "object",
+                                    "description": "a JSON Schema with type 'object' naming \
+                                         the fields to extract"
+                                }
+                            },
+                            "description": "extract structured fields from a prior output \
+                                 instead of calling a tool"
+                        }
+                    }
+                }
+            },
+            "answer": {
+                "type": "string",
+                "description": "reference selecting the run's answer, e.g. '$step1/summary'; \
+                     omitted means the last step's output"
+            }
+        }
+    })
+}
+
+/// A plan as the planner wrote it, deserialised strictly.
+///
+/// `deny_unknown_fields` beside the schema validation, because two layers of
+/// refusal cost nothing and a field that parses but is never read is the
+/// defect class this crate keeps finding in other people's formats.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanDoc {
+    steps: Vec<PlanStep>,
+    #[serde(default)]
+    answer: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanStep {
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    args: Option<serde_json::Map<String, Value>>,
+    #[serde(default)]
+    parse: Option<ParseStep>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParseStep {
+    from: String,
+    schema: Value,
+}
+
+/// Resolve a `$input` / `$stepN` reference, labels intact.
+///
+/// The pointer after the head is RFC 6901, the same spelling the label
+/// machinery uses, so the projected value arrives with the label of exactly
+/// the field it names — which is the entire point of a reference: a value
+/// that travelled by name keeps the provenance a model's retyping would have
+/// stripped.
+fn resolve_reference(
+    reference: &str,
+    input: &Tainted<Value>,
+    outputs: &[Tainted<Value>],
+) -> Result<Tainted<Value>, String> {
+    let (head, pointer) = match reference.find('/') {
+        Some(split) => (&reference[..split], &reference[split..]),
+        None => (reference, ""),
+    };
+    let base = if head == "$input" {
+        input
+    } else {
+        let step = head
+            .strip_prefix("$step")
+            .and_then(|n| n.parse::<usize>().ok())
+            .ok_or_else(|| {
+                format!(
+                    "'{reference}' is not a reference this plan can hold — use $input \
+                     or $step<N>"
+                )
+            })?;
+        outputs
+            .get(step)
+            .ok_or_else(|| format!("'{reference}' points at a step that has not run yet"))?
+    };
+    base.project_pointer(pointer)
+        .ok_or_else(|| format!("'{reference}' selects nothing in the value it points at"))
+}
+
+/// Assemble a step's arguments, resolving references wherever they appear.
+///
+/// Literals carry the **plan's** label — they are model output, and arrive at
+/// every gate as exactly that. References carry the label of the value they
+/// name. Objects and arrays are rebuilt with [`Tainted::object`] /
+/// [`Tainted::array`], so the distinction survives per field all the way to
+/// the sink binding.
+fn assemble_arguments(
+    value: &Value,
+    plan_label: &crate::core::Label,
+    input: &Tainted<Value>,
+    outputs: &[Tainted<Value>],
+) -> Result<Tainted<Value>, String> {
+    match value {
+        Value::String(s) if s.starts_with("$$") => Ok(Tainted::with_label(
+            Value::String(s[1..].to_owned()),
+            plan_label.clone(),
+        )),
+        Value::String(s) if s.starts_with('$') => resolve_reference(s, input, outputs),
+        Value::Object(map) => {
+            let mut fields = Vec::with_capacity(map.len());
+            for (name, nested) in map {
+                fields.push((
+                    name.clone(),
+                    assemble_arguments(nested, plan_label, input, outputs)?,
+                ));
+            }
+            Ok(Tainted::object(fields))
+        }
+        Value::Array(items) => {
+            let mut elements = Vec::with_capacity(items.len());
+            for nested in items {
+                elements.push(assemble_arguments(nested, plan_label, input, outputs)?);
+            }
+            Ok(Tainted::array(elements))
+        }
+        other => Ok(Tainted::with_label(other.clone(), plan_label.clone())),
+    }
+}
+
+/// A parse schema with the runtime's escape bit injected, or `None` if the
+/// planner's schema is not an object schema.
+///
+/// `have_enough_information` is added by the runtime, never by the planner,
+/// and `additionalProperties` is forced closed — a parse is bounded or it is
+/// not a parse. Mirrors `CaMeL`'s reference implementation, which injects the
+/// same field with `create_model` for the same reason: a model short of
+/// information that answers anyway produces wrong data nothing can detect.
+fn bounded_parse_schema(declared: &Value) -> Option<Value> {
+    if declared.get("type") != Some(&json!("object")) {
+        return None;
+    }
+    let mut schema = declared.clone();
+    let map = schema.as_object_mut()?;
+    map.insert("additionalProperties".to_owned(), json!(false));
+    let properties = map
+        .entry("properties")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()?;
+    properties.insert(
+        "have_enough_information".to_owned(),
+        json!({
+            "type": "boolean",
+            "description": "Whether the source provided enough information. Set false \
+                 rather than inventing any value."
+        }),
+    );
+    let required = map.entry("required").or_insert_with(|| json!([]));
+    let required = required.as_array_mut()?;
+    if !required.contains(&json!("have_enough_information")) {
+        required.push(json!("have_enough_information"));
+    }
+    Some(schema)
+}
+
+/// The model for untrusted contact: the quarantined role when one is
+/// declared, the given fallback otherwise.
+///
+/// One implementation, consulted by memory formation and by a plan's `parse`
+/// steps — the two places the declarative tier itself points a model at
+/// untrusted-derived content.
+fn untrusted_contact_model(m: &Manifest, fallback: &ModelId) -> ModelId {
+    m.spec
+        .models
+        .as_ref()
+        .and_then(|models| models.quarantined.as_ref())
+        .map_or_else(|| fallback.clone(), |r| ModelId::new(&r.provider, &r.model))
+}
+
+/// The tool surface a declarative agent offers a model: exactly the manifest's
+/// grants, resolved through the operator's catalogue, with the declared
+/// descriptions and argument shapes.
+///
+/// A tool granted by a manifest but absent from the catalogue is not offered:
+/// the model would choose it, and the call would be refused after the tokens
+/// were paid for. Offered with the manifest's own words and argument shape —
+/// a bare name makes the model guess, and a guess is refused at the field
+/// check after it has been paid for, so the declaration is where the
+/// description belongs, reviewable and covered by the digest. One
+/// implementation for the loop and the planner, because two copies of the
+/// offer rule would agree everywhere except the grant nobody probed.
+fn offered_tools<'g>(
+    catalog: &crate::tools::ToolCatalog,
+    granted: &'g [crate::manifest::ToolGrant],
+) -> (
+    Vec<(crate::tools::ToolId, &'g crate::manifest::ToolGrant)>,
+    Vec<crate::model::ToolDeclaration>,
+) {
+    let offered: Vec<(crate::tools::ToolId, &crate::manifest::ToolGrant)> = granted
+        .iter()
+        .filter_map(|g| catalog.resolve_reference(&g.reference).map(|id| (id, g)))
+        .collect();
+    let declared: Vec<crate::model::ToolDeclaration> = offered
+        .iter()
+        .map(|(id, grant)| {
+            let (description, arguments) = catalog.declaration(id).map_or_else(
+                || {
+                    (
+                        grant.description.clone().unwrap_or_default(),
+                        grant
+                            .arguments
+                            .clone()
+                            .unwrap_or_else(|| json!({ "type": "object" })),
+                    )
+                },
+                |(description, arguments)| (description.to_owned(), arguments.clone()),
+            );
+            crate::model::ToolDeclaration::new(id.wire_name(), description, arguments)
+        })
+        .collect();
+    (offered, declared)
 }
 
 fn privileged(

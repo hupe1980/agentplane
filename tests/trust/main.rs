@@ -24,5 +24,6 @@ mod identity;
 mod keyring;
 mod manifest;
 mod peers;
+mod planned;
 mod policy;
 mod witness;

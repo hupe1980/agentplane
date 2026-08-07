@@ -2691,8 +2691,20 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a tool grant asking for a human is dispatched without asking, so the "
         "mutation happens and the only review left is of the answer — which "
         "arrives after the money moved",
-        "                if grant.requires_approval {",
-        "                if false && grant.requires_approval {",
+        """                // not the answer they will produce.
+                if grant.requires_approval {""",
+        """                // not the answer they will produce.
+                if false && grant.requires_approval {""",
+    ),
+    "APlannedCallSkipsItsApproval": (
+        "src/runtime/declarative.rs",
+        "a_planned_step_waits_for_its_approval",
+        "a planned step whose grant asks for a human dispatches without asking "
+        "— the plan was reviewed by nobody and the call by nobody either",
+        """                    // report it to.
+                    if grant.requires_approval {""",
+        """                    // report it to.
+                    if false && grant.requires_approval {""",
     ),
     "TheAuditIsSilentAboutReleases": (
         "src/audit.rs",
@@ -3286,6 +3298,27 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         .or_else(|| records.last())
     else {""",
     ),
+    "ADeclarativeAgentAnswersToTwoNames": (
+        "src/manifest/mod.rs",
+        "a_declarative_agent_provides_exactly_one_capability",
+        "a declarative agent accepts several capabilities — a distinction "
+        "nothing executes, refused later at build under the agent's own name",
+        "        if self.spec.execution.is_some() && self.spec.capabilities.provides.len() > 1 {",
+        "        if false {",
+    ),
+    "AMetQuorumSilencesAFork": (
+        "src/journal/witness.rs",
+        "a_fork_report_survives_a_met_quorum",
+        "a met quorum silences an integrity refusal, so the one witness that "
+        "remembers a different history is outvoted by witnesses that never saw "
+        "it",
+        """    pub fn needs_attention(&self) -> bool {
+        !self.met() || !self.integrity.is_empty()
+    }""",
+        """    pub fn needs_attention(&self) -> bool {
+        !self.met()
+    }""",
+    ),
     # ── Seals and conclusions ───────────────────────────────────────────────
     "SealedRunAcceptsAppends": (
         "src/store/redb.rs",
@@ -3341,15 +3374,49 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     "FormationIgnoresQuarantined": (
         "src/runtime/declarative.rs",
         "formation_runs_on_the_quarantined_model_when_declared",
-        "memory extraction runs on the privileged model even when a quarantined "
-        "one is declared, so the role designated for untrusted contact governs "
-        "nothing in the declarative tier",
-        """        let model = cx
-            .manifest()
-            .and_then(|m| m.spec.models.as_ref())
-            .and_then(|models| models.quarantined.as_ref())
-            .map_or_else(|| model.clone(), |r| ModelId::new(&r.provider, &r.model));""",
-        """        let model = model.clone();""",
+        "untrusted contact runs on the privileged model even when a quarantined "
+        "one is declared, so the role designated for it governs nothing in the "
+        "declarative tier",
+        """    m.spec
+        .models
+        .as_ref()
+        .and_then(|models| models.quarantined.as_ref())
+        .map_or_else(|| fallback.clone(), |r| ModelId::new(&r.provider, &r.model))""",
+        """    let _ = m;
+    fallback.clone()""",
+    ),
+    "PlannedAcceptsUntrustedInput": (
+        "src/runtime/declarative.rs",
+        "a_planned_agent_refuses_untrusted_input",
+        "a planned agent plans over untrusted input, so the attacker authors "
+        "the authorization order",
+        "        if input.label().trust != crate::core::Trust::Trusted {",
+        "        if false {",
+    ),
+    "AReferenceIsRetyped": (
+        "src/runtime/declarative.rs",
+        "a_reference_keeps_provenance_a_literal_does_not",
+        "a plan reference is retyped under the plan's own label, so binding a "
+        "trusted value strips the provenance the reference exists to carry",
+        "        Value::String(s) if s.starts_with('$') => resolve_reference(s, input, outputs),",
+        """        Value::String(s) if s.starts_with('$') => resolve_reference(s, input, outputs)
+            .map(|v| Tainted::with_label(v.peek().clone(), plan_label.clone())),""",
+    ),
+    "AShortfallAnswersAnyway": (
+        "src/runtime/declarative.rs",
+        "a_parse_shortfall_fails_the_run_rather_than_guessing",
+        "a parse that declared it lacked information answers anyway, producing "
+        "wrong data nothing downstream can detect",
+        """                    let enough = value
+                        .get("have_enough_information")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !enough {""",
+        """                    let enough = value
+                        .get("have_enough_information")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !enough && false {""",
     ),
     "LostAckCheapAborts": (
         "src/runtime/group.rs",

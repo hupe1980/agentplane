@@ -177,6 +177,7 @@ examples:
     cargo run --example saga_checkout
     cargo run --example effect_group
     cargo run --example tool_loop --features redb,testkit,manifest
+    cargo run --example planned_run --features redb,testkit,manifest
     cargo run --example model_run --features redb,testkit
     cargo run --example media_run --features redb,testkit,media
     cargo run --example memory_run

@@ -645,10 +645,25 @@ impl Tainted<serde_json::Value> {
     /// tracked descendant label. Used by plan argument assembly; returning
     /// `None` distinguishes an absent field from a present JSON null.
     pub(crate) fn project_field(&self, name: &str) -> Option<Self> {
-        let value = self.value.get(name)?.clone();
-        let base = format!("/{}", escape_pointer_token(name));
-        let label = self.label_at(&base)?.clone();
-        let prefix = format!("{base}/");
+        self.project_pointer(&format!("/{}", escape_pointer_token(name)))
+    }
+
+    /// Select the value at a JSON Pointer while preserving and rebasing every
+    /// tracked descendant label.
+    ///
+    /// The generalisation `project_field` delegates to — one implementation,
+    /// because two copies of the rebase rule would agree everywhere except the
+    /// nesting depth nobody probed. The projected value's own label comes from
+    /// [`label_at`](Self::label_at), so a value that was never assembled field
+    /// by field inherits conservatively from its nearest labelled ancestor.
+    /// `None` distinguishes an absent path from a present JSON null.
+    pub(crate) fn project_pointer(&self, pointer: &str) -> Option<Self> {
+        if pointer.is_empty() {
+            return Some(self.clone());
+        }
+        let value = self.value.pointer(pointer)?.clone();
+        let label = self.label_at(pointer)?.clone();
+        let prefix = format!("{pointer}/");
         let fields = self
             .fields
             .iter()

@@ -2416,6 +2416,15 @@ spec:
             .kind,
         ExecutionKind::Completion,
     );
+    assert_eq!(
+        of("planned")
+            .expect("parse")
+            .spec
+            .execution
+            .expect("declared")
+            .kind,
+        ExecutionKind::Planned,
+    );
     assert!(
         of("toolCalling").is_err(),
         "camelCase is not the wire spelling and must not be accepted"
@@ -2683,6 +2692,42 @@ spec:
         "formation discarded the source provenance"
     );
     assert_eq!(recalled[0].access_retention_seconds, Some(600));
+}
+
+/// A declarative agent provides exactly one capability.
+///
+/// The behaviour cannot tell two apart — the capability never reaches the
+/// prompt — so a second name would be a distinction nothing executes, and it
+/// used to fail anyway, at *build*, as a `DuplicateSkillName` naming the
+/// agent's own name: a refusal nobody could act on for a shape that meant
+/// nothing. A **coded** agent providing several capabilities stays legal,
+/// because each has its own skill behind it.
+#[test]
+fn a_declarative_agent_provides_exactly_one_capability() {
+    let two = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: doubled, version: "1.0.0" }
+spec:
+  capabilities: { provides: [support.triage, support.summarise] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: completion }
+  budgets: {}
+"#;
+    match Manifest::parse(two) {
+        Err(ManifestError::Unenforceable { field, .. }) => {
+            assert_eq!(field, "spec.capabilities.provides");
+        }
+        Err(e) => panic!("wrong refusal: {e}"),
+        Ok(_) => panic!("a declarative agent answered to two names nothing distinguishes"),
+    }
+
+    // The same two capabilities on a *coded* agent parse fine.
+    let coded = two.replace("  execution: { kind: completion }\n", "");
+    assert!(
+        Manifest::parse(&coded).is_ok(),
+        "a coded agent with two skills behind two capabilities is legal"
+    );
 }
 
 /// Formation runs on the quarantined model when one is declared.

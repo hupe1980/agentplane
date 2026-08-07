@@ -530,16 +530,12 @@ That member does not run when it is registered. It runs inside the transaction
 that buys is not a refinement:
 
 - **nothing is externalised and later reversed**, so no reversal can fail;
-- **the in-doubt window shrinks to one instant.** A transaction committed or it
-  did not — but the *client's knowledge* of which can still be lost, when the
-  connection drops between sending `COMMIT` and receiving its acknowledgement.
-  The two failures are kept distinguishable and handled oppositely: a commit
-  the server **refused** — a serialization or constraint failure, answered as a
-  database error — is a clean rollback and takes the cheap abort, while a
-  commit whose answer never arrived **quarantines the group**, because the
-  writes may be standing, permanent, with no reversal registered and none
-  possible, and settling `Aborted` over them would be the journal claiming
-  *taken back whole* about work nobody took back;
+- **the in-doubt window shrinks to one instant**: the connection dropping
+  between `COMMIT` and its acknowledgement. A commit the server **refused** is
+  a clean rollback and takes the cheap abort; a commit whose answer never
+  arrived **quarantines the group**, because the writes may be standing and
+  settling `Aborted` over them would claim *taken back whole* about work
+  nobody took back;
 - **an abort is a `ROLLBACK`**, which is free and cannot itself fail halfway.
 
 Compensation that never has to run beats compensation that runs correctly. DBOS
@@ -738,13 +734,17 @@ failed one. `Checkpoint` also has a text form in the C2SP note encoding, because
 the one artifact that must leave the operator's control cannot exist only as a
 Rust struct.
 
-#### What is still open
+#### The quorum, enforced
 
-* **Witness policy.** `HttpWitness` publishes to an independent C2SP
-  `tlog-witness`, so the transport is built. What remains a deployment decision
-  is how many cosignatures suffice and what happens while those witnesses are
-  unavailable. A checkpoint that is configured but never actually published is
-  still only as trustworthy as the operator.
+* **Witness policy.** `WitnessQuorum::of(n)` declares how many cosignatures
+  suffice, and `cosign_quorum` holds each submission round to it. Three
+  answers stay distinguishable: **met**; a **shortfall**, a finding to clear
+  rather than a log line; and an **integrity refusal** — a witness that saw
+  this log shrink or fork — reported *even when the quorum was met*. A run
+  never waits on witnessing: it is retrospective evidence, gathered after
+  sealing. The number itself is a deployment trust decision, and a checkpoint
+  configured but never published is still only as trustworthy as the
+  operator.
 * **Split views** — one history to one auditor, a different one to another — are
   refused by a witness that remembers, because the second history cannot prove
   it extends the first. The client and wire protocol exist; independence still

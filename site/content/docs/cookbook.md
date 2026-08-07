@@ -350,7 +350,7 @@ For real deployments, `OpenDalBlobs` puts them on anything
 [OpenDAL](https://opendal.apache.org) reaches — filesystem, S3, GCS, Azure:
 
 ```toml
-agentplane = { version = "0.3", features = ["opendal"] }
+agentplane = { version = "0.4", features = ["opendal"] }
 ```
 
 ```rust
@@ -466,9 +466,9 @@ spec:
 The agent opens a task carrying **its answer** as the proposal — not a
 description of it — and returns only on approval. Needs a case and `.tasks(store)`.
 
-**The trap: expecting `kind` to grow keywords.** It will not. `completion` is one
-model call; a tool-calling loop will be another named kind when the model layer
-can surface tool calls. What you will never find here is sequencing, conditions
+**The trap: expecting `kind` to grow keywords.** It is a closed enum —
+`completion`, `tool-calling`, `planned` — and each is a behaviour the runtime
+implements and tests. What you will never find here is sequencing, conditions
 or loops — config that encodes control flow stops being config and becomes a poor
 programming language. If you need structure, use a plan, which is
 contract-validated data.
@@ -493,7 +493,7 @@ model cannot be — the behaviour is a `Skill`, and the manifest governs its
 **boundary**: which model, which tools, what it may spend.
 
 ```toml
-agentplane = { version = "0.3", features = ["manifest"] }
+agentplane = { version = "0.4", features = ["manifest"] }
 ```
 
 Everything in the zero-Rust manifest above applies; drop `spec.execution` and add what a coded agent needs:
@@ -1154,6 +1154,33 @@ both agents need `max_sensitivity_egress: internal` or the room refuses its
 own point. `requires_approval: true` works exactly as on any grant — a person
 sees the capability and the arguments before any specialist runs.
 
+## 🗺️ Plan once, then execute without the model
+
+When the task's shape is known up front and the data the tools return is
+hostile, `kind: planned` beats the loop: one privileged call fixes the steps
+before anything untrusted is read, and step outputs travel between steps as
+references no model reads.
+
+```yaml
+spec:
+  execution: { kind: planned, max_turns: 4 }
+  models:
+    privileged:   { provider: anthropic, model: claude-sonnet-5 }
+    quarantined:  { provider: anthropic, model: claude-haiku-4-5-20251001 }
+```
+
+The planner answers with steps like
+`{ "tool": "crm__lookup", "args": { "id": "$input/customer" } }` and
+`{ "tool": "mail__send", "args": { "to": "$step0/email" } }` — the references
+are resolved by the runtime, labels intact. A `parse` step hands a prior
+output to the quarantined model under a bounded schema. Run
+`cargo run --example planned_run --features redb,testkit,manifest` to watch a
+prompt injection arrive in a tool output and find no reader.
+
+**The trap:** planning over untrusted input. It is refused outright — the
+planner reads the input to write the plan, so hand hostile content to a tool
+or a `parse` step instead, or use `tool-calling`.
+
 ## 🧱 Where are the built-in tools?
 
 There are none, and the reason is worth two paragraphs because every other
@@ -1178,8 +1205,9 @@ catalogue — and a catalogue is authority somebody has to review, entry by entr
 forever.
 
 What you get instead: `execution.kind` is the built-in *behaviour* —
-`completion` and `tool-calling` are the prebuilt agent loop, minus the part that
-runs outside the journal — and a typed `Tool` is about fifteen lines.
+`completion`, `tool-calling` and `planned` are the prebuilt agent loops, minus
+the part that runs outside the journal — and a typed `Tool` is about fifteen
+lines.
 
 ## 🔌 Call tools on an MCP server you already run
 

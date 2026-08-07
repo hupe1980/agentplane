@@ -228,27 +228,27 @@ The fixtures had to become honest in the process. A step that writes to a ledger
 now returns *that it wrote*, not the ledger's response — which is the real
 pattern anyway: data may set parameters, not choose control flow.
 
-### Quarantining a parse, today
+### Quarantining a parse
 
 The dual-model pattern's quarantined step — a model with no tools parsing
-hostile text into a bounded shape — is expressible now, two ways, and neither
-promotes trust:
+hostile text into a bounded shape — exists three ways, and none promotes
+trust:
 
-* **Memory formation** runs on the manifest's `quarantined` model when one is
-  declared: no tools, a bounded schema, and the privileged path learns nothing
-  from it but success or failure.
-* **A specialist granted as `tool://agent/<capability>`**: a completion-kind
-  agent with a declared output schema digests the content, and the bounded
-  derivative comes back **labelled untrusted**, journaled, its spend billed to
-  the asker.
+* **A `planned` agent's `parse` step** — the full form: control flow fixed
+  before the hostile text was fetched, the parse on the `quarantined` model,
+  its output flowing onward as a labelled reference **no model reads**. See
+  the [manifest reference](@/docs/manifest.md#spec-execution).
+* **Memory formation** runs on the `quarantined` model when one is declared:
+  no tools, a bounded schema, nothing handed back but success or failure.
+* **A specialist granted as `tool://agent/<capability>`**: the bounded
+  derivative comes back **labelled untrusted**, journaled, spend billed to
+  the asker — containment, not isolation, because the granting agent still
+  reads the derivative.
 
-Call the second what it is: containment, not isolation — the granting agent
-still *reads* the derivative, so a hostile document compressed into a hostile
-summary still reaches its context, bounded and labelled. What neither path
-will ever do is make untrusted data trusted. Schema-shaped is not trusted;
-extraction is not a wash cycle; the only promotion is a typed, journaled
-`release` a policy authorized. The gates hold because the *label* survives
-the parse, not because the parse cleaned anything.
+No path makes untrusted data trusted. Schema-shaped is not trusted; the only
+promotion is a typed, journaled `release` a policy authorized. The gates hold
+because the *label* survives the parse, not because the parse cleaned
+anything.
 
 ### Sensitivity composes upward only
 

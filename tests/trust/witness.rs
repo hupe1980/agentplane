@@ -419,3 +419,219 @@ async fn an_unseen_origin_starts_at_zero() {
         .await
         .expect("a first checkpoint extends from nothing");
 }
+
+// ── Quorum: the policy half ─────────────────────────────────────────────────
+//
+// The number of cosignatures that suffice is a trust decision only a
+// deployment can make. What the runtime owns is making the declared number
+// enforceable and its shortfall loud — and never letting a met quorum silence
+// a witness that remembers a different history.
+
+/// A witness that is down. Routine, not an integrity event.
+#[derive(Debug)]
+struct Down;
+
+#[async_trait::async_trait]
+impl Witness for Down {
+    async fn cosign(
+        &self,
+        _checkpoint: &Checkpoint,
+        _old_size: u64,
+        _proof: &[Digest],
+    ) -> Result<agentplane::journal::Cosignature, WitnessError> {
+        Err(WitnessError::Unavailable("connection refused".into()))
+    }
+}
+
+/// Seal `n` runs so the store has a real log to prove consistency over.
+async fn sealed_store(n: usize) -> Arc<agentplane::store::RedbStore> {
+    use agentplane::journal::{Append, JournalStore, RecordKind};
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    for _ in 0..n {
+        let run = agentplane::RunId::generate();
+        let lease = store
+            .acquire(run, "w", std::time::Duration::from_mins(1))
+            .await
+            .expect("lease");
+        store
+            .append(
+                lease.epoch,
+                vec![Append::new(
+                    run,
+                    RecordKind::RunAdmitted {
+                        capability: "witnessed".into(),
+                        governed_by: None,
+                        input_label: agentplane::core::Label::trusted(),
+                        input: serde_json::Value::Null,
+                        policy_bundle: None,
+                    },
+                )],
+            )
+            .await
+            .expect("append");
+        store
+            .seal(run, lease.epoch, "succeeded")
+            .await
+            .expect("seal");
+    }
+    store
+}
+
+/// Enough fresh witnesses cosign, and the report says nothing needs a person.
+#[tokio::test]
+async fn a_met_quorum_with_no_refusals_needs_nobody() {
+    use agentplane::journal::{JournalStore, WitnessQuorum, cosign_quorum};
+
+    let store = sealed_store(3).await;
+    let cp = store.checkpoint().await.expect("checkpoint");
+    let witnesses: Vec<Arc<dyn Witness>> = vec![Arc::new(witness()), Arc::new(witness())];
+
+    let outcome = cosign_quorum(
+        store.as_ref(),
+        &cp,
+        &witnesses,
+        WitnessQuorum::of(2).expect("two"),
+    )
+    .await
+    .expect("submission");
+
+    assert!(outcome.met(), "two fresh witnesses did not cosign");
+    assert_eq!(outcome.shortfall(), 0);
+    assert!(!outcome.needs_attention());
+    assert_eq!(outcome.cosignatures.len(), 2);
+}
+
+/// A shortfall is a finding, not a log line: the declared bar was not reached.
+#[tokio::test]
+async fn a_shortfall_demands_attention_and_says_how_much() {
+    use agentplane::journal::{JournalStore, WitnessQuorum, cosign_quorum};
+
+    let store = sealed_store(2).await;
+    let cp = store.checkpoint().await.expect("checkpoint");
+    let witnesses: Vec<Arc<dyn Witness>> = vec![Arc::new(witness()), Arc::new(Down)];
+
+    let outcome = cosign_quorum(
+        store.as_ref(),
+        &cp,
+        &witnesses,
+        WitnessQuorum::of(2).expect("two"),
+    )
+    .await
+    .expect("submission");
+
+    assert!(!outcome.met());
+    assert_eq!(outcome.shortfall(), 1);
+    assert!(outcome.needs_attention());
+    assert_eq!(
+        outcome.routine.len(),
+        1,
+        "the outage is routine, on the record"
+    );
+    assert!(outcome.integrity.is_empty(), "an outage is not a fork");
+}
+
+/// **A met quorum does not silence a fork.** One witness among three remembers
+/// a different history at this size; two honest cosigners are not a reason to
+/// look away from the third — they may simply never have seen what it saw.
+#[tokio::test]
+async fn a_fork_report_survives_a_met_quorum() {
+    use agentplane::journal::{JournalStore, WitnessQuorum, cosign_quorum};
+
+    let store = sealed_store(3).await;
+    let cp = store.checkpoint().await.expect("checkpoint");
+
+    // This witness cosigned a *different* history of the same origin and size.
+    let poisoned = witness();
+    let forged = Checkpoint {
+        origin: cp.origin.clone(),
+        size: cp.size,
+        root: Digest::of(b"a history that never happened"),
+    };
+    poisoned
+        .cosign(&forged, 0, &[])
+        .await
+        .expect("the forged history is internally consistent");
+
+    let witnesses: Vec<Arc<dyn Witness>> =
+        vec![Arc::new(witness()), Arc::new(witness()), Arc::new(poisoned)];
+    let outcome = cosign_quorum(
+        store.as_ref(),
+        &cp,
+        &witnesses,
+        WitnessQuorum::of(2).expect("two"),
+    )
+    .await
+    .expect("submission");
+
+    assert!(outcome.met(), "the two honest witnesses cosigned");
+    assert_eq!(outcome.integrity.len(), 1, "the fork is on the record");
+    assert!(
+        matches!(outcome.integrity[0].1, WitnessError::Forked { .. }),
+        "wrong classification: {:?}",
+        outcome.integrity[0].1
+    );
+    assert!(
+        outcome.needs_attention(),
+        "a met quorum silenced a fork report — the alarm witnessing exists for"
+    );
+}
+
+/// The stale answer heals itself: the witness names its cursor, the caller
+/// builds the proof from there, and the retry cosigns. The C2SP 409 dance.
+#[tokio::test]
+async fn a_stale_witness_is_healed_with_a_proof_from_its_cursor() {
+    use agentplane::journal::{Append, JournalStore, RecordKind, WitnessQuorum, cosign_quorum};
+
+    let store = sealed_store(1).await;
+    let early = store.checkpoint().await.expect("first checkpoint");
+    let w = Arc::new(witness());
+    w.cosign(&early, 0, &[]).await.expect("first sight");
+
+    // The log grows while the witness is not looking.
+    for _ in 0..2 {
+        let run = agentplane::RunId::generate();
+        let lease = store
+            .acquire(run, "w", std::time::Duration::from_mins(1))
+            .await
+            .expect("lease");
+        store
+            .append(
+                lease.epoch,
+                vec![Append::new(
+                    run,
+                    RecordKind::RunAdmitted {
+                        capability: "witnessed".into(),
+                        governed_by: None,
+                        input_label: agentplane::core::Label::trusted(),
+                        input: serde_json::Value::Null,
+                        policy_bundle: None,
+                    },
+                )],
+            )
+            .await
+            .expect("append");
+        store
+            .seal(run, lease.epoch, "succeeded")
+            .await
+            .expect("seal");
+    }
+    let late = store.checkpoint().await.expect("grown checkpoint");
+
+    let witnesses: Vec<Arc<dyn Witness>> = vec![w];
+    let outcome = cosign_quorum(
+        store.as_ref(),
+        &late,
+        &witnesses,
+        WitnessQuorum::of(1).expect("one"),
+    )
+    .await
+    .expect("submission");
+
+    assert!(
+        outcome.met(),
+        "the stale cursor was not healed: routine {:?}, integrity {:?}",
+        outcome.routine,
+        outcome.integrity
+    );
+    assert!(!outcome.needs_attention());
+}

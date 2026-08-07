@@ -126,6 +126,150 @@ pub trait Witness: Send + Sync + Debug {
     ) -> Result<Cosignature, WitnessError>;
 }
 
+/// A deployment's answer to *how many cosignatures suffice*.
+///
+/// The number itself is a trust decision only a deployment can make — one
+/// public witness rules out a silent rewrite by the operator alone; three
+/// independent ones rule out collusion with any single witness. What the
+/// runtime owns is making the declared number **enforceable and its
+/// shortfall loud**, which is the half that was missing: a deployment that
+/// "uses witnesses" with no declared quorum has evidence when it happens to
+/// have evidence.
+///
+/// Zero is refused at construction: a quorum of nothing reads in review as
+/// witnessing that is on.
+#[derive(Debug, Clone, Copy)]
+pub struct WitnessQuorum {
+    required: usize,
+}
+
+impl WitnessQuorum {
+    /// Require `required` cosignatures per checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// If `required` is zero — a quorum of nothing is witnessing that is off,
+    /// spelled as if it were on.
+    pub fn of(required: usize) -> Result<Self, &'static str> {
+        if required == 0 {
+            return Err(
+                "a quorum of zero cosignatures is witnessing that is off, spelled as if \
+                 it were on — omit witnessing instead of declaring an empty one",
+            );
+        }
+        Ok(Self { required })
+    }
+
+    /// How many cosignatures this policy demands.
+    #[must_use]
+    pub const fn required(&self) -> usize {
+        self.required
+    }
+}
+
+/// What one submission round produced, against a declared quorum.
+///
+/// Availability never waits on this: witnessing is retrospective evidence,
+/// gathered after sealing, off the run path — a run whose witnesses are
+/// unreachable proceeded long ago, and refusing to proceed would make the
+/// plane's availability depend on a third party, which is the wrong trade
+/// for evidence that is read after the fact. What a deployment gets instead
+/// is a report that cannot be mistaken for success: a shortfall is a finding
+/// whoever operates the plane must clear, not a log line.
+#[derive(Debug)]
+pub struct QuorumOutcome {
+    /// The cosignatures gathered, in witness order.
+    pub cosignatures: Vec<Cosignature>,
+    /// Routine failures, by witness index: unreachable, still stale after the
+    /// retry, or a proof the caller could not supply. Self-healing or
+    /// operational — resubmit later.
+    pub routine: Vec<(usize, WitnessError)>,
+    /// Integrity refusals, by witness index: a witness that saw this log
+    /// **shrink or fork**. The event witnessing exists to detect, and it is
+    /// reported even when the quorum was met — two honest cosigners do not
+    /// silence a third that remembers a different history.
+    pub integrity: Vec<(usize, WitnessError)>,
+    required: usize,
+}
+
+impl QuorumOutcome {
+    /// Whether enough witnesses cosigned.
+    #[must_use]
+    pub fn met(&self) -> bool {
+        self.cosignatures.len() >= self.required
+    }
+
+    /// How many cosignatures are still missing.
+    #[must_use]
+    pub fn shortfall(&self) -> usize {
+        self.required.saturating_sub(self.cosignatures.len())
+    }
+
+    /// Whether a person must look.
+    ///
+    /// True on a shortfall — the declared evidence bar was not reached — and
+    /// true on **any** integrity refusal, met quorum or not: a fork report
+    /// from one witness among five cosigners is the alarm, not noise, because
+    /// the four may simply never have seen the history the fifth remembers.
+    #[must_use]
+    pub fn needs_attention(&self) -> bool {
+        !self.met() || !self.integrity.is_empty()
+    }
+}
+
+/// Submit one checkpoint to every witness and hold the result to a quorum.
+///
+/// Speaks the protocol each witness expects: a first submission from size
+/// zero, and on a *stale* answer — the witness naming where it actually is —
+/// a consistency proof is built from the store at that size and the
+/// submission retried once. That is the C2SP 409 dance, and it is routine; a
+/// witness whose cursor is **ahead of** the checkpoint is answered by the
+/// witness itself with the shrink refusal, which is anything but.
+///
+/// # Errors
+///
+/// Only if the **store** cannot produce a consistency proof — a caller-side
+/// failure. A witness failing is never an error here; it is what the
+/// [`QuorumOutcome`] exists to report.
+pub async fn cosign_quorum(
+    store: &dyn super::JournalStore,
+    checkpoint: &Checkpoint,
+    witnesses: &[std::sync::Arc<dyn Witness>],
+    quorum: WitnessQuorum,
+) -> Result<QuorumOutcome, crate::core::StoreError> {
+    let mut outcome = QuorumOutcome {
+        cosignatures: Vec::new(),
+        routine: Vec::new(),
+        integrity: Vec::new(),
+        required: quorum.required(),
+    };
+    for (index, witness) in witnesses.iter().enumerate() {
+        let first = witness.cosign(checkpoint, 0, &[]).await;
+        let result = match first {
+            Err(WitnessError::Stale { witness_size, .. }) => {
+                // The witness said where it is. A cursor ahead of this
+                // checkpoint gets no proof — there is no growth to prove, and
+                // the witness's own shrink refusal is the honest answer.
+                let proof = if witness_size <= checkpoint.size {
+                    store.consistency_proof(witness_size).await?
+                } else {
+                    Vec::new()
+                };
+                witness.cosign(checkpoint, witness_size, &proof).await
+            }
+            other => other,
+        };
+        match result {
+            Ok(cosignature) => outcome.cosignatures.push(cosignature),
+            Err(e @ (WitnessError::Forked { .. } | WitnessError::Shrank { .. })) => {
+                outcome.integrity.push((index, e));
+            }
+            Err(e) => outcome.routine.push((index, e)),
+        }
+    }
+    Ok(outcome)
+}
+
 /// A witness that remembers, in this process.
 ///
 /// Its signer is a [`CheckpointSigner`], so the key may live in a KMS or an HSM

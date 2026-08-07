@@ -216,15 +216,13 @@ was the only trace.
 curl -H "$AUTH" 'https://plane/runs?outcome=quarantined'
 ```
 
-Concluded runs are indexed by how they ended. The index is **derived**: the
-store maintains it from the `RunSealed` record inside `append`, in the same
-transaction, so tamper detection covers the outcome and this can be rebuilt
-from the chain. It is a convenience, never an authority. **The last conclusion
-wins** — a failed run is listed under `failed` while it stands failed, and
-moves to `succeeded` when a resume concludes it again, so the failed backlog
-actually drains. Failure does not seal: a failed or exhausted run stays open
-and resumable, and only a conclusion nothing may resume — succeeded,
-quarantined, cancelled — freezes the journal and enters the Merkle log.
+Concluded runs are indexed by how they ended. The index is **derived** from
+the `RunSealed` record inside `append`, in the same transaction, so it can be
+rebuilt from the chain and is never an authority. **The last conclusion
+wins**: a failed run moves to `succeeded` when a resume concludes it again,
+so the failed backlog drains. Failure does not seal — a failed or exhausted
+run stays open and resumable; only succeeded, quarantined and cancelled
+freeze the journal and enter the Merkle log.
 
 The list comes back **newest first**, and `truncated` says whether there is
 more. That ordering is part of the store contract rather than a detail of the

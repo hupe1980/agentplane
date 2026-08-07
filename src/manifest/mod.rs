@@ -457,6 +457,34 @@ pub enum ExecutionKind {
     /// as a failed call rather than ending the run: the model gets a chance to
     /// correct itself, and it never gets the tool it nearly named.
     ToolCalling,
+
+    /// Plan first over trusted input, then execute without the model.
+    ///
+    /// One privileged call reads the run's input — which MUST be trusted, and
+    /// an untrusted input is refused outright — and emits a plan in a bounded
+    /// schema: which granted tools to call, in what order, with which
+    /// arguments. The runtime validates every step against the manifest's
+    /// grants and executes the plan itself. Step outputs travel between steps
+    /// as **labelled data bound by reference** (`$step0/txn/id`), never back
+    /// through a model's context, so a hostile tool output cannot steer the
+    /// steps that follow it: control flow was fixed before anything untrusted
+    /// was read, and the data it touches keeps its provenance into every
+    /// protected-field and taint gate.
+    ///
+    /// This is the dual-model pattern completed (`CaMeL`'s shape): a `parse`
+    /// step hands a prior output to the **quarantined** model under a
+    /// declared schema and a fixed extraction-only instruction, and the only
+    /// thing a parse can say out of band is *not enough information*, which
+    /// fails the step. Nothing a parse returns becomes trusted — schema-shaped
+    /// is not trusted, and the only promotion anywhere is a typed, journaled
+    /// release.
+    ///
+    /// Bought at a price [`ToolCalling`](Self::ToolCalling) does not pay: a
+    /// plan cannot react to what it discovers mid-flight. Choose `planned`
+    /// when the task's shape is known up front and the inputs the tools
+    /// return are hostile; choose `tool-calling` when the shape is the
+    /// discovery.
+    Planned,
 }
 
 /// Where this agent sits in a multi-agent arrangement.
@@ -893,6 +921,22 @@ impl Manifest {
                 return Err(ManifestError::Empty("spec.identity.role"));
             }
         }
+        // A declarative agent provides exactly one capability. The behaviour
+        // cannot tell two apart — the capability never reaches the prompt, so
+        // both names would run the identical model call — and accepting YAML
+        // that declares a distinction nothing executes is the `routed`/`router`
+        // mistake again. Two capabilities are two agents: two documents, one
+        // room file, each with its own digest. A *coded* agent may provide
+        // several, because each capability has its own skill behind it.
+        if self.spec.execution.is_some() && self.spec.capabilities.provides.len() > 1 {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.capabilities.provides",
+                detail: "a declarative agent provides exactly one capability — the \
+                         behaviour cannot tell two apart, so a second name would be a \
+                         distinction nothing executes. Split into two documents in one \
+                         room file, each with its own digest",
+            });
+        }
         self.validate_oversight()?;
         self.validate_tool_approval()?;
         self.validate_tool_grants()?;
@@ -988,7 +1032,10 @@ impl Manifest {
         let Some(execution) = &self.spec.execution else {
             return Ok(());
         };
-        if execution.kind != ExecutionKind::ToolCalling {
+        if !matches!(
+            execution.kind,
+            ExecutionKind::ToolCalling | ExecutionKind::Planned
+        ) {
             return Ok(());
         }
         for grant in &self.spec.tools {
@@ -998,10 +1045,10 @@ impl Manifest {
                 .is_none_or(|d| d.trim().is_empty())
             {
                 return Err(ManifestError::Syntax(format!(
-                    "spec.tools: '{}' has no description, and a `tool-calling` agent offers \
-                     its tools to a model by name and description. Without one the model \
-                     guesses, and a guessed call is refused at the field check after it has \
-                     been paid for",
+                    "spec.tools: '{}' has no description, and a `tool-calling` or `planned` \
+                     agent offers its tools to a model by name and description. Without one \
+                     the model guesses, and a guessed call is refused at the field check \
+                     after it has been paid for",
                     grant.reference
                 )));
             }
@@ -1150,13 +1197,13 @@ impl Manifest {
         // whole format refuses.
         if !matches!(
             self.spec.execution.as_ref().map(|e| e.kind),
-            Some(ExecutionKind::ToolCalling)
+            Some(ExecutionKind::ToolCalling | ExecutionKind::Planned)
         ) {
             return Err(ManifestError::Unenforceable {
                 field: "spec.tools[].requires_approval",
-                detail: "per-call approval is applied by the `tool-calling` loop; a \
-                         hand-written skill chooses its own moment to ask, and a \
-                         `completion` agent calls no tools at all",
+                detail: "per-call approval is applied by the `tool-calling` loop and the \
+                         `planned` executor; a hand-written skill chooses its own moment \
+                         to ask, and a `completion` agent calls no tools at all",
             });
         }
         Ok(())

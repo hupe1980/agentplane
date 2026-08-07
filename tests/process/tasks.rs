@@ -1008,6 +1008,134 @@ spec:
     );
 }
 
+/// A planned step whose grant asks for a human waits, exactly as a loop call
+/// does — and the reviewer sees the **resolved** arguments, references already
+/// bound, because approving `$input/payee` would be approving a name rather
+/// than a destination.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_planned_step_waits_for_its_approval() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use agentplane::runtime::Agent;
+    use agentplane::tools::{Tool, ToolBox, ToolFailure};
+
+    static PAID: AtomicUsize = AtomicUsize::new(0);
+
+    /// Move funds between accounts.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct Payout {
+        /// Where the money goes.
+        recipient: String,
+        /// How much, in minor units.
+        amount: i64,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Payout {
+        const SERVER: &'static str = "ledger";
+        const NAME: &'static str = "payout";
+        async fn call(self) -> Result<Value, ToolFailure> {
+            PAID.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "moved": self.amount, "to": self.recipient }))
+        }
+    }
+
+    const YAML: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities: { provides: [desk.pay] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: planned, max_turns: 2 }
+  oversight:
+    approval: tools-only
+    deadline: { name: payment-review, kind: hours, params: { n: 4 } }
+  tools:
+    - ref: tool://ledger/payout
+      mutates: true
+      description: Move funds between accounts.
+      requires_approval: true
+      protected_fields:
+        - path: /recipient
+          max_sensitivity: internal
+        - path: /amount
+          max_sensitivity: internal
+  budgets: {}
+"#;
+    let manifest = agentplane::manifest::Manifest::parse(YAML).expect("manifest");
+
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_answer(agentplane::model::Completion {
+        text: String::new(),
+        structured: Some(json!({
+            "steps": [{ "tool": "ledger__payout",
+                         "args": { "recipient": "$input/payee", "amount": 250_000 } }]
+        })),
+        tool_calls: Vec::new(),
+        usage: agentplane::model::Usage::default(),
+        stop_reason: Some("end_turn".to_owned()),
+        truncated: false,
+        continuation: None,
+    });
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .events(Arc::clone(&store) as Arc<dyn EventStore>)
+        .tasks(Arc::clone(&store) as Arc<dyn TaskStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .toolbox(ToolBox::new().with::<Payout>())
+        .build();
+
+    rt.run_in_case(
+        "desk.pay",
+        json!({ "payee": "treasury@example.com" }),
+        "payment",
+        &[key("PAY-2")],
+    )
+    .await
+    .expect("the run suspends on the approval");
+
+    assert_eq!(
+        PAID.load(Ordering::SeqCst),
+        0,
+        "the payout happened before anyone approved it"
+    );
+
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    let shown = &task.justification.proposed_action;
+    assert_eq!(
+        shown["tool"], "tool://ledger/payout",
+        "the reviewer was not shown which tool would run: {shown}"
+    );
+    assert_eq!(
+        shown["arguments"]["recipient"], "treasury@example.com",
+        "the reviewer was shown the reference, not the destination it \
+         resolves to: {shown}"
+    );
+
+    rt.decide_task(
+        task.id,
+        &Decision::reject("carol", "not on the settlement list"),
+        &officer(),
+    )
+    .await
+    .expect("the rejection is recorded");
+
+    assert_eq!(
+        PAID.load(Ordering::SeqCst),
+        0,
+        "a refused planned step was dispatched anyway"
+    );
+}
+
 /// A deadline transition journals the state it moved **from**, for that deadline.
 ///
 /// `meet_deadline` and `cancel_deadline` both discard the prior state, so it
