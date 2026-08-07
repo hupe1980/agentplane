@@ -694,3 +694,160 @@ fn every_published_yaml_fragment_is_well_formed() {
         broken.join("\n\n")
     );
 }
+
+/// Every public method on `StepCtx`, gathered across the runtime module.
+///
+/// Scoped to the `impl StepCtx` blocks, and read from every file rather than
+/// one: `ctx.rs` also holds `Mode` and the commission effect, whose methods
+/// must not make the caller permissive — and `group.rs` carries
+/// `StepCtx::group`, so reading `ctx.rs` alone reported the four pages that
+/// document it as wrong. A guard's own first run is where that gets found.
+fn step_ctx_methods(root: &Path) -> std::collections::BTreeSet<String> {
+    let mut real = std::collections::BTreeSet::new();
+    for file in walk(&root.join("src/runtime")) {
+        if file.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&file).expect("a readable module");
+        let mut in_step_ctx = false;
+        for line in source.lines() {
+            if line.starts_with("impl") {
+                in_step_ctx = line.contains("StepCtx");
+            }
+            if !in_step_ctx {
+                continue;
+            }
+            let Some(rest) = line.trim_start().strip_prefix("pub ") else {
+                continue;
+            };
+            let rest = rest.strip_prefix("async ").unwrap_or(rest);
+            let rest = rest.strip_prefix("const ").unwrap_or(rest);
+            if let Some(name) = rest.strip_prefix("fn ") {
+                let name: String = name
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    real.insert(name);
+                }
+            }
+        }
+    }
+    real
+}
+
+/// Every `cx.method(...)` a page publishes names a method that exists.
+///
+/// The defect this catches shipped: the concepts page's `StepCtx` table — the
+/// surface a newcomer programs against — listed `random()`, `write_case_state()`
+/// and `read_blob`, none of which are on the type. The real names are `rng()`,
+/// `put_case_state()` and `blobs()`. A reader copying any of the three gets a
+/// compile error, and nothing in the toolchain looked: doc tests compile
+/// rustdoc under `src/`, never the markdown, and the one harness that does
+/// build a published snippet only builds the *first* example a reader meets.
+///
+/// Deliberately one-directional. It refuses a documented name that does not
+/// exist; it does not demand that every method be documented, because a page
+/// choosing what to teach is editorial and a guard that forced completeness
+/// would be answered by a table nobody reads.
+#[test]
+fn every_documented_step_ctx_method_exists() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let real = step_ctx_methods(root);
+    assert!(
+        real.len() > 20,
+        "only {} StepCtx methods were found — the impl blocks moved and this \
+         guard is now inert",
+        real.len()
+    );
+
+    let mut pages = 0usize;
+    let mut cited = 0usize;
+    let mut bad: Vec<String> = Vec::new();
+    let mut files: Vec<std::path::PathBuf> = vec![root.join("README.md")];
+    files.extend(walk(&root.join("site/content")));
+    for file in &files {
+        if file.extension().is_none_or(|e| e != "md") {
+            continue;
+        }
+        pages += 1;
+        let text = std::fs::read_to_string(file).expect("a readable page");
+        for (n, line) in text.lines().enumerate() {
+            // Both spellings a page uses: `cx.recall(` in a snippet and
+            // `StepCtx::recall` in prose.
+            for (marker, offset) in [("cx.", 3usize), ("StepCtx::", 9)] {
+                let mut from = 0usize;
+                while let Some(at) = line[from..].find(marker) {
+                    let start = from + at + offset;
+                    let name: String = line[start..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    from = start.max(from + at + 1);
+                    if name.is_empty() {
+                        continue;
+                    }
+                    // A call or a rustdoc-style reference, not a field access
+                    // in prose like `cx.step` — only names followed by `(`
+                    // or closing a doc link are claims about the API.
+                    let after = line[start + name.len()..].chars().next();
+                    if !matches!(after, Some('(' | ')' | '`') | None) {
+                        continue;
+                    }
+                    cited += 1;
+                    if !real.contains(&name) {
+                        bad.push(format!(
+                            "{}:{}: `{marker}{name}` is not a StepCtx method",
+                            file.strip_prefix(root).unwrap_or(file).display(),
+                            n + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // The table under `{#step-context}` is the one place a method is published
+    // *bare* — ``random()`` rather than ``cx.random(`` — and it is the page a
+    // newcomer programs against, so the markers above walk straight past the
+    // defect this guard exists for. Its own first version did exactly that:
+    // it passed with `random()` reinstated. Scanned separately rather than by
+    // loosening the markers, because a bare ``foo()`` anywhere else in the
+    // prose is as likely to be someone else's API as this one's.
+    let concepts = read("site/content/docs/concepts.md");
+    let table = concepts
+        .split_once("{#step-context}")
+        .map(|(_, rest)| rest.split("\n## ").next().unwrap_or(rest))
+        .expect("the concepts page still carries the StepCtx section");
+    let mut table_cited = 0usize;
+    for row in table.lines().filter(|l| l.starts_with('|')) {
+        for cell in row.split('`') {
+            let name: String = cell
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() || !cell[name.len()..].starts_with('(') {
+                continue;
+            }
+            table_cited += 1;
+            if !real.contains(&name) {
+                bad.push(format!(
+                    "site/content/docs/concepts.md: the StepCtx table lists \
+                     `{name}()`, which is not a method on the type"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        pages > 5 && cited > 20 && table_cited > 10,
+        "the walk found {pages} pages, {cited} citations and {table_cited} \
+         table rows — the site moved and this guard is now inert"
+    );
+    assert!(
+        bad.is_empty(),
+        "a page publishes a StepCtx method that does not exist, so a reader \
+         copying it gets a compile error:\n  {}",
+        bad.join("\n  ")
+    );
+}

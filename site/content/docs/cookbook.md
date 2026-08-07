@@ -13,50 +13,6 @@ For the vocabulary — effect, disposition, label — see
 
 ---
 
-## 🔔 Wire durable A2A push
-
-Push is a deployment capability, not merely a Cargo feature. Supply the same
-tenant-scoped durable store used by the runtime and a transport with an explicit
-host grant, take the worker handle, and only then sign the card:
-
-```rust,ignore
-use agentplane::api::a2a::A2aServer;
-use agentplane::push::{PushPolicy, PushSender, PushStore, PushTransport};
-use std::sync::Arc;
-
-let sender = Arc::new(PushSender::new(
-    PushPolicy::new().allow_host("hooks.customer.example"),
-));
-let server = A2aServer::new(runtime, authenticator, &security, &manifest, public_url)?
-    .with_push(
-        store.clone() as Arc<dyn PushStore>,
-        sender as Arc<dyn PushTransport>,
-    )?;
-let worker = server.push_worker().expect("push was just configured");
-let router = server.signing_cards_with(&card_signer)?.router();
-
-// Run this from the deployment's scheduler on every instance. A saturated
-// sweep means more due registrations exist, so drain another bounded batch
-// immediately; otherwise wait until the next scheduler tick.
-loop {
-    // Unix seconds come from this operational scheduler's clock. The worker
-    // never reaches for ambient time, which keeps backoff tests deterministic.
-    let report = worker.run_once(scheduler_now, 100).await?;
-    if !report.saturated {
-        break;
-    }
-}
-```
-
-There is deliberately no hidden Tokio worker. Lifecycle, shutdown, frequency
-and alerting belong to the process supervisor. Delivery is at least once: a
-crash after the receiver accepts but before cursor persistence repeats the
-event, and receivers must be idempotent. The journal is the outbox, so there is
-no task-transition/outbox dual write to lose. Configure push before card signing
-because `pushNotifications` is part of the signed document.
-
----
-
 ## 🧬 Build an agent
 
 An agent here is not a class you subclass. It is **skills** (what it can do), a
@@ -325,85 +281,6 @@ types require a versioned `MediaValidator` such as a malware scanner.
 
 ---
 
-## 📦 Keep large bytes out of the chain
-
-The journal refuses a record over 1 MiB, because an append-only hash chain can
-never take it back. Bytes that big go in a content-addressed store, and the
-*digest* goes in the journal.
-
-```rust
-use agentplane::blob::{BlobStore, MemoryBlobs};      // or OpenDalBlobs, feature `opendal`
-
-let blobs: Arc<dyn BlobStore> = Arc::new(MemoryBlobs::new());
-
-// The store hashes the bytes; a caller does not get to say where they live.
-let digest = blobs.put(&image_bytes).await?;
-
-// Journal the address, not the payload.
-let call = ModelCall::new(provider, model, json!({
-    "system": "describe the attached screenshot",
-    "screenshot": digest.to_hex(),
-}));
-```
-
-For real deployments, `OpenDalBlobs` puts them on anything
-[OpenDAL](https://opendal.apache.org) reaches — filesystem, S3, GCS, Azure:
-
-```toml
-agentplane = { version = "0.4", features = ["opendal"] }
-```
-
-```rust
-use agentplane::blob::OpenDalBlobs;
-
-let op = opendal::Operator::new(opendal::services::S3::default().bucket("agent-blobs"))?;
-let blobs = OpenDalBlobs::new(op, "runs");
-```
-
-**The trap:** a reference that is not a digest. This is the
-[claim check](https://docs.temporal.io/external-storage) pattern every durable
-engine converges on, with one difference that carries the weight — because the
-address *is* the hash, the chain still commits to the exact bytes it does not
-contain. `get` re-hashes before returning, so a blob edited on disk is refused
-rather than served. A token pointing at mutable storage would move the
-tamper-evidence boundary without saying so, and the journal would still look
-sound.
-
-**Store through the context, not the store.** `cx.store_blob` records which case
-the bytes belong to — a digest cannot be reversed later to find that out, so the
-association has to be made now or never:
-
-```rust
-let digest = cx.store_blob(&image_bytes).await?;   // linked to this case
-```
-
-**Erasing later.** A request names a person, which resolves to a case — never to
-a digest. So erase by case:
-
-```rust
-use agentplane::blob::erase_case;
-
-let n = erase_case(blobs.as_ref(), cases.as_ref(), case, now, "art-17 request").await?;
-```
-
-Every blob that case produced is tombstoned; other cases are untouched, even
-ones holding identical bytes. For a single artifact, `blobs.expire(digest, …)`
-does the same for one address.
-
-The chain still verifies — it committed to the digest, not the content — so you
-keep the proof of what happened without keeping the data. A read afterwards
-returns `BlobError::Expired` with the date and reason, never `NotFound`:
-retention doing its job and a blob nobody can account for are different answers,
-and only one of them is worth waking somebody for.
-
-**What it does not solve:** scheduling, and anything already inside a record. There
-is no TTL — you decide when to call `expire`. And personal data written into a
-*journal record* cannot be removed at all, because the chain is append-only. The
-1 MiB refusal keeps bulk content out by construction, but a short string still
-fits, so keep identifiers out of records deliberately.
-
----
-
 ## 📄 Write an agent with no Rust at all
 
 If the agent is a prompt, a model and a result shape, the code adds nothing a
@@ -485,6 +362,241 @@ agent on a model its own declaration does not name.
 still Rust because it delegates.
 
 ---
+
+## 🎫 Work with labelled values
+
+`Tainted<T>` is the type every value in a skill arrives in. Reading is free;
+the gate is at sinks, so there is no unwrap:
+
+```rust
+let name = input.peek()["name"].as_str().unwrap_or_default();  // reading is fine
+let label = input.label();                                     // trust, sensitivity, provenance
+```
+
+Build values so the labels stay *per field* rather than collapsing to the
+worst one:
+
+```rust
+let args = Tainted::object([
+    ("recipient".to_owned(), Tainted::trusted(json!("treasury"))),
+    ("memo".to_owned(), from_the_model),          // untrusted, and stays that way
+]);
+```
+
+`object` and `array` keep each field's label at its RFC 6901 path, which is
+what lets a protected `/recipient` be satisfied while `/memo` remains
+untrusted. `map` and `zip` cannot — the runtime cannot prove how a closure
+reshaped a value — so they keep the conservative whole-value label and drop
+field paths. Reach for `object` when the difference matters.
+
+Labels **join**: combine anything untrusted and the result is untrusted;
+combine anything `Confidential` and the result is at least `Confidential`.
+Effect output is labelled at the source, untrusted by default, so this happens
+without a skill saying so.
+
+**The trap:** `Tainted::trusted(...)` on something a model or a tool produced.
+It compiles, and it is the laundering every gate downstream depends on not
+happening. Trusted means *from the operator, the manifest, or the run's own
+trusted input*; raising anything else is `cx.release`, which asks policy and
+leaves a record.
+
+## 🔩 Reach a system this crate has never heard of
+
+Tools, models and peers are effects with drivers written for them. Everything
+else is an `Effect` you write — the extension seam:
+
+```rust
+#[async_trait::async_trait]
+impl Effect for ChargeCard {
+    type Output = Receipt;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        // Hashed with the position into the effect key: these arguments are
+        // what makes this call *this* call on replay.
+        EffectDescriptor::new("psp.charge", json!({ "order": self.order, "cents": self.cents }))
+    }
+
+    fn mutates(&self) -> bool { true }
+    fn recovery(&self) -> Recovery { Recovery::Reconcile }
+
+    async fn perform(&self) -> Result<Receipt, EffectError> {
+        match self.client.post(&self.order).await {
+            Ok(r)                      => Ok(r),
+            Err(e) if e.is_connect()   => Err(EffectError::Unavailable {
+                driver: "psp".into(), detail: e.to_string() }),
+            Err(e) if e.is_timeout()   => Err(EffectError::Timeout {
+                driver: "psp".into(), waited_ms: 30_000 }),
+            Err(e)                     => Err(EffectError::Rejected(e.to_string())),
+        }
+    }
+}
+```
+
+**The one decision that matters is the error mapping**, and it is a claim about
+the world, not about the wire: `Unavailable` and `Rejected` mean *nothing was
+applied*, so the runtime may retry; `Timeout` and `Interrupted` mean *it may
+have landed*, so it will not. Map a timeout to `Rejected` and a card gets
+charged twice.
+
+`recovery` says what to do with a call that may have landed: `Retry` (safe to
+repeat), `Reconcile` (ask the provider what happened — implement `reconcile`),
+or `RequiresOperator`. A mutating effect that declares nothing gets
+`RequiresOperator`.
+
+Declare `trust()` only if the output is *not* somebody else's data — the
+default is untrusted, and it is the right default. If the effect carries an
+outbound value, dispatch it with `cx.sink(effect, &args)` rather than
+`cx.effect`, which refuses it.
+
+You do not need an effect for the ordinary nondeterminism: `cx.now()` is the
+journaled clock, `cx.rng()` is seeded per step and reproduces on replay, and
+`cx.note("...")` puts a line in the chain for whoever reads it later.
+`SystemTime::now()` and a thread RNG are lint errors here, because a replay
+that recomputed them would disagree with the history it claims to reproduce.
+
+## 🤖 Call a model
+
+```rust
+use agentplane::model::{ModelCall, ModelProvider};
+
+let prompt = input.map(|ticket| json!({ "task": "triage", "ticket": ticket }));
+let call = ModelCall::new(provider, model_id, prompt.peek().clone());
+let completion = cx.sink(call, &prompt).await?;   // Tainted<Completion>
+```
+
+**The trap:** treating a failed call as free. A model call has a third state
+between success and failure — it ran, generated four hundred tokens, and the
+stream died. The provider bills for those tokens. If the ceiling counts them as
+zero, a retry loop against a flaky provider spends real money against a limit
+reading nothing.
+
+The drivers stream by default precisely so a severed call can report what it
+burned. You do not have to do anything to get that.
+
+## 📐 Ask for structured output
+
+```rust
+let prompt = Tainted::trusted(prompt);
+let call = ModelCall::new(provider, model, prompt.peek().clone()).expecting(schema);
+let completion = cx.sink(call, &prompt).await?;
+let value = completion.peek().structured.as_ref().expect("a schema was declared");
+```
+
+The schema goes to the provider's own constrained-decoding mode, where it is
+enforced **during** generation. A schema applied afterwards rejects an answer you
+have already paid for.
+
+**The trap:** assuming every model supports it. They don't, uniformly. Set the
+mode per *model*, not per driver — one driver serves many models over one key:
+
+```rust
+let provider = Anthropic::new(key)?
+    .structured_via_for("claude-legacy-1", SchemaMode::ForcedTool);
+```
+
+## 🧰 Define a tool once
+
+A tool is one type. Its arguments are its fields and its schema comes from those
+fields, so the model is shown exactly what the body deserializes. The description
+stays in the manifest because it steers model behaviour and therefore belongs in
+the digest-covered review artifact:
+
+```rust
+/// Read a ledger account's balance.
+#[derive(Deserialize, JsonSchema)]
+struct ReadBalance {
+    /// The account to read.
+    account: String,
+}
+
+#[async_trait]
+impl Tool for ReadBalance {
+    const SERVER: &'static str = "ledger";
+    const NAME: &'static str = "read";
+    fn mutates() -> bool { false }
+
+    async fn call(self) -> Result<Value, ToolFailure> {
+        Ok(json!({ "account": self.account, "balance": 42 }))
+    }
+}
+
+let rt = Runtime::builder(store)
+    .agent(Agent::new(&manifest))
+    .toolbox(ToolBox::new().with::<ReadBalance>().with::<PostEntry>())
+    .build();
+```
+
+`call` takes `self` because **the arguments are the tool**: by the time it runs,
+the model's JSON is this type or the call was refused. There is no `Value` left
+to index and no field name to misspell.
+
+### What a failure has to say
+
+`ToolFailure` names the **disposition**, not a transport error, because that is
+the only thing the runtime does anything with — it decides whether a retry is a
+correction or a second real invocation:
+
+```rust
+async fn call(self) -> Result<Value, ToolFailure> {
+    if !self.account.starts_with("AC-") {
+        // Nothing was attempted. Safe to repeat.
+        return Err(ToolFailure::DidNotHappen(format!("not an account: {}", self.account)));
+    }
+    match self.post().await {
+        Ok(receipt)              => Ok(json!({ "receipt": receipt })),
+        Err(e) if e.is_timeout() => Err(ToolFailure::InDoubt(e.to_string())),
+        Err(e)                   => Err(ToolFailure::Landed(e.to_string())),
+    }
+}
+```
+
+The `ToolId` is attached by the box that dispatched the call, so a body cannot
+name a tool other than itself and there is no identity to repeat on every error
+path. Getting the choice wrong in the `DidNotHappen` direction is how a payment
+happens twice, so **`InDoubt` is the honest answer whenever a request left this
+process and no acknowledgement came back**. `RequiresOperator` on the grant then
+escalates it rather than guessing.
+
+### What the output is labelled
+
+You do not label it, and you cannot. A tool's result comes back
+`Tainted<Value>` and **untrusted**, because it is the outside world's data — and
+nothing in the catalogue can change that, since the catalogue governs authority
+and not provenance. `ToolSafety::output_sensitivity` sets the *sensitivity* floor
+its results carry; there is no corresponding knob for trust.
+
+That is deliberate even for the case that feels wrong — an internal registry
+lookup whose answer really is reliable. Trust is not a property of where a value
+came from in the deployer's head; it is a claim that has to be journaled, and the
+way to make it is `cx.release`, which names the destination, basis and evidence
+and asks policy under `data:release`. A `trusted: true` field on a tool
+declaration would be the same claim with no record, no authorization and no
+reviewer.
+
+This is the shape Python's `@tool`, Pydantic AI, the OpenAI Agents SDK and Rig
+all arrived at, and the reasons are the same: a schema written twice is a schema
+that disagrees with itself. Those SDKs also derive the description from code,
+which is right when code is the declaration. Here the manifest is the reviewed,
+content-addressed declaration, so model-steering prose belongs there instead.
+
+`.toolbox(..)` is one call because it used to be three, and two of them were
+optional. It derives the catalogue from each agent's own declaration — the
+grants, their ceilings and their protected fields, stated once — and it
+**refuses to build** if the tools this binary implements and the manifests a
+reviewer approved have drifted **in either direction**: a tool implemented but
+not granted means the binary can do something its declaration does not admit; a
+grant with nothing behind it means the model is offered a tool that fails when
+chosen. Neither is caught by the dispatch gates, which refuse a *call* long
+after the disagreement shaped what the model was told it could do.
+
+The check runs at `build`, not when the box is wired, and that is what makes it
+worth trusting: checking on the `.toolbox(..)` call would check against the
+agents registered *so far*, so writing `.toolbox(..).agent(..)` would pass by
+having nothing yet to disagree with. Every agent on the plane is checked, not
+the first.
+
+**The trap:** believing the type is the security boundary. It is not — it is the
+*shape*. The manifest still declares what this deployment permits.
 
 ## 📜 Govern a skill you *did* write
 
@@ -573,6 +685,197 @@ the one document whose purpose was to make the ceiling reviewable. Every struct
 is `deny_unknown_fields`. For the same reason a manifest with *no* `budgets` is
 refused: unbounded is a decision, and `budgets: {}` is how you state it where a
 reviewer can object.
+
+---
+
+## 🗃️ Keep state across runs, not inside one
+
+A month-long process is a **case** plus short runs. Start a run correlated by
+business key, and it joins the existing case or opens one:
+
+```rust
+rt.run_in_case("claim.assess", input, "claim", &[CorrelationKey::new("claim", "CLM-9")]).await?;
+```
+
+Inside the skill, case state is versioned and every access is journaled:
+
+```rust
+let (state, version) = cx.case_state().await?;      // untrusted: many runs write it
+let next = json!({ "stage": "assessed" });
+cx.put_case_state(version, next).await?;            // refused if the case moved
+cx.deadline("respond-by", &DeadlineSpec::days(5), None).await?;
+cx.meet_deadline("respond-by").await?;
+cx.set_case_status(CaseStatus::Closed).await?;      // refused with an open obligation
+```
+
+**The trap:** treating `put_case_state` like a setter. It names the version it
+read, and a concurrent run that wrote first makes it fail — which is the lost
+update it exists to prevent. Re-read and decide again; do not retry the same
+write. Closing releases the correlation keys, so a closed case stops
+collecting new matter.
+
+## 🏷️ Send untrusted content without giving it authority
+
+Protect the fields that choose *what the world will do* rather than requiring
+every descriptive byte to be trusted:
+
+```rust
+let args = Tainted::object([
+    ("recipient".to_owned(), Tainted::trusted(json!("treasury"))),
+    ("memo".to_owned(), model_written_memo),
+]);
+let safety = ToolSafety::default()
+    .protect(ProtectedField::trusted("/recipient"));
+let call = ToolCall::prepare(&catalog, client, tool, args.peek().clone())?;
+let result = cx.sink(call, &args).await?;
+```
+
+The recipient must remain trusted; the memo may remain untrusted. `sink` also
+compares canonical JSON, so a call cannot validate `args` and dispatch a
+different recipient. Effects carrying outbound values are rejected by
+`cx.effect`, making this gate mandatory rather than conventional.
+
+When a trusted process authorizes a change, release the smallest possible
+field and name the decision:
+
+```rust
+let args = cx.release(
+    args,
+    Release::fields(
+        ReleaseScope::trust(),
+        ["/recipient".to_owned()],
+        "operator matched settlement SET-42",
+        "tool://ledger/transfer",
+        ["approval:SET-42".to_owned()],
+    ),
+).await?;
+```
+
+Policy evaluates `data:release`; the journal records releaser, prior label,
+scope, field, destination, basis and evidence. Provenance is retained, unrelated
+fields are unchanged, and the result remains `Tainted<Value>`. Run the complete
+success/refusal/release trail with `cargo run --example governed_transfer`.
+
+## 🔔 Wire durable A2A push
+
+Push is a deployment capability, not merely a Cargo feature. Supply the same
+tenant-scoped durable store used by the runtime and a transport with an explicit
+host grant, take the worker handle, and only then sign the card:
+
+```rust,ignore
+use agentplane::api::a2a::A2aServer;
+use agentplane::push::{PushPolicy, PushSender, PushStore, PushTransport};
+use std::sync::Arc;
+
+let sender = Arc::new(PushSender::new(
+    PushPolicy::new().allow_host("hooks.customer.example"),
+));
+let server = A2aServer::new(runtime, authenticator, &security, &manifest, public_url)?
+    .with_push(
+        store.clone() as Arc<dyn PushStore>,
+        sender as Arc<dyn PushTransport>,
+    )?;
+let worker = server.push_worker().expect("push was just configured");
+let router = server.signing_cards_with(&card_signer)?.router();
+
+// Run this from the deployment's scheduler on every instance. A saturated
+// sweep means more due registrations exist, so drain another bounded batch
+// immediately; otherwise wait until the next scheduler tick.
+loop {
+    // Unix seconds come from this operational scheduler's clock. The worker
+    // never reaches for ambient time, which keeps backoff tests deterministic.
+    let report = worker.run_once(scheduler_now, 100).await?;
+    if !report.saturated {
+        break;
+    }
+}
+```
+
+There is deliberately no hidden Tokio worker. Lifecycle, shutdown, frequency
+and alerting belong to the process supervisor. Delivery is at least once: a
+crash after the receiver accepts but before cursor persistence repeats the
+event, and receivers must be idempotent. The journal is the outbox, so there is
+no task-transition/outbox dual write to lose. Configure push before card signing
+because `pushNotifications` is part of the signed document.
+
+---
+
+## 📦 Keep large bytes out of the chain
+
+The journal refuses a record over 1 MiB, because an append-only hash chain can
+never take it back. Bytes that big go in a content-addressed store, and the
+*digest* goes in the journal.
+
+```rust
+use agentplane::blob::{BlobStore, MemoryBlobs};      // or OpenDalBlobs, feature `opendal`
+
+let blobs: Arc<dyn BlobStore> = Arc::new(MemoryBlobs::new());
+
+// The store hashes the bytes; a caller does not get to say where they live.
+let digest = blobs.put(&image_bytes).await?;
+
+// Journal the address, not the payload.
+let call = ModelCall::new(provider, model, json!({
+    "system": "describe the attached screenshot",
+    "screenshot": digest.to_hex(),
+}));
+```
+
+For real deployments, `OpenDalBlobs` puts them on anything
+[OpenDAL](https://opendal.apache.org) reaches — filesystem, S3, GCS, Azure:
+
+```toml
+agentplane = { version = "0.4", features = ["opendal"] }
+```
+
+```rust
+use agentplane::blob::OpenDalBlobs;
+
+let op = opendal::Operator::new(opendal::services::S3::default().bucket("agent-blobs"))?;
+let blobs = OpenDalBlobs::new(op, "runs");
+```
+
+**The trap:** a reference that is not a digest. This is the
+[claim check](https://docs.temporal.io/external-storage) pattern every durable
+engine converges on, with one difference that carries the weight — because the
+address *is* the hash, the chain still commits to the exact bytes it does not
+contain. `get` re-hashes before returning, so a blob edited on disk is refused
+rather than served. A token pointing at mutable storage would move the
+tamper-evidence boundary without saying so, and the journal would still look
+sound.
+
+**Store through the context, not the store.** `cx.store_blob` records which case
+the bytes belong to — a digest cannot be reversed later to find that out, so the
+association has to be made now or never:
+
+```rust
+let digest = cx.store_blob(&image_bytes).await?;   // linked to this case
+```
+
+**Erasing later.** A request names a person, which resolves to a case — never to
+a digest. So erase by case:
+
+```rust
+use agentplane::blob::erase_case;
+
+let n = erase_case(blobs.as_ref(), cases.as_ref(), case, now, "art-17 request").await?;
+```
+
+Every blob that case produced is tombstoned; other cases are untouched, even
+ones holding identical bytes. For a single artifact, `blobs.expire(digest, …)`
+does the same for one address.
+
+The chain still verifies — it committed to the digest, not the content — so you
+keep the proof of what happened without keeping the data. A read afterwards
+returns `BlobError::Expired` with the date and reason, never `NotFound`:
+retention doing its job and a blob nobody can account for are different answers,
+and only one of them is worth waking somebody for.
+
+**What it does not solve:** scheduling, and anything already inside a record. There
+is no TTL — you decide when to call `expire`. And personal data written into a
+*journal record* cannot be removed at all, because the chain is append-only. The
+1 MiB refusal keeps bulk content out by construction, but a short string still
+fits, so keep identifiers out of records deliberately.
 
 ---
 
@@ -667,25 +970,6 @@ naming an unregistered provider, or a plane whose store serves another tenant.
 
 ---
 
-## 🤖 Call a model
-
-```rust
-use agentplane::model::{ModelCall, ModelProvider};
-
-let prompt = input.map(|ticket| json!({ "task": "triage", "ticket": ticket }));
-let call = ModelCall::new(provider, model_id, prompt.peek().clone());
-let completion = cx.sink(call, &prompt).await?;   // Tainted<Completion>
-```
-
-**The trap:** treating a failed call as free. A model call has a third state
-between success and failure — it ran, generated four hundred tokens, and the
-stream died. The provider bills for those tokens. If the ceiling counts them as
-zero, a retry loop against a flaky provider spends real money against a limit
-reading nothing.
-
-The drivers stream by default precisely so a severed call can report what it
-burned. You do not have to do anything to get that.
-
 ## 🏠 Run a Hugging Face model locally
 
 The de-facto wire of self-hosted inference is the `OpenAI`-compatible
@@ -739,69 +1023,6 @@ assumed. A deployment that knows its server enforces it opts up with
 rather than silently dropped: `reasoning_effort` (no neutral spelling on this
 wire) and governed media (a per-server dialect). Against `api.openai.com`
 itself, use the `openai` driver — Responses is the current primitive there.
-
-## 🏷️ Send untrusted content without giving it authority
-
-Protect the fields that choose *what the world will do* rather than requiring
-every descriptive byte to be trusted:
-
-```rust
-let args = Tainted::object([
-    ("recipient".to_owned(), Tainted::trusted(json!("treasury"))),
-    ("memo".to_owned(), model_written_memo),
-]);
-let safety = ToolSafety::default()
-    .protect(ProtectedField::trusted("/recipient"));
-let call = ToolCall::prepare(&catalog, client, tool, args.peek().clone())?;
-let result = cx.sink(call, &args).await?;
-```
-
-The recipient must remain trusted; the memo may remain untrusted. `sink` also
-compares canonical JSON, so a call cannot validate `args` and dispatch a
-different recipient. Effects carrying outbound values are rejected by
-`cx.effect`, making this gate mandatory rather than conventional.
-
-When a trusted process authorizes a change, release the smallest possible
-field and name the decision:
-
-```rust
-let args = cx.release(
-    args,
-    Release::fields(
-        ReleaseScope::trust(),
-        ["/recipient".to_owned()],
-        "operator matched settlement SET-42",
-        "tool://ledger/transfer",
-        ["approval:SET-42".to_owned()],
-    ),
-).await?;
-```
-
-Policy evaluates `data:release`; the journal records releaser, prior label,
-scope, field, destination, basis and evidence. Provenance is retained, unrelated
-fields are unchanged, and the result remains `Tainted<Value>`. Run the complete
-success/refusal/release trail with `cargo run --example governed_transfer`.
-
-## 📐 Ask for structured output
-
-```rust
-let prompt = Tainted::trusted(prompt);
-let call = ModelCall::new(provider, model, prompt.peek().clone()).expecting(schema);
-let completion = cx.sink(call, &prompt).await?;
-let value = completion.peek().structured.as_ref().expect("a schema was declared");
-```
-
-The schema goes to the provider's own constrained-decoding mode, where it is
-enforced **during** generation. A schema applied afterwards rejects an answer you
-have already paid for.
-
-**The trap:** assuming every model supports it. They don't, uniformly. Set the
-mode per *model*, not per driver — one driver serves many models over one key:
-
-```rust
-let provider = Anthropic::new(key)?
-    .structured_via_for("claude-legacy-1", SchemaMode::ForcedTool);
-```
 
 ## ⏸️ Wait for a reply that may arrive first
 
@@ -989,110 +1210,6 @@ an atomic member — it is a `reversible` one.
 notion of a foreign table, so it lends no transaction and the member is refused
 at registration. That is a capability being absent, and it is refused where
 refusing costs nothing rather than after the eager members have run.
-
-## 🧰 Define a tool once
-
-A tool is one type. Its arguments are its fields and its schema comes from those
-fields, so the model is shown exactly what the body deserializes. The description
-stays in the manifest because it steers model behaviour and therefore belongs in
-the digest-covered review artifact:
-
-```rust
-/// Read a ledger account's balance.
-#[derive(Deserialize, JsonSchema)]
-struct ReadBalance {
-    /// The account to read.
-    account: String,
-}
-
-#[async_trait]
-impl Tool for ReadBalance {
-    const SERVER: &'static str = "ledger";
-    const NAME: &'static str = "read";
-    fn mutates() -> bool { false }
-
-    async fn call(self) -> Result<Value, ToolFailure> {
-        Ok(json!({ "account": self.account, "balance": 42 }))
-    }
-}
-
-let rt = Runtime::builder(store)
-    .agent(Agent::new(&manifest))
-    .toolbox(ToolBox::new().with::<ReadBalance>().with::<PostEntry>())
-    .build();
-```
-
-`call` takes `self` because **the arguments are the tool**: by the time it runs,
-the model's JSON is this type or the call was refused. There is no `Value` left
-to index and no field name to misspell.
-
-### What a failure has to say
-
-`ToolFailure` names the **disposition**, not a transport error, because that is
-the only thing the runtime does anything with — it decides whether a retry is a
-correction or a second real invocation:
-
-```rust
-async fn call(self) -> Result<Value, ToolFailure> {
-    if !self.account.starts_with("AC-") {
-        // Nothing was attempted. Safe to repeat.
-        return Err(ToolFailure::DidNotHappen(format!("not an account: {}", self.account)));
-    }
-    match self.post().await {
-        Ok(receipt)              => Ok(json!({ "receipt": receipt })),
-        Err(e) if e.is_timeout() => Err(ToolFailure::InDoubt(e.to_string())),
-        Err(e)                   => Err(ToolFailure::Landed(e.to_string())),
-    }
-}
-```
-
-The `ToolId` is attached by the box that dispatched the call, so a body cannot
-name a tool other than itself and there is no identity to repeat on every error
-path. Getting the choice wrong in the `DidNotHappen` direction is how a payment
-happens twice, so **`InDoubt` is the honest answer whenever a request left this
-process and no acknowledgement came back**. `RequiresOperator` on the grant then
-escalates it rather than guessing.
-
-### What the output is labelled
-
-You do not label it, and you cannot. A tool's result comes back
-`Tainted<Value>` and **untrusted**, because it is the outside world's data — and
-nothing in the catalogue can change that, since the catalogue governs authority
-and not provenance. `ToolSafety::output_sensitivity` sets the *sensitivity* floor
-its results carry; there is no corresponding knob for trust.
-
-That is deliberate even for the case that feels wrong — an internal registry
-lookup whose answer really is reliable. Trust is not a property of where a value
-came from in the deployer's head; it is a claim that has to be journaled, and the
-way to make it is `cx.release`, which names the destination, basis and evidence
-and asks policy under `data:release`. A `trusted: true` field on a tool
-declaration would be the same claim with no record, no authorization and no
-reviewer.
-
-This is the shape Python's `@tool`, Pydantic AI, the OpenAI Agents SDK and Rig
-all arrived at, and the reasons are the same: a schema written twice is a schema
-that disagrees with itself. Those SDKs also derive the description from code,
-which is right when code is the declaration. Here the manifest is the reviewed,
-content-addressed declaration, so model-steering prose belongs there instead.
-
-`.toolbox(..)` is one call because it used to be three, and two of them were
-optional. It derives the catalogue from each agent's own declaration — the
-grants, their ceilings and their protected fields, stated once — and it
-**refuses to build** if the tools this binary implements and the manifests a
-reviewer approved have drifted **in either direction**: a tool implemented but
-not granted means the binary can do something its declaration does not admit; a
-grant with nothing behind it means the model is offered a tool that fails when
-chosen. Neither is caught by the dispatch gates, which refuse a *call* long
-after the disagreement shaped what the model was told it could do.
-
-The check runs at `build`, not when the box is wired, and that is what makes it
-worth trusting: checking on the `.toolbox(..)` call would check against the
-agents registered *so far*, so writing `.toolbox(..).agent(..)` would pass by
-having nothing yet to disagree with. Every agent on the plane is checked, not
-the first.
-
-**The trap:** believing the type is the security boundary. It is not — it is the
-*shape*. The manifest still declares what this deployment permits.
 
 ## 🤝 Consult another agent, from a file
 
@@ -1607,9 +1724,19 @@ Use `MemoryWrite::retain_after_access(seconds)` with
 The refresh is a separate journaled, idempotent touch effect; ordinary recall
 remains read-only and strict replay never extends retention twice.
 
-Semantic ranking stays outside `MemoryStore` and inside the journal:
+Semantic ranking stays outside `MemoryStore` and inside the journal. Get the
+query vector from `cx.embed` — **never** by calling an embedder yourself: the
+vector is inside the retrieval effect's identity, and an embedding service does
+not promise the same floats twice, so a self-computed one quarantines a healthy
+run on the next replay:
 
 ```rust
+let query_vector = cx
+    .embed(embedder, Tainted::trusted("refund policy".to_owned()))
+    .await?
+    .peek()
+    .clone();
+
 let hits = cx.semantic_recall(
     retriever, // Arc<dyn SemanticRetriever>
     Tainted::trusted(SemanticQuery {

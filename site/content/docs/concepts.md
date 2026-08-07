@@ -323,18 +323,21 @@ discovering one call at a time.
 
 | | |
 |---|---|
-| `now()`, `random()` | the clock and RNG, journaled and reproduced on replay |
+| `now()`, `rng()`, `note(text)` | the clock, the per-step RNG, and a line in the chain — all reproduced on replay |
 | `effect(e)` | any effect with no labelled value to bind |
 | `sink(e, &value)` | an outbound effect **with** its labelled arguments — the only path that can carry protected fields |
 | `release(request)` | typed, policy-authorized improvement of a label |
 | `deadline`, `meet_deadline`, `cancel_deadline` | obligations |
-| `sleep(d)`, `await_event(&spec)` | durable suspension — a waiting run is a row, not a thread |
-| `case_state()`, `write_case_state()` | shared state across runs, version-checked |
-| `remember`, `recall`, `compact`, `form_memories` | governed memory |
+| `sleep(d)`, `await_event(&spec)`, `task(&spec)` | durable suspension — a waiting run is a row, not a thread |
+| `case_state()`, `put_case_state(v, s)`, `set_case_status(s)` | shared state across runs, version-checked |
+| `remember`, `recall`, `compact`, `form_memories`, `sweep_expired_memories` | governed memory |
 | `embed`, `semantic_recall` | vectors and ranking, both journaled |
-| `store_blob`, `read_blob` | content-addressed payloads |
+| `store_blob(bytes)`, `blobs()` | content-addressed payloads |
+| `fetch_media(..)` | a governed remote fetch, SSRF controls and all |
+| `draw(..)` | spend against a standing authorization |
 | `commission(capability, input)` | hand work to another agent on this plane |
 | `group()` | a transactional effect group |
+| `manifest()`, `budget()`, `run_id()` | what this agent was declared to be, and what it has spent |
 
 Two things about `commission` are worth stating because every multi-agent
 adopter asks: it takes `&mut self` and is **singular**, so a step delegates to
@@ -345,6 +348,23 @@ decisions outside it. **Fan out above the runtime**: independent opinions are
 better as independent runs with their own journals, which is also what makes each
 one separately replayable. There is no `join`/`select` helper and there
 deliberately will not be one.
+
+## 12. 📄 Coded and declarative agents {#agent-tiers}
+
+A skill you write is one way to have an agent. The other is to write no code:
+`spec.execution.kind` names a behaviour the runtime supplies, so the digest
+covers the agent *entirely* rather than only its boundary.
+
+| `kind` | The loop | Reach for it when |
+|---|---|---|
+| `completion` | one model call, answered in the declared shape | the task is a prompt and a result shape |
+| `tool-calling` | call tools until the model stops asking | the shape of the work *is* the discovery |
+| `planned` | plan once over trusted input, then execute with data routed by reference | the shape is known up front and the data is hostile |
+
+The set is closed on purpose: a config format whose behaviours are open-ended
+is one nobody can review. Everything else in this page applies unchanged —
+every turn, tool call and parse is an ordinary journaled effect, so a strict
+replay reassembles the whole thing without calling anyone.
 
 ## The pattern underneath all of them 🔍
 
