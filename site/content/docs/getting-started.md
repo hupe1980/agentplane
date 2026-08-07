@@ -266,6 +266,14 @@ file with no Rust anywhere. Each document keeps its own digest: the file is
 packaging, not identity. `agentplane run room.yaml` starts at the room's one
 declared orchestrator; say `--capability` when the file leaves any doubt.
 
+Every verb takes only its own flags — `agentplane run --push-host …` does not
+parse, because the flag lives on `serve`'s struct. Deployment wiring also reads
+`AGENTPLANE_STORE`, `AGENTPLANE_URL`, `AGENTPLANE_POLICY`, `AGENTPLANE_TOKENS`,
+`AGENTPLANE_ADDR` and `AGENTPLANE_OPERATOR_ADDR`, with the flag winning when
+both are given — one rule, rather than a config file and a precedence table.
+`agentplane <verb> --help` is generated from the same structs that enforce the
+flags, so it cannot describe an option nobody implemented.
+
 The answer goes to stdout and everything else to stderr, so it pipes. A run that
 is refused, exhausted or failed exits non-zero, because whoever scripts this
 needs the shell's own answer to "did it work".

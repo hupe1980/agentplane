@@ -20,12 +20,36 @@
 //! everything the agent does is in the file, so there is no accompanying program
 //! that could diverge from it.
 //!
-//! # Why the arguments are parsed by hand
+//! # Why the arguments are *not* parsed by hand any more
 //!
-//! The surface is three verbs and five flags. A dependency that grows feature
-//! flags and a derive macro to express that is a poor trade for a crate whose
-//! argument is a small, auditable substrate — the same reason the SSE parser is
-//! hand-rolled.
+//! They were, and the reason was written down: *the surface is three verbs and
+//! five flags, and a dependency that grows feature flags and a derive macro to
+//! express that is a poor trade*. That was true. It stopped being true without
+//! anybody noticing — `serve` and its wiring took the binary to **four verbs and
+//! fourteen flags**, and the comment justifying the decision went on describing
+//! the surface it was written against.
+//!
+//! The cost was not tidiness. A hand-rolled parser reads one flag table for
+//! every verb, so a flag belonging to one was **silently accepted** by another:
+//!
+//! ```sh
+//! agentplane run agent.yaml --push-host evil.example.com --tokens /nonexistent
+//! # ran happily; both flags did nothing, and one of them is a security control
+//! ```
+//!
+//! That is shape 1 — a declaration that does nothing — at the command line, and
+//! I12 says a declared control must be enforced or rejected by the parser. What
+//! a derive buys is that the bad state stops being representable: a flag lives on
+//! its subcommand's struct, and `run --push-host` fails to parse by
+//! construction. `--strict` `requires` `--replay` in the same way, and `--help`
+//! is generated from the structs that enforce the flags rather than being prose
+//! that can describe an option nobody implemented.
+//!
+//! It costs 9 crates on `cli` and **nothing on the library**, which is what
+//! settled it: `cli` produces a binary and already carries three hundred.
+//! Re-derive with `cargo tree --no-default-features --features cli -e normal
+//! --prefix none | sort -u | wc -l` — a number in a comment nobody can check is
+//! exactly how the sentence above this one went stale.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -36,105 +60,6 @@ use agentplane::model::ModelProvider;
 use agentplane::runtime::{Mode, RunStatus, Runtime, RuntimeBuilder};
 use agentplane::store::RedbStore;
 
-const USAGE: &str = "\
-agentplane — run an agent that is only a file
-
-USAGE
-    agentplane run <manifest.yaml> [OPTIONS]
-    agentplane serve <manifest.yaml> --url <URL> --policy <FILE> --tokens <FILE>
-    agentplane validate <manifest.yaml>
-    agentplane digest <manifest.yaml>
-
-    A file may hold several manifests separated by `---` (the Kubernetes
-    convention), so a whole multi-agent room deploys as one file. Each
-    document keeps its own digest — the file is packaging, not identity.
-
-OPTIONS
-    --input <JSON>       the run's input; defaults to {}
-    --input-file <PATH>  read the input from a file instead
-    --capability <CAP>   which capability to run. Optional when the file leaves
-                         no doubt: a single capability runs itself, and a room
-                         with exactly one orchestrator starts at its desk
-    --store <PATH>       journal on disk; defaults to memory, which keeps nothing
-    --replay <RUN_ID>    re-execute a recorded run instead of starting one
-    --strict             with --replay: verify rather than resume
-    --mcp <NAME>=<CMD>   run an MCP server as a child process and reach it as
-                         `tool://<NAME>/...`. Repeatable, one per server. The
-                         manifest grants the tools; this only says which
-                         transport reaches the server that offers them:
-
-                           --mcp tickets=\"npx -y @acme/ticket-server\"
-
-                         A declarative `tool-calling` or `planned` agent needs
-                         one of these, or a plane with no catalogue refuses to
-                         build. Needs the `mcp-stdio` feature
-
-SERVE
-    Hosts this agent as an A2A 1.0 peer: the public Agent Card at
-    /.well-known/agent-card.json and the JSON-RPC methods at /a2a.
-
-    --url <URL>          where callers reach this plane. Goes on the card, so it
-                         is the public address, not the bind address
-    --addr <HOST:PORT>   what to bind; defaults to 127.0.0.1:8080
-    --policy <FILE>      a Cedar policy set. REQUIRED — there is no permissive
-                         default, because a permissive engine and no engine are
-                         the same behaviour and only one of them looks governed
-    --tokens <FILE>      bearer tokens naming callers. REQUIRED, for the same
-                         reason: a server that authenticates nobody has no
-                         actor to record a decision against
-    --operator-addr <HOST:PORT>
-                         also serve the operator surface — the worklist, task
-                         decisions, and GET /runs?outcome=quarantined — on its
-                         own listener. Off unless asked for, and deliberately a
-                         separate port: a peer holds the public address
-    --sweep-every <SECS> how often deadlines, task expiry, dead letters and due
-                         timers are swept; 30 by default, 0 to run the sweep
-                         from your own scheduler instead
-    --push-host <HOST>   permit A2A push notifications to this exact host.
-                         Repeatable. Without at least one, push is not wired and
-                         the Agent Card advertises it as **absent** rather than
-                         claiming a capability nothing serves. Webhooks are
-                         HTTPS-only, checked at registration as well as at
-                         delivery, so a caller learns straight away that its
-                         URL will never be called
-
-      - token: \"a-long-random-string\"
-        actor: peer-a
-        roles: [peer]
-        tenant: acme     # optional; the default tenant when absent
-
-PROVIDERS
-    The manifest names a provider; the key comes from the environment, never
-    from the file — an agent's declaration must not change when its key does.
-
-      anthropic         ANTHROPIC_API_KEY
-      bedrock           AWS_REGION plus the standard AWS credential chain
-      openai            OPENAI_API_KEY
-      chat-completions  CHAT_COMPLETIONS_BASE_URL, pointing at any
-                        OpenAI-compatible server — TGI, vLLM, Ollama,
-                        llama.cpp, or Hugging Face's hosted router — plus
-                        CHAT_COMPLETIONS_API_KEY when the server wants one.
-                        This is how a local or Hugging Face model runs under
-                        a governed manifest.
-      fake              no key. Answers deterministically without a network,
-                        so a manifest can be exercised before anyone pays
-                        for it.
-";
-
-/// Send this crate's own events somewhere a person can read them.
-///
-/// Not decoration. Several controls here are deliberately *quiet toward the
-/// caller* and loud toward the operator: an A2A decline tells a peer only that
-/// it was declined, and names the determining policy in a `tracing` event
-/// instead, so a prober cannot map the authorization vocabulary from refusals.
-/// A binary with no subscriber installed turns the second half of that into
-/// nothing — the server refuses requests for reasons its own operator can never
-/// read, which is I13's *detection without delivery* reached by packaging.
-///
-/// `RUST_LOG` controls it, defaulting to `info` for this crate and `warn`
-/// elsewhere: a default of `off` would be the same hole with a knob on it, and
-/// a default of `debug` would bury the events that matter under the ones that
-/// do not. Events go to **stderr**, so the answer on stdout still pipes.
 fn install_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env()
@@ -147,47 +72,155 @@ fn install_tracing() {
         .try_init();
 }
 
-fn main() -> ExitCode {
-    install_tracing();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("agentplane: {e}");
-            ExitCode::FAILURE
-        }
-    }
+/// The command line.
+///
+/// One struct per verb, which is the whole point: a flag is reachable only from
+/// the subcommand that uses it, so the parser refuses what the old hand-rolled
+/// table silently accepted.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "agentplane",
+    version,
+    about = "Run an agent that is only a file",
+    long_about = "Run, host and pin agents declared entirely in YAML.\n\n\
+                  A file may hold several manifests separated by `---` (the \
+                  Kubernetes convention), so a whole multi-agent room deploys as \
+                  one file. Each document keeps its own digest — the file is \
+                  packaging, not identity.",
+    disable_help_subcommand = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    verb: Verb,
 }
 
-fn run(args: &[String]) -> Result<ExitCode, String> {
-    let Some(verb) = args.first().map(String::as_str) else {
-        print!("{USAGE}");
-        return Ok(ExitCode::FAILURE);
-    };
-    if matches!(verb, "-h" | "--help" | "help") {
-        print!("{USAGE}");
-        return Ok(ExitCode::SUCCESS);
-    }
+#[derive(clap::Subcommand, Debug)]
+enum Verb {
+    /// Execute an agent once and print its answer.
+    Run(RunArgs),
+    /// Host an agent as an A2A 1.0 peer.
+    Serve(Box<ServeArgs>),
+    /// Check every document in a file, and say what is in it.
+    Validate(FileArgs),
+    /// Print the identity a registry pins.
+    Digest(FileArgs),
+}
 
-    let path = args
-        .get(1)
-        .ok_or_else(|| format!("`{verb}` needs a manifest path. See --help"))?;
+#[derive(clap::Args, Debug)]
+struct FileArgs {
+    /// The manifest, or a `---`-separated file of them.
+    manifest: String,
+}
+
+#[derive(clap::Args, Debug)]
+struct RunArgs {
+    /// The manifest, or a `---`-separated file of them.
+    manifest: String,
+
+    /// The run's input, as JSON. Defaults to `{}`.
+    #[arg(long, conflicts_with = "input_file")]
+    input: Option<String>,
+
+    /// Read the run's input from a file instead.
+    #[arg(long)]
+    input_file: Option<String>,
+
+    /// Which capability to run. Optional when the file leaves no doubt.
+    #[arg(long)]
+    capability: Option<String>,
+
+    /// Journal on disk. Defaults to memory, which keeps nothing.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: Option<String>,
+
+    /// Re-execute a recorded run instead of starting one.
+    #[arg(long)]
+    replay: Option<String>,
+
+    /// With --replay: verify rather than resume.
+    #[arg(long, requires = "replay")]
+    strict: bool,
+
+    /// Run an MCP server as a child process and reach it as `tool://NAME/...`.
+    ///
+    /// Repeatable, one per server. The manifest grants the tools; this says only
+    /// which transport reaches the server offering them, because an agent's
+    /// digest must not change when it moves between a laptop and a cluster.
+    /// Needs the `mcp-stdio` feature.
+    #[arg(long, value_name = "NAME=COMMAND")]
+    mcp: Vec<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServeArgs {
+    /// The manifest. `serve` hosts exactly one agent.
+    manifest: String,
+
+    /// Where callers reach this plane. Goes on the Agent Card, so it is the
+    /// public URL rather than what you bind.
+    #[arg(long, env = "AGENTPLANE_URL")]
+    url: Option<String>,
+
+    /// What to bind the peer surface to.
+    #[arg(long, env = "AGENTPLANE_ADDR", default_value = "127.0.0.1:8080")]
+    addr: String,
+
+    /// A Cedar policy set. No default: a permissive engine and no engine are the
+    /// same behaviour, and only one of them looks governed.
+    #[arg(long, env = "AGENTPLANE_POLICY")]
+    policy: Option<String>,
+
+    /// Bearer tokens naming the callers this plane accepts.
+    #[arg(long, env = "AGENTPLANE_TOKENS")]
+    tokens: Option<String>,
+
+    /// Journal on disk. Required: a served task's id is a promise it can be
+    /// fetched again.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: Option<String>,
+
+    /// Also serve the operator surface — the worklist, task decisions and
+    /// `GET /runs?outcome=quarantined` — on its own listener.
+    #[arg(long, env = "AGENTPLANE_OPERATOR_ADDR")]
+    operator_addr: Option<String>,
+
+    /// How often deadlines, task expiry, dead letters and due timers are swept.
+    /// `0` runs the sweep from your own scheduler instead.
+    #[arg(long, value_name = "SECS", env = "AGENTPLANE_SWEEP_EVERY")]
+    sweep_every: Option<u32>,
+
+    /// Permit A2A push notifications to this exact host. Repeatable.
+    ///
+    /// Without one, push is not wired and the Agent Card advertises it as
+    /// absent rather than claiming a capability nothing serves.
+    #[arg(long, value_name = "HOST")]
+    push_host: Vec<String>,
+
+    /// Run an MCP server as a child process and reach it as `tool://NAME/...`.
+    #[arg(long, value_name = "NAME=COMMAND")]
+    mcp: Vec<String>,
+}
+
+/// Read and validate the manifests, for every verb.
+///
+/// A manifest that does not validate is not a thing to run, digest, or reason
+/// about — and in a multi-document file every document is held to that, because
+/// deploying two thirds of a room is worse than deploying none of it.
+fn manifests_at(path: &str) -> Result<Vec<Manifest>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
+    Manifest::parse_all(&text).map_err(|e| e.to_string())
+}
 
-    // Parsed before anything else, for every verb. A manifest that does not
-    // validate is not a thing to run, digest, or reason about — and in a
-    // multi-document file every document is held to that, because deploying
-    // two thirds of a room is worse than deploying none of it.
-    let manifests = Manifest::parse_all(&text).map_err(|e| e.to_string())?;
-
-    match verb {
-        "validate" => {
-            for m in &manifests {
+fn dispatch(cli: Cli) -> Result<ExitCode, String> {
+    match cli.verb {
+        Verb::Validate(a) => {
+            for m in &manifests_at(&a.manifest)? {
                 println!("ok: {} {}", m.metadata.name, m.metadata.version);
             }
             Ok(ExitCode::SUCCESS)
         }
-        "digest" => {
+        Verb::Digest(a) => {
+            let manifests = manifests_at(&a.manifest)?;
             // One document prints the bare digest, so scripts that pin a single
             // agent keep working; a room prints one line per agent, because a
             // bundle digest would make one agent's edit move its neighbours'
@@ -206,28 +239,40 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        "run" => execute(&manifests, &Options::parse(&args[2..])?),
-        "serve" => serve(&manifests, &Options::parse(&args[2..])?),
-        other => Err(format!("unknown command `{other}`. See --help")),
+        Verb::Run(a) => {
+            let manifests = manifests_at(&a.manifest)?;
+            execute(&manifests, &a)
+        }
+        Verb::Serve(a) => {
+            let manifests = manifests_at(&a.manifest)?;
+            serve(&manifests, &a)
+        }
     }
 }
 
-#[derive(Default)]
-struct Options {
-    input: Option<String>,
-    input_file: Option<String>,
-    capability: Option<String>,
-    store: Option<String>,
-    replay: Option<String>,
-    strict: bool,
-    addr: Option<String>,
-    url: Option<String>,
-    policy: Option<String>,
-    tokens: Option<String>,
-    operator_addr: Option<String>,
-    sweep_every: Option<u32>,
-    mcp: Vec<String>,
-    push_hosts: Vec<String>,
+fn main() -> ExitCode {
+    install_tracing();
+    // `clap` prints its own diagnostics and exits; everything past the parse is
+    // this binary's own vocabulary.
+    let cli = <Cli as clap::Parser>::parse();
+    match dispatch(cli) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("agentplane: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+impl RunArgs {
+    fn read_input(&self) -> Result<serde_json::Value, String> {
+        let text = match (&self.input, &self.input_file) {
+            (Some(s), _) => s.clone(),
+            (_, Some(p)) => std::fs::read_to_string(p).map_err(|e| format!("reading {p}: {e}"))?,
+            _ => "{}".into(),
+        };
+        serde_json::from_str(&text).map_err(|e| format!("the input is not valid JSON: {e}"))
+    }
 }
 
 /// How many due webhook registrations one push tick delivers.
@@ -241,63 +286,11 @@ const PUSH_BATCH: usize = 64;
 /// How often a served plane sweeps, when nobody says otherwise.
 ///
 /// Short enough that a breached deadline is noticed in the same minute, long
-/// enough that an idle plane is not doing constant store reads. `--sweep-every 0`
-/// turns it off, for a deployment running the sweep from its own scheduler.
+/// enough that an idle plane is not doing constant store reads.
+/// `--sweep-every 0` turns it off, for a deployment running the sweep from its
+/// own scheduler.
 #[cfg(all(feature = "a2a-server", feature = "cedar"))]
 const DEFAULT_SWEEP_SECONDS: u32 = 30;
-
-impl Options {
-    fn parse(args: &[String]) -> Result<Self, String> {
-        let mut o = Self::default();
-        let mut it = args.iter();
-        while let Some(flag) = it.next() {
-            // A flag needing a value and not getting one is an error, never a
-            // default. Silently running with `{}` because `--input` was last on
-            // the line is the kind of mistake that only shows up in the output.
-            let mut value = || {
-                it.next()
-                    .cloned()
-                    .ok_or_else(|| format!("{flag} needs a value"))
-            };
-            match flag.as_str() {
-                "--input" => o.input = Some(value()?),
-                "--input-file" => o.input_file = Some(value()?),
-                "--capability" => o.capability = Some(value()?),
-                "--store" => o.store = Some(value()?),
-                "--replay" => o.replay = Some(value()?),
-                "--strict" => o.strict = true,
-                "--addr" => o.addr = Some(value()?),
-                "--url" => o.url = Some(value()?),
-                "--policy" => o.policy = Some(value()?),
-                "--tokens" => o.tokens = Some(value()?),
-                "--operator-addr" => o.operator_addr = Some(value()?),
-                "--mcp" => o.mcp.push(value()?),
-                "--push-host" => o.push_hosts.push(value()?),
-                "--sweep-every" => {
-                    let raw = value()?;
-                    o.sweep_every =
-                        Some(raw.parse().map_err(|_| {
-                            format!("--sweep-every wants whole seconds, got `{raw}`")
-                        })?);
-                }
-                other => return Err(format!("unknown option `{other}`. See --help")),
-            }
-        }
-        if o.input.is_some() && o.input_file.is_some() {
-            return Err("--input and --input-file both given; which one did you mean?".into());
-        }
-        Ok(o)
-    }
-
-    fn read_input(&self) -> Result<serde_json::Value, String> {
-        let text = match (&self.input, &self.input_file) {
-            (Some(s), _) => s.clone(),
-            (_, Some(p)) => std::fs::read_to_string(p).map_err(|e| format!("reading {p}: {e}"))?,
-            _ => "{}".into(),
-        };
-        serde_json::from_str(&text).map_err(|e| format!("the input is not valid JSON: {e}"))
-    }
-}
 
 /// Host this agent as an A2A 1.0 peer.
 ///
@@ -316,7 +309,7 @@ impl Options {
 /// refuses a runtime with no policy engine and no case layer; this wires both
 /// rather than working around either.
 #[cfg(all(feature = "a2a-server", feature = "cedar"))]
-fn serve(manifests: &[Manifest], opts: &Options) -> Result<ExitCode, String> {
+fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
     use agentplane::api::a2a::A2aServer;
     use agentplane::api::tokens::TokenAuthenticator;
 
@@ -348,7 +341,7 @@ fn serve(manifests: &[Manifest], opts: &Options) -> Result<ExitCode, String> {
          There is deliberately no default — a server that authenticates nobody has no \
          actor to record a decision against",
     )?;
-    let addr = opts.addr.as_deref().unwrap_or("127.0.0.1:8080");
+    let addr = opts.addr.as_str();
 
     let policy_src = std::fs::read_to_string(policy_path)
         .map_err(|e| format!("reading the policy set {policy_path}: {e}"))?;
@@ -411,7 +404,7 @@ fn serve(manifests: &[Manifest], opts: &Options) -> Result<ExitCode, String> {
         let mut server = A2aServer::new(Arc::clone(&runtime), auth, &security, manifest, url)
             .map_err(|e| e.to_string())?;
 
-        server = wire_push(server, &opts.push_hosts, &store)?;
+        server = wire_push(server, &opts.push_host, &store)?;
         if let Some(worker) = server.push_worker() {
             spawn_push_worker(worker, opts.sweep_every.unwrap_or(DEFAULT_SWEEP_SECONDS));
         }
@@ -699,7 +692,7 @@ fn spawn_push_worker(worker: agentplane::api::a2a::A2aPushWorker, every: u32) {
 /// reason the provider list is derived from the build rather than written out.
 #[cfg(not(all(feature = "a2a-server", feature = "cedar")))]
 #[allow(clippy::unnecessary_wraps)]
-fn serve(_manifests: &[Manifest], _opts: &Options) -> Result<ExitCode, String> {
+fn serve(_manifests: &[Manifest], _opts: &ServeArgs) -> Result<ExitCode, String> {
     Err(
         "this build cannot serve: `serve` needs the `a2a-server` and `cedar` features. \
          Reinstall with `--features cli,a2a-server,cedar`, or use the `:full` \
@@ -708,7 +701,7 @@ fn serve(_manifests: &[Manifest], _opts: &Options) -> Result<ExitCode, String> {
     )
 }
 
-fn execute(manifests: &[Manifest], opts: &Options) -> Result<ExitCode, String> {
+fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
     for manifest in manifests {
         if manifest.spec.execution.is_none() {
             return Err(format!(

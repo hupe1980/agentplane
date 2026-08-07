@@ -75,7 +75,7 @@ redb = ["dep:redb"]
 # builder calls; the manifest is what makes those declarations reviewable.
 manifest = ["dep:serde_yaml_ng", "dep:base64", "dep:jsonschema"]
 # Everything the `agentplane` binary needs to run a declarative agent.
-cli = ["manifest", "redb", "providers", "bedrock", "testkit", "dep:tracing-subscriber"]
+cli = ["manifest", "redb", "providers", "bedrock", "testkit", "dep:tracing-subscriber", "dep:clap"]
 # Content-addressed blob storage on any backend OpenDAL reaches — filesystem,
 # S3, GCS, Azure. The other half of the journal's record-size limit: bytes too
 # big for the chain go here, and the chain commits to their digest.
@@ -117,7 +117,9 @@ mcp = ["dep:rmcp"]
 # transport-agnostic on purpose (`McpClient::new` takes a connection somebody
 # else made: stdio, a child process, streamable HTTP), and this one costs 8
 # crates plus `tokio/process` that an embedder connecting over their own
-# transport should not pay for. It is what lets `agentplane run` and
+# transport should not pay for — 178 with `mcp` and 186 with this, by
+# `cargo tree --no-default-features --features redb,manifest,<f> -e normal
+# --prefix none | sort -u | wc -l`. It is what lets `agentplane run` and
 # `agentplane serve` execute a declarative `tool-calling` agent with no Rust.
 mcp-stdio = ["mcp", "rmcp/transport-child-process"]
 # HTTP surface for operators: the worklist, run status, event delivery. Off by
@@ -202,6 +204,21 @@ tracing     = "0.1"
 # read. That is I13 — detection without delivery — reached by shipping a
 # server with no way to see what it decided.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "env-filter"], optional = true }
+# The binary's argument parser. Hand-rolled until the surface outgrew the
+# reasoning for it — the module comment said "three verbs and five flags" while
+# the binary had grown to four and fourteen, and flags belonging to one verb were
+# silently accepted by another. `--push-host` on `run` is a security control that
+# did nothing, which is shape 1 at the command line.
+#
+# What a dependency buys here is that the bad state stops being representable: a
+# flag lives on the subcommand's struct, so passing it elsewhere fails to parse.
+# +9 crates on `cli` and **+0 on the library**, which is the number that decided
+# it — `cli` produces a binary and already carries three hundred. Re-derive with
+# `cargo tree --no-default-features --features cli -e normal --prefix none |
+# sort -u | wc -l`; the first draft of this comment said twelve, taken before
+# `default-features = false` trimmed the colour stack — shape 20 inside a single
+# afternoon.
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "env", "wrap_help"], optional = true }
 redb        = { version = "3", optional = true }
 # The maintained fork of serde_yaml, which is deprecated. Ten crates deep.
 serde_yaml_ng = { version = "0.10", optional = true }

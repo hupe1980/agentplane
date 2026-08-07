@@ -18,7 +18,16 @@
 //! | erasure scope | a named key, `transit/keys/<scope>` |
 //! | mint a data key | `POST transit/datakey/plaintext/<scope>` |
 //! | open a data key | `POST transit/decrypt/<scope>` |
-//! | rotate | `POST transit/keys/<scope>/rotate`, then `transit/rewrap` |
+//! | rewrap under a rotated key | `POST transit/rewrap/<scope>` |
+//!
+//! Rotation itself is **not** in that table, and the row that used to claim it
+//! was wrong: `transit/keys/<scope>/rotate` appears nowhere in this file.
+//! Rotating a wrapping key is Vault's operation and its operator's decision —
+//! on their schedule, under their audit, with their approvals — and a runtime
+//! that rotated somebody's key ring because it happened to be running would be
+//! taking a decision that is not its own. What this crate owns is the half that
+//! follows: after a rotation, `rewrap` moves an existing wrapped key onto the
+//! new version without ever seeing the plaintext.
 //! | erase | `DELETE transit/keys/<scope>` |
 //!
 //! # Erasure needs to be switched on

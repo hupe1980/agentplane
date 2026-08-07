@@ -133,5 +133,34 @@ echo "$out" | grep -q 'no transport is wired' || {
     echo "FAIL: the refusal does not name the missing transport: $out"; exit 1; }
 echo "ok: refused at build, naming the server nobody wired"
 
+echo "── a flag belonging to another verb does not parse ──"
+# The defect the parser rewrite removed: one flag table for every verb meant
+# `run` silently accepted `--push-host`, `--url`, `--tokens` and friends and did
+# nothing with them. One of those is a security control, which makes it shape 1
+# at the command line — a declaration that does nothing.
+for bad in --push-host --url --operator-addr --tokens; do
+    if "${BIN[@]}" run "$YAML" --input '{}' "$bad" x >/dev/null 2>&1; then
+        echo "FAIL: \`run\` accepted the serve-only flag $bad"; exit 1
+    fi
+done
+if "${BIN[@]}" validate "$YAML" --input '{}' >/dev/null 2>&1; then
+    echo "FAIL: \`validate\` accepted a run-only flag"; exit 1
+fi
+echo "ok: each verb takes only its own flags"
+
+echo "── --strict without --replay does not parse ──"
+# It used to be accepted and ignored, so a reader asking for a *verification*
+# replay got an ordinary one and no hint of the difference.
+if "${BIN[@]}" run "$YAML" --input '{}' --strict >/dev/null 2>&1; then
+    echo "FAIL: --strict was accepted without --replay"; exit 1
+fi
+echo "ok: --strict requires --replay"
+
+echo "── the two input flags are mutually exclusive ──"
+if "${BIN[@]}" run "$YAML" --input '{}' --input-file /dev/null >/dev/null 2>&1; then
+    echo "FAIL: --input and --input-file were both accepted"; exit 1
+fi
+echo "ok: refused, rather than one silently winning"
+
 echo
 echo "the CLI runs an agent that is only a file"
