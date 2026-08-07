@@ -688,6 +688,20 @@ impl Record {
         self.body.effect_key
     }
 
+    /// The same record with its payload opened — a **read-time view**.
+    ///
+    /// `raw`, `hash` and `prev_hash` are untouched, so the chain still
+    /// verifies over the bytes that were written. This is the move upcasting
+    /// already makes: stored bytes are history, the typed body is a view of
+    /// them. Swapping a sealed payload for its plaintext therefore cannot
+    /// change what any proof commits to.
+    #[cfg(feature = "keyring")]
+    #[must_use]
+    pub(crate) fn with_opened_kind(mut self, kind: RecordKind) -> Self {
+        self.body.kind = kind;
+        self
+    }
+
     /// Verify a contiguous run of records links correctly.
     ///
     /// Checks both the chain and the sequence: a gap means records were deleted,

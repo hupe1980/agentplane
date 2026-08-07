@@ -86,7 +86,7 @@ opendal = ["dep:opendal"]
 # this crate never holds. Erasure destroys the data key, so every copy — live
 # store, replica, and every backup ever taken — becomes unreadable at once,
 # which deleting from the live store cannot do.
-keyring = ["dep:chacha20poly1305"]
+keyring = ["dep:chacha20poly1305", "dep:base64"]
 # A key ring that is somebody else: HashiCorp Vault's transit engine, over its
 # documented HTTP API. The wrapping key is created inside Vault and never leaves
 # it, so erasure is something this crate asks for and cannot undo.

@@ -8,6 +8,9 @@
 
 mod atomic;
 mod note;
+#[cfg(feature = "keyring")]
+pub mod payload;
+
 mod record;
 mod replay;
 mod store;

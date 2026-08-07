@@ -488,3 +488,149 @@ async fn erasing_one_tenants_key_leaves_another_tenant_readable() {
          another tenant plus a unit, making the two indistinguishable"
     );
 }
+
+// ── The journal, sealed at rest ─────────────────────────────────────────────
+
+/// A run whose payloads are sealed: written and read back in the clear by the
+/// runtime, ciphertext in the store, and the **chain verifies with no keys**.
+///
+/// That last property is the whole design. The chain commits to the sealed
+/// bytes, so tamper evidence does not depend on the key — which is what makes
+/// the erasure below survivable rather than self-defeating.
+#[tokio::test]
+async fn a_sealed_journal_hides_payloads_and_still_verifies_without_keys() {
+    use agentplane::core::{Digest, Label, RunId};
+    use agentplane::journal::{Append, JournalStore, Record, RecordKind, payload};
+    use agentplane::keyring::SealedJournal;
+
+    let plain: Arc<dyn JournalStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let keys = Arc::new(MemoryKeyRing::default());
+    let sealed = SealedJournal::wrap(
+        Arc::clone(&plain),
+        Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
+    );
+
+    let run = RunId::generate();
+    let lease = sealed
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    sealed
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "intake".into(),
+                    governed_by: None,
+                    input_label: Label::trusted(),
+                    input: serde_json::json!({ "patient": "Ada Lovelace" }),
+                    policy_bundle: None,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+
+    // Through the wrapper: readable.
+    let opened = sealed.read(run, 1).await.expect("read");
+    match opened[0].kind() {
+        RecordKind::RunAdmitted { input, .. } => {
+            assert_eq!(input["patient"], "Ada Lovelace", "the payload did not open");
+        }
+        other => panic!("unexpected record: {other:?}"),
+    }
+
+    // Straight from the store: sealed, and the name is nowhere in the bytes.
+    let raw = plain.read(run, 1).await.expect("raw read");
+    match raw[0].kind() {
+        RecordKind::RunAdmitted { input, .. } => {
+            assert!(
+                payload::is_sealed(input),
+                "the payload reached the store in the clear: {input}"
+            );
+        }
+        other => panic!("unexpected record: {other:?}"),
+    }
+    assert!(
+        !String::from_utf8_lossy(raw[0].raw()).contains("Lovelace"),
+        "the plaintext is in the bytes the store keeps"
+    );
+
+    // The routing stays in the clear, so the runtime keeps working with no key.
+    assert_eq!(raw[0].kind().kind_str(), "RunAdmitted");
+
+    // **The property that matters**: verified with no key ring in sight.
+    Record::verify_chain(&raw, Digest::ZERO).expect("the chain verifies without keys");
+}
+
+/// After the scope's key is destroyed the payload is unreadable **and the
+/// chain still verifies** — an erasure that does not cost the tamper evidence.
+///
+/// The alternative design, hashing the plaintext, would have destroyed both at
+/// once: the data *and* the ability to show nothing had been altered.
+#[tokio::test]
+async fn erasing_the_key_leaves_the_chain_verifiable() {
+    use agentplane::core::{Digest, Label, RunId, Timestamp};
+    use agentplane::journal::{Append, JournalStore, Record, RecordKind, payload};
+    use agentplane::keyring::SealedJournal;
+
+    let plain: Arc<dyn JournalStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let keys = Arc::new(MemoryKeyRing::default());
+    let sealed = SealedJournal::wrap(
+        Arc::clone(&plain),
+        Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
+    );
+
+    let run = RunId::generate();
+    let lease = sealed
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    sealed
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "intake".into(),
+                    governed_by: None,
+                    input_label: Label::trusted(),
+                    input: serde_json::json!({ "patient": "Ada Lovelace" }),
+                    policy_bundle: None,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+
+    // A run with no case seals under its own id — an erasure unit somebody can
+    // name, and the one an operator would reach for here.
+    keys.destroy(
+        &agentplane::keyring::scope(&agentplane::core::TenantId::default(), &run.to_string()),
+        Timestamp::from_unix_timestamp(1_760_000_000).expect("time"),
+        "subject exercised the right to erasure",
+    )
+    .await
+    .expect("destroy");
+
+    // Unreadable — through the wrapper that holds the ring, not merely to
+    // somebody without one.
+    let after = sealed.read(run, 1).await.expect("read still works");
+    match after[0].kind() {
+        RecordKind::RunAdmitted { input, .. } => {
+            assert!(
+                payload::is_sealed(input),
+                "the payload opened after its key was destroyed: {input}"
+            );
+        }
+        other => panic!("unexpected record: {other:?}"),
+    }
+
+    // And the history still proves it was not altered.
+    let raw = plain.read(run, 1).await.expect("raw read");
+    Record::verify_chain(&raw, Digest::ZERO)
+        .expect("erasure destroyed the tamper evidence along with the data");
+}

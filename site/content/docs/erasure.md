@@ -60,12 +60,26 @@ spec:
 Absent means unbounded, which is what every deployment had before the field
 existed.
 
-**Not built:** envelope encryption of journal rows and case state. The design
-requires it; today only blob payloads and memory item content are sealed, so
-destroying a wrapping key makes *those* unreadable and leaves the chain
-readable. Deployments whose erasure obligation covers prompts or tool arguments
-must minimize at the boundary — the table above — rather than plan on shredding
-the journal later.
+**Or seal the journal itself.** `SealedJournal::wrap(store, keys)` seals the
+payload fields — run input, effect arguments (prompts, tool calls) and effect
+outputs — under the same per-case scope `erase_case` already destroys, so a
+single erasure reaches blobs and journal alike:
+
+```rust
+let store = SealedJournal::wrap(store, keys);
+```
+
+Two properties make it worth having rather than merely present. Only the
+*payload* is sealed: `seq`, `run`, `case`, `effect_key` and the record's own
+variant stay in the clear, so exactly-once, the case scan, the outcome index
+and the chain keep working with no key at all. And the chain commits to the
+**ciphertext**, so an auditor holding no keys still verifies the history of a
+run whose payloads have been erased — hashing the plaintext would have tied
+the tamper evidence to the key and destroyed both together.
+
+What stays plaintext is case *state* in the case store. Data that must be
+erasable still belongs in a blob or a sealed journal, and the table above is
+what to check it against.
 
 ---
 

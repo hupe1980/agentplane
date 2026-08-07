@@ -210,6 +210,11 @@ pub fn scope(tenant: &crate::core::TenantId, unit: &str) -> String {
     format!("{tenant}/{unit}")
 }
 
+mod envelope;
+
+mod journal;
+pub use journal::SealedJournal;
+
 mod sealed;
 pub use sealed::EncryptedBlobs;
 

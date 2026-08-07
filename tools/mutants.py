@@ -3306,6 +3306,25 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if self.spec.execution.is_some() && self.spec.capabilities.provides.len() > 1 {",
         "        if false {",
     ),
+    "TheJournalIsNotSealed": (
+        "src/keyring/journal.rs",
+        "a_sealed_journal_hides_payloads_and_still_verifies_without_keys",
+        "a sealed journal writes its payloads in the clear, so the prompts and "
+        "arguments a deployment sealed reach the store readable",
+        "                *field = payload::wrap(&envelope);",
+        "                let _ = &envelope;",
+    ),
+    "ADestroyedKeyStillOpens": (
+        "src/journal/payload.rs",
+        "erasing_the_key_leaves_the_chain_verifiable",
+        "a sealed payload is not recognised as sealed, so an erased record "
+        "reads as though its key still existed",
+        """    value
+        .as_object()
+        .is_some_and(|o| o.len() == 1 && o.get(SEALED).is_some_and(serde_json::Value::is_string))""",
+        """    let _ = value;
+    false""",
+    ),
     "TheJournalCeilingIsAdvisory": (
         "src/runtime/ctx.rs",
         "data_above_the_journal_ceiling_is_refused_before_it_is_recorded",
