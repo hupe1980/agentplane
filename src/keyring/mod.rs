@@ -212,6 +212,12 @@ pub fn scope(tenant: &crate::core::TenantId, unit: &str) -> String {
 
 mod envelope;
 
+mod cases;
+pub use cases::SealedCases;
+
+mod tasks;
+pub use tasks::SealedTasks;
+
 mod journal;
 pub use journal::SealedJournal;
 

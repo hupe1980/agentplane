@@ -1242,3 +1242,61 @@ async fn a_deadline_transition_records_the_state_that_deadline_moved_from() {
     assert_eq!(state("first"), DeadlineState::Cancelled);
     assert_eq!(state("second"), DeadlineState::Met);
 }
+
+/// A task proposal is sealed in the worklist — the copy an operator queries.
+///
+/// `proposed_action` is the most specific caller data in the system: for a
+/// payment approval it is the amount and the destination account. The journal
+/// seals its copy; without this the worklist keeps a readable one. `summary`
+/// stays readable on purpose — it is the line a reviewer reads in a queue, and
+/// a worklist of unreadable rows helps nobody.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn a_task_proposal_is_sealed_in_the_worklist() {
+    use agentplane::journal::payload;
+    use agentplane::keyring::SealedTasks;
+    use agentplane::testkit::MemoryKeyRing;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let keys = Arc::new(MemoryKeyRing::default());
+    let sealed = SealedTasks::wrap(
+        Arc::clone(&store) as Arc<dyn TaskStore>,
+        Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
+        agentplane::core::TenantId::default(),
+    );
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .events(Arc::clone(&store) as Arc<dyn EventStore>)
+        .tasks(Arc::clone(&sealed) as Arc<dyn TaskStore>)
+        .skill(ProposesRefund::new(OnExpiry::Deny))
+        .build();
+
+    rt.run_in_case("demo.refund", json!({}), "dispute", &[key("SEAL-1")])
+        .await
+        .unwrap();
+
+    // Through the wrapper: the reviewer sees the real proposal.
+    let queued = sealed.queue(&officer(), 10).await.unwrap();
+    assert_eq!(queued.len(), 1, "the task did not reach the queue");
+    assert_eq!(
+        queued[0].justification.proposed_action["amount_eur"], 4200,
+        "the proposal did not open for the reviewer"
+    );
+
+    // In the store: sealed, and the amount is not in the bytes.
+    let raw = store.task(queued[0].id).await.unwrap().expect("stored");
+    assert!(
+        payload::is_sealed(&raw.justification.proposed_action),
+        "the proposal reached the worklist in the clear: {}",
+        raw.justification.proposed_action
+    );
+    assert!(
+        !raw.justification
+            .proposed_action
+            .to_string()
+            .contains("4200"),
+        "the amount is in the stored bytes"
+    );
+    // The summary stays readable, which is what keeps a queue usable.
+    assert!(raw.justification.summary.contains("deviation"));
+}

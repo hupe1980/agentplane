@@ -3306,6 +3306,26 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if self.spec.execution.is_some() && self.spec.capabilities.provides.len() > 1 {",
         "        if false {",
     ),
+    "ATaskProposalIsNotSealed": (
+        "src/keyring/tasks.rs",
+        "a_task_proposal_is_sealed_in_the_worklist",
+        "a task proposal is written to the worklist in the clear, so the exact "
+        "amount and account a reviewer approves stay readable in the copy an "
+        "operator queries",
+        "        sealed.justification.proposed_action = payload::wrap(&envelope);",
+        "        let _ = &envelope;",
+    ),
+    "CaseStateIsNotSealed": (
+        "src/keyring/cases.rs",
+        "case_state_is_sealed_and_erasing_the_case_takes_it",
+        "case state is written to the case store in the clear, so the copy an "
+        "operator reads first survives an erasure that destroyed the journal's",
+        """        self.inner
+            .put_state(case, expected, payload::wrap(&envelope))
+            .await""",
+        """        let _ = &envelope;
+        self.inner.put_state(case, expected, state).await""",
+    ),
     "TheJournalIsNotSealed": (
         "src/keyring/journal.rs",
         "a_sealed_journal_hides_payloads_and_still_verifies_without_keys",

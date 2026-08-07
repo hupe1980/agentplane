@@ -634,3 +634,76 @@ async fn erasing_the_key_leaves_the_chain_verifiable() {
     Record::verify_chain(&raw, Digest::ZERO)
         .expect("erasure destroyed the tamper evidence along with the data");
 }
+
+/// Case state is sealed in the case store too, under the scope `erase_case`
+/// destroys — so one erasure reaches the journal's copy and this one alike.
+///
+/// The journal's copy of a case write is sealed by `SealedJournal`; this is
+/// the second copy, the one the store keeps so `case()` can answer without
+/// replaying a run. Sealing one without the other would leave the data
+/// readable exactly where an operator looks first.
+#[tokio::test]
+async fn case_state_is_sealed_and_erasing_the_case_takes_it() {
+    use agentplane::case::CaseStore;
+    use agentplane::core::{CorrelationKey, TenantId, Timestamp};
+    use agentplane::journal::payload;
+    use agentplane::keyring::SealedCases;
+
+    let plain: Arc<dyn CaseStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let keys = Arc::new(MemoryKeyRing::default());
+    let tenant = TenantId::default();
+    let sealed = SealedCases::wrap(
+        Arc::clone(&plain),
+        Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
+        tenant.clone(),
+    );
+
+    let at = Timestamp::from_unix_timestamp(1_760_000_000).expect("time");
+    let case = sealed
+        .correlate_or_open("claim", &[CorrelationKey::new("claim", "CLM-9")], at)
+        .await
+        .expect("open")
+        .case_id();
+    let current = sealed.case(case).await.expect("read").expect("exists");
+    sealed
+        .put_state(
+            case,
+            current.version,
+            serde_json::json!({ "claimant": "Ada Lovelace" }),
+        )
+        .await
+        .expect("write");
+
+    // Through the wrapper: readable.
+    let opened = sealed.case(case).await.expect("read").expect("exists");
+    assert_eq!(opened.state["claimant"], "Ada Lovelace");
+
+    // Straight from the store: sealed, and the name is not in it.
+    let raw = plain.case(case).await.expect("raw").expect("exists");
+    assert!(
+        payload::is_sealed(&raw.state),
+        "case state reached the store in the clear: {}",
+        raw.state
+    );
+    assert!(!raw.state.to_string().contains("Lovelace"));
+
+    // Erasing the case destroys the scope key — the same act that erases its
+    // blobs and its journal payloads.
+    keys.destroy(
+        &agentplane::keyring::scope(&tenant, &case.to_string()),
+        at,
+        "subject exercised the right to erasure",
+    )
+    .await
+    .expect("destroy");
+
+    let after = sealed.case(case).await.expect("read").expect("exists");
+    assert!(
+        payload::is_sealed(&after.state),
+        "case state opened after its key was destroyed: {}",
+        after.state
+    );
+    // Still listable and closable: a completed erasure is not an outage.
+    assert_eq!(after.id, case);
+}
