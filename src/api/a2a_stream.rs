@@ -150,7 +150,7 @@ pub(super) async fn payloads_for_record(
 /// Only terminal states end a subscription. `INPUT_REQUIRED` can receive a
 /// later message or out-of-band authorization and therefore remains live under
 /// A2A 1.0.
-const fn closes(state: TaskState) -> bool {
+pub(super) const fn closes(state: TaskState) -> bool {
     matches!(
         state,
         TaskState::Completed | TaskState::Failed | TaskState::Canceled | TaskState::Rejected

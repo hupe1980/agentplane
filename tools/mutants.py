@@ -3424,6 +3424,45 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                    Ok(None)\n"
         "                }",
     ),
+    "ASealedRunMayResume": (
+        "src/runtime/executor.rs",
+        "a_sealing_conclusion_is_never_resumable",
+        "a conclusion that froze the journal and published a Merkle leaf is "
+        "treated as resumable, so its resume grows the history past the leaf "
+        "every later checkpoint attests — the failure the 'a conclusion is not "
+        "a closure' work removed for `failed`, reachable again the moment the "
+        "sealing set and the resumable set disagree",
+        '        "quarantined" => Some(RunStatus::Quarantined(\n'
+        '            "recorded as quarantined; a human must resolve it before it can run again".into(),\n'
+        "        )),",
+        '        "quarantined" => None,',
+    ),
+    "TheLiveAnswerHasItsOwnStateMapping": (
+        "src/api/a2a.rs",
+        "the_live_answer_and_the_read_back_answer_are_the_same_state",
+        "the immediate SendMessage response derives its A2A state from its own "
+        "match instead of the one every read-back path uses, so the same task "
+        "reports one state to the client holding the response and another to the "
+        "client that polled for it",
+        "fn state_of(status: &crate::runtime::RunStatus) -> TaskState {\n    sealed_state(status.as_str())\n}",
+        "fn state_of(status: &crate::runtime::RunStatus) -> TaskState {\n"
+        "    use crate::runtime::RunStatus;\n"
+        "    match status {\n"
+        "        RunStatus::Succeeded => TaskState::Working,\n"
+        "        _ => sealed_state(status.as_str()),\n"
+        "    }\n}",
+    ),
+    "TwoSpellingsOfTerminal": (
+        "src/api/a2a.rs",
+        "subscribing_to_a_finished_task_is_unsupported",
+        "the SubscribeToTask refusal keeps its own list of terminal states "
+        "instead of asking `closes`, so the rule deciding whether a stream ends "
+        "and the rule deciding whether a subscription is refused can disagree",
+        "    if req.method == method::SUBSCRIBE && super::a2a_stream::closes(task.status.state) {",
+        "    if req.method == method::SUBSCRIBE\n"
+        "        && matches!(task.status.state, TaskState::Canceled | TaskState::Rejected)\n"
+        "    {",
+    ),
     "A2aReplyNeverApplies": (
         "src/api/a2a.rs",
         "a_skill_declares_several_artifacts_and_they_arrive_as_several",

@@ -3441,9 +3441,18 @@ fn resume_is_closed(records: &[Record]) -> Option<RunStatus> {
         }),
         // The two conclusions that deliberately do not close a run: a failed
         // run resumes with its completed effects read back from history, and an
-        // exhausted one continues once somebody raises the ceiling. These are
-        // also the two that do not seal (`RunStatus::seals`) — the sets must
-        // stay equal, and a test pins the agreement.
+        // exhausted one continues once somebody raises the ceiling.
+        //
+        // Their relationship to [`RunStatus::seals`] is the load-bearing part
+        // and is pinned by `a_sealing_conclusion_is_never_resumable`. The
+        // direction that matters is *no sealing status may be resumable*: a
+        // status that seals froze the journal and published a Merkle leaf, so
+        // resuming it would grow the history past the leaf every later
+        // checkpoint attests. The reverse direction is deliberately **not** an
+        // equality — `Suspended` and `Replanning` also do not seal, and never
+        // reach here at all, because neither is ever a recorded conclusion.
+        // Stating that as "the two that do not seal" was wrong; there are four,
+        // and only two of them can be a `RunSealed` outcome.
         "failed" | "exhausted" => None,
         // Fail closed. An outcome this build does not recognise — a sweep's
         // `swept`, a future variant, a corrupted string — is not permission to
@@ -4781,5 +4790,124 @@ impl Runtime {
                 .count_by(metrics::DEAD_LETTERS, "", retired as u64);
         }
         Ok(retired)
+    }
+}
+
+#[cfg(test)]
+mod resume_agreement_tests {
+    use super::{RunStatus, resume_is_closed};
+    use crate::core::{BudgetExceeded, CorrelationKey, SuspendReason, Timestamp};
+    use crate::journal::RecordKind;
+
+    /// Every `RunStatus`, so adding one forces a decision here.
+    ///
+    /// Written out rather than derived, because Rust cannot enumerate a
+    /// data-carrying enum — and a list is honest about that: the count
+    /// assertion below fails the day a variant is added, which is exactly when
+    /// somebody must decide whether it seals and whether it may resume.
+    fn every_status() -> Vec<RunStatus> {
+        vec![
+            RunStatus::Succeeded,
+            RunStatus::Failed("because".into()),
+            RunStatus::Suspended(SuspendReason::AwaitingEvent {
+                kind: "reply".into(),
+                correlation: vec![CorrelationKey::new("claim", "CLM-1")],
+                until: Timestamp::from_unix_timestamp(1_760_000_000).expect("time"),
+            }),
+            RunStatus::Exhausted(BudgetExceeded::Steps { allowed: 1 }),
+            RunStatus::Quarantined("unknown outcome".into()),
+            RunStatus::Replanning("try again".into()),
+            RunStatus::Cancelled {
+                actor: "ops".into(),
+                reason: "stop".into(),
+            },
+        ]
+    }
+
+    /// **A conclusion that sealed the journal may never be resumed.**
+    ///
+    /// `RunStatus::seals` decides whether a conclusion freezes the run and
+    /// publishes a Merkle leaf; `resume_is_closed` decides whether a recorded
+    /// conclusion may be continued. A status that did the first and permits the
+    /// second would grow the history past the leaf every later checkpoint
+    /// attests — the failure the "a conclusion is not a closure" work removed
+    /// for `failed`, reachable again the moment the two disagree.
+    ///
+    /// The executor's own comment claimed "a test pins the agreement" while no
+    /// such test existed, which is the unfalsifiable-guarantee shape this
+    /// project treats as a defect in itself: the rule was real, checked by
+    /// nobody, and deletable in silence.
+    #[test]
+    fn a_sealing_conclusion_is_never_resumable() {
+        let statuses = every_status();
+        assert_eq!(
+            statuses.len(),
+            7,
+            "a RunStatus variant was added or removed — decide whether it seals \
+             and whether a resume may continue from it, then update this list"
+        );
+
+        for status in &statuses {
+            let records = sealed_as(status.as_str());
+            let verdict = resume_is_closed(&records);
+            if status.seals() {
+                assert!(
+                    verdict.is_some(),
+                    "'{}' seals the journal and enters the Merkle log, yet a resume \
+                     is permitted from it — the resume would grow the history past \
+                     the leaf every later checkpoint attests",
+                    status.as_str()
+                );
+            }
+        }
+    }
+
+    /// The availability half: the two conclusions that stay open really do.
+    ///
+    /// Asserted separately and by name rather than as the converse of the rule
+    /// above, because the converse is false — `Suspended` and `Replanning` do
+    /// not seal either, and neither is ever a recorded conclusion.
+    #[test]
+    fn a_failed_or_exhausted_run_may_still_be_resumed() {
+        for outcome in ["failed", "exhausted"] {
+            assert!(
+                resume_is_closed(&sealed_as(outcome)).is_none(),
+                "'{outcome}' is a conclusion a resume must be able to continue \
+                 from — its completed effects are read back from history, which \
+                 is the point of having a journal"
+            );
+        }
+    }
+
+    /// An outcome this build cannot interpret is never permission to resume.
+    #[test]
+    fn an_unrecognised_conclusion_fails_closed() {
+        let verdict = resume_is_closed(&sealed_as("swept"));
+        assert!(
+            matches!(verdict, Some(RunStatus::Quarantined(_))),
+            "an unrecognised conclusion must quarantine rather than resume: {verdict:?}"
+        );
+    }
+
+    /// A chain whose only record is a seal with this outcome.
+    fn sealed_as(outcome: &str) -> Vec<crate::journal::Record> {
+        use crate::core::{Digest, Epoch};
+        use crate::journal::{Record, RecordBody};
+
+        let body = RecordBody {
+            seq: 1,
+            run: crate::core::RunId::generate(),
+            case: None,
+            step: None,
+            phase: super::Phase::Forward,
+            epoch: Epoch::default(),
+            v: 1,
+            effect_key: None,
+            kind: RecordKind::RunSealed {
+                outcome: outcome.to_owned(),
+                chain_head: Digest::of(b""),
+            },
+        };
+        vec![Record::seal(body, Digest::of(b"")).expect("a sealed record")]
     }
 }

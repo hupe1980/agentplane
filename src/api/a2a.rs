@@ -183,17 +183,27 @@ pub enum TaskState {
 /// declined the work; quarantine means it accepted the work, started, and can no
 /// longer be trusted to describe what it did. Reporting that as a refusal tells
 /// the caller nothing happened, when something did.
+/// The A2A state a live run's status surfaces as.
+///
+/// Delegates to [`sealed_state`] rather than matching again, and the reason is
+/// that these two are the **same question asked on two paths**: this one answers
+/// the caller who receives the immediate `SendMessage` response, and
+/// `sealed_state` answers everyone who reads the task back — `GetTask`,
+/// `SubscribeToTask`, and every streamed status update.
+///
+/// They used to be separate matches that happened to agree, and the agreement
+/// was luck rather than structure: `RunStatus::as_str` and this function are
+/// exhaustive over the enum, so the compiler forces both to grow a new variant,
+/// while `sealed_state` matches on strings behind a `_ => Failed` that nothing
+/// checks. A variant added for something that is not a failure — an
+/// authorization wait, a rejection — would have been surfaced correctly to the
+/// caller who got the response and as `Failed` to the caller who polled for it.
+/// The same task, two answers, decided by which path the client took.
+///
+/// One implementation makes that unrepresentable. `as_str` stays the single
+/// enumeration point, and the compiler still refuses a variant with no string.
 fn state_of(status: &crate::runtime::RunStatus) -> TaskState {
-    use crate::runtime::RunStatus;
-    match status {
-        RunStatus::Succeeded => TaskState::Completed,
-        RunStatus::Suspended(_) => TaskState::InputRequired,
-        RunStatus::Cancelled { .. } => TaskState::Canceled,
-        RunStatus::Failed(_)
-        | RunStatus::Exhausted(_)
-        | RunStatus::Quarantined(_)
-        | RunStatus::Replanning(_) => TaskState::Failed,
-    }
+    sealed_state(status.as_str())
 }
 
 /// A2A's `TaskStatus`.
@@ -1393,12 +1403,12 @@ async fn stream_method(
             format!("no such task: {run}"),
         ));
     };
-    if req.method == method::SUBSCRIBE
-        && matches!(
-            task.status.state,
-            TaskState::Completed | TaskState::Failed | TaskState::Canceled | TaskState::Rejected
-        )
-    {
+    // `closes` and not a second `matches!` with the same four states: this
+    // decides whether a subscription is *refused*, and `closes` decides whether
+    // a stream *ends*. Two spellings of one rule disagree the day somebody adds
+    // a terminal state to one of them, and the result is either a subscription
+    // accepted that shuts immediately or one refused that would have streamed.
+    if req.method == method::SUBSCRIBE && super::a2a_stream::closes(task.status.state) {
         return Err(RpcError::new(
             code::UNSUPPORTED_OPERATION,
             "SubscribeToTask requires a non-terminal task",

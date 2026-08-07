@@ -2629,3 +2629,59 @@ async fn a_skill_declares_several_artifacts_and_they_arrive_as_several() {
         .collect();
     assert_ne!(ids[0], ids[1], "two artifacts share one id: {ids:?}");
 }
+
+/// **A task reports one state, whichever path a client takes.**
+///
+/// The immediate `SendMessage` response and every read-back path — `GetTask`,
+/// `SubscribeToTask`, streamed status updates — used to derive the A2A state
+/// from *different* functions: one exhaustive over `RunStatus`, one matching
+/// the sealed outcome string behind a `_ => Failed`. They agreed only because
+/// the catch-all happened to cover the four variants that mean failure.
+///
+/// The compiler kept the enum-shaped one honest and kept nothing else honest.
+/// A `RunStatus` variant added for something that is *not* a failure — an
+/// authorization wait, a rejection — would have surfaced correctly to the caller
+/// holding the response and as `Failed` to the caller who polled for it. Same
+/// task, two answers, decided by which path the client happened to take.
+///
+/// Asserted end to end on the wire rather than by comparing the two functions,
+/// because the claim is about what a *client* sees.
+#[tokio::test]
+async fn the_live_answer_and_the_read_back_answer_are_the_same_state() {
+    let f = fixture();
+    let router = f.router();
+    let (status, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({
+                "message": {
+                    "messageId": "m-agree",
+                    "role": "ROLE_USER",
+                    "parts": [{ "text": "settle it" }],
+                }
+            }),
+            Some("peer"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+
+    let live = sent["result"]["task"]["status"]["state"].clone();
+    let task_id = sent["result"]["task"]["id"].as_str().expect("a task id");
+    assert!(live.is_string(), "{sent}");
+
+    let (status, fetched) = send(
+        &router,
+        rpc("GetTask", &json!({ "id": task_id }), Some("peer")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+
+    assert_eq!(
+        fetched["result"]["status"]["state"], live,
+        "the immediate response and the read-back disagree about the same task's \
+         state — a client that held the response and one that polled for it would \
+         see different tasks: live={live}, fetched={fetched}"
+    );
+}
