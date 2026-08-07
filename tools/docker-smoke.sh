@@ -84,7 +84,8 @@ if [[ "$FEATURES" == *a2a-server* && "$FEATURES" == *cedar* ]]; then
   cid=$(docker run -d --rm -p 18080:8080 -p 19090:9090 -v "$ROOT/examples:/work:ro" "$IMAGE" \
           serve /work/served.yaml --addr 0.0.0.0:8080 --url http://localhost:18080 \
           --policy /work/serve-policy.cedar --tokens /work/serve-tokens.yaml \
-          --operator-addr 0.0.0.0:9090 --store /tmp/served.redb)
+          --operator-addr 0.0.0.0:9090 --push-host hooks.example.com \
+          --store /tmp/served.redb)
   # `--store` needs a writable path, so this one is deliberately *not*
   # `--read-only`: a served task's id is a promise it can be fetched again, and
   # the CLI refuses an in-memory journal for exactly that reason.
@@ -127,10 +128,24 @@ if [[ "$FEATURES" == *a2a-server* && "$FEATURES" == *cedar* ]]; then
             -H 'a2a-version: 1.0' -H 'authorization: Bearer another-long-random-string' -d "$rpc")
   grep -q '"error"' <<<"$cross" || { echo "REFUSED: an operator token sent a message: $cross"; exit 1; }
 
+  # Push: the card must *claim* it, and the grant must *bite*. Advertising a
+  # capability nothing serves is the failure this pairing exists to rule out —
+  # a peer that registers a webhook and never hears back has a worse day than
+  # one told up front.
+  grep -q '"pushNotifications":true' <<<"$card" || {
+    echo "REFUSED: push was granted and the card does not advertise it: $card"; exit 1; }
+
+  reg='{"jsonrpc":"2.0","id":"9","method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[{"text":"hi"}],"messageId":"push-1"},"configuration":{"taskPushNotificationConfig":{"url":"https://evil.example.net/hook"}}}}'
+  refused=$(curl -s -X POST "http://127.0.0.1:18080/a2a" -H 'content-type: application/json' \
+              -H 'a2a-version: 1.0' -H 'authorization: Bearer a-long-random-string' -d "$reg")
+  grep -q 'does not permit webhooks' <<<"$refused" || {
+    echo "REFUSED: a webhook to an ungranted host was accepted: $refused"; exit 1; }
+
   docker rm -f "$cid" >/dev/null 2>&1 || true
   trap - EXIT
   echo "    served a card, refused an anonymous call, completed an authorized one,"
-  echo "    listed the conclusion to an operator, and kept the two roles apart"
+  echo "    listed the conclusion to an operator, kept the two roles apart, and"
+  echo "    advertised push while refusing a webhook to an ungranted host"
 fi
 
 # `mcp-stdio` is compiled into `:full`, and the image deliberately **cannot**

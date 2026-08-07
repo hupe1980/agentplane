@@ -200,6 +200,27 @@ The separation is enforced by **policy**, not by the port. In
 reaches `api:*`, so a peer token that reaches the operator socket is still
 refused — the separate port is defence in depth rather than the control itself.
 
+`--push-host <host>` (repeatable) turns on **A2A push notifications** to that
+exact host. Without one, push is not wired and the Agent Card advertises it as
+*absent* rather than claiming a capability nothing serves. That flag is the
+whole of the configuration: `PushSender` owns HTTPS-only, the all-answer
+public-IP check, DNS pinning, manual redirects, the timeout and secret
+redaction; what an operator decides is *where*, which is the one thing the crate
+cannot. The grant is checked at **registration** as well as at delivery, so a
+peer learns straight away:
+
+```text
+this deployment does not permit webhooks to 'evil.example.net'
+a webhook URL must be https — the payload describes a task, and sending it in
+clear to an address the recipient chose is a disclosure
+```
+
+Note the ordering: a peer also needs `a2a:task.push` in the policy set, and that
+gate runs **first**. A policy that omits it declines with the uniform *this
+request was not permitted*, saying nothing about the URL — which is correct, and
+worth knowing when a webhook registration is refused for a reason that looks
+nothing like a webhook problem.
+
 A served plane also **sweeps**: deadlines warn and breach, tasks expire, dead
 letters are retired, and due timers fire, every `--sweep-every` seconds (30 by
 default, `0` to drive it from your own scheduler). Without it an agent that calls

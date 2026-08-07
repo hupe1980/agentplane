@@ -34,7 +34,13 @@ permit(
     action in [
         Action::"a2a:message.send",
         Action::"a2a:task.read",
-        Action::"a2a:task.continue"
+        Action::"a2a:task.continue",
+        // Registering a webhook. Without this a peer's
+        // `taskPushNotificationConfig` is declined by *policy* before the push
+        // grant is ever consulted — the refusal is correct and says nothing
+        // about the URL, which is exactly the uniform decline an external
+        // caller gets. `--push-host` is the second gate, not the first.
+        Action::"a2a:task.push"
     ],
     resource
 ) when {

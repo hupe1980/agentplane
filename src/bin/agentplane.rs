@@ -90,6 +90,13 @@ SERVE
     --sweep-every <SECS> how often deadlines, task expiry, dead letters and due
                          timers are swept; 30 by default, 0 to run the sweep
                          from your own scheduler instead
+    --push-host <HOST>   permit A2A push notifications to this exact host.
+                         Repeatable. Without at least one, push is not wired and
+                         the Agent Card advertises it as **absent** rather than
+                         claiming a capability nothing serves. Webhooks are
+                         HTTPS-only, checked at registration as well as at
+                         delivery, so a caller learns straight away that its
+                         URL will never be called
 
       - token: \"a-long-random-string\"
         actor: peer-a
@@ -220,7 +227,16 @@ struct Options {
     operator_addr: Option<String>,
     sweep_every: Option<u32>,
     mcp: Vec<String>,
+    push_hosts: Vec<String>,
 }
+
+/// How many due webhook registrations one push tick delivers.
+///
+/// Bounded, and the report says when it came back full — a worker still draining
+/// a backlog is one not delivering the next notification, and a capped result
+/// shaped like a complete one is the silent-truncation shape.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+const PUSH_BATCH: usize = 64;
 
 /// How often a served plane sweeps, when nobody says otherwise.
 ///
@@ -256,6 +272,7 @@ impl Options {
                 "--tokens" => o.tokens = Some(value()?),
                 "--operator-addr" => o.operator_addr = Some(value()?),
                 "--mcp" => o.mcp.push(value()?),
+                "--push-host" => o.push_hosts.push(value()?),
                 "--sweep-every" => {
                     let raw = value()?;
                     o.sweep_every =
@@ -391,8 +408,13 @@ fn serve(manifests: &[Manifest], opts: &Options) -> Result<ExitCode, String> {
         let runtime = builder.try_build().map_err(|e| e.to_string())?;
 
         let security = agentplane::peers::CardSecurity::bearer("bearer", Vec::<String>::new());
-        let server = A2aServer::new(Arc::clone(&runtime), auth, &security, manifest, url)
+        let mut server = A2aServer::new(Arc::clone(&runtime), auth, &security, manifest, url)
             .map_err(|e| e.to_string())?;
+
+        server = wire_push(server, &opts.push_hosts, &store)?;
+        if let Some(worker) = server.push_worker() {
+            spawn_push_worker(worker, opts.sweep_every.unwrap_or(DEFAULT_SWEEP_SECONDS));
+        }
 
         spawn_sweeper(&runtime, opts.sweep_every.unwrap_or(DEFAULT_SWEEP_SECONDS));
 
@@ -584,6 +606,89 @@ async fn connect_mcp_servers(
          image, which is built with it"
             .to_owned(),
     )
+}
+
+/// Turn on A2A push, if the operator granted anywhere to send it.
+///
+/// `--push-host` is the *whole* configuration, and that is the point:
+/// [`PushSender`](agentplane::push::PushSender) already owns HTTPS-only, the
+/// all-answer public-IP check, DNS pinning, manual per-hop redirects, the
+/// timeout and secret redaction. What an operator supplies is **where**, which
+/// is the one thing the crate cannot decide for them.
+///
+/// No host means push is not wired **and the card says so** — advertising a
+/// capability nothing serves is worse than not having it, because a peer that
+/// registers a webhook and never hears back has a worse day than one told up
+/// front.
+///
+/// # Errors
+///
+/// If the card has already been signed, since push changes what the signature
+/// covers.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+fn wire_push(
+    server: agentplane::api::a2a::A2aServer,
+    hosts: &[String],
+    store: &Arc<RedbStore>,
+) -> Result<agentplane::api::a2a::A2aServer, String> {
+    if hosts.is_empty() {
+        return Ok(server);
+    }
+    let policy = hosts
+        .iter()
+        .fold(agentplane::push::PushPolicy::new(), |policy, host| {
+            policy.allow_host(host)
+        });
+    let server = server
+        .with_push(
+            Arc::clone(store) as Arc<dyn agentplane::push::PushStore>,
+            Arc::new(agentplane::push::PushSender::new(policy))
+                as Arc<dyn agentplane::push::PushTransport>,
+        )
+        .map_err(|e| e.to_string())?;
+    for host in hosts {
+        eprintln!("  push: https://{host}");
+    }
+    Ok(server)
+}
+
+/// Deliver due webhooks on a clock.
+///
+/// The task journal is the outbox: each receiver stores its first unacknowledged
+/// sequence and the cursor advances only after HTTP 2xx, so a crash after the
+/// POST but before persistence **repeats** an event rather than losing it —
+/// which is the right way round, and which A2A receivers are required to
+/// tolerate.
+///
+/// Shares the sweeper's cadence because it is the same job: the operator's
+/// scheduler running the plane's periodic work. Several instances may race and
+/// produce duplicates; cursors advance monotonically, so none can regress.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+fn spawn_push_worker(worker: agentplane::api::a2a::A2aPushWorker, every: u32) {
+    if every == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(u64::from(every)));
+        loop {
+            tick.tick().await;
+            #[allow(clippy::disallowed_methods)]
+            let at = time::OffsetDateTime::now_utc().unix_timestamp();
+            let Ok(at) = u64::try_from(at) else { continue };
+            match worker.run_once(at, PUSH_BATCH).await {
+                // A batch that came back full is a backlog, and a backlog must
+                // not produce the same numbers as a quiet plane.
+                Ok(report) if report.saturated => {
+                    tracing::warn!(?report, "push delivery is saturated");
+                }
+                Ok(report) if report.registrations > 0 => {
+                    tracing::info!(?report, "push delivered");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "push delivery failed"),
+            }
+        }
+    });
 }
 
 /// The same verb, in a build that cannot answer it.
