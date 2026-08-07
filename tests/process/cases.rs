@@ -863,11 +863,23 @@ async fn changing_a_case_status_is_journaled_and_not_repeated_on_replay() {
     assert_eq!(out.status, RunStatus::Succeeded, "got {:?}", out.status);
 
     let cases = Arc::clone(&store) as Arc<dyn CaseStore>;
-    let case = cases
-        .correlate(&[key("matter", "M-9")])
-        .await
-        .unwrap()
-        .expect("the case exists");
+    // The case id comes from the journal, not from `correlate`: closing the case
+    // released its correlation keys (that is the whole point — a new matter must
+    // open a fresh case rather than reanimating a closed one), so a closed case
+    // is deliberately no longer correlatable.
+    let records = store.read(out.run_id, 1).await.unwrap();
+    let case = records
+        .iter()
+        .find_map(|r| r.body.case)
+        .expect("the run was correlated to a case");
+    assert!(
+        cases
+            .correlate(&[key("matter", "M-9")])
+            .await
+            .unwrap()
+            .is_none(),
+        "a closed case must not stay correlatable, or a new matter joins it"
+    );
     assert_eq!(
         cases.case(case).await.unwrap().expect("case").status,
         CaseStatus::Closed
@@ -875,10 +887,7 @@ async fn changing_a_case_status_is_journaled_and_not_repeated_on_replay() {
 
     // Both mutations must be on the record: an unjournaled change to shared
     // state is a change nobody can attribute.
-    let kinds: Vec<String> = store
-        .read(out.run_id, 1)
-        .await
-        .unwrap()
+    let kinds: Vec<String> = records
         .iter()
         .map(|r| r.kind().kind_str().to_owned())
         .collect();
@@ -1069,6 +1078,69 @@ async fn a_sweep_records_what_it_did_in_a_sealed_run() {
         quiet.record.is_none(),
         "a tick that decided nothing still opened a run"
     );
+    assert!(
+        !quiet.evidence_lost && !quiet.needs_attention(),
+        "a quiet tick is not an incident"
+    );
+}
+
+/// A sweep whose own evidence cannot be written says so.
+///
+/// The tick breaches an obligation — the state changes — and then its sealed
+/// record fails to write. That must not read as a quiet tick: a decision with no
+/// durable account of who made it is the exact I13 failure the sweep's own run
+/// exists to prevent, so `evidence_lost` is set and `needs_attention` is true.
+/// The bug this rules out is `seal` returning the same empty `record` for both
+/// "nothing happened" and "something happened and its record did not".
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_sweep_whose_evidence_fails_to_write_is_flagged_not_silent() {
+    use agentplane::core::{Deadline, DeadlineState};
+    use agentplane::testkit::{Fault, Faulty, Schedule};
+
+    let inner = Arc::new(RedbStore::open_in_memory().unwrap());
+    let cases = Arc::clone(&inner) as Arc<dyn CaseStore>;
+    let now = Timestamp::from_unix_timestamp(1_800_000_000).unwrap();
+
+    let case = cases
+        .correlate_or_open("matter", &[key("matter", "M-88")], now)
+        .await
+        .unwrap()
+        .case_id();
+    cases
+        .register_deadline(&Deadline {
+            case,
+            name: "respond-by".to_owned(),
+            resolved_at: now - time::Duration::hours(1),
+            calendar_digest: Digest::of(b"test-calendar"),
+            warn_at: None,
+            state: DeadlineState::Pending,
+        })
+        .await
+        .unwrap();
+
+    // The case store still works — the breach happens — but the sweep's own
+    // `Swept` evidence append fails.
+    let journal: Arc<dyn JournalStore> = Arc::new(Faulty::new(
+        Arc::clone(&inner) as Arc<dyn JournalStore>,
+        Schedule::healthy().on_kind("Swept", Fault::FailedClean),
+    ));
+    let rt = Runtime::builder(journal).cases(Arc::clone(&cases)).build();
+
+    let report = rt.sweep(now, time::Duration::minutes(5)).await.unwrap();
+    assert_eq!(report.breached, 1, "the breach must still have happened");
+    assert!(
+        report.record.is_none(),
+        "no sealed run exists when its append failed"
+    );
+    assert!(
+        report.evidence_lost,
+        "a sweep whose evidence write failed reported as a quiet tick"
+    );
+    assert!(
+        report.needs_attention(),
+        "a lost sweep record must demand attention"
+    );
 }
 
 /// A case's history includes what happened *to* it, not only what its runs did.
@@ -1213,9 +1285,27 @@ async fn a_quarantined_run_can_be_found_afterwards() {
         }
     }
 
+    #[derive(Debug)]
+    struct Settles;
+
+    #[async_trait::async_trait]
+    impl Skill for Settles {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("settles").provides("ledger.settle")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, agentplane::core::SkillError> {
+            Ok(Outcome::done(Tainted::trusted(json!("settled"))))
+        }
+    }
+
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .skill(Transfers)
+        .skill(Settles)
         .build();
 
     let out = rt.run("ledger.transfer", json!({})).await.unwrap();
@@ -1225,20 +1315,36 @@ async fn a_quarantined_run_can_be_found_afterwards() {
         out.status
     );
 
-    let found = store.runs_by_outcome("quarantined", 50).await.unwrap();
+    // A genuinely-succeeding run, so the selectivity check below has a real
+    // succeeded run to place — not the same skill again, which also quarantines.
+    let ok = rt.run("ledger.settle", json!({})).await.unwrap();
     assert!(
-        found.contains(&out.run_id),
-        "the quarantined run is not findable, so the only trace of the most \
-         serious thing this runtime concluded is a log line: {found:?}"
+        matches!(ok.status, RunStatus::Succeeded),
+        "expected a success, got {:?}",
+        ok.status
     );
 
-    // And a run that ended well is not in that backlog, so the query selects
-    // rather than returning whatever it can reach.
-    let ok = rt.run("ledger.transfer", json!({})).await.unwrap();
+    // The outcome index is *selective*, and both directions are asserted against
+    // queries taken after both runs exist — an earlier snapshot could not have
+    // contained the later run's id, so the property looked pinned while nothing
+    // was checked.
+    let quarantined = store.runs_by_outcome("quarantined", 50).await.unwrap();
     let succeeded = store.runs_by_outcome("succeeded", 50).await.unwrap();
     assert!(
-        !succeeded.contains(&out.run_id),
-        "a quarantined run appeared under `succeeded`"
+        quarantined.contains(&out.run_id),
+        "the quarantined run is not findable, so the only trace of the most \
+         serious thing this runtime concluded is a log line: {quarantined:?}"
     );
-    assert!(!found.contains(&ok.run_id) || ok.run_id == out.run_id);
+    assert!(
+        !quarantined.contains(&ok.run_id),
+        "a succeeded run appeared under `quarantined`: {quarantined:?}"
+    );
+    assert!(
+        succeeded.contains(&ok.run_id),
+        "the succeeded run is not findable under its own outcome: {succeeded:?}"
+    );
+    assert!(
+        !succeeded.contains(&out.run_id),
+        "a quarantined run appeared under `succeeded`: {succeeded:?}"
+    );
 }

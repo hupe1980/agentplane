@@ -20,7 +20,6 @@ spec:
     max_delegation_depth: 2
   capabilities:
     provides: [audit.anomaly-detection]
-    requires: [data.fetch]
   budgets:
     max_tokens: 120000
     max_minor_units: 250
@@ -47,7 +46,7 @@ spec:
     - max_sensitivity: internal
       mutates: true
       ref: tool://validator/apply_correction
-  capabilities: { requires: ["data.fetch"], provides: ["audit.anomaly-detection"] }
+  capabilities: { provides: ["audit.anomaly-detection"] }
   security:
     max_delegation_depth: 2
     max_sensitivity_egress: "internal"

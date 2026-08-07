@@ -38,11 +38,18 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::core::Timestamp;
+use crate::core::{Secret, Timestamp};
 
 use super::{DataKey, KeyError, KeyRing, WrappedKey};
 
 /// Vault's transit engine, reached over HTTP.
+///
+/// `Debug` derives safely because the only credential — the Vault token — is a
+/// [`Secret`], which redacts itself and zeroizes on drop. A bare `String` here
+/// would print verbatim, and `VaultTransit` is reachable through the derived
+/// `Debug` of `Runtime`, `StepCtx` and `RuntimeBuilder`, so one `tracing::debug!`
+/// would put the token in a log — the exact hole every other credential holder
+/// in this crate hand-redacts against.
 #[derive(Debug, Clone)]
 pub struct VaultTransit {
     http: reqwest::Client,
@@ -50,7 +57,7 @@ pub struct VaultTransit {
     address: String,
     /// Mount path of the transit engine, usually `transit`.
     mount: String,
-    token: String,
+    token: Secret,
 }
 
 #[derive(Deserialize)]
@@ -103,7 +110,7 @@ impl VaultTransit {
             http,
             address: address.into().trim_end_matches('/').to_owned(),
             mount: mount.into().trim_matches('/').to_owned(),
-            token: token.into(),
+            token: Secret::new(token),
         })
     }
 
@@ -122,7 +129,7 @@ impl VaultTransit {
         let mut req = self
             .http
             .request(method, url)
-            .header("X-Vault-Token", &self.token);
+            .header("X-Vault-Token", self.token.expose());
         if let Some(b) = body {
             req = req.json(&b);
         }

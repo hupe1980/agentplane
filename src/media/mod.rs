@@ -908,13 +908,14 @@ fn validate_resolved(
     host: &str,
     addresses: impl IntoIterator<Item = SocketAddr>,
 ) -> Result<Vec<SocketAddr>, MediaError> {
-    crate::netguard::all_public(host, addresses).map_err(|detail| {
-        // An empty resolution is an outage; a private answer is a refusal. The
-        // two call for different responses, so they keep different variants.
-        if detail.contains("no addresses") {
-            MediaError::Unavailable(detail)
-        } else {
-            MediaError::Refused(format!("media {detail}"))
+    crate::netguard::all_public(host, addresses).map_err(|e| {
+        use crate::netguard::NetGuardError;
+        // An empty resolution is an outage; a forbidden answer is a refusal. The
+        // two call for different responses, and the netguard error carries the
+        // kind as a type so this decision cannot ride on message wording.
+        match e {
+            NetGuardError::NoAddresses { .. } => MediaError::Unavailable(e.to_string()),
+            NetGuardError::Forbidden { .. } => MediaError::Refused(format!("media {e}")),
         }
     })
 }

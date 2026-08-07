@@ -810,6 +810,14 @@ async fn a_denying_policy_stops_every_method() {
             .contains(&action::MESSAGE_SEND.to_owned()),
         "SendMessage did not ask the policy engine at all"
     );
+    // The denial does not teach: a Cedar reason names the action, resource and
+    // the policy ids that fired, which is a probe-able map of the authorization
+    // vocabulary handed to an external caller. The reason stays operator-side;
+    // the caller learns only that it was declined.
+    assert!(
+        !body.to_string().contains("secret-rule"),
+        "the policy's reason leaked to the external caller: {body:#}"
+    );
 }
 
 // ── Version negotiation ─────────────────────────────────────────────────────

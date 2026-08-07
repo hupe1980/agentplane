@@ -522,6 +522,15 @@ impl CaseStore for RedbStore {
     }
 
     async fn set_status(&self, case: CaseId, status: CaseStatus) -> Result<(), StoreError> {
+        // Closing is not an ordinary status change: it must release the
+        // correlation keys and refuse an open obligation. Routing it through
+        // `close` is what keeps the two spellings of "closed" — the `status`
+        // column and correlation-open membership — from drifting apart, which
+        // they did while `set_status(Closed)` wrote only the column and left the
+        // case correlatable (a new matter would attach to a closed case).
+        if status == CaseStatus::Closed {
+            return self.close(case).await;
+        }
         let tenant = self.tenant_name();
         let key = case.to_string();
         self.with_db(move |db| {

@@ -994,7 +994,27 @@ impl A2aServer {
             context: &context,
         }) {
             PolicyDecision::Permit => Ok(caller),
-            PolicyDecision::Deny { reason } => Err(RpcError::new(code::INVALID_REQUEST, reason)),
+            PolicyDecision::Deny { reason } => {
+                // The determining policy and its reason stay operator-side. A
+                // Cedar denial names the action, the resource, and the policy
+                // ids that fired; returned to an external caller that is a
+                // probe-able map of the authorization vocabulary. A decline
+                // carries no reason on the wire — the runtime's own denial
+                // already names the action and resource the gate keyed on. The
+                // caller learns only that it was declined; the reason reaches
+                // whoever runs the plane.
+                tracing::warn!(
+                    target: "agentplane::a2a",
+                    action,
+                    resource,
+                    reason,
+                    "A2A request denied at admission"
+                );
+                Err(RpcError::new(
+                    code::INVALID_REQUEST,
+                    "this request was not permitted",
+                ))
+            }
         }
     }
 

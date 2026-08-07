@@ -39,6 +39,10 @@ enum Failure {
     DidNotHappen,
     /// Nobody can say whether it landed.
     InDoubt,
+    /// The call took effect, but its response could not be used. It *did* reach
+    /// the world, which is the strongest possible reason an abort may not claim
+    /// to have taken the group back whole.
+    Landed,
 }
 
 impl World {
@@ -66,6 +70,7 @@ impl World {
             return Err(match how {
                 Failure::DidNotHappen => EffectError::Rejected(format!("{kind} refused")),
                 Failure::InDoubt => EffectError::Other(format!("{kind} did not answer")),
+                Failure::Landed => EffectError::Performed(format!("{kind} took effect")),
             });
         }
         self.log.lock().expect("lock").push(what.to_owned());
@@ -445,6 +450,36 @@ async fn a_group_in_doubt_is_quarantined_rather_than_reversed() {
     assert!(
         !world.did("released sku-1"),
         "a group reversed a member while another was in doubt: {:?}",
+        world.entries()
+    );
+}
+
+/// A deferred member that fails **Landed** is quarantined, never cheap-aborted.
+///
+/// `mail.send` is the deferred, irreversible send, and it is the only deferred
+/// member — so when it fails, no prior deferred landed and no atomic member
+/// committed. The abort path's completeness check must still refuse, because the
+/// member's own disposition says it *did* reach the world: settling `Aborted`
+/// and reversing the hold and the authorisation would take back everything
+/// except the mail that actually went out. Excluding only `InDoubt` here let a
+/// provider answering 200-with-an-unusable-body take the cheap abort over a send
+/// that stands — the group rule that an abort is available only while nothing
+/// has externalised, violated for the member with the strongest evidence it did.
+#[tokio::test]
+async fn a_deferred_member_that_landed_is_quarantined_not_cheap_aborted() {
+    let world = World::new();
+    let out = run(&world.fail("mail.send", Failure::Landed), json!({})).await;
+
+    assert!(
+        matches!(out.status, RunStatus::Quarantined(_)),
+        "a deferred member that landed took the cheap abort instead of quarantining: {:?}",
+        out.status
+    );
+    // Nothing may be reversed: the charge stands beside the send, and an
+    // `Aborted` claiming otherwise would be a lie about both.
+    assert!(
+        !world.did("released sku-1") && !world.did("voided"),
+        "the group reversed members around a send that landed: {:?}",
         world.entries()
     );
 }

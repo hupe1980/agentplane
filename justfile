@@ -169,6 +169,7 @@ test-a2a-server:
 
 # run every example end to end
 examples:
+    cargo run --example hello_skill
     cargo run --example durable_pipeline
     cargo run --example clearing_case
     cargo run --example plan_graph

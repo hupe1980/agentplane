@@ -7,8 +7,6 @@
 
 use std::sync::Arc;
 
-use serde_json::Value;
-
 use crate::batch::{BatchCensus, BatchItem, BatchReport, BatchStatus, ItemOutcome, ItemSource};
 use crate::core::{BatchId, PlanIR, RunId, RuntimeError, Spend};
 
@@ -260,10 +258,4 @@ async fn store_page(spec: &BatchSpec, after: Option<&str>) -> Result<Vec<BatchIt
         // read as "no more items" would truncate a settlement run silently,
         // which is the exact failure this crate exists to make loud.
         .map_err(|e| RuntimeError::PlanContract(e.to_string()))
-}
-
-/// Batch input is a plain value per item; the plan binds it as run input.
-#[allow(dead_code)]
-fn item_input(item: &BatchItem) -> Value {
-    item.input.clone()
 }

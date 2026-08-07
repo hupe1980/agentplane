@@ -234,6 +234,9 @@ Note `run("demo.greet", …)` takes the **capability**, not the skill name. Plan
 bind capabilities to skills, so what a step needs is decoupled from who provides
 it.
 
+This exact skill and run is on disk as a runnable file — `cargo run --example
+hello_skill` — so the shape above is something you execute, not only read.
+
 ## 5. Do something to the outside world 🌍
 
 The point of the journal is effects. Here is a tool call:

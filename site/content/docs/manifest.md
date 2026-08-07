@@ -40,7 +40,7 @@ spec:
   identity:       { role: "...", constraints: "..." }
   topology:       { mode: single, role: specialist }
   security:       { max_sensitivity_egress: internal, max_delegation_depth: 0 }
-  capabilities:   { provides: [support.triage], requires: [] }
+  capabilities:   { provides: [support.triage] }
   models:
     privileged:   { provider: anthropic, model: claude-sonnet-5 }
     quarantined:  { provider: anthropic, model: claude-haiku-4-5-20251001 }
@@ -171,7 +171,8 @@ confidence.
 | Field | Notes |
 |---|---|
 | `provides` | The capability names this agent answers to. `Runtime::run(capability, input)` dispatches on these, and a plane **refuses to build** if two agents claim one capability or if a declarative agent provides none. |
-| `requires` | What it expects to reach, via `StepCtx::commission`. Descriptive. |
+
+A `requires` twin was removed: it was parsed and digest-covered but never enforced, and a control the runtime does not check is exactly what a reviewable file exists to eliminate. A build-time check that every required capability is available on the plane is a well-formed future control; a field that only *documents* intent belongs in prose, not beside enforced ceilings.
 
 ## `spec.models`
 

@@ -109,11 +109,20 @@ impl SweepLedger {
     /// write would turn a bookkeeping problem into an operational one — but it
     /// is loud, because a sweep whose evidence is missing is the case this
     /// whole mechanism exists to prevent.
-    async fn seal(self, store: &Arc<dyn JournalStore>) -> Option<RunId> {
-        let run = self.run?;
+    ///
+    /// The three outcomes are distinct on purpose: a quiet tick and a tick whose
+    /// evidence write *failed* both used to return `None`, so a report could not
+    /// tell "nothing happened" from "something happened and its record did not"
+    /// — the exact detection-without-delivery failure I13 rules out, applied to
+    /// the one run whose whole purpose is to make the sweeper's decisions
+    /// answerable from the journal.
+    async fn seal(self, store: &Arc<dyn JournalStore>) -> SweepRecord {
+        let Some(run) = self.run else {
+            return SweepRecord::Quiet;
+        };
         if let Err(e) = store.append(SWEEP_EPOCH, self.entries).await {
             tracing::error!(%run, error = %e, "a sweep's own record could not be written");
-            return None;
+            return SweepRecord::EvidenceLost;
         }
 
         // The conclusion goes *in* the chain before the chain closes over it,
@@ -124,7 +133,7 @@ impl SweepLedger {
             Ok(head) => head,
             Err(e) => {
                 tracing::error!(%run, error = %e, "a sweep's record could not be read back");
-                return None;
+                return SweepRecord::EvidenceLost;
             }
         };
         let sealed = crate::journal::Append::new(
@@ -136,14 +145,30 @@ impl SweepLedger {
         );
         if let Err(e) = store.append(SWEEP_EPOCH, vec![sealed]).await {
             tracing::error!(%run, error = %e, "a sweep's record could not be closed");
-            return None;
+            return SweepRecord::EvidenceLost;
         }
         if let Err(e) = store.seal(run, SWEEP_EPOCH, SWEEP_OUTCOME).await {
             tracing::error!(%run, error = %e, "a sweep's record could not be sealed");
-            return None;
+            return SweepRecord::EvidenceLost;
         }
-        Some(run)
+        SweepRecord::Recorded(run)
     }
+}
+
+/// The fate of a tick's own evidence.
+///
+/// Three outcomes rather than an `Option<RunId>`, because a quiet tick and a
+/// tick whose evidence could not be written are the two states an operator most
+/// needs to tell apart: the first is the plane resting, the second is a decision
+/// with no durable account of who made it.
+enum SweepRecord {
+    /// The tick decided nothing, so there was nothing to record.
+    Quiet,
+    /// The tick's decisions are in this sealed run.
+    Recorded(RunId),
+    /// The tick decided something and its record could not be written. The state
+    /// changed and the journal did not.
+    EvidenceLost,
 }
 
 /// Which sweeps hit their cap this tick.
@@ -214,10 +239,20 @@ pub struct SweepReport {
     pub saturated: Saturation,
     /// The sealed run holding this tick's own record, when it did anything.
     ///
-    /// `None` for a quiet tick, which writes nothing. Present means the
+    /// `None` for a quiet tick, which writes nothing — **and** `None` when the
+    /// evidence write failed, which is a different fact entirely and is carried
+    /// separately in [`evidence_lost`](Self::evidence_lost). Present means the
     /// sweeper's decisions are answerable from the journal rather than only
     /// from the state they produced.
     pub record: Option<RunId>,
+    /// The tick decided something and its own record could not be written.
+    ///
+    /// The most serious thing this report can carry: the state changed —
+    /// obligations breached, cases escalated — and the durable, tamper-evident
+    /// account of *who decided that and when* did not. Distinct from a quiet
+    /// tick, which also leaves `record` empty but changed nothing, and it makes
+    /// [`needs_attention`](Self::needs_attention) true so it cannot pass as one.
+    pub evidence_lost: bool,
     /// What the plane is holding, as of this sweep.
     ///
     /// Carried on the report as well as emitted, so an embedder that wants the
@@ -235,6 +270,9 @@ impl SweepReport {
             // A saturated sweep is the case a human most needs to see: the
             // plane is keeping up with its cap rather than with its work.
             || self.saturated.any()
+            // A decision whose evidence never landed is the I13 failure this
+            // report exists to surface: the state moved and the record did not.
+            || self.evidence_lost
     }
 
     #[must_use]
@@ -294,7 +332,11 @@ impl Runtime {
 
         // Written before the census so the record covers the decisions, not the
         // reading. A tick that decided nothing writes nothing.
-        report.record = ledger.seal(self.store()).await;
+        match ledger.seal(self.store()).await {
+            SweepRecord::Quiet => {}
+            SweepRecord::Recorded(run) => report.record = Some(run),
+            SweepRecord::EvidenceLost => report.evidence_lost = true,
+        }
 
         // Observed last, so the reading reflects what this sweep just resolved
         // rather than the backlog it was about to clear.

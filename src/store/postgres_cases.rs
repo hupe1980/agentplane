@@ -611,14 +611,25 @@ impl CaseStore for PostgresStore {
     }
 
     async fn set_status(&self, case: CaseId, status: CaseStatus) -> Result<(), StoreError> {
+        // Closing releases the correlation keys and refuses an open obligation;
+        // an ordinary status write does neither. Keeping `set_status(Closed)` a
+        // bare column write let the `status` column and correlation-open
+        // membership disagree — a closed case stayed correlatable and a new
+        // matter attached to it. Route it through `close`.
+        if status == CaseStatus::Closed {
+            return self.close(case).await;
+        }
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        client
+        let n = client
             .execute(
                 "UPDATE cases SET status = $2 WHERE case_id = $1 AND tenant = $3",
                 &[&case.to_string(), &status.as_str(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
+        if n == 0 {
+            return Err(StoreError::NotFound(case.to_string()));
+        }
         Ok(())
     }
 

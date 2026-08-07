@@ -271,6 +271,10 @@ name              = "bedrock_live"
 required-features = ["bedrock"]
 
 [[example]]
+name              = "hello_skill"
+required-features = ["redb"]
+
+[[example]]
 name              = "durable_pipeline"
 required-features = ["redb"]
 

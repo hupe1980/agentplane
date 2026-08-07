@@ -30,6 +30,14 @@
 (*     invariants are `NoUnwindPastAnExternalisedDeferred` and                *)
 (*     `AbortIsComplete`.                                                    *)
 (*                                                                          *)
+(*   * A deferred member that fails having externalised ITSELF — it reached   *)
+(*     the world and then its response could not be used (`Landed`) — is the   *)
+(*     same shape a member deep. The failure carries the evidence that the     *)
+(*     call took effect, so it too quarantines, even as the FIRST deferred     *)
+(*     with nothing else out. Modelling this failure as not-externalised is    *)
+(*     the misreading that let a deferred member returning `Landed` take the   *)
+(*     cheap abort; `DeferredFailsLanded` records it as sent.                  *)
+(*                                                                          *)
 (* Doubt is inherited from the saga unchanged: a group holding a member of    *)
 (* unknown outcome reverses nothing.                                         *)
 (***************************************************************************)
@@ -248,6 +256,33 @@ DeferredFailsLate ==
     /\ UNCHANGED <<landed, reversed, sent, pos, gatePos, unwindPos, doubt, invariantsHold,
                    txState>>
 
+(* A deferred member fails having externalised ITSELF: it reached the world     *)
+(* and then its response could not be used (`Landed`). A distinct choice from    *)
+(* `DeferredFailsFirst` — same member, same state (nothing else out yet), but a  *)
+(* failure carrying the evidence that the call took effect — so the model        *)
+(* explores both dispositions of one bad member. It is recorded as `sent`,       *)
+(* because it went out, and the group quarantines: reversing around it would     *)
+(* take back everything except the thing that happened. This is the case the     *)
+(* implementation's `!in_doubt` guard missed — `Landed` is not `InDoubt`, so it  *)
+(* was read as "nothing externalised" and took the cheap abort. Recording it as  *)
+(* NOT sent would reproduce the misreading and hide the bug from every invariant *)
+(* below.                                                                        *)
+DeferredFailsLanded ==
+    /\ settled = "open"
+    /\ unwindPos = 0
+    /\ pos = Reversibles + 1
+    /\ invariantsHold
+    /\ gatePos <= Deferreds
+    /\ gatePos \in BadDeferreds
+    \* A deferred member only runs once the transaction has resolved, exactly as
+    \* `ReleaseDeferred` requires — landing before the atomic members committed
+    \* would externalise work the transaction could still take back.
+    /\ txState # "pending"
+    /\ sent' = Append(sent, gatePos)
+    /\ settled' = "quarantined"
+    /\ UNCHANGED <<landed, reversed, pos, gatePos, unwindPos, doubt, invariantsHold,
+                   txState>>
+
 Commit ==
     /\ settled = "open"
     /\ unwindPos = 0
@@ -309,6 +344,7 @@ Next ==
     \/ ReleaseDeferred
     \/ DeferredFailsFirst
     \/ DeferredFailsLate
+    \/ DeferredFailsLanded
     \/ Commit
     \/ ReverseOne
     \/ ReversalFails

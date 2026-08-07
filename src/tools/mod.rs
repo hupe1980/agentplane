@@ -302,9 +302,20 @@ impl Advertised {
     /// is what a compromised or swapped-out server looks like from here.
     #[must_use]
     pub fn overclaims(&self, safety: &ToolSafety) -> bool {
-        (self.read_only == Some(true) && safety.mutates)
+        // Every overclaim is a safety promise about a tool the operator declared
+        // *mutating*; a read-only grant has nothing to overclaim against.
+        if !safety.mutates {
+            return false;
+        }
+        // Read-only or "not destructive" on a mutating grant are the same signal
+        // — a server claiming more safety than it was given, which is what a
+        // swapped-out server looks like from here. `destructive` was recorded and
+        // never read, so the claim that most invites "this is safe to repeat"
+        // went unchecked.
+        self.read_only == Some(true)
+            || self.destructive == Some(false)
+            // Idempotent, but only where repeating is genuinely unsafe.
             || (self.idempotent == Some(true)
-                && safety.mutates
                 && matches!(safety.recovery, Recovery::RequiresOperator))
     }
 }
@@ -813,5 +824,66 @@ impl Effect for ToolCall {
                     Disposition::Landed => EffectError::Performed(detail),
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod overclaim_tests {
+    use super::*;
+
+    /// Each safety claim is checked on its own, so removing any one clause is a
+    /// real regression rather than one masked by another firing on the same
+    /// fixture. `destructive == Some(false)` on a mutating grant is the clause
+    /// that was recorded and never read.
+    #[test]
+    fn a_server_claiming_more_safety_than_granted_is_flagged_per_clause() {
+        let mutating = ToolSafety::default(); // mutates: true, Recovery::default
+        let operator_needs_operator = ToolSafety::default().recovery(Recovery::RequiresOperator);
+
+        // read-only lie
+        assert!(
+            Advertised {
+                read_only: Some(true),
+                ..Advertised::default()
+            }
+            .overclaims(&mutating)
+        );
+
+        // not-destructive lie — the clause under test
+        assert!(
+            Advertised {
+                destructive: Some(false),
+                ..Advertised::default()
+            }
+            .overclaims(&mutating)
+        );
+
+        // idempotent lie, but only when repeating is unsafe
+        assert!(
+            Advertised {
+                idempotent: Some(true),
+                ..Advertised::default()
+            }
+            .overclaims(&operator_needs_operator)
+        );
+
+        // Honest advertisements and honest silence do not flag.
+        assert!(
+            !Advertised {
+                destructive: Some(true),
+                read_only: Some(false),
+                idempotent: Some(false),
+            }
+            .overclaims(&mutating)
+        );
+        assert!(!Advertised::default().overclaims(&mutating));
+        assert!(
+            !Advertised {
+                read_only: Some(true),
+                destructive: Some(false),
+                idempotent: Some(true),
+            }
+            .overclaims(&ToolSafety::read_only())
+        );
     }
 }

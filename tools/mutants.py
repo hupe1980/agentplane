@@ -2185,7 +2185,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a group unwinds around a member whose outcome nobody can establish — "
         "undoing a call that may or may not have landed, which is a coin flip "
         "with the outside world's money on it",
-        "    let doubt = match &result {\n        Err(SkillError::Step(e)) => crate::runtime::group::in_doubt(e),\n        _ => false,\n    };",
+        "    let doubt = match &result {\n        Err(SkillError::Step(e)) => crate::runtime::group::may_have_externalised(e),\n        _ => false,\n    };",
         "    let doubt = false;",
     ),
     "ReversalsRunForwards": (
@@ -2219,8 +2219,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "cheap abort path, so the journal settles the group as taken back whole "
         "while the transaction's writes stand with no reversal registered and "
         "none possible",
-        "                Err(e) if outputs.is_empty() && !atomic_committed && !in_doubt(&e) => {",
-        "                Err(e) if outputs.is_empty() && !in_doubt(&e) => {",
+        "                Err(e) if outputs.is_empty() && !atomic_committed && !may_have_externalised(&e) => {",
+        "                Err(e) if outputs.is_empty() && !may_have_externalised(&e) => {",
     ),
     "AMutatingEffectPassesAsARead": (
         "src/runtime/group.rs",
@@ -2501,8 +2501,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "that it did, so *why is this case escalated* is answerable only from "
         "the resulting state — which cannot tell 'the sweep breached this at "
         "02:00' from 'somebody set it', and no human was there to remember",
-        "        report.record = ledger.seal(self.store()).await;",
-        "",
+        "        match ledger.seal(self.store()).await {\n            SweepRecord::Quiet => {}\n            SweepRecord::Recorded(run) => report.record = Some(run),\n            SweepRecord::EvidenceLost => report.evidence_lost = true,\n        }",
+        "        let _ = ledger;",
     ),
     "AQuietSweepOpensARun": (
         "src/runtime/sweeper.rs",
@@ -2941,7 +2941,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_webhook_resolving_to_a_private_address_is_refused",
         "resolved webhook addresses are not checked, so a granted hostname "
         "pointing at loopback or a metadata service is connected to",
-        "        let addrs = crate::netguard::all_public(&host, resolved).map_err(PushError::Unroutable)?;",
+        "        let addrs = crate::netguard::all_public(&host, resolved)\n            .map_err(|e| PushError::Unroutable(e.to_string()))?;",
         "        let addrs: Vec<std::net::SocketAddr> = resolved.collect();",
     ),
     "AWebhookTokenIsEchoedBack": (

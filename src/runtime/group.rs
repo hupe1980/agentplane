@@ -446,14 +446,17 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
             let resource = member.resource.clone();
             match self.cx.effect(member.effect).await {
                 Ok(v) => outputs.push(v),
-                // Nothing has externalised — no deferred member landed and no
-                // atomic member committed — so the group can still be taken
-                // back whole. The second conjunct is load-bearing: an atomic
-                // member's write is permanent the moment its transaction
-                // commits, has no registered reversal and cannot have one, so
-                // an `Aborted` settlement after it would be the journal saying
-                // "taken back whole" over a ledger row that stands.
-                Err(e) if outputs.is_empty() && !atomic_committed && !in_doubt(&e) => {
+                // Nothing has externalised — no prior deferred member landed, no
+                // atomic member committed, and *this* member provably did not
+                // reach the world (`DidNotHappen`) — so the group can still be
+                // taken back whole. All three conjuncts are load-bearing. The
+                // atomic one: an atomic member's write is permanent the moment
+                // its transaction commits, has no registered reversal and cannot
+                // have one. The `may_have_externalised` one: a member that fails
+                // `Landed` or `InDoubt` did or might have taken effect, so an
+                // `Aborted` settlement would be the journal claiming "taken back
+                // whole" over a write that stands.
+                Err(e) if outputs.is_empty() && !atomic_committed && !may_have_externalised(&e) => {
                     let what = format!("deferred member '{kind}' on '{resource}' failed: {e}");
                     self.cx.abort_open_group(&what).await?;
                     return Err(StepError::GroupAborted { what });
@@ -558,14 +561,33 @@ fn no_group() -> StepError {
     }
 }
 
-/// Whether a failure leaves the outside world in an unknown state.
+/// Whether a member's failure leaves open the possibility that the call reached
+/// the outside world.
 ///
-/// Doubt is the one condition under which nothing may be reversed: undoing a
-/// call that may or may not have happened is a coin flip with real money on it.
-pub(crate) fn in_doubt(e: &StepError) -> bool {
+/// The cheap abort — settling `Aborted`, the journal's claim of *taken back
+/// whole* — is available only when this is **false**: the member provably did
+/// not externalise (`DidNotHappen`). Two dispositions forfeit that claim, and
+/// for the same reason:
+///
+/// * `InDoubt` — the call may or may not have happened, and reversing a coin
+///   flip is a coin flip with the outside world's money on it;
+/// * `Landed` — the call *did* happen, so reversing everything around it would
+///   undo everything except the thing that actually took effect. A member that
+///   fails `Landed` registered no reversal (an undo is built from an output a
+///   failed member has none of), so an `Aborted` settlement would be a lie about
+///   a write that stands.
+///
+/// The `Landed` arm is the load-bearing one: excluding only `InDoubt` here let a
+/// deferred member return `Landed` (a provider answering 200 with an unusable
+/// body) and still take the cheap abort — the group rule that an abort is
+/// available only while nothing has externalised, violated for the one member
+/// whose failure carries the strongest evidence that it did.
+pub(crate) fn may_have_externalised(e: &StepError) -> bool {
     match e {
         StepError::Undecidable { .. } => true,
-        StepError::Effect(inner) => inner.disposition() == crate::core::Disposition::InDoubt,
+        StepError::Effect(inner) => inner.disposition() != crate::core::Disposition::DidNotHappen,
+        // Anything else is a pre-dispatch refusal (a gate, a budget, a footprint
+        // check) — the member never left the process, so the cheap abort stands.
         _ => false,
     }
 }

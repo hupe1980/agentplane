@@ -258,11 +258,18 @@ impl<'a> StepCtx<'a> {
         self.reversing = reversing;
     }
 
-    /// The next effect key at this step, consuming an ordinal.
+    /// Derive the next effect key at this step and consume its ordinal, in one
+    /// call so the two can never be done out of step.
     ///
-    /// Shared with the ordinary dispatch path rather than reimplemented: two
-    /// derivations of one key is two chances for a replay to look like
-    /// divergence.
+    /// Advancing the ordinal is the bookkeeping a hand-rolled effect path can
+    /// forget, and a forgotten advance collides the next effect's key — a replay
+    /// divergence with nothing on the record to explain it. This bundles the two,
+    /// so every single-attempt effect (a group member, a timer, a release) gets
+    /// a fresh key by construction rather than by the author remembering.
+    ///
+    /// The *retried* forward path (`effect_unlabelled`) cannot use this: it
+    /// re-derives per attempt with the attempt number in the key, so its ordinal
+    /// is taken once, before the retry loop, and the derivation lives there.
     pub(crate) fn next_effect_key(&mut self, descriptor: &EffectDescriptor) -> EffectKey {
         let ordinal = self.ordinal;
         self.ordinal += 1;
@@ -451,11 +458,6 @@ impl<'a> StepCtx<'a> {
     #[must_use]
     pub fn step_id(&self) -> StepId {
         self.step
-    }
-
-    #[must_use]
-    pub fn mode(&self) -> Mode {
-        self.mode
     }
 
     /// What this run has consumed so far, and against what limits.
@@ -1489,15 +1491,7 @@ impl<'a> StepCtx<'a> {
             "timer.sleep",
             serde_json::json!({ "until": until.unix_timestamp() }),
         );
-        let key = EffectKey::derive(
-            self.step,
-            self.phase,
-            self.ordinal,
-            1,
-            &descriptor.kind,
-            &canon::value_bytes(&descriptor.args),
-        );
-        self.ordinal += 1;
+        let key = self.next_effect_key(&descriptor);
 
         // ── Replay: the timer already fired ────────────────────────────────
         if self.mode.is_replaying() {
@@ -1812,15 +1806,7 @@ impl<'a> StepCtx<'a> {
                 "value": value_digest,
             }),
         );
-        let key = EffectKey::derive(
-            self.step,
-            self.phase,
-            self.ordinal,
-            1,
-            &descriptor.kind,
-            &canon::value_bytes(&descriptor.args),
-        );
-        self.ordinal += 1;
+        let key = self.next_effect_key(&descriptor);
 
         if self.mode.is_replaying() {
             match self.cursor.next(key)? {

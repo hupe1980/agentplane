@@ -574,7 +574,6 @@ async fn an_open_run_refuses_to_resume_under_a_different_policy_bundle() {
                 Append::new(
                     run,
                     RecordKind::PlanFrozen {
-                        digest: plan.digest(),
                         steps: vec!["pay".into()],
                         plan: serde_json::to_value(plan).unwrap(),
                     },

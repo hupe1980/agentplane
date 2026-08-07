@@ -513,7 +513,6 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                 Append::new(
                     run,
                     RecordKind::PlanFrozen {
-                        digest: plan.digest(),
                         steps: vec!["demo.once".into()],
                         plan: serde_json::to_value(&plan).unwrap(),
                     },

@@ -1392,6 +1392,20 @@ mod tests {
             "sync",
             "an asynchronous guardrail releases content before assessing it"
         );
+
+        // Trace is off by default and reaches both request forms when asked for,
+        // because the intervention reason it returns is journaled — and a
+        // control the streaming path drops is one a `stream: true` deployment
+        // loses.
+        assert_eq!(g.config().trace().as_str(), "disabled");
+        assert_eq!(g.stream_config().trace().as_str(), "disabled");
+        let traced = Guardrail::new("gr-7", "3").with_trace();
+        assert_eq!(traced.config().trace().as_str(), "enabled");
+        assert_eq!(
+            traced.stream_config().trace().as_str(),
+            "enabled",
+            "with_trace must reach the streaming path too"
+        );
     }
 
     #[test]

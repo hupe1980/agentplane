@@ -51,6 +51,7 @@ only to satisfy an auditor always rots.
 ## 🚀 Try it
 
 ```sh
+cargo run --example hello_skill        # one skill, one run, one replay — start here
 cargo run --example durable_pipeline   # crash, resume, divergence
 cargo run --example clearing_case      # correlation, obligations, human tasks
 cargo run --example plan_graph         # multi-step plans, contract, provenance

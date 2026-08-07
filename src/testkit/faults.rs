@@ -233,12 +233,6 @@ impl Faulty {
             .map_or_else(|e| e.into_inner().clone(), |g| g.clone())
     }
 
-    /// The wrapped store, for assertions the fault layer should not mediate.
-    #[must_use]
-    pub fn inner(&self) -> &Arc<dyn JournalStore> {
-        &self.inner
-    }
-
     fn record(&self, n: u64, fault: Fault) {
         if let Ok(mut g) = self.injected.lock() {
             g.push((n, fault));

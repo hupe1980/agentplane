@@ -11,17 +11,13 @@ fn read(rel: &str) -> String {
 }
 
 fn core_sources() -> Vec<(String, String)> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/core");
-    std::fs::read_dir(&dir)
-        .expect("src/core exists")
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
-        .map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            (
-                name,
-                std::fs::read_to_string(e.path()).expect("read core source"),
-            )
+    // `walk` recurses, so a future `src/core/<subdir>` cannot smuggle in an I/O
+    // dependency the flat `read_dir` this replaced would never have looked at.
+    walk("src/core")
+        .into_iter()
+        .map(|path| {
+            let content = read(&path);
+            (path, content)
         })
         .collect()
 }
@@ -67,7 +63,7 @@ fn core_has_no_io_dependencies() {
         for needle in FORBIDDEN {
             assert!(
                 !code.contains(needle),
-                "src/core/{name} references `{needle}` — core must have no I/O"
+                "{name} references `{needle}` — core must have no I/O"
             );
         }
     }
@@ -520,13 +516,22 @@ fn telemetry_did_not_loosen_the_determinism_gate() {
 /// than trusting review to spot the difference.
 #[test]
 fn spans_are_instrumented_onto_futures_not_entered() {
-    for file in ["ctx.rs", "executor.rs", "sweeper.rs"] {
-        let src = read(&format!("src/runtime/{file}"));
+    // The whole of `src/runtime`, like the sibling clock guard — a fixed file
+    // list is exactly the shape that lets a `.enter()` land in `declarative.rs`,
+    // `group.rs` or `batch.rs` (all async runtime code) unnoticed.
+    let files = walk("src/runtime");
+    assert!(
+        files.len() >= 8,
+        "expected to scan the runtime module; found {} files",
+        files.len()
+    );
+    for file in files {
+        let src = read(&file);
         assert!(
             !src.contains(".enter()"),
-            "src/runtime/{file} enters a span guard. In async code that guard \
-             outlives the await and captures unrelated work — use \
-             `.instrument(span)` so the span belongs to the future"
+            "{file} enters a span guard. In async code that guard outlives the \
+             await and captures unrelated work — use `.instrument(span)` so the \
+             span belongs to the future"
         );
     }
 }

@@ -142,9 +142,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     println!("steps            → {}", steps.join(" → "));
 
-    let frozen = records.iter().any(
-        |r| matches!(r.kind(), RecordKind::PlanFrozen { digest, .. } if *digest == plan.digest()),
-    );
+    let frozen = records.iter().any(|r| {
+        matches!(r.kind(), RecordKind::PlanFrozen { plan: recorded, .. }
+            if serde_json::from_value::<agentplane::core::PlanIR>(recorded.clone())
+                .is_ok_and(|p| p.digest() == plan.digest()))
+    });
     println!("plan in journal  → {frozen} (the run can be audited against it)");
     store.verify(out.run_id).await?;
     println!("chain            → verifies");

@@ -106,14 +106,15 @@ pub enum RecordKind {
     /// From here the plan is an authorization graph: the journal that follows
     /// can be checked against it, down to per-argument provenance.
     PlanFrozen {
-        digest: Digest,
         /// Capability per step, for readability in a log listing.
         steps: Vec<String>,
         /// The plan itself, so replay reads it back rather than recompiling.
         ///
         /// Recompiling could produce a different graph — a changed manifest, a
         /// different router — and replay would then verify the run against a
-        /// plan that never governed it.
+        /// plan that never governed it. The plan is content-addressed, so its
+        /// digest is `plan.digest()` recomputed on demand rather than a second
+        /// copy stored beside it that a future writer could let disagree.
         plan: Value,
     },
 

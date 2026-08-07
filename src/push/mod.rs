@@ -362,7 +362,8 @@ impl PushSender {
         let resolved = tokio::net::lookup_host((host.as_str(), port))
             .await
             .map_err(|e| PushError::Unroutable(format!("DNS for '{host}': {e}")))?;
-        let addrs = crate::netguard::all_public(&host, resolved).map_err(PushError::Unroutable)?;
+        let addrs = crate::netguard::all_public(&host, resolved)
+            .map_err(|e| PushError::Unroutable(e.to_string()))?;
 
         let mut client = reqwest::Client::builder()
             .timeout(self.timeout)

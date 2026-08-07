@@ -470,15 +470,19 @@ async fn the_frozen_plan_is_journaled() {
     let out = h.rt.run_plan(plan.clone(), json!({})).await.unwrap();
 
     let records = h.store.read(out.run_id, 1).await.unwrap();
-    let frozen = records.iter().find_map(|r| match r.kind() {
-        RecordKind::PlanFrozen { digest, plan, .. } => Some((*digest, plan.clone())),
-        _ => None,
-    });
-    let (digest, recorded) = frozen.expect("the plan must be part of the record");
-    assert_eq!(digest, plan.digest(), "content-addressed");
+    let recorded = records
+        .iter()
+        .find_map(|r| match r.kind() {
+            RecordKind::PlanFrozen { plan, .. } => Some(plan.clone()),
+            _ => None,
+        })
+        .expect("the plan must be part of the record");
+    let recovered: PlanIR = serde_json::from_value(recorded).unwrap();
+    // Content-addressed: the recovered plan hashes to the same digest, which is
+    // recomputed rather than read from a second stored copy that could disagree.
+    assert_eq!(recovered.digest(), plan.digest(), "content-addressed");
     assert_eq!(
-        serde_json::from_value::<PlanIR>(recorded).unwrap(),
-        plan,
+        recovered, plan,
         "the plan itself is recoverable, not just its hash"
     );
 }

@@ -97,24 +97,44 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
 /// at the first answer passes it. The caller must then connect to exactly these
 /// addresses — resolving again would invite a different answer.
 ///
+/// Why a resolution was rejected.
+///
+/// Two variants rather than one string, because the caller's response differs by
+/// kind: an empty resolution is an outage (retry later), a forbidden address is
+/// a refusal (never fetch this). Deciding that by matching on message text — as
+/// `media` once did — means the first reword of a message here silently flips a
+/// retry into an abandonment. The distinction is a type.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NetGuardError {
+    /// The host resolved to no addresses at all. An outage, not a refusal.
+    #[error("DNS for '{host}' returned no addresses")]
+    NoAddresses { host: String },
+    /// The host resolved to a non-public address — loopback, private,
+    /// link-local, or the cloud metadata service. The SSRF case.
+    #[error("'{host}' resolved to forbidden address {address}")]
+    Forbidden { host: String, address: IpAddr },
+}
+
 /// # Errors
 ///
-/// The offending address, as a string, when any answer is not public — or a
-/// message when there were no answers at all.
-pub fn all_public<I>(host: &str, addresses: I) -> Result<Vec<std::net::SocketAddr>, String>
+/// [`NetGuardError::NoAddresses`] when there were no answers at all, and
+/// [`NetGuardError::Forbidden`] when any answer is not public.
+pub fn all_public<I>(host: &str, addresses: I) -> Result<Vec<std::net::SocketAddr>, NetGuardError>
 where
     I: IntoIterator<Item = std::net::SocketAddr>,
 {
     let addresses: Vec<_> = addresses.into_iter().collect();
     if addresses.is_empty() {
-        return Err(format!("DNS for '{host}' returned no addresses"));
+        return Err(NetGuardError::NoAddresses {
+            host: host.to_owned(),
+        });
     }
     for address in &addresses {
         if !is_public_ip(address.ip()) {
-            return Err(format!(
-                "'{host}' resolved to forbidden address {}",
-                address.ip()
-            ));
+            return Err(NetGuardError::Forbidden {
+                host: host.to_owned(),
+                address: address.ip(),
+            });
         }
     }
     let mut unique = std::collections::BTreeSet::new();

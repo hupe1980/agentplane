@@ -203,12 +203,6 @@ impl CardSecurity {
         }
     }
 
-    #[must_use]
-    pub fn bearer_format(mut self, format: impl Into<String>) -> Self {
-        self.scheme.http_auth_security_scheme.bearer_format = Some(format.into());
-        self
-    }
-
     #[cfg(feature = "a2a-server")]
     pub(crate) fn apply(&self, card: &mut AgentCard) {
         card.security_schemes

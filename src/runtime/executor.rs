@@ -1136,7 +1136,6 @@ impl Runtime {
             Append::new(
                 run,
                 RecordKind::PlanFrozen {
-                    digest: plan.digest(),
                     steps: plan
                         .nodes
                         .iter()
@@ -1832,7 +1831,6 @@ impl Runtime {
                 vec![stamp(Append::new(
                     run,
                     RecordKind::PlanFrozen {
-                        digest: plan.digest(),
                         steps: plan.nodes.iter().map(|n| n.capability.0.clone()).collect(),
                         plan: serde_json::to_value(plan)?,
                     },
@@ -3120,10 +3118,11 @@ async fn settle_abandoned_group(
         return result;
     }
 
-    // Doubt travels no further. Reversing around a call that may or may not
-    // have happened is a coin flip with the outside world's money on it.
+    // A member whose failure may have reached the world travels no further.
+    // Reversing around a call that may have — or did — happen leaves the world
+    // holding a write no `Aborted` settlement can honestly claim to have undone.
     let doubt = match &result {
-        Err(SkillError::Step(e)) => crate::runtime::group::in_doubt(e),
+        Err(SkillError::Step(e)) => crate::runtime::group::may_have_externalised(e),
         _ => false,
     };
     if doubt {

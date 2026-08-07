@@ -633,14 +633,21 @@ pub struct Security {
     pub max_delegation_depth: Option<u8>,
 }
 
-/// What this agent offers and needs, as capability strings.
+/// What this agent offers, as capability strings.
+///
+/// `provides` is enforced: the plane refuses to build if a declared capability
+/// has no skill behind it, and an Agent Card advertises exactly these. A twin
+/// `requires` field was removed rather than left as review-only intent — it was
+/// parsed, digest-covered and never checked, which is the advisory-control shape
+/// I12 forbids, and its enforced meaning (does a requirement bind a plane-mate's
+/// capability, a `tool://agent` grant, or a peer?) was never pinned. A build
+/// check that every required capability is available on the plane is a
+/// well-formed future control; until it exists, the field does not.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capabilities {
     #[serde(default)]
     pub provides: Vec<String>,
-    #[serde(default)]
-    pub requires: Vec<String>,
 }
 
 /// Ceilings, in the manifest's own vocabulary.

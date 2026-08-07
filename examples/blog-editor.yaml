@@ -25,7 +25,6 @@ spec:
 
   capabilities:
     provides: [blog.commission]
-    requires: [blog.research, blog.draft]
 
   models:
     privileged: { provider: fake, model: editor-1 }

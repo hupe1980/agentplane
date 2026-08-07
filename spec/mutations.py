@@ -113,6 +113,26 @@ MUTATIONS: dict[str, tuple[str, str, str, str, str]] = {
     /\\ Len(sent) = 0
     /\\ unwindPos' = Len(landed)""",
     ),
+    # The bug the implementation had a second time, one member deeper: a
+    # deferred member that fails having externalised ITSELF (`Landed`, not
+    # `InDoubt`) takes the cheap abort. The `!in_doubt` guard read `Landed` as
+    # "nothing externalised", so the group settled "aborted" — taken back whole
+    # — over a send that went out. Modelled by having the landed failure record
+    # itself as sent (it did go out) and then abort anyway.
+    "AbortAfterLandedDeferred": (
+        "EffectGroup",
+        "NoUnwindPastAnExternalisedDeferred",
+        "a deferred member that externalised itself before failing aborts anyway",
+        """    /\\ sent' = Append(sent, gatePos)
+    /\\ settled' = "quarantined"
+    /\\ UNCHANGED <<landed, reversed, pos, gatePos, unwindPos, doubt, invariantsHold,
+                   txState>>""",
+        """    /\\ sent' = Append(sent, gatePos)
+    /\\ unwindPos' = Len(landed)
+    /\\ settled' = "aborting"
+    /\\ UNCHANGED <<landed, reversed, pos, gatePos, doubt, invariantsHold,
+                   txState>>""",
+    ),
     # Committing a group nobody settled. The most consequential outcome becomes
     # the one an author gets by writing nothing at all.
     "AbandonCommits": (

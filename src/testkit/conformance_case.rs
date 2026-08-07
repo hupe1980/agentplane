@@ -47,6 +47,7 @@ fn effect(n: u8) -> EffectKey {
 pub async fn check_cases(store: &Arc<dyn CaseStore>, r: &mut Report) {
     correlating_twice_yields_one_case(store, r).await;
     a_closed_case_does_not_match(store, r).await;
+    closing_via_set_status_also_releases_the_keys(store, r).await;
     an_unmet_obligation_blocks_closure(store, r).await;
     the_census_counts_every_open_case(store, r).await;
     two_concurrent_messages_open_one_case(store, r).await;
@@ -321,6 +322,74 @@ async fn a_closed_case_does_not_match(store: &Arc<dyn CaseStore>, r: &mut Report
             "closure",
             "a message about a settled matter reanimated the closed case. Closing \
              must release the keys, or a new dispute joins an audited one",
+        );
+    }
+}
+
+/// The only agent-reachable way to close a case is `set_status(Closed)` — the
+/// `SetCaseStatus` effect. It must do everything `close` does, or a case reached
+/// closed by the path agents actually use stays correlatable (a new matter
+/// attaches to a closed case) and can hide an unmet obligation behind a tidy
+/// status. `close` itself has no agent surface, so a battery that only exercised
+/// it proved a path nobody takes.
+async fn closing_via_set_status_also_releases_the_keys(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let k = keys("INV-SS");
+    let Ok(opened) = store.correlate_or_open("matter", &k, ts(1_000)).await else {
+        return;
+    };
+    let case = opened.case_id();
+
+    // An unmet obligation must block this path exactly as it blocks `close`.
+    let deadline = crate::core::Deadline {
+        case,
+        name: "ack".into(),
+        resolved_at: ts(9_000),
+        calendar_digest: crate::core::Digest::of(b"cal"),
+        warn_at: None,
+        state: crate::core::DeadlineState::Pending,
+    };
+    if store.register_deadline(&deadline).await.is_err() {
+        r.record("closure", "register_deadline failed");
+        return;
+    }
+    if store
+        .set_status(case, crate::core::CaseStatus::Closed)
+        .await
+        .is_ok()
+    {
+        r.record(
+            "closure",
+            "set_status(Closed) closed a case with a pending obligation. The agent \
+             path must refuse it exactly as close does",
+        );
+    }
+    let _ = store
+        .set_deadline_state(case, "ack", crate::core::DeadlineState::Met)
+        .await;
+    if store
+        .set_status(case, crate::core::CaseStatus::Closed)
+        .await
+        .is_err()
+    {
+        r.record(
+            "closure",
+            "a case with all obligations met must be closable",
+        );
+        return;
+    }
+
+    // Closed by the agent path — the keys must be released too.
+    let Ok(again) = store.correlate_or_open("matter", &k, ts(2_000)).await else {
+        r.record("closure", "a key must be reusable once its case is closed");
+        return;
+    };
+    if again.case_id() == case {
+        r.record(
+            "closure",
+            "set_status(Closed) left the case correlatable. The status column and \
+             correlation-open membership are two spellings of closed and the agent \
+             path wrote only one",
         );
     }
 }

@@ -407,7 +407,6 @@ async fn an_orphaned_mutating_effect_is_quarantined_not_retried() {
                 Append::new(
                     run,
                     RecordKind::PlanFrozen {
-                        digest: plan.digest(),
                         steps: vec!["demo.pipeline".into()],
                         plan: serde_json::to_value(&plan).unwrap(),
                     },
