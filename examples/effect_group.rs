@@ -175,7 +175,10 @@ async fn checkout(
         .build();
 
     let out = runtime
-        .run("shop.checkout", json!({ "order": "ORD-42" }))
+        .run(
+            "shop.checkout",
+            Tainted::trusted(json!({ "order": "ORD-42" })),
+        )
         .await?;
 
     // The group is bracketed in the journal, so "was this taken or taken back?"

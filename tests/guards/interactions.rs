@@ -107,7 +107,7 @@ async fn a_compensation_may_sleep_before_it_reverses() {
             .terminal(),
     ]);
 
-    let out = rt.run_plan(p, json!({})).await.unwrap();
+    let out = rt.run_plan(p, Tainted::trusted(json!({}))).await.unwrap();
 
     assert!(
         out.status.is_suspended(),
@@ -214,7 +214,7 @@ async fn a_replan_requested_beside_a_succeeding_sibling_keeps_its_work() {
             .terminal(),
     ]);
 
-    let out = rt.run_plan(p, json!({})).await.unwrap();
+    let out = rt.run_plan(p, Tainted::trusted(json!({}))).await.unwrap();
     assert_eq!(
         out.status,
         RunStatus::Succeeded,
@@ -298,7 +298,7 @@ async fn one_step_may_sleep_retry_and_sleep_again() {
         })
         .build();
 
-    let mut out = rt.run("i", json!({})).await.unwrap();
+    let mut out = rt.run("i", Tainted::trusted(json!({}))).await.unwrap();
     let mut rounds = 0;
     while out.status.is_suspended() && rounds < 5 {
         rt.fire_timers(later(120 * (rounds + 1))).await.unwrap();

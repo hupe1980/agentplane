@@ -316,7 +316,9 @@ async fn run(world: &Arc<World>, script: Value) -> agentplane::runtime::RunOutco
             world: Arc::clone(world),
         })
         .build();
-    rt.run("checkout", script).await.expect("run")
+    rt.run("checkout", Tainted::trusted(script))
+        .await
+        .expect("run")
 }
 
 // ── A failure takes back what landed ────────────────────────────────────────
@@ -623,7 +625,10 @@ async fn a_reversal_is_journaled_and_is_not_repeated_on_replay() {
         })
         .build();
 
-    let out = rt.run("checkout", json!({})).await.expect("run");
+    let out = rt
+        .run("checkout", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert!(matches!(out.status, RunStatus::Failed(_)));
     let after_live = world.entries();
     assert!(after_live.contains(&"voided".to_owned()));
@@ -720,7 +725,10 @@ async fn a_group_survives_a_suspension_without_being_reversed() {
         })
         .build();
 
-    let out = rt.run("waits", json!({})).await.expect("run");
+    let out = rt
+        .run("waits", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert!(
         out.status.is_suspended(),
         "expected a suspension, got {:?}",
@@ -778,7 +786,10 @@ async fn a_group_is_taken_back_even_when_the_budget_is_exhausted() {
         })
         .build();
 
-    let out = rt.run("checkout", json!({})).await.expect("run");
+    let out = rt
+        .run("checkout", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert!(
         !matches!(out.status, RunStatus::Quarantined(_)),
         "the unwind was refused for want of budget: {:?}",
@@ -844,7 +855,10 @@ async fn a_group_left_open_behind_a_replan_is_still_reversed() {
         })
         .build();
 
-    let out = rt.run("replans", json!({})).await.expect("run");
+    let out = rt
+        .run("replans", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert!(
         matches!(out.status, RunStatus::Failed(_)),
         "a replan carried an unsettled group through: {:?}",
@@ -962,7 +976,9 @@ async fn a_probe_decides_whether_a_group_member_needs_reversing() {
                 landed,
             })
             .build();
-        rt.run("probes", json!({})).await.expect("run");
+        rt.run("probes", Tainted::trusted(json!({})))
+            .await
+            .expect("run");
 
         assert_eq!(
             world.did("voided"),
@@ -1065,7 +1081,10 @@ async fn a_committed_group_is_still_undone_by_the_step_s_own_compensation() {
             .arg("x", ArgSource::node(StepId(0)))
             .terminal(),
     ]);
-    let out = rt.run_plan(plan, json!({})).await.expect("run");
+    let out = rt
+        .run_plan(plan, Tainted::trusted(json!({})))
+        .await
+        .expect("run");
 
     assert!(matches!(out.status, RunStatus::Failed(_)));
     assert_eq!(
@@ -1164,7 +1183,9 @@ async fn concurrent_steps_each_get_their_own_group() {
             .arg("r", ArgSource::node(StepId(1)))
             .terminal(),
     ]);
-    rt.run_plan(plan, json!({})).await.expect("run");
+    rt.run_plan(plan, Tainted::trusted(json!({})))
+        .await
+        .expect("run");
 
     let log = world.entries();
     assert!(
@@ -1233,9 +1254,9 @@ async fn a_group_survives_waiting_for_an_event() {
         .build();
 
     let out = rt
-        .run_in_case(
+        .run_correlated(
             "awaits",
-            json!({}),
+            Tainted::trusted(json!({})),
             "shipment",
             &[CorrelationKey::new("shipment", "S-1")],
         )
@@ -1346,7 +1367,10 @@ async fn the_gate_exemption_ends_with_the_reversal() {
         })
         .build();
 
-    let out = rt.run("aborts", json!({})).await.expect("run");
+    let out = rt
+        .run("aborts", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
 
     assert!(
         world.did("released"),
@@ -1449,7 +1473,10 @@ async fn a_member_that_binds_outbound_arguments_is_refused_at_registration() {
             })
             .build();
 
-        let out = rt.run("registers", json!({})).await.expect("run");
+        let out = rt
+            .run("registers", Tainted::trusted(json!({})))
+            .await
+            .expect("run");
         // Deferred: nothing has run, so it is an ordinary refusal and the group
         // can still be taken back whole. Reversible: the forward member has
         // already landed and there is no usable way to undo it, which is a
@@ -1528,7 +1555,10 @@ async fn a_gated_member_that_fails_after_another_landed_does_not_unwind() {
         })
         .build();
 
-    let out = rt.run("two.sends", json!({})).await.expect("run");
+    let out = rt
+        .run("two.sends", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
 
     assert!(
         matches!(out.status, RunStatus::Quarantined(_)),
@@ -1604,7 +1634,10 @@ async fn a_group_spanning_a_suspension_is_announced_once() {
         })
         .build();
 
-    let out = rt.run("waits2", json!({})).await.expect("run");
+    let out = rt
+        .run("waits2", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert!(out.status.is_suspended());
 
     // Resume: the step re-runs from the top, replaying the member.
@@ -1752,7 +1785,10 @@ async fn an_atomic_member_commits_with_the_journal() {
         })
         .build();
 
-    let out = rt.run("books", json!({})).await.expect("run");
+    let out = rt
+        .run("books", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(
         world.entries(),
@@ -1804,7 +1840,10 @@ async fn a_refused_atomic_member_leaves_nothing_behind() {
         })
         .build();
 
-    let out = rt.run("books", json!({})).await.expect("run");
+    let out = rt
+        .run("books", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
 
     assert!(
         matches!(out.status, RunStatus::Failed(_)),
@@ -1862,7 +1901,10 @@ async fn a_lost_commit_acknowledgement_quarantines_the_group() {
         })
         .build();
 
-    let out = rt.run("books", json!({})).await.expect("run");
+    let out = rt
+        .run("books", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert!(
         matches!(out.status, RunStatus::Quarantined(_)),
         "a commit whose acknowledgement was lost took the cheap abort — the \
@@ -1911,7 +1953,10 @@ async fn a_replayed_atomic_member_is_not_applied_again() {
         })
         .build();
 
-    let out = rt.run("books", json!({})).await.expect("run");
+    let out = rt
+        .run("books", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
     let after_live = store.applied().len();
     assert_eq!(after_live, 1);
@@ -1951,7 +1996,10 @@ async fn an_atomic_member_is_refused_by_a_store_that_cannot_enlist() {
         })
         .build();
 
-    let out = rt.run("books", json!({})).await.expect("run");
+    let out = rt
+        .run("books", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     let RunStatus::Failed(why) = &out.status else {
         panic!("expected a refusal, got {:?}", out.status);
     };
@@ -2007,7 +2055,10 @@ async fn an_atomic_member_is_authorized_before_it_commits() {
         })
         .build();
 
-    let out = rt.run("books", json!({})).await.expect("run");
+    let out = rt
+        .run("books", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
 
     let RunStatus::Failed(why) = &out.status else {
         panic!(
@@ -2098,7 +2149,10 @@ async fn a_deferred_failure_after_an_atomic_commit_is_not_an_abort() {
         })
         .build();
 
-    let out = rt.run("post.then.send", json!({})).await.expect("run");
+    let out = rt
+        .run("post.then.send", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
 
     // The ledger row committed with the journal and cannot be taken back.
     assert_eq!(

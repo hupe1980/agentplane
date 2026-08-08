@@ -24,6 +24,7 @@
 
 use std::sync::Arc;
 
+use agentplane::core::Tainted;
 use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
 use agentplane::model::ModelProvider;
@@ -218,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = rt
         .run(
             "desk.ask",
-            json!({ "question": "AC-1 balance and ticket 7?" }),
+            Tainted::trusted(json!({ "question": "AC-1 balance and ticket 7?" })),
         )
         .await?;
     assert_eq!(out.status, RunStatus::Succeeded);

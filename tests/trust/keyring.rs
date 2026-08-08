@@ -343,9 +343,9 @@ async fn erasing_a_case_destroys_its_key_and_the_backup_with_it() {
         .build();
 
     let out = rt
-        .run_in_case(
+        .run_correlated(
             "records.keep",
-            json!({}),
+            Tainted::trusted(json!({})),
             "claim",
             &[CorrelationKey::new("claim", "CLM-1")],
         )

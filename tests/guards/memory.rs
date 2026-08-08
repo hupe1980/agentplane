@@ -586,7 +586,10 @@ async fn memory_security_metadata_is_part_of_replay_identity() {
         .memory(Arc::clone(&memories))
         .skill(Remembers(Trust::Untrusted))
         .build();
-    let run = live.run("remembers", json!({})).await.expect("live");
+    let run = live
+        .run("remembers", Tainted::trusted(json!({})))
+        .await
+        .expect("live");
     assert_eq!(run.status, RunStatus::Succeeded);
 
     let changed = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
@@ -639,7 +642,10 @@ async fn a_replayed_recall_does_not_search_again() {
         .skill(Recalls)
         .build();
 
-    let out = rt.run("recalls", json!({})).await.expect("run");
+    let out = rt
+        .run("recalls", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(
         out.output.as_ref().expect("output").peek()["recalled"][0],
@@ -745,7 +751,7 @@ async fn a_replayed_semantic_recall_does_not_rerank_the_index() {
         .build();
 
     let live = rt
-        .run("semantic-recalls", json!({}))
+        .run("semantic-recalls", Tainted::trusted(json!({})))
         .await
         .expect("live semantic recall");
     assert_eq!(live.status, RunStatus::Succeeded);
@@ -792,7 +798,7 @@ async fn a_replayed_expiry_sweep_does_not_erase_again() {
         .build();
 
     let live = rt
-        .run("sweeps-memory", json!({}))
+        .run("sweeps-memory", Tainted::trusted(json!({})))
         .await
         .expect("live sweep");
     assert_eq!(live.status, RunStatus::Succeeded);
@@ -835,7 +841,7 @@ async fn a_replayed_recall_does_not_refresh_access_retention_again() {
         .skill(RecallsAndRefreshes)
         .build();
     let live = rt
-        .run("recalls-refreshes", json!({}))
+        .run("recalls-refreshes", Tainted::trusted(json!({})))
         .await
         .expect("live recall");
     assert_eq!(touches.load(Ordering::SeqCst), 1);
@@ -1287,7 +1293,10 @@ async fn a_summary_inherits_the_join_of_what_it_summarised() {
         .memory(Arc::clone(&memories))
         .skill(Compacts)
         .build();
-    let out = rt.run("compacts", json!({})).await.expect("run");
+    let out = rt
+        .run("compacts", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);
 
     let summary = memories
@@ -1331,7 +1340,9 @@ async fn a_summary_records_the_versions_it_was_made_from() {
         .memory(Arc::clone(&memories))
         .skill(Compacts)
         .build();
-    rt.run("compacts", json!({})).await.expect("run");
+    rt.run("compacts", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
 
     let summary = memories
         .version("summary-1", 1)
@@ -1377,7 +1388,9 @@ async fn forgetting_a_source_can_reach_what_was_derived_from_it() {
         .memory(Arc::clone(&memories))
         .skill(Compacts)
         .build();
-    rt.run("compacts", json!({})).await.expect("run");
+    rt.run("compacts", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
 
     // The edge exists and is walkable from the source.
     let derived = memories.derivatives("m-1").await.expect("derivatives");
@@ -1474,7 +1487,10 @@ async fn compaction_cannot_exceed_the_sensitivity_ceiling() {
     secret.sensitivity = Sensitivity::Confidential;
     memories.remember(&secret).await.expect("remember");
 
-    let refused = rt.run("compacts_at", json!({})).await.expect("run");
+    let refused = rt
+        .run("compacts_at", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert_ne!(
         refused.status,
         RunStatus::Succeeded,
@@ -1493,7 +1509,10 @@ async fn compaction_cannot_exceed_the_sensitivity_ceiling() {
     secret.sensitivity = Sensitivity::Confidential;
     memories.remember(&secret).await.expect("remember");
     assert_eq!(
-        rt.run("compacts_at", json!({})).await.expect("run").status,
+        rt.run("compacts_at", Tainted::trusted(json!({})))
+            .await
+            .expect("run")
+            .status,
         RunStatus::Succeeded
     );
     assert!(memories.version("summary-1", 1).await.expect("v").is_some());
@@ -1563,7 +1582,10 @@ async fn a_replayed_run_reads_its_embedding_back_rather_than_asking_again() {
         .skill(Embeds(Arc::clone(&embedder)))
         .build();
 
-    let live = rt.run("embeds", json!({})).await.expect("live embed");
+    let live = rt
+        .run("embeds", Tainted::trusted(json!({})))
+        .await
+        .expect("live embed");
     assert_eq!(live.status, RunStatus::Succeeded);
     assert_eq!(embedder.0.load(Ordering::SeqCst), 1);
     assert_eq!(

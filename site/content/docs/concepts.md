@@ -264,6 +264,42 @@ Labels say *"this is untrusted"*; source binding says *"this must have come from
 step s0"* — strictly stronger, and free at replay time because both graphs are
 already in the journal.
 
+### The unit of concurrency is the plan node
+
+This is a design statement, not an API detail, and it is the thing to know
+before designing around `commission`.
+
+`StepCtx::commission` takes `&mut self` and is singular, and there is no
+`join`/`select` helper anywhere — so it is easy to conclude that in-run fan-out
+is impossible and to put the concurrency above the runtime. That conclusion is
+wrong, and it has been reached and written down as settled by at least one
+evaluation.
+
+Independent nodes are a **ready set**: `PlanIR::fan_out` dispatches every branch
+concurrently inside one run, each with its own journal slice, feeding one
+aggregator keyed by the capability that produced each result.
+
+```rust
+use agentplane::core::PlanIR;
+
+let plan = PlanIR::fan_out(["risk.score", "fraud.check"], "decide");
+let out = rt.run_plan(plan, Tainted::trusted(input)).await?;
+```
+
+`PlanIR` lives in `agentplane::core`, not `agentplane::plan` — the `plan` module
+holds `Contract`, `Replanner` and `validate`. That split is a fair share of why
+the type gets missed.
+
+Determinism does not depend on completion order: admission happens in
+deterministic ready order, outcomes are applied in deterministic ready order,
+and every branch's effects are keyed by its own step. What is deliberately
+absent is `race` — first-wins-cancel-the-rest would abandon an announced effect
+with no terminal record, which is the unknown outcome the effect protocol exists
+to prevent.
+
+`run_plan` is the entry point; `Contract` validates the graph before the first
+step runs.
+
 ---
 
 ## 10. ⏳ Human oversight and obligations {#oversight}

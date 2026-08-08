@@ -54,6 +54,7 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use agentplane::core::Tainted;
 use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
 use agentplane::model::ModelProvider;
@@ -754,7 +755,9 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
             agent.replay(run, mode).await
         } else {
             let capability = entry_capability(manifests, opts.capability.as_deref())?;
-            agent.run(&capability, opts.read_input()?).await
+            agent
+                .run(&capability, Tainted::trusted(opts.read_input()?))
+                .await
         }
         .map_err(|e| e.to_string())?;
 

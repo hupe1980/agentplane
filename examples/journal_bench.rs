@@ -87,7 +87,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::builder(Arc::clone(&store)).skill(Burst(n)).build();
 
     let started = Instant::now();
-    let outcome = runtime.run("perf.burst", json!({})).await?;
+    let outcome = runtime
+        .run("perf.burst", Tainted::trusted(json!({})))
+        .await?;
     let live = started.elapsed();
 
     // Replay performs nothing and reads every effect back, so this is the cost

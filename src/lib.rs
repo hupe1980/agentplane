@@ -73,7 +73,7 @@
 //! # async fn run(store: Arc<dyn JournalStore>) -> Result<(), Box<dyn std::error::Error>> {
 //! // With the default features, `agentplane::store::RedbStore` is one.
 //! let runtime = Runtime::builder(store).skill(Greet).build();
-//! let outcome = runtime.run("greet", serde_json::json!({"name": "world"})).await?;
+//! let outcome = runtime.run("greet", Tainted::trusted(serde_json::json!({"name": "world"}))).await?;
 //!
 //! // Replaying re-executes the deterministic zone and reads every effect back
 //! // from the journal. No clock is read; no tool is called twice. `Strict`
@@ -110,11 +110,32 @@ pub mod quota;
 pub mod runtime;
 pub mod tools;
 
-#[cfg(feature = "redb")]
+#[cfg(any(feature = "redb", feature = "postgres"))]
 pub mod store;
 
 #[cfg(feature = "testkit")]
 pub mod testkit;
+
+// A backend feature must deliver its backend.
+//
+// `store` was declared under `redb` alone while holding both backends, so
+// `--no-default-features --features postgres` compiled cleanly, pulled in
+// `tokio-postgres` and `deadpool-postgres`, and exposed *no store module at
+// all* — the Postgres deployment paid for three dependency crates and could not
+// name `PostgresStore`. `just features` reported success throughout, because
+// building a feature and reaching what it names are different questions and it
+// only ever asked the first.
+//
+// These make the compiler ask the second. Naming the type is what a consumer
+// does, so a gate that configures it out fails here rather than in their editor.
+#[cfg(feature = "redb")]
+const _: fn() = || {
+    let _: Option<&crate::store::RedbStore> = None;
+};
+#[cfg(feature = "postgres")]
+const _: fn() = || {
+    let _: Option<&crate::store::PostgresStore> = None;
+};
 
 pub use crate::core::{
     AgentRef, Capability, CaseId, Digest, EffectKey, Label, Outcome, Recovery, RunId, RuntimeError,

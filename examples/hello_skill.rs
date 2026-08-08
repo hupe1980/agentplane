@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let outcome = runtime
-        .run("demo.greet", json!({ "name": "world" }))
+        .run("demo.greet", Tainted::trusted(json!({ "name": "world" })))
         .await?;
     println!("live:    {:?} → {:?}", outcome.status, outcome.output);
 

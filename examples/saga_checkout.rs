@@ -171,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let first = runtime
         .run_plan(
             checkout(),
-            json!({ "order": "ORD-42", "amount_minor": 12900 }),
+            Tainted::trusted(json!({ "order": "ORD-42", "amount_minor": 12900 })),
         )
         .await?;
     assert!(matches!(first.status, RunStatus::Failed(_)));

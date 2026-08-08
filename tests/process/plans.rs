@@ -430,7 +430,10 @@ fn harness(untrusted: &[&'static str]) -> Harness {
 #[tokio::test]
 async fn a_multi_step_plan_executes_in_dependency_order() {
     let h = harness(&[]);
-    let out = h.rt.run_plan(ok_plan(), json!({ "id": 1 })).await.unwrap();
+    let out =
+        h.rt.run_plan(ok_plan(), Tainted::trusted(json!({ "id": 1 })))
+            .await
+            .unwrap();
 
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(h.calls.load(Ordering::SeqCst), 3);
@@ -449,7 +452,10 @@ async fn a_multi_step_plan_executes_in_dependency_order() {
 #[tokio::test]
 async fn every_step_is_journaled_separately() {
     let h = harness(&[]);
-    let out = h.rt.run_plan(ok_plan(), json!({})).await.unwrap();
+    let out =
+        h.rt.run_plan(ok_plan(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
 
     let records = h.store.read(out.run_id, 1).await.unwrap();
     let starts: Vec<_> = records
@@ -467,7 +473,10 @@ async fn every_step_is_journaled_separately() {
 async fn the_frozen_plan_is_journaled() {
     let h = harness(&[]);
     let plan = ok_plan();
-    let out = h.rt.run_plan(plan.clone(), json!({})).await.unwrap();
+    let out =
+        h.rt.run_plan(plan.clone(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
 
     let records = h.store.read(out.run_id, 1).await.unwrap();
     let recorded = records
@@ -491,7 +500,9 @@ async fn the_frozen_plan_is_journaled() {
 #[tokio::test]
 async fn arguments_are_assembled_from_their_declared_sources() {
     let h = harness(&[]);
-    h.rt.run_plan(ok_plan(), json!({ "id": 7 })).await.unwrap();
+    h.rt.run_plan(ok_plan(), Tainted::trusted(json!({ "id": 7 })))
+        .await
+        .unwrap();
 
     let seen = h.seen.lock().unwrap();
     assert_eq!(seen[0].1, json!({ "id": 7 }), "step 0 reads the run input");
@@ -549,7 +560,10 @@ async fn untrust_propagates_downstream() {
         .skill(AssertsUntrusted)
         .build();
 
-    let out = rt.run_plan(ok_plan(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(ok_plan(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
 }
 
@@ -567,7 +581,10 @@ async fn an_invalid_plan_is_rejected_before_anything_runs() {
         PlanNode::new(1, "validate").arg("b", ArgSource::node(StepId(0))),
     ]);
 
-    let err = h.rt.run_plan(bad, json!({})).await.unwrap_err();
+    let err =
+        h.rt.run_plan(bad, Tainted::trusted(json!({})))
+            .await
+            .unwrap_err();
     assert!(err.to_string().contains("cycle"), "got: {err}");
     assert_eq!(
         h.calls.load(Ordering::SeqCst),
@@ -580,7 +597,10 @@ async fn an_invalid_plan_is_rejected_before_anything_runs() {
 #[tokio::test]
 async fn a_multi_step_run_replays_strictly() {
     let h = harness(&[]);
-    let first = h.rt.run_plan(ok_plan(), json!({ "id": 3 })).await.unwrap();
+    let first =
+        h.rt.run_plan(ok_plan(), Tainted::trusted(json!({ "id": 3 })))
+            .await
+            .unwrap();
     let before = h.calls.load(Ordering::SeqCst);
 
     let again = h.rt.replay(first.run_id, Mode::Strict).await.unwrap();
@@ -602,7 +622,10 @@ async fn a_multi_step_run_replays_strictly() {
 #[tokio::test]
 async fn a_bare_target_compiles_to_a_single_node_plan() {
     let h = harness(&[]);
-    let out = h.rt.run("fetch", json!({ "x": 1 })).await.unwrap();
+    let out =
+        h.rt.run("fetch", Tainted::trusted(json!({ "x": 1 })))
+            .await
+            .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(h.calls.load(Ordering::SeqCst), 1);
 }
@@ -620,7 +643,10 @@ async fn a_diamond_plan_runs_both_branches_then_joins() {
             .terminal(),
     ]);
 
-    let out = h.rt.run_plan(plan, json!({})).await.unwrap();
+    let out =
+        h.rt.run_plan(plan, Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
 
     let seen = h.seen.lock().unwrap();
@@ -641,7 +667,9 @@ async fn a_field_selector_narrows_an_upstream_output() {
             .terminal(),
     ]);
 
-    h.rt.run_plan(plan, json!({})).await.unwrap();
+    h.rt.run_plan(plan, Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     let seen = h.seen.lock().unwrap();
     assert_eq!(seen[1].1, json!("fetch"), "only the selected field arrives");
 }
@@ -680,7 +708,10 @@ async fn a_constant_argument_is_trusted() {
             .terminal(),
     ]);
     assert_eq!(
-        rt.run_plan(plan, json!({})).await.unwrap().status,
+        rt.run_plan(plan, Tainted::trusted(json!({})))
+            .await
+            .unwrap()
+            .status,
         RunStatus::Succeeded
     );
 }
@@ -750,7 +781,7 @@ async fn sibling_steps_in_the_ready_set_run_concurrently() {
 
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        rt.run_plan(plan, json!({})),
+        rt.run_plan(plan, Tainted::trusted(json!({}))),
     )
     .await
     .expect("sequential dispatch would deadlock here")
@@ -828,7 +859,10 @@ async fn a_concurrently_dispatched_run_replays_strictly() {
         ])
     };
 
-    let out = rt.run_plan(plan(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(plan(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
     let ran = calls.load(Ordering::SeqCst);
 
@@ -1041,7 +1075,10 @@ async fn fan_out_dispatches_every_branch_concurrently_within_one_run() {
 
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        rt.run_plan(plan, json!({ "doc": "de.billing.rechnung.erstellt" })),
+        rt.run_plan(
+            plan,
+            Tainted::trusted(json!({ "doc": "de.billing.rechnung.erstellt" })),
+        ),
     )
     .await
     .expect("sequential dispatch would deadlock on the rendezvous")

@@ -398,7 +398,7 @@ let runtime = Runtime::builder(Arc::clone(&store))
     .skill(Greet)
     .build();
 
-let outcome = runtime.run("demo.greet", json!({ "name": "world" })).await?;
+let outcome = runtime.run("demo.greet", Tainted::trusted(json!({ "name": "world" }))).await?;
 println!("{:?} → {:?}", outcome.status, outcome.output);
 
 // Re-executes the logic, reads every effect back. Nothing is performed again.
@@ -415,7 +415,7 @@ party that knows:
 
 ```text
 Error: no skill provides capability 'demo.greeet' — this plane provides:
-demo.greet. `run` takes a capability, not a skill name; a skill declares its own
+demo.greet. `run_trusted` takes a capability, not a skill name; a skill declares its own
 with `SkillDescriptor::new(..).provides(..)`
 ```
 

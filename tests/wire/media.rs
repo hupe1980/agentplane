@@ -75,7 +75,7 @@ async fn an_untrusted_url_cannot_select_even_a_read_only_media_destination() {
         ),
         true,
     )
-    .run("fetches-media", json!({}))
+    .run("fetches-media", Tainted::trusted(json!({})))
     .await
     .unwrap();
 
@@ -91,7 +91,7 @@ async fn an_untrusted_url_cannot_select_even_a_read_only_media_destination() {
 #[tokio::test]
 async fn case_linked_media_is_refused_when_there_is_no_case_to_link() {
     let out = runtime(GovernedMedia::new(policy()), false)
-        .run("fetches-media", json!({}))
+        .run("fetches-media", Tainted::trusted(json!({})))
         .await
         .unwrap();
 

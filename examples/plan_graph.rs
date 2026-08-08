@@ -128,7 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("plan digest      → {}", plan.digest());
 
     let out = rt
-        .run_plan(plan.clone(), json!({ "meter": "51238696781" }))
+        .run_plan(
+            plan.clone(),
+            Tainted::trusted(json!({ "meter": "51238696781" })),
+        )
         .await?;
     println!("run              → {}", out.status.as_str());
     println!("output           → {}", out.output.as_ref().unwrap().peek());
@@ -158,14 +161,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .terminal(),
         PlanNode::new(1, "meter.validate").arg("b", ArgSource::node(StepId(0))),
     ]);
-    match rt.run_plan(circular, json!({})).await {
+    match rt.run_plan(circular, Tainted::trusted(json!({}))).await {
         Err(e) => println!("\ncircular plan    → refused: {e}"),
         Ok(_) => panic!("a plan with a cycle must not run"),
     }
 
     // A capability nothing provides is caught the same way.
     let ungrounded = PlanIR::single("meter.delete-everything");
-    match rt.run_plan(ungrounded, json!({})).await {
+    match rt.run_plan(ungrounded, Tainted::trusted(json!({}))).await {
         Err(e) => println!("ungrounded plan  → refused: {e}"),
         Ok(_) => panic!("a plan asking for what we cannot do must not run"),
     }
@@ -183,7 +186,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ])
     .topology(Topology::Collaborative(Collaboration::ParallelDisjoint));
 
-    match rt.run_plan(false_parallelism, json!({})).await {
+    match rt
+        .run_plan(false_parallelism, Tainted::trusted(json!({})))
+        .await
+    {
         Err(e) => println!("\nfalse parallel   → refused: {e}"),
         Ok(_) => panic!("overlapping inputs are not disjoint"),
     }
@@ -200,7 +206,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .topology(Topology::Collaborative(Collaboration::ParallelDisjoint));
 
     let ok = rt
-        .run_plan(genuine, json!({ "meter": "A", "other": "B" }))
+        .run_plan(
+            genuine,
+            Tainted::trusted(json!({ "meter": "A", "other": "B" })),
+        )
         .await?;
     println!("genuine parallel → {}", ok.status.as_str());
     assert_eq!(ok.status, RunStatus::Succeeded);

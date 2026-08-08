@@ -229,7 +229,7 @@ async fn an_effect_output_is_untrusted_by_default() {
                 .arg("x", ArgSource::node(StepId(0)))
                 .terminal(),
         ]),
-        json!({}),
+        Tainted::trusted(json!({})),
     )
     .await
     .unwrap();
@@ -314,7 +314,7 @@ async fn plan_argument_assembly_preserves_field_level_provenance() {
                     .arg("memo", ArgSource::node_field(StepId(0), "memo"))
                     .terminal(),
             ]),
-            json!({}),
+            Tainted::trusted(json!({})),
         )
         .await
         .unwrap();
@@ -347,7 +347,7 @@ async fn a_trusted_effect_does_not_taint_the_run() {
                 .arg("x", ArgSource::node(StepId(0)))
                 .terminal(),
         ]),
-        json!({}),
+        Tainted::trusted(json!({})),
     )
     .await
     .unwrap();
@@ -382,7 +382,7 @@ async fn declared_sensitivity_raises_but_cannot_lower() {
                 .arg("x", ArgSource::node(StepId(0)))
                 .terminal(),
         ]),
-        json!({}),
+        Tainted::trusted(json!({})),
     )
     .await
     .unwrap();
@@ -427,7 +427,7 @@ async fn an_undeclared_effect_keeps_the_sensitivity_its_provenance_implies() {
                 .arg("x", ArgSource::node(StepId(0)))
                 .terminal(),
         ]),
-        json!({}),
+        Tainted::trusted(json!({})),
     )
     .await
     .unwrap();
@@ -484,7 +484,7 @@ async fn tool_output_cannot_reach_a_mutating_sink() {
             world: Arc::clone(&world),
         })
         .build()
-        .run("naive", json!({}))
+        .run("naive", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -549,7 +549,7 @@ async fn releasing_is_the_only_label_improvement_and_it_is_journaled() {
             world: Arc::clone(&world),
         })
         .build()
-        .run("reviewed", json!({}))
+        .run("reviewed", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -631,7 +631,7 @@ async fn a_run_holding_tool_output_may_not_replan() {
                     .arg("x", ArgSource::node(StepId(0)))
                     .terminal(),
             ]),
-            json!({}),
+            Tainted::trusted(json!({})),
         )
         .await
         .unwrap();
@@ -681,7 +681,10 @@ async fn a_replayed_effect_carries_the_same_label() {
             .terminal(),
     ]);
 
-    let out = build(&seen).run_plan(plan, json!({})).await.unwrap();
+    let out = build(&seen)
+        .run_plan(plan, Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     let live = seen.lock().unwrap().clone();
 
     let replayed: Seen = Arc::default();
@@ -745,10 +748,7 @@ async fn taint_survives_a_handoff_between_agents() {
         .build();
 
     // The hand-off carries the label.
-    let out = rt
-        .run_tainted("demo.report", from_specialist)
-        .await
-        .expect("run");
+    let out = rt.run("demo.report", from_specialist).await.expect("run");
 
     let seen = out.output.as_ref().unwrap().peek()["trust"]
         .as_str()

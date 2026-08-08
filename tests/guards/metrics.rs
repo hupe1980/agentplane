@@ -218,7 +218,10 @@ async fn a_run_reports_its_outcome_and_its_effects() {
     let db = store();
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(meter.clone());
-    runtime(&db).run("ping", json!({})).await.unwrap();
+    runtime(&db)
+        .run("ping", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     drop(guard);
 
     let runs = meter.named(metrics::RUNS.name);
@@ -243,7 +246,10 @@ async fn a_run_reports_its_outcome_and_its_effects() {
 #[tokio::test]
 async fn a_replayed_effect_is_counted_separately_from_a_performed_one() {
     let db = store();
-    let out = runtime(&db).run("ping", json!({})).await.unwrap();
+    let out = runtime(&db)
+        .run("ping", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
 
     let meter = Meter::default();
     let _ambient = crate::ambient_subscriber();
@@ -358,9 +364,9 @@ async fn the_census_reports_humans_the_plane_is_waiting_on() {
     assert_eq!(rt.census(t(1_000)).await.unwrap().open_tasks, 0);
 
     let out = rt
-        .run_in_case(
+        .run_correlated(
             "approve",
-            json!({}),
+            Tainted::trusted(json!({})),
             "approval",
             &[CorrelationKey::new("req", "1")],
         )
@@ -427,7 +433,10 @@ async fn every_sample_matches_its_declaration() {
     let db = store();
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(meter.clone());
-    runtime(&db).run("ping", json!({})).await.unwrap();
+    runtime(&db)
+        .run("ping", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     runtime(&db)
         .sweep(t(2_000), time::Duration::hours(1))
         .await
@@ -488,7 +497,9 @@ async fn metrics_carry_no_tenant_unless_asked() {
             .metric_tenant(TenantLabel::Omitted)
             .skill(Pinger)
             .build();
-        rt.run("ping", json!({})).await.expect("run");
+        rt.run("ping", Tainted::trusted(json!({})))
+            .await
+            .expect("run");
         meter.samples()
     };
 
@@ -523,7 +534,9 @@ async fn an_asked_for_tenant_label_is_the_planes_own() {
             .metric_tenant(TenantLabel::Name)
             .skill(Pinger)
             .build();
-        rt.run("ping", json!({})).await.expect("run");
+        rt.run("ping", Tainted::trusted(json!({})))
+            .await
+            .expect("run");
         meter.samples()
     };
 

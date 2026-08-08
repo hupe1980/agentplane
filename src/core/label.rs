@@ -911,6 +911,157 @@ mod tests {
             );
         }
     }
+
+    /// A descendant inherits from its nearest labelled ancestor, not the join.
+    ///
+    /// Split from the test above only for length. The fixture has to make the
+    /// two answers observably different, or the assertion passes either way.
+    #[test]
+    fn an_untracked_descendant_inherits_its_nearest_labelled_ancestor() {
+        let nested = Tainted::object([
+            (
+                "recipient".to_owned(),
+                Tainted::with_label(
+                    serde_json::json!({ "addr": "ops@example.com" }),
+                    Label::trusted(),
+                ),
+            ),
+            (
+                "note".to_owned(),
+                Tainted::with_label(
+                    serde_json::json!("n"),
+                    Label::untrusted(src("tool://mail")).with_sensitivity(Sensitivity::Secret),
+                ),
+            ),
+        ]);
+
+        assert_eq!(
+            nested.label_at("/recipient/addr").map(|l| l.sensitivity),
+            Some(Sensitivity::Public),
+            "a descendant of a tracked field inherited the whole-value label \
+             instead of its own ancestor's, so a field-scoped ceiling reads as \
+             the join of everything beside it"
+        );
+        assert_eq!(
+            nested.label().sensitivity,
+            Sensitivity::Secret,
+            "the fixture no longer distinguishes the two, so the assertion \
+             above would pass under either reading"
+        );
+    }
+
+    /// The three field-provenance accessors, each pinned by what it returns.
+    ///
+    /// A sweep replaced `field_labels` with `std::iter::empty()`, flipped
+    /// `label_at`'s pointer comparison, and turned `apply_release`'s lineage
+    /// check from `||` into `&&` — all three survived. Together they *are*
+    /// field-level provenance: what an auditor reads, what a protected field
+    /// checks, and what stops a release claiming precision the runtime does not
+    /// have. Every test around them asserted whole-value behaviour, which is why
+    /// emptying the field map changed nothing any check could see.
+    #[test]
+    fn field_provenance_is_reported_rebased_and_required() {
+        let value = Tainted::object([
+            (
+                "recipient".to_owned(),
+                Tainted::with_label(
+                    serde_json::json!("ops@example.com"),
+                    Label::untrusted(src("tool://mail")),
+                ),
+            ),
+            (
+                "amount".to_owned(),
+                Tainted::with_label(serde_json::json!(10), Label::trusted()),
+            ),
+        ]);
+
+        // `field_labels` reports both, so emptying it is observable.
+        let reported: Vec<&str> = value.field_labels().map(|(p, _)| p).collect();
+        assert_eq!(
+            reported,
+            vec!["/amount", "/recipient"],
+            "field labels are not reported in stable pointer order, so an audit \
+             of who influenced which field reads differently run to run"
+        );
+
+        // `label_at` answers per field, and an exact hit is not the parent's.
+        assert_eq!(
+            value.label_at("/recipient").map(|l| l.trust),
+            Some(Trust::Untrusted),
+            "the tracked field's own label was not returned"
+        );
+        assert_eq!(
+            value.label_at("/amount").map(|l| l.trust),
+            Some(Trust::Trusted),
+            "a trusted sibling inherited its untrusted neighbour's label"
+        );
+        assert!(
+            value.label_at("/absent").is_none(),
+            "a path that is not in the value reported a label, so a sink would \
+             check a field that is not being sent"
+        );
+
+        // `apply_release` requires lineage for *every* named field: one that is
+        // tracked and one that is not must still be refused.
+        let release = Release {
+            scope: ReleaseScope {
+                trust: true,
+                sensitivity: None,
+            },
+            basis: "reviewed".to_owned(),
+            destination: "tool://ledger/post".to_owned(),
+            fields: ["/recipient".to_owned(), "/absent".to_owned()]
+                .into_iter()
+                .collect(),
+            evidence: ["ticket:1".to_owned()].into_iter().collect(),
+        };
+        assert!(
+            value.clone().apply_release(&release).is_none(),
+            "a release naming one tracked field and one untracked field was \
+             applied, so the untracked half was promoted on the strength of the \
+             whole-value label — precision the runtime does not have"
+        );
+
+        // The half that separates the two conditions. A value assembled whole
+        // carries no per-field lineage, so `/a` is **present in the value and
+        // untracked** — which `||` refuses and `&&` would allow, promoting a
+        // field on the strength of the whole-value label alone.
+        let untracked = Tainted::with_label(
+            serde_json::json!({ "a": "x" }),
+            Label::untrusted(src("tool://mail")),
+        );
+        let over_untracked = Release {
+            scope: ReleaseScope {
+                trust: true,
+                sensitivity: None,
+            },
+            basis: "reviewed".to_owned(),
+            destination: "tool://ledger/post".to_owned(),
+            fields: ["/a".to_owned()].into_iter().collect(),
+            evidence: ["ticket:1".to_owned()].into_iter().collect(),
+        };
+        assert!(
+            untracked.apply_release(&over_untracked).is_none(),
+            "a field present in the value but with no tracked lineage was \
+             released, so the promotion rests on the whole-value label while \
+             the decision reads as field-scoped"
+        );
+
+        // And the positive half, so a refuse-everything change cannot pass.
+        let ok = Release {
+            fields: ["/recipient".to_owned()].into_iter().collect(),
+            ..release
+        };
+        let good = value
+            .clone()
+            .apply_release(&ok)
+            .expect("a release over a field with real lineage was refused");
+        assert_eq!(
+            good.label_at("/recipient").map(|l| l.trust),
+            Some(Trust::Trusted),
+            "the released field was not promoted"
+        );
+    }
 }
 
 /// Every rule `Release::validate` enforces, each with the case it rejects.
@@ -924,7 +1075,9 @@ mod tests {
 /// and nothing else.
 #[cfg(test)]
 mod release_validation_tests {
-    use super::{Release, ReleaseScope, Sensitivity};
+    use std::collections::BTreeSet;
+
+    use super::{ProtectedField, Release, ReleaseScope, Sensitivity, SourceId, is_json_pointer};
 
     /// A release that the rules accept, which each case below then breaks in
     /// exactly one way. Without this baseline a rejection proves nothing — it
@@ -1019,6 +1172,242 @@ mod release_validation_tests {
             "a path that is not a JSON Pointer was accepted, so it would match \
              no field and release nothing while reading as a release"
         );
+    }
+
+    /// RFC 6901 escapes, from both sides of every branch.
+    ///
+    /// `is_json_pointer` decides which declared field paths are real, and its
+    /// escape handling had no test at all: a sweep flipped `+= 1` to `-= 1`,
+    /// `==` to `!=`, and dropped the `!` in the escape check, and every one
+    /// survived. A pointer parser that accepts `~2` matches no field, so a
+    /// protected-field rule written with one silently guards nothing while the
+    /// manifest reads as if it does.
+    #[test]
+    fn a_json_pointer_is_judged_by_rfc_6901_escapes() {
+        for good in [
+            "/a", "/a/b", "/",     // the whole-document child, a legal pointer
+            "/a~0b", // escaped tilde
+            "/a~1b", // escaped solidus
+            "/a~0",  // escape as the final token
+            "/a~1", "/~0~1",  // adjacent escapes
+            "/a~01b", // `~0` followed by an ordinary `1`
+        ] {
+            assert!(
+                is_json_pointer(good),
+                "{good} is a valid RFC 6901 pointer and was refused, so a \
+                 legitimate protected field would be rejected at parse"
+            );
+        }
+
+        for bad in [
+            "",  // empty
+            "a", // no leading solidus
+            "a/b", "/a~", // trailing tilde: an escape with nothing after it
+            "/~", "/a~2b", // `~` may only be followed by 0 or 1
+            "/a~xb", "/~9",
+        ] {
+            assert!(
+                !is_json_pointer(bad),
+                "{bad:?} is not a valid RFC 6901 pointer and was accepted, so a \
+                 rule written with it would match no field and guard nothing"
+            );
+        }
+    }
+
+    /// The two rules that decide whether a protected field constrains anything.
+    ///
+    /// Both are conjunctions, and a sweep turning either `&&` into `||` survived
+    /// — so the gate on a rule arriving from a manifest was, as far as any check
+    /// knew, decoration. Each case below is paired with an acceptance, because a
+    /// refuse-everything mutation passes a file of refusals perfectly.
+    #[test]
+    fn a_protected_field_must_constrain_something_and_not_contradict_itself() {
+        let trusted_and_sources = ProtectedField {
+            path: "/recipient".to_owned(),
+            require_trusted: true,
+            allowed_sources: BTreeSet::from([SourceId::new("crm")]),
+            max_sensitivity: None,
+        };
+        assert!(
+            trusted_and_sources.validate().is_err(),
+            "require_trusted beside allowed_sources was accepted; one demands \
+             the lattice's top and the other names who may supply it, so a \
+             reviewer cannot tell which is in force"
+        );
+
+        let constrains_nothing = ProtectedField {
+            path: "/recipient".to_owned(),
+            require_trusted: false,
+            allowed_sources: BTreeSet::new(),
+            max_sensitivity: None,
+        };
+        assert!(
+            constrains_nothing.validate().is_err(),
+            "a rule with no trust, source or sensitivity constraint was \
+             accepted, so a field reads as protected while permitting anything"
+        );
+
+        // The three acceptances, one per constraint, so a refuse-everything
+        // change cannot pass this test.
+        for (label, field) in [
+            (
+                "trust alone",
+                ProtectedField {
+                    path: "/recipient".to_owned(),
+                    require_trusted: true,
+                    allowed_sources: BTreeSet::new(),
+                    max_sensitivity: None,
+                },
+            ),
+            (
+                "sources alone",
+                ProtectedField {
+                    path: "/recipient".to_owned(),
+                    require_trusted: false,
+                    allowed_sources: BTreeSet::from([SourceId::new("crm")]),
+                    max_sensitivity: None,
+                },
+            ),
+            (
+                "a sensitivity ceiling alone",
+                ProtectedField {
+                    path: "/recipient".to_owned(),
+                    require_trusted: false,
+                    allowed_sources: BTreeSet::new(),
+                    max_sensitivity: Some(Sensitivity::Internal),
+                },
+            ),
+        ] {
+            assert!(
+                field.validate().is_ok(),
+                "{label} is a legitimate rule and was refused"
+            );
+        }
+
+        let bad_path = ProtectedField {
+            path: "recipient".to_owned(),
+            require_trusted: true,
+            allowed_sources: BTreeSet::new(),
+            max_sensitivity: None,
+        };
+        assert!(
+            bad_path.validate().is_err(),
+            "a path that is not a JSON Pointer was accepted"
+        );
+    }
+
+    /// Exactly one field is a field selection, not a whole-value one.
+    ///
+    /// `fields.len() > 1` guards the "whole value and named fields together"
+    /// contradiction. A sweep relaxing it to `>=` survived, which would refuse
+    /// the ordinary single-field release — the common case — while the
+    /// contradiction it exists to catch still needs two entries.
+    #[test]
+    fn a_single_named_field_is_a_release_and_not_a_contradiction() {
+        let one = {
+            let mut r = sound();
+            r.fields.clear();
+            r.fields.insert("/recipient".to_owned());
+            r
+        };
+        assert!(
+            one.validate().is_ok(),
+            "releasing exactly one named field was refused, which is the \
+             ordinary shape of a field-scoped release"
+        );
+    }
+
+    /// The accessors an audit reads report what was decided, not a constant.
+    ///
+    /// `AuditReport::releases` names the releaser, basis, **destination**,
+    /// **fields** and **evidence** of every discretionary label change — the one
+    /// discretionary act in the system. A sweep replaced `destination`,
+    /// `fields_scope` and `evidence` with fabricated values and all three
+    /// survived, including under a feature set that compiles the integration
+    /// tests: every test around them asserted that a release was *refused* or
+    /// *applied*, and none read back what it said it was for. An audit listing
+    /// a destination nobody chose is worse than no listing, because it reads as
+    /// corroboration.
+    ///
+    /// The values below are deliberately unalike, so a getter returning any
+    /// fixed string or any other field's value is caught rather than
+    /// coincidentally right.
+    #[test]
+    fn a_release_reports_the_decision_it_was_given() {
+        let release = Release::fields(
+            ReleaseScope::trust(),
+            ["/recipient".to_owned()],
+            "four-eyes approval AC-1",
+            "tool://ledger/post_entry",
+            ["ticket:AC-1".to_owned(), "reviewer:sam".to_owned()],
+        );
+
+        assert_eq!(
+            release.basis(),
+            "four-eyes approval AC-1",
+            "the basis an audit reports is not the one the releaser gave"
+        );
+        assert_eq!(
+            release.destination(),
+            "tool://ledger/post_entry",
+            "the destination an audit reports is not the sink the release named"
+        );
+        assert_eq!(
+            release.fields_scope(),
+            &["/recipient".to_owned()].into_iter().collect(),
+            "the field scope an audit reports is not what was released"
+        );
+        assert_eq!(
+            release.evidence(),
+            &["reviewer:sam".to_owned(), "ticket:AC-1".to_owned()]
+                .into_iter()
+                .collect(),
+            "the evidence an audit reports is not what was supplied — evidence \
+             is the difference between a decision and an assertion"
+        );
+        assert!(
+            !release.is_whole_value(),
+            "a field-scoped release reported itself as whole-value, which is a \
+             broader claim than was authorized"
+        );
+
+        let whole = Release::whole(
+            ReleaseScope::trust(),
+            "operator override",
+            "tool://ledger/post_entry",
+            ["ticket:AC-2".to_owned()],
+        );
+        assert!(
+            whole.is_whole_value(),
+            "a whole-value release did not report itself as one"
+        );
+    }
+
+    /// The safe constructors refuse a path that is not a JSON Pointer.
+    ///
+    /// `assert_json_pointer` replaced with `()` survived. The first attempt at
+    /// this test aimed at `Release::fields`, which panics through `validate`
+    /// rather than through the assert — so it passed with the mutation applied
+    /// and proved nothing. The assert's only callers are the two
+    /// `ProtectedField` constructors, and those are what a mutation of it must
+    /// be caught by.
+    #[test]
+    fn a_protected_field_constructor_refuses_a_path_that_is_not_a_pointer() {
+        for build in [
+            (|| ProtectedField::trusted("recipient")) as fn() -> ProtectedField,
+            || ProtectedField::from_sources("recipient", [SourceId::new("crm")]),
+        ] {
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
+            assert!(
+                refused.is_err(),
+                "a path with no leading solidus was accepted, so the rule would \
+                 match no field and guard nothing"
+            );
+        }
+
+        // The acceptance, so a panic-on-everything change cannot pass.
+        let ok = ProtectedField::trusted("/recipient");
+        assert_eq!(ok.path(), "/recipient");
     }
 
     /// Evidence is the difference between a decision and an assertion.

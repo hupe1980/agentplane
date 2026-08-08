@@ -824,13 +824,44 @@ impl Runtime {
     }
 
     /// Execute a fresh run with no case attached.
-    pub async fn run(&self, target: &str, input: Value) -> Result<RunOutcome, RuntimeError> {
-        self.admit(target, Tainted::trusted(input), None).await
+    ///
+    /// The input arrives **labelled**, and that is the whole of the decision.
+    /// [`Tainted::trusted`](crate::core::Tainted::trusted) is what an operator
+    /// writes for a literal, a constant or a configuration value they vouch for;
+    /// anything that came from outside — an inbound event, a queue message, a
+    /// counterparty's payload — keeps the label it arrived with.
+    ///
+    /// This took a bare `Value` and admitted it as `Trusted` by default. A
+    /// deployment whose runs are started by inbound events passed counterparty
+    /// data straight in, and three controls went quiet at once: `require_trusted`
+    /// protected fields were satisfied by attacker-chosen values, the egress
+    /// ceiling had nothing untrusted to join with, and the journal recorded no
+    /// contact with outside data. Nothing failed and the suite stayed green,
+    /// which is the profile of every other default this crate declines to offer.
+    ///
+    /// A `run_trusted`/`run_tainted` pair was tried first and is worse: it
+    /// doubles every shape, puts `run_trusted_in_case` one word away from
+    /// `run_tainted_in_case`, and still lets `run_trusted(cap, payload)` compile
+    /// over data nobody vouched for. A label is a **value** — it can be
+    /// computed, threaded through an adapter, or derived from where a message
+    /// arrived, none of which a method name can do. [`spawn`](Self::spawn)
+    /// already worked this way; `run` was the outlier.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::NoProvider`] when no skill provides `target`, and
+    /// whatever admission refuses — policy, quota, a halted tenant, a lease.
+    pub async fn run(
+        &self,
+        target: &str,
+        input: Tainted<Value>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        self.admit(target, input, None).await
     }
 
     /// Admit a run and let it proceed in the background, returning its id.
     ///
-    /// The asynchronous counterpart to [`run_tainted`](Self::run_tainted), for
+    /// The asynchronous counterpart to [`run`](Self::run), for
     /// callers that want a handle rather than an answer — A2A's
     /// `return_immediately`, a queue worker, an operator kicking something off.
     ///
@@ -885,7 +916,7 @@ impl Runtime {
         Ok(run)
     }
 
-    pub async fn spawn_tainted_in_case(
+    pub async fn spawn_in_case(
         self: &Arc<Self>,
         target: &str,
         input: Tainted<Value>,
@@ -895,7 +926,7 @@ impl Runtime {
             .await
     }
 
-    pub async fn spawn_tainted_correlated(
+    pub async fn spawn_correlated(
         self: &Arc<Self>,
         target: &str,
         input: Tainted<Value>,
@@ -913,55 +944,14 @@ impl Runtime {
         .await
     }
 
-    /// Start a run whose input carries a label.
-    ///
-    /// The hand-off boundary. A specialist's answer is untrusted — it came from
-    /// a model — and an orchestrator commissioning the next specialist with it
-    /// must not launder it on the way. Passing the labelled value keeps the
-    /// provenance, and the label is journaled so a replay reaches the same
-    /// verdict at the same gates.
-    ///
-    /// Without this the only door was [`run`](Self::run), whose input is trusted
-    /// by definition, so **every agent-to-agent hand-off washed the taint out**
-    /// — the one thing "risk context must survive delegation" forbids.
-    ///
-    /// # Errors
-    ///
-    /// As [`run`](Self::run).
-    pub async fn run_tainted(
-        &self,
-        target: &str,
-        input: Tainted<Value>,
-    ) -> Result<RunOutcome, RuntimeError> {
-        self.admit(target, input, None).await
-    }
-
     /// Execute a run that belongs to a long-lived case.
     ///
     /// Correlation happens **before planning**, because which case a message
     /// belongs to is a question of fact, not of judgement: it is a deterministic
     /// lookup on business keys, never a model call. If an open case matches any
     /// key the run joins it; otherwise a case is opened.
+    /// Start a new immutable run inside a case that already exists.
     pub async fn run_in_case(
-        &self,
-        target: &str,
-        input: Value,
-        case_kind: &str,
-        keys: &[CorrelationKey],
-    ) -> Result<RunOutcome, RuntimeError> {
-        self.admit(
-            target,
-            Tainted::trusted(input),
-            Some(CaseBinding::Correlate {
-                kind: case_kind.to_owned(),
-                keys: keys.to_vec(),
-            }),
-        )
-        .await
-    }
-
-    /// Execute tainted input as a new immutable run in an existing case.
-    pub async fn run_tainted_in_case(
         &self,
         target: &str,
         input: Tainted<Value>,
@@ -971,7 +961,8 @@ impl Runtime {
             .await
     }
 
-    pub async fn run_tainted_correlated(
+    /// Join or open a case by business key, then run.
+    pub async fn run_correlated(
         &self,
         target: &str,
         input: Tainted<Value>,
@@ -993,21 +984,25 @@ impl Runtime {
     ///
     /// The plan is validated and frozen *before the first step runs*: one that
     /// would fail at step seven must not begin at step one.
-    pub async fn run_plan(&self, plan: PlanIR, input: Value) -> Result<RunOutcome, RuntimeError> {
-        self.admit_plan(plan, Tainted::trusted(input), None).await
+    pub async fn run_plan(
+        &self,
+        plan: PlanIR,
+        input: Tainted<Value>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        self.admit_plan(plan, input, None).await
     }
 
     /// Execute an explicit plan inside a long-lived case.
-    pub async fn run_plan_in_case(
+    pub async fn run_plan_correlated(
         &self,
         plan: PlanIR,
-        input: Value,
+        input: Tainted<Value>,
         case_kind: &str,
         keys: &[CorrelationKey],
     ) -> Result<RunOutcome, RuntimeError> {
         self.admit_plan(
             plan,
-            Tainted::trusted(input),
+            input,
             Some(CaseBinding::Correlate {
                 kind: case_kind.to_owned(),
                 keys: keys.to_vec(),
@@ -4429,6 +4424,18 @@ impl RuntimeBuilder {
     ///   not show up at runtime. It *works*, and writes this tenant's runs into
     ///   another's keyspace while every erasure and every policy request names
     ///   the right one.
+    ///
+    /// # Long-running services want [`try_build`](Self::try_build)
+    ///
+    /// This panics, which is the honest answer for a binary wiring its own
+    /// skills: every variant above is a bug in code the author is looking at,
+    /// and aborting reports it at the moment it can be fixed. A daemon is a
+    /// different case — it wants to exit with a diagnostic, and a plane
+    /// assembled from a manifest that arrived at runtime is handling an *input*,
+    /// where a panic reports one tenant's typo by killing every other tenant's
+    /// in-flight run. `try_build` returns the same `BuildError` instead. One
+    /// implementation underneath both, so they cannot disagree about what is
+    /// refused.
     #[must_use]
     pub fn build(self) -> Arc<Runtime> {
         // Not `expect`. That formats the error with `Debug`, which would print

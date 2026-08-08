@@ -224,7 +224,10 @@ async fn sweep(failing: Option<&'static str>) {
     let world = Arc::new(Mutex::new(Vec::new()));
     let rt = runtime(&origin, &world, failing);
 
-    let out = rt.run_plan(chain(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     let records = origin.read(out.run_id, 1).await.unwrap();
     assert!(records.len() > 6, "a journal worth truncating");
 

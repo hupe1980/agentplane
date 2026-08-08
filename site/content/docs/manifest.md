@@ -150,6 +150,28 @@ The block is optional because an embedder may compose its prompt in code — in
 which case the digest simply does not cover it, and the page says so rather than
 implying otherwise.
 
+**A coded skill is not forced into that trade, and reading only the paragraph
+above suggests it is.** `StepCtx::manifest()` hands a skill the declaration it is
+running under, and `Identity::system_prompt()` renders `role`, a blank line, then
+`constraints` — the same string a declarative agent gets:
+
+```rust
+use agentplane::manifest::Identity;
+
+let system = cx
+    .manifest()
+    .and_then(|m| m.spec.identity.as_ref())
+    .map(Identity::system_prompt)
+    .unwrap_or_default();
+```
+
+So behaviour can stay in Rust while the prompt stays in the reviewed, digested
+file. What a coded agent gives up is coverage of its **conduct**, not of its
+prompt: the manifest still pins what it says, and cannot pin what the code then
+does with the answer. That distinction is worth stating plainly, because an
+evaluation reasoned from the paragraph above that the two were exclusive and
+recorded the trade-off as settled.
+
 There is no templating — no `{variables}`, no dynamic-instructions callback,
 no state injection. A templated instruction has no reviewable identity, and
 the instruction slot is the trusted slot: run-time values spliced into it

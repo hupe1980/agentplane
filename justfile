@@ -98,10 +98,22 @@ test-minimal:
 # Each runs one seam with *only* its own features on — the configuration an
 # embedder who wants that seam and nothing else will actually build. It proves
 # the seam does not quietly depend on some other feature being present.
+#
+# "Only its own" has to include `--no-default-features`, and for a while it did
+# not: without it `redb` is on regardless, so a seam could lean on the default
+# backend and this section's claim would still read as proven. The seams that
+# genuinely need *a* store name `redb` themselves below, which is honest; the two
+# that do not are the two where the default was hiding something.
 
 # the store contract, against a real Postgres container
+#
+# `--no-default-features` is the whole point here rather than tidiness: this seam
+# *is* a store, so linking the embedded one alongside it masks exactly the
+# defects that matter. With redb on, `store` could be — and was — gated on `redb`
+# alone, and the case-layer battery with it, so the shared-store backend was
+# untestable and unreachable in the configuration a Postgres deployment ships.
 test-postgres:
-    cargo test --features postgres,testkit --test guards postgres::
+    cargo test --no-default-features --features postgres,testkit --test guards postgres::
 
 # the key-ring contract, against a real Vault container
 #
@@ -110,7 +122,7 @@ test-postgres:
 # real defects the unit tests could not: Vault reports a destroyed key as a 400
 # with a message, not a 404.
 test-vault:
-    cargo test --features keyring-vault,testkit --test guards vault:: -- --test-threads=1
+    cargo test --no-default-features --features keyring-vault,testkit --test guards vault:: -- --test-threads=1
 
 # real MCP round trips against an in-process server
 test-mcp:

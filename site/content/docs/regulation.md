@@ -99,15 +99,21 @@ digest. So you can prove *what happened* and *that the record is unaltered*
 without retaining those bytes, which is what makes Art. 26 and Art. 17
 compatible rather than opposed.
 
-The condition in that sentence is load-bearing, and it decides whether an
-Art. 17 request can be discharged at all. The journal is append-only and its
-rows are **not** encrypted, so anything recorded in it — the run's input, every
-effect's canonical arguments, and therefore **model prompts and tool
-arguments**, plus every effect's output — is beyond both deletion and key
-destruction. Personal data that must be erasable has to reach a blob and leave
-only its digest in the chain. [Erasure and keys](@/docs/erasure.md#what-lands-where-and-what-can-be-erased)
-partitions this row by row; a deployment that puts customer records into
-prompts has made them permanent, and no later request can undo it.
+A record is never *deleted* — the chain is append-only. But **erasability is a
+wiring decision, not a size one**: the 1 MiB record ceiling is a refusal, not a
+router, and sensitivity does not track volume. A name, an address and an IBAN
+are a few hundred bytes. Three mechanisms decide it, and they compose:
+
+| | What it does |
+|---|---|
+| **`.keyring(..)`** | Seals journal payloads under a per-case wrapping key. The chain commits to **ciphertext**, so destroying the key erases every copy — live store, replica, every backup — while the history still verifies with no key at all. `erase_case` then discharges an Art. 17 request against records |
+| **`cx.store_blob`** | Puts bytes in a blob at **any** size and journals only the digest |
+| **`security.max_sensitivity_journaled`** | Refuses at dispatch, before the announcement, when a value above the ceiling would be journaled |
+
+So customer data in a prompt is permanent on an *unsealed* journal and erasable
+on a sealed one. [Erasure and
+keys](@/docs/erasure.md#what-lands-where-and-what-can-be-erased) partitions it
+row by row.
 
 **Erasure is answered by case**, which is the unit a request actually names.
 `erase_case` tombstones every blob that case produced and leaves other cases
@@ -117,10 +123,11 @@ belonged to.
 
 **What is still missing:** a scheduled TTL — object-store lifecycle rules do
 age-based expiry better than a sweeper could, at the cost of deleting rather
-than tombstoning. And personal data that reached a journal **record** rather than a
-blob cannot be removed at all — the chain is append-only by design. Keep it out
-of records; the 1 MiB ceiling pushes bulk content out by construction, but a
-short string still fits.
+than tombstoning. And on an **unsealed** journal, personal data that reached a
+record cannot be removed: wire a key ring, or keep it out through
+`cx.store_blob` and `max_sensitivity_journaled`. Governed memory is the one
+store `.keyring(..)` deliberately does not wrap — its erasure unit outlives the
+case and its adapter is single-node by contract — so wrap it explicitly.
 
 ---
 

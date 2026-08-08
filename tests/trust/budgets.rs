@@ -150,7 +150,10 @@ fn fixture(n: usize, tokens: u64, budget: Budget) -> Fixture {
 #[tokio::test]
 async fn an_unlimited_budget_does_not_interfere() {
     let f = fixture(20, 1_000_000, Budget::unlimited());
-    let out = f.rt.run("demo.spend", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(f.calls.load(Ordering::SeqCst), 20);
 }
@@ -159,7 +162,10 @@ async fn an_unlimited_budget_does_not_interfere() {
 #[tokio::test]
 async fn an_effect_count_limit_stops_a_runaway_loop_exactly() {
     let f = fixture(100, 0, Budget::default().effects(5));
-    let out = f.rt.run("demo.spend", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
 
     match &out.status {
         RunStatus::Exhausted(e) => {
@@ -179,7 +185,10 @@ async fn an_effect_count_limit_stops_a_runaway_loop_exactly() {
 #[tokio::test]
 async fn a_token_limit_reports_where_it_stood() {
     let f = fixture(100, 40, Budget::default().tokens(100));
-    let out = f.rt.run("demo.spend", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
 
     match &out.status {
         RunStatus::Exhausted(e) => {
@@ -206,7 +215,10 @@ async fn a_cost_limit_is_enforced_in_minor_units() {
         })
         .build();
 
-    let out = rt.run("demo.spend", json!({})).await.unwrap();
+    let out = rt
+        .run("demo.spend", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(matches!(out.status, RunStatus::Exhausted(_)));
     assert_eq!(calls.load(Ordering::SeqCst), 3, "stops once 250 is reached");
 }
@@ -232,7 +244,10 @@ async fn a_step_limit_stops_the_plan_between_steps() {
             .terminal(),
     ]);
 
-    let out = rt.run_plan(plan, json!({})).await.unwrap();
+    let out = rt
+        .run_plan(plan, Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     match &out.status {
         RunStatus::Exhausted(e) => assert!(e.to_string().contains("step budget"), "got: {e}"),
         other => panic!("got {other:?}"),
@@ -251,7 +266,10 @@ async fn a_step_limit_stops_the_plan_between_steps() {
 #[tokio::test]
 async fn a_metered_budget_overshoots_by_at_most_one_operation() {
     let f = fixture(10, 60, Budget::default().tokens(100));
-    let out = f.rt.run("demo.spend", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
 
     assert!(matches!(out.status, RunStatus::Exhausted(_)));
     assert_eq!(
@@ -271,7 +289,10 @@ async fn a_metered_budget_overshoots_by_at_most_one_operation() {
 #[tokio::test]
 async fn spend_is_journaled_so_replay_bills_identically() {
     let f = fixture(3, 25, Budget::default().tokens(1000));
-    let out = f.rt.run("demo.spend", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
 
     let records = f.store.read(out.run_id, 1).await.unwrap();
@@ -313,7 +334,10 @@ async fn an_exhausted_run_replays_as_exhausted() {
         .skill(skill())
         .build();
 
-    let out = rt.run("demo.spend", json!({})).await.unwrap();
+    let out = rt
+        .run("demo.spend", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(matches!(out.status, RunStatus::Exhausted(_)));
     let performed = calls.load(Ordering::SeqCst);
 
@@ -348,7 +372,10 @@ async fn an_exhausted_run_replays_as_exhausted() {
 #[tokio::test]
 async fn free_operations_still_count() {
     let f = fixture(50, 0, Budget::default().effects(4));
-    let out = f.rt.run("demo.spend", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     assert!(matches!(out.status, RunStatus::Exhausted(_)));
     assert_eq!(f.calls.load(Ordering::SeqCst), 4);
 }
@@ -359,7 +386,10 @@ async fn free_operations_still_count() {
 #[tokio::test]
 async fn exhaustion_is_distinguishable_from_failure() {
     let f = fixture(100, 0, Budget::default().effects(1));
-    let out = f.rt.run("demo.spend", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
 
     assert!(matches!(out.status, RunStatus::Exhausted(_)));
     assert!(
@@ -374,7 +404,10 @@ async fn exhaustion_is_distinguishable_from_failure() {
 #[tokio::test]
 async fn exhaustion_is_journaled() {
     let f = fixture(100, 0, Budget::default().effects(2));
-    let out = f.rt.run("demo.spend", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
 
     let records = f.store.read(out.run_id, 1).await.unwrap();
     let finished = records.iter().any(
@@ -409,7 +442,10 @@ async fn a_step_limited_run_replays_as_exhausted() {
             .terminal(),
     ]);
 
-    let out = rt.run_plan(plan, json!({})).await.unwrap();
+    let out = rt
+        .run_plan(plan, Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(
         matches!(out.status, RunStatus::Exhausted(_)),
         "got {:?}",

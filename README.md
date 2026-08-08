@@ -12,7 +12,7 @@ is calling real systems that move real money.
 
 ```rust
 // Performs its effects once, and journals everything.
-let outcome = runtime.run("reconcile", input).await?;
+let outcome = runtime.run("reconcile", Tainted::trusted(input)).await?;
 
 // Replay re-executes the logic and reads every effect back from the journal.
 // No tool is called again. No clock is read again. No invoice is issued twice.
@@ -151,7 +151,7 @@ hold, `Debug` is the message:
 
 ```text
 Error: no skill provides capability 'demo.greeet' — this plane provides:
-demo.greet. `run` takes a capability, not a skill name; a skill declares its own
+demo.greet. `run_trusted` takes a capability, not a skill name; a skill declares its own
 with `SkillDescriptor::new(..).provides(..)`
 ```
 
@@ -266,6 +266,8 @@ Full inventory, including what is **not** built →
 | ⚙️ | [Operations](https://hupe1980.github.io/agentplane/docs/operations/) — deploying, HA, retention, observability |
 | ⚖️ | [Regulation](https://hupe1980.github.io/agentplane/docs/regulation/) — EU AI Act obligation by obligation, and what is missing |
 | 📋 | [Status](https://hupe1980.github.io/agentplane/docs/status/) — built vs designed-not-built |
+| ⬆️ | [Upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/) — what breaks between pre-alpha releases, and the shortest correct fix |
+| 📜 | [Changelog](CHANGELOG.md) — what changed and when. *Status* answers what is true now; this answers what moved |
 | 🤝 | [Contributing](CONTRIBUTING.md) — the assurance ladder, and how to run it |
 
 ## 🧪 Assurance
@@ -319,6 +321,19 @@ refusal to replan on untrusted data was implemented, tested, and green — and
 deleting it would have failed no test, because the fixtures laundered the taint
 before it reached the check. It was found by accident. The sweep is so the next
 one is not.
+
+It runs on **every push**, and that sentence is the repair rather than the
+original design. The job was gated to pull requests, on the reasoning that a
+push to `main` had already passed the sweep on the way in — true of a repository
+that merges, and this one has never opened a pull request in its history, so the
+gate did not make the sweep cheaper, it switched the sweep off. Three mutations
+then rotted into code that no longer *compiled* — among them the retried draw
+that double-spends a customer's standing authorization — leaving three real
+guarantees unfalsifiable with every check green. `just anchors` reported all
+three present throughout, and correctly: it proves a mutation still **matches**
+the code it names, which is text and not types. The cheap check has that limit
+by construction; what it cannot do is notice that the expensive one is not
+running.
 
 ## 🚫 Non-goals
 

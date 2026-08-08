@@ -629,7 +629,7 @@ async fn cedar_governs_a_run_and_the_digest_lands_in_the_journal() {
             world: Arc::clone(&world),
         })
         .build()
-        .run("pay", json!({}))
+        .run("pay", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -688,7 +688,7 @@ async fn cedar_can_key_on_the_delegation_chain() {
             world: Arc::clone(&world),
         })
         .build()
-        .run("pay", json!({}))
+        .run("pay", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -929,7 +929,10 @@ spec:
         .build();
 
     let outcome = rt
-        .run("support.summarise", json!({"ticket": "printer on fire"}))
+        .run(
+            "support.summarise",
+            Tainted::trusted(json!({"ticket": "printer on fire"})),
+        )
         .await;
     assert!(
         matches!(

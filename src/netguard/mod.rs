@@ -74,6 +74,17 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     if let Some(mapped) = ip.to_ipv4_mapped() {
         return is_public_v4(mapped);
     }
+    // The first two clauses are deliberately redundant: `::` and `::1` both
+    // have `segments[0] == 0`, so the clause below already refuses them. They
+    // stay because a reader should not have to derive "loopback is refused"
+    // from a bitmask, and because the arithmetic rule could later be narrowed.
+    //
+    // The consequence is worth stating so it is not re-investigated: an
+    // automated sweep reports `|| -> &&` here as surviving, and it always will.
+    // Nothing can distinguish the two, since every address satisfying either
+    // clause satisfies the one below. It is an equivalent mutant, not a gap —
+    // the only one left in this file, and the rest of it is pinned from both
+    // sides of every edge by `every_range_is_refused_and_its_neighbour_is_not`.
     !(ip.is_unspecified()
         || ip.is_loopback()
         || (segments[0] & 0xfe00) == 0xfc00
@@ -146,27 +157,148 @@ where
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_ranges_an_ssrf_payload_aims_at_are_refused() {
-        for addr in [
-            "127.0.0.1",
-            "10.0.0.1",
-            "172.16.0.1",
-            "192.168.1.1",
-            "169.254.169.254", // the cloud metadata service
-            "0.0.0.0",
-            "100.64.0.1",
-            "::1",
-            "fe80::1",
-            "fc00::1",
-            // An IPv4 address in v6 notation still reaches loopback.
-            "::ffff:127.0.0.1",
-        ] {
+    /// Every range, from both sides of every edge.
+    ///
+    /// A list of addresses that must be refused proves less than it looks. It
+    /// cannot fail when a bound moves *outward*, because a wider rule still
+    /// refuses everything the list names — so `b == 254` becoming `b != 254`,
+    /// or `<=` becoming `>`, leaves it green while the classifier has changed
+    /// meaning. An automated sweep put a number on that: of 111 mutations to
+    /// this file, **67 survived** — nearly every comparison and nearly every
+    /// `||` between the ranges, in the one function standing between a hostile
+    /// URL and the internal network.
+    ///
+    /// So each row carries an address *inside* the range and its nearest
+    /// neighbour *outside*, and the outside half is what does the work: it is
+    /// the only thing that fails when a rule grows. The neighbours are chosen
+    /// to be caught by no other rule, or they would prove nothing either.
+    ///
+    /// This pins **this classifier's** boundaries, not IANA's registry. Where
+    /// the two differ the code is the subject under test, and a deliberate
+    /// widening should fail here and be re-approved rather than pass quietly.
+    /// (refused address, permitted neighbour, what the pair pins)
+    type Edge = (&'static str, &'static str, &'static str);
+
+    /// Both halves of every row, with the message naming which half failed.
+    fn assert_edges(edges: &[Edge]) {
+        for &(refused, permitted, why) in edges {
             assert!(
-                !is_public_ip(addr.parse().unwrap()),
-                "{addr} was treated as publicly routable"
+                !is_public_ip(refused.parse().unwrap()),
+                "{refused} was treated as publicly routable ({why})"
+            );
+            assert!(
+                is_public_ip(permitted.parse().unwrap()),
+                "{permitted} was refused, so the rule for {why} reaches further \
+                 than it should — the guard is refusing part of the internet"
             );
         }
+    }
+
+    #[test]
+    fn every_ipv4_range_is_refused_and_its_neighbour_is_not() {
+        assert_edges(&[
+            ("0.1.2.3", "1.0.0.1", "0.0.0.0/8 — 'this network'"),
+            ("10.255.255.254", "11.0.0.1", "10/8 private"),
+            ("127.255.255.254", "128.0.0.1", "127/8 loopback"),
+            (
+                "100.64.0.1",
+                "100.63.255.254",
+                "100.64/10 CGNAT, lower edge",
+            ),
+            (
+                "100.127.255.254",
+                "100.128.0.1",
+                "100.64/10 CGNAT, upper edge",
+            ),
+            (
+                "169.254.169.254",
+                "169.253.0.1",
+                "link-local — cloud metadata",
+            ),
+            ("169.254.0.1", "169.255.0.1", "link-local, upper edge"),
+            ("172.16.0.1", "172.15.0.1", "172.16/12 private, lower edge"),
+            (
+                "172.31.255.254",
+                "172.32.0.1",
+                "172.16/12 private, upper edge",
+            ),
+            (
+                "192.0.0.1",
+                "192.0.1.1",
+                "192.0.0/24 IETF protocol assignments",
+            ),
+            ("192.0.2.1", "192.0.3.1", "192.0.2/24 TEST-NET-1"),
+            (
+                "192.88.99.1",
+                "192.88.100.1",
+                "192.88.99/24 6to4 relay anycast",
+            ),
+            (
+                "192.168.1.1",
+                "192.167.0.1",
+                "192.168/16 private, lower edge",
+            ),
+            (
+                "192.168.255.254",
+                "192.169.0.1",
+                "192.168/16 private, upper edge",
+            ),
+            (
+                "198.18.0.1",
+                "198.17.0.1",
+                "198.18/15 benchmarking, lower edge",
+            ),
+            (
+                "198.19.255.254",
+                "198.20.0.1",
+                "198.18/15 benchmarking, upper edge",
+            ),
+            ("198.51.100.1", "198.51.101.1", "198.51.100/24 TEST-NET-2"),
+            ("203.0.113.1", "203.0.114.1", "203.0.113/24 TEST-NET-3"),
+            ("224.0.0.1", "223.255.255.254", "224/4 multicast and above"),
+            ("255.255.255.255", "223.255.255.254", "broadcast"),
+        ]);
+    }
+
+    /// The v6 half of [`every_ipv4_range_is_refused_and_its_neighbour_is_not`].
+    ///
+    /// Split by family only to keep each function readable; the reasoning in
+    /// that test's documentation governs both.
+    #[test]
+    fn every_ipv6_range_is_refused_and_its_neighbour_is_not() {
+        assert_edges(&[
+            ("::", "1::1", "unspecified, and ::/16 generally"),
+            ("::2", "1::1", "::/16 — includes IPv4-compatible v6"),
+            ("::1", "1::1", "loopback"),
+            // An IPv4 address in v6 notation still reaches what it names, and
+            // the neighbour proves the mapping is judged rather than waved past.
+            (
+                "::ffff:127.0.0.1",
+                "::ffff:1.1.1.1",
+                "IPv4-mapped is judged as v4",
+            ),
+            ("64:ff9b::1", "64:ff9c::1", "64:ff9b::/32 NAT64 well-known"),
+            ("64:ff9b:1::1", "65::1", "64:ff9b:1::/48 local-use NAT64"),
+            ("100::1", "101::1", "100::/64 discard-only"),
+            (
+                "2001::1",
+                "2001:200::1",
+                "2001::/23 protocol assignments, lower",
+            ),
+            ("2001:1ff::1", "2001:200::1", "2001::/23 upper edge"),
+            ("2001:db8::1", "2001:db9::1", "2001:db8::/32 documentation"),
+            ("2002::1", "2003::1", "2002::/16 6to4"),
+            ("3ffe::1", "3fe0::1", "3ff0::/12, lower edge"),
+            ("3fff::1", "3fe0::1", "3ff0::/12, upper edge"),
+            ("5f00::1", "5f01::1", "5f00::/16 segment routing"),
+            ("fc00::1", "fe00::1", "fc00::/7 unique-local, lower edge"),
+            ("fdff::1", "fe00::1", "fc00::/7 unique-local, upper edge"),
+            ("fe80::1", "fe40::1", "fe80::/10 link-local, lower edge"),
+            ("febf::1", "fe40::1", "fe80::/10 link-local, upper edge"),
+            ("fec0::1", "fe00::1", "fec0::/10 site-local, lower edge"),
+            ("feff::1", "fe00::1", "fec0::/10 site-local, upper edge"),
+            ("ff02::1", "fe00::1", "ff00::/8 multicast"),
+        ]);
     }
 
     #[test]

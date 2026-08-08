@@ -11,6 +11,7 @@
 use std::sync::{Arc, Mutex};
 
 use agentplane::core::Provenance;
+use agentplane::core::Tainted;
 use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
 use agentplane::model::{Completion, ModelProvider, Usage};
@@ -124,7 +125,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     // ── 1. Live run ─────────────────────────────────────────────────────────
-    let out = rt.run("desk.notify", json!({ "customer": "AC-1" })).await?;
+    let out = rt
+        .run(
+            "desk.notify",
+            Tainted::trusted(json!({ "customer": "AC-1" })),
+        )
+        .await?;
     println!("1. planned run  → {:?}", out.status);
     println!(
         "   sent to        → {:?} — the address the lookup returned, by reference",

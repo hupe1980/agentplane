@@ -77,7 +77,44 @@ curl -fsS "http://${ADDR}/.well-known/agent-card.json" >/dev/null \
 # pytest directly rather than run_tck.py, so the exclusions above apply and
 # the exit code is the verdict. `-m must` is the release bar: MUSTs are hard
 # failures; SHOULD/MAY are reported by the kit's own tooling when wanted.
+#
+# `-rs` because the exit code alone is not the verdict it looks like: a MUST row
+# the kit *skips* is counted neither passed nor failed, so it reads exactly like
+# one that passed. This bit — STREAM-SUB-002 ("stream closes at terminal state")
+# skipped on the kit's own client timeout for a release, while the server was in
+# fact correct: reproduced by hand, the subscription emits the terminal
+# TASK_STATE_COMPLETED and closes in about two seconds. The row was neither
+# passing nor failing, and nothing said so. This is the same standard
+# `mutants.py --verify` already applies to itself — distinguish *survived* from
+# *never ran* — applied to the conformance kit.
 cd "${CACHE}/a2a-tck"
+set +e
 ./.venv/bin/python3 -m pytest tests/compatibility/ \
-    --sut-host "http://${ADDR}" --transport jsonrpc -m must -q \
-    "${DESELECT[@]}" "$@"
+    --sut-host "http://${ADDR}" --transport jsonrpc -m must -rs -q \
+    "${DESELECT[@]}" "$@" 2>&1 | tee "${CACHE}/last-run.txt"
+STATUS=${PIPESTATUS[0]}
+set -e
+[[ $STATUS -eq 0 ]] || exit "$STATUS"
+
+# A floor, not an exact count: the kit gains rows between releases and a new
+# *passing* row must not be a failure here. A row that stops passing must be.
+PASSED=$(sed -n 's/^\([0-9]\{1,\}\) passed.*/\1/p' "${CACHE}/last-run.txt" | tail -1)
+EXPECTED_MIN=77
+if [[ -z "$PASSED" ]]; then
+    echo "REFUSED: could not read a pass count from the kit's output — a run that" >&2
+    echo "         asserted nothing reports no failures and reads like success" >&2
+    exit 1
+fi
+if (( PASSED < EXPECTED_MIN )); then
+    echo "REFUSED: ${PASSED} MUST rows passed, down from ${EXPECTED_MIN}." >&2
+    echo "         A row that stopped passing skips silently — read the SKIPPED" >&2
+    echo "         lines above and find which one, rather than lowering this." >&2
+    exit 1
+fi
+echo "ok: ${PASSED} MUST-level rows passed (floor ${EXPECTED_MIN}); skips listed above"
+echo "    Skipped rows are not passing rows. The standing ones are: the two"
+echo "    unconfigured transports, the errors only a non-streaming agent can"
+echo "    raise, the ten push rows (this fixture wires no --push-host, and"
+echo "    PushSender refuses a non-public webhook host by design, so the kit"
+echo "    cannot reach them from localhost), and STREAM-SUB-002's client-side"
+echo "    timeout, checked by hand and correct on the server."

@@ -9,6 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use agentplane::core::Tainted;
 use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
 use agentplane::runtime::{Agent, Mode, RunStatus, Runtime};
@@ -144,7 +145,10 @@ async fn a_planned_agent_routes_data_by_reference_not_through_a_model() {
     let rt = wired(&manifest, &provider, read_only_catalog(), &client);
 
     let out = rt
-        .run("pay.invoice", json!({ "customer": "AC-1" }))
+        .run(
+            "pay.invoice",
+            Tainted::trusted(json!({ "customer": "AC-1" })),
+        )
         .await
         .expect("run");
     assert!(
@@ -203,7 +207,7 @@ async fn a_planned_agent_refuses_untrusted_input() {
         json!({ "customer": "AC-1" }),
         agentplane::core::Label::untrusted(agentplane::core::SourceId::new("inbox")),
     );
-    let out = rt.run_tainted("pay.invoice", input).await.expect("run");
+    let out = rt.run("pay.invoice", input).await.expect("run");
     match out.status {
         RunStatus::Failed(reason) => assert!(
             reason.contains("refuses untrusted input"),
@@ -228,7 +232,10 @@ async fn a_plan_naming_an_ungranted_tool_fails_before_any_dispatch() {
     let rt = wired(&manifest, &provider, read_only_catalog(), &client);
 
     let out = rt
-        .run("pay.invoice", json!({ "customer": "AC-1" }))
+        .run(
+            "pay.invoice",
+            Tainted::trusted(json!({ "customer": "AC-1" })),
+        )
         .await
         .expect("run");
     match out.status {
@@ -238,6 +245,103 @@ async fn a_plan_naming_an_ungranted_tool_fails_before_any_dispatch() {
         other => panic!("an ungranted tool dispatched: {other:?}"),
     }
     assert!(client.calls().is_empty(), "something reached a tool");
+}
+
+const UNDERSCORED: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: payer, version: "1.0.0" }
+spec:
+  capabilities: { provides: [pay.invoice] }
+  identity: { role: "Settle invoices" }
+  security: { max_sensitivity_egress: internal }
+  models:
+    privileged: { provider: fake, model: planner-1 }
+  tools:
+    - ref: tool://crm/get_account
+      mutates: false
+      description: Look up a customer record.
+      arguments:
+        type: object
+        properties:
+          id: { type: string }
+        required: [id]
+  execution: { kind: planned, max_turns: 4 }
+  budgets: {}
+"#;
+
+/// A hand-written plan naming the *manifest* spelling gets told which one to use.
+///
+/// `wire_name` escapes `_` to `_u`, so `tool://crm/get_account` is
+/// `crm__get_uaccount` on the wire. Someone writing a plan in a test writes the
+/// obvious `crm__get_account`, and "not granted" sends them to the policy for a
+/// mistake that is in the escaping — the grant is right there in the manifest.
+#[tokio::test]
+async fn a_plan_naming_the_manifest_spelling_is_told_the_wire_name() {
+    let manifest = Manifest::parse(UNDERSCORED).expect("parse");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_answer(plan(json!({
+        "steps": [{ "tool": "crm__get_account", "args": {} }]
+    })));
+    let client = Arc::new(Recorder::default());
+    let catalog = Arc::new(ToolCatalog::new().allow(
+        ToolId::new("crm", "get_account"),
+        ToolSafety::read_only().max_sensitivity(agentplane::core::Sensitivity::Internal),
+    ));
+    let rt = wired(&manifest, &provider, catalog, &client);
+
+    let out = rt
+        .run(
+            "pay.invoice",
+            Tainted::trusted(json!({ "customer": "AC-1" })),
+        )
+        .await
+        .expect("run");
+    match out.status {
+        RunStatus::Failed(reason) => {
+            assert!(
+                reason.contains("tool://crm/get_account") && reason.contains("crm__get_uaccount"),
+                "the refusal did not name both spellings: {reason}"
+            );
+        }
+        other => panic!("an ungranted spelling dispatched: {other:?}"),
+    }
+    assert!(client.calls().is_empty(), "something reached a tool");
+}
+
+/// And a name that is nobody's spelling still gets the plain refusal, so the
+/// hint cannot degrade into "did you mean" attached to everything.
+#[tokio::test]
+async fn a_plan_naming_nothing_at_all_gets_no_spelling_hint() {
+    let manifest = Manifest::parse(UNDERSCORED).expect("parse");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_answer(plan(json!({
+        "steps": [{ "tool": "vault__open", "args": {} }]
+    })));
+    let client = Arc::new(Recorder::default());
+    let catalog = Arc::new(ToolCatalog::new().allow(
+        ToolId::new("crm", "get_account"),
+        ToolSafety::read_only().max_sensitivity(agentplane::core::Sensitivity::Internal),
+    ));
+    let rt = wired(&manifest, &provider, catalog, &client);
+
+    let out = rt
+        .run(
+            "pay.invoice",
+            Tainted::trusted(json!({ "customer": "AC-1" })),
+        )
+        .await
+        .expect("run");
+    match out.status {
+        RunStatus::Failed(reason) => {
+            assert!(reason.contains("not granted"), "wrong refusal: {reason}");
+            assert!(
+                !reason.contains("did you mean"),
+                "invented a near miss: {reason}"
+            );
+        }
+        other => panic!("an ungranted tool dispatched: {other:?}"),
+    }
 }
 
 const PROTECTED: &str = r#"
@@ -289,7 +393,10 @@ async fn a_reference_keeps_provenance_a_literal_does_not() {
     let client = Arc::new(Recorder::default());
     let rt = wired(&manifest, &provider, Arc::clone(&catalog), &client);
     let out = rt
-        .run("pay.invoice", json!({ "payee": "treasury@example.com" }))
+        .run(
+            "pay.invoice",
+            Tainted::trusted(json!({ "payee": "treasury@example.com" })),
+        )
         .await
         .expect("run");
     assert!(
@@ -309,7 +416,10 @@ async fn a_reference_keeps_provenance_a_literal_does_not() {
     let client = Arc::new(Recorder::default());
     let rt = wired(&manifest, &provider, catalog, &client);
     let out = rt
-        .run("pay.invoice", json!({ "payee": "treasury@example.com" }))
+        .run(
+            "pay.invoice",
+            Tainted::trusted(json!({ "payee": "treasury@example.com" })),
+        )
         .await
         .expect("run");
     assert!(
@@ -383,7 +493,10 @@ async fn a_parse_runs_on_the_quarantined_model() {
     let rt = wired(&manifest, &provider, catalog, &client);
 
     let out = rt
-        .run("read.contact", json!({ "url": "https://example.com" }))
+        .run(
+            "read.contact",
+            Tainted::trusted(json!({ "url": "https://example.com" })),
+        )
         .await
         .expect("run");
     assert!(
@@ -430,7 +543,10 @@ async fn a_parse_shortfall_fails_the_run_rather_than_guessing() {
     let rt = wired(&manifest, &provider, catalog, &client);
 
     let out = rt
-        .run("read.contact", json!({ "url": "https://example.com" }))
+        .run(
+            "read.contact",
+            Tainted::trusted(json!({ "url": "https://example.com" })),
+        )
         .await
         .expect("run");
     match out.status {
@@ -569,7 +685,7 @@ async fn data_above_the_journal_ceiling_is_refused_before_it_is_recorded() {
         agentplane::core::Label::trusted()
             .with_sensitivity(agentplane::core::Sensitivity::Confidential),
     );
-    let out = rt.run_tainted("intake.record", input).await.expect("run");
+    let out = rt.run("intake.record", input).await.expect("run");
 
     match out.status {
         RunStatus::Failed(reason) => {
@@ -611,7 +727,7 @@ async fn data_within_the_journal_ceiling_still_runs() {
         agentplane::core::Label::trusted()
             .with_sensitivity(agentplane::core::Sensitivity::Internal),
     );
-    let out = rt.run_tainted("intake.record", input).await.expect("run");
+    let out = rt.run("intake.record", input).await.expect("run");
     assert!(
         matches!(out.status, RunStatus::Succeeded),
         "internal data was refused by a ceiling set at internal: {:?}",

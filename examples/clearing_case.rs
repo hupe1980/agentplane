@@ -218,9 +218,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Day 0: the request goes out ────────────────────────────────────────
     let sent = rt
-        .run_in_case(
+        .run_correlated(
             "switch.request",
-            json!({ "document": "DOC-4711", "meter": "51238696781" }),
+            Tainted::trusted(json!({ "document": "DOC-4711", "meter": "51238696781" })),
             "supplier-switch",
             &keys,
         )
@@ -394,9 +394,9 @@ async fn demonstrate_early_arrival(rt: &Runtime) -> Result<(), Box<dyn std::erro
     println!("\nearly reply      → {:?}", rt.deliver(&early).await?);
 
     let racy = rt
-        .run_in_case(
+        .run_correlated(
             "switch.request",
-            json!({ "document": "DOC-9999", "meter": "51238696782" }),
+            Tainted::trusted(json!({ "document": "DOC-9999", "meter": "51238696782" })),
             "supplier-switch",
             &early_keys,
         )

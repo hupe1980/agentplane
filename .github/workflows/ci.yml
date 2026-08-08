@@ -53,12 +53,25 @@ jobs:
   # fail. Without this a guarantee can be implemented, tested, and still
   # unfalsifiable — which this project shipped once, and found by accident.
   #
-  # Pull requests only: the sweep costs ~25 minutes, and a push to `main` is a
-  # commit that already passed it on the way in. `just anchors` — which is in
-  # `just ci`, and so runs on every push — catches the cheap half, a mutation
-  # that no longer matches the code it names and therefore verifies nothing.
+  # This ran on pull requests only, justified by "a push to `main` is a commit
+  # that already passed it on the way in". That premise was false for this
+  # repository and had been from the start: every commit here has exactly one
+  # parent — `git log --format=%p | awk '{print NF}' | sort -u` prints `1` —
+  # because work lands by pushing straight to `main` and never through a pull
+  # request. So the condition did not make the sweep cheaper; it switched the
+  # sweep off, and nothing said so.
+  #
+  # The cost of that was three guarantees: `PolicyOnReplay`,
+  # `ADrawIsNotIdempotent` and `ACardsSkillsAreNotTheDeclaredCapabilities` had
+  # each rotted into a mutation that no longer *compiled*, so the sweep could
+  # not build them and no test was proving them. `just anchors` reported all
+  # three present the whole time, because it checks that a mutation still
+  # matches the code it names — text, not types — which is the cheap half only.
+  # A guarantee that stopped being checked looks exactly like one that is.
+  #
+  # It therefore runs on every push. ~25 minutes, in parallel with everything
+  # else, is the price of the sweep being a gate rather than a habit.
   mutants:
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

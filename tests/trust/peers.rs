@@ -540,7 +540,7 @@ async fn a_credential_is_presented_to_the_peer_and_never_written_to_the_journal(
             source: Arc::new(Cached::new(issuer as Arc<dyn TokenExchange>)),
         })
         .build()
-        .run("review", json!({}))
+        .run("review", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -638,7 +638,10 @@ async fn a_remote_task_poll_is_journaled_and_replay_does_not_poll_again() {
         })
         .build();
 
-    let live = runtime.run("peer.poll", json!({})).await.unwrap();
+    let live = runtime
+        .run("peer.poll", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert_eq!(live.status, RunStatus::Succeeded);
     assert_eq!(client.task_reads.lock().unwrap().len(), 1);
     assert_eq!(

@@ -10,7 +10,11 @@
 
 pub mod backstop;
 pub mod conformance;
-#[cfg(feature = "redb")]
+// The case-layer battery is backend-agnostic — it names no `redb` type — so the
+// gate has to be "a backend exists", not "the embedded one does". Read as `redb`
+// it made the *shared-store* backend's own contract untestable without linking
+// the embedded one, which is the configuration a Postgres deployment ships.
+#[cfg(any(feature = "redb", feature = "postgres"))]
 pub mod conformance_case;
 #[cfg(feature = "keyring")]
 pub mod conformance_keyring;

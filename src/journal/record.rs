@@ -844,8 +844,10 @@ impl Append {
     /// Materialize into a body at a given position.
     ///
     /// Sealing a record is a store's job, so this has no callers in a build with
-    /// no store compiled in.
-    #[cfg(any(feature = "redb", test))]
+    /// no store compiled in. Both backends are stores: the gate read `redb`
+    /// alone while `PostgresStore` calls this on every append, which nothing
+    /// noticed because no configuration ever compiled Postgres without redb.
+    #[cfg(any(feature = "redb", feature = "postgres", test))]
     pub(crate) fn into_body(self, seq: Seq, epoch: Epoch) -> RecordBody {
         RecordBody {
             seq,

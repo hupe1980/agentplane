@@ -3,6 +3,7 @@
 //! These check properties that no amount of code review reliably catches,
 //! because they are about what is *absent*.
 
+use agentplane::core::Tainted;
 use std::path::Path;
 
 fn read(rel: &str) -> String {
@@ -1280,7 +1281,7 @@ fn every_runtime_future_survives_a_spawn(
 ) {
     fn spawnable<F: std::future::Future + Send>(_f: F) {}
 
-    spawnable(rt.run("target", serde_json::Value::Null));
+    spawnable(rt.run("target", Tainted::trusted(serde_json::Value::Null)));
     spawnable(rt.replay(run, agentplane::runtime::Mode::Strict));
     spawnable(rt.deliver(event));
     spawnable(rt.decide_task(task, decision, &[]));

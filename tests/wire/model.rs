@@ -111,7 +111,10 @@ async fn live_model_stream_is_labelled_and_strict_replay_is_silent() {
     let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .skill(Streams(Arc::clone(&capture)))
         .build();
-    let live = runtime.run("streams-model", json!("hi")).await.unwrap();
+    let live = runtime
+        .run("streams-model", Tainted::trusted(json!("hi")))
+        .await
+        .unwrap();
     {
         let events = capture.0.lock().unwrap();
         assert_eq!(events.len(), 2);
@@ -165,7 +168,10 @@ async fn the_fake_provider_streams_deltas_that_reassemble_exactly() {
         })
         .build();
 
-    let live = runtime.run("streams-fake", json!("when?")).await.unwrap();
+    let live = runtime
+        .run("streams-fake", Tainted::trusted(json!("when?")))
+        .await
+        .unwrap();
 
     let events = capture.0.lock().unwrap();
     let text: String = events
@@ -374,7 +380,7 @@ async fn a_failed_completion_is_journaled_with_its_cost() {
             provider: Arc::clone(&provider),
         })
         .build()
-        .run("ask", json!({}))
+        .run("ask", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -486,7 +492,7 @@ async fn a_failed_completion_spends_the_budget_that_stops_the_next_one() {
             provider: Arc::clone(&provider),
         })
         .build()
-        .run("ask", json!({}))
+        .run("ask", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -527,7 +533,10 @@ async fn replay_charges_a_failed_completion_the_same_as_the_live_run() {
             })
             .build()
     };
-    let out = build().run("ask", json!({})).await.unwrap();
+    let out = build()
+        .run("ask", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     let live_calls = provider.calls();
 
     // Asserting the verdict rather than that a `Result` is one of its two
@@ -628,7 +637,7 @@ async fn a_model_prompt_above_its_sensitivity_ceiling_never_leaves() {
             provider: Arc::clone(&provider),
         })
         .build()
-        .run("secret-prompt", json!({}))
+        .run("secret-prompt", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -901,7 +910,10 @@ async fn strict_replay_does_not_read_media_blobs_or_call_the_model() {
             .build()
     };
 
-    let live = build().run("describe-media", json!({})).await.unwrap();
+    let live = build()
+        .run("describe-media", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(
         matches!(live.status, RunStatus::Succeeded),
         "{:?}",
@@ -992,7 +1004,10 @@ async fn an_untrusted_instruction_is_refused_before_the_model_sees_it() {
             })
             .build();
 
-        let out = rt.run("demo.obeys", json!({})).await.unwrap();
+        let out = rt
+            .run("demo.obeys", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
 
         if poisoned {
             let RunStatus::Failed(why) = &out.status else {
@@ -1088,7 +1103,10 @@ async fn run_against(provider_answer: Option<Value>) -> agentplane::runtime::Run
         .owner("audit")
         .skill(AsksForAnObject(provider_answer))
         .build();
-    runtime.run("asks-object", json!({})).await.unwrap()
+    runtime
+        .run("asks-object", Tainted::trusted(json!({})))
+        .await
+        .unwrap()
 }
 
 /// A declared schema binds the *answer*, and it is held at the effect boundary.

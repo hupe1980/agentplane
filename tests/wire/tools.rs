@@ -351,7 +351,10 @@ async fn a_tool_call_is_performed_once_and_replayed_from_the_journal() {
             .build()
     };
 
-    let out = build().run("call", json!({})).await.unwrap();
+    let out = build()
+        .run("call", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(matches!(out.status, RunStatus::Succeeded));
     assert_eq!(client.calls.lock().unwrap().len(), 1);
 
@@ -425,7 +428,7 @@ async fn tool_output_cannot_steer_a_mutating_call() {
             client: Arc::clone(&client),
         })
         .build()
-        .run("naive", json!({}))
+        .run("naive", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -490,7 +493,10 @@ async fn a_sink_cannot_check_one_argument_value_and_send_another() {
         })
         .build();
 
-    let out = runtime.run("substitutes", json!({})).await.unwrap();
+    let out = runtime
+        .run("substitutes", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(
         matches!(out.status, RunStatus::Failed(_)),
         "{:?}",
@@ -547,7 +553,7 @@ async fn a_tool_call_cannot_bypass_sink_gates_through_effect() {
             client: Arc::clone(&client),
         })
         .build()
-        .run("bypass-sink", json!({}))
+        .run("bypass-sink", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -622,7 +628,7 @@ async fn untrusted_content_may_accompany_a_trusted_protected_tool_argument() {
             recipient_label: Label::trusted(),
         })
         .build()
-        .run("structured", json!({}))
+        .run("structured", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -647,7 +653,7 @@ async fn untrusted_data_cannot_select_a_protected_tool_argument() {
             recipient_label: Label::untrusted(SourceId::new("model.complete")),
         })
         .build()
-        .run("structured", json!({}))
+        .run("structured", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -679,7 +685,7 @@ async fn untrusted_data_cannot_select_a_protected_read_only_argument() {
             recipient_label: Label::untrusted(SourceId::new("model.complete")),
         })
         .build()
-        .run("structured", json!({}))
+        .run("structured", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -711,7 +717,7 @@ async fn a_protected_tool_argument_must_derive_only_from_allowed_sources() {
             recipient_label: Label::untrusted(SourceId::new("model.complete")),
         })
         .build()
-        .run("structured", json!({}))
+        .run("structured", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -758,7 +764,7 @@ async fn untrusted_data_from_an_allowed_source_may_select_a_protected_argument()
             recipient_label: Label::untrusted(SourceId::new("run.input")),
         })
         .build()
-        .run("structured", json!({}))
+        .run("structured", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -788,7 +794,7 @@ async fn a_protected_tool_argument_honours_its_own_sensitivity_ceiling() {
             recipient_label: Label::trusted().with_sensitivity(Sensitivity::Confidential),
         })
         .build()
-        .run("structured", json!({}))
+        .run("structured", Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -1509,7 +1515,7 @@ spec:
             client: Arc::clone(&client),
         }))
         .build()
-        .run("ledger.ask", json!({}))
+        .run("ledger.ask", Tainted::trusted(json!({})))
         .await;
 
     assert!(
@@ -1724,7 +1730,7 @@ async fn run_tool_calling<T: agentplane::tools::Tool>(
         .build();
 
     let out = rt
-        .run("ledger.ask", json!({ "q": "AC-1?" }))
+        .run("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
         .await
         .expect("the run completes");
     (out, provider)
@@ -1895,7 +1901,7 @@ async fn an_in_doubt_tool_call_does_not_become_a_chat_message() {
         .tools(Arc::new(catalog), Arc::new(Times) as Arc<dyn ToolClient>)
         .agent(Agent::new(&manifest))
         .build()
-        .run("ledger.ask", json!({ "q": "AC-1?" }))
+        .run("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
         .await
         .expect("the run completes");
 

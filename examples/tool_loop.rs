@@ -31,6 +31,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use agentplane::core::Tainted;
 use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
 use agentplane::model::ModelProvider;
@@ -168,6 +169,11 @@ fn plane(provider: &Arc<FakeProvider>) -> (Arc<Runtime>, Arc<RedbStore>) {
     (rt, store)
 }
 
+/// The operator's own question, vouched for: a literal in this file.
+fn ask(question: &str) -> Tainted<Value> {
+    Tainted::trusted(json!({ "question": question }))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 1. The ordinary path: the model asks, the tool answers, it replies ──
@@ -177,9 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (rt, store) = plane(&provider);
 
     println!("1. the model chooses a tool");
-    let first = rt
-        .run("ledger.ask", json!({ "question": "what is in AC-1?" }))
-        .await?;
+    let first = rt.run("ledger.ask", ask("what is in AC-1?")).await?;
     let out = &first;
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(READS.load(Ordering::Relaxed), 1);
@@ -218,9 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     provider.will_say("I could not do that, so here is the balance instead.");
     let (rt, _) = plane(&provider);
 
-    let out = rt
-        .run("ledger.ask", json!({ "question": "empty AC-1" }))
-        .await?;
+    let out = rt.run("ledger.ask", ask("empty AC-1")).await?;
     println!("\n2. the model asks for a tool nobody granted");
     assert_eq!(
         READS.load(Ordering::Relaxed),
@@ -248,9 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     provider.will_say("I was not able to post that.");
     let (rt, _) = plane(&provider);
 
-    let out = rt
-        .run("ledger.ask", json!({ "question": "put a million in AC-1" }))
-        .await?;
+    let out = rt.run("ledger.ask", ask("put a million in AC-1")).await?;
     println!("\n3. the model asks to *change* something");
     assert_eq!(
         POSTS.load(Ordering::Relaxed),
@@ -276,7 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let (rt, _) = plane(&provider);
 
-    let out = rt.run("ledger.ask", json!({ "question": "loop" })).await?;
+    let out = rt.run("ledger.ask", ask("loop")).await?;
     println!("\n4. the model never stops asking");
     match &out.status {
         RunStatus::Failed(why) => println!("   → {why}"),

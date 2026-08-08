@@ -147,9 +147,14 @@ fn key(v: &str) -> CorrelationKey {
 
 async fn suspended_run(f: &Fixture, target: &str) -> RunId {
     let out =
-        f.rt.run_in_case(target, json!({}), "dispute", &[key("INV-1")])
-            .await
-            .unwrap();
+        f.rt.run_correlated(
+            target,
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-1")],
+        )
+        .await
+        .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
     out.run_id
 }
@@ -324,7 +329,12 @@ async fn a_stop_will_not_unwind_around_an_unknown_outcome() {
         .build();
 
     let out = rt
-        .run_in_case("demo.post", json!({}), "dispute", &[key("INV-2")])
+        .run_correlated(
+            "demo.post",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-2")],
+        )
         .await;
     assert!(
         !faulty.injected().is_empty(),
@@ -409,7 +419,10 @@ async fn stopping_a_finished_run_does_not_reopen_it() {
         .skill(Quick)
         .build();
     let out = rt
-        .run_plan(agentplane::core::PlanIR::single("demo.quick"), json!({}))
+        .run_plan(
+            agentplane::core::PlanIR::single("demo.quick"),
+            Tainted::trusted(json!({})),
+        )
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Succeeded));

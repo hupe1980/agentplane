@@ -1769,7 +1769,7 @@ async fn run_a2a(
         let case = crate::core::CaseId::parse(context).map_err(|_| {
             crate::core::RuntimeError::PlanContract("contextId is not a case issued here".into())
         })?;
-        return server.runtime.run_tainted_in_case(skill, input, case).await;
+        return server.runtime.run_in_case(skill, input, case).await;
     }
     // Always correlated: `A2aServer::new` refuses a runtime without a case
     // layer, so every task gets a real, continuable context — the contextId
@@ -1777,7 +1777,7 @@ async fn run_a2a(
     // schema and continues nothing.
     server
         .runtime
-        .run_tainted_correlated(
+        .run_correlated(
             skill,
             input,
             "a2a.context",
@@ -1799,15 +1799,12 @@ async fn spawn_a2a(
         let case = crate::core::CaseId::parse(context).map_err(|_| {
             crate::core::RuntimeError::PlanContract("contextId is not a case issued here".into())
         })?;
-        return server
-            .runtime
-            .spawn_tainted_in_case(skill, input, case)
-            .await;
+        return server.runtime.spawn_in_case(skill, input, case).await;
     }
     // Always correlated, for the reason `run_a2a` states.
     server
         .runtime
-        .spawn_tainted_correlated(
+        .spawn_correlated(
             skill,
             input,
             "a2a.context",

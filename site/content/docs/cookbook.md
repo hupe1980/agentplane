@@ -114,7 +114,7 @@ let rt = Runtime::builder(Arc::clone(&store))
     .build();
 
 // One capability: no plan needed.
-let out = rt.run("ticket.triage", json!({ "text": "printer on fire" })).await?;
+let out = rt.run("ticket.triage", Tainted::trusted(json!({ "text": "printer on fire" }))).await?;
 
 // Several: name the order, and what feeds what.
 let plan = PlanIR::new(vec![
@@ -123,7 +123,7 @@ let plan = PlanIR::new(vec![
         .arg("triage", ArgSource::node(StepId(0)))
         .terminal(),
 ]);
-let out = rt.run_plan(plan, json!({ "text": "printer on fire" })).await?;
+let out = rt.run_plan(plan, Tainted::trusted(json!({ "text": "printer on fire" }))).await?;
 ```
 
 ### Which one: a plan, or a commission?
@@ -145,7 +145,7 @@ The rule of thumb: **if you can draw the graph before you start, draw it.** A
 plan is checkable in advance and a commission is not; the commission's advantage
 is that it does not need to be.
 
-Most agents need neither. `rt.run(capability, input)` is one capability and no
+Most agents need neither. `rt.run(capability, Tainted::trusted(input))` is one capability and no
 graph, which is what nine of the twelve examples use.
 
 ### Fan out to several specialists at once
@@ -159,7 +159,7 @@ let plan = PlanIR::fan_out(
     ["billing.anomaly", "billing.regulatory"],   // run concurrently
     "billing.decide",                            // then combine
 );
-let out = rt.run_plan(plan, document).await?;
+let out = rt.run_plan(plan, Tainted::trusted(document)).await?;
 ```
 
 The aggregator receives one argument per branch, **keyed by the capability that
@@ -318,7 +318,7 @@ let rt = Runtime::builder(store)
     .agent(Agent::new(&m))
     .build();
 
-let out = rt.run("support.summarise", ticket).await?;
+let out = rt.run("support.summarise", Tainted::trusted(ticket)).await?;
 ```
 
 Rust-generated declarations use `Manifest::builder(name, version)` with
@@ -694,7 +694,7 @@ A month-long process is a **case** plus short runs. Start a run correlated by
 business key, and it joins the existing case or opens one:
 
 ```rust
-rt.run_in_case("claim.assess", input, "claim", &[CorrelationKey::new("claim", "CLM-9")]).await?;
+rt.run_correlated("claim.assess", Tainted::trusted(input), "claim", &[CorrelationKey::new("claim", "CLM-9")]).await?;
 ```
 
 Inside the skill, case state is versioned and every access is journaled:

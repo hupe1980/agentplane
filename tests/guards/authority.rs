@@ -300,7 +300,10 @@ async fn strict_replay_reads_the_receipt_and_does_not_draw_again() {
         .skill(Buys(Spend::money(12_000)))
         .build();
 
-    let live = runtime.run("commerce.buy", json!({})).await.expect("run");
+    let live = runtime
+        .run("commerce.buy", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert_eq!(live.status, RunStatus::Succeeded);
 
     let after_live = store
@@ -349,7 +352,10 @@ async fn a_run_that_cannot_draw_does_not_succeed() {
         .skill(Buys(Spend::money(90_000)))
         .build();
 
-    let outcome = runtime.run("commerce.buy", json!({})).await.expect("run");
+    let outcome = runtime
+        .run("commerce.buy", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert!(
         matches!(outcome.status, RunStatus::Failed(_)),
         "a draw over the ceiling must not read as success; got {:?}",
@@ -376,7 +382,10 @@ async fn drawing_without_a_store_refuses_rather_than_proceeding() {
         .skill(Buys(Spend::money(1)))
         .build();
 
-    let outcome = runtime.run("commerce.buy", json!({})).await.expect("run");
+    let outcome = runtime
+        .run("commerce.buy", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert!(
         matches!(outcome.status, RunStatus::Failed(_)),
         "an unwired ceiling must refuse, not wave the draw through; got {:?}",

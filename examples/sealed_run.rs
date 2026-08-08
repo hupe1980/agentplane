@@ -62,9 +62,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let out = rt
-        .run_in_case(
+        .run_correlated(
             "claim.intake",
-            json!({ "claimant": "Ada Lovelace", "iban": "GB29 NWBK 6016 1331 9268 19" }),
+            Tainted::trusted(
+                json!({ "claimant": "Ada Lovelace", "iban": "GB29 NWBK 6016 1331 9268 19" }),
+            ),
             "claim",
             &[CorrelationKey::new("claim", "CLM-42")],
         )

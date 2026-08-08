@@ -6,6 +6,7 @@
 
 #![cfg(feature = "manifest")]
 
+use agentplane::core::Tainted;
 use agentplane::manifest::{Manifest, ManifestError};
 
 const GOOD: &str = r#"
@@ -259,7 +260,10 @@ async fn each_agents_budget_bounds_only_its_own_runs() {
         }))
         .build();
 
-    let rich = rt.run("work.do", serde_json::json!({})).await.expect("run");
+    let rich = rt
+        .run("work.do", Tainted::trusted(serde_json::json!({})))
+        .await
+        .expect("run");
     assert!(
         matches!(rich.status, RunStatus::Succeeded),
         "the generous agent's run was bounded by somebody else's ceiling: {:?}",
@@ -267,7 +271,7 @@ async fn each_agents_budget_bounds_only_its_own_runs() {
     );
 
     let poor = rt
-        .run("work.cheap", serde_json::json!({}))
+        .run("work.cheap", Tainted::trusted(serde_json::json!({})))
         .await
         .expect("run");
     assert!(
@@ -467,7 +471,10 @@ async fn the_journal_records_which_declaration_governed_a_run() {
         .agent(Agent::new(&m).skill(Claims("worker", "work.do")))
         .build();
 
-    let out = rt.run("work.do", serde_json::json!({})).await.expect("run");
+    let out = rt
+        .run("work.do", Tainted::trusted(serde_json::json!({})))
+        .await
+        .expect("run");
     let records = store.read(out.run_id, 0).await.expect("read");
 
     let admitted = records
@@ -515,7 +522,10 @@ async fn a_run_with_no_declaration_records_no_governor() {
         .skill(Claims("worker", "work.do"))
         .build();
 
-    let out = rt.run("work.do", serde_json::json!({})).await.expect("run");
+    let out = rt
+        .run("work.do", Tainted::trusted(serde_json::json!({})))
+        .await
+        .expect("run");
     let records = store.read(out.run_id, 0).await.expect("read");
     let governed = records.iter().find_map(|r| match r.kind() {
         RecordKind::RunAdmitted { governed_by, .. } => Some(governed_by.clone()),
@@ -577,7 +587,9 @@ async fn admission_policy_sees_the_agent_apart_from_the_capability() {
         .agent(Agent::new(&m).skill(Claims("worker", "work.do")))
         .build();
 
-    rt.run("work.do", serde_json::json!({})).await.expect("run");
+    rt.run("work.do", Tainted::trusted(serde_json::json!({})))
+        .await
+        .expect("run");
 
     let seen = engine.0.lock().unwrap().clone();
     let (principal, resource, digest) = seen
@@ -672,7 +684,9 @@ async fn a_policy_can_bind_to_the_publisher_that_vouched_for_an_agent() {
         )
         .build();
 
-    rt.run("work.do", serde_json::json!({})).await.expect("run");
+    rt.run("work.do", Tainted::trusted(serde_json::json!({})))
+        .await
+        .expect("run");
     assert!(
         engine
             .0
@@ -693,7 +707,7 @@ async fn a_policy_can_bind_to_the_publisher_that_vouched_for_an_agent() {
         .policy(std::sync::Arc::clone(&engine2) as std::sync::Arc<dyn PolicyEngine>)
         .agent(Agent::new(&m).skill(Claims("worker", "work.do")))
         .build();
-    rt2.run("work.do", serde_json::json!({}))
+    rt2.run("work.do", Tainted::trusted(serde_json::json!({})))
         .await
         .expect("run");
     assert!(
@@ -1364,7 +1378,7 @@ async fn run_boundary(
             },
         }))
         .build()
-        .run("work.do", serde_json::json!({}))
+        .run("work.do", Tainted::trusted(serde_json::json!({})))
         .await
         .expect("run")
 }
@@ -1456,7 +1470,9 @@ async fn run_with(model: &str) -> agentplane::runtime::RunOutcome {
             capability: "work.do",
         }))
         .build();
-    rt.run("work.do", serde_json::json!({})).await.expect("run")
+    rt.run("work.do", Tainted::trusted(serde_json::json!({})))
+        .await
+        .expect("run")
 }
 
 /// A model the manifest never named is refused before it is called.
@@ -1513,7 +1529,10 @@ async fn a_manifest_refusal_is_journaled() {
         }))
         .build();
 
-    let out = rt.run("work.do", serde_json::json!({})).await.expect("run");
+    let out = rt
+        .run("work.do", Tainted::trusted(serde_json::json!({})))
+        .await
+        .expect("run");
     let records = store.read(out.run_id, 1).await.expect("read");
 
     let denial = records
@@ -1621,7 +1640,7 @@ async fn protected_tool_fields_must_match_the_live_catalogue() {
     let outcome = Runtime::builder(store)
         .agent(agentplane::runtime::Agent::new(&manifest).skill(CallsTool { catalog, client }))
         .build()
-        .run("work.do", json!({}))
+        .run("work.do", Tainted::trusted(json!({})))
         .await
         .expect("run");
 
@@ -1695,7 +1714,7 @@ async fn an_agent_defined_only_in_yaml_runs() {
     let out = rt
         .run(
             "support.summarise",
-            serde_json::json!({ "ticket": "printer on fire" }),
+            Tainted::trusted(serde_json::json!({ "ticket": "printer on fire" })),
         )
         .await
         .expect("run");
@@ -2175,7 +2194,7 @@ spec:
         .build();
 
     let out = rt
-        .run("ledger.ask", json!({ "q": "balance?" }))
+        .run("ledger.ask", Tainted::trusted(json!({ "q": "balance?" })))
         .await
         .expect("run");
     assert!(matches!(out.status, RunStatus::Succeeded));
@@ -2271,7 +2290,10 @@ spec:
         .agent(Agent::new(&manifest))
         .build();
 
-    let outcome = runtime.run("guarded.ask", json!({})).await.expect("run");
+    let outcome = runtime
+        .run("guarded.ask", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert!(matches!(outcome.status, RunStatus::Failed(_)));
     assert_eq!(
         provider.calls(),
@@ -2351,7 +2373,10 @@ spec:
         .agent(Agent::new(&m))
         .build();
 
-    let out = rt.run("loop.forever", json!({})).await.expect("run");
+    let out = rt
+        .run("loop.forever", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     match out.status {
         RunStatus::Failed(why) => assert!(
             why.contains("did not finish") && why.contains('3'),
@@ -2669,7 +2694,7 @@ spec:
         agentplane::core::Label::untrusted(agentplane::core::SourceId::new("customer-record"))
             .with_sensitivity(agentplane::core::Sensitivity::Confidential),
     );
-    let outcome = rt.run_tainted("remember.answer", input).await.unwrap();
+    let outcome = rt.run("remember.answer", input).await.unwrap();
     assert!(
         matches!(outcome.status, agentplane::runtime::RunStatus::Succeeded),
         "formation run failed: {:?}",
@@ -2792,7 +2817,10 @@ spec:
         .agent(Agent::new(&manifest))
         .build();
     let outcome = rt
-        .run("remember.answer", json!({"question": "language?"}))
+        .run(
+            "remember.answer",
+            Tainted::trusted(json!({"question": "language?"})),
+        )
         .await
         .unwrap();
     assert!(
@@ -3346,10 +3374,7 @@ async fn a_declared_instruction_survives_an_untrusted_input() {
         SourceId::new("peer:unknown"),
     );
 
-    let out = rt
-        .run_tainted("support.summarise", hostile)
-        .await
-        .expect("run");
+    let out = rt.run("support.summarise", hostile).await.expect("run");
 
     assert!(
         matches!(out.status, RunStatus::Succeeded),
@@ -3453,7 +3478,7 @@ spec:
         SourceId::new("peer:unknown"),
     );
 
-    let out = rt.run_tainted("ledger.ask", hostile).await.expect("run");
+    let out = rt.run("ledger.ask", hostile).await.expect("run");
 
     assert!(
         matches!(out.status, RunStatus::Succeeded),
@@ -3562,7 +3587,10 @@ spec:
         .agent(Agent::new(&helper).skill(Helps))
         .build();
 
-    let out = rt.run("research.do", json!({})).await.expect("run");
+    let out = rt
+        .run("research.do", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
 
     let RunStatus::Failed(why) = &out.status else {
         panic!(
@@ -3712,7 +3740,7 @@ spec:
         // `RuntimeBuilder::skill` is governed by no manifest at all.
         .agent(Agent::new(&manifest).skill(Coded))
         .build()
-        .run("billing.check", json!({}))
+        .run("billing.check", Tainted::trusted(json!({})))
         .await
         .expect("run");
 
@@ -3857,7 +3885,7 @@ spec:
     let outcome = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .agent(Agent::new(&manifest).skill(ReadsContext(Arc::clone(&calls))))
         .build()
-        .run("context.read", json!({}))
+        .run("context.read", Tainted::trusted(json!({})))
         .await
         .unwrap();
     assert!(matches!(outcome.status, RunStatus::Failed(_)));
@@ -3962,7 +3990,7 @@ async fn an_agent_is_consulted_as_a_granted_tool_and_replay_wakes_nobody() {
     let out = rt
         .run(
             "blog.report",
-            serde_json::json!({ "q": "why do printers burn?" }),
+            Tainted::trusted(serde_json::json!({ "q": "why do printers burn?" })),
         )
         .await
         .expect("run");

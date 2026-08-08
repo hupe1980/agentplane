@@ -138,7 +138,7 @@ async fn a_committed_but_lost_effect_record_is_not_performed_again() {
     ));
 
     let first = runtime(Arc::clone(&faulty) as Arc<dyn JournalStore>, &world)
-        .run_plan(plan(), json!({}))
+        .run_plan(plan(), Tainted::trusted(json!({})))
         .await;
 
     assert_replay_was_not_backstopped("live run under a lost commit", &first);
@@ -204,7 +204,7 @@ async fn a_committed_but_lost_announcement_leaves_a_resolvable_orphan() {
     ));
 
     let first = runtime(Arc::clone(&faulty) as Arc<dyn JournalStore>, &world)
-        .run_plan(plan(), json!({}))
+        .run_plan(plan(), Tainted::trusted(json!({})))
         .await;
 
     assert!(!faulty.injected().is_empty(), "no fault was delivered");
@@ -262,7 +262,7 @@ async fn a_clean_append_failure_leaves_no_trace() {
     ));
 
     let first = runtime(Arc::clone(&faulty) as Arc<dyn JournalStore>, &world)
-        .run_plan(plan(), json!({}))
+        .run_plan(plan(), Tainted::trusted(json!({})))
         .await;
 
     assert!(!faulty.injected().is_empty(), "no fault was delivered");
@@ -309,7 +309,7 @@ async fn a_fenced_append_stops_the_run_rather_than_forcing_the_write() {
     ));
 
     let out = runtime(Arc::clone(&faulty) as Arc<dyn JournalStore>, &world)
-        .run_plan(plan(), json!({}))
+        .run_plan(plan(), Tainted::trusted(json!({})))
         .await;
 
     assert!(!faulty.injected().is_empty(), "no fault was delivered");
@@ -339,7 +339,7 @@ async fn the_same_seed_injects_the_same_faults() {
             Schedule::seeded(0xDEAD_BEEF).every(3, Fault::FailedClean),
         ));
         let _ = runtime(Arc::clone(&faulty) as Arc<dyn JournalStore>, &world)
-            .run_plan(plan(), json!({}))
+            .run_plan(plan(), Tainted::trusted(json!({})))
             .await;
         runs.push(faulty.injected());
     }

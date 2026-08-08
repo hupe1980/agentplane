@@ -86,7 +86,10 @@ fn later(secs: i64) -> Timestamp {
 async fn a_sleeping_run_suspends_and_holds_nothing() {
     let f = fixture(Duration::from_hours(1));
 
-    let out = f.rt.run("demo.sleep", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
 
     match &out.status {
         RunStatus::Suspended(SuspendReason::AwaitingTime { until }) => {
@@ -117,7 +120,10 @@ async fn sleeping_without_a_timer_store_is_refused() {
         })
         .build();
 
-    let out = rt.run("demo.sleep", json!({})).await.unwrap();
+    let out = rt
+        .run("demo.sleep", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     match &out.status {
         RunStatus::Failed(m) => assert!(m.contains("timer store"), "got: {m}"),
         other => panic!("expected a loud refusal, got {other:?}"),
@@ -131,7 +137,10 @@ async fn sleeping_without_a_timer_store_is_refused() {
 async fn a_sweep_wakes_a_run_whose_instant_arrived() {
     let f = fixture(Duration::from_mins(1));
 
-    let out = f.rt.run("demo.sleep", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     assert!(out.status.is_suspended());
 
     // Nothing is due yet.
@@ -169,7 +178,10 @@ async fn a_sweep_wakes_a_run_whose_instant_arrived() {
 #[tokio::test]
 async fn a_timer_fires_exactly_once_across_two_sweeps() {
     let f = fixture(Duration::from_mins(1));
-    let out = f.rt.run("demo.sleep", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     assert!(out.status.is_suspended());
 
     let first = f.rt.fire_timers(later(120)).await.unwrap();
@@ -189,7 +201,9 @@ async fn a_timer_fires_exactly_once_across_two_sweeps() {
 #[tokio::test]
 async fn a_fired_timer_is_reported_but_is_not_an_incident() {
     let f = fixture(Duration::from_mins(1));
-    f.rt.run("demo.sleep", json!({})).await.unwrap();
+    f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
 
     let report =
         f.rt.sweep(later(120), time::Duration::hours(24))
@@ -211,7 +225,10 @@ async fn a_fired_timer_is_reported_but_is_not_an_incident() {
 #[tokio::test]
 async fn the_wake_instant_is_journaled_not_recomputed() {
     let f = fixture(Duration::from_mins(1));
-    let out = f.rt.run("demo.sleep", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
 
     let armed = f.rt.timers().unwrap().pending(10).await.unwrap();
     assert_eq!(armed.len(), 1);
@@ -245,7 +262,10 @@ async fn the_wake_instant_is_journaled_not_recomputed() {
 #[tokio::test]
 async fn a_late_sweep_records_the_due_instant_not_its_own() {
     let f = fixture(Duration::from_mins(1));
-    let out = f.rt.run("demo.sleep", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     let due = f.rt.timers().unwrap().pending(10).await.unwrap()[0].fire_at;
 
     // The sweep runs an hour late.
@@ -267,7 +287,10 @@ async fn a_late_sweep_records_the_due_instant_not_its_own() {
 #[tokio::test]
 async fn replay_reads_the_sleep_back_instead_of_sleeping_again() {
     let f = fixture(Duration::from_mins(1));
-    let first = f.rt.run("demo.sleep", json!({})).await.unwrap();
+    let first =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     f.rt.fire_timers(later(120)).await.unwrap();
     assert_eq!(f.woke.load(Ordering::SeqCst), 1);
 
@@ -285,7 +308,10 @@ async fn replay_reads_the_sleep_back_instead_of_sleeping_again() {
 #[tokio::test]
 async fn replaying_a_sleeping_run_does_not_reset_its_clock() {
     let f = fixture(Duration::from_mins(1));
-    let out = f.rt.run("demo.sleep", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     let armed = f.rt.timers().unwrap().pending(10).await.unwrap();
     let original = armed[0].fire_at;
 
@@ -477,7 +503,10 @@ async fn two_concurrent_siblings_can_both_sleep() {
             .terminal(),
     ]);
 
-    let out = rt.run_plan(plan, json!({})).await.unwrap();
+    let out = rt
+        .run_plan(plan, Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
     assert_eq!(
         store.armed_timers(out.run_id).await.unwrap(),

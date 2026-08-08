@@ -227,7 +227,7 @@ async fn a_refused_run_writes_nothing() {
         },
     );
 
-    let refused = rt.run("work", json!({})).await;
+    let refused = rt.run("work", Tainted::trusted(json!({}))).await;
     assert!(
         matches!(
             refused,
@@ -259,7 +259,10 @@ async fn a_finished_run_frees_its_slot() {
     );
 
     for _ in 0..3 {
-        let out = rt.run("work", json!({})).await.expect("run");
+        let out = rt
+            .run("work", Tainted::trusted(json!({})))
+            .await
+            .expect("run");
         assert_eq!(out.status, RunStatus::Succeeded);
     }
 
@@ -308,7 +311,10 @@ async fn replay_does_not_consult_the_quota() {
         },
     );
 
-    let out = rt.run("work", json!({})).await.expect("run");
+    let out = rt
+        .run("work", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
 
     // Fill the tenant's ceiling with something else entirely, so any quota
@@ -352,7 +358,7 @@ async fn a_quota_refusal_is_not_a_policy_denial() {
         },
     );
 
-    match rt.run("work", json!({})).await {
+    match rt.run("work", Tainted::trusted(json!({}))).await {
         Err(RuntimeError::QuotaExceeded(QuotaError::TooManyRuns { running, .. })) => {
             assert_eq!(running, 0, "the refusal must report the count it saw");
         }
@@ -386,7 +392,10 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
 
     // The positive half, first: nothing is refused before the switch is thrown.
     assert_eq!(
-        one.run("work", json!({})).await.expect("run").status,
+        one.run("work", Tainted::trusted(json!({})))
+            .await
+            .expect("run")
+            .status,
         RunStatus::Succeeded
     );
 
@@ -395,7 +404,7 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
         .expect("halt");
 
     for (which, rt) in [("the halting instance", &one), ("a second instance", &two)] {
-        match rt.run("work", json!({})).await {
+        match rt.run("work", Tainted::trusted(json!({}))).await {
             Err(agentplane::core::RuntimeError::QuotaExceeded(
                 agentplane::quota::QuotaError::Halted { tenant, reason },
             )) => {
@@ -413,14 +422,21 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
     // an incident in one customer's data stops everybody else's business too.
     let other = plane(&store, "globex", TenantQuota::default());
     assert_eq!(
-        other.run("work", json!({})).await.expect("run").status,
+        other
+            .run("work", Tainted::trusted(json!({})))
+            .await
+            .expect("run")
+            .status,
         RunStatus::Succeeded,
         "halting one tenant stopped another"
     );
 
     one.set_halt(None).await.expect("lift");
     assert_eq!(
-        two.run("work", json!({})).await.expect("run").status,
+        two.run("work", Tainted::trusted(json!({})))
+            .await
+            .expect("run")
+            .status,
         RunStatus::Succeeded,
         "work did not resume on the second instance after the halt was lifted"
     );

@@ -372,7 +372,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "strict_replay_never_asks_the_policy_engine",
         "policy is re-evaluated while replaying a recorded run",
         "            if self.mode.is_replaying() {",
-        "            self.gate(key, &descriptor, effect.mutates()).await?;\n            if self.mode.is_replaying() {",
+        "            self.gate(key, &descriptor, effect.mutates(), outbound).await?;\n            if self.mode.is_replaying() {",
     ),
     "DenialNotJournaled": (
         "src/runtime/ctx.rs",
@@ -1878,7 +1878,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         .map_err(|e| be(&e))?
         .map(|v| v.value())
     {""",
-        """    if let Some(prior) = None::<(u64, i64, u64, i64, u32)> {""",
+        # `ReceiptRow`, not the tuple spelled out: this mutation stopped
+        # compiling when money went unsigned, so the guarantee it names went
+        # unverified while `--check` still reported the anchor present. Naming
+        # the alias makes the row's shape the store's business, not this table's.
+        """    if let Some(prior) = None::<ReceiptRow> {""",
     ),
     "OnlyOneAxisOfTheCeilingIsBounded": (
         "src/authority/mod.rs",
@@ -2204,8 +2208,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "an_agent_card_is_derived_from_the_manifest",
         "the card's skills are not the declared capabilities, so a peer is told "
         "about work the plane would refuse to dispatch",
-        "            .provides\n            .iter()",
-        "            .requires\n            .iter()",
+        # This used to swap `.provides` for `.requires`, and stopped compiling
+        # when `Capabilities` lost every field but `provides` — so the guarantee
+        # went unverified while `--check` still found the anchor, which is the
+        # exact gap `--verify` exists to close. The mutation now advertises a
+        # capability the manifest never declared: same guarantee removed, and it
+        # cannot rot into a non-compiling edit again, because the field it
+        # writes is the one the test reads.
+        "                id: capability.clone(),\n                name: capability.clone(),",
+        "                id: format!(\"{capability}.undeclared\"),\n                name: capability.clone(),",
     ),
     "TheExtendedCardLeaksTheModel": (
         "src/peers/card.rs",

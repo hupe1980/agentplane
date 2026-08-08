@@ -128,7 +128,9 @@ async fn a_real_completion_replays_without_calling_openai_again() {
     let out = rt
         .run(
             "triage",
-            json!({ "text": "The printer is on fire and the office is being evacuated." }),
+            Tainted::trusted(
+                json!({ "text": "The printer is on fire and the office is being evacuated." }),
+            ),
         )
         .await
         .expect("the live run failed");
@@ -177,7 +179,10 @@ async fn openai_returns_an_answer_in_the_declared_schema() {
         .build();
 
     let out = rt
-        .run("triage", json!({ "text": "The stapler is empty." }))
+        .run(
+            "triage",
+            Tainted::trusted(json!({ "text": "The stapler is empty." })),
+        )
         .await
         .expect("the live run failed");
 
@@ -215,7 +220,7 @@ async fn a_real_completion_is_still_untrusted() {
     // The skill asserts the label on the value it received; a run that succeeds
     // is the assertion holding against a real provider's answer.
     let out = rt
-        .run("asserts", json!({ "text": "anything" }))
+        .run("asserts", Tainted::trusted(json!({ "text": "anything" })))
         .await
         .expect("the live run failed");
     assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);

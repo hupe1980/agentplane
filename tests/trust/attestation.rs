@@ -58,7 +58,10 @@ async fn signed_run(signer: Arc<Ed25519Signer>) -> (Arc<RedbStore>, Vec<Record>)
         .skill(Trivial)
         .build();
     let out = rt
-        .run_plan(agentplane::core::PlanIR::single("demo.trivial"), json!({}))
+        .run_plan(
+            agentplane::core::PlanIR::single("demo.trivial"),
+            Tainted::trusted(json!({})),
+        )
         .await
         .unwrap();
     let records = (store.clone() as Arc<dyn JournalStore>)
@@ -240,7 +243,10 @@ async fn an_unsigned_plane_is_ordinary_not_broken() {
         .skill(Trivial)
         .build();
     let out = rt
-        .run_plan(agentplane::core::PlanIR::single("demo.trivial"), json!({}))
+        .run_plan(
+            agentplane::core::PlanIR::single("demo.trivial"),
+            Tainted::trusted(json!({})),
+        )
         .await
         .unwrap();
 
@@ -319,7 +325,10 @@ async fn sealed_runs(store: &Arc<RedbStore>, n: usize) -> Vec<agentplane::core::
     let mut runs = Vec::new();
     for _ in 0..n {
         let out = rt
-            .run_plan(agentplane::core::PlanIR::single("demo.trivial"), json!({}))
+            .run_plan(
+                agentplane::core::PlanIR::single("demo.trivial"),
+                Tainted::trusted(json!({})),
+            )
             .await
             .unwrap();
         runs.push(out.run_id);
@@ -606,7 +615,10 @@ async fn an_audit_with_a_key_checks_who_wrote_it() {
         .skill(Trivial)
         .build();
     let out = rt
-        .run_plan(agentplane::core::PlanIR::single("demo.trivial"), json!({}))
+        .run_plan(
+            agentplane::core::PlanIR::single("demo.trivial"),
+            Tainted::trusted(json!({})),
+        )
         .await
         .unwrap();
     let s = store.clone() as Arc<dyn JournalStore>;
@@ -758,7 +770,10 @@ async fn the_audit_reports_who_raised_a_label_and_on_what_evidence() {
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .skill(Releases)
         .build();
-    let out = rt.run("demo.release", serde_json::json!({})).await.unwrap();
+    let out = rt
+        .run("demo.release", Tainted::trusted(serde_json::json!({})))
+        .await
+        .unwrap();
 
     let s = Arc::clone(&store) as Arc<dyn JournalStore>;
     let report =
@@ -852,7 +867,10 @@ async fn an_audit_reports_what_authorized_each_run() {
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .skill(Quiet)
         .build();
-    let out = rt.run("demo.quiet", serde_json::json!({})).await.unwrap();
+    let out = rt
+        .run("demo.quiet", Tainted::trusted(serde_json::json!({})))
+        .await
+        .unwrap();
     let s = Arc::clone(&store) as Arc<dyn JournalStore>;
     let report =
         agentplane::audit::audit(&s, &[out.run_id], &agentplane::audit::Evidence::default())
@@ -875,7 +893,10 @@ async fn an_audit_reports_what_authorized_each_run() {
         .policy(Arc::new(Permits) as Arc<dyn agentplane::core::PolicyEngine>)
         .skill(Quiet)
         .build();
-    let out = rt.run("demo.quiet", serde_json::json!({})).await.unwrap();
+    let out = rt
+        .run("demo.quiet", Tainted::trusted(serde_json::json!({})))
+        .await
+        .unwrap();
     let s = Arc::clone(&store) as Arc<dyn JournalStore>;
     let report =
         agentplane::audit::audit(&s, &[out.run_id], &agentplane::audit::Evidence::default())

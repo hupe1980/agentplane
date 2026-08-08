@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let learned = runtime
-        .run_tainted(
+        .run(
             "support.memory",
             Tainted::from_source(
                 json!({"action": "remember", "fact": "Customer prefers German"}),
@@ -126,7 +126,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let recalled = runtime
-        .run("support.memory", json!({"action": "recall"}))
+        .run(
+            "support.memory",
+            Tainted::trusted(json!({"action": "recall"})),
+        )
         .await?;
     assert_eq!(
         recalled.output.map(|o| o.peek().clone()),
@@ -163,7 +166,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
         .skill(SemanticMemory(retriever))
         .build();
-    let ranked = semantic.run("support.semantic-memory", json!({})).await?;
+    let ranked = semantic
+        .run("support.semantic-memory", Tainted::trusted(json!({})))
+        .await?;
     assert_eq!(
         ranked.output.map(|o| o.peek().clone()),
         Some(json!("Customer prefers German"))

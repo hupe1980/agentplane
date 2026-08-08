@@ -108,7 +108,10 @@ async fn a_resumed_run_continues_instead_of_restarting() {
         .build();
 
     // The run gets through stage 0, then the process dies.
-    let first = rt.run("pipeline", json!({})).await.unwrap();
+    let first = rt
+        .run("pipeline", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(matches!(first.status, RunStatus::Failed(_)));
     assert_eq!(calls[0].load(Ordering::SeqCst), 1, "stage 0 ran once");
 
@@ -152,7 +155,10 @@ async fn a_failed_run_is_findable_open_and_moves_on_resume() {
         .skill(pipeline(&crash_at, &calls))
         .build();
 
-    let first = rt.run("pipeline", json!({})).await.unwrap();
+    let first = rt
+        .run("pipeline", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(matches!(first.status, RunStatus::Failed(_)));
 
     let failed = store.runs_by_outcome("failed", 10).await.unwrap();
@@ -212,7 +218,10 @@ async fn an_unrecognised_recorded_outcome_refuses_resume() {
 
     // A real journal whose run is still open (failure does not seal), with an
     // ending appended that this build has no rule for.
-    let first = rt.run("pipeline", json!({})).await.unwrap();
+    let first = rt
+        .run("pipeline", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(matches!(first.status, RunStatus::Failed(_)));
     let run = first.run_id;
     let lease = store
@@ -254,7 +263,10 @@ async fn a_resumed_run_extends_the_existing_chain() {
         .skill(pipeline(&crash_at, &tally()))
         .build();
 
-    let first = rt.run("pipeline", json!({})).await.unwrap();
+    let first = rt
+        .run("pipeline", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     let before = store.read(first.run_id, 1).await.unwrap().len();
 
     crash_at.store(NO_CRASH, Ordering::SeqCst);
@@ -279,7 +291,10 @@ async fn resuming_is_idempotent() {
         .skill(pipeline(&crash_at, &calls))
         .build();
 
-    let first = rt.run("pipeline", json!({})).await.unwrap();
+    let first = rt
+        .run("pipeline", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     crash_at.store(NO_CRASH, Ordering::SeqCst);
     for _ in 0..4 {
         rt.replay(first.run_id, Mode::Resume).await.unwrap();
@@ -352,7 +367,10 @@ async fn resume_handles_a_crash_before_a_trailing_effect() {
         })
         .build();
 
-    let crashed = rt.run("trailer", json!({})).await.unwrap();
+    let crashed = rt
+        .run("trailer", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(matches!(crashed.status, RunStatus::Failed(_)));
     assert_eq!(calls[0].load(Ordering::SeqCst), 1);
     assert_eq!(calls[1].load(Ordering::SeqCst), 1);
@@ -405,7 +423,10 @@ async fn resume_refuses_a_journal_written_by_different_code() {
         .skill(pipeline(&crash_at, &tally()))
         .build();
 
-    let recorded = rt.run("pipeline", json!({})).await.unwrap();
+    let recorded = rt
+        .run("pipeline", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
 
     // Not a crash — a rewrite. Stage 0 now does something else entirely.
     let changed = Runtime::builder(store.clone())
@@ -589,7 +610,10 @@ async fn resuming_a_finished_run_does_not_re_execute_it() {
         .skill(pipeline(&crash_at, &calls))
         .build();
 
-    let done = rt.run("pipeline", json!({})).await.unwrap();
+    let done = rt
+        .run("pipeline", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     let records_before = store.read(done.run_id, 1).await.unwrap().len();
 
     let resumed = rt.replay(done.run_id, Mode::Resume).await.unwrap();
@@ -748,7 +772,7 @@ async fn a_long_run_keeps_its_lease() {
         })
         .build();
 
-    let running = tokio::spawn(async move { rt.run("slow", json!({})).await });
+    let running = tokio::spawn(async move { rt.run("slow", Tainted::trusted(json!({}))).await });
 
     // Wait until the skill is in flight and its lease has had time to lapse,
     // then do what a recovering instance does: try to take the run over.

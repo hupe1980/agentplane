@@ -196,9 +196,9 @@ impl Fixture {
     async fn pending_task(&self) -> String {
         let out = self
             .rt
-            .run_in_case(
+            .run_correlated(
                 "demo.refund",
-                json!({}),
+                Tainted::trusted(json!({})),
                 "dispute",
                 &[CorrelationKey::new("document", "INV-1")],
             )
@@ -444,9 +444,9 @@ async fn a_truncated_worklist_says_it_was_truncated() {
     // Three tasks, one per run — see `two_runs_of_one_plan_do_not_share_one_task`
     // in tests/tasks.rs for why that is not a given.
     for doc in ["INV-1", "INV-2", "INV-3"] {
-        f.rt.run_in_case(
+        f.rt.run_correlated(
             "demo.refund",
-            json!({}),
+            Tainted::trusted(json!({})),
             "dispute",
             &[CorrelationKey::new("document", doc)],
         )
@@ -1167,9 +1167,9 @@ async fn a_caller_cannot_read_another_tenants_run() {
 
     // A real run in acme, whose id globex will present.
     let theirs = acme_plane
-        .run_in_case(
+        .run_correlated(
             "demo.refund",
-            json!({}),
+            Tainted::trusted(json!({})),
             "dispute",
             &[CorrelationKey::new("document", "INV-7")],
         )

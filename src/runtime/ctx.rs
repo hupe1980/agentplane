@@ -3671,7 +3671,7 @@ impl Effect for Commission {
         // commissioned agent performed effects before it failed, and asserting
         // that nothing was applied would be a claim it has no basis for.
         let out = plane
-            .run_tainted(
+            .run(
                 &self.capability,
                 Tainted::with_label(self.input.clone(), self.label.clone()),
             )

@@ -136,7 +136,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = rt
         .run(
             "triage",
-            json!({ "text": "The printer is on fire and the office is being evacuated." }),
+            Tainted::trusted(
+                json!({ "text": "The printer is on fire and the office is being evacuated." }),
+            ),
         )
         .await?;
     println!("run      {} → {:?}", out.run_id, out.status);

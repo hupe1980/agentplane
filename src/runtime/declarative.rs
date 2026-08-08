@@ -589,10 +589,35 @@ impl Declarative {
                             .find(|(offered, _)| *offered == id)
                             .map(|(_, grant)| (id, *grant))
                     }) else {
-                        return Ok(Outcome::fail(format!(
-                            "plan step {index} calls '{name}', which is not granted to \
-                             this agent"
-                        )));
+                        // "Not granted" reads as a *policy* finding, and for a
+                        // hand-written plan it is usually a *spelling* one: the
+                        // grant is right there in the manifest, under the other
+                        // of this tool's two names. `wire_name` escapes `_` to
+                        // `_u`, so `tool://svc/get_gas` is `svc__get_ugas` on
+                        // the wire, and an author who writes the obvious
+                        // `svc__get_gas` goes looking in the policy for a
+                        // mistake that is in the escaping. A planner is offered
+                        // the wire names and will not hit this; a person
+                        // writing a plan in a test will.
+                        //
+                        // Both spellings are already derived here, so the hint
+                        // costs a lookup rather than a second source of truth.
+                        let near_miss = offered.iter().find_map(|(id, _)| {
+                            (id.reference() == *name
+                                || format!("{}__{}", id.server, id.tool) == *name)
+                                .then(|| (id.reference(), id.wire_name()))
+                        });
+                        return Ok(Outcome::fail(match near_miss {
+                            Some((reference, wire)) => format!(
+                                "plan step {index} calls '{name}', which is not granted to \
+                                 this agent — but '{reference}' is, and a plan step names a \
+                                 tool by its wire name: did you mean '{wire}'?"
+                            ),
+                            None => format!(
+                                "plan step {index} calls '{name}', which is not granted to \
+                                 this agent"
+                            ),
+                        }));
                     };
                     let Some(declaration) = declared.iter().find(|tool| &tool.name == name) else {
                         return Ok(Outcome::fail(format!(

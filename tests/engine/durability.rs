@@ -186,7 +186,10 @@ async fn replay_does_not_re_perform_effects() {
         })
         .build();
 
-    let first = rt.run("calls-tool", json!({})).await.unwrap();
+    let first = rt
+        .run("calls-tool", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -215,7 +218,10 @@ async fn replay_reproduces_the_recorded_output() {
         })
         .build();
 
-    let first = rt.run("calls-tool", json!({"x": 1})).await.unwrap();
+    let first = rt
+        .run("calls-tool", Tainted::trusted(json!({"x": 1})))
+        .await
+        .unwrap();
     let again = rt.replay(first.run_id, Mode::Strict).await.unwrap();
     assert_eq!(first.output, again.output);
     assert_eq!(
@@ -232,7 +238,10 @@ async fn replay_reproduces_the_recorded_output() {
 async fn the_clock_is_journaled_not_re_read() {
     let rt = Runtime::builder(store()).skill(ReadsClock).build();
 
-    let first = rt.run("reads-clock", json!({})).await.unwrap();
+    let first = rt
+        .run("reads-clock", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let again = rt.replay(first.run_id, Mode::Strict).await.unwrap();
 
@@ -247,7 +256,10 @@ async fn the_clock_is_journaled_not_re_read() {
 #[tokio::test]
 async fn effects_at_different_ordinals_are_distinct() {
     let rt = Runtime::builder(store()).skill(ReadsClock).build();
-    let out = rt.run("reads-clock", json!({})).await.unwrap();
+    let out = rt
+        .run("reads-clock", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     let records = rt.store().read(out.run_id, 1).await.unwrap();
     assert_eq!(count_kind(&records, "EffectStarted"), 2);
     assert_eq!(count_kind(&records, "EffectDone"), 2);
@@ -270,7 +282,10 @@ async fn strict_replay_rejects_a_build_that_does_more_than_the_record() {
         })
         .build();
 
-    let first = rt.run("variable", json!({})).await.unwrap();
+    let first = rt
+        .run("variable", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
 
     // Simulate shipping a change that adds a step.
@@ -298,7 +313,10 @@ async fn strict_replay_rejects_a_build_that_does_something_different() {
         })
         .build();
 
-    let first = rt.run("variable", json!({})).await.unwrap();
+    let first = rt
+        .run("variable", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
 
     // Fewer effects: the second recorded key never gets requested, and the
     // first requested key at position 1 is now a different one.
@@ -430,7 +448,10 @@ async fn a_fenced_writer_cannot_append() {
 async fn the_journal_chain_verifies() {
     let calls = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store()).skill(CallsTool { calls }).build();
-    let out = rt.run("calls-tool", json!({})).await.unwrap();
+    let out = rt
+        .run("calls-tool", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
 
     let head = rt.store().verify(out.run_id).await.unwrap();
     assert_eq!(
@@ -450,7 +471,10 @@ async fn replay_refuses_a_tampered_journal() {
     let rt = Runtime::builder(s.clone())
         .skill(CallsTool { calls })
         .build();
-    let out = rt.run("calls-tool", json!({"v": 1})).await.unwrap();
+    let out = rt
+        .run("calls-tool", Tainted::trusted(json!({"v": 1})))
+        .await
+        .unwrap();
 
     // Edit a record's bytes behind the runtime's back.
     s.tamper_for_test(out.run_id, 1, br#"{"seq":1,"tampered":true}"#.to_vec())
@@ -476,7 +500,7 @@ async fn a_sink_refuses_data_above_its_ceiling() {
         })
         .build();
 
-    let out = rt.run("sinks", json!({})).await.unwrap();
+    let out = rt.run("sinks", Tainted::trusted(json!({}))).await.unwrap();
     match out.status {
         RunStatus::Failed(msg) => assert!(msg.contains("exceeds"), "got: {msg}"),
         other => panic!("expected the ceiling to reject, got {other:?}"),
@@ -495,7 +519,7 @@ async fn untrusted_data_cannot_reach_a_mutating_sink() {
         })
         .build();
 
-    let out = rt.run("sinks", json!({})).await.unwrap();
+    let out = rt.run("sinks", Tainted::trusted(json!({}))).await.unwrap();
     match out.status {
         RunStatus::Failed(msg) => {
             assert!(msg.contains("untrusted"), "got: {msg}");
@@ -517,7 +541,7 @@ async fn untrusted_data_may_reach_a_read_only_sink() {
         })
         .build();
 
-    let out = rt.run("sinks", json!({})).await.unwrap();
+    let out = rt.run("sinks", Tainted::trusted(json!({}))).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
 }
 
@@ -555,7 +579,10 @@ async fn release_is_journaled_with_its_evidence() {
     }
 
     let rt = Runtime::builder(store()).skill(Releases).build();
-    let out = rt.run("demo.release", json!({})).await.unwrap();
+    let out = rt
+        .run("demo.release", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     let records = rt.store().read(out.run_id, 1).await.unwrap();
 
     let found = records.iter().any(|r| match r.kind() {
@@ -600,7 +627,7 @@ async fn a_failing_skill_does_not_succeed() {
     }
 
     let rt = Runtime::builder(store()).skill(Claims).build();
-    let out = rt.run("claims", json!({})).await.unwrap();
+    let out = rt.run("claims", Tainted::trusted(json!({}))).await.unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));
 }
 
@@ -608,7 +635,10 @@ async fn a_failing_skill_does_not_succeed() {
 #[tokio::test]
 async fn an_unknown_target_is_refused_before_anything_happens() {
     let rt = Runtime::builder(store()).build();
-    let err = rt.run("nonexistent", json!({})).await.unwrap_err();
+    let err = rt
+        .run("nonexistent", Tainted::trusted(json!({})))
+        .await
+        .unwrap_err();
     assert!(matches!(
         err,
         agentplane::core::RuntimeError::NoProvider { .. }
@@ -625,7 +655,10 @@ async fn skills_resolve_by_capability() {
             calls: Arc::clone(&calls),
         })
         .build();
-    let out = rt.run("demo.call", json!({})).await.unwrap();
+    let out = rt
+        .run("demo.call", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -682,7 +715,10 @@ async fn strict_replay_writes_nothing() {
 
     let s = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(s.clone()).skill(Releases).build();
-    let out = rt.run("demo.release", json!({})).await.unwrap();
+    let out = rt
+        .run("demo.release", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
 
     let before = s.read(out.run_id, 1).await.unwrap();
     for _ in 0..3 {
@@ -726,7 +762,10 @@ async fn notes_are_journaled_next_to_their_effects() {
     }
 
     let rt = Runtime::builder(store()).skill(Explains).build();
-    let out = rt.run("explains", json!({})).await.unwrap();
+    let out = rt
+        .run("explains", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     let records = rt.store().read(out.run_id, 1).await.unwrap();
 
     let note_at = records

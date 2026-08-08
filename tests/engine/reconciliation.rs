@@ -176,7 +176,10 @@ fn reconciliations(records: &[agentplane::journal::Record]) -> Vec<Disposition> 
 async fn a_probe_that_finds_it_landed_completes_the_effect_without_repeating_it() {
     let f = fixture(Probe::SaysItLanded);
 
-    let out = f.rt.run("demo.pay", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.pay", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(f.calls.load(Ordering::SeqCst), 1, "sent exactly once");
     assert_eq!(f.probes.load(Ordering::SeqCst), 1, "and asked once");
@@ -201,7 +204,10 @@ async fn a_probe_that_finds_it_never_landed_permits_a_retry() {
         .skill(Pay(effect))
         .build();
 
-    let out = rt.run("demo.pay", json!({})).await.unwrap();
+    let out = rt
+        .run("demo.pay", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert_eq!(
         calls.load(Ordering::SeqCst),
         2,
@@ -227,7 +233,10 @@ async fn a_probe_that_finds_it_never_landed_permits_a_retry() {
 async fn a_probe_that_cannot_tell_still_escalates() {
     let f = fixture(Probe::CannotTell);
 
-    let out = f.rt.run("demo.pay", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.pay", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1, "never sent twice");
     assert_eq!(f.probes.load(Ordering::SeqCst), 1);
     match &out.status {
@@ -244,7 +253,10 @@ async fn a_probe_that_cannot_tell_still_escalates() {
 async fn an_unreachable_probe_escalates_rather_than_assuming() {
     let f = fixture(Probe::Unreachable);
 
-    let out = f.rt.run("demo.pay", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.pay", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     assert!(matches!(out.status, RunStatus::Quarantined(_)));
 }
@@ -265,7 +277,10 @@ async fn the_verdict_is_journaled_even_when_it_resolves_nothing() {
         (Probe::Unreachable, Disposition::InDoubt),
     ] {
         let f = fixture(probe);
-        let out = f.rt.run("demo.pay", json!({})).await.unwrap();
+        let out =
+            f.rt.run("demo.pay", Tainted::trusted(json!({})))
+                .await
+                .unwrap();
         let records = f.store.read(out.run_id, 1).await.unwrap();
         assert_eq!(
             reconciliations(&records).first(),
@@ -280,7 +295,10 @@ async fn the_verdict_is_journaled_even_when_it_resolves_nothing() {
 #[tokio::test]
 async fn a_failed_probe_records_why() {
     let f = fixture(Probe::Unreachable);
-    let out = f.rt.run("demo.pay", json!({})).await.unwrap();
+    let out =
+        f.rt.run("demo.pay", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     let records = f.store.read(out.run_id, 1).await.unwrap();
 
     let detail = records.iter().find_map(|r| match r.kind() {
@@ -301,7 +319,10 @@ async fn a_failed_probe_records_why() {
 async fn replay_reads_the_verdict_back_instead_of_probing_again() {
     let f = fixture(Probe::SaysItLanded);
 
-    let first = f.rt.run("demo.pay", json!({})).await.unwrap();
+    let first =
+        f.rt.run("demo.pay", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
     assert_eq!(f.probes.load(Ordering::SeqCst), 1);
 

@@ -114,9 +114,14 @@ async fn a_run_awaiting_a_human_suspends_and_queues_a_task() {
     let f = fixture(ProposesRefund::new(OnExpiry::Deny));
 
     let out =
-        f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-1")])
-            .await
-            .unwrap();
+        f.rt.run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-1")],
+        )
+        .await
+        .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
 
     let queue = f.store.queue(&officer(), 10).await.unwrap();
@@ -138,9 +143,14 @@ async fn a_run_awaiting_a_human_suspends_and_queues_a_task() {
 #[tokio::test]
 async fn a_task_carries_what_a_reviewer_needs_to_disagree() {
     let f = fixture(ProposesRefund::new(OnExpiry::Deny));
-    f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-2")])
-        .await
-        .unwrap();
+    f.rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-2")],
+    )
+    .await
+    .unwrap();
 
     let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
     let j = &task.justification;
@@ -169,9 +179,14 @@ async fn a_task_carries_what_a_reviewer_needs_to_disagree() {
 async fn a_decision_resumes_the_run_and_names_the_decider() {
     let f = fixture(ProposesRefund::new(OnExpiry::Deny));
     let out =
-        f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-3")])
-            .await
-            .unwrap();
+        f.rt.run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-3")],
+        )
+        .await
+        .unwrap();
 
     let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
     f.rt.decide_task(
@@ -204,9 +219,14 @@ async fn the_proposer_may_not_approve_their_own_proposal() {
     skill.exclude = Some("alice");
     let f = fixture(skill);
 
-    f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-4")])
-        .await
-        .unwrap();
+    f.rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-4")],
+    )
+    .await
+    .unwrap();
     let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
 
     let err =
@@ -236,9 +256,14 @@ async fn the_proposer_may_not_approve_their_own_proposal() {
 #[tokio::test]
 async fn a_reviewer_without_the_role_is_refused() {
     let f = fixture(ProposesRefund::new(OnExpiry::Deny));
-    f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-5")])
-        .await
-        .unwrap();
+    f.rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-5")],
+    )
+    .await
+    .unwrap();
     let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
 
     let err =
@@ -256,9 +281,14 @@ async fn a_reviewer_without_the_role_is_refused() {
 #[tokio::test]
 async fn a_task_is_claimed_by_exactly_one_reviewer() {
     let f = fixture(ProposesRefund::new(OnExpiry::Deny));
-    f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-6")])
-        .await
-        .unwrap();
+    f.rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-6")],
+    )
+    .await
+    .unwrap();
     let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
 
     f.store.claim(task.id, "alice", &officer()).await.unwrap();
@@ -274,9 +304,14 @@ async fn a_task_is_claimed_by_exactly_one_reviewer() {
 #[tokio::test]
 async fn the_queue_respects_roles() {
     let f = fixture(ProposesRefund::new(OnExpiry::Deny));
-    f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-7")])
-        .await
-        .unwrap();
+    f.rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-7")],
+    )
+    .await
+    .unwrap();
 
     assert_eq!(f.store.queue(&officer(), 10).await.unwrap().len(), 1);
     assert!(
@@ -309,13 +344,23 @@ async fn two_runs_of_one_plan_do_not_share_one_task() {
     let f = fixture(ProposesRefund::new(OnExpiry::Deny));
 
     let a =
-        f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-8")])
-            .await
-            .unwrap();
+        f.rt.run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-8")],
+        )
+        .await
+        .unwrap();
     let b =
-        f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-9")])
-            .await
-            .unwrap();
+        f.rt.run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-9")],
+        )
+        .await
+        .unwrap();
     assert!(a.status.is_suspended());
     assert!(b.status.is_suspended());
 
@@ -355,9 +400,14 @@ async fn two_runs_of_one_plan_do_not_share_one_task() {
 async fn an_unanswered_task_denies_by_default() {
     let f = fixture(ProposesRefund::new(OnExpiry::Deny));
     let out =
-        f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-8")])
-            .await
-            .unwrap();
+        f.rt.run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-8")],
+        )
+        .await
+        .unwrap();
     assert!(out.status.is_suspended());
 
     // Long after the window closed.
@@ -386,9 +436,14 @@ async fn proceeding_unattended_requires_explicit_consent() {
     // `OnExpiry::Proceed` without `allow_unattended()`.
     let f = fixture(ProposesRefund::new(OnExpiry::Proceed));
     let out =
-        f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-9")])
-            .await
-            .unwrap();
+        f.rt.run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-9")],
+        )
+        .await
+        .unwrap();
 
     match out.status {
         RunStatus::Failed(msg) => assert!(
@@ -407,9 +462,14 @@ async fn a_pre_authorised_task_proceeds_unattended() {
     let f = fixture(skill);
 
     let out =
-        f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-10")])
-            .await
-            .unwrap();
+        f.rt.run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-10")],
+        )
+        .await
+        .unwrap();
     assert!(out.status.is_suspended());
 
     let later = Timestamp::now_utc() + time::Duration::days(30);
@@ -429,9 +489,14 @@ async fn a_pre_authorised_task_proceeds_unattended() {
 #[tokio::test]
 async fn an_escalating_task_is_escalated_once() {
     let f = fixture(ProposesRefund::new(OnExpiry::Escalate));
-    f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-11")])
-        .await
-        .unwrap();
+    f.rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-11")],
+    )
+    .await
+    .unwrap();
 
     let later = Timestamp::now_utc() + time::Duration::days(30);
     let first = f.rt.sweep(later, time::Duration::days(365)).await.unwrap();
@@ -482,9 +547,14 @@ async fn a_breached_obligation_escalates_the_case() {
         .skill(JustObliges)
         .build();
 
-    rt.run_in_case("demo.obliges", json!({}), "matter", &[key("INV-12")])
-        .await
-        .unwrap();
+    rt.run_correlated(
+        "demo.obliges",
+        Tainted::trusted(json!({})),
+        "matter",
+        &[key("INV-12")],
+    )
+    .await
+    .unwrap();
 
     let case_id = store.correlate(&[key("INV-12")]).await.unwrap().unwrap();
     assert_eq!(
@@ -550,9 +620,14 @@ async fn a_met_obligation_is_not_breached() {
         .skill(MeetsIt)
         .build();
 
-    rt.run_in_case("demo.meets", json!({}), "matter", &[key("INV-13")])
-        .await
-        .unwrap();
+    rt.run_correlated(
+        "demo.meets",
+        Tainted::trusted(json!({})),
+        "matter",
+        &[key("INV-13")],
+    )
+    .await
+    .unwrap();
 
     let report = rt
         .sweep(
@@ -588,7 +663,12 @@ async fn tasks_without_a_task_store_are_refused() {
         .build();
 
     let out = rt
-        .run_in_case("demo.refund", json!({}), "dispute", &[key("INV-14")])
+        .run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-14")],
+        )
         .await
         .unwrap();
     match out.status {
@@ -601,9 +681,14 @@ async fn tasks_without_a_task_store_are_refused() {
 #[tokio::test]
 async fn a_resubmitted_decision_is_a_duplicate() {
     let f = fixture(ProposesRefund::new(OnExpiry::Deny));
-    f.rt.run_in_case("demo.refund", json!({}), "dispute", &[key("INV-15")])
-        .await
-        .unwrap();
+    f.rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-15")],
+    )
+    .await
+    .unwrap();
     let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
 
     let d = Decision::approve("alice", "ok");
@@ -680,9 +765,9 @@ async fn a_refused_answer_is_not_written_into_memory() {
         .agent(Agent::new(&manifest))
         .build();
 
-    rt.run_in_case(
+    rt.run_correlated(
         "overseen.answer",
-        json!({ "q": "x" }),
+        Tainted::trusted(json!({ "q": "x" })),
         "review",
         &[key("doc-1")],
     )
@@ -775,9 +860,9 @@ async fn a_tool_calling_agent_still_asks_a_human() {
         .toolbox(ToolBox::new().with::<ReadBalance>())
         .build();
 
-    rt.run_in_case(
+    rt.run_correlated(
         "overseen.answer",
-        json!({ "q": "AC-1?" }),
+        Tainted::trusted(json!({ "q": "AC-1?" })),
         "review",
         &[key("doc-2")],
     )
@@ -831,7 +916,12 @@ async fn a_cancelled_obligation_no_longer_blocks_closing_the_case() {
         .build();
 
     let out = rt
-        .run_in_case("demo.withdraw", json!({}), "dispute", &[key("INV-9")])
+        .run_correlated(
+            "demo.withdraw",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-9")],
+        )
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -954,9 +1044,9 @@ spec:
         .toolbox(ToolBox::new().with::<Transfer>())
         .build();
 
-    rt.run_in_case(
+    rt.run_correlated(
         "desk.pay",
-        json!({ "q": "pay AC-9" }),
+        Tainted::trusted(json!({ "q": "pay AC-9" })),
         "payment",
         &[key("PAY-1")],
     )
@@ -1094,9 +1184,9 @@ spec:
         .toolbox(ToolBox::new().with::<Payout>())
         .build();
 
-    rt.run_in_case(
+    rt.run_correlated(
         "desk.pay",
-        json!({ "payee": "treasury@example.com" }),
+        Tainted::trusted(json!({ "payee": "treasury@example.com" })),
         "payment",
         &[key("PAY-2")],
     )
@@ -1185,7 +1275,12 @@ async fn a_deadline_transition_records_the_state_that_deadline_moved_from() {
         .build();
 
     let out = rt
-        .run_in_case("demo.windows", json!({}), "windows", &[key("W-1")])
+        .run_correlated(
+            "demo.windows",
+            Tainted::trusted(json!({})),
+            "windows",
+            &[key("W-1")],
+        )
         .await
         .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -1271,9 +1366,14 @@ async fn a_task_proposal_is_sealed_in_the_worklist() {
         .skill(ProposesRefund::new(OnExpiry::Deny))
         .build();
 
-    rt.run_in_case("demo.refund", json!({}), "dispute", &[key("SEAL-1")])
-        .await
-        .unwrap();
+    rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("SEAL-1")],
+    )
+    .await
+    .unwrap();
 
     // Through the wrapper: the reviewer sees the real proposal.
     let queued = sealed.queue(&officer(), 10).await.unwrap();

@@ -335,6 +335,22 @@ pub struct SemanticHit {
 }
 
 /// Derived semantic index, never durable memory truth.
+///
+/// # A static reference corpus is in scope, as memory items
+///
+/// Worth stating because the answer is narrower than "a vector-database seam"
+/// suggests, and an evaluator reached for a bespoke retrieval tool before
+/// finding this. A hit is a [`Selected`] — an id, a version and a content
+/// digest — so what comes back is always a **memory item**, and the index is
+/// derived from `MemoryStore`, which stays the durable truth.
+///
+/// Operator-ingested regulatory or reference material is therefore a first-class
+/// use, written once as memory items in a scope nothing else writes to. It is
+/// not *an agent's* learned memory, and it does not have to be: `memory_formation`
+/// governs what a model may add, retention is optional, and a corpus with no
+/// expiry simply never expires. What this seam cannot do is return documents
+/// that are not memory items — an external corpus has to be ingested rather than
+/// federated, so that a replay can re-materialise the exact versions a run read.
 #[async_trait]
 pub trait SemanticRetriever: Send + Sync + Debug {
     /// Stable non-secret implementation configuration for effect identity.

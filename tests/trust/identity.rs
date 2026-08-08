@@ -319,7 +319,7 @@ async fn a_plan_outside_the_chain_s_authority_never_starts() {
         .unwrap();
 
     let err = runtime(&store, &world, Some(chain))
-        .run_plan(plan("billing.transfer"), json!({}))
+        .run_plan(plan("billing.transfer"), Tainted::trusted(json!({})))
         .await
         .expect_err("out of scope");
 
@@ -342,7 +342,7 @@ async fn a_plan_within_authority_runs() {
         .unwrap();
 
     let out = runtime(&store, &world, Some(chain))
-        .run_plan(plan("audit.check"), json!({}))
+        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -362,7 +362,7 @@ async fn the_chain_is_journaled_at_admission() {
         .unwrap();
 
     let out = runtime(&store, &world, Some(chain))
-        .run_plan(plan("audit.check"), json!({}))
+        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -388,7 +388,7 @@ async fn a_run_with_no_chain_records_none() {
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, None)
-        .run_plan(plan("audit.check"), json!({}))
+        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -416,7 +416,7 @@ async fn replay_uses_the_recorded_chain_not_the_configured_one() {
         .unwrap();
 
     let out = runtime(&store, &world, Some(chain))
-        .run_plan(plan("audit.check"), json!({}))
+        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
         .await
         .unwrap();
 
@@ -478,7 +478,7 @@ async fn the_policy_request_carries_the_owner_and_the_depth() {
             world: Arc::clone(&world),
         })
         .build()
-        .run_plan(plan("audit.check"), json!({}))
+        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
         .await
         .unwrap();
 

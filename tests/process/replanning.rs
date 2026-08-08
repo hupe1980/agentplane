@@ -163,7 +163,10 @@ fn planner() -> Fallback {
 async fn a_run_can_change_its_plan_and_finish_on_the_new_one() {
     let f = fixture(planner(), false, Budget::default().replans(2));
 
-    let out = f.rt.run_plan(plan(), json!({})).await.unwrap();
+    let out =
+        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(
         f.replans.load(Ordering::SeqCst),
@@ -182,7 +185,10 @@ async fn a_run_can_change_its_plan_and_finish_on_the_new_one() {
 #[tokio::test]
 async fn both_plan_versions_are_journaled_and_the_successor_names_its_parent() {
     let f = fixture(planner(), false, Budget::default().replans(2));
-    let out = f.rt.run_plan(plan(), json!({})).await.unwrap();
+    let out =
+        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
 
     let plans: Vec<PlanIR> = f
         .store
@@ -247,7 +253,7 @@ async fn replanning_is_refused_once_untrusted_data_is_in_working_memory() {
             .terminal(),
     ]);
 
-    let out = rt.run_plan(p, json!({})).await.unwrap();
+    let out = rt.run_plan(p, Tainted::trusted(json!({}))).await.unwrap();
     match &out.status {
         RunStatus::Failed(m) => {
             assert!(m.contains("untrusted"), "the refusal must say why: {m}");
@@ -318,7 +324,10 @@ async fn the_replan_budget_bounds_thrashing() {
         .skill(Never)
         .build();
 
-    let out = rt.run_plan(plan(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(plan(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     match &out.status {
         RunStatus::Exhausted(e) => assert!(e.to_string().contains("replan"), "got: {e}"),
         other => panic!("expected the ceiling to stop it, got {other:?}"),
@@ -336,7 +345,10 @@ async fn asking_to_replan_without_a_planner_names_the_missing_piece() {
         })
         .build();
 
-    let out = rt.run_plan(plan(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(plan(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     match &out.status {
         RunStatus::Failed(m) => assert!(m.contains(".replanner("), "got: {m}"),
         other => panic!("expected a named refusal, got {other:?}"),
@@ -356,7 +368,10 @@ async fn a_planner_that_declines_stops_the_run_with_its_reason() {
         Budget::default().replans(2),
     );
 
-    let out = f.rt.run_plan(plan(), json!({})).await.unwrap();
+    let out =
+        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     match &out.status {
         RunStatus::Failed(m) => assert!(m.contains("no other provider"), "got: {m}"),
         other => panic!("expected the planner's reason to survive, got {other:?}"),
@@ -377,7 +392,10 @@ async fn a_successor_without_lineage_is_rejected() {
         Budget::default().replans(2),
     );
 
-    let out = f.rt.run_plan(plan(), json!({})).await.unwrap();
+    let out =
+        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     match &out.status {
         RunStatus::Failed(m) => assert!(m.contains("predecessor"), "got: {m}"),
         other => panic!("expected rejection, got {other:?}"),
@@ -395,7 +413,10 @@ async fn a_successor_without_lineage_is_rejected() {
 async fn replay_reads_the_successor_back_instead_of_asking_again() {
     let f = fixture(planner(), false, Budget::default().replans(2));
 
-    let first = f.rt.run_plan(plan(), json!({})).await.unwrap();
+    let first =
+        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
     assert_eq!(f.replans.load(Ordering::SeqCst), 1);
 
@@ -633,7 +654,10 @@ mod unwinding {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let rt = runtime(Arc::new(Swaps), &log);
 
-        let out = rt.run_plan(v1(), json!({})).await.unwrap();
+        let out = rt
+            .run_plan(v1(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
         match &out.status {
             RunStatus::Failed(m) => {
                 assert!(m.contains("reuses step"), "got: {m}");
@@ -663,7 +687,10 @@ mod unwinding {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let rt = runtime(Arc::new(Extends), &log);
 
-        let out = rt.run_plan(v1(), json!({})).await.unwrap();
+        let out = rt
+            .run_plan(v1(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
         assert!(
             matches!(out.status, RunStatus::Failed(_)),
             "got {:?}",
@@ -690,7 +717,10 @@ mod unwinding {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let rt = runtime(Arc::new(Drops), &log);
 
-        let out = rt.run_plan(v1(), json!({})).await.unwrap();
+        let out = rt
+            .run_plan(v1(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
         assert!(
             matches!(out.status, RunStatus::Failed(_)),
             "got {:?}",

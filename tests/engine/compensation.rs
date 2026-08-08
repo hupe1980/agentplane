@@ -213,7 +213,10 @@ async fn a_failing_step_unwinds_the_completed_ones_in_reverse() {
         ],
     );
 
-    let out = rt.run_plan(chain(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(
         matches!(out.status, RunStatus::Failed(_)),
         "got {:?}",
@@ -241,7 +244,10 @@ async fn compensating_effects_are_journaled_in_their_own_phase() {
         ],
     );
 
-    let out = rt.run_plan(chain(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     let records = store.read(out.run_id, 1).await.unwrap();
 
     let compensating = records
@@ -280,7 +286,10 @@ async fn compensation_effects_do_not_collide_with_forward_ones() {
         ],
     );
 
-    let out = rt.run_plan(chain(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     let records = store.read(out.run_id, 1).await.unwrap();
 
     let mut keys: Vec<String> = records
@@ -310,7 +319,10 @@ async fn a_pivot_stops_the_unwind() {
         ],
     );
 
-    let out = rt.run_plan(chain(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));
     assert_eq!(
         entries(&l),
@@ -334,7 +346,10 @@ async fn an_unnecessary_declaration_is_skipped_without_stopping_the_unwind() {
         ],
     );
 
-    let out = rt.run_plan(chain(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));
     assert_eq!(entries(&l), vec!["do:a", "do:b", "do:c", "undo:a"]);
 }
@@ -358,7 +373,10 @@ async fn an_undeclared_step_that_changed_nothing_needs_no_compensation() {
         ],
     );
 
-    let out = rt.run_plan(chain(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(
         matches!(out.status, RunStatus::Failed(_)),
         "got {:?}",
@@ -383,7 +401,10 @@ async fn an_undeclared_step_that_changed_something_escalates() {
         ],
     );
 
-    let out = rt.run_plan(chain(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     match &out.status {
         RunStatus::Quarantined(m) => assert!(
             m.contains("declares no compensation"),
@@ -415,7 +436,10 @@ async fn a_failed_compensation_quarantines_and_names_the_step() {
         ],
     );
 
-    let out = rt.run_plan(chain(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     match &out.status {
         RunStatus::Quarantined(m) => {
             assert!(m.contains("compensation failed for step s1"), "got: {m}");
@@ -488,7 +512,10 @@ async fn a_quarantined_run_is_never_unwound() {
         .skill(Undecidable(Arc::clone(&l)))
         .build();
 
-    let out = rt.run_plan(chain(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(
         matches!(out.status, RunStatus::Quarantined(_)),
         "got {:?}",
@@ -520,7 +547,10 @@ async fn an_exhausted_run_still_unwinds() {
         .skill(Step::new("c", &l))
         .build();
 
-    let out = rt.run_plan(chain(), json!({})).await.unwrap();
+    let out = rt
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(
         matches!(out.status, RunStatus::Exhausted(_)),
         "got {:?}",
@@ -549,7 +579,10 @@ async fn replay_reproduces_an_unwind_without_repeating_it() {
         ],
     );
 
-    let first = rt.run_plan(chain(), json!({})).await.unwrap();
+    let first = rt
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     let during = entries(&l);
     assert_eq!(during, vec!["do:a", "do:b", "do:c", "undo:b", "undo:a"]);
 
@@ -649,7 +682,12 @@ async fn a_compensation_may_wait_for_a_human_and_the_unwind_resumes() {
 
     let key = CorrelationKey::new("matter", "M-1");
     let out = rt
-        .run_plan_in_case(chain(), json!({}), "matter", std::slice::from_ref(&key))
+        .run_plan_correlated(
+            chain(),
+            Tainted::trusted(json!({})),
+            "matter",
+            std::slice::from_ref(&key),
+        )
         .await
         .unwrap();
 
@@ -748,7 +786,10 @@ async fn a_succeeding_sibling_is_compensated_when_its_neighbour_fails() {
             .terminal(),
     ]);
 
-    let out = rt.run_plan(plan, json!({})).await.unwrap();
+    let out = rt
+        .run_plan(plan, Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(
         matches!(out.status, RunStatus::Failed(_)),
         "got {:?}",
@@ -829,9 +870,9 @@ async fn a_failure_beats_a_siblings_suspension() {
     ]);
 
     let out = rt
-        .run_plan_in_case(
+        .run_plan_correlated(
             plan,
-            json!({}),
+            Tainted::trusted(json!({})),
             "matter",
             &[CorrelationKey::new("matter", "M-9")],
         )
