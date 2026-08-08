@@ -4301,3 +4301,78 @@ async fn a_room_of_agent_grants_still_builds_without_a_toolbox() {
         .try_build()
         .expect("a room of agent grants needs no toolbox");
 }
+
+/// **A quarantined model nothing can select is refused.**
+///
+/// Exactly two things point a model at untrusted-derived content on their own: a
+/// plan's `parse` steps, and memory formation. A `tool-calling` or `completion`
+/// agent with neither sends every call to the privileged model — so a declared
+/// `quarantined` role reads as dual-model isolation while one model does all the
+/// work, which is a declared control governing nothing.
+///
+/// Found in a real manifest: a `tool-calling` billing agent declaring
+/// `privileged: sonnet` beside `quarantined: haiku`, where the haiku model was
+/// never called.
+#[test]
+fn a_quarantined_model_nothing_selects_is_refused() {
+    let inert = r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: billing, version: '1.0.0' }
+spec:
+  execution: { kind: tool-calling, max_turns: 15 }
+  identity: { role: 'Resolve disputes', constraints: 'Be brief.' }
+  capabilities: { provides: [billing] }
+  models:
+    privileged:  { provider: anthropic, model: claude-sonnet-5 }
+    quarantined: { provider: anthropic, model: claude-haiku-4-5 }
+  budgets: {}
+";
+    match Manifest::parse(inert) {
+        Err(ManifestError::Unenforceable { field, detail }) => {
+            assert_eq!(field, "spec.models.quarantined");
+            assert!(
+                detail.contains("planned") && detail.contains("memory_formation"),
+                "the refusal does not name the two ways to make it live: {detail}"
+            );
+        }
+        other => panic!("an inert quarantined model was accepted: {other:?}"),
+    }
+}
+
+/// The three shapes where it *is* live still parse.
+///
+/// Without this, refusing every `quarantined` declaration would satisfy the test
+/// above perfectly while breaking the dual-model pattern the role exists for.
+#[test]
+fn a_quarantined_model_something_selects_still_parses() {
+    let head = r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: billing, version: '1.0.0' }
+spec:
+  identity: { role: 'Resolve disputes', constraints: 'Be brief.' }
+  capabilities: { provides: [billing] }
+  models:
+    privileged:  { provider: anthropic, model: claude-sonnet-5 }
+    quarantined: { provider: anthropic, model: claude-haiku-4-5 }
+  budgets: {}
+";
+    // `planned` — its `parse` steps run on the quarantined role.
+    Manifest::parse(&format!(
+        "{head}  execution: {{ kind: planned, max_turns: 5 }}\n"
+    ))
+    .expect("planned selects the quarantined role through its parse steps");
+
+    // `tool-calling` **with** formation — the extraction runs on it.
+    Manifest::parse(&format!(
+        "{head}  execution: {{ kind: tool-calling, max_turns: 5 }}\n  \
+         memory_formation:\n    subject: team/billing\n    purpose: learned\n    \
+         instruction: Extract stable facts only.\n    max_items: 2\n"
+    ))
+    .expect("memory formation selects the quarantined role");
+
+    // A coded agent: no `execution`, so the roles are a reviewed allowlist its
+    // own skill chooses from rather than something a tier selects.
+    Manifest::parse(head).expect("a coded agent may declare both roles");
+}

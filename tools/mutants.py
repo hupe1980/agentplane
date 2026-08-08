@@ -765,6 +765,16 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "            decidable_by_you: true,",
     ),
     # ── Attestation ─────────────────────────────────────────────────────────
+    "AnAuditNeverSaysWhatAuthorized": (
+        "src/audit.rs",
+        "an_audit_reports_what_authorized_each_run",
+        "the offline audit reports history as sound without ever saying what "
+        "warranted it, so a run that executed with no policy engine configured "
+        "at all verifies exactly as soundly as a governed one and an auditor "
+        "reading `sound` concludes it was governed",
+        "        warrants.extend(warrant_in(run, &records));",
+        "        let _ = warrant_in;",
+    ),
     "AnAuditHidesWhatItSkipped": (
         "src/audit.rs",
         "an_audit_reports_what_it_could_not_look_at",
@@ -1451,6 +1461,51 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
 
     # ── Wire drivers ────────────────────────────────────────────────────────
+    "ATruncatedVectorStaysUnnormalised": (
+        "src/model/embeddings.rs",
+        "gemini_embeds_a_query_and_renormalises_a_truncated_vector",
+        "a Matryoshka-truncated vector is returned without re-normalising, so "
+        "cosine against a normalised index is scaled by whatever magnitude "
+        "survived the truncation and every score is quietly biased",
+        "        if self.dimensions.is_some() {\n            let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();",
+        "        if false {\n            let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();",
+    ),
+    "AQueryIsEmbeddedAsADocument": (
+        "src/model/embeddings.rs",
+        "gemini_embeds_a_query_and_renormalises_a_truncated_vector",
+        "the query is embedded under the document task type, which an "
+        "asymmetric model ranks badly and no reply reports",
+        '            "taskType": "RETRIEVAL_QUERY",',
+        '            "taskType": "RETRIEVAL_DOCUMENT",',
+    ),
+    "AnAsymmetryHintNeverLeaves": (
+        "src/model/embeddings.rs",
+        "an_input_type_reaches_the_wire_and_the_revision",
+        "the declared input type never reaches the wire, so an asymmetric model "
+        "embeds a query symmetrically — right shape, worse ranking, nothing in "
+        "the reply saying so",
+        '            body["input_type"] = serde_json::json!(input_type);',
+        "            let _ = input_type;",
+    ),
+    "AnEmbedderTakesWhateverCameBack": (
+        "src/model/embeddings.rs",
+        "an_embedder_refuses_an_answer_that_is_not_one_vector",
+        "the embedder takes the first vector of however many came back, so a "
+        "server answering with several ranks a query against a vector produced "
+        "for somebody else's input — and the effect key records it as this "
+        "query's",
+        "        let [datum] = reply.data.as_slice() else {",
+        "        let [datum, ..] = reply.data.as_slice() else {",
+    ),
+    "AnEmbedderRevisionForgetsItsWidth": (
+        "src/model/embeddings.rs",
+        "an_embedder_sends_the_wire_and_names_its_revision",
+        "the embedding revision names the model but not the dimension count, so "
+        "vectors of two widths share one effect identity and a replay reads one "
+        "as the other",
+        '            let _ = write!(revision, "@{d}");',
+        "            let _ = d;",
+    ),
     "AnyProviderAnswerSatisfiesItsSchema": (
         "src/model/mod.rs",
         "a_provider_answer_that_defies_its_schema_is_a_metered_failure",
@@ -2063,6 +2118,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        run.to_string()",
     ),
     # ── Tool declarations ───────────────────────────────────────────────────
+    "AnInertQuarantinedModelParses": (
+        "src/manifest/mod.rs",
+        "a_quarantined_model_nothing_selects_is_refused",
+        "a quarantined model nothing in the declaration can select is accepted, "
+        "so a tool-calling agent reads as dual-model isolation while every call "
+        "goes to the privileged model — a declared control governing nothing",
+        "            if !selectable {",
+        "            if false {",
+    ),
     "AForcedSchemaSilentlyEatsTheTools": (
         "src/model/anthropic.rs",
         "a_forced_schema_and_declared_tools_are_refused_together",
@@ -3128,7 +3192,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     "AStreamNeverClosesOnAFinishedTask": (
         "src/api/a2a_stream.rs",
-        "subscribing_to_a_finished_task_is_unsupported",
+        "a_stream_on_an_already_finished_task_ends",
         "a stream opened on an already-finished task polls forever: the record "
         "that ended the run was consumed before the subscriber existed, so the "
         "loop never sees it — which is every client reconnecting after a drop",

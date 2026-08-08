@@ -791,3 +791,104 @@ async fn the_audit_reports_who_raised_a_label_and_on_what_evidence() {
         report.findings
     );
 }
+
+// ── The warrant, not only the letter ────────────────────────────────────────
+
+/// **An audit says what authorized a run, including "nothing did".**
+///
+/// Chains, signatures and inclusion proofs all answer *is this history intact*.
+/// A run that executed with **no policy engine configured at all** answers that
+/// question exactly as well as a governed one — same chain, same signatures,
+/// same leaf — so an auditor reading `sound` would conclude a run was governed
+/// when the deployment had no gate wired at all. *Was policy switched on for
+/// this run* is a question the journal answers and the report did not surface.
+///
+/// The mirror of the argument the `releases` field already makes: verifying the
+/// envelope is not verifying the letter, and verifying the letter is not
+/// verifying the warrant.
+///
+/// Both halves are asserted, because a `warrants` list that reported `None`
+/// unconditionally would satisfy the ungoverned case perfectly and tell an
+/// auditor of a governed plane nothing at all.
+#[tokio::test]
+async fn an_audit_reports_what_authorized_each_run() {
+    #[derive(Debug)]
+    struct Quiet;
+
+    #[derive(Debug)]
+    struct Permits;
+
+    impl agentplane::core::PolicyEngine for Permits {
+        fn authorize(
+            &self,
+            _r: &agentplane::core::PolicyRequest<'_>,
+        ) -> agentplane::core::PolicyDecision {
+            agentplane::core::PolicyDecision::Permit
+        }
+        fn bundle(&self) -> agentplane::core::PolicyBundleIdentity {
+            agentplane::core::PolicyBundleIdentity::new(
+                agentplane::core::Digest::of(b"test.permits"),
+                "test/permits-v1",
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Quiet {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("quiet").provides("demo.quiet")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            input: Tainted<serde_json::Value>,
+        ) -> Result<Outcome, agentplane::core::SkillError> {
+            Ok(Outcome::done(input))
+        }
+    }
+
+    // ── ungoverned: no engine wired ────────────────────────────────────────
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Quiet)
+        .build();
+    let out = rt.run("demo.quiet", serde_json::json!({})).await.unwrap();
+    let s = Arc::clone(&store) as Arc<dyn JournalStore>;
+    let report =
+        agentplane::audit::audit(&s, &[out.run_id], &agentplane::audit::Evidence::default())
+            .await
+            .unwrap();
+    assert!(
+        report.findings.is_empty() && report.sound.contains(&out.run_id),
+        "the ungoverned run must still verify as intact — that is the whole point"
+    );
+    assert_eq!(report.warrants.len(), 1, "no warrant was reported");
+    assert!(
+        report.warrants[0].policy.is_none(),
+        "a run with no policy engine was reported as governed: {:?}",
+        report.warrants[0].policy
+    );
+
+    // ── governed: an engine wired ──────────────────────────────────────────
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(Arc::new(Permits) as Arc<dyn agentplane::core::PolicyEngine>)
+        .skill(Quiet)
+        .build();
+    let out = rt.run("demo.quiet", serde_json::json!({})).await.unwrap();
+    let s = Arc::clone(&store) as Arc<dyn JournalStore>;
+    let report =
+        agentplane::audit::audit(&s, &[out.run_id], &agentplane::audit::Evidence::default())
+            .await
+            .unwrap();
+    let warrant = report.warrants.first().expect("no warrant was reported");
+    let bundle = warrant
+        .policy
+        .as_ref()
+        .expect("a governed run was reported as ungoverned");
+    assert_eq!(
+        bundle,
+        &agentplane::core::PolicyEngine::bundle(&Permits),
+        "the warrant names a different policy bundle than the one that governed the run"
+    );
+}

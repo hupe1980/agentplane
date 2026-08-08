@@ -1326,6 +1326,34 @@ impl Manifest {
             });
         }
 
+        // A quarantined model nothing can select is a declared control that
+        // governs nothing. Exactly two things point a model at
+        // untrusted-derived content on their own: a plan's `parse` steps, and
+        // memory formation. A `completion` or `tool-calling` agent with neither
+        // sends every call to the privileged model, so the second role reads as
+        // dual-model isolation while one model does all the work.
+        if models.quarantined.is_some() {
+            let kind = self.spec.execution.as_ref().map(|e| e.kind);
+            let selectable = matches!(kind, Some(ExecutionKind::Planned))
+                || self.spec.memory_formation.is_some()
+                // A coded skill chooses its own models, so the declaration is a
+                // reviewed allowlist rather than something the tier selects
+                // from — that is a different claim and a legitimate one.
+                || kind.is_none();
+            if !selectable {
+                return Err(ManifestError::Unenforceable {
+                    field: "spec.models.quarantined",
+                    detail: "nothing in this declaration would ever select it: `parse` steps \
+                             (execution.kind: planned) and memory formation are the only two \
+                             places the declarative tier points a model at untrusted-derived \
+                             content, and this agent has neither — so every call would go to \
+                             the privileged model while the file reads as dual-model \
+                             isolation. Use `execution.kind: planned`, declare \
+                             `memory_formation`, or drop the role",
+                });
+            }
+        }
+
         Ok(())
     }
 

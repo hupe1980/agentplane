@@ -469,9 +469,12 @@ fn every_documented_manifest_parses() {
 /// having it, because the README points readers at something nothing checks.
 /// `memory_run` had been in that state.
 ///
-/// The two `_live` examples are exempt by name and by design: they spend money
+/// The `_live` examples are exempt by name and by design: they spend money
 /// against a real provider, and a credential being available is not a decision
-/// to use it.
+/// to use it. `_bench` is exempt for a different reason — it is a *measurement*
+/// rather than a demonstration, it runs for twenty seconds, and CI time is a
+/// real cost. Both exemptions are by suffix so adding one is a rename somebody
+/// has to mean, rather than a name quietly missing from a list.
 #[test]
 fn every_example_is_run_by_the_examples_recipe() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -493,7 +496,7 @@ fn every_example_is_run_by_the_examples_recipe() {
                 .then(|| p.file_stem()?.to_str().map(str::to_owned))
                 .flatten()
         })
-        .filter(|name| !name.ends_with("_live"))
+        .filter(|name| !name.ends_with("_live") && !name.ends_with("_bench"))
         .collect();
     on_disk.sort();
 

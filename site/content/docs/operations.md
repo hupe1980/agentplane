@@ -176,6 +176,58 @@ named the right invariant — including one mutation that moved the writes outsi
 the transaction, which the atomicity check caught with "a rejected batch left 1
 record(s) behind".
 
+## What an effect costs
+
+The first question a runtime built on *"the journal is the plan of record"*
+invites, and one this project could not answer until it had a way to produce a
+number. `just perf` produces it; these figures are from an Apple-silicon laptop
+and are quoted with the command precisely because they are hardware-specific:
+
+```
+2000 effects, redb in memory
+  live      161.8ms      12363 effects/sec   0.08 ms/effect
+  replay     11.7ms     171282 effects/sec   14x faster than live
+
+2000 effects, redb on disk
+  live       17.5s         115 effects/sec   8.73 ms/effect
+  replay     16.3ms     122809 effects/sec   1072x faster than live
+```
+
+### Read the gap, not the numbers
+
+**Two fsyncs per effect.** An effect crosses the protocol twice — `EffectStarted`
+before dispatch, its terminal record after — and both are durable commits at
+`Durability::Immediate`, because I2 says the announcement must survive the
+process *before* anything reaches the world. The ~9 ms is that guarantee's
+price, not an inefficiency waiting to be tuned away. Batching the two would
+break the only thing standing between a crash and an unrecorded payment.
+
+**Against what an effect normally is, this is noise.** A model call is seconds; a
+tool call is tens of milliseconds. At 9 ms, journaling is well under 1 % of a
+real agent's wall clock, and the whole design is priced for effects that reach
+the world.
+
+**It stops being noise when effects are cheap and many.** `cx.now()`, a case
+read, a memory recall — a plan doing hundreds of those pays 9 ms each. If a
+step is looping over cheap effects, that loop is the cost.
+
+**On redb it is a plane-wide ceiling, not a per-run one.** redb has a single
+writer, which is exactly what makes its exactly-once key and its fencing free of
+races — and it means ~115 effects/sec is the *whole plane's* durable write
+budget on this hardware, not one run's. A single-node plane running agents that
+call models will never notice. A plane running many concurrent runs of cheap
+effects will, and that is the signal to move to `PostgreSQL`, which is also the
+answer for more than one instance.
+
+**Replay is not the same cost, by a wide margin.** It performs nothing and reads
+history back — 1000× faster on disk. That matters more than it looks: a
+divergence check, a crash recovery and an offline audit all pay the read price,
+so the expensive half is the half that only happens once.
+
+`PostgreSQL` is deliberately **not** measured here. It is a different machine, a
+different fsync, and usually a network hop; quoting a number produced on a
+laptop's container would be worse than quoting none.
+
 ## The sweeper
 
 Until something runs on a clock, a deadline is a number in a table and an

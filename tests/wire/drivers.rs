@@ -70,6 +70,7 @@ async fn serve(canned: Canned) -> String {
         .route("/v1/messages", post(handle))
         .route("/v1/responses", post(handle))
         .route("/v1/chat/completions", post(handle))
+        .route("/v1/embeddings", post(handle))
         // Gemini names the method in the path, and the model in it.
         .route("/v1beta/models/{model}", post(handle))
         .with_state(canned);
@@ -1386,6 +1387,71 @@ async fn a_model_that_ignores_the_forced_tool_is_caught() {
         err.usage().spend().tokens,
         13,
         "the model generated an answer and it was billed as free"
+    );
+    // **Which** refusal, not merely that there was one. Asserting only
+    // `Unusable` cannot tell this check from the schema validator two lines
+    // later: a driver that let the missing tool call through as `null` produced
+    // the same variant with the same usage, because `null` fails the schema. The
+    // test passed for a reason it was not written about, and the guarantee — the
+    // driver notices an ignored `tool_choice` and says so — was verified by
+    // nobody. Naming the sentence separates the two paths.
+    assert!(
+        err.to_string().contains("did not honour `tool_choice`"),
+        "the refusal came from somewhere other than the forced-tool check: {err}"
+    );
+}
+
+/// The same, with a schema that would have **accepted** the empty answer.
+///
+/// The case the assertion above still cannot reach on its own. When the declared
+/// schema permits `null`, a driver that treats a missing forced-tool call as
+/// `null` does not fail validation — it returns a **successful completion**
+/// carrying nothing, and a model that ignored `tool_choice` is reported as
+/// having answered. The check has to be the driver's, before the validator ever
+/// runs, and this is the fixture where those two differ.
+#[tokio::test]
+async fn an_ignored_forced_tool_is_caught_even_by_a_schema_that_permits_null() {
+    let (c, _) = canned(
+        200,
+        json!({
+            "content": [{ "type": "text", "text": "about ninety-nine" }],
+            "usage": { "input_tokens": 4, "output_tokens": 9 },
+            "stop_reason": "end_turn"
+        }),
+    );
+    let url = serve(c).await;
+    let provider = Anthropic::new("k")
+        .unwrap()
+        .base(url)
+        .buffered()
+        .structured_via(SchemaMode::ForcedTool);
+    // Permissive on purpose: `null` satisfies it, so the validator has nothing
+    // to say and only the driver's own check stands between an ignored
+    // `tool_choice` and a successful empty answer.
+    let permissive = json!({ "type": ["object", "null"] });
+
+    let err = provider
+        .complete(agentplane::model::Request {
+            model: &model(),
+            prompt: &json!("x"),
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: None,
+            schema: Some(&permissive),
+            tools: &[],
+            exchanges: &[],
+            continuation: None,
+            stream: None,
+        })
+        .await
+        .expect_err("a model that ignored the forced tool was reported as having answered");
+
+    assert!(
+        matches!(err, ModelError::Unusable { .. }),
+        "wrong failure: {err}"
+    );
+    assert!(
+        err.to_string().contains("did not honour `tool_choice`"),
+        "the refusal does not name the ignored forced tool: {err}"
     );
 }
 
@@ -3725,5 +3791,167 @@ async fn chat_completions_streaming_carries_an_unknown_tool_call_field_too() {
         "the server's own field was dropped reassembling the stream, so the next \
          request cannot return it — and this is the path the driver takes by \
          default: {state}"
+    );
+}
+
+// ── Embeddings ──────────────────────────────────────────────────────────────
+
+/// The embeddings wire, and the model in the effect identity.
+///
+/// `revision()` is what the retrieval effect's key carries beside the vector, so
+/// it has to name **everything that changes the floats** — the model, and the
+/// dimension count where one was asked for. A 1536-wide vector and a 256-wide
+/// one from the same model rank against different geometry and must not share
+/// an identity, or a replay reads one as the other.
+#[tokio::test]
+async fn an_embedder_sends_the_wire_and_names_its_revision() {
+    use agentplane::memory::Embedder as _;
+    use agentplane::model::embeddings::OpenAiEmbedder;
+
+    let (c, seen) = canned(
+        200,
+        json!({ "data": [{ "embedding": [0.25, -0.5, 0.75] }] }),
+    );
+    let url = serve(c).await;
+    let embedder = OpenAiEmbedder::new("embed-3-small")
+        .unwrap()
+        .base(url)
+        .key("k")
+        .dimensions(3);
+
+    assert_eq!(
+        embedder.revision(),
+        "embed-3-small@3",
+        "the revision must name the width; two widths are not one index"
+    );
+
+    let vector = embedder.embed("refund policy").await.expect("embed");
+    assert_eq!(vector, vec![0.25, -0.5, 0.75]);
+
+    let body = seen.lock().unwrap().clone().expect("a request was sent");
+    assert_eq!(body["model"], "embed-3-small");
+    assert_eq!(body["input"], "refund policy");
+    assert_eq!(
+        body["dimensions"], 3,
+        "the width was not asked for on the wire"
+    );
+}
+
+/// A server answering with the wrong number of vectors is refused.
+///
+/// One text was sent, so one embedding must come back. Taking the first of
+/// several would silently rank a query against a vector produced for somebody
+/// else's input — and the effect key would record it as this query's.
+#[tokio::test]
+async fn an_embedder_refuses_an_answer_that_is_not_one_vector() {
+    use agentplane::memory::Embedder as _;
+    use agentplane::model::embeddings::OpenAiEmbedder;
+
+    for body in [
+        json!({ "data": [{ "embedding": [0.1] }, { "embedding": [0.2] }] }),
+        json!({ "data": [] }),
+        json!({ "data": [{ "embedding": [] }] }),
+    ] {
+        let (c, _) = canned(200, body.clone());
+        let url = serve(c).await;
+        let err = OpenAiEmbedder::new("m")
+            .unwrap()
+            .base(url)
+            .embed("x")
+            .await
+            .expect_err("a malformed embeddings reply was accepted");
+        assert!(
+            matches!(err, agentplane::core::StoreError::Backend(_)),
+            "wrong failure for {body}: {err}"
+        );
+    }
+}
+
+/// An ungranted host is refused before the request is built.
+///
+/// An embedding call sends the query text to a third party. That it is short
+/// does not make it uninteresting, and the egress ceiling applies to it exactly
+/// as it applies to a completion.
+#[tokio::test]
+async fn an_embedder_refuses_a_host_nobody_granted() {
+    use agentplane::memory::Embedder as _;
+    use agentplane::model::embeddings::OpenAiEmbedder;
+
+    let err = OpenAiEmbedder::new("m")
+        .unwrap()
+        .base("https://not-granted.example")
+        .egress(agentplane::core::Egress::new().allow("api.openai.com"))
+        .embed("x")
+        .await
+        .expect_err("an ungranted host was reached");
+    assert!(
+        err.to_string().contains("not-granted.example"),
+        "the refusal does not name the host: {err}"
+    );
+}
+
+/// Gemini embeds a **query**, and a truncated vector is unit length again.
+///
+/// Two things nothing in a reply would tell you. `taskType` is fixed rather than
+/// offered: this seam only embeds the thing being looked *for*, and a query
+/// embedded as a document ranks worse and reports nothing. And Matryoshka
+/// truncation cuts the tail, so a shortened vector is no longer normalised —
+/// cosine against a normalised index would be scaled by whatever magnitude
+/// survived, biasing every score.
+#[tokio::test]
+async fn gemini_embeds_a_query_and_renormalises_a_truncated_vector() {
+    use agentplane::memory::Embedder as _;
+    use agentplane::model::embeddings::GeminiEmbedder;
+
+    // Deliberately not unit length: 3-4-0 has magnitude 5.
+    let (c, seen) = canned(200, json!({ "embedding": { "values": [3.0, 4.0, 0.0] } }));
+    let url = serve(c).await;
+    let embedder = GeminiEmbedder::new("k", "gemini-embedding-001")
+        .unwrap()
+        .base(url)
+        .dimensions(3);
+
+    let vector = embedder.embed("refund policy").await.expect("embed");
+    let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+    assert!(
+        (norm - 1.0).abs() < 1e-5,
+        "a truncated vector was left un-normalised (norm {norm}); cosine against a \
+         normalised index would be scaled by it"
+    );
+    assert!((vector[0] - 0.6).abs() < 1e-5, "{vector:?}");
+
+    let body = seen.lock().unwrap().clone().expect("a request was sent");
+    assert_eq!(
+        body["taskType"], "RETRIEVAL_QUERY",
+        "a query was embedded as something else"
+    );
+    assert_eq!(body["outputDimensionality"], 3);
+    assert_eq!(body["content"]["parts"][0]["text"], "refund policy");
+}
+
+/// An asymmetric model is told the text is a query, and that is in the identity.
+///
+/// Voyage and Cohere's direct API both take `input_type`, and both rank worse
+/// without it while returning vectors of exactly the right shape — so nothing
+/// downstream can notice. It reaches `revision()` because a query embedded with
+/// the hint and one without are not comparable and must not share an effect key.
+#[tokio::test]
+async fn an_input_type_reaches_the_wire_and_the_revision() {
+    use agentplane::memory::Embedder as _;
+    use agentplane::model::embeddings::OpenAiEmbedder;
+
+    let (c, seen) = canned(200, json!({ "data": [{ "embedding": [1.0] }] }));
+    let url = serve(c).await;
+    let embedder = OpenAiEmbedder::new("voyage-3-large")
+        .unwrap()
+        .base(url)
+        .input_type("query");
+
+    assert_eq!(embedder.revision(), "voyage-3-large/query");
+    embedder.embed("x").await.expect("embed");
+    let body = seen.lock().unwrap().clone().expect("a request was sent");
+    assert_eq!(
+        body["input_type"], "query",
+        "the asymmetry hint never reached the wire"
     );
 }

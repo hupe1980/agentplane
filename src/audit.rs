@@ -65,6 +65,43 @@ pub struct AuditReport {
     /// who, on what basis, toward what destination, over which fields, on what
     /// evidence.
     pub releases: Vec<ReleaseRecord>,
+    /// What authorized each run: the declaration it ran under, and the policy
+    /// bundle that governed it.
+    ///
+    /// Not a finding, for the same reason `releases` is not: an authorized run
+    /// is the ordinary case. It is reported because **an audit that verifies
+    /// history is intact and never says what warranted it has checked the
+    /// letter and not the warrant** — the mirror of the argument one field up.
+    ///
+    /// The load-bearing entry is the one where `policy` is `None`. A run that
+    /// executed with **no policy engine configured at all** verifies exactly as
+    /// soundly as a governed one: its chain is intact, its signatures check, its
+    /// leaf is included. Nothing in an integrity report distinguishes them, so
+    /// an auditor reading `sound` would conclude a run was governed when the
+    /// deployment had no gate wired. *Was policy switched on for this run* is an
+    /// audit question the journal answers and this report did not surface.
+    ///
+    /// The digest is what makes the declaration half meaningful: a name and
+    /// version identify a file that may since have been edited, and only the
+    /// digest pins what it actually said — the system prompt included.
+    pub warrants: Vec<Warrant>,
+}
+
+/// What authorized one run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warrant {
+    /// The run this describes.
+    pub run: RunId,
+    /// The agent declaration that governed it, if one did.
+    ///
+    /// `None` for a run started from code rather than from a manifest, which is
+    /// a legitimate shape and a different one from a manifest-governed run.
+    pub declaration: Option<crate::journal::AgentIdentity>,
+    /// The complete policy bundle that governed it.
+    ///
+    /// `None` means **no engine was configured**. That is the entry an auditor
+    /// most needs and the one an integrity-only report cannot show.
+    pub policy: Option<crate::core::PolicyBundleIdentity>,
 }
 
 /// One journaled decision to improve a label.
@@ -218,6 +255,29 @@ fn releases_in(run: RunId, records: &[Record]) -> Vec<ReleaseRecord> {
         .collect()
 }
 
+/// What authorized one run, from the record that opened it.
+///
+/// `RunAdmitted` carries both, and carries them once: the declaration because
+/// *which manifest governed this* must be answerable years later, and the bundle
+/// because *was policy switched on* must be too. Reading them here rather than
+/// re-deriving from today's wiring is the whole point — an audit runs against a
+/// store it did not write, on a machine that may have no engine configured at
+/// all.
+fn warrant_in(run: RunId, records: &[Record]) -> Option<Warrant> {
+    records.iter().find_map(|record| match record.kind() {
+        crate::journal::RecordKind::RunAdmitted {
+            governed_by,
+            policy_bundle,
+            ..
+        } => Some(Warrant {
+            run,
+            declaration: governed_by.clone(),
+            policy: policy_bundle.clone(),
+        }),
+        _ => None,
+    })
+}
+
 pub async fn audit(
     store: &Arc<dyn JournalStore>,
     runs: &[RunId],
@@ -228,6 +288,7 @@ pub async fn audit(
     let mut not_checked = Vec::new();
     let mut sound = Vec::new();
     let mut releases = Vec::new();
+    let mut warrants = Vec::new();
 
     if evidence.verifier.is_none() {
         not_checked.push(
@@ -263,8 +324,11 @@ pub async fn audit(
         }
 
         // Collected after the chain verified, so a reader is never shown a
-        // decision drawn from records whose integrity did not hold.
+        // decision — or a warrant — drawn from records whose integrity did not
+        // hold. A forged `RunAdmitted` naming a policy bundle nobody configured
+        // is exactly the claim an auditor must not be handed.
         releases.extend(releases_in(run, &records));
+        warrants.extend(warrant_in(run, &records));
 
         match store.inclusion_proof(run).await? {
             Some(inc) => {
@@ -325,5 +389,6 @@ pub async fn audit(
         findings,
         not_checked,
         releases,
+        warrants,
     })
 }

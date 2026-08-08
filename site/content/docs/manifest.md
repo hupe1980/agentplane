@@ -46,7 +46,6 @@ spec:
   capabilities:   { provides: [support.triage] }
   models:
     privileged:   { provider: anthropic, model: claude-sonnet-5 }
-    quarantined:  { provider: anthropic, model: claude-haiku-4-5-20251001 }
   budgets:        { max_tokens: 120000, max_steps: 5 }
   tools:
     - ref: "tool://tickets/read"
@@ -221,6 +220,15 @@ between agents is an agent of its own, granted as `tool://agent/<capability>`.
 |---|---|
 | `privileged` | The model trusted with tool calls and decisions. |
 | `quarantined` | The model that reads untrusted material and holds no authority. |
+
+**`quarantined` is refused where nothing would select it.** Two things point a
+model at untrusted-derived content on their own: a plan's `parse` steps
+(`execution.kind: planned`) and `memory_formation`. A `completion` or
+`tool-calling` agent with neither sends *every* call to the privileged model, so
+declaring the second role there would read as dual-model isolation while one
+model did all the work — a control the file claims and the runtime never
+applies. A **coded** agent may declare both: its skill chooses, so the roles are
+a reviewed allowlist rather than something a tier selects from.
 
 Both are `{ provider, model }`, where `provider` is the name a driver was
 registered under. The `agentplane` binary ships `openai`, `anthropic`, `gemini`,

@@ -318,8 +318,8 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `a2a` | A2A peer transport — calling other agents |
 | `a2a-server` | being called: the public Agent Card and the A2A 1.0 JSON-RPC methods |
 | `push` | Persistent A2A registration cursors, retrying worker API, and SSRF-guarded webhook delivery; `a2a-server` includes it |
-| `providers` | Anthropic, OpenAI, Google Gemini and OpenAI-compatible model drivers |
-| `bedrock` | Amazon Bedrock Runtime Converse through the AWS SDK; separate because the dependency graph is substantial |
+| `providers` | Anthropic, OpenAI, Google Gemini and OpenAI-compatible model drivers, plus the `OpenAI`-compatible **embeddings** driver semantic retrieval needs |
+| `bedrock` | Amazon Bedrock Runtime Converse through the AWS SDK, plus Titan/Cohere **embeddings**; separate because the dependency graph is substantial |
 | `media` | governed remote-media fetch: exact grants, SSRF-safe pinned DNS, redirects, limits, validation, digest and retention |
 | `cedar` | Cedar as the authorization engine |
 | `signing` | Ed25519 record attestation |

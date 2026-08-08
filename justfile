@@ -197,6 +197,15 @@ examples:
 
 FULL_FEATURES := "cli,mcp,mcp-stdio,a2a-server,http,cedar,keyring,media,opendal,signing,witness-http,postgres,push"
 
+# what an effect costs, so a performance claim can carry a number
+#
+# Not in `ci`: it is a measurement, it takes half a minute, and the figure is
+# hardware-specific — the point is that anybody can re-derive the one the docs
+# quote, not that CI asserts it.
+perf:
+    cargo run --release --quiet --example journal_bench --features redb
+    DISK=1 cargo run --release --quiet --example journal_bench --features redb
+
 # the binary is never exercised by `cargo test` — it only compiles
 cli-smoke:
     tools/cli-smoke.sh

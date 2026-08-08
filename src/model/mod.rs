@@ -43,6 +43,9 @@ mod bedrock_stream;
 pub mod chat_completions;
 #[cfg(feature = "providers")]
 mod chat_completions_stream;
+/// The embeddings wire, beside the drivers it shares a transport with.
+#[cfg(feature = "providers")]
+pub mod embeddings;
 #[cfg(feature = "providers")]
 pub mod gemini;
 #[cfg(feature = "providers")]

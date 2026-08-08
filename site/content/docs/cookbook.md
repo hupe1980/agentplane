@@ -1515,6 +1515,61 @@ replace the other's grants and nothing would say which won.
 one of two: the manifest is inside the agent's digest, the catalogue is the
 deployment's. A tool absent from *either* is not callable.
 
+## ⚖️ Turn on a policy engine
+
+The policy text is in [security](@/docs/security.md); this is the wiring, which
+nothing else showed.
+
+```rust
+use agentplane::policy::CedarEngine;
+
+let engine = CedarEngine::new(std::fs::read_to_string("policy.cedar")?.as_str())?;
+let runtime = Runtime::builder(store)
+    .policy(Arc::new(engine) as Arc<dyn PolicyEngine>)
+    .skill(MySkill)
+    .build();
+```
+
+`CedarEngine::from_bundle` takes a schema and static entities too, and validates
+the policies against the schema **at startup** — a policy set that cannot compile
+should fail when you deploy it, not on the first request that needs it.
+
+Three things bite:
+
+- **There is no `AllowAll`.** No engine wired means no gate; a permissive engine
+  and no engine are the same behaviour, so having two spellings is how a plane
+  ends up with a policy layer everyone believes is on.
+- **A broken policy denies everything, and says so differently.** Cedar is total,
+  so a rule that fails to evaluate simply does not contribute and the answer is a
+  clean `Deny`. That is reported as *malformed* rather than as a refusal —
+  `policy_error=true` in the `tracing` event — because "the rules say no" and
+  "the rules are broken and nobody noticed" call for opposite responses.
+- **The runtime's gates see no caller roles.** `run:admit` and `effect:perform`
+  are asked by the runtime, which has a plan and a delegation chain, not an HTTP
+  request. `context.roles` exists on the `api:*` and `a2a:*` actions only; to key
+  the runtime's gates on who asked, give the run a delegation chain, whose
+  context is merged into those requests.
+
+## 📡 Host an agent as an A2A peer
+
+```sh
+agentplane serve examples/served.yaml \
+  --url https://agent.example.com --addr 0.0.0.0:8080 \
+  --policy policy.cedar --tokens tokens.yaml --store ./served.redb \
+  --operator-addr 127.0.0.1:9090 --push-host hooks.example.com
+```
+
+Serves the public Agent Card and the A2A 1.0 methods, sweeps deadlines and due
+timers every 30s, and — on a **separate** listener — the operator surface:
+`GET /runs?outcome=quarantined`, the worklist, task decisions. The two are
+separated by *policy* (`peer` reaches `a2a:*`, `operator` reaches `api:*`), so
+the port split is defence in depth rather than the control.
+
+`--policy`, `--tokens` and `--store` have no defaults. A served task's id is a
+promise it can be fetched again, which an in-memory journal breaks at the next
+restart. Needs `--features cli,a2a-server,cedar`, or the `:full` image. The full
+walkthrough is in [getting started](@/docs/getting-started.md).
+
 ## 🔐 Restrict where the plane may connect
 
 ```rust
@@ -1799,8 +1854,145 @@ let hits = cx.semantic_recall(
 The effect records the exact vector, embedding revision, immutable index
 snapshot, filters, scores and `(id, version, digest)` selections. Replay does
 not rerank. It materializes exact versions from authoritative memory and rejects
-out-of-scope or changed commitments. `InMemorySemanticRetriever` is the exact
-cosine reference; production ANN stores implement the same seam.
+out-of-scope or changed commitments.
+
+### The embedder
+
+`OpenAiEmbedder` speaks `POST /v1/embeddings`, which is `OpenAI`'s wire and the
+one every compatible server answers — so it reaches OpenAI, Ollama, vLLM, TGI,
+LM Studio and Hugging Face's router without a second driver, exactly as
+`chat-completions` does for completions:
+
+```rust
+use agentplane::model::embeddings::OpenAiEmbedder;
+
+let embedder = Arc::new(
+    OpenAiEmbedder::new("text-embedding-3-small")?
+        .key(std::env::var("OPENAI_API_KEY")?)
+        .dimensions(512)
+        .egress(Egress::new().allow("api.openai.com")),
+);
+```
+
+Three drivers ship, chosen by which wire the provider speaks:
+
+| Driver | Reaches | Feature |
+|---|---|---|
+| `OpenAiEmbedder` | `OpenAI`, **Voyage AI**, Ollama, vLLM, TGI, LM Studio, Hugging Face's router — anything answering `POST /v1/embeddings` | `providers` |
+| `GeminiEmbedder` | Google `gemini-embedding-001` via `:embedContent` | `providers` |
+| `BedrockEmbedder` | Amazon Titan Embed and Cohere Embed on Bedrock | `bedrock` |
+
+**Anthropic has no embeddings API** and recommends Voyage AI, which the first
+driver reaches by base URL alone — Voyage speaks the same `/v1/embeddings` wire,
+so it needs no driver of its own:
+
+```rust
+OpenAiEmbedder::new("voyage-3-large")?
+    .base("https://api.voyageai.com")
+    .key(std::env::var("VOYAGE_API_KEY")?)
+    .input_type("query")   // ← the one thing that is not optional in practice
+```
+
+`input_type` matters more than it looks. Voyage and Cohere embed questions and
+documents into deliberately different regions and **rank worse when the two are
+swapped** — returning vectors of exactly the right shape, so nothing downstream
+notices. `OpenAI`'s own models are symmetric and take no such parameter, which is
+why it is opt-in. Gemini's equivalent (`taskType`) is not a knob at all: this
+seam only ever embeds the thing being looked *for*, so it is fixed to
+`RETRIEVAL_QUERY`.
+
+Bedrock's is a **declared dialect**, never sniffed from the model id — Titan
+takes `inputText` and answers `embedding`, Cohere takes `texts` and answers
+`embeddings`, and cross-region inference profiles prefix the id, so a substring
+match would bind behaviour to a naming convention AWS owns:
+
+```rust
+BedrockEmbedder::from_env("eu-central-1", "amazon.titan-embed-text-v2:0",
+                          EmbeddingDialect::Titan).await?
+```
+
+`revision()` names the model **and** the width, because both change the floats:
+a 1536-wide vector and a 512-wide one from the same model rank against different
+geometry, and the effect key is what stops a replay reading one as the other.
+It embeds one text per call on purpose — one effect is one observation, and a
+batching driver would have to decide how a partial failure maps onto several
+effect keys.
+
+### Hybrid retrieval
+
+**`SemanticQuery` carries the query text alongside the vector, and the text is a
+search input rather than only provenance.** That is what makes hybrid retrieval
+expressible: dense similarity finds meaning, the literal terms find the things
+embeddings famously lose — identifiers, error codes, product names — and a
+retriever fusing the two has everything it needs already in the struct.
+
+Where the fusion is *declared* is `SemanticRetriever::profile()`, which is **in
+the effect key**. So a weighting change, or switching fusion off, is replay
+divergence rather than a quietly different ranking:
+
+```rust
+#[derive(Debug)]
+struct LanceHybrid { table: Arc<lancedb::Table>, alpha: f32 }
+
+#[async_trait]
+impl SemanticRetriever for LanceHybrid {
+    // Everything that changes the ranking, and nothing secret. A run whose
+    // ranking was produced under `alpha: 0.5` must not replay under `0.7`
+    // and call itself the same history.
+    fn profile(&self) -> Value {
+        json!({ "engine": "lancedb", "fusion": "rrf", "alpha": self.alpha })
+    }
+
+    async fn search(&self, q: &SemanticQuery) -> Result<Vec<SemanticHit>, StoreError> {
+        // Dense from `q.embedding`, lexical from `q.text`, fused — then return
+        // **commitments**, never content: `(id, version, digest)` and a score.
+        // The index is derived; authoritative memory is what the runtime reads
+        // back, and it verifies scope and digest before anything is exposed.
+    }
+}
+```
+
+The rule a retriever must not break: return `Selected` commitments and scores,
+never item content. An index is derived and may be stale, poisoned or simply
+wrong; the runtime materializes the exact versions from `MemoryStore` and
+refuses out-of-scope or changed digests. A retriever that returned text would be
+handing the model something nothing verified.
+
+`InMemorySemanticRetriever` is the exact-cosine reference and ranks on the
+vector alone — a reference implementation, not a statement about what the seam
+permits.
+
+### Several passes, and rephrasing
+
+A conversational agent that rephrases before retrieving is a *composition*, not a
+new execution kind — and every step is already an effect, so the whole pass
+replays without repeating a call:
+
+```rust
+// 1. What has been said, from case state — journaled, so replay reads it back.
+let (history, _version) = cx.case_state().await?;
+
+// 2. Rephrase. A model call like any other: keyed, metered, replayable.
+//    The history is untrusted, so it goes in `messages`; the instruction that
+//    says *rewrite this as a standalone question* is the manifest's, and
+//    trusted, which is why `/system` is a protected field.
+let standalone = cx.sink(ModelCall::new(provider, model, prompt), &prompt).await?;
+
+// 3. Embed the rewritten question — never the raw turn.
+let vector = cx.embed(embedder, standalone.map(|c| c.text.clone())).await?;
+
+// 4. Retrieve, 5. answer with what came back.
+```
+
+The reason to rephrase at all is the reason it belongs *before* the embedding:
+"what about the second one?" embeds to nothing useful, and the vector is inside
+the retrieval effect's identity — so the rewrite has to happen where the journal
+can see it, not inside a helper that reruns differently next time.
+
+There is deliberately **no `execution.kind: rag`**. The pipeline above is a plan:
+which passes, whether to rephrase, whether to rerank are decisions a deployment
+makes, and a fourth hardcoded tier would answer them once for everybody. That is
+the prompt-framework job this runtime's non-goals disclaim.
 
 **The trap:** stripping the label before writing. `StepCtx::remember` prevents
 the obvious laundering path by accepting `MemoryWrite` plus `Tainted<Value>` and

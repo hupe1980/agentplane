@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.8.0"
+version      = "0.9.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -12,39 +12,24 @@ categories   = ["asynchronous", "data-structures"]
 
 # What ships, stated as an allowlist.
 #
-# This was an `exclude` list and that was the wrong shape: a denylist has to
-# predict every generated file, and it failed twice — first `CONCEPT.md` and
-# `mutants.out/`, then `tools/__pycache__/*.pyc`. Each time the fix was to add
-# one more line after discovering the leak, which is the pattern that produces
-# the third one.
-#
-# An allowlist cannot be surprised. Anything new in the working tree — a
-# scratch file, a profiler dump, a tool's cache — is absent from the tarball by
-# default rather than present by default. That matters more here than for most
-# crates, because a crates.io publish is immutable: a file that should not have
-# shipped cannot be withdrawn, only yanked with the contents still served.
+# A denylist has to predict every generated file; an allowlist cannot be
+# surprised. That matters more here than for most crates, because a crates.io
+# publish is immutable — a file that should not have shipped cannot be
+# withdrawn, only yanked with the contents still served.
 #
 # Development infrastructure (`tests/`, `spec/`, `tools/`, `justfile`) is
-# deliberately not published — it is in the repository, and a consumer building
-# this crate has no use for the TLA+ specs or the mutation table.
+# deliberately absent: a consumer building this crate has no use for the TLA+
+# specs or the mutation table. The guides live at hupe1980.github.io/agentplane,
+# so the README links out rather than freezing a copy in every release.
 #
-# `docs/` is not published either, now that the guides have a home of their own
-# at hupe1980.github.io/agentplane. Shipping them here too would freeze a copy
-# inside every released version, and the README links out rather than inward so
-# the link works identically on crates.io, on GitHub, and from an unpacked
-# tarball.
-# Leading slashes anchor to the package root. Without them these are
-# gitignore-style globs matching *any* depth, which is how `spec/README.md`
-# arrived in the tarball behind a bare `README.md`.
+# Leading slashes anchor to the package root; without them these are
+# gitignore-style globs matching any depth.
 include = [
     "/src/**/*.rs",
     "/examples/*.rs",
-    # The manifest example `include_str!`s this; without it the packaged
-    # crate does not compile, and `cargo package --list` alone would not say so.
+    # An example `include_str!`s a manifest, so without these the packaged crate
+    # does not compile — and `cargo package --list` alone would not say so.
     "/examples/*.yaml",
-    # The served example's policy set. Named beside its manifest in the guides,
-    # so an unpacked tarball that had the agent and not the rules would document
-    # a command a reader cannot run.
     "/examples/*.cedar",
     "/src/bin/*.rs",
     "/README.md",
@@ -76,20 +61,14 @@ redb = ["dep:redb"]
 manifest = ["dep:serde_yaml_ng", "dep:base64", "dep:jsonschema"]
 # Everything the `agentplane` binary needs to run a declarative agent.
 cli = ["manifest", "redb", "providers", "bedrock", "testkit", "dep:tracing-subscriber", "dep:clap"]
-# Content-addressed blob storage on any backend OpenDAL reaches — filesystem,
-# S3, GCS, Azure. The other half of the journal's record-size limit: bytes too
-# big for the chain go here, and the chain commits to their digest.
-#
-# Deliberately *not* the journal's foundation: an object store has no ordered
-# scan, no multi-key transaction and no unique constraint, which is all the
-# journal needs and none of what a content-addressed write needs.
+# Content-addressed blobs on any backend OpenDAL reaches. Bytes too big for the
+# chain go here and the chain commits to their digest. Deliberately not the
+# journal's own store: an object store has no ordered scan, no multi-key
+# transaction and no unique constraint, which is all the journal needs.
 opendal = ["dep:opendal"]
 # Envelope encryption for payload bytes, and the erasure it makes provable.
-#
-# Bytes are sealed under a per-scope data key; the data key is wrapped by a key
-# this crate never holds. Erasure destroys the data key, so every copy — live
-# store, replica, and every backup ever taken — becomes unreadable at once,
-# which deleting from the live store cannot do.
+# Destroying the wrapping key makes every copy unreadable at once — live store,
+# replica, and every backup ever taken — which deleting a row cannot do.
 keyring = ["dep:chacha20poly1305", "dep:base64"]
 # A key ring that is somebody else: HashiCorp Vault's transit engine, over its
 # documented HTTP API. The wrapping key is created inside Vault and never leaves
@@ -112,15 +91,13 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 # allowed to do, and that decision must not depend on which transport is linked.
 mcp = ["dep:rmcp"]
 
-# Reach an MCP server by **running it** — the stdio child process almost every
-# published server is. Separate from `mcp` because the host surface is
+# Reach an MCP server by **running it** — the stdio child process most published
+# servers are. Separate from `mcp` because the host surface is
 # transport-agnostic on purpose (`McpClient::new` takes a connection somebody
-# else made: stdio, a child process, streamable HTTP), and this one costs 8
-# crates plus `tokio/process` that an embedder connecting over their own
-# transport should not pay for — 178 with `mcp` and 186 with this, by
-# `cargo tree --no-default-features --features redb,manifest,<f> -e normal
-# --prefix none | sort -u | wc -l`. It is what lets `agentplane run` and
-# `agentplane serve` execute a declarative `tool-calling` agent with no Rust.
+# else made), and this costs 8 crates plus `tokio/process` that an embedder
+# connecting over their own transport should not pay for. It is what lets
+# `agentplane run`/`serve` execute a declarative `tool-calling` agent with no
+# Rust.
 mcp-stdio = ["mcp", "rmcp/transport-child-process"]
 # HTTP surface for operators: the worklist, run status, event delivery. Off by
 # default — a library embedded in someone else's process should not open a port
@@ -139,10 +116,8 @@ witness-http = ["dep:reqwest"]
 # transport happens to be linked.
 a2a = ["dep:reqwest"]
 # Serve this plane as an A2A agent: the public card plus the JSON-RPC methods.
-# `push` is not optional here: A2A 1.0 defines push notification configs as
-# part of the protocol, and this server implements them unconditionally. A
-# feature that uses a module without declaring it is a feature that does not
-# build alone — which nothing noticed until every feature was built alone.
+# `push` is not optional here: A2A 1.0 defines push notification configs as part
+# of the protocol, and this server implements them unconditionally.
 a2a-server = ["http", "manifest", "push", "dep:async-stream"]
 # Webhook delivery for A2A push notifications: a durable config store plus
 # SSRF-guarded outbound POSTs.
@@ -196,28 +171,17 @@ tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 async-stream = { version = "0.3", optional = true }
 tracing     = "0.1"
-# The binary's only reason for this: this crate keeps an operator-side channel on
-# purpose — an A2A decline tells the caller nothing and names the determining
-# policy in a `tracing` event instead, so a prober cannot map the authorization
-# vocabulary. With no subscriber installed that event reaches nobody, and
-# `agentplane serve` would refuse requests for reasons its operator can never
-# read. That is I13 — detection without delivery — reached by shipping a
-# server with no way to see what it decided.
+# Several controls here are quiet toward the caller and loud toward the
+# operator: an A2A decline names the determining policy in a `tracing` event and
+# tells the peer nothing, so a prober cannot map the authorization vocabulary.
+# With no subscriber installed, that second half reaches nobody.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "env-filter"], optional = true }
-# The binary's argument parser. Hand-rolled until the surface outgrew the
-# reasoning for it — the module comment said "three verbs and five flags" while
-# the binary had grown to four and fourteen, and flags belonging to one verb were
-# silently accepted by another. `--push-host` on `run` is a security control that
-# did nothing, which is shape 1 at the command line.
-#
-# What a dependency buys here is that the bad state stops being representable: a
-# flag lives on the subcommand's struct, so passing it elsewhere fails to parse.
-# +9 crates on `cli` and **+0 on the library**, which is the number that decided
-# it — `cli` produces a binary and already carries three hundred. Re-derive with
+# The binary's argument parser. A flag lives on its subcommand's struct, so
+# passing a `serve` flag to `run` fails to parse rather than being silently
+# accepted and ignored — which is what a hand-rolled table did, including for a
+# security control. +9 crates on `cli`, +0 on the library; re-derive with
 # `cargo tree --no-default-features --features cli -e normal --prefix none |
-# sort -u | wc -l`; the first draft of this comment said twelve, taken before
-# `default-features = false` trimmed the colour stack — shape 20 inside a single
-# afternoon.
+# sort -u | wc -l`.
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "env", "wrap_help"], optional = true }
 redb        = { version = "3", optional = true }
 # The maintained fork of serde_yaml, which is deprecated. Ten crates deep.
@@ -245,43 +209,26 @@ axum = { version = "0.8.9", default-features = false, features = ["json", "http1
 # `rand_core` off: keys come from the deployment, and a signer that can mint its
 # own identity is a signer whose signatures mean nothing.
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize", "signature"], optional = true }
-# `rustls` rather than the platform's TLS: one static binary is a design
-# commitment (P11), and linking OpenSSL puts a system dependency back in.
-# `webpki-roots` is listed explicitly because 0.13 split the old `rustls-tls`
-# feature into a backend and its trust anchors — asking only for `rustls` builds
-# a client that trusts nothing and fails every handshake.
-# `stream` gates `Response::bytes_stream`, which is how a model driver learns
-# what a call burned *before* the connection died. Without it the only honest
-# report for a severed response is "cost unknown", and the budget ceiling that
-# exists to bound a runaway provider reads zero while it spends.
-# `rustls` and not `native-tls`: one TLS stack, in Rust, so a deployment's
-# threat model does not have to include OpenSSL's.
+# `rustls`, not `native-tls`: one TLS stack, in Rust, so a deployment's threat
+# model need not include OpenSSL's. `stream` gates `Response::bytes_stream`,
+# which is how a driver learns what a severed call burned — without it the only
+# honest report is "cost unknown" and the runaway-provider ceiling reads zero.
 #
-# The **trust anchor is the operating system's store**, supplied by
-# `rustls-platform-verifier`, which reqwest's `rustls` feature wires in. That is
-# a decision rather than a default, and it is the same one this crate makes
-# about policy engines, content classifiers and tracing exporters: the operator
+# The **trust anchor is the operating system's store**, via
+# `rustls-platform-verifier`. That is a decision, not a default: the operator
 # already administers a CA policy, and a runtime that ignored it would break
-# every corporate inspection proxy while claiming to be more secure.
-#
-# This list previously also carried `webpki-roots`, which looked like pinning
-# Mozilla's bundle and did nothing of the kind. reqwest 0.13 has no such
-# feature — it declares `webpki-roots` as an *optional dependency* and never
-# writes `dep:webpki-roots` in its own `[features]`, so Cargo synthesises an
-# implicit feature of that name. Enabling it therefore resolves, compiles, and
-# links the entire root bundle into every build, while the verifier stays the
-# platform one. A declaration that does nothing, in the one place where
-# believing it changes what an operator thinks their trust anchors are. The
-# guard in `tests/guards/docs.rs` keeps it gone.
+# every corporate inspection proxy while claiming to be more secure. Do not add
+# `webpki-roots` — reqwest declares it as an optional dependency and never
+# writes `dep:webpki-roots`, so Cargo synthesises an implicit feature that links
+# Mozilla's whole bundle while the verifier stays the platform one. A guard in
+# `tests/guards/docs.rs` keeps it gone.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "charset", "stream"], optional = true }
-# Default features are declined on both AWS crates for one reason: the SDK's
-# `rustls` feature is `legacy-rustls-ring`, which pins `rustls` 0.21 and with it
-# `rustls-webpki` 0.101 — three live RUSTSEC advisories against the code that
-# validates certificates (name-constraint bypass twice, and a reachable panic in
-# CRL parsing). `default-https-client` selects the maintained `rustls-aws-lc`
-# stack instead. A TLS client is the one dependency this crate must not take on
-# whatever a transitive default happens to pick, so the choice is written down
-# here and `just audit` is what keeps it honest.
+# Defaults declined on both AWS crates for one reason: the SDK's `rustls` feature
+# is `legacy-rustls-ring`, pinning `rustls` 0.21 and `rustls-webpki` 0.101 —
+# three live RUSTSEC advisories against certificate validation.
+# `default-https-client` selects the maintained `rustls-aws-lc` stack. A TLS
+# client must not be whatever a transitive default picks; `just audit` keeps it
+# honest.
 aws-config = { version = "1.10.1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"], optional = true }
 aws-sdk-bedrockruntime = { version = "1.139.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"], optional = true }
 aws-smithy-types = { version = "1.6.1", optional = true }
@@ -329,6 +276,10 @@ required-features = ["redb", "providers"]
 [[example]]
 name              = "bedrock_live"
 required-features = ["bedrock"]
+
+[[example]]
+name              = "journal_bench"
+required-features = ["redb"]
 
 [[example]]
 name              = "hello_skill"

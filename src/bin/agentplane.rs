@@ -37,7 +37,7 @@
 //! # ran happily; both flags did nothing, and one of them is a security control
 //! ```
 //!
-//! That is shape 1 — a declaration that does nothing — at the command line, and
+//! That is a declaration that does nothing, at the command line, and
 //! I12 says a declared control must be enforced or rejected by the parser. What
 //! a derive buys is that the bad state stops being representable: a flag lives on
 //! its subcommand's struct, and `run --push-host` fails to parse by

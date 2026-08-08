@@ -140,10 +140,20 @@ async fn a_webhook_resolving_to_a_private_address_is_refused() {
 fn a_configuration_read_back_does_not_carry_its_token() {
     let shown = config("https://hooks.acme.example/a2a").redacted();
     let text = serde_json::to_string(&shown).expect("serialize");
-    assert!(
-        !text.contains("the-receivers-token"),
-        "a webhook token was echoed back to a caller: {text}"
-    );
+    // **Both** secrets, and the test used to check only one of them. The
+    // fixture carries two — `token`, the A2A correlation secret, and
+    // `authentication.credentials`, the receiver's bearer — and this assertion
+    // named the credentials while the test was called *does not carry its
+    // token*. A mutation echoing `token` back therefore passed it: the string it
+    // exposed was not the string being looked for. A fixture with two secrets
+    // needs an assertion that names both, or it proves whichever one nobody
+    // broke.
+    for secret in ["the-receivers-token", "opaque-a2a-token"] {
+        assert!(
+            !text.contains(secret),
+            "a webhook secret was echoed back to a caller: {text}"
+        );
+    }
     assert_eq!(shown["url"], "https://hooks.acme.example/a2a");
 }
 

@@ -170,6 +170,29 @@ pub fn tail(
     first: A2aTask,
     from: Seq,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    Sse::new(frames(runtime, run, case, id, first, from))
+}
+
+/// The event sequence behind [`tail`], before axum wraps it.
+///
+/// Split out for one reason: `Sse` hands back no way to read what it will send,
+/// so the stream's own behaviour could not be tested — and the full mutation
+/// sweep proved that was not hypothetical. Deleting the `already_over` return
+/// below left **all forty-six** A2A tests passing, because the only path any of
+/// them takes to a terminal task is `SubscribeToTask`, which is refused before
+/// it ever reaches here. The guarantee looked verified and was verified by
+/// nothing.
+///
+/// A function returning the raw stream is testable, and the test that names this
+/// guarantee now actually drives it.
+fn frames(
+    runtime: Arc<Runtime>,
+    run: RunId,
+    case: Option<String>,
+    id: Value,
+    first: A2aTask,
+    from: Seq,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     // Whether the run is *already* over when the stream opens. Checked here and
     // not only in the loop below: the record that ended it was consumed before
     // this subscriber existed, so the loop would never see it and would poll a
@@ -242,7 +265,7 @@ pub fn tail(
     // from the journal, because the stream is a view of history rather than a
     // subscription to memory. A connection that never ends cannot be recovered
     // from by anybody.
-    Sse::new(stream)
+    stream
 }
 
 /// The task a stream opens with, read from the journal as it stands now.
@@ -261,4 +284,61 @@ pub async fn current(runtime: &Runtime, run: RunId) -> Option<(A2aTask, Option<S
     let mut task = task_of(run, state, &detail, case.clone());
     task.artifacts = task_artifacts(runtime, run, state).await.ok()?;
     Some((task, case, next))
+}
+
+#[cfg(all(test, feature = "redb"))]
+mod tests {
+    use super::{Event, RunId, TaskState, frames};
+    use futures_util::StreamExt as _;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// **A stream opened on an already-finished task ends.**
+    ///
+    /// It yields the task snapshot the spec requires and then stops, rather than
+    /// polling a run whose closing record was written before this subscriber
+    /// existed — a loop that would never see it and never end.
+    ///
+    /// This test exists because the full mutation sweep found the guarantee
+    /// verified by **nothing**: deleting the early return left every one of the
+    /// forty-six A2A tests green. `SubscribeToTask` is refused on a terminal
+    /// task before it reaches the stream, so no test drove the one method that
+    /// does reach it — `SendStreamingMessage`, which has no such pre-check.
+    /// The mutation's named test was checking the *refusal*, one layer up, and
+    /// the sweep is what told the difference between "checked" and "looks
+    /// checked".
+    #[tokio::test]
+    async fn a_stream_on_an_already_finished_task_ends() {
+        let store = Arc::new(crate::store::RedbStore::open_in_memory().expect("store"));
+        let runtime = crate::runtime::Runtime::builder(
+            Arc::clone(&store) as Arc<dyn crate::journal::JournalStore>
+        )
+        .build();
+        let run = RunId::generate();
+
+        // Terminal before anybody subscribed, which is the whole condition.
+        let finished = crate::api::a2a::task_of(run, TaskState::Completed, "succeeded", None);
+
+        // Bounded on purpose. Without the guard this stream never ends, so a
+        // plain `collect()` would **hang** rather than fail — and a hanging test
+        // is a CI timeout with no message, which is a worse report than a red
+        // assertion. The deadline turns "never ends" into a sentence.
+        let collected: Vec<Result<Event, std::convert::Infallible>> = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            frames(runtime, run, None, json!(1), finished, 1).collect(),
+        )
+        .await
+        .expect(
+            "a stream on an already-finished task never ended: its closing record was \
+             written before this subscriber existed, so the loop will never see it",
+        );
+
+        assert_eq!(
+            collected.len(),
+            1,
+            "a stream on a finished task must yield the snapshot and stop; it \
+             produced {} events",
+            collected.len()
+        );
+    }
 }

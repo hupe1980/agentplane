@@ -288,7 +288,24 @@ pub struct SemanticQuery {
     pub subject: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
-    /// Human-readable query used to produce `embedding`.
+    /// The query as written — **a search input, not only provenance.**
+    ///
+    /// It is carried beside the vector rather than derived from it because a
+    /// retriever may legitimately want both: dense similarity for meaning and
+    /// the literal terms for exact matches that embeddings famously lose —
+    /// identifiers, error codes, product names. A retriever that fuses the two
+    /// is doing *hybrid* retrieval, and everything it needs is already in this
+    /// struct.
+    ///
+    /// Where the fusion is *declared* is [`SemanticRetriever::profile`], which
+    /// is in the effect key: changing a weighting or switching fusion off is
+    /// replay divergence rather than a silently different ranking. That is the
+    /// supported axis, and it is per-retriever on purpose — a per-call knob
+    /// would let one run rank two ways with nothing on the record saying which.
+    ///
+    /// The shipped [`InMemorySemanticRetriever`] ignores this field and ranks on
+    /// the vector alone. It is a reference implementation, not a statement about
+    /// what the seam permits.
     pub text: String,
     /// Exact query vector, obtained through
     /// [`StepCtx::embed`](crate::runtime::StepCtx::embed).
@@ -345,8 +362,18 @@ pub trait SemanticRetriever: Send + Sync + Debug {
 /// visible — an embedding call is metered like any other effect — and puts the
 /// model revision on the record beside the vector it produced.
 ///
-/// The crate ships no driver, for the reason it ships no policy evaluator:
-/// picking one for the embedder is not its call.
+/// [`OpenAiEmbedder`](crate::model::embeddings::OpenAiEmbedder) is the shipped
+/// one, behind `providers`. This comment used to say the crate shipped none
+/// *"for the reason it ships no policy evaluator"* — which copied a decision
+/// from a case where it holds to one where it does not: the crate ships five
+/// model drivers and a policy evaluator adapter, and the thing it genuinely
+/// refuses is a content *classifier*, for a reason specific to classifiers. An
+/// embedder is a model driver by another name.
+///
+/// The consequence settled it. Without one, `StepCtx::embed` and therefore the
+/// whole semantic-retrieval tier could not be used without writing Rust — the
+/// same language barrier that kept the A2A server, the MCP host and push out of
+/// reach of a declarative agent.
 #[async_trait]
 pub trait Embedder: Send + Sync + Debug {
     /// Stable, non-secret identity of the model and revision producing vectors.
