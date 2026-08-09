@@ -1,4 +1,4 @@
-//! PostgreSQL-backed journal.
+//! `PostgreSQL`-backed journal.
 //!
 //! # What this backend is for
 //!
@@ -323,6 +323,60 @@ impl PostgresStore {
         &self.pool
     }
 
+    /// A lifecycle lock for cryptographic memory erasure, in *this* database.
+    ///
+    /// The coordinator that makes [`EncryptedMemoryStore`] honest on an
+    /// active-active plane. Deliberately taken from the store rather than
+    /// constructed from a connection string: a lock in a different database
+    /// would be a second system that can be up while this one is down, and a
+    /// coordinator that is available when the data is not protects nothing.
+    ///
+    /// ```ignore
+    /// let memory = EncryptedMemoryStore::new(inner, keys, tenant)
+    ///     .coordinated_by(Arc::new(store.erasure_coordinator()));
+    /// ```
+    ///
+    /// [`EncryptedMemoryStore`]: crate::keyring::EncryptedMemoryStore
+    /// Whether somebody is holding a scope's erasure lock, without taking it.
+    ///
+    /// `pg_try_advisory_lock`, released immediately if it was free — so this
+    /// answers the question and leaves the answer true. For tests and operator
+    /// diagnostics; the erasure path itself blocks rather than probing, because
+    /// a caller that failed to get the lock would have to choose between
+    /// retrying and skipping, and skipping an erasure is the wrong answer to
+    /// contention.
+    ///
+    /// # Errors
+    ///
+    /// If the database cannot be reached.
+    #[cfg(feature = "keyring")]
+    pub async fn erasure_probe(&self, scope: &str) -> Result<bool, crate::core::StoreError> {
+        let key = crate::keyring::coordinator::PostgresCoordinator::scope_key(scope);
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::core::StoreError::Backend(e.to_string()))?;
+        let row = client
+            .query_one("SELECT pg_try_advisory_lock($1)", &[&key])
+            .await
+            .map_err(|e| crate::core::StoreError::Backend(e.to_string()))?;
+        let got: bool = row.get(0);
+        if got {
+            client
+                .execute("SELECT pg_advisory_unlock($1)", &[&key])
+                .await
+                .map_err(|e| crate::core::StoreError::Backend(e.to_string()))?;
+        }
+        Ok(!got)
+    }
+
+    #[cfg(feature = "keyring")]
+    #[must_use]
+    pub fn erasure_coordinator(&self) -> crate::keyring::coordinator::PostgresCoordinator {
+        crate::keyring::coordinator::PostgresCoordinator::new(self.pool.clone())
+    }
+
     pub(super) fn tenant_name(&self) -> String {
         self.tenant.to_string()
     }
@@ -541,6 +595,13 @@ impl PostgresStore {
 
 #[async_trait]
 impl JournalStore for PostgresStore {
+    /// The topology an embedded store cannot serve: several plane instances
+    /// sharing one store, with fencing and exactly-once arbitrated by the
+    /// database rather than by hoping the writers agree.
+    fn is_shared(&self) -> bool {
+        true
+    }
+
     fn tenant(&self) -> &str {
         self.tenant.as_str()
     }

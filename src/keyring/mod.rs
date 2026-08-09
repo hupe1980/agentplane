@@ -227,6 +227,8 @@ pub use journal::SealedJournal;
 mod sealed;
 pub use sealed::EncryptedBlobs;
 
+pub mod coordinator;
+pub use coordinator::{ErasureCoordinator, Lease, LocalCoordinator, under_lock};
 mod memory;
 pub use memory::EncryptedMemoryStore;
 

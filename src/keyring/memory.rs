@@ -42,7 +42,7 @@ pub struct EncryptedMemoryStore {
     inner: Arc<dyn MemoryStore>,
     keys: Arc<dyn KeyRing>,
     tenant: TenantId,
-    lifecycle: tokio::sync::Mutex<()>,
+    lifecycle: Arc<dyn super::ErasureCoordinator>,
 }
 
 impl std::fmt::Debug for EncryptedMemoryStore {
@@ -54,18 +54,59 @@ impl std::fmt::Debug for EncryptedMemoryStore {
 }
 
 impl EncryptedMemoryStore {
+    /// Seal this store's content, serialised by a **process-local** lifecycle
+    /// lock.
+    ///
+    /// It was called `new_single_node`, and that name stopped being true when
+    /// the lock became a seam: this is single-node *by default* now, not by
+    /// construction. An active-active plane calls
+    /// [`coordinated_by`](Self::coordinated_by) with a coordinator that spans
+    /// instances — and [`is_distributed`](Self::is_distributed) is how a caller
+    /// checks which it got, rather than inferring it from a constructor name.
     #[must_use]
-    pub fn new_single_node(
-        inner: Arc<dyn MemoryStore>,
-        keys: Arc<dyn KeyRing>,
-        tenant: TenantId,
-    ) -> Self {
+    pub fn new(inner: Arc<dyn MemoryStore>, keys: Arc<dyn KeyRing>, tenant: TenantId) -> Self {
         Self {
             inner,
             keys,
             tenant,
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: Arc::new(super::LocalCoordinator::new()),
         }
+    }
+
+    /// Serialise this store's lifecycle operations with somebody else's lock.
+    ///
+    /// The default is [`LocalCoordinator`](super::LocalCoordinator), which is a
+    /// process-local mutex and therefore correct for a single-writer deployment
+    /// and **nothing else**. An active-active plane supplies a coordinator that
+    /// spans instances — otherwise a write on the second instance lands under a
+    /// scope the first is destroying, and the erasure reports success over a row
+    /// sealed to a key that no longer exists.
+    #[must_use]
+    pub fn coordinated_by(mut self, coordinator: Arc<dyn super::ErasureCoordinator>) -> Self {
+        self.lifecycle = coordinator;
+        self
+    }
+
+    /// Whether this store's lifecycle lock spans instances.
+    ///
+    /// Read at `build`, so a plane wiring a shared store can refuse a
+    /// single-node coordinator rather than discovering it during an erasure
+    /// that already reported success.
+    #[must_use]
+    pub fn is_distributed(&self) -> bool {
+        self.lifecycle.is_distributed()
+    }
+
+    /// The lifecycle lock's scope: one per **tenant**, not per subject.
+    ///
+    /// Per-subject would be finer and is not available: `forget`,
+    /// `forget_cascading` and `set_legal_hold` are addressed by item id, and
+    /// `sweep_expired` spans every subject at once. Looking a subject up to
+    /// decide which lock to take is a read that races the very thing the lock
+    /// protects — so the scope is the widest operation's scope, which is what
+    /// the process-local mutex this replaced was already doing.
+    fn lifecycle_scope(&self) -> String {
+        super::scope(&self.tenant, "memory-lifecycle")
     }
 
     fn scope(&self, subject: &str) -> String {
@@ -174,30 +215,32 @@ impl EncryptedMemoryStore {
         at: Timestamp,
         reason: &str,
     ) -> Result<usize, StoreError> {
-        let _guard = self.lifecycle.lock().await;
-        let current = self
-            .inner
-            .recall(&Recall::about(subject).limit(usize::MAX))
-            .await?;
-        for item in &current {
-            if self.inner.legal_hold(&item.id).await? {
-                return Err(StoreError::Backend(format!(
-                    "memory '{}' is under legal hold",
-                    item.id
-                )));
+        super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
+            let current = self
+                .inner
+                .recall(&Recall::about(subject).limit(usize::MAX))
+                .await?;
+            for item in &current {
+                if self.inner.legal_hold(&item.id).await? {
+                    return Err(StoreError::Backend(format!(
+                        "memory '{}' is under legal hold",
+                        item.id
+                    )));
+                }
             }
-        }
-        self.keys
-            .destroy(&self.scope(subject), at, reason)
-            .await
-            .map_err(key_error)?;
-        match self.inner.forget_subject(subject).await {
-            Ok(count) => Ok(count),
-            Err(error) => {
-                tracing::warn!(%subject, %error, "memory key was destroyed but ciphertext cleanup failed");
-                Ok(current.len())
+            self.keys
+                .destroy(&self.scope(subject), at, reason)
+                .await
+                .map_err(key_error)?;
+            match self.inner.forget_subject(subject).await {
+                Ok(count) => Ok(count),
+                Err(error) => {
+                    tracing::warn!(%subject, %error, "memory key was destroyed but ciphertext cleanup failed");
+                    Ok(current.len())
+                }
             }
-        }
+        })
+        .await
     }
 }
 
@@ -208,17 +251,25 @@ fn key_error(error: KeyError) -> StoreError {
 
 #[async_trait]
 impl MemoryStore for EncryptedMemoryStore {
+    /// This store *does* have a lifecycle lock, so the answer is never `None` —
+    /// and whether it spans instances is the coordinator's to say.
+    fn erasure_is_distributed(&self) -> Option<bool> {
+        Some(self.lifecycle.is_distributed())
+    }
+
     async fn remember(&self, item: &MemoryItem) -> Result<u64, StoreError> {
-        let _guard = self.lifecycle.lock().await;
-        let mut sealed = item.clone();
-        sealed.content = self.seal(item).await?;
-        sealed.derived_from.clear();
-        for source in &item.derived_from {
-            sealed
-                .derived_from
-                .push(self.backing_selection(source).await?);
-        }
-        self.inner.remember(&sealed).await
+        super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
+            let mut sealed = item.clone();
+            sealed.content = self.seal(item).await?;
+            sealed.derived_from.clear();
+            for source in &item.derived_from {
+                sealed
+                    .derived_from
+                    .push(self.backing_selection(source).await?);
+            }
+            self.inner.remember(&sealed).await
+        })
+        .await
     }
 
     async fn recall(&self, query: &Recall) -> Result<Vec<MemoryItem>, StoreError> {
@@ -238,13 +289,17 @@ impl MemoryStore for EncryptedMemoryStore {
     }
 
     async fn forget(&self, id: &str) -> Result<(), StoreError> {
-        let _guard = self.lifecycle.lock().await;
-        self.inner.forget(id).await
+        super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
+            self.inner.forget(id).await
+        })
+        .await
     }
 
     async fn forget_subject(&self, subject: &str) -> Result<usize, StoreError> {
-        let _guard = self.lifecycle.lock().await;
-        self.inner.forget_subject(subject).await
+        super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
+            self.inner.forget_subject(subject).await
+        })
+        .await
     }
 
     async fn derivatives(&self, id: &str) -> Result<Vec<MemoryItem>, StoreError> {
@@ -257,13 +312,17 @@ impl MemoryStore for EncryptedMemoryStore {
     }
 
     async fn forget_cascading(&self, id: &str) -> Result<usize, StoreError> {
-        let _guard = self.lifecycle.lock().await;
-        self.inner.forget_cascading(id).await
+        super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
+            self.inner.forget_cascading(id).await
+        })
+        .await
     }
 
     async fn set_legal_hold(&self, id: &str, held: bool) -> Result<(), StoreError> {
-        let _guard = self.lifecycle.lock().await;
-        self.inner.set_legal_hold(id, held).await
+        super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
+            self.inner.set_legal_hold(id, held).await
+        })
+        .await
     }
 
     async fn legal_hold(&self, id: &str) -> Result<bool, StoreError> {
@@ -271,8 +330,10 @@ impl MemoryStore for EncryptedMemoryStore {
     }
 
     async fn sweep_expired(&self, at: Timestamp) -> Result<usize, StoreError> {
-        let _guard = self.lifecycle.lock().await;
-        self.inner.sweep_expired(at).await
+        super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
+            self.inner.sweep_expired(at).await
+        })
+        .await
     }
 
     async fn touch(&self, ids: &[String], at: Timestamp) -> Result<(), StoreError> {

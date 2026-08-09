@@ -531,6 +531,7 @@ async fn an_orphaned_mutating_effect_is_quarantined_not_retried() {
                         input: json!({}),
                         input_label: agentplane::core::Label::trusted(),
                         policy_bundle: None,
+                        canon: agentplane::core::canon::VERSION,
                     },
                 ),
                 // Replay reads the plan back from history rather than

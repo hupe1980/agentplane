@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.11.0"
+version      = "0.12.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -235,6 +235,16 @@ aws-sdk-bedrockruntime = { version = "1.139.0", default-features = false, featur
 aws-smithy-types = { version = "1.6.1", optional = true }
 
 [dev-dependencies]
+# An **independent** A2A server, as a test double. The conformance kit validates
+# servers, so this crate's *client* had no outside authority to talk to — the
+# one interoperability gap the kit cannot close. Pre-1.0 churn is tolerable for a
+# test double in a way it is not for a shipped boundary: nothing in `src/` links
+# these, and `cargo package` does not carry dev-dependencies.
+#
+# `default-features = false`: the default pulls a TLS stack this needs for
+# nothing — the double binds a loopback port over plain HTTP.
+a2a-lf = { version = "0.3.0", default-features = false }
+a2a-server-lf = { version = "0.4.1", default-features = false }
 # For the Bedrock unit tests: a stub HTTP client, so building an SDK `Config`
 # never constructs the default TLS provider. That provider reads the OS trust
 # store eagerly, and under a fully parallel test run the macOS keychain read

@@ -135,6 +135,10 @@ impl AtomicJournal for StagedAtomic {
 
 #[async_trait]
 impl JournalStore for StagedAtomic {
+    fn is_shared(&self) -> bool {
+        self.inner.is_shared()
+    }
+
     fn tenant(&self) -> &str {
         self.inner.tenant()
     }

@@ -201,6 +201,22 @@ pub trait JournalStore: Send + Sync + Debug {
     /// would leave a journal that describes something that never happened.
     async fn append(&self, epoch: Epoch, batch: Vec<Append>) -> Result<Vec<Record>, StoreError>;
 
+    /// Whether more than one plane instance can write to this store.
+    ///
+    /// **No default, deliberately.** A default of `false` would let an
+    /// embedder's shared backend answer *single-writer* by saying nothing, and
+    /// the runtime uses this answer to refuse configurations that are unsafe on
+    /// a shared store — and a control that fails open when an implementer forgets
+    /// is not a control. It would be a property the runtime *relies on* while
+    /// only the implementations this crate happens to ship establish it.
+    ///
+    /// Answer `true` if two processes pointed at the same durable state can
+    /// both append. `redb` is a file with a single writer and answers `false`;
+    /// `PostgreSQL` is the topology an embedded store cannot serve and answers
+    /// `true`. A decorator delegates to what it wraps — the question is about
+    /// the durable state, not about the layers in front of it.
+    fn is_shared(&self) -> bool;
+
     /// This store's own transaction, when a co-located resource can join it.
     ///
     /// `None` — the default — means the backend cannot offer it, which is the

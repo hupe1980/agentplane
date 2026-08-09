@@ -456,6 +456,7 @@ async fn journal_is_apart(acme: &PostgresStore, globex: &PostgresStore) {
                 input_label: agentplane::core::Label::trusted(),
                 input: serde_json::Value::Null,
                 policy_bundle: None,
+                canon: agentplane::core::canon::VERSION,
             },
         )],
     )
@@ -924,4 +925,101 @@ async fn an_unconvertible_column_is_refused_rather_than_nulled() {
         msg.contains("at") && msg.contains("does not convert"),
         "the refusal did not say which column or why: {msg}"
     );
+}
+
+/// The erasure lock actually excludes a second instance.
+///
+/// Gated on `keyring` as well as `postgres`, because the coordinator is only
+/// meaningful beside an `EncryptedMemoryStore` — and `just test-postgres` turns
+/// both on so this runs where the backend it is about lives.
+///
+/// The property the whole coordinator seam exists for, and the one a
+/// process-local mutex cannot have. `EncryptedMemoryStore` used to serialise
+/// subject erasure against writes and legal-hold changes with a
+/// `tokio::sync::Mutex` — correct on a single writer, and silently nothing on an
+/// active-active plane, where a write on the second instance lands under a scope
+/// the first is destroying and the erasure reports success over a row sealed to
+/// a key that no longer exists.
+///
+/// Two coordinators here are two *instances*: separate objects, separate pooled
+/// sessions, one database. The first holds the lock; the second must not get it
+/// until the first releases. Both halves are asserted, because a coordinator
+/// that never grants is as broken as one that always does — and the second half
+/// is what a `try_lock`-shaped mistake would fail.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn the_erasure_lock_excludes_a_second_instance() {
+    use agentplane::keyring::ErasureCoordinator;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+
+    let one = PostgresStore::connect(&url).await.expect("connect");
+    let two = PostgresStore::connect(&url).await.expect("connect");
+    let a = one.erasure_coordinator();
+    let b = two.erasure_coordinator();
+    assert!(
+        a.is_distributed(),
+        "a coordinator that answers `false` here would be refused beside a \
+         shared store, which is the point of asking"
+    );
+
+    let scope = "acme/memory-lifecycle";
+    let held = a
+        .acquire(scope)
+        .await
+        .expect("first instance takes the lock");
+
+    // Probed with `pg_try_advisory_lock` on a third session rather than by
+    // cancelling a real `acquire`. Dropping an in-flight `pg_advisory_lock`
+    // returns a connection to the pool with a query still outstanding and the
+    // lock's fate unknown — so the obvious `timeout(b.acquire(..))` deadlocks
+    // the *next* user of that connection, which is how this test first hung.
+    // The hazard is real beyond the test and is recorded on `acquire`: it is
+    // not cancel-safe, and callers must use `under_lock`.
+    let probe = PostgresStore::connect(&url).await.expect("connect");
+    let held_by_someone: bool = probe
+        .erasure_probe(scope)
+        .await
+        .expect("probe the lock without taking it");
+    assert!(
+        held_by_someone,
+        "a second session could take a lock the first was holding — the erasure \
+         window this seam exists to close is open"
+    );
+
+    // The negative half: an unheld scope probes as free, or the probe is a
+    // constant and the assertion above proves nothing.
+    assert!(
+        !probe
+            .erasure_probe("nobody/memory-lifecycle")
+            .await
+            .expect("probe"),
+        "the probe reports every scope as locked, so it distinguishes nothing"
+    );
+
+    // And it is granted once the holder releases, or the lock is a deadlock.
+    a.release(held).await.expect("release");
+    let after = tokio::time::timeout(std::time::Duration::from_secs(30), b.acquire(scope))
+        .await
+        .expect("the second instance never got the lock after it was released")
+        .expect("acquire");
+    b.release(after).await.expect("release");
+
+    // A different scope is never contended, or one tenant's erasure would stop
+    // every other tenant's writes.
+    let x = a.acquire("acme/memory-lifecycle").await.expect("a");
+    let y = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        b.acquire("other/memory-lifecycle"),
+    )
+    .await
+    .expect("a different scope must not be blocked by this one")
+    .expect("acquire");
+    a.release(x).await.expect("release");
+    b.release(y).await.expect("release");
 }

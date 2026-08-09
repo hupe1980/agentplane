@@ -79,6 +79,10 @@ struct NoExactlyOnce {
 
 #[async_trait::async_trait]
 impl JournalStore for NoExactlyOnce {
+    fn is_shared(&self) -> bool {
+        self.inner.is_shared()
+    }
+
     async fn append(
         &self,
         epoch: agentplane::core::Epoch,

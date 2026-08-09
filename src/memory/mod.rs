@@ -613,6 +613,20 @@ impl From<StoreError> for MemoryError {
 /// Where memories live.
 #[async_trait]
 pub trait MemoryStore: Send + Sync + Debug {
+    /// Whether this store's erasure lifecycle lock spans instances.
+    ///
+    /// `None` — the default, and the honest answer for most stores — means
+    /// there is no lifecycle lock because there is no cryptographic erasure to
+    /// serialise. `Some(false)` means there is one and it is process-local, so
+    /// a plane sharing its durable state with another instance would have a
+    /// window between an erasure's hold check and its key destruction in which
+    /// the other instance can write. The runtime refuses that pairing at
+    /// `build`, which is why this is a question a store can be asked rather
+    /// than a fact an operator has to remember.
+    fn erasure_is_distributed(&self) -> Option<bool> {
+        None
+    }
+
     /// Append a new version of a memory.
     ///
     /// Appends rather than replaces: the previous version is marked superseded

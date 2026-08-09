@@ -90,6 +90,12 @@ fn sealing(e: &super::KeyError) -> StoreError {
 
 #[async_trait]
 impl JournalStore for SealedJournal {
+    /// The durable state's answer, not this decorator's: sealing payloads
+    /// changes what is readable, never how many writers there are.
+    fn is_shared(&self) -> bool {
+        self.inner.is_shared()
+    }
+
     fn tenant(&self) -> &str {
         self.inner.tenant()
     }

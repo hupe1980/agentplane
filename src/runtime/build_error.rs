@@ -87,6 +87,18 @@ pub enum BuildError {
         grants: String,
     },
 
+    /// A process-local erasure lock beside a store two instances can write.
+    #[error(
+        "this plane's journal store is shared between instances, and its \
+         governed memory is sealed with a **process-local** erasure lock — so \
+         the window between an erasure's legal-hold check and its key \
+         destruction is open to the other instance, which can write an item \
+         that ends up sealed under a scope about to stop existing. The erasure \
+         would report success. Wire a coordinator that spans instances: \
+         `EncryptedMemoryStore::new(..).coordinated_by(Arc::new(store.erasure_coordinator()))`"
+    )]
+    ErasureCoordinatorNotShared,
+
     /// An agent declares oversight on a plane that cannot ask anybody.
     ///
     /// The same shape as [`DeclarativeToolsUnreachable`](Self::DeclarativeToolsUnreachable),

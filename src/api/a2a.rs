@@ -826,6 +826,8 @@ pub struct A2aServer {
     card: AgentCard,
     extended: ExtendedAgentCard,
     /// The card's advertised skill ids — what a caller may ask for.
+    /// Each agent's own card, by agent name.
+    per_agent: std::collections::BTreeMap<String, crate::peers::AgentCard>,
     skills: Vec<String>,
     push: Option<PushRuntime>,
 }
@@ -906,6 +908,18 @@ pub enum ServerSetupError {
     Card(#[from] crate::manifest::ManifestError),
     #[error("push changes the signed Agent Card; configure it before calling signing_cards_with")]
     CardAlreadySigned,
+    #[error(
+        "an A2A server serves at least one agent, and no manifest was given —          the well-known card path must answer with a card describing something"
+    )]
+    NoAgents,
+    #[error(
+        "agents '{first}' and '{second}' both advertise skill '{skill}', so a          request naming it would be a routing decision the caller did not make.          A2A dispatch is named, never inferred: give the skill distinct          capability names, or serve the two agents from separate planes"
+    )]
+    AmbiguousSkill {
+        skill: String,
+        first: String,
+        second: String,
+    },
 }
 
 impl A2aServer {
@@ -926,15 +940,99 @@ impl A2aServer {
         manifest: &Manifest,
         url: impl Into<String>,
     ) -> Result<Self, ServerSetupError> {
+        Self::hosting(runtime, auth, security, &[manifest], url)
+    }
+
+    /// Serve several declared agents from one plane.
+    ///
+    /// A2A's well-known card path is singular per host, so a plane hosting many
+    /// agents could previously give each its own card only by running a server
+    /// per agent. The first manifest is the one the **well-known card
+    /// describes** — a room's orchestrator, in the shape the CLI already uses —
+    /// and every agent additionally gets its own full card at
+    /// [`agent_card_path`](crate::peers::agent_card_path), listed in the
+    /// [`EXT_AGENT_DIRECTORY`](crate::peers::EXT_AGENT_DIRECTORY) extension so
+    /// a caller can find them.
+    ///
+    /// Skill dispatch spans every agent, because they are all on the runtime
+    /// already — what was missing was only discovery. Two agents advertising
+    /// one skill id is **refused**: dispatch names a skill, and a name that
+    /// resolves to two agents is a routing decision the caller did not make.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerSetupError::NoPolicy`], [`ServerSetupError::NoCases`],
+    /// [`ServerSetupError::NoAgents`] for an empty slice, or
+    /// [`ServerSetupError::AmbiguousSkill`].
+    pub fn hosting(
+        runtime: Arc<Runtime>,
+        auth: Arc<dyn Authenticator>,
+        security: &crate::peers::CardSecurity,
+        manifests: &[&Manifest],
+        url: impl Into<String>,
+    ) -> Result<Self, ServerSetupError> {
         let policy = runtime.policy().ok_or(ServerSetupError::NoPolicy)?.clone();
         if runtime.cases().is_none() {
             return Err(ServerSetupError::NoCases);
         }
+        let [primary, rest @ ..] = manifests else {
+            return Err(ServerSetupError::NoAgents);
+        };
         let url = url.into();
-        let mut card = AgentCard::derive(manifest, url.clone())?;
-        let mut extended = ExtendedAgentCard::derive(manifest, url)?;
+
+        // Every agent's own card, derived exactly as a lone agent's would be —
+        // same digest, same skills, same ceilings. A card that differed because
+        // its agent shared a plane would make the plane part of the identity a
+        // consumer pins, which the room work already refused for manifests.
+        let mut directory = Vec::new();
+        let mut per_agent = std::collections::BTreeMap::new();
+        let mut owner_of_skill: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for m in manifests {
+            let name = m.metadata.name.clone();
+            let mut agent_card = AgentCard::derive(m, url.clone())?;
+            security.apply(&mut agent_card);
+            for skill in &agent_card.skills {
+                if let Some(other) = owner_of_skill.insert(skill.id.clone(), name.clone())
+                    && other != name
+                {
+                    return Err(ServerSetupError::AmbiguousSkill {
+                        skill: skill.id.clone(),
+                        first: other,
+                        second: name,
+                    });
+                }
+            }
+            directory.push(serde_json::json!({
+                "name": name,
+                "version": m.metadata.version,
+                "cardPath": crate::peers::agent_card_path(&name),
+                "manifestDigest": m.digest()?.to_hex(),
+                "skills": agent_card.skills.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            }));
+            per_agent.insert(name, agent_card);
+        }
+
+        let mut card = AgentCard::derive(primary, url.clone())?;
+        let mut extended = ExtendedAgentCard::derive(primary, url)?;
         security.apply(&mut card);
         security.apply(&mut extended.public);
+
+        // Only when there is more than one, so a single-agent plane's card is
+        // byte-for-byte what it was: an extension nobody needs is a claim a
+        // verifier has to understand for nothing.
+        if !rest.is_empty() {
+            let ext = crate::peers::AgentExtension {
+                uri: crate::peers::EXT_AGENT_DIRECTORY.to_owned(),
+                description: Some(
+                    "Every agent this plane serves, and where each agent's own card is.".to_owned(),
+                ),
+                required: false,
+                params: Some(serde_json::json!({ "agents": directory })),
+            };
+            card.capabilities.extensions.push(ext.clone());
+            extended.public.capabilities.extensions.push(ext);
+        }
 
         // The card names the tenant only when there is one to route on. A2A's
         // rule is that a client echoes this value back in every request, so
@@ -950,13 +1048,17 @@ impl A2aServer {
             }
         }
 
-        let skills = card.skills.iter().map(|s| s.id.clone()).collect();
+        // The union, because every agent is already on the runtime and a skill
+        // that dispatches but is not accepted here would be a refusal the plane
+        // could have answered.
+        let skills = owner_of_skill.keys().cloned().collect();
         Ok(Self {
             runtime,
             auth,
             policy,
             card,
             extended,
+            per_agent,
             skills,
             push: None,
         })
@@ -1034,6 +1136,10 @@ impl A2aServer {
     pub fn router(self) -> Router {
         Router::new()
             .route(WELL_KNOWN_PATH, get(agent_card))
+            // Unauthenticated like the well-known card, and for the same
+            // reason: a card a caller must already be trusted to read is a card
+            // that cannot be discovered.
+            .route("/agents/{agent}/agent-card.json", get(one_agent_card))
             .route("/a2a", post(rpc))
             .route("/a2a/", post(rpc))
             .with_state(self)
@@ -1422,6 +1528,22 @@ impl A2aPushWorker {
 /// dispatch, which is what makes publishing it safe.
 async fn agent_card(State(server): State<A2aServer>) -> Json<AgentCard> {
     Json(server.card.clone())
+}
+
+/// One agent's own card.
+///
+/// A 404 for an unknown name, deliberately naming nothing: the directory
+/// extension on the well-known card is how a caller learns which names exist,
+/// and answering an unknown one with the list would make this path a way to
+/// enumerate a plane without reading the card that governs it.
+async fn one_agent_card(
+    State(server): State<A2aServer>,
+    axum::extract::Path(agent): axum::extract::Path<String>,
+) -> Response {
+    server.per_agent.get(&agent).map_or_else(
+        || (StatusCode::NOT_FOUND, "no such agent on this plane").into_response(),
+        |card| Json(card.clone()).into_response(),
+    )
 }
 
 async fn rpc(

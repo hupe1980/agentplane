@@ -605,6 +605,13 @@ where
 #[allow(clippy::too_many_lines)]
 #[async_trait]
 impl JournalStore for RedbStore {
+    /// One file, one writer. That single writer is what makes exactly-once a
+    /// table key and fencing race-free here — and it is why a plane that needs
+    /// two instances needs `PostgreSQL` instead.
+    fn is_shared(&self) -> bool {
+        false
+    }
+
     fn tenant(&self) -> &str {
         self.tenant.as_str()
     }

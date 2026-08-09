@@ -382,6 +382,7 @@ fn admitted(run: RunId) -> Append {
             input_label: crate::core::Label::trusted(),
             input: serde_json::Value::Null,
             policy_bundle: None,
+            canon: crate::core::canon::VERSION,
         },
     )
 }

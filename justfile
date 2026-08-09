@@ -113,7 +113,7 @@ test-minimal:
 # alone, and the case-layer battery with it, so the shared-store backend was
 # untestable and unreachable in the configuration a Postgres deployment ships.
 test-postgres:
-    cargo test --no-default-features --features postgres,testkit --test guards postgres::
+    cargo test --no-default-features --features postgres,testkit,keyring --test guards postgres::
 
 # the key-ring contract, against a real Vault container
 #

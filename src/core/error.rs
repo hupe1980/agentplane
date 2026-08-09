@@ -114,6 +114,27 @@ pub enum RuntimeError {
         configured: Option<crate::core::Digest>,
     },
 
+    /// The history was written under a different canonicalization rule.
+    ///
+    /// Not a divergence, and reporting it as one is the defect this exists to
+    /// remove: every effect key comes out of the canonicalizer, so a rule change
+    /// moves all of them at once and a healthy run replays as *non-determinism*.
+    /// The run is **unverifiable by this build**, which is a different claim and
+    /// the one the evidence supports.
+    ///
+    /// The journal chain is unaffected — it hashes the bytes it stored rather
+    /// than re-canonicalizing them — so the history is intact and readable; it
+    /// simply cannot be re-derived here. Before format freeze the answer is to
+    /// recreate; after it, a build that means to read old history implements the
+    /// old rule and selects on this number.
+    #[error(
+        "this run's derived digests were produced by canonicalization rule \
+         {recorded} and this build implements {implemented}, so its effect keys \
+         cannot be recomputed here. The journal is intact — the chain hashes \
+         stored bytes, not re-canonicalized ones — and this is not a divergence"
+    )]
+    CanonicalizationChanged { recorded: u16, implemented: u16 },
+
     /// Nothing on this plane answers to the name `run` was given.
     ///
     /// Carries what the plane *does* provide, because the question a reader has

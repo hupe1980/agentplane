@@ -368,6 +368,7 @@ async fn a_crash_orphan_is_resolved_by_the_probe_rather_than_escalated() {
                         input: json!({}),
                         input_label: agentplane::core::Label::trusted(),
                         policy_bundle: None,
+                        canon: agentplane::core::canon::VERSION,
                     },
                 ),
                 Append::new(
@@ -446,6 +447,7 @@ async fn strict_replay_of_an_orphan_neither_performs_nor_probes_nor_writes() {
                         input: json!({}),
                         input_label: agentplane::core::Label::trusted(),
                         policy_bundle: None,
+                        canon: agentplane::core::canon::VERSION,
                     },
                 ),
                 Append::new(

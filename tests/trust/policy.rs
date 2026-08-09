@@ -572,6 +572,7 @@ async fn an_open_run_refuses_to_resume_under_a_different_policy_bundle() {
                         input: json!({}),
                         input_label: agentplane::core::Label::trusted(),
                         policy_bundle: Some(admitted),
+                        canon: agentplane::core::canon::VERSION,
                     },
                 ),
                 Append::new(

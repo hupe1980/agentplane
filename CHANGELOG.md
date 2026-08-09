@@ -2,11 +2,18 @@
 
 Notable changes per release, following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Pre-alpha, and versioned accordingly.** The crate is not published; `0.x` bumps
+**Pre-alpha, and versioned accordingly.** The crate *is* published — `0.x` bumps
 carry breaking changes without deprecation cycles, because a hard cut is cheaper
-than a compatibility shim nobody has yet depended on. Every breaking entry says
-what to do about it, and [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/)
+than a compatibility shim, and pre-1.0 is the window in which that is an honest
+trade rather than a broken promise. Every breaking entry says what to do about
+it, and [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/)
 carries the ones that need more than a sentence.
+
+This line used to read *the crate is not published*, which stopped being true at
+the first release and stayed on the page — the shape this project catalogues as a
+premise that expired. It matters more here than most: an entry's audience is
+somebody who already depends on a version, so "nobody has yet depended on it" is
+exactly the assumption a changelog may not make.
 
 **This file carries the reasoning, not just the diff.** It used to share that job
 with a status page listing everything built — two hundred rows, nearly all of them
@@ -22,6 +29,104 @@ and how to check either. What *exists* is answered by the
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rather
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
+
+## [0.12.0] — 2026-08-09
+
+### Fixed — testing
+
+- **A flaky Vault container test.** `WaitFor` matching a stdout line means the
+  process printed it, not that Docker has finished publishing the port, so a
+  one-shot `get_host_port_ipv4` failed as `PortNotExposed` on a loaded machine.
+  Both call sites now retry within a bound; a genuinely dead container still
+  fails loudly. Worth an entry because a flake trains people to re-run rather
+  than read, which costs more than the test is worth.
+
+### Fixed — interoperability
+
+- **An absent `tenant` was sent as JSON `null` instead of being omitted**, and a
+  comment above the line said *"omitted entirely when the interface declares
+  none"* — which is what it was meant to do and not what it did. `json!` renders
+  `None` as `null`; ProtoJSON omits a field at its default value, so the
+  reference server answered `invalid type: null, expected a string`. The same
+  bug was in `GetTask` and in the governance extension's `provenance`.
+
+  **This crate's own server accepted all of it** — `serde` reads `null` into an
+  `Option` as `None` — so every in-repo test agreed with the bug. It took a
+  server nobody here wrote to find it, on the first round trip.
+
+### Added
+
+- **Client-side interoperability evidence, against an independent server.** The
+  protocol project's conformance kit validates *servers*, so this crate's client
+  had no outside authority to talk to — the one interoperability gap the kit
+  cannot close, and a release blocker. `a2a-server-lf` (the reference Rust SDK's
+  server) now stands up in-process as a **dev-dependency** test double: its
+  request handler, its task store, its JSON-RPC framing, none of it written
+  here. Two tests: a full `SendMessage` round trip, and a disposition mapping
+  taken from the reference server's own refusal rather than from a canned
+  fixture written to this crate's reading of the spec.
+
+  Pre-1.0 churn is acceptable here in a way it is not on a shipped boundary:
+  nothing in `src/` links these crates and `cargo package` does not carry
+  dev-dependencies. `default-features = false` keeps a TLS stack out of it — the
+  double binds a loopback port over plain HTTP.
+
+- **Canonicalization is versioned, and a rule change reads as *unverifiable*
+  rather than *divergent*.** `core::canon::VERSION` is journaled on
+  `RunAdmitted`, defaulting to `1` on read so a record written before the field
+  existed says the UTF-8 ordering that produced it. Replay compares it before
+  recomputing anything: a run written under another rule is
+  `RuntimeError::CanonicalizationChanged`, not a quarantine.
+
+  Why it mattered: every effect key comes out of the canonicalizer, so the
+  change from UTF-8 byte ordering to RFC 8785's UTF-16 code units moved all of
+  them at once. A replay of healthy history recomputed different keys and
+  reported **non-determinism** — the most serious conclusion this runtime
+  reaches — with nothing on the record to say the rule had moved. The chain was
+  never implicated and the test asserts that too: it hashes the bytes it stored
+  rather than re-canonicalizing them, so a refusal that also implied corruption
+  would be the wrong answer twice.
+
+- **A plane serves an Agent Card per agent.** `A2aServer::hosting(..)` takes
+  several manifests; each agent gets a full card at `/agents/{name}/agent-card.json`,
+  and the well-known path stays one valid card describing the first. A new
+  `agent-directory` extension on that card lists every agent, its card path and
+  its manifest digest. The discriminator is a **path**, not `AgentInterface::tenant`
+  — that field's documented meaning is the tenant id a caller echoes back, so
+  overloading it to select an agent would put two meanings in one string on a
+  multi-tenant plane. Skill dispatch already spanned every agent on the runtime;
+  what was missing was discovery. Two agents advertising one skill id is refused
+  at construction (`ServerSetupError::AmbiguousSkill`), because A2A dispatch is
+  named and a name resolving to two agents is a routing decision the caller did
+  not make. An empty plane is `ServerSetupError::NoAgents`.
+
+- **`ErasureCoordinator`, and a PostgreSQL implementation.**
+  `EncryptedMemoryStore` serialised subject erasure against writes and
+  legal-hold changes with a process-local mutex — correct on a single writer,
+  silently nothing on an active-active plane. The lock is now a seam:
+  `LocalCoordinator` is the mutex, named for what it is and answering
+  `is_distributed() == false`; `PostgresCoordinator` (from
+  `PostgresStore::erasure_coordinator()`) is a **session** advisory lock in the
+  database the plane already shares, so an instance that dies mid-erasure
+  releases by dying. Wire it with `EncryptedMemoryStore::coordinated_by(..)`.
+  Held by a test that races two coordinators against a live PostgreSQL and
+  asserts both halves — the second instance blocks while the first holds, and is
+  granted once it releases.
+
+  **The unsafe pairing is refused at `build`.** `JournalStore::is_shared` (new,
+  and **required** — no default, so a shared backend cannot answer
+  *single-writer* by saying nothing) meets `MemoryStore::erasure_is_distributed`
+  (new, defaulting to `None` for a store with no lifecycle lock), and a shared
+  store beside a process-local lock is `BuildError::ErasureCoordinatorNotShared`.
+  Four cases are pinned, because the two that must still build are what keep it
+  from being a ban.
+
+  `ErasureCoordinator::acquire` is documented as **not cancel-safe**: dropping it
+  mid-flight can leave the lock taken with no lease to release, because the
+  PostgreSQL coordinator has a query outstanding on a pooled connection at that
+  moment. Found by a test that wrapped it in a `timeout` and hung the suite. Use
+  `under_lock`; to ask whether a scope is locked without taking it, use
+  `PostgresStore::erasure_probe`.
 
 ## [0.11.0] — 2026-08-09
 

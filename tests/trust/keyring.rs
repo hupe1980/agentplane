@@ -528,6 +528,7 @@ async fn a_sealed_journal_hides_payloads_and_still_verifies_without_keys() {
                     input_label: Label::trusted(),
                     input: serde_json::json!({ "patient": "Ada Lovelace" }),
                     policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
                 },
             )],
         )
@@ -602,6 +603,7 @@ async fn erasing_the_key_leaves_the_chain_verifiable() {
                     input_label: Label::trusted(),
                     input: serde_json::json!({ "patient": "Ada Lovelace" }),
                     policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
                 },
             )],
         )
@@ -773,6 +775,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
                         input_label: Label::trusted(),
                         input: serde_json::json!({ "claimant": "Ada Lovelace" }),
                         policy_bundle: None,
+                        canon: agentplane::core::canon::VERSION,
                     },
                 )
                 .case(case),
@@ -987,6 +990,7 @@ async fn configuring_a_key_ring_seals_every_store() {
                     input_label: Label::trusted(),
                     input: serde_json::json!({ "who": "Ada" }),
                     policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
                 },
             )],
         )

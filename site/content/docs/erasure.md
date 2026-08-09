@@ -118,9 +118,66 @@ outlives every case, so `erase_case` was never the act that reaches it. Wrap it
 where you can see the deployment:
 
 ```rust
-let memories = EncryptedMemoryStore::new_single_node(inner, Arc::clone(&keys), tenant.clone());
+let memories = EncryptedMemoryStore::new(inner, Arc::clone(&keys), tenant.clone());
 Runtime::builder(store).memory(Arc::new(memories)).keyring(keys).build()
 ```
+
+### Erasing on more than one instance
+
+Destroying a subject's wrapping key is not one operation. It reads the subject's
+items, checks every legal hold, tombstones, and then asks a KMS to destroy the
+scope — and **between the hold check and the destroy**, a write on another
+instance can add an item, or an operator can place a hold on one. Either makes
+the erasure wrong in a way nothing detects: the new item is sealed under a scope
+that is about to stop existing, and the held item is destroyed anyway.
+
+`EncryptedMemoryStore` closed that window with a process-local mutex, which is
+correct on a single writer and silently nothing on an active-active plane. The
+lock is now a seam, and the default is honest about being local:
+
+```rust
+// Single node: the default. `is_distributed()` answers false.
+let memories = EncryptedMemoryStore::new(inner, keys.clone(), tenant.clone());
+
+// Active-active: a session advisory lock in the database the plane shares.
+let memories = EncryptedMemoryStore::new(inner, keys.clone(), tenant.clone())
+    .coordinated_by(Arc::new(store.erasure_coordinator()));
+```
+
+**Why a session advisory lock and not a row.** A row taken with `SELECT … FOR
+UPDATE` needs its transaction held open for the whole erasure, and the erasure's
+own writes go through the store's other connections — so the row lock would be
+held by a transaction that cannot see the work it protects. A *session* lock is
+held by the connection, and `PostgreSQL` releases it when the session ends. That
+last property is the one that chose it: an instance that dies mid-erasure
+releases by dying, where a lease with a TTL must choose between stranding the
+subject and handing it over while the first instance's KMS call may still be in
+flight.
+
+**The lease is not an RAII guard**, deliberately. Releasing a distributed lock is
+async and fallible and `Drop` is neither, so a guard would have to block a
+runtime thread or swallow the failure — and swallowing *that* failure strands the
+subject for every other instance. Use `under_lock`, which releases on the success
+and the failure path.
+
+The scope is per **tenant**, not per subject: `forget`, `forget_cascading` and
+`set_legal_hold` are addressed by item id and `sweep_expired` spans every
+subject, so choosing a subject-scoped lock would need a read that races the very
+thing the lock protects.
+
+**The pairing is refused at `build`.** Both facts are in hand there: the journal
+store says whether two instances can write it (`JournalStore::is_shared`), and
+the memory store says whether its lifecycle lock spans them
+(`MemoryStore::erasure_is_distributed`). A shared store beside a process-local
+lock is `BuildError::ErasureCoordinatorNotShared`, naming the fix.
+
+`is_shared` has **no default**, deliberately. A default of `false` would let an
+embedder's shared backend answer *single-writer* by saying nothing, and a control
+that fails open when an implementer forgets is a property the runtime relies on
+rather than checks. `erasure_is_distributed` *does* default — to `None`, meaning
+"no lifecycle lock because there is no cryptographic erasure here", which is the
+honest answer for an ordinary store and leaves the check inapplicable rather than
+satisfied.
 
 Two properties make it worth having rather than merely present. Only the
 *payload* is sealed: `seq`, `run`, `case`, `effect_key` and the record's own

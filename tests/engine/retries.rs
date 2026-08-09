@@ -550,6 +550,7 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                         input: json!({}),
                         input_label: agentplane::core::Label::trusted(),
                         policy_bundle: None,
+                        canon: agentplane::core::canon::VERSION,
                     },
                 ),
                 Append::new(

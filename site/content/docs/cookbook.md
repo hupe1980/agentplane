@@ -2019,7 +2019,7 @@ runtime derives stable ids and security labels. Coded skills invoke
 that silently stores every conversation.
 
 With feature `keyring`, wrap a single-node memory backend in
-`EncryptedMemoryStore::new_single_node`. Content is ciphertext in the backing
+`EncryptedMemoryStore::new`. Content is ciphertext in the backing
 store. `erase_subject(subject, at, reason)` checks legal holds, destroys the
 tenant/subject wrapping scope, then cleans rows, leaving pre-erasure backups
 undecryptable. This process-local lifecycle coordinator is not an active-active

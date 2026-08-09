@@ -1611,6 +1611,39 @@ provenance block is separately attested and bound to the call, so a peer with th
 workload verifier can check who made that exact request; neither substitutes for
 the peer's own authorization decision.
 
+#### A plane with many agents serves a card for each
+
+A2A's well-known card path is singular per host, so a plane hosting several
+declared agents could give each its own card only by running a server per agent
+— 28 specialists, 28 processes. `A2aServer::hosting(..)` takes the room's
+manifests instead:
+
+```rust
+let server = A2aServer::hosting(runtime, auth, &security, &manifests, url)?;
+// /.well-known/agent-card.json   → the first manifest's card
+// /agents/researcher/agent-card.json → the researcher's own card
+```
+
+**The discriminator is a path, and that is a decision.** The obvious shortcut is
+the `tenant` field A2A puts on every `AgentInterface`, and it is the wrong one:
+its documented meaning is *the tenant id to send back on a request*, so
+overloading it to select an **agent** would make every caller echo an agent name
+into a field reserved for tenancy — and a plane that also serves several tenants
+would then have two meanings in one string.
+
+So the well-known path stays exactly what the specification says: one valid card
+describing one real agent. An `agent-directory` extension on it lists every
+agent, its card path and its **manifest digest**, so a caller can find the rest
+without the plane inventing a discovery endpoint. Each agent's own card is the
+card it would have alone — sharing a plane must not change the identity a
+consumer pins, which is the same rule that makes a document's digest inside a
+room file equal its digest by itself.
+
+Dispatch already spanned every agent, because they are all on the runtime; what
+was missing was only discovery. Two agents advertising **one skill id** is
+refused at construction: A2A dispatch is named, never inferred, and a name
+resolving to two agents is a routing decision the caller did not make.
+
 #### Reading somebody else's card
 
 `CardClient` fetches a card from the well-known path, optionally verifies it, and

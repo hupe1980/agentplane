@@ -464,6 +464,7 @@ async fn sealed_store(n: usize) -> Arc<agentplane::store::RedbStore> {
                         input_label: agentplane::core::Label::trusted(),
                         input: serde_json::Value::Null,
                         policy_bundle: None,
+                        canon: agentplane::core::canon::VERSION,
                     },
                 )],
             )
@@ -605,6 +606,7 @@ async fn a_stale_witness_is_healed_with_a_proof_from_its_cursor() {
                         input_label: agentplane::core::Label::trusted(),
                         input: serde_json::Value::Null,
                         policy_bundle: None,
+                        canon: agentplane::core::canon::VERSION,
                     },
                 )],
             )

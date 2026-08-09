@@ -69,7 +69,7 @@ async fn memory_subject_erasure_makes_backup_ciphertext_unreadable() {
     let inner = Arc::new(RedbStore::open_in_memory().expect("live store"));
     let backup = Arc::new(RedbStore::open_in_memory().expect("backup store"));
     let keys = Arc::new(MemoryKeyRing::new());
-    let encrypted = Arc::new(EncryptedMemoryStore::new_single_node(
+    let encrypted = Arc::new(EncryptedMemoryStore::new(
         Arc::clone(&inner) as Arc<dyn MemoryStore>,
         Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
         tenant.clone(),
@@ -112,7 +112,7 @@ async fn memory_subject_erasure_makes_backup_ciphertext_unreadable() {
         .await
         .expect("destroy subject key");
 
-    let restored = EncryptedMemoryStore::new_single_node(
+    let restored = EncryptedMemoryStore::new(
         Arc::clone(&backup) as Arc<dyn MemoryStore>,
         keys as Arc<dyn agentplane::keyring::KeyRing>,
         tenant,
@@ -131,7 +131,7 @@ async fn encrypted_memory_preserves_plaintext_derivation_commitments() {
     use agentplane::testkit::MemoryKeyRing;
 
     let inner = Arc::new(RedbStore::open_in_memory().expect("store"));
-    let encrypted = EncryptedMemoryStore::new_single_node(
+    let encrypted = EncryptedMemoryStore::new(
         Arc::clone(&inner) as Arc<dyn MemoryStore>,
         Arc::new(MemoryKeyRing::new()),
         TenantId::new("derived-memory").expect("tenant"),
@@ -1669,4 +1669,201 @@ async fn newer_untrusted_memories_cannot_evict_a_trusted_one() {
         2,
         "untrusted memories must still fill the remaining room"
     );
+}
+
+/// The encrypted memory store actually takes the lifecycle lock.
+///
+/// The coordinator seam is only worth having if the store uses it, and nothing
+/// proved that: the key-ring conformance battery is single-threaded, so removing
+/// the lock entirely changes nothing it can observe. A mutation deleting
+/// `under_lock` from `erase_subject` survived it — *weak*, in the harness's own
+/// vocabulary, which is the signal that a guarantee has no test of its own.
+///
+/// So this counts acquisitions rather than racing for them: deterministic, and
+/// it fails for exactly the right reason. The scope is asserted too, because a
+/// lock taken under the wrong name excludes nothing while looking present — the
+/// same shape as sealing under a scope `erase_case` never destroys.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn the_encrypted_memory_store_takes_the_lifecycle_lock() {
+    use agentplane::core::TenantId;
+    use agentplane::keyring::{EncryptedMemoryStore, ErasureCoordinator, Lease, LocalCoordinator};
+    use agentplane::testkit::memory_keyring::MemoryKeyRing;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct Counting {
+        events: Mutex<Vec<String>>,
+        inner: LocalCoordinator,
+    }
+
+    #[async_trait::async_trait]
+    impl ErasureCoordinator for Counting {
+        async fn acquire(&self, scope: &str) -> Result<Lease, agentplane::core::StoreError> {
+            self.events.lock().unwrap().push(scope.to_owned());
+            self.inner.acquire(scope).await
+        }
+        async fn release(&self, lease: Lease) -> Result<(), agentplane::core::StoreError> {
+            self.events.lock().unwrap().push("release".to_owned());
+            self.inner.release(lease).await
+        }
+        fn is_distributed(&self) -> bool {
+            false
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let coordinator = Arc::new(Counting::default());
+    let sealed = EncryptedMemoryStore::new(
+        Arc::clone(&store) as Arc<dyn MemoryStore>,
+        Arc::new(MemoryKeyRing::new()),
+        TenantId::new("acme").expect("tenant"),
+    )
+    .coordinated_by(coordinator.clone());
+
+    sealed
+        .remember(&item(
+            "m-1",
+            "customer/7",
+            json!("a note"),
+            Trust::Untrusted,
+        ))
+        .await
+        .expect("remember");
+    sealed
+        .erase_subject("customer/7", at(1_760_000_100), "rtbf")
+        .await
+        .expect("erase");
+
+    let events = coordinator.events.lock().unwrap().clone();
+    let acquires: Vec<&String> = events.iter().filter(|e| *e != "release").collect();
+    assert_eq!(
+        acquires.len(),
+        2,
+        "a write and an erasure must each take the lock: {events:?}"
+    );
+    assert!(
+        acquires
+            .iter()
+            .all(|e| e.as_str() == "acme/memory-lifecycle"),
+        "the lock was taken under the wrong scope, which excludes nothing while \
+         looking present: {events:?}"
+    );
+    assert_eq!(
+        events.iter().filter(|e| *e == "release").count(),
+        2,
+        "a lock taken and not released strands the subject for every other \
+         instance: {events:?}"
+    );
+}
+
+/// A process-local erasure lock beside a shared store refuses the build.
+///
+/// `is_distributed()` answered the question and nothing checked it, so wiring
+/// the local coordinator onto an active-active plane was a mistake the runtime
+/// could see and did not stop — the exact shape this project calls a defect in
+/// itself. Both facts are in hand at `build`: the store says whether two
+/// instances can write it, the memory store says whether its lifecycle lock
+/// spans them.
+///
+/// Four cases, because the two that must *build* are what keep this from being
+/// a ban: only shared-store **and** local-lock is refused.
+#[cfg(feature = "keyring")]
+#[test]
+fn a_local_erasure_lock_beside_a_shared_store_is_refused() {
+    use agentplane::core::TenantId;
+    use agentplane::keyring::{EncryptedMemoryStore, ErasureCoordinator, Lease};
+    use agentplane::runtime::BuildError;
+    use agentplane::testkit::memory_keyring::MemoryKeyRing;
+
+    /// Answers `true` without needing a database, so the refusal can be tested
+    /// without one — the check is about the two answers, not about `PostgreSQL`.
+    #[derive(Debug, Default)]
+    struct Spanning(agentplane::keyring::LocalCoordinator);
+
+    #[async_trait::async_trait]
+    impl ErasureCoordinator for Spanning {
+        async fn acquire(&self, scope: &str) -> Result<Lease, agentplane::core::StoreError> {
+            self.0.acquire(scope).await
+        }
+        async fn release(&self, lease: Lease) -> Result<(), agentplane::core::StoreError> {
+            self.0.release(lease).await
+        }
+        fn is_distributed(&self) -> bool {
+            true
+        }
+    }
+
+    let tenant = TenantId::new("acme").expect("tenant");
+    let sealed = |distributed: bool| {
+        let store = Arc::new(
+            RedbStore::open_in_memory()
+                .expect("store")
+                .for_tenant(TenantId::new("acme").expect("tenant")),
+        );
+        let mut m = EncryptedMemoryStore::new(
+            Arc::clone(&store) as Arc<dyn MemoryStore>,
+            Arc::new(MemoryKeyRing::new()),
+            tenant.clone(),
+        );
+        if distributed {
+            m = m.coordinated_by(Arc::new(Spanning::default()));
+        }
+        Arc::new(m) as Arc<dyn MemoryStore>
+    };
+
+    // A shared journal is what makes the pairing unsafe. `SharedJournal` here
+    // is a decorator answering `is_shared() == true` over redb, so the refusal
+    // is exercised without a container.
+    let shared = || {
+        Arc::new(agentplane::testkit::SharedJournal::new(Arc::new(
+            RedbStore::open_in_memory()
+                .expect("store")
+                .for_tenant(TenantId::new("acme").expect("tenant")),
+        ))) as Arc<dyn JournalStore>
+    };
+    let single = || {
+        Arc::new(
+            RedbStore::open_in_memory()
+                .expect("store")
+                .for_tenant(TenantId::new("acme").expect("tenant")),
+        ) as Arc<dyn JournalStore>
+    };
+
+    // Refused: shared store, process-local lock.
+    let err = Runtime::builder(shared())
+        .tenant(tenant.clone())
+        .memory(sealed(false))
+        .try_build()
+        .expect_err("a local erasure lock beside a shared store was accepted");
+    assert!(
+        matches!(err, BuildError::ErasureCoordinatorNotShared),
+        "wrong refusal: {err}"
+    );
+
+    // Builds: shared store, coordinator that spans instances.
+    Runtime::builder(shared())
+        .tenant(tenant.clone())
+        .memory(sealed(true))
+        .try_build()
+        .expect("a coordinator that spans instances is the fix, and must build");
+
+    // Builds: single-writer store, process-local lock — the ordinary case.
+    Runtime::builder(single())
+        .tenant(tenant.clone())
+        .memory(sealed(false))
+        .try_build()
+        .expect("a process-local lock is correct on a single writer");
+
+    // Builds: shared store, memory that does no cryptographic erasure at all.
+    let plain = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(TenantId::new("acme").expect("tenant")),
+    );
+    Runtime::builder(shared())
+        .tenant(tenant)
+        .memory(Arc::clone(&plain) as Arc<dyn MemoryStore>)
+        .try_build()
+        .expect("a store with no lifecycle lock has nothing to coordinate");
 }

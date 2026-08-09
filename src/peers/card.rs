@@ -103,6 +103,35 @@ pub const EXT_MANIFEST_PROVENANCE: &str =
 /// The extension that carries tools, budget and topology on the extended card.
 pub const EXT_GOVERNANCE: &str = "https://hupe1980.github.io/agentplane/a2a/ext/governance/v1";
 
+/// The extension that lists every agent a plane serves, and where each card is.
+///
+/// # Why an extension rather than `AgentInterface::tenant`
+///
+/// A2A's well-known card path is singular per host, so a plane hosting several
+/// declared agents could give each its own card only by running a server per
+/// agent — 28 specialists, 28 processes. The obvious shortcut is the `tenant`
+/// field A2A already puts on every interface, and it is the wrong one: its
+/// documented meaning is *the tenant id to send back on a request*, so
+/// overloading it to select an **agent** would make every caller echo an agent
+/// name into a field the protocol reserves for tenancy — and a plane that also
+/// serves several tenants would then have two meanings in one string.
+///
+/// So the discriminator is a path, and this extension is the directory that
+/// makes the paths discoverable. The well-known card stays exactly what the
+/// specification says it is: one valid `AgentCard`, describing one real agent.
+pub const EXT_AGENT_DIRECTORY: &str =
+    "https://hupe1980.github.io/agentplane/a2a/ext/agent-directory/v1";
+
+/// Where one agent's own card is served.
+///
+/// A path rather than a full URL, because the card is served from whatever host
+/// the caller reached and a card that hard-coded one would be wrong behind a
+/// proxy — the same reason the interface URL is deployment configuration.
+#[must_use]
+pub fn agent_card_path(agent: &str) -> String {
+    format!("/agents/{agent}/agent-card.json")
+}
+
 impl CardCapabilities {
     /// What this crate can actually do.
     const fn implemented() -> Self {

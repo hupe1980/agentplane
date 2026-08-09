@@ -64,6 +64,32 @@ spec:
     provides: [settlement.check, settlement.reverse]
 "#;
 
+/// Two agents in one file, the Kubernetes packaging convention. The first is
+/// the one the well-known card describes.
+const TWO_AGENTS: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata:
+  name: desk
+  version: "1.0.0"
+spec:
+  budgets:
+    max_steps: 5
+  capabilities:
+    provides: [support.answer]
+---
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata:
+  name: researcher
+  version: "1.0.0"
+spec:
+  budgets:
+    max_steps: 5
+  capabilities:
+    provides: [research.dig]
+"#;
+
 /// What a skill saw: whether its input was untrusted, its provenance, the value.
 type Seen = Arc<Mutex<Vec<(bool, Vec<String>, Value)>>>;
 
@@ -173,13 +199,16 @@ struct Fixture {
 }
 
 fn fixture_from(yaml: &str, policy: Arc<Recording>) -> Fixture {
-    let manifest = Manifest::parse(yaml).expect("parse");
+    // `parse_all`, so a room file wires every agent onto the one plane — which
+    // is the arrangement the per-agent card work exists to serve.
+    let all = Manifest::parse_all(yaml).expect("parse");
+    let manifest = all.first().expect("at least one agent").clone();
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));
     let mut builder = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>)
         .policy(policy.clone() as Arc<dyn PolicyEngine>);
-    for cap in &manifest.spec.capabilities.provides {
+    for cap in all.iter().flat_map(|m| &m.spec.capabilities.provides) {
         // Leaked so the descriptor can hold a `&'static str`; these live for the
         // test process either way.
         let cap: &'static str = Box::leak(cap.clone().into_boxed_str());
@@ -2917,4 +2946,188 @@ async fn a_parameter_that_belongs_to_another_method_is_refused() {
         ok["result"]["task"]["id"].is_string(),
         "a specification-defined field was refused: {ok:#}"
     );
+}
+
+/// A plane serves a card per agent, and the well-known one says where they are.
+///
+/// A2A's well-known card path is singular per host, so a plane hosting several
+/// declared agents could give each its own card only by running a server per
+/// agent — 28 specialists, 28 processes. The discriminator is deliberately a
+/// **path** and not `AgentInterface::tenant`: that field's documented meaning is
+/// the tenant id a caller echoes back on every request, so overloading it to
+/// select an *agent* would put two meanings in one string the moment a plane
+/// served several tenants too.
+///
+/// Three things are asserted, and the third is the one that keeps this honest:
+/// the well-known card is still a single valid card describing a real agent; the
+/// directory extension names every agent and where its card is; and **skill
+/// dispatch spans all of them**, because they were always on the runtime and
+/// what was missing was only discovery.
+#[tokio::test]
+async fn a_plane_serves_one_card_per_agent_and_a_directory() {
+    let f = fixture_from(TWO_AGENTS, Arc::new(Recording::default()));
+    let manifests = Manifest::parse_all(TWO_AGENTS).expect("two agents");
+    let refs: Vec<&Manifest> = manifests.iter().collect();
+    let server = A2aServer::hosting(
+        f.rt.clone(),
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &refs,
+        "https://plane.internal/a2a",
+    )
+    .expect("a plane may host several agents");
+    let router = server.router();
+
+    // 1. The well-known path is still one valid card, describing a real agent.
+    let http = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/agent-card.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(http.status(), StatusCode::OK);
+    let card: Value = serde_json::from_slice(
+        &axum::body::to_bytes(http.into_body(), 256 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(card["name"], "desk", "{card:#}");
+
+    // 2. The directory extension names every agent and its card path.
+    let directory = card["capabilities"]["extensions"]
+        .as_array()
+        .expect("extensions")
+        .iter()
+        .find(|e| e["uri"].as_str() == Some(agentplane::peers::EXT_AGENT_DIRECTORY))
+        .expect("the directory extension is absent")["params"]["agents"]
+        .as_array()
+        .expect("agents")
+        .clone();
+    let names: Vec<&str> = directory
+        .iter()
+        .filter_map(|a| a["name"].as_str())
+        .collect();
+    assert_eq!(names, ["desk", "researcher"], "{directory:#?}");
+    assert!(
+        directory
+            .iter()
+            .all(|a| a["manifestDigest"].as_str().is_some_and(|d| d.len() == 64)),
+        "every entry carries the digest a consumer pins: {directory:#?}"
+    );
+
+    // 3. Each agent's own card is served, and is the card it would have alone —
+    //    sharing a plane must not change the identity a consumer pins.
+    for (name, expect_skill) in [("desk", "support.answer"), ("researcher", "research.dig")] {
+        let http = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(agentplane::peers::agent_card_path(name))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(http.status(), StatusCode::OK, "{name}");
+        let one: Value = serde_json::from_slice(
+            &axum::body::to_bytes(http.into_body(), 256 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(one["name"], name);
+        assert_eq!(one["skills"][0]["id"], expect_skill, "{one:#}");
+    }
+
+    // An unknown agent is a plain 404 that enumerates nothing.
+    let http = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/agents/nobody/agent-card.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(http.status(), StatusCode::NOT_FOUND);
+
+    // 4. Dispatch spans both agents — the non-primary one is reachable.
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": {
+                "messageId": "m-1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "go"}],
+                "metadata": {"skill": "research.dig"}
+            }}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert!(
+        sent["result"]["task"]["id"].is_string(),
+        "the second agent's skill did not dispatch: {sent:#}"
+    );
+}
+
+/// Two agents claiming one skill is refused at construction.
+///
+/// A2A dispatch is **named, never inferred** — that is the rule that keeps a
+/// model reading attacker-controlled text out of the decision about which
+/// capability runs. A skill id resolving to two agents would put the routing
+/// decision back where the caller cannot see it, so the plane refuses to serve
+/// rather than picking. The positive half is the ordinary room, which must
+/// still build.
+#[tokio::test]
+async fn two_agents_claiming_one_skill_are_refused() {
+    const COLLIDING: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: desk, version: "1.0.0" }
+spec:
+  budgets: { max_steps: 5 }
+  capabilities: { provides: [support.answer] }
+---
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: night-desk, version: "1.0.0" }
+spec:
+  budgets: { max_steps: 5 }
+  capabilities: { provides: [support.answer] }
+"#;
+    let f = fixture_from(TWO_AGENTS, Arc::new(Recording::default()));
+    let colliding = Manifest::parse_all(COLLIDING).expect("two agents");
+    let refs: Vec<&Manifest> = colliding.iter().collect();
+    let err = A2aServer::hosting(
+        f.rt.clone(),
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &refs,
+        "https://plane.internal/a2a",
+    )
+    .expect_err("one skill on two agents was served");
+    assert!(
+        matches!(&err, ServerSetupError::AmbiguousSkill { skill, .. } if skill == "support.answer"),
+        "wrong refusal: {err}"
+    );
+
+    // An empty plane has nothing for the well-known path to answer with.
+    assert!(matches!(
+        A2aServer::hosting(
+            f.rt.clone(),
+            Arc::new(HeaderAuth),
+            &card_security(),
+            &[],
+            "https://plane.internal/a2a",
+        ),
+        Err(ServerSetupError::NoAgents)
+    ));
 }

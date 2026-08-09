@@ -1243,6 +1243,7 @@ impl Runtime {
             input: input.peek().clone(),
             input_label: input.label().clone(),
             policy_bundle: self.policy.as_ref().map(|p| p.bundle()),
+            canon: crate::core::canon::VERSION,
         }
     }
 
@@ -1502,6 +1503,8 @@ impl Runtime {
         // that survive individually-valid records — deletion, reordering, and
         // splicing history from another run.
         Record::verify_chain(&records, Digest::ZERO).map_err(RuntimeError::from_store)?;
+
+        ensure_replayable_canon(&records)?;
 
         let input = records.iter().find_map(recorded_input).ok_or_else(|| {
             RuntimeError::PlanContract("journal has no RunAdmitted record".into())
@@ -3193,6 +3196,37 @@ fn recorded_input(r: &Record) -> Option<Tainted<Value>> {
     }
 }
 
+/// Refuse a history this build cannot re-derive.
+///
+/// Before recomputing anything, because every effect key a replay derives comes
+/// out of the canonicalizer: a run written under another rule recomputes
+/// different keys and would be quarantined as *non-determinism* — the most
+/// serious conclusion this runtime reaches, reported for a healthy run because
+/// the rule moved underneath it.
+///
+/// The chain itself is fine and always was: it hashes the bytes it stored rather
+/// than re-canonicalizing them. What moved is everything *derived*, which is
+/// exactly the class replay compares.
+fn ensure_replayable_canon(records: &[Record]) -> Result<(), RuntimeError> {
+    if let Some(recorded) = records.iter().find_map(recorded_canon)
+        && recorded != crate::core::canon::VERSION
+    {
+        return Err(RuntimeError::CanonicalizationChanged {
+            recorded,
+            implemented: crate::core::canon::VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// Which canonicalization rule wrote this run's derived digests.
+fn recorded_canon(r: &Record) -> Option<u16> {
+    match r.kind() {
+        RecordKind::RunAdmitted { canon, .. } => Some(*canon),
+        _ => None,
+    }
+}
+
 fn recorded_agent(records: &[Record]) -> String {
     records
         .iter()
@@ -4094,7 +4128,7 @@ impl RuntimeBuilder {
     /// deployment's topology is visible:
     ///
     /// ```ignore
-    /// let memories = EncryptedMemoryStore::new_single_node(inner, keys.clone(), tenant.clone());
+    /// let memories = EncryptedMemoryStore::new(inner, keys.clone(), tenant.clone());
     /// Runtime::builder(store).memory(Arc::new(memories)).keyring(keys).build()
     /// ```
     ///
@@ -4492,7 +4526,12 @@ impl RuntimeBuilder {
     #[cfg_attr(not(feature = "manifest"), allow(unused_mut))]
     #[allow(clippy::too_many_lines)]
     pub fn try_build(mut self) -> Result<Arc<Runtime>, BuildError> {
-        check_same_tenant(self.store.as_ref(), self.blobs.as_ref(), &self.tenant)?;
+        check_same_tenant(
+            self.store.as_ref(),
+            self.blobs.as_ref(),
+            self.memories.as_ref(),
+            &self.tenant,
+        )?;
         self.seal_stores();
         #[cfg(feature = "manifest")]
         self.settle_tools()?;
@@ -4743,6 +4782,7 @@ impl RuntimeBuilder {
 fn check_same_tenant(
     store: &dyn JournalStore,
     blobs: Option<&Arc<dyn crate::blob::BlobStore>>,
+    memories: Option<&Arc<dyn crate::memory::MemoryStore>>,
     tenant: &crate::core::TenantId,
 ) -> Result<(), BuildError> {
     if let Some(blobs) = blobs
@@ -4758,6 +4798,20 @@ fn check_same_tenant(
             plane: tenant.to_string(),
             store: store.tenant().to_owned(),
         });
+    }
+
+    // After the tenant checks, deliberately: a store scoped to the wrong tenant
+    // is the more basic fault, and reporting the erasure lock first would send
+    // an operator to fix the second-most-wrong thing.
+    //
+    // A process-local erasure lock beside a store two instances can write is a
+    // control that reads as present and is not. The window it fails to close is
+    // between an erasure's legal-hold check and its key destruction: the other
+    // instance writes an item, that item is sealed under a scope about to stop
+    // existing, and the erasure reports success. Both facts are here, so the
+    // refusal is here.
+    if store.is_shared() && memories.is_some_and(|m| m.erasure_is_distributed() == Some(false)) {
+        return Err(BuildError::ErasureCoordinatorNotShared);
     }
     Ok(())
 }

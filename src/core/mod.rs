@@ -11,7 +11,7 @@
 mod attest;
 mod budget;
 mod calendar;
-pub(crate) mod canon;
+pub mod canon;
 mod case;
 mod effect;
 pub(crate) mod error;

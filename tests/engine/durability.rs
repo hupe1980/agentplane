@@ -782,3 +782,83 @@ async fn notes_are_journaled_next_to_their_effects() {
         "the note must precede the action it explains"
     );
 }
+
+/// A run written under another canonicalization rule is *unverifiable*, not
+/// *divergent*.
+///
+/// Every effect key comes out of the canonicalizer, so a rule change moves all
+/// of them at once. Without the recorded version, a replay of healthy history
+/// recomputes different keys and reports **non-determinism** — the most serious
+/// conclusion this runtime reaches, for a run that did nothing wrong, with
+/// nothing on the record to say the rule moved underneath it. The rule has
+/// already changed once, from UTF-8 byte ordering to RFC 8785's UTF-16 code
+/// units, so this is a thing that happened rather than a thing that might.
+///
+/// The chain is deliberately *not* implicated: it hashes the bytes it stored
+/// rather than re-canonicalizing them, so the history is intact and readable —
+/// it simply cannot be re-derived here. The test asserts that too, because a
+/// refusal that also claimed corruption would be the wrong answer twice.
+#[tokio::test]
+async fn history_under_an_older_canonicalization_rule_is_unverifiable_not_divergent() {
+    use agentplane::journal::{Append, Record, RecordKind};
+
+    let store = store();
+    let rt = Runtime::builder(Arc::clone(&store))
+        .skill(CallsTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .build();
+    let run = agentplane::core::RunId::generate();
+
+    // History whose admission names canonicalization rule 1 — what every record
+    // written before the version existed reads as, by `serde` default.
+    let lease = store
+        .acquire(run, "canon", std::time::Duration::from_mins(1))
+        .await
+        .unwrap();
+    store
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "pay".into(),
+                    governed_by: None,
+                    input: json!({}),
+                    input_label: agentplane::core::Label::trusted(),
+                    policy_bundle: None,
+                    canon: 1,
+                },
+            )],
+        )
+        .await
+        .unwrap();
+
+    let err = rt
+        .replay(run, Mode::Strict)
+        .await
+        .expect_err("history under another canonicalization rule was replayed");
+    assert!(
+        matches!(
+            err,
+            agentplane::core::RuntimeError::CanonicalizationChanged { recorded: 1, .. }
+        ),
+        "a rule change was reported as something else: {err}"
+    );
+
+    // The history is intact. A refusal that also implied corruption would send
+    // an operator hunting for tampering that did not happen.
+    let records = store.read(run, 1).await.unwrap();
+    Record::verify_chain(&records, agentplane::core::Digest::ZERO)
+        .expect("the chain hashes stored bytes, so a rule change cannot break it");
+
+    // And the positive half: a run this build wrote replays normally, or the
+    // check above would be satisfied by refusing everything.
+    let fresh = rt
+        .run("calls-tool", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    rt.replay(fresh.run_id, Mode::Strict)
+        .await
+        .expect("a run written by this build replays");
+}

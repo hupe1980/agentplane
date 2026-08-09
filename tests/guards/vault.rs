@@ -43,6 +43,33 @@ async fn the_memory_key_ring_satisfies_the_key_ring_contract() {
     report.assert_conforms("MemoryKeyRing");
 }
 
+/// The published port, retried.
+///
+/// `WaitFor` matching a stdout line means the process printed it, not that
+/// Docker has finished publishing the port — so a one-shot query fails as
+/// `PortNotExposed` on a loaded machine. That is a flake, and a flake trains
+/// people to re-run rather than read, which costs more than the test is worth.
+/// A genuinely dead container still fails here, loudly, after the bound.
+async fn published_port<I>(
+    container: &testcontainers_modules::testcontainers::ContainerAsync<I>,
+    port: u16,
+) -> u16
+where
+    I: testcontainers_modules::testcontainers::Image,
+{
+    let mut last = String::from("never queried");
+    for _ in 0..50 {
+        match container.get_host_port_ipv4(port).await {
+            Ok(p) => return p,
+            Err(e) => {
+                last = e.to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    panic!("the container never published port {port}: {last}");
+}
+
 #[tokio::test]
 async fn vault_transit_satisfies_the_key_ring_contract() {
     let image = GenericImage::new("hashicorp/vault", VAULT)
@@ -55,7 +82,7 @@ async fn vault_transit_satisfies_the_key_ring_contract() {
         eprintln!("skipping: no Docker daemon available");
         return;
     };
-    let port = container.get_host_port_ipv4(8200).await.expect("port");
+    let port = published_port(&container, 8200).await;
     let address = format!("http://127.0.0.1:{port}");
 
     let http = reqwest::Client::new();
@@ -132,7 +159,7 @@ async fn erasing_a_key_that_forbids_deletion_is_refused_not_retried() {
         eprintln!("skipping: no Docker daemon available");
         return;
     };
-    let port = container.get_host_port_ipv4(8200).await.expect("port");
+    let port = published_port(&container, 8200).await;
     let address = format!("http://127.0.0.1:{port}");
     let http = reqwest::Client::new();
 

@@ -46,6 +46,30 @@
 use serde::Serialize;
 use serde_json::Value;
 
+/// Which canonicalization rule this build implements.
+///
+/// **1** was UTF-8 byte ordering of object keys. **2** is RFC 8785's UTF-16
+/// code-unit ordering, adopted so a signed Agent Card verifies against the
+/// standard rather than only against this crate.
+///
+/// # Why a digest is not enough on its own
+///
+/// The rule change moved every derived digest — effect keys, manifest digests,
+/// plan digests — and nothing on the record said which rule produced them. The
+/// journal chain was never at risk, because it hashes the bytes it stored rather
+/// than re-canonicalizing them. The exposure is **replay**: a run recorded under
+/// rule 1 and replayed by a build implementing rule 2 recomputes different
+/// effect keys and is quarantined as *non-determinism* — a healthy run, reported
+/// as the most serious conclusion this runtime reaches, with nothing on the
+/// record to say the rule moved underneath it.
+///
+/// So the version is journaled at admission and replay compares it first. A run
+/// written under another rule is **unverifiable by this build**, which is a
+/// different sentence from *this run diverged* and the one the evidence
+/// supports. That distinction is the whole point: an audit must report unknown
+/// scope as prominently as corruption, and never as corruption.
+pub const VERSION: u16 = 2;
+
 /// Serialize to canonical bytes.
 ///
 /// # Errors

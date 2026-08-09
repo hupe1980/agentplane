@@ -84,9 +84,9 @@ mod discovery;
 #[cfg(feature = "manifest")]
 pub use card::{
     AgentCard, AgentExtension, CardCapabilities, CardInterface, CardSecurity,
-    CardSecurityRequirement, CardSecurityScheme, CardSkill, EXT_GOVERNANCE,
+    CardSecurityRequirement, CardSecurityScheme, CardSkill, EXT_AGENT_DIRECTORY, EXT_GOVERNANCE,
     EXT_MANIFEST_PROVENANCE, ExtendedAgentCard, ExtendedBudget, ExtendedTool,
-    HttpAuthSecurityScheme, SecurityScopeList, WELL_KNOWN_PATH,
+    HttpAuthSecurityScheme, SecurityScopeList, WELL_KNOWN_PATH, agent_card_path,
 };
 #[cfg(feature = "manifest")]
 pub use card_sig::{

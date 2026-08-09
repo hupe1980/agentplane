@@ -202,42 +202,45 @@ impl A2aClient {
             // very deduplication this field exists for.
             |p| p.dedupe_key().to_string(),
         );
+        let mut governance = serde_json::Map::new();
+        governance.insert("capability".into(), json!(capability));
+        governance.insert("chain".into(), json!(acting_as));
+        // Inserted only when there is one. `json!` renders `None` as `null`,
+        // and an absent ProtoJSON field is **omitted**, not null-valued.
+        if let Some(attested) = attested {
+            governance.insert("provenance".into(), json!(attested));
+        }
+
+        let mut params = serde_json::Map::new();
+        insert_tenant(&mut params, tenant);
+        params.insert(
+            "message".into(),
+            json!({
+                "role": "ROLE_USER",
+                "messageId": message_id,
+                "parts": [{ "data": payload, "mediaType": "application/json" }],
+                "extensions": [EXTENSION_URI],
+                "metadata": { EXTENSION_URI: Value::Object(governance) }
+            }),
+        );
+
         json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "SendMessage",
-            "params": {
-                // Omitted entirely when the interface declares none. An empty
-                // string is a *value*, and a server comparing against its own
-                // advertised tenant would read it as a request for a different
-                // agent.
-                "tenant": tenant,
-                "message": {
-                    "role": "ROLE_USER",
-                    "messageId": message_id,
-                    "parts": [{ "data": payload, "mediaType": "application/json" }],
-                    "extensions": [EXTENSION_URI],
-                    "metadata": {
-                        EXTENSION_URI: {
-                            "capability": capability,
-                            "chain": acting_as,
-                            "provenance": attested,
-                        }
-                    }
-                }
-            }
+            "params": Value::Object(params),
         })
     }
 
     fn get_task_body(task_id: &str, tenant: Option<&str>) -> Value {
+        let mut params = serde_json::Map::new();
+        insert_tenant(&mut params, tenant);
+        params.insert("id".into(), json!(task_id));
         json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "GetTask",
-            "params": {
-                "tenant": tenant,
-                "id": task_id,
-            }
+            "params": Value::Object(params),
         })
     }
 
@@ -525,5 +528,23 @@ impl PeerClient for A2aClient {
             ));
         }
         Ok(result)
+    }
+}
+
+/// Add `tenant` only when the interface declares one.
+///
+/// One implementation, because it was written twice as `"tenant": tenant` in a
+/// `json!` — where `None` renders as **`null`**, not as an absent field. A
+/// comment above one of them said "omitted entirely when the interface declares
+/// none", which is what the code was meant to do and not what it did.
+///
+/// `ProtoJSON` omits a field at its default value, and the reference server parses
+/// accordingly: a `null` where a string belongs is a type error, not an absence.
+/// This crate's *own* server accepted it — `serde` reads `null` into an
+/// `Option` as `None` — so every in-repo test agreed with the bug. Only a server
+/// nobody here wrote could find it, which is the whole argument for rung 8.
+fn insert_tenant(params: &mut serde_json::Map<String, Value>, tenant: Option<&str>) {
+    if let Some(tenant) = tenant {
+        params.insert("tenant".into(), json!(tenant));
     }
 }

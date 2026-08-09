@@ -23,6 +23,8 @@ mod fake_model;
 pub mod faults;
 #[cfg(feature = "keyring")]
 pub mod memory_keyring;
+mod shared_journal;
+pub use shared_journal::SharedJournal;
 mod staged_atomic;
 mod stub_signer;
 #[cfg(feature = "keyring")]

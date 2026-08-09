@@ -242,6 +242,12 @@ impl Faulty {
 
 #[async_trait]
 impl JournalStore for Faulty {
+    /// What it wraps. Injecting faults does not change the topology, and a
+    /// fault harness that claimed otherwise would test a different plane.
+    fn is_shared(&self) -> bool {
+        self.inner.is_shared()
+    }
+
     async fn append(&self, epoch: Epoch, batch: Vec<Append>) -> Result<Vec<Record>, StoreError> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let kinds: Vec<&str> = batch.iter().map(|a| a.kind.kind_str()).collect();

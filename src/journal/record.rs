@@ -99,6 +99,20 @@ pub enum RecordKind {
         /// decision: this is an audit question, not a replay one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_bundle: Option<PolicyBundleIdentity>,
+        /// Which canonicalization rule produced this run's derived digests.
+        ///
+        /// Journaled once, here, because it is a property of the whole run and
+        /// replay needs it before it recomputes anything. Defaulted to **1** on
+        /// read: a record written before this field existed was written under
+        /// the UTF-8 ordering, and reading its absence as "today's rule" is the
+        /// one wrong answer available.
+        ///
+        /// See [`canon::VERSION`](crate::core::canon::VERSION) for what the
+        /// distinction buys — a run under another rule is *unverifiable*, not
+        /// *divergent*, and reporting the second for the first quarantines
+        /// healthy history.
+        #[serde(default = "canon_v1")]
+        canon: u16,
     },
 
     /// The plan was compiled from trusted input and frozen.
@@ -541,6 +555,11 @@ pub struct RecordBody {
     pub kind: RecordKind,
 }
 
+/// The rule in force before the version was recorded.
+const fn canon_v1() -> u16 {
+    1
+}
+
 /// A sealed journal entry: body, chain links, and the bytes that were hashed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
@@ -901,6 +920,7 @@ mod tests {
                     input: json!(null),
                     input_label: crate::core::Label::trusted(),
                     policy_bundle: None,
+                    canon: crate::core::canon::VERSION,
                 },
             ),
             Digest::ZERO,
@@ -934,6 +954,7 @@ mod tests {
                     input: json!({ "ticket": "printer on fire" }),
                     input_label: crate::core::Label::trusted(),
                     policy_bundle: None,
+                    canon: crate::core::canon::VERSION,
                 },
             ),
             Digest::ZERO,

@@ -15,6 +15,7 @@
 //! times. Five groups keep both costs reasonable rather than optimising one
 //! into the other.
 
+mod a2a_interop;
 mod a2a_server;
 mod api;
 mod drivers;

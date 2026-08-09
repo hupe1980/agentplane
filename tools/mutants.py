@@ -3142,6 +3142,55 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                    if let Some((missing, remedy)) = missing {",
         "                    if let Some((missing, remedy)) = None::<(&'static str, &'static str)>.or(missing).filter(|_| false) {",
     ),
+    "TwoAgentsMayShareOneSkill": (
+        "src/api/a2a.rs",
+        "two_agents_claiming_one_skill_are_refused",
+        "two agents on one plane may advertise the same skill id, so a request "
+        "naming it resolves to whichever agent was registered first — a routing "
+        "decision the caller did not make, on a surface whose whole rule is that "
+        "dispatch is named and never inferred",
+        "                if let Some(other) = owner_of_skill.insert(skill.id.clone(), name.clone())\n                    && other != name\n                {",
+        "                if let Some(other) = owner_of_skill.insert(skill.id.clone(), name.clone())\n                    && other != name\n                    && false\n                {",
+    ),
+    "AnAbsentTenantIsSentAsNull": (
+        "src/peers/a2a.rs",
+        "this_crates_client_round_trips_against_the_reference_server",
+        "an absent `tenant` is emitted as JSON `null` rather than omitted, which "
+        "ProtoJSON reads as a type error where a string belongs — this crate's "
+        "own server accepts it because `serde` reads null into an `Option`, so "
+        "every in-repo test agrees with the bug and only a foreign server sees it",
+        "    if let Some(tenant) = tenant {\n        params.insert(\"tenant\".into(), json!(tenant));\n    }",
+        "    params.insert(\"tenant\".into(), json!(tenant));",
+    ),
+    "ACanonRuleChangeReadsAsDivergence": (
+        "src/runtime/executor.rs",
+        "history_under_an_older_canonicalization_rule_is_unverifiable_not_divergent",
+        "replay does not check which canonicalization rule wrote a run, so "
+        "history written under the old UTF-8 key ordering recomputes different "
+        "effect keys and is quarantined as non-determinism — the most serious "
+        "conclusion this runtime reaches, reported for a healthy run",
+        "    if let Some(recorded) = records.iter().find_map(recorded_canon)\n        && recorded != crate::core::canon::VERSION\n    {",
+        "    if let Some(recorded) = records.iter().find_map(recorded_canon)\n        && recorded != crate::core::canon::VERSION\n        && false\n    {",
+    ),
+    "ALocalErasureLockBesideASharedStoreBuilds": (
+        "src/runtime/executor.rs",
+        "a_local_erasure_lock_beside_a_shared_store_is_refused",
+        "a plane pairs a shared journal with a process-local erasure lock and "
+        "builds, so the window between an erasure's hold check and its key "
+        "destruction is open to the other instance — and the erasure reports "
+        "success over an item sealed to a scope that no longer exists",
+        "    if store.is_shared() && memories.is_some_and(|m| m.erasure_is_distributed() == Some(false)) {",
+        "    if false && store.is_shared() && memories.is_some_and(|m| m.erasure_is_distributed() == Some(false)) {",
+    ),
+    "TheErasureLockIsNotTaken": (
+        "src/keyring/memory.rs",
+        "the_encrypted_memory_store_takes_the_lifecycle_lock",
+        "subject erasure runs without the lifecycle lock, so a write on another "
+        "instance lands under a scope this one is destroying and the erasure "
+        "reports success over a row sealed to a key that no longer exists",
+        "        super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {\n            let current = self",
+        "        (async {\n            let current = self",
+    ),
     "AnUnknownA2aParameterIsIgnored": (
         "src/api/a2a.rs",
         "a_parameter_that_belongs_to_another_method_is_refused",
