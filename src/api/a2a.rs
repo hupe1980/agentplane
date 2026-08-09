@@ -658,7 +658,27 @@ impl PushRequest {
 }
 
 /// What every method's params may carry.
+///
+/// One struct for every method, which is the same shape the binary's arguments
+/// had before they moved onto per-verb structs: a field belonging to one method
+/// was **silently accepted** by another and did nothing. On the wire that reads
+/// worse than at a command line, because the caller is a stranger who cannot
+/// see the source. `ListTasks` was the case that mattered — a request naming
+/// `contxtId`, or the `context_id` the protocol's own conformance kit sends,
+/// parsed cleanly, dropped the filter, and answered with **every** task the
+/// caller may see, shaped exactly like the scoped list that was asked for.
+///
+/// Two mechanisms close it, and they are different questions.
+/// [`deny_unknown_fields`] refuses a name this surface does not know at all
+/// (`contxtId`, `task_id`), which the A2A specification licenses
+/// outright: A2A §5.5 says JSON field names **MUST** be camelCase, so `context_id` is not an
+/// alternative spelling but a violation. [`FIELDS_BY_METHOD`] refuses a name
+/// this surface knows and *this method* does not (`pageSize` on `CancelTask`).
+/// Neither subsumes the other.
+///
+/// [`deny_unknown_fields`]: https://serde.rs/container-attrs.html
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommonParams {
     /// A2A's opaque routing identifier.
     #[serde(default)]
@@ -669,6 +689,22 @@ struct CommonParams {
     id: Option<String>,
     #[serde(default)]
     configuration: Option<SendConfiguration>,
+    /// `SendMessageRequest.metadata`, accepted and not interpreted.
+    ///
+    /// Modelled rather than ignored because the two are different answers now
+    /// that unknown fields are refused: the specification defines this field, so
+    /// a conforming client may send it and must not meet `-32602`. It is
+    /// deliberately not read — opaque caller data has no governed meaning here,
+    /// and inventing one would be a control nothing enforces. What the runtime
+    /// does record about an inbound message is its authenticated sender, which
+    /// is provenance rather than a field the sender chose.
+    ///
+    /// `dead_code` is allowed here for the one case where it is the point: the
+    /// field exists so that deserialization *accepts* the name, and reading it
+    /// is what would be wrong.
+    #[serde(default)]
+    #[allow(dead_code)]
+    metadata: Option<Value>,
     #[serde(default, rename = "taskId")]
     push_task: Option<String>,
     #[serde(default)]
@@ -805,6 +841,7 @@ struct PushRuntime {
 pub struct A2aPushWorker {
     runtime: Arc<Runtime>,
     push: PushRuntime,
+    max_attempts: u32,
 }
 
 /// Outcome of one bounded push sweep.
@@ -815,7 +852,29 @@ pub struct PushSweepReport {
     pub deliveries: usize,
     pub retries: usize,
     pub completed: usize,
+    /// Registrations this sweep gave up on: a permanent refusal, or a receiver
+    /// that stayed unreachable past [`A2aPushWorker::max_attempts`].
+    ///
+    /// Counted separately from `completed` because they are opposite outcomes
+    /// wearing one shape — both remove the registration, and only one of them
+    /// delivered anything.
+    pub abandoned: usize,
     pub saturated: bool,
+}
+
+impl PushSweepReport {
+    /// Whether this tick found anything a human should see.
+    ///
+    /// The sweeper's own report has had this since I13 was written down, and
+    /// this one did not — so a webhook that will never be delivered to produced
+    /// `retries: 1` on an *info* line, byte-identical to a receiver that is
+    /// merely rebooting. Detection without delivery, in the report whose whole
+    /// job is delivery.
+    #[must_use]
+    pub const fn needs_attention(&self) -> bool {
+        // A backlog and a quiet plane must not produce the same numbers.
+        self.saturated || self.abandoned > 0
+    }
 }
 
 impl std::fmt::Debug for A2aServer {
@@ -955,6 +1014,7 @@ impl A2aServer {
         self.push.clone().map(|push| A2aPushWorker {
             runtime: Arc::clone(&self.runtime),
             push,
+            max_attempts: A2aPushWorker::DEFAULT_MAX_ATTEMPTS,
         })
     }
 
@@ -1120,6 +1180,38 @@ impl A2aServer {
 }
 
 impl A2aPushWorker {
+    /// How many consecutive failures a receiver gets before it is abandoned.
+    ///
+    /// Backoff is `1 << min(attempts, 8)` seconds, so it caps at 256 s: this
+    /// default is a little over two hours of a receiver being down, which is a
+    /// reboot, a deploy or a certificate renewal and not a webhook that has
+    /// gone away. Past it the registration is removed and *reported*, because
+    /// the alternative is a row that is retried until the journal is deleted —
+    /// and a queue that only ever grows is one nobody can read.
+    pub const DEFAULT_MAX_ATTEMPTS: u32 = 32;
+
+    /// Change the ceiling above.
+    ///
+    /// Zero is refused, for the reason [`WitnessQuorum`] refuses an empty
+    /// quorum: it would spell *never deliver anything* as if it were a retry
+    /// policy.
+    ///
+    /// # Panics
+    ///
+    /// If `attempts` is zero.
+    ///
+    /// [`WitnessQuorum`]: crate::journal::WitnessQuorum
+    #[must_use]
+    pub const fn max_attempts(mut self, attempts: u32) -> Self {
+        assert!(
+            attempts > 0,
+            "a push retry ceiling of zero abandons every receiver on its first \
+             hiccup; configure no push instead"
+        );
+        self.max_attempts = attempts;
+        self
+    }
+
     /// Deliver at most `limit` due registrations once.
     ///
     /// `at` is Unix time in seconds and is explicit to make backoff tests
@@ -1127,6 +1219,16 @@ impl A2aPushWorker {
     /// Multiple workers may race and produce duplicates, which A2A receivers
     /// must tolerate; cursor updates use monotonic advancement, so they cannot
     /// lose an event.
+    ///
+    /// # Giving up is an outcome, not an omission
+    ///
+    /// Two failures end a registration rather than rescheduling it, and both
+    /// are counted in [`PushSweepReport::abandoned`] so an operator can see
+    /// them: a **permanent** refusal ([`PushError::is_permanent`](crate::push::PushError::is_permanent) — a host
+    /// taken off the allowlist, a URL that is not HTTPS, a URL that does not
+    /// parse), which no backoff improves; and a transient failure that has
+    /// happened [`max_attempts`](Self::max_attempts) times, which is a
+    /// receiver that is not coming back.
     pub async fn run_once(
         &self,
         at: u64,
@@ -1161,17 +1263,20 @@ impl A2aPushWorker {
                 {
                     Ok(payloads) => payloads,
                     Err(error) => {
-                        let exponent = attempts.min(8);
-                        self.push
-                            .store
-                            .retry(
-                                registration.config.task,
-                                &registration.config.id,
-                                at.saturating_add(1u64 << exponent),
-                                &error.to_string(),
-                            )
-                            .await?;
-                        report.retries += 1;
+                        // A projection failure is this plane's own bug, never
+                        // the receiver's, so it is always transient here — the
+                        // ceiling still applies, because a record that cannot
+                        // be projected cannot be projected on the next tick
+                        // either and the cursor never moves past it.
+                        self.give_up_or_retry(
+                            &registration,
+                            at,
+                            attempts,
+                            &error.to_string(),
+                            false,
+                            &mut report,
+                        )
+                        .await?;
                         break;
                     }
                 };
@@ -1186,26 +1291,23 @@ impl A2aPushWorker {
                         Ok(crate::push::Delivered::Accepted) => {
                             report.deliveries += 1;
                         }
-                        Ok(other) => failed = Some(format!("receiver outcome: {other:?}")),
-                        Err(error) => failed = Some(error.to_string()),
+                        Ok(other) => failed = Some((format!("receiver outcome: {other:?}"), false)),
+                        Err(error) => failed = Some((error.to_string(), error.is_permanent())),
                     }
                     if failed.is_some() {
                         break;
                     }
                 }
-                if let Some(error) = failed {
-                    let exponent = attempts.min(8);
-                    let delay = 1u64 << exponent;
-                    self.push
-                        .store
-                        .retry(
-                            registration.config.task,
-                            &registration.config.id,
-                            at.saturating_add(delay),
-                            &error,
-                        )
-                        .await?;
-                    report.retries += 1;
+                if let Some((error, permanent)) = failed {
+                    self.give_up_or_retry(
+                        &registration,
+                        at,
+                        attempts,
+                        &error,
+                        permanent,
+                        &mut report,
+                    )
+                    .await?;
                     break;
                 }
                 self.push
@@ -1229,6 +1331,59 @@ impl A2aPushWorker {
             }
         }
         Ok(report)
+    }
+
+    /// Reschedule one failed registration, or stop.
+    ///
+    /// One implementation, because the two call sites above are the same
+    /// decision and a second copy of it is the shape that agrees everywhere
+    /// except the boundary nobody probed.
+    async fn give_up_or_retry(
+        &self,
+        registration: &crate::push::PushRegistration,
+        at: u64,
+        attempts: u32,
+        error: &str,
+        permanent: bool,
+        report: &mut PushSweepReport,
+    ) -> Result<(), crate::core::StoreError> {
+        // `attempts` counts the failures *before* this one, so the ceiling is
+        // reached when this failure makes it up to the ceiling — not one tick
+        // later, which would make `max_attempts(1)` mean two attempts.
+        let exhausted = attempts.saturating_add(1) >= self.max_attempts;
+        if permanent || exhausted {
+            let reason = if permanent {
+                "the deployment no longer permits this destination"
+            } else {
+                "the receiver did not answer within the retry ceiling"
+            };
+            tracing::warn!(
+                task = %registration.config.task,
+                config = %registration.config.id,
+                url = %registration.config.url,
+                attempts = attempts.saturating_add(1),
+                %error,
+                "abandoning a push registration: {reason}"
+            );
+            self.push
+                .store
+                .delete(registration.config.task, &registration.config.id)
+                .await?;
+            report.abandoned += 1;
+            return Ok(());
+        }
+        let exponent = attempts.min(8);
+        self.push
+            .store
+            .retry(
+                registration.config.task,
+                &registration.config.id,
+                at.saturating_add(1u64 << exponent),
+                error,
+            )
+            .await?;
+        report.retries += 1;
+        Ok(())
     }
 
     async fn cleanup_acknowledged_terminal(
@@ -1345,7 +1500,7 @@ async fn stream_method(
     >,
     RpcError,
 > {
-    let params = parse_params(&req.params)?;
+    let params = parse_params(&req.method, &req.params)?;
     server.check_tenant(&params)?;
     if req.method == method::SEND_STREAMING
         && let Some(configuration) = &params.configuration
@@ -1443,7 +1598,7 @@ async fn dispatch(
     headers: &HeaderMap,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let params = parse_params(&req.params)?;
+    let params = parse_params(&req.method, &req.params)?;
     server.check_tenant(&params)?;
 
     match req.method.as_str() {
@@ -1470,16 +1625,77 @@ async fn dispatch(
     }
 }
 
-fn parse_params(value: &Value) -> Result<CommonParams, RpcError> {
+/// Which parameter names each method actually reads.
+///
+/// `tenant` is on every row rather than special-cased: A2A's routing identifier
+/// is orthogonal to the method, and leaving it out of one row would refuse a
+/// correctly-routed request for that method alone — the kind of hole a table
+/// exists to make visible.
+const FIELDS_BY_METHOD: &[(&str, &[&str])] = &[
+    (
+        method::SEND_MESSAGE,
+        &["tenant", "message", "configuration", "metadata"],
+    ),
+    (
+        method::SEND_STREAMING,
+        &["tenant", "message", "configuration", "metadata"],
+    ),
+    (method::GET_TASK, &["tenant", "id", "historyLength"]),
+    (method::CANCEL_TASK, &["tenant", "id"]),
+    (method::SUBSCRIBE, &["tenant", "id"]),
+    (method::GET_EXTENDED_CARD, &["tenant"]),
+    (
+        method::LIST_TASKS,
+        &[
+            "tenant",
+            "contextId",
+            "status",
+            "pageSize",
+            "pageToken",
+            "historyLength",
+            "statusTimestampAfter",
+            "includeArtifacts",
+        ],
+    ),
+    (
+        method::CREATE_PUSH,
+        &["tenant", "taskId", "id", "url", "token", "authentication"],
+    ),
+    (method::GET_PUSH, &["tenant", "taskId", "id"]),
+    (
+        method::LIST_PUSH,
+        &["tenant", "taskId", "pageSize", "pageToken"],
+    ),
+    (method::DELETE_PUSH, &["tenant", "taskId", "id"]),
+];
+
+fn parse_params(method: &str, value: &Value) -> Result<CommonParams, RpcError> {
     if value.is_null() {
         return Ok(CommonParams::default());
     }
-    if !value.is_object() {
+    let Some(object) = value.as_object() else {
         return Err(RpcError::new(
             code::INVALID_PARAMS,
             "A2A method parameters must be a JSON object",
         ));
+    };
+
+    // Before deserializing, because the union struct would accept the field and
+    // the method would then ignore it. An unknown method falls through to the
+    // dispatcher's own `METHOD_NOT_FOUND`, which is a better answer than a
+    // parameter complaint about a method that does not exist.
+    if let Some((_, allowed)) = FIELDS_BY_METHOD.iter().find(|(m, _)| *m == method)
+        && let Some(stray) = object.keys().find(|k| !allowed.contains(&k.as_str()))
+    {
+        return Err(RpcError::new(
+            code::INVALID_PARAMS,
+            format!(
+                "'{stray}' is not a parameter of {method}; it takes {}",
+                allowed.join(", ")
+            ),
+        ));
     }
+
     serde_json::from_value(value.clone()).map_err(|error| {
         RpcError::new(
             code::INVALID_PARAMS,

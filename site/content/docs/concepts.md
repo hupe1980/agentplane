@@ -310,13 +310,27 @@ point: a missed retry is an inconvenience, a missed regulatory window is a
 breach. The two must not share a mechanism.
 
 ```rust,ignore
+use std::time::Duration;
+
 // Resolved once against the deployment's Calendar and journaled, so a replay
-// never recomputes "five working days" under a changed holiday table.
-let due = cx.deadline("aperak", &DeadlineSpec::working_days(1), Some(Duration::hours(1))).await?;
+// never recomputes the due date under a changed holiday table.
+let due = cx
+    .deadline("aperak", &DeadlineSpec::days(1), Some(Duration::from_secs(3600)))
+    .await?;
 
 cx.meet_deadline("aperak").await?;    // discharged
 cx.cancel_deadline("aperak").await?;  // no longer applicable
 ```
+
+`DeadlineSpec::{minutes, hours, days}` are the rules the built-in `WallClock`
+understands, and it deliberately understands **no** others. *Five working days,
+at 17:00, excluding public holidays observed in any federal state* is a
+`DeadlineSpec::new("working-days", json!({ "n": 5 }))` resolved by a `Calendar`
+the deployment supplies — and a calendar that does not implement a rule
+**refuses** it rather than approximating, because a wrong working-day answer is
+worse than no answer: it looks right. The calendar's digest is journaled beside
+the resolved instant, so a changed holiday table is a different ruleset rather
+than a retroactively different deadline.
 
 Four properties carry it:
 

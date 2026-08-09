@@ -219,7 +219,13 @@ impl PushTransport for RecordingPush {
         }
     }
 
-    async fn deliver(&self, _config: &PushConfig, payload: &Value) -> Result<Delivered, PushError> {
+    async fn deliver(&self, config: &PushConfig, payload: &Value) -> Result<Delivered, PushError> {
+        // The real `PushSender` re-checks the grant here, not only at
+        // registration, because a registration outlives the configuration that
+        // permitted it. A double that skipped it would be exempt from the one
+        // control this path exists to apply — and every test written against it
+        // would pass with the control removed.
+        self.validate(config)?;
         self.payloads.lock().unwrap().push(payload.clone());
         let mut failures = self.failures.lock().unwrap();
         if *failures > 0 {
@@ -2683,5 +2689,232 @@ async fn the_live_answer_and_the_read_back_answer_are_the_same_state() {
         "the immediate response and the read-back disagree about the same task's \
          state — a client that held the response and one that polled for it would \
          see different tasks: live={live}, fetched={fetched}"
+    );
+}
+
+/// A webhook this deployment will never deliver to stops being retried.
+///
+/// The grant is re-checked at delivery precisely because a registration
+/// outlives the configuration that permitted it — but noticing a permanent
+/// refusal and then scheduling it again forever is detection without delivery
+/// (I13): the operator sees `retries: 1` on an info line, the same shape a
+/// receiver that is merely down produces, and nothing ever says *this one is
+/// never going to work*.
+///
+/// Registered through the store rather than the RPC, because that is the real
+/// sequence: granted at registration, revoked afterwards.
+#[tokio::test]
+async fn a_permanently_refused_webhook_is_abandoned_rather_than_retried_forever() {
+    let f = fixture();
+    let (server, worker, _transport) = f.push_server();
+    let router = server.router();
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = RunId::parse(sent["result"]["task"]["id"].as_str().unwrap()).unwrap();
+
+    f.store
+        .put(
+            &PushConfig {
+                id: "revoked".to_owned(),
+                task,
+                url: "https://revoked.example/hook".to_owned(),
+                token: None,
+                authentication: None,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+
+    let report = worker.run_once(10, 10).await.unwrap();
+
+    assert_eq!(
+        report.abandoned, 1,
+        "a permanent refusal was rescheduled instead of being given up on: {report:?}"
+    );
+    assert_eq!(
+        report.retries, 0,
+        "a decision no backoff can change was queued for another attempt: {report:?}"
+    );
+    assert!(
+        report.needs_attention(),
+        "the tick that gave up on a peer's webhook reads exactly like a quiet one: {report:?}"
+    );
+    assert!(
+        f.store.get(task, "revoked").await.unwrap().is_none(),
+        "a webhook refused by the operator's own grant is still queued"
+    );
+}
+
+/// A receiver that never comes back is abandoned too, and only after the
+/// ceiling.
+///
+/// The positive half is what does the work here: a change that abandoned on the
+/// *first* transient failure would satisfy the assertion above perfectly while
+/// dropping every notification to a receiver that was rebooting. So this asserts
+/// both edges — one attempt short of the ceiling still retries, and the ceiling
+/// itself gives up.
+#[tokio::test]
+async fn an_unreachable_receiver_is_retried_up_to_the_ceiling_and_then_abandoned() {
+    let f = fixture();
+    let (server, worker, transport) = f.push_server();
+    let worker = worker.max_attempts(3);
+    let router = server.router();
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({
+                "message": text("go"),
+                "configuration": {
+                    "taskPushNotificationConfig": {"url": "https://client.example/hook"}
+                }
+            }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = RunId::parse(sent["result"]["task"]["id"].as_str().unwrap()).unwrap();
+    for _ in 0..10 {
+        transport.fail_next();
+    }
+
+    let mut at = 10u64;
+    let mut ticks = Vec::new();
+    for _ in 0..3 {
+        ticks.push(worker.run_once(at, 10).await.unwrap());
+        at += 4096;
+    }
+
+    assert_eq!(
+        (ticks[0].retries, ticks[1].retries),
+        (1, 1),
+        "a receiver short of the ceiling was abandoned early: {ticks:?}"
+    );
+    assert!(
+        !ticks[0].needs_attention() && !ticks[1].needs_attention(),
+        "an ordinary backoff was reported as something a human must clear: {ticks:?}"
+    );
+    assert_eq!(
+        ticks[2].abandoned, 1,
+        "the third failure of a ceiling of three did not give up: {ticks:?}"
+    );
+    assert!(ticks[2].needs_attention(), "{:?}", ticks[2]);
+    assert!(
+        f.store.get(task, "cfg-0").await.unwrap().is_none()
+            && f.store.list(task).await.unwrap().is_empty(),
+        "an abandoned registration is still queued"
+    );
+}
+
+/// A parameter this method does not take is refused, not ignored.
+///
+/// One `CommonParams` served every method — the same shape the binary's
+/// arguments had before they moved onto per-verb structs, where a flag
+/// belonging to one verb was silently accepted by another and did nothing. On
+/// the wire it reads worse, because the caller is a stranger who cannot see the
+/// source.
+///
+/// `ListTasks` is the case that matters and it is why this is a defect rather
+/// than untidiness: a request whose `contextId` was misspelled parsed cleanly,
+/// dropped the filter, and answered with **every** task the caller may see —
+/// shaped exactly like the scoped list that was asked for, so nothing
+/// downstream could tell. It was found by the protocol project's own
+/// conformance kit, whose JSON-RPC client sends `context_id`: five CORE-LIST
+/// rows had been passing over a filter that never ran.
+///
+/// The specification is what licenses refusing it rather than accepting both:
+/// A2A §5.5 says JSON field names MUST be camelCase, and A2A §9.4.4's own example sends
+/// `contextId`. A server that also answers the other spelling accepts clients
+/// that have lost half the protocol, and the call working is why they never
+/// find out.
+#[tokio::test]
+async fn a_parameter_that_belongs_to_another_method_is_refused() {
+    let f = fixture();
+    let router = f.router();
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let context = sent["result"]["task"]["contextId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The scoped question, spelled the way the specification spells it.
+    let (_, ok) = send(
+        &router,
+        rpc("ListTasks", &json!({"contextId": context}), Some("peer-a")),
+    )
+    .await;
+    let scoped = ok["result"]["tasks"].as_array().expect("a task list").len();
+    assert_eq!(scoped, 1, "{ok:#}");
+
+    // The same question misspelled. It must not come back as an answer.
+    for (params, what) in [
+        (json!({"contxtId": context}), "a typo in the filter"),
+        (
+            json!({"context_id": context}),
+            "the snake_case spelling the specification forbids",
+        ),
+    ] {
+        let (_, refused) = send(&router, rpc("ListTasks", &params, Some("peer-a"))).await;
+        assert_eq!(
+            err_code(&refused),
+            i64::from(code::INVALID_PARAMS),
+            "{what} was accepted: {refused:#}"
+        );
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ListTasks"),
+            "the refusal does not name the method or the field: {refused:#}"
+        );
+    }
+
+    // A field this surface knows, on a method that does not take it.
+    let (_, refused) = send(
+        &router,
+        rpc(
+            "CancelTask",
+            &json!({"id": "run_x", "pageSize": 5}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        err_code(&refused),
+        i64::from(code::INVALID_PARAMS),
+        "a paging parameter on CancelTask was accepted: {refused:#}"
+    );
+
+    // And the positive half, so a refuse-everything change cannot pass: the
+    // specification defines `metadata` on SendMessageRequest, so a conforming
+    // client sending it must not meet -32602.
+    let (_, ok) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go"), "metadata": {"trace": "abc"}}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert!(
+        ok["result"]["task"]["id"].is_string(),
+        "a specification-defined field was refused: {ok:#}"
     );
 }

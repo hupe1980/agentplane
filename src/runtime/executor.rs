@@ -614,6 +614,35 @@ impl Runtime {
         &self.store
     }
 
+    /// Which case a run belongs to, or `None` if it belongs to none.
+    ///
+    /// Read from the **journal**, not from a column beside it. The binding is
+    /// stamped on the run's own records at admission, so answering from there
+    /// is answering from the plan of record — a case-store column saying the
+    /// same thing would be a second copy of one fact, and the two could
+    /// disagree about a run the case layer never saw.
+    ///
+    /// It is the first question an operator surface asks, which is why it is a
+    /// method rather than a documented one-liner: every caller was otherwise
+    /// going to reach for the first record and read `body.case` off it, and a
+    /// caller who reached for the *last* one instead would still be right today
+    /// and wrong the moment a run is admitted before its case is known.
+    ///
+    /// # Errors
+    ///
+    /// If the journal cannot be read. An unknown run is `Ok(None)` rather than
+    /// an error: *no such run* and *a run in no case* are both honest answers
+    /// to this question, and neither is a fault.
+    pub async fn case_of(&self, run: RunId) -> Result<Option<crate::core::CaseId>, RuntimeError> {
+        Ok(self
+            .store
+            .read(run, 1)
+            .await
+            .map_err(RuntimeError::from_store)?
+            .first()
+            .and_then(|record| record.body.case))
+    }
+
     #[must_use]
     pub fn store(&self) -> &Arc<dyn JournalStore> {
         &self.store
@@ -4579,6 +4608,46 @@ impl RuntimeBuilder {
                     }
                 }
 
+                // Oversight needs somewhere to put the decision, and both
+                // halves are known here. Left to run time it surfaces at the
+                // first real approval — a person already waiting, on the code
+                // path a test suite is least likely to reach.
+                let declared = if m.spec.oversight.is_some() {
+                    Some("`spec.oversight`".to_owned())
+                } else if m.spec.tools.iter().any(|g| g.requires_approval) {
+                    Some("a grant with `requires_approval: true`".to_owned())
+                } else {
+                    None
+                };
+                if let Some(declared) = declared {
+                    // Ordered by what a reader fixes first: without a case
+                    // there is nothing for a task to hang off.
+                    //
+                    // Timers are deliberately **not** required, and the test
+                    // suite is why: four approval tests wire a case store and a
+                    // worklist, no timers, and run an approval end to end. A
+                    // task is opened, the run suspends, a person decides. What
+                    // a timer store adds is the sweeper firing `on_expiry`, and
+                    // refusing a configuration that works would be this check
+                    // asserting more than it knows — the failure mode it exists
+                    // to prevent, arriving from the other side.
+                    let missing = if self.cases.is_none() {
+                        Some(("case store", "cases"))
+                    } else if self.tasks.is_none() {
+                        Some(("worklist", "tasks"))
+                    } else {
+                        None
+                    };
+                    if let Some((missing, remedy)) = missing {
+                        return Err(BuildError::OversightUnreachable {
+                            agent: m.metadata.name.clone(),
+                            declared,
+                            missing,
+                            remedy,
+                        });
+                    }
+                }
+
                 for cap in &m.spec.capabilities.provides {
                     let skill: Arc<dyn Skill> = Arc::new(super::declarative::Declarative::new(
                         execution.kind,
@@ -4843,11 +4912,21 @@ impl Runtime {
     /// the message arrived, was held, and no run ever asked for it. That is the
     /// failure which otherwise presents as a process silently never completing,
     /// so it is worth alerting on rather than logging.
-    pub async fn sweep_events(&self, grace: time::Duration) -> Result<usize, RuntimeError> {
+    /// `grace` is a `std::time::Duration` for the reason
+    /// [`StepCtx::deadline`](crate::runtime::StepCtx::deadline)'s `warn_before`
+    /// is: a negative grace window is meaningless, and the signed type could
+    /// express it — a cutoff moved *forward* of now, retiring events that had
+    /// not yet had their chance. It is also the `Duration` the caller has.
+    pub async fn sweep_events(&self, grace: std::time::Duration) -> Result<usize, RuntimeError> {
         let events = self
             .events
             .as_ref()
             .ok_or_else(|| RuntimeError::PlanContract("this runtime has no event store".into()))?;
+        // Saturating rather than fallible: a grace window beyond what the
+        // calendar type can hold means "retire nothing", which is what
+        // `Duration::MAX` gives, and refusing the call would be a worse answer
+        // to a caller asking for a longer hold.
+        let grace = time::Duration::try_from(grace).unwrap_or(time::Duration::MAX);
         let cutoff = now_for_admission() - grace;
         let retired = events
             .sweep_unclaimed(cutoff, "no run claimed this event within the grace window")

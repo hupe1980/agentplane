@@ -1285,7 +1285,7 @@ fn every_runtime_future_survives_a_spawn(
     spawnable(rt.replay(run, agentplane::runtime::Mode::Strict));
     spawnable(rt.deliver(event));
     spawnable(rt.decide_task(task, decision, &[]));
-    spawnable(rt.sweep(now, time::Duration::seconds(1)));
+    spawnable(rt.sweep(now, std::time::Duration::from_secs(1)));
     spawnable(rt.fire_timers(now));
     spawnable(rt.census(now));
 }

@@ -3867,27 +3867,64 @@ async fn an_embedder_refuses_an_answer_that_is_not_one_vector() {
     }
 }
 
-/// An ungranted host is refused before the request is built.
+/// An ungranted host is refused **before the request is built**.
 ///
 /// An embedding call sends the query text to a third party. That it is short
 /// does not make it uninteresting, and the egress ceiling applies to it exactly
 /// as it applies to a completion.
+///
+/// # Why this points at a server that works
+///
+/// The first version of this test pointed at `https://not-granted.example` and
+/// asserted the failure named that host — and it passed with the whole egress
+/// check deleted, because a driver that *does* reach the network fails with
+/// `{url}: dns error ...`, which names the host too. A mutation sweep found it:
+/// replacing `check_egress` with `Ok(())` survived. It also meant the suite made
+/// a real DNS query to prove a control that runs before any I/O.
+///
+/// So the base is the local canned server, which answers correctly. Bypassing
+/// the ceiling now produces a **successful embedding**, and the assertion is on
+/// the ceiling's own wording rather than on a substring a network error shares.
 #[tokio::test]
 async fn an_embedder_refuses_a_host_nobody_granted() {
     use agentplane::memory::Embedder as _;
     use agentplane::model::embeddings::OpenAiEmbedder;
 
+    let (c, seen) = canned(200, json!({ "data": [{ "embedding": [1.0] }] }));
+    let url = serve(c).await;
     let err = OpenAiEmbedder::new("m")
         .unwrap()
-        .base("https://not-granted.example")
+        .base(url.clone())
         .egress(agentplane::core::Egress::new().allow("api.openai.com"))
         .embed("x")
         .await
         .expect_err("an ungranted host was reached");
     assert!(
-        err.to_string().contains("not-granted.example"),
-        "the refusal does not name the host: {err}"
+        err.to_string().contains("not a granted destination"),
+        "this is not the egress ceiling refusing: {err}"
     );
+    assert!(
+        seen.lock().unwrap().is_none(),
+        "the query text reached an ungranted host; the ceiling ran after the request, not before it"
+    );
+
+    // The positive half: granting the host this driver actually points at lets
+    // the same call through, so a refuse-everything change cannot pass.
+    // `serve` hands back `http://127.0.0.1:<port>`.
+    let host = url
+        .trim_start_matches("http://")
+        .rsplit_once(':')
+        .expect("the stub URL carries a port")
+        .0
+        .to_owned();
+    let vector = OpenAiEmbedder::new("m")
+        .unwrap()
+        .base(url)
+        .egress(agentplane::core::Egress::new().allow(host))
+        .embed("x")
+        .await
+        .expect("a granted host was refused");
+    assert_eq!(vector, vec![1.0]);
 }
 
 /// Gemini embeds a **query**, and a truncated vector is unit length again.
@@ -3927,6 +3964,86 @@ async fn gemini_embeds_a_query_and_renormalises_a_truncated_vector() {
     );
     assert_eq!(body["outputDimensionality"], 3);
     assert_eq!(body["content"]["parts"][0]["text"], "refund policy");
+
+    // The revision is what the retrieval effect's key carries, and a mutation
+    // sweep found it had no assertion at all: `revision()` could return an empty
+    // string and every test still passed, which would let two models' vectors
+    // share one identity.
+    assert_eq!(embedder.revision(), "gemini:gemini-embedding-001@3");
+    let native = GeminiEmbedder::new("k", "gemini-embedding-001").unwrap();
+    assert_eq!(native.revision(), "gemini:gemini-embedding-001");
+    assert_ne!(
+        native.revision(),
+        embedder.revision(),
+        "two widths are two geometries and shared one effect identity"
+    );
+}
+
+/// A Gemini reply this driver cannot honestly read is refused.
+///
+/// Each row is a distinct way for the answer to be unusable, and none of them
+/// is visible downstream: the wrong envelope yields no vector at all, a
+/// non-numeric component silently disappears from a `filter_map`, and a
+/// component no `f32` can hold narrows to infinity, which journals as `null`
+/// and would give two different vectors one effect key.
+#[tokio::test]
+async fn gemini_refuses_a_reply_that_is_not_a_vector() {
+    use agentplane::memory::Embedder as _;
+    use agentplane::model::embeddings::GeminiEmbedder;
+
+    for (body, what) in [
+        (json!({ "embedding": {} }), "no values at all"),
+        (json!({ "embedding": { "values": [] } }), "an empty vector"),
+        (
+            json!({ "embedding": { "values": [1.0, "nan"] } }),
+            "a component that is not a number",
+        ),
+        (
+            json!({ "embedding": { "values": [1.0, 1e39] } }),
+            "a component no f32 can hold",
+        ),
+        (
+            // Only reachable with a width asked for, which the caller below
+            // supplies: a zero-magnitude vector has no direction, so cosine
+            // against it is 0/0. Skipping the re-normalisation instead — which
+            // is what the guard used to do — hands it back to fail layers away
+            // as "the retriever returned a non-finite score".
+            json!({ "embedding": { "values": [0.0, 0.0] } }),
+            "a vector with no magnitude",
+        ),
+    ] {
+        let (c, _) = canned(200, body.clone());
+        let url = serve(c).await;
+        // A width is asked for throughout, so the re-normalisation branch is on
+        // the path for every row rather than only for the last.
+        let outcome = GeminiEmbedder::new("k", "gemini-embedding-001")
+            .unwrap()
+            .base(url)
+            .dimensions(2)
+            .embed("x")
+            .await;
+        assert!(
+            outcome.is_err(),
+            "accepted {what}: {:?} came back as an embedding",
+            outcome.unwrap()
+        );
+    }
+
+    // The positive half, so a refuse-everything change cannot pass: an ordinary
+    // reply at the native width is returned exactly as it arrived.
+    let (c, _) = canned(200, json!({ "embedding": { "values": [3.0, 4.0] } }));
+    let url = serve(c).await;
+    let vector = GeminiEmbedder::new("k", "gemini-embedding-001")
+        .unwrap()
+        .base(url)
+        .embed("x")
+        .await
+        .expect("an ordinary reply was refused");
+    assert_eq!(
+        vector,
+        vec![3.0, 4.0],
+        "a native-width vector arrives normalised and must be left alone"
+    );
 }
 
 /// An asymmetric model is told the text is a query, and that is in the identity.

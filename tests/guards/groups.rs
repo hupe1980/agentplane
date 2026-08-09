@@ -702,7 +702,7 @@ async fn a_group_survives_a_suspension_without_being_reversed() {
             // precisely so a wait can happen inside it.
             let _ = g;
             // A durable wait: the frame is persisted and the task dropped.
-            cx.sleep(std::time::Duration::from_hours(1))
+            cx.sleep(std::time::Duration::from_secs(3600))
                 .await
                 .map_err(SkillError::Step)?;
             cx.group("waits", ["inventory"])
@@ -1618,7 +1618,7 @@ async fn a_group_spanning_a_suspension_is_announced_once() {
             .await
             .map_err(SkillError::Step)?;
             let _ = g;
-            cx.sleep(std::time::Duration::from_hours(1))
+            cx.sleep(std::time::Duration::from_secs(3600))
                 .await
                 .map_err(SkillError::Step)?;
             unreachable!("never resumes in this test")

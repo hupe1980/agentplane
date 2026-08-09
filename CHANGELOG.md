@@ -8,15 +8,150 @@ than a compatibility shim nobody has yet depended on. Every breaking entry says
 what to do about it, and [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/)
 carries the ones that need more than a sentence.
 
-What this file does **not** do is duplicate the built-vs-designed inventory. That
-is [status](https://hupe1980.github.io/agentplane/docs/status/), which answers
-*what is true now and what evidence holds it*; this answers *what changed and
-when*. Two documents, two questions.
+**This file carries the reasoning, not just the diff.** It used to share that job
+with a status page listing everything built — two hundred rows, nearly all of them
+phrased as *X used to do Y, now it does Z*, which is a change and not a status.
+Keeping one fact in two places is the defect this project treats most seriously
+elsewhere, so the list is gone and the entries below are where a mechanism's
+history lives. [Status](https://hupe1980.github.io/agentplane/docs/status/) now
+answers only what a status page can: what will move, what is deliberately absent,
+and how to check either. What *exists* is answered by the
+[concepts](https://hupe1980.github.io/agentplane/docs/concepts/) page, the
+[API reference](https://docs.rs/agentplane), and the test suite.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rather
-than written at the time, so they are deliberately terse — the detail for those
-releases lives in the status page and in `git log`, and inventing more would be
+than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
+
+## [0.11.0] — 2026-08-09
+
+### Changed — breaking
+
+- **A `mutates: true` grant with no `protected_fields` is refused at parse for a
+  `tool-calling` agent.** Three facts composed: a model completion is untrusted
+  unconditionally, the tool loop builds a call's arguments from it, and a
+  mutating sink whose grant names no protected fields refuses an untrusted
+  argument bundle outright. Together, such a grant could never fire — and the
+  run did not fail cleanly, it *succeeded having done nothing the model asked
+  for*. Reported from a migration with 108 such grants across 27 manifests, all
+  unreachable, each reading as a live capability. Three fixes, and the message
+  gives all three: declare the authority-bearing arguments in
+  `protected_fields` (ordinary untrusted content may sit beside them, which is
+  what the feature is for); move to `execution.kind: planned`, whose arguments
+  are resolved by the runtime; or say `mutates: false`.
+
+- **`BuildError::OversightUnreachable`.** An agent declaring `spec.oversight` or
+  a `requires_approval` grant now refuses the build on a plane with no case
+  store, worklist or timers. Both facts are known at `build`; left to run time
+  it arrived at the first real approval with a person already waiting.
+
+- **A2A method parameters are per-method and unknown names are refused.** One
+  `CommonParams` served every method, so a field belonging to one was silently
+  accepted by another. `ListTasks` was the case that mattered: a request whose
+  `contextId` was misspelled — or spelled `context_id`, which the A2A
+  specification's §5.5 forbids — parsed cleanly, dropped the filter, and
+  answered with **every** task the caller may see, shaped exactly like the
+  scoped list. Found by the protocol project's own conformance kit, whose
+  JSON-RPC client sends snake_case: five CORE-LIST rows had been passing over a
+  filter that never ran.
+
+### Added
+
+- **`Runtime::case_of(run)`** — which case a run belongs to, read from the
+  journal rather than a column beside it.
+- **`PushSender::allow_plaintext_loopback`** (`testkit` only) — lifts the HTTPS
+  and public-address refusals for a webhook on this machine, so the conformance
+  kit's `http://localhost:PORT` receiver is reachable and its **ten push MUSTs
+  run at all**. The operator host grant is not lifted, and a plaintext public
+  destination stays refused.
+
+### Fixed
+
+- **The worked taint-gate policy in `docs/security` was an outage.**
+  `context.label` is the *whole bundle's* label, so in a tool loop the `forbid`
+  matched every mutating call. A deployment shipped it and its unit tests
+  passed, because a hand-written context is a context assembled to suit the
+  rule. The page now says so and offers a scoped form.
+- The `getting-started` guide points services at `try_build()`.
+
+### Changed — breaking (continued)
+
+- **One `Duration` on the public surface.** `StepCtx::deadline`'s `warn_before`,
+  `Runtime::sweep_events`'s `grace` and `Runtime::sweep`'s `event_grace` took
+  `time::Duration` while `StepCtx::sleep` took `std::time::Duration` — two types
+  spelled the same word, only one from a crate this one re-exports, so a caller
+  with the obvious `use std::time::Duration` met a type error naming a
+  dependency the guides never mention. They now all take
+  `std::time::Duration`. It is also **unsigned**, which makes two states
+  unrepresentable that the signed type allowed: a negative `warn_before` put
+  `warn_at` *after* the instant it warns about, and a negative grace window
+  moved the dead-letter cutoff forward of now.
+
+  `time::Duration::hours(1)` becomes `std::time::Duration::from_secs(3600)`.
+  (`Duration::from_hours` is still unstable on the declared MSRV, which is also
+  why `clippy::duration_suboptimal_units` is allowed with the command that
+  re-derives the premise.)
+
+- **`DeadlineSpec::minutes`** joins `hours` and `days`. `WallClock` resolved
+  `"minutes"` and nothing spelled it, which is where `"minute"` and `"mins"`
+  start diverging between an application and its calendar adapter.
+
+### Fixed
+
+- **A push webhook that will never be delivered to is abandoned, not retried
+  forever.** The operator's host grant is re-checked at *delivery* as well as at
+  registration, because a registration outlives the configuration that permitted
+  it — but the worker noticed the refusal and then rescheduled it, so a host
+  taken off the allowlist bought one more attempt every 256 seconds for as long
+  as the journal existed. Permanent refusals (`NotHttps`, `HostNotGranted`,
+  `Malformed`) now abandon the registration; transient ones keep their backoff
+  and gain a ceiling, `A2aPushWorker::max_attempts` (32 by default). `Unroutable`
+  stays transient, because it covers DNS and DNS changes.
+
+- **`PushSweepReport::needs_attention()`**, matching `SweepReport`. Giving up on
+  a peer's webhook used to produce `retries: 1` on an *info* line — the same
+  shape a rebooting receiver produces — so `agentplane serve` logged an
+  unrecoverable delivery failure as routine progress. New field:
+  `PushSweepReport::abandoned`.
+
+- **`--features bedrock` alone now exposes `BedrockEmbedder`.** The `embeddings`
+  module was gated on `providers` while holding the Bedrock driver, so a
+  Bedrock-only build paid for the AWS SDK and could not name an embedder at all —
+  leaving semantic retrieval unavailable to the deployments that chose Bedrock
+  because their data may not leave one account. The gate is now
+  `any(providers, bedrock)`, and a `const _` in `lib.rs` names each embedder so a
+  future gate regression fails this crate's build.
+
+- **An embedding component no `f32` can hold is refused.** `1e39` parses as an
+  ordinary JSON number and narrows to `inf`, which the length check could not
+  see; `serde_json::to_value` then writes it as `null`, so every out-of-range
+  component would have shared one effect key. A zero-magnitude vector is refused
+  for the neighbouring reason — it has no direction to rank against.
+
+- **The `run_trusted` that never existed.** The README and the getting-started
+  page published the plane's *no such capability* message with a method name
+  deleted in 0.10.0. A guard now formats the real error and holds both pages to
+  it.
+
+- **`DeadlineSpec::working_days`, which never existed either.** The concepts
+  page taught obligations with it — beside a comment saying *five working days*
+  while the call said one, the tell that nobody had run it. A second guard now
+  refuses any documented `Type::associated_fn` this crate does not declare; the
+  previous one covered `StepCtx` alone.
+
+- **`Duration::from_hours(24)` in a published snippet.** Still unstable, so the
+  `cx.sleep` example on the architecture page did not compile.
+
+### Testing
+
+- `RecordingPush`, the A2A push test double, now honours its own `validate`. It
+  did not, so *the grant is re-checked at delivery* had no test that travelled
+  the worker's path — the one path an operator's revocation takes.
+- An automated sweep over `model::embeddings` left **14 of 53** mutations alive,
+  including `check_egress -> Ok(())`, both `revision()` implementations, and the
+  whole of `BedrockEmbedder::embed`. 14 became 0. The egress test itself was the
+  interesting repair: it pointed at an unresolvable host and asserted the failure
+  named it, which a DNS error does too, so it passed with the ceiling deleted.
 
 ## [0.10.0] — 2026-08-08
 

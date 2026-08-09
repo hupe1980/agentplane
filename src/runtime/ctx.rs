@@ -3115,11 +3115,26 @@ impl StepCtx<'_> {
     /// rather than recomputing it against whatever the calendar says today.
     /// That is what keeps a corrected holiday table from retroactively moving a
     /// deadline that has already been relied upon.
+    ///
+    /// # Why `warn_before` is a `std::time::Duration`
+    ///
+    /// Two reasons, and the second is the one that bites. It used to be
+    /// `time::Duration`, which is **signed** — so a negative warning offset
+    /// parsed, compiled, and put `warn_at` *after* the instant it warns about:
+    /// a warning that can only fire once the obligation is already breached.
+    /// A quantity that only makes sense non-negative is an unsigned type here,
+    /// as it is for [`Spend`](crate::core::Spend).
+    ///
+    /// And it is the `Duration` a caller already has.
+    /// [`sleep`](Self::sleep) takes the standard one, so the public surface had
+    /// two types spelled `Duration`, only one of which came from a crate this
+    /// one re-exports — a reader with the obvious `use std::time::Duration`
+    /// met a type error naming a dependency the guides never mentioned.
     pub async fn deadline(
         &mut self,
         name: impl Into<String>,
         spec: &DeadlineSpec,
-        warn_before: Option<time::Duration>,
+        warn_before: Option<std::time::Duration>,
     ) -> Result<Deadline, StepError> {
         let name = name.into();
         let cx = self.case_ctx()?.clone();
@@ -3140,7 +3155,9 @@ impl StepCtx<'_> {
             name: name.clone(),
             resolved_at: resolved.at,
             calendar_digest: resolved.calendar_digest,
-            warn_at: warn_before.and_then(|d| resolved.at.checked_sub(d)),
+            warn_at: warn_before
+                .and_then(|d| time::Duration::try_from(d).ok())
+                .and_then(|d| resolved.at.checked_sub(d)),
             state: DeadlineState::Pending,
         };
 

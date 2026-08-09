@@ -137,6 +137,23 @@ const _: fn() = || {
     let _: Option<&crate::store::PostgresStore> = None;
 };
 
+// The same question, asked of the embedding drivers, because they failed it the
+// same way. `model::embeddings` was gated on `providers` while holding
+// `BedrockEmbedder` — so `--features bedrock` bought the AWS SDK, documented
+// Titan and Cohere embeddings, and exposed no embedder at all. Semantic
+// retrieval was unavailable to exactly the deployments that chose Bedrock
+// because their data may not leave one account, which is the population the
+// driver exists for.
+#[cfg(feature = "providers")]
+const _: fn() = || {
+    let _: Option<&crate::model::embeddings::OpenAiEmbedder> = None;
+    let _: Option<&crate::model::embeddings::GeminiEmbedder> = None;
+};
+#[cfg(feature = "bedrock")]
+const _: fn() = || {
+    let _: Option<&crate::model::embeddings::BedrockEmbedder> = None;
+};
+
 pub use crate::core::{
     AgentRef, Capability, CaseId, Digest, EffectKey, Label, Outcome, Recovery, RunId, RuntimeError,
     Sensitivity, Seq, Skill, SkillDescriptor, SourceId, StepId, Tainted, Trust,

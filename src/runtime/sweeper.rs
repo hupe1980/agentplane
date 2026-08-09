@@ -308,7 +308,7 @@ impl Runtime {
     pub async fn sweep(
         &self,
         now: Timestamp,
-        event_grace: time::Duration,
+        event_grace: std::time::Duration,
     ) -> Result<SweepReport, RuntimeError> {
         let mut report = SweepReport::default();
         let mut ledger = SweepLedger::new();

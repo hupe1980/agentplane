@@ -22,6 +22,7 @@
 //! is in the effect key, so a guessed default would put a guess in the identity
 //! of every vector.
 
+#[cfg(feature = "providers")]
 use crate::core::Secret;
 use crate::core::StoreError;
 use crate::memory::Embedder;
@@ -31,15 +32,34 @@ use crate::memory::Embedder;
 /// Vectors are `f32` by the seam's own contract — that is what an index stores
 /// and what cosine is computed in. JSON carries `f64`, so narrowing is not a
 /// loss of information the caller had: it is the wire's precision meeting the
-/// type the whole retrieval path already uses. A value no `f32` can hold is not
-/// an embedding component, and the caller's length check refuses the reply
-/// rather than silently shortening it.
+/// type the whole retrieval path already uses.
+///
+/// # The narrowing has to be checked, and the comment here once said it was
+///
+/// `1e39` is an ordinary JSON number — `serde_json` refuses only what no `f64`
+/// can hold — and `1e39 as f32` is `inf`. So the obvious one-liner returned
+/// `Some(inf)`, the caller's `len()` check passed because nothing was dropped,
+/// and an infinite component went into the vector.
+///
+/// What it does downstream is the reason this is a check rather than a
+/// tidy-up. The query vector is part of the retrieval effect's identity, and
+/// `serde_json::to_value` turns a non-finite float into `null` — so `+inf`,
+/// `-inf` and every out-of-range component journal as the same value and
+/// therefore share an effect key. [`core::canon`](crate::core::canon) states
+/// the rule this breaks: two *different* values must never hash identically,
+/// because replay then hands one effect the other's recorded output.
+///
+/// Returning `None` puts it back on the length check, which refuses the whole
+/// reply and names the driver — a provider answering with a component no
+/// embedding index can rank against is not speaking this wire.
 #[allow(clippy::cast_possible_truncation)]
 fn json_f32(value: &serde_json::Value) -> Option<f32> {
-    value.as_f64().map(|f| f as f32)
+    let narrowed = value.as_f64()? as f32;
+    narrowed.is_finite().then_some(narrowed)
 }
 
 /// Embeddings over the `OpenAI`-compatible wire.
+#[cfg(feature = "providers")]
 #[derive(Debug, Clone)]
 pub struct OpenAiEmbedder {
     http: reqwest::Client,
@@ -52,6 +72,7 @@ pub struct OpenAiEmbedder {
     timeout: std::time::Duration,
 }
 
+#[cfg(feature = "providers")]
 impl OpenAiEmbedder {
     /// Five minutes, matching the model drivers.
     pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
@@ -162,16 +183,19 @@ impl OpenAiEmbedder {
     }
 }
 
+#[cfg(feature = "providers")]
 #[derive(serde::Deserialize)]
 struct EmbeddingsReply {
     data: Vec<EmbeddingDatum>,
 }
 
+#[cfg(feature = "providers")]
 #[derive(serde::Deserialize)]
 struct EmbeddingDatum {
     embedding: Vec<f32>,
 }
 
+#[cfg(feature = "providers")]
 #[async_trait::async_trait]
 impl Embedder for OpenAiEmbedder {
     /// Model **and** dimension count.
@@ -646,10 +670,26 @@ impl Embedder for GeminiEmbedder {
         // arrives normalised and is left exactly as it came.
         if self.dimensions.is_some() {
             let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                for v in &mut vector {
-                    *v /= norm;
-                }
+            // Refused rather than skipped. A zero-magnitude vector has no
+            // direction, so cosine against it is `0/0` — and the guard that
+            // used to *skip* normalisation here handed one straight back, to
+            // fail several layers away as "the retriever returned a non-finite
+            // score", naming the retriever for the driver's answer. Refusing
+            // also makes the guard falsifiable: skipping is indistinguishable
+            // from dividing by zero unless something produces the zero vector.
+            //
+            // `is_finite` as well as `> 0.0`: every component is finite by
+            // `json_f32`, but a sum of squares is not, and dividing by an
+            // infinite norm would answer with a vector of zeros — the same
+            // directionless value, arrived at silently.
+            if !norm.is_finite() || norm <= 0.0 {
+                return Err(StoreError::Backend(format!(
+                    "{url}: the vector has no usable magnitude ({norm}), so there \
+                     is no direction to rank against"
+                )));
+            }
+            for v in &mut vector {
+                *v /= norm;
             }
         }
         Ok(vector)
@@ -693,5 +733,188 @@ mod bedrock_dialect_tests {
         let err = bedrock_body(EmbeddingDialect::Cohere, "x", Some(512))
             .expect_err("a width Cohere cannot send was accepted");
         assert!(err.to_string().contains("no `dimensions`"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod narrowing_tests {
+    use super::json_f32;
+
+    /// A component `f32` cannot hold is refused, not turned into infinity.
+    ///
+    /// Both halves, because a `None`-for-everything change would satisfy the
+    /// negative one perfectly and reject every real embedding: the ordinary
+    /// values must still narrow, including one that loses precision, since
+    /// precision loss *is* the contract and range loss is not.
+    #[test]
+    fn a_component_no_f32_can_hold_is_refused_rather_than_infinite() {
+        // `1e39` is an ordinary JSON number — `serde_json` refuses only what no
+        // `f64` can hold — and `1e39 as f32` is `inf`. The obvious narrowing
+        // returned `Some(inf)`, which the caller's length check cannot see.
+        for out_of_range in ["1e39", "-1e39", "1e300"] {
+            let value: serde_json::Value = serde_json::from_str(out_of_range).expect("valid JSON");
+            assert_eq!(
+                json_f32(&value),
+                None,
+                "{out_of_range} narrowed to a non-finite component; journaled as \
+                 `null` it would share an effect key with every other one"
+            );
+        }
+
+        assert_eq!(json_f32(&serde_json::json!(1.0)), Some(1.0));
+        assert_eq!(json_f32(&serde_json::json!(-0.0321)), Some(-0.0321));
+        assert_eq!(
+            json_f32(&serde_json::json!(0.123_456_789_012_345_68_f64)),
+            Some(0.123_456_79),
+            "precision loss is the contract; range loss is the defect"
+        );
+        assert_eq!(json_f32(&serde_json::json!("0.5")), None);
+    }
+}
+
+#[cfg(all(test, feature = "bedrock"))]
+mod bedrock_reply_tests {
+    use super::{BedrockEmbedder, EmbeddingDialect};
+    use crate::memory::Embedder as _;
+
+    /// A Bedrock client whose one answer is `body`.
+    ///
+    /// The request builder had a test and the **response reader** had none, so a
+    /// mutation sweep replaced the whole of `embed` with `Ok(vec![1.0])` and the
+    /// suite stayed green. That is the shape the media-block work already named:
+    /// a producer and a consumer each tested against hand-written JSON, with
+    /// nothing feeding one to the other, so a renamed key breaks the driver and
+    /// no test.
+    fn embedder(dialect: EmbeddingDialect, body: &'static str) -> BedrockEmbedder {
+        let config = aws_sdk_bedrockruntime::Config::builder()
+            .region(aws_config::Region::new("eu-central-1"))
+            .credentials_provider(aws_sdk_bedrockruntime::config::Credentials::for_tests())
+            .behavior_version_latest()
+            .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
+                move |_req| {
+                    http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .unwrap()
+                },
+            ))
+            .build();
+        BedrockEmbedder::from_client(
+            aws_sdk_bedrockruntime::Client::from_conf(config),
+            "eu-central-1",
+            "amazon.titan-embed-text-v2:0",
+            dialect,
+        )
+    }
+
+    /// Each dialect reads the shape its vendor answers with.
+    #[tokio::test]
+    async fn each_dialect_reads_its_own_reply() {
+        let titan = embedder(EmbeddingDialect::Titan, r#"{"embedding":[0.25,-0.5,0.75]}"#)
+            .embed("refund policy")
+            .await
+            .expect("titan reply");
+        assert_eq!(titan, vec![0.25, -0.5, 0.75]);
+
+        let cohere = embedder(EmbeddingDialect::Cohere, r#"{"embeddings":[[1.0,0.0]]}"#)
+            .embed("refund policy")
+            .await
+            .expect("cohere reply");
+        assert_eq!(cohere, vec![1.0, 0.0]);
+    }
+
+    /// Every reply this driver cannot honestly read is refused.
+    ///
+    /// Each row is a different way to be wrong, and each is one a downstream
+    /// index would not notice: a vector of the wrong rank ranks against
+    /// nothing, a component that is not a number silently disappears from a
+    /// `filter_map`, and more than one row means the query was ranked against
+    /// somebody else's text.
+    #[tokio::test]
+    async fn a_reply_this_dialect_cannot_read_is_refused() {
+        for (dialect, body, what) in [
+            (
+                EmbeddingDialect::Titan,
+                r#"{"embeddings":[[1.0]]}"#,
+                "Cohere's shape read as Titan's",
+            ),
+            (
+                EmbeddingDialect::Cohere,
+                r#"{"embedding":[1.0]}"#,
+                "Titan's shape read as Cohere's",
+            ),
+            (
+                EmbeddingDialect::Cohere,
+                r#"{"embeddings":[[1.0],[2.0]]}"#,
+                "two rows for one text",
+            ),
+            (
+                EmbeddingDialect::Titan,
+                r#"{"embedding":[]}"#,
+                "an empty vector, which no index can rank against",
+            ),
+            (
+                EmbeddingDialect::Titan,
+                r#"{"embedding":[1.0,"nan",2.0]}"#,
+                "a component that is not a number",
+            ),
+            (
+                EmbeddingDialect::Titan,
+                r#"{"embedding":[1.0,1e39]}"#,
+                "a component no f32 can hold, which narrows to infinity",
+            ),
+        ] {
+            let err = embedder(dialect, body)
+                .embed("x")
+                .await
+                .expect_err(&format!("accepted {what}"));
+            assert!(
+                matches!(err, crate::core::StoreError::Backend(_)),
+                "{what}: {err}"
+            );
+        }
+    }
+
+    /// The revision names the region, and that is not decoration.
+    ///
+    /// A Bedrock model id names a model, not a deployment: the same id in two
+    /// regions is two services, and a vector from one has no standing in an
+    /// index built from the other. It sits in the retrieval effect's key, so a
+    /// revision that dropped the region would let a replay read one region's
+    /// vector as the other's — and it is the fact a compliance reader most
+    /// wants on the record.
+    #[test]
+    fn the_revision_names_the_region_the_model_and_the_width() {
+        let base = |region| {
+            let config = aws_sdk_bedrockruntime::Config::builder()
+                .region(aws_config::Region::new(region))
+                .behavior_version_latest()
+                .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
+                    |_req| http::Response::builder().status(200).body("").unwrap(),
+                ))
+                .build();
+            BedrockEmbedder::from_client(
+                aws_sdk_bedrockruntime::Client::from_conf(config),
+                region,
+                "amazon.titan-embed-text-v2:0",
+                EmbeddingDialect::Titan,
+            )
+        };
+
+        assert_eq!(
+            base("eu-central-1").revision(),
+            "bedrock:eu-central-1/amazon.titan-embed-text-v2:0"
+        );
+        assert_ne!(
+            base("eu-central-1").revision(),
+            base("us-east-1").revision(),
+            "two regions are two services and shared one effect identity"
+        );
+        assert_eq!(
+            base("eu-central-1").dimensions(256).revision(),
+            "bedrock:eu-central-1/amazon.titan-embed-text-v2:0@256",
+            "a width that does not reach the revision lets two geometries share an index"
+        );
     }
 }

@@ -550,13 +550,43 @@ permit(
 ```
 
 ```cedar
-// The taint gate, as a rule. The runtime enforces this structurally too; the
-// two are not redundant, because a policy can express conditions the lattice
-// has no vocabulary for.
+// The whole-value taint gate. Read the warning under it before shipping this.
 permit(principal, action == Action::"effect:perform", resource);
 
 forbid(principal, action == Action::"effect:perform", resource)
 when { context.mutates && context.label.trust == "untrusted" };
+```
+
+**That one denies every mutating call a tool loop will ever make, and it is the
+snippet on this page most likely to be copied.** `context.label` is the label of
+the **whole argument bundle**, and in a `tool-calling` agent the bundle is
+assembled from a model completion — which is untrusted unconditionally, because
+its source is a model. So after any model turn the `forbid` matches everything
+mutating. A deployment shipped this rule, passed its own unit tests, and found
+it end to end: a hand-written context is a context assembled to suit the rule.
+
+Per-argument trust is what [protected sink
+fields](@/docs/manifest.md) are for, and they are the reason this coarse rule is
+rarely what you want: they let an authority-bearing selector require trusted
+data while ordinary untrusted content sits beside it in the same call. The
+runtime enforces the coarse version structurally anyway — a mutating grant that
+names no protected fields is refused for a `tool-calling` agent **at parse**, so
+the case this rule is reaching for cannot be deployed in the first place.
+
+Write it, if you write it, for the effects a *skill* dispatches, where the
+argument bundle's label is something your own code decided:
+
+```cedar
+// Scoped to the kinds a coded skill builds its own arguments for, so a tool
+// loop's completions are not caught by a rule aimed at something else.
+permit(principal, action == Action::"effect:perform", resource);
+
+forbid(principal, action == Action::"effect:perform", resource)
+when {
+    context.mutates &&
+    context.label.trust == "untrusted" &&
+    !context.label.provenance.containsAny(["model:privileged", "model:quarantined"])
+};
 ```
 
 ```cedar

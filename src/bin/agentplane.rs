@@ -464,7 +464,10 @@ fn spawn_sweeper(runtime: &Arc<Runtime>, every: u32) {
                 Ok(_) => {}
                 Err(error) => tracing::error!(%error, "firing timers failed"),
             }
-            match sweeper.sweep(now, time::Duration::hours(1)).await {
+            match sweeper
+                .sweep(now, std::time::Duration::from_secs(3600))
+                .await
+            {
                 // A sweep that decided something, hit its cap, or lost its own
                 // evidence is a finding an operator must clear rather than a
                 // line in a log — I13 applies to the sweeper's own report.
@@ -670,10 +673,12 @@ fn spawn_push_worker(worker: agentplane::api::a2a::A2aPushWorker, every: u32) {
             let at = time::OffsetDateTime::now_utc().unix_timestamp();
             let Ok(at) = u64::try_from(at) else { continue };
             match worker.run_once(at, PUSH_BATCH).await {
-                // A batch that came back full is a backlog, and a backlog must
-                // not produce the same numbers as a quiet plane.
-                Ok(report) if report.saturated => {
-                    tracing::warn!(?report, "push delivery is saturated");
+                // A batch that came back full is a backlog, and a registration
+                // given up on is a peer that will never hear back. Neither may
+                // produce the same numbers — or the same log level — as a quiet
+                // plane, which is I13 applied to this worker's own report.
+                Ok(report) if report.needs_attention() => {
+                    tracing::warn!(?report, "push delivery needs attention");
                 }
                 Ok(report) if report.registrations > 0 => {
                     tracing::info!(?report, "push delivered");

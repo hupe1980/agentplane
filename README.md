@@ -151,7 +151,7 @@ hold, `Debug` is the message:
 
 ```text
 Error: no skill provides capability 'demo.greeet' — this plane provides:
-demo.greet. `run_trusted` takes a capability, not a skill name; a skill declares its own
+demo.greet. `run` takes a capability, not a skill name; a skill declares its own
 with `SkillDescriptor::new(..).provides(..)`
 ```
 
@@ -248,7 +248,7 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | 🚦 | **Ceilings that survive scaling out** — a budget bounds one run; a tenant that can start runs can start a thousand. Per-tenant limits on concurrent runs and spend are accounted **in the store**, because an in-process counter fails *open*: it silently doubles the moment a second instance starts, which is exactly when it was needed. Refusals are back-pressure, distinct from a policy denial — one means *not right now*, the other *never* |
 | 🛰️ | **One plane, several agents** — a runtime owns the journal, the drivers and the process identity; an agent owns a manifest and its skills. Each agent on a plane is separately declared, bounded and answerable, and two of them claiming one capability is *refused at startup* rather than silently resolved — as a panic naming the mistake when a binary wired itself, or a typed `BuildError` from `try_build` when the manifest arrived from a registry or a tenant, where a bad declaration is an input rather than a bug and a panic would take every other tenant's in-flight run down with it. `StepCtx::commission` hands work to a peer as a **journaled effect**, so a replay reassembles the room without waking it, the label travels with the answer, and the specialist's spend is billed to the run that asked |
 
-Full inventory, including what is **not** built →
+What is deliberately **not** built, and what will move →
 **[docs/status.md](https://hupe1980.github.io/agentplane/docs/status/)**
 
 ## 📚 Documentation
@@ -265,9 +265,9 @@ Full inventory, including what is **not** built →
 | 🗝️ | [Erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) — erasure that reaches backups, key rotation and revocation, and how tenants are kept apart |
 | ⚙️ | [Operations](https://hupe1980.github.io/agentplane/docs/operations/) — deploying, HA, retention, observability |
 | ⚖️ | [Regulation](https://hupe1980.github.io/agentplane/docs/regulation/) — EU AI Act obligation by obligation, and what is missing |
-| 📋 | [Status](https://hupe1980.github.io/agentplane/docs/status/) — built vs designed-not-built |
+| 📋 | [Status](https://hupe1980.github.io/agentplane/docs/status/) — what is pre-alpha, what to pin, what is deliberately absent |
 | ⬆️ | [Upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/) — what breaks between pre-alpha releases, and the shortest correct fix |
-| 📜 | [Changelog](CHANGELOG.md) — what changed and when. *Status* answers what is true now; this answers what moved |
+| 📜 | [Changelog](CHANGELOG.md) — what changed and when, including every mechanism's reasoning as it landed |
 | 🤝 | [Contributing](CONTRIBUTING.md) — the assurance ladder, and how to run it |
 
 ## 🧪 Assurance

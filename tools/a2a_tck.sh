@@ -30,16 +30,45 @@ CACHE="${ROOT}/.tck-cache"
 TCK_REPO="https://github.com/a2aproject/a2a-tck.git"
 ADDR="${A2A_TCK_ADDR:-127.0.0.1:9999}"
 
-# Two of the kit's MUST rows contradict themselves, and are excluded with the
-# evidence rather than silently: each *titles* a required error
+# Rows excluded with the evidence rather than silently. Two classes.
+#
+# (1) Two rows contradict themselves: each *titles* a required error
 # (ContentTypeNotSupportedError; "agent rejects unacceptable contextId") while
 # setting no `expected_error`, so its validator demands success for a request
 # its own description says MUST fail. This server returns the error the titles
-# require. Worth an upstream issue; a kit release that fixes them makes these
-# two lines deletable.
+# require.
+#
+# (2) Six rows are blocked by a defect in the kit's own JSON-RPC client, and
+# the evidence is the specification the kit ships in the same repository.
+# `specification.md` §5.5 states that all JSON serializations of the A2A data
+# model **MUST** use camelCase field names, "not the snake_case convention used
+# in Protocol Buffer definitions" — and §9.4.4's own worked example sends
+# `{"contextId": ..., "pageSize": ...}`. `tck/transport/jsonrpc_client.py`
+# sends `context_id`, `page_size`, `include_artifacts` and `task_id`.
+#
+# This server refuses those, which is why the rows fail. Accepting them would
+# be accepting a spelling the specification forbids — the same reason the
+# version header and the method names are exact here.
+#
+# Worth knowing what the exclusion cost and what it bought, because the pass
+# count went *down*: the five CORE-LIST rows previously **passed vacuously**.
+# The server used to ignore an unrecognised parameter, so a request whose
+# `contextId` filter was spelled `context_id` had no filter at all and answered
+# with every task the caller could see — shaped exactly like the scoped list the
+# row asked for, so the row could not fail. Refusing unknown parameters is what
+# turned five silent passes into five honest failures against a kit bug.
+#
+# All eight are worth an upstream issue; a kit release that fixes the client
+# makes six of these lines deletable and should raise the floor by five.
 DESELECT=(
     --deselect "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-SEND-003-jsonrpc]"
     --deselect "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-MULTI-002a-jsonrpc]"
+    --deselect "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-LIST-001-jsonrpc]"
+    --deselect "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-LIST-002-jsonrpc]"
+    --deselect "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-LIST-003-jsonrpc]"
+    --deselect "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-LIST-004-jsonrpc]"
+    --deselect "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-LIST-005-jsonrpc]"
+    --deselect "tests/compatibility/core_operations/test_push_notifications.py::TestPushNotificationCrud::test_create_push_config[jsonrpc]"
 )
 
 command -v uv >/dev/null || { echo "uv is required (https://docs.astral.sh/uv/)"; exit 2; }
@@ -59,7 +88,7 @@ uv pip install -q -e .
 
 # ── The server under test ───────────────────────────────────────────────────
 cd "$ROOT"
-cargo build --example a2a_tck_live --features redb,a2a-server,manifest
+cargo build --example a2a_tck_live --features redb,a2a-server,manifest,testkit
 A2A_TCK_ADDR="$ADDR" ./target/debug/examples/a2a_tck_live &
 SUT_PID=$!
 trap 'kill "$SUT_PID" 2>/dev/null || true' EXIT
@@ -99,7 +128,15 @@ set -e
 # A floor, not an exact count: the kit gains rows between releases and a new
 # *passing* row must not be a failure here. A row that stops passing must be.
 PASSED=$(sed -n 's/^\([0-9]\{1,\}\) passed.*/\1/p' "${CACHE}/last-run.txt" | tail -1)
-EXPECTED_MIN=77
+# 77 until push was wired and unknown parameters started being refused. Both
+# moved it, in opposite directions and for opposite reasons, so the composition
+# matters more than the number: +4 real push rows (including all three
+# *delivery* rows — that the agent POSTs, carries its auth, and sends a
+# StreamResponse), −3 rows that could only pass while push was absent, and −5
+# CORE-LIST rows that had been passing over a filter the server silently
+# dropped. Lowering a floor is normally the wrong move; here the rows it lets go
+# were never checking anything, and the comment beside DESELECT says which.
+EXPECTED_MIN=73
 if [[ -z "$PASSED" ]]; then
     echo "REFUSED: could not read a pass count from the kit's output — a run that" >&2
     echo "         asserted nothing reports no failures and reads like success" >&2
@@ -113,8 +150,9 @@ if (( PASSED < EXPECTED_MIN )); then
 fi
 echo "ok: ${PASSED} MUST-level rows passed (floor ${EXPECTED_MIN}); skips listed above"
 echo "    Skipped rows are not passing rows. The standing ones are: the two"
-echo "    unconfigured transports, the errors only a non-streaming agent can"
-echo "    raise, the ten push rows (this fixture wires no --push-host, and"
-echo "    PushSender refuses a non-public webhook host by design, so the kit"
-echo "    cannot reach them from localhost), and STREAM-SUB-002's client-side"
-echo "    timeout, checked by hand and correct on the server."
+echo "    unconfigured transports, the errors only an agent *without* streaming"
+echo "    or push could raise, the five push rows the kit's snake_case client"
+echo "    cannot get past CreateTaskPushNotificationConfig (see DESELECT), and"
+echo "    STREAM-SUB-002's client-side timeout, checked by hand and correct on"
+echo "    the server. Push itself is wired now: the three PUSH-DELIVER rows run"
+echo "    against a real webhook receiver."

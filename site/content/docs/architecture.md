@@ -1144,7 +1144,7 @@ selects, so two runs waiting on one key cannot both consume a single message.
 A wait whose event is the clock.
 
 ```rust
-cx.sleep(Duration::from_hours(24)).await?;      // or sleep_until(instant)
+cx.sleep(Duration::from_secs(86400)).await?;      // or sleep_until(instant)
 ```
 
 The run suspends, the frame is persisted, and a sweep wakes it when the instant

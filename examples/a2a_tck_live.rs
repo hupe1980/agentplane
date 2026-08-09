@@ -212,18 +212,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .agent(Agent::new(&manifest).skill(TckAgent))
         .build();
 
+    // Push, so the kit's ten push MUSTs run rather than skipping.
+    //
+    // The kit's receiver is an `http://localhost:PORT` server, because a
+    // conformance kit cannot mint a public TLS endpoint for a run on a laptop.
+    // Both of this crate's address controls refuse that, and the price was ten
+    // MUST rows that could not execute at all — on the one surface where an
+    // untrusted party names an address this plane connects to. The exception
+    // is `testkit`-only and lifts exactly two refusals for exactly one shape of
+    // address; the operator grant below still has to name the host, and a
+    // plaintext *public* destination stays refused.
     let server = A2aServer::new(
         runtime,
         Arc::new(AnyoneIsTck),
         &CardSecurity::bearer("tck", ["a2a:invoke"]),
         &manifest,
         format!("{public}/a2a"),
+    )?
+    .with_push(
+        Arc::clone(&store) as Arc<dyn agentplane::push::PushStore>,
+        Arc::new(
+            agentplane::push::PushSender::new(
+                agentplane::push::PushPolicy::new()
+                    .allow_host("localhost")
+                    .allow_host("127.0.0.1"),
+            )
+            .allow_plaintext_loopback(),
+        ) as Arc<dyn agentplane::push::PushTransport>,
     )?;
+
+    // The kit waits seconds, not minutes, for a delivery — so the worker runs
+    // on a tick of its own rather than an operator's scheduler. One second is
+    // the fixture being a fixture; a deployment drives it from `serve`.
+    if let Some(worker) = server.push_worker() {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+            loop {
+                tick.tick().await;
+                #[allow(clippy::disallowed_methods)]
+                let at = time::OffsetDateTime::now_utc().unix_timestamp();
+                let Ok(at) = u64::try_from(at) else { continue };
+                if let Err(error) = worker.run_once(at, 32).await {
+                    eprintln!("push worker: {error}");
+                }
+            }
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     eprintln!("a2a-tck fixture serving on http://{bind}");
     eprintln!("  card:     {public}/.well-known/agent-card.json");
     eprintln!("  json-rpc: {public}/a2a");
+    eprintln!("  push:     http://localhost:* (testkit loopback exception)");
     axum::serve(listener, server.router()).await?;
     Ok(())
 }

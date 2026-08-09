@@ -44,7 +44,13 @@ pub mod chat_completions;
 #[cfg(feature = "providers")]
 mod chat_completions_stream;
 /// The embeddings wire, beside the drivers it shares a transport with.
-#[cfg(feature = "providers")]
+// `any(..)`, not `providers`: `BedrockEmbedder` lives in here and is the driver
+// a plane whose data may not leave one AWS account needs, so gating the module
+// on `providers` made the `bedrock` feature pay for the AWS SDK and expose no
+// embedder at all — the "a feature that builds is not a feature that delivers"
+// shape the store gate already had. A `const _` in `lib.rs` names each
+// embedder's type so a gate that configures one out fails *this* crate's build.
+#[cfg(any(feature = "providers", feature = "bedrock"))]
 pub mod embeddings;
 #[cfg(feature = "providers")]
 pub mod gemini;

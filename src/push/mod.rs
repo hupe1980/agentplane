@@ -171,6 +171,30 @@ pub enum PushError {
     Unroutable(String),
 }
 
+impl PushError {
+    /// Whether waiting could change this answer.
+    ///
+    /// The grant is re-checked at delivery because a registration outlives the
+    /// configuration that permitted it — but noticing a refusal and then
+    /// scheduling that same refusal again is a decision that will never change,
+    /// retried forever. A scheme that is not HTTPS, a URL that does not parse,
+    /// and a host the operator has taken off the allowlist are all answers no
+    /// backoff improves, so the worker abandons them rather than queueing a
+    /// forty-first attempt against an answer it already has.
+    ///
+    /// [`Unroutable`](Self::Unroutable) is deliberately **not** permanent: it
+    /// covers DNS, and DNS changes. A name that resolves inward today may be
+    /// repointed tomorrow, and abandoning on the first answer would make a
+    /// transient misconfiguration indistinguishable from a revoked grant.
+    #[must_use]
+    pub const fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::NotHttps | Self::HostNotGranted(_) | Self::Malformed(_)
+        )
+    }
+}
+
 /// Durable storage for webhook registrations.
 ///
 /// Durable because a task outlives the connection that created it, and a
@@ -266,15 +290,25 @@ impl PushPolicy {
     /// [`PushError::NotHttps`], [`PushError::Malformed`], or
     /// [`PushError::HostNotGranted`].
     pub fn check(&self, url: &str) -> Result<(), PushError> {
+        self.check_allowing_loopback(url, false)
+    }
+
+    /// The same check, with the two address-shape refusals optionally lifted.
+    ///
+    /// `allow_loopback` is reachable only through
+    /// [`PushSender::allow_plaintext_loopback`], which exists only under
+    /// `testkit`. The **host grant is not lifted** — that is the primary
+    /// control and it still has to name the host.
+    fn check_allowing_loopback(&self, url: &str, allow_loopback: bool) -> Result<(), PushError> {
         let parsed = reqwest::Url::parse(url).map_err(|e| PushError::Malformed(e.to_string()))?;
-        if parsed.scheme() != "https" {
-            return Err(PushError::NotHttps);
-        }
         let host = parsed
             .host_str()
             .ok_or_else(|| PushError::Malformed("no host".to_owned()))?
             .trim_end_matches('.')
             .to_ascii_lowercase();
+        if parsed.scheme() != "https" && !(allow_loopback && is_loopback_name(&host)) {
+            return Err(PushError::NotHttps);
+        }
         if !self.hosts.contains(&host) {
             return Err(PushError::HostNotGranted(host));
         }
@@ -282,11 +316,34 @@ impl PushPolicy {
     }
 }
 
+/// Whether a host names this machine, without resolving it.
+///
+/// Literals only, plus the one name every stack special-cases. Anything that
+/// merely *resolves* to loopback is deliberately not covered here — that is
+/// [`netguard`](crate::netguard)'s job at delivery, against the answers DNS
+/// actually gave, and a name-based guess in front of it would be a second
+/// implementation of one rule.
+fn is_loopback_name(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Delivers notifications, under the controls in the module docs.
 #[derive(Debug, Clone)]
 pub struct PushSender {
     policy: PushPolicy,
     timeout: std::time::Duration,
+    /// Lift the HTTPS requirement and the public-address check for a webhook
+    /// on this machine. `testkit` only, and absent from any other build.
+    #[cfg(feature = "testkit")]
+    plaintext_loopback: bool,
 }
 
 /// Delivery transport used by the durable worker.
@@ -311,6 +368,47 @@ impl PushSender {
         Self {
             policy,
             timeout: Self::DEFAULT_TIMEOUT,
+            #[cfg(feature = "testkit")]
+            plaintext_loopback: false,
+        }
+    }
+
+    /// Permit `http://` to a webhook on this machine. **`testkit` only.**
+    ///
+    /// The A2A conformance kit's webhook receiver is an `http://localhost:PORT`
+    /// server, because a kit cannot mint a public TLS endpoint for a run on a
+    /// laptop. Both of this crate's address controls refuse that, correctly —
+    /// and the consequence was that the kit's **ten push MUSTs could not run at
+    /// all**, so the one surface where an untrusted party names an address this
+    /// plane connects to had no outside-authority evidence behind it. Ten
+    /// unrunnable rows is a worse answer than one named exception.
+    ///
+    /// What this does **not** lift is the part that is the actual control: the
+    /// operator's **host grant** still has to name the host, the task-level
+    /// authorization still runs, the cursor still advances only on 2xx, and
+    /// every non-loopback destination is judged exactly as before — a plaintext
+    /// URL to a public host stays refused with the flag set, which is the half
+    /// that keeps this from being an off switch.
+    ///
+    /// It cannot exist in a production build: the field is `cfg(testkit)`, and
+    /// `testkit` is documented as never belonging in one.
+    #[cfg(feature = "testkit")]
+    #[must_use]
+    pub const fn allow_plaintext_loopback(mut self) -> Self {
+        self.plaintext_loopback = true;
+        self
+    }
+
+    /// Whether the loopback exception is in force. Always false without
+    /// `testkit`, which is what lets the delivery path read one flag.
+    const fn loopback_allowed(&self) -> bool {
+        #[cfg(feature = "testkit")]
+        {
+            self.plaintext_loopback
+        }
+        #[cfg(not(feature = "testkit"))]
+        {
+            false
         }
     }
 
@@ -362,8 +460,22 @@ impl PushSender {
         let resolved = tokio::net::lookup_host((host.as_str(), port))
             .await
             .map_err(|e| PushError::Unroutable(format!("DNS for '{host}': {e}")))?;
-        let addrs = crate::netguard::all_public(&host, resolved)
-            .map_err(|e| PushError::Unroutable(e.to_string()))?;
+        let addrs = if self.loopback_allowed() && is_loopback_name(&host) {
+            // Named rather than inferred: the exception applies to a host that
+            // *is* a loopback literal or `localhost`, not to one that merely
+            // resolved to one. A name that resolves inward is the rebinding
+            // attack, and it stays refused with the flag set.
+            let addrs: Vec<_> = resolved.collect();
+            if addrs.is_empty() {
+                return Err(PushError::Unroutable(format!(
+                    "DNS for '{host}' returned no addresses"
+                )));
+            }
+            addrs
+        } else {
+            crate::netguard::all_public(&host, resolved)
+                .map_err(|e| PushError::Unroutable(e.to_string()))?
+        };
 
         let mut client = reqwest::Client::builder()
             .timeout(self.timeout)
@@ -411,7 +523,8 @@ impl PushSender {
 #[async_trait]
 impl PushTransport for PushSender {
     fn validate(&self, config: &PushConfig) -> Result<(), PushError> {
-        self.policy.check(&config.url)?;
+        self.policy
+            .check_allowing_loopback(&config.url, self.loopback_allowed())?;
         if let Some(authentication) = &config.authentication {
             authentication.validate()?;
         }

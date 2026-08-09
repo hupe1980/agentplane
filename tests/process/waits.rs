@@ -307,7 +307,7 @@ async fn unclaimed_events_are_dead_lettered_by_the_sweep_not_on_arrival() {
     );
 
     // With no grace period, everything already buffered ages out.
-    let retired = f.rt.sweep_events(time::Duration::ZERO).await.unwrap();
+    let retired = f.rt.sweep_events(std::time::Duration::ZERO).await.unwrap();
     assert_eq!(retired, 1);
 
     let dead = f.store.dead_letters(10).await.unwrap();
@@ -333,7 +333,7 @@ async fn the_sweep_leaves_claimed_events_alone() {
     .unwrap();
     f.rt.deliver(&reply("EV-7", "D-7", json!(1))).await.unwrap();
 
-    let retired = f.rt.sweep_events(time::Duration::ZERO).await.unwrap();
+    let retired = f.rt.sweep_events(std::time::Duration::ZERO).await.unwrap();
     assert_eq!(retired, 0, "a consumed event is not garbage");
     assert!(f.store.dead_letters(10).await.unwrap().is_empty());
 }
@@ -518,11 +518,17 @@ async fn the_sweep_reports_what_it_retired() {
             .await
             .unwrap();
     }
-    assert_eq!(f.rt.sweep_events(time::Duration::ZERO).await.unwrap(), 3);
+    assert_eq!(
+        f.rt.sweep_events(std::time::Duration::ZERO).await.unwrap(),
+        3
+    );
     assert_eq!(f.store.dead_letters(10).await.unwrap().len(), 3);
 
     // Sweeping again finds nothing new.
-    assert_eq!(f.rt.sweep_events(time::Duration::ZERO).await.unwrap(), 0);
+    assert_eq!(
+        f.rt.sweep_events(std::time::Duration::ZERO).await.unwrap(),
+        0
+    );
 }
 
 /// A far-future grace window protects everything recently received.
@@ -533,7 +539,10 @@ async fn the_grace_window_is_respected() {
         .await
         .unwrap();
 
-    let retired = f.rt.sweep_events(time::Duration::days(30)).await.unwrap();
+    let retired =
+        f.rt.sweep_events(std::time::Duration::from_secs(2_592_000))
+            .await
+            .unwrap();
     assert_eq!(retired, 0, "recent events are still claimable");
 
     let _ = Timestamp::now_utc();

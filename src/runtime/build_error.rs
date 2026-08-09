@@ -87,6 +87,28 @@ pub enum BuildError {
         grants: String,
     },
 
+    /// An agent declares oversight on a plane that cannot ask anybody.
+    ///
+    /// The same shape as [`DeclarativeToolsUnreachable`](Self::DeclarativeToolsUnreachable),
+    /// and both facts are in hand at `build`: the manifest says a human must
+    /// decide, and the plane says there is nowhere to put the decision. Left to
+    /// run time it surfaces on the one code path a test suite is least likely
+    /// to reach — the first real approval — with the person already waiting.
+    #[error(
+        "agent '{agent}' declares {declared}, so a run must be able to open a \
+         task and suspend until somebody decides it — but this plane has no \
+         {missing}. Wire it with `RuntimeBuilder::{remedy}(..)`, or drop the \
+         oversight declaration. A run admitted through plain `run(..)` also has \
+         no case, so give it correlation keys with `run_correlated(..)` or name \
+         one with `run_in_case(..)`"
+    )]
+    OversightUnreachable {
+        agent: String,
+        declared: String,
+        missing: &'static str,
+        remedy: &'static str,
+    },
+
     /// An agent grant names a capability no agent on this plane provides.
     #[error(
         "agent '{agent}' grants 'tool://agent/{capability}', and no agent on \

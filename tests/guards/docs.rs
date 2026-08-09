@@ -274,12 +274,22 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
 /// went straight past a detector that required a digit after the sign. It slipped
 /// a fresh leak into shipped rustdoc while the guard reported clean — the shape
 /// this project keeps a second check for, arriving in the check itself.
+/// Documents whose section numbers a reader *can* resolve.
+///
+/// A published specification's section is not the leak this guard is about:
+/// `the A2A specification §5.5` names its document and does not get renumbered
+/// underneath a reader without a version. The exemption is a named list rather
+/// than "anything with a citation", because the failure mode being prevented is
+/// a bare `§11.1` that reads as though the reader ought to know which document
+/// it means.
+const NAMED_EXTERNAL: &[&str] = &["RFC", "C2SP", "A2A", "MCP", "CloudEvents"];
+
 fn cites_internal_section(line: &str) -> bool {
     let Some(at) = line.find('§') else {
         return false;
     };
     let before = &line[..at];
-    if before.contains("RFC") || before.contains("C2SP") {
+    if NAMED_EXTERNAL.iter().any(|doc| before.contains(doc)) {
         return false;
     }
     let mut after = line[at..].chars().skip(1);
@@ -308,6 +318,10 @@ fn cites_internal_section(line: &str) -> bool {
 /// the rule would leave a green test guarding an empty set.
 #[test]
 fn nothing_a_reader_sees_cites_an_internal_section_number() {
+    assert!(
+        !cites_internal_section("/// the A2A specification §5.5 requires camelCase"),
+        "a named external specification's section is resolvable and must not be flagged"
+    );
     assert!(
         cites_internal_section("//! The sensitivity lattice (§12) controls what may leave"),
         "the detector does not recognise the very thing it exists to find"
@@ -991,5 +1005,271 @@ fn the_tls_trust_anchor_is_the_platform_verifier_and_not_a_pinned_bundle() {
          anchor not at all. If pinned roots are genuinely wanted, that is \
          `rustls-no-provider` plus an explicit `ClientConfig`, and it is a \
          decision to make on purpose rather than a word in a feature list"
+    );
+}
+
+/// A published error message is the one the runtime produces.
+///
+/// The README and the getting-started page both quote the plane's answer to a
+/// misspelled capability, because it is the first failure a newcomer meets and
+/// the sentence is doing teaching work. Quoting it makes the message a fact
+/// maintained in three places, and it drifted in exactly the way §10.6 shape 18
+/// predicts: admission moved to `Tainted<Value>`, the `run_trusted` /
+/// `run_tainted` pair was deleted for being worse than one door, and both pages
+/// went on telling readers that *`run_trusted` takes a capability*. A reader
+/// grepping for that method finds nothing at all.
+///
+/// Nothing in the toolchain could have caught it. Doc tests compile rustdoc
+/// under `src/`, never markdown; the `StepCtx` guard reads methods off
+/// `impl StepCtx`, and this is a `Runtime` method quoted inside a plain-text
+/// block. So this asserts the published lines against the message the code
+/// **actually formats**, which is a known answer rather than a second copy —
+/// rewording the error fails here instead of in a reader's editor.
+#[test]
+fn the_published_no_provider_message_is_the_one_the_runtime_writes() {
+    let error = agentplane::core::RuntimeError::NoProvider {
+        target: "demo.greeet".to_owned(),
+        available: vec!["demo.greet".to_owned()],
+    };
+    let produced = error.to_string();
+    assert!(
+        produced.contains("demo.greeet") && produced.contains("takes a capability"),
+        "this guard is anchored on a message that has changed shape: {produced}"
+    );
+
+    // The pages wrap the sentence to fit a code block, so compare on words.
+    let normalise = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let produced = normalise(&produced);
+
+    for page in ["README.md", "site/content/docs/getting-started.md"] {
+        let text = normalise(&read(page));
+        assert!(
+            text.contains(&produced),
+            "{page} publishes an error message the runtime does not write.\n\
+             The runtime says:\n  {produced}\n\
+             Search the page for `no skill provides capability` and make it match."
+        );
+    }
+}
+
+/// Names two pages describe as **deliberately absent**.
+///
+/// An unconfigured seam is no control, spelled as absence — so the pages name
+/// `Egress::allow_all` in order to say it is not there. Exempting those pages
+/// would let real drift hide behind whichever page carried the exemption, so
+/// the guard asserts the *absence* instead: adding one of these fails, which is
+/// correct, because two documents would then be wrong the other way.
+const ABSENT_BY_DESIGN: &[(&str, &str)] = &[("Egress", "allow_all")];
+
+/// Types this crate does not own.
+///
+/// Named rather than pattern-matched: an "anything not in `src/`" rule would
+/// silently grow to cover the crate's own types the moment one was renamed.
+const FOREIGN_TYPES: &[&str] = &[
+    "Duration",
+    "Value",
+    "String",
+    "Vec",
+    "Arc",
+    "Some",
+    "None",
+    "Ok",
+    "Err",
+    "Path",
+    "PathBuf",
+    "HashMap",
+    "BTreeMap",
+    "Option",
+    "Result",
+    "Box",
+    "Mutex",
+    "RwLock",
+    "Instant",
+    "SystemTime",
+    "OffsetDateTime",
+    "Regex",
+    "Url",
+    "Client",
+    "Router",
+    "Uuid",
+    "Ulid",
+    "Cow",
+    "Self",
+    "Default",
+    "From",
+    "Into",
+    "Iterator",
+    "Cedar",
+    "Utc",
+    "NaiveDate",
+];
+
+/// Every `Type::associated_fn` a page publishes exists on that type.
+///
+/// The `StepCtx` guard covers the surface a newcomer programs against, and it
+/// covers **only** `StepCtx` — so a constructor on any other public type could
+/// be invented in prose and nothing would look. One was: the concepts page
+/// taught obligations with `DeadlineSpec::working_days(1)`, which does not
+/// exist and never has. The type has three constructors and none of them is
+/// that, so the first line of the deadline example a reader copies did not
+/// compile — and the comment above it said *five working days* while the call
+/// said one, which is the tell that nobody had run it.
+///
+/// The check is name-based rather than type-resolved, and the trade is stated
+/// because it decides what this can and cannot find. It collects every
+/// `pub fn`/`pub const fn` name declared anywhere in `src/` and refuses a
+/// documented `Type::name` whose `name` is not among them. So it catches an
+/// **invented** name, and it does not catch a real name attached to the wrong
+/// type — resolving that needs the compiler, which for markdown means building
+/// every snippet, which the doc-example harness does for the ones that carry
+/// their own imports.
+///
+/// Std and dependency paths are skipped by an allowlist rather than by
+/// guessing, because `Duration::from_secs` and `Value::String` are not this
+/// crate's to declare and a guard that flagged them would be turned off.
+/// Every public function name this crate declares, inherent or on a trait.
+///
+/// Name-based on purpose, and the trade decides what the guard can find: it
+/// catches an **invented** name and not a real name attached to the wrong type,
+/// which needs the compiler. Trait methods carry no `pub` and are collected
+/// separately — a public trait's methods are as callable as any inherent one,
+/// and `SemanticRetriever::profile` is a documented name that only exists that
+/// way.
+fn declared_function_names(root: &Path) -> std::collections::BTreeSet<String> {
+    fn name_after(prefix: &str, line: &str) -> Option<String> {
+        let rest = line.strip_prefix(prefix)?;
+        let rest = rest.strip_prefix("async ").unwrap_or(rest);
+        let rest = rest.strip_prefix("const ").unwrap_or(rest);
+        let rest = rest.strip_prefix("unsafe ").unwrap_or(rest);
+        let name: String = rest
+            .strip_prefix("fn ")?
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    let mut declared = std::collections::BTreeSet::new();
+    for file in walk(&root.join("src")) {
+        if file.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        for line in std::fs::read_to_string(&file)
+            .expect("a readable module")
+            .lines()
+        {
+            let line = line.trim_start();
+            if let Some(name) = name_after("pub ", line).or_else(|| name_after("", line)) {
+                declared.insert(name);
+            }
+        }
+    }
+    // Names a `derive` or a std trait supplies, which no `fn` line declares.
+    for supplied in [
+        "default",
+        "from",
+        "into",
+        "try_from",
+        "try_into",
+        "clone",
+        "fmt",
+        "eq",
+        "cmp",
+        "hash",
+        "next",
+        "deref",
+        "drop",
+        "to_string",
+        "to_owned",
+        "as_ref",
+        "from_str",
+    ] {
+        declared.insert(supplied.to_owned());
+    }
+    declared
+}
+
+#[test]
+fn every_documented_associated_function_exists() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let declared = declared_function_names(root);
+    assert!(
+        declared.len() > 200,
+        "only {} public functions were found — the scan is now inert",
+        declared.len()
+    );
+
+    for (ty, name) in ABSENT_BY_DESIGN {
+        assert!(
+            !declared.contains(*name),
+            "`{ty}::{name}` now exists, and two pages tell readers it deliberately \
+             does not. Fix the pages, then remove this row"
+        );
+    }
+
+    for (ty, name) in ABSENT_BY_DESIGN {
+        assert!(
+            !declared.contains(*name),
+            "`{ty}::{name}` now exists, and two pages tell readers it deliberately              does not. Fix the pages, then remove this row"
+        );
+    }
+
+    let mut pages: Vec<std::path::PathBuf> = walk(&root.join("site/content/docs"))
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+        .collect();
+    pages.push(root.join("README.md"));
+    assert!(
+        pages.len() > 5,
+        "only {} pages were scanned — the site layout moved",
+        pages.len()
+    );
+
+    let mut missing: Vec<String> = Vec::new();
+    for page in &pages {
+        let text = std::fs::read_to_string(page).expect("a readable page");
+        let rel = page.strip_prefix(root).unwrap_or(page).display();
+        for (number, line) in text.lines().enumerate() {
+            let bytes: Vec<char> = line.chars().collect();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == ':' && i + 1 < bytes.len() && bytes[i + 1] == ':' {
+                    // Walk back over the type name and forward over the member.
+                    let start = bytes[..i]
+                        .iter()
+                        .rposition(|c| !(c.is_alphanumeric() || *c == '_'))
+                        .map_or(0, |p| p + 1);
+                    let ty: String = bytes[start..i].iter().collect();
+                    let mut j = i + 2;
+                    while j < bytes.len() && (bytes[j].is_alphanumeric() || bytes[j] == '_') {
+                        j += 1;
+                    }
+                    let member: String = bytes[i + 2..j].iter().collect();
+                    let followed_by_call = bytes.get(j).is_some_and(|c| *c == '(');
+                    let is_type = ty.chars().next().is_some_and(char::is_uppercase);
+                    let is_fn = member.chars().next().is_some_and(char::is_lowercase);
+                    if is_type
+                        && is_fn
+                        && followed_by_call
+                        && !FOREIGN_TYPES.contains(&ty.as_str())
+                        && !ABSENT_BY_DESIGN.contains(&(ty.as_str(), member.as_str()))
+                        && !declared.contains(&member)
+                    {
+                        missing.push(format!("{rel}:{}: {ty}::{member}", number + 1));
+                    }
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "these pages call associated functions this crate does not declare — a \
+         reader copying the line gets a compile error, and nothing else in the \
+         toolchain reads markdown:\n{}",
+        missing.join("\n")
     );
 }

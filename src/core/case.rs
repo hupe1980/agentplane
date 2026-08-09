@@ -169,6 +169,20 @@ impl DeadlineSpec {
     }
 
     /// A plain wall-clock offset, understood by the built-in calendar.
+    ///
+    /// One constructor per rule `WallClock` accepts, and the set is closed for
+    /// a reason: a rule with no canonical spelling is where `"minutes"`,
+    /// `"minute"` and `"mins"` diverge between an application and the calendar
+    /// adapter meant to resolve them — and a calendar that does not recognise a
+    /// kind refuses it, so the drift surfaces as a failed obligation rather
+    /// than a wrong one. `minutes` was the rule that had this hole:
+    /// `WallClock` resolved it and nothing here spelled it.
+    #[must_use]
+    pub fn minutes(n: u32) -> Self {
+        Self::new("minutes", serde_json::json!({ "n": n }))
+    }
+
+    /// A plain wall-clock offset, understood by the built-in calendar.
     #[must_use]
     pub fn hours(n: u32) -> Self {
         Self::new("hours", serde_json::json!({ "n": n }))

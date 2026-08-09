@@ -2586,7 +2586,7 @@ metadata: { name: thinker, version: "1.0.0" }
 spec:
   capabilities: { provides: [think] }
   models: { privileged: { provider: fake, model: loop-1, reasoning_effort: high } }
-  tools: [{ ref: "tool://ledger/read", description: "Read a ledger account." }]
+  tools: [{ ref: "tool://ledger/read", mutates: false, description: "Read a ledger account." }]
   execution: { kind: tool-calling }
   budgets: {}
 "#;
@@ -4403,4 +4403,143 @@ spec:
     // A coded agent: no `execution`, so the roles are a reviewed allowlist its
     // own skill chooses from rather than something a tier selects.
     Manifest::parse(head).expect("a coded agent may declare both roles");
+}
+
+/// A mutating grant a tool loop can never dispatch is refused at parse.
+///
+/// Three facts compose, each right on its own: a model completion is labelled
+/// untrusted unconditionally, the loop builds a call's arguments from that
+/// completion, and a mutating sink whose grant names no protected fields
+/// refuses an untrusted argument bundle outright. Together they make
+/// `mutates: true` with no `protected_fields` a grant that cannot fire — and
+/// the run does not even fail cleanly, it **succeeds having done nothing the
+/// model asked for**, which is the profile of a control nobody debugs quickly.
+///
+/// Reported from a migration that had 108 such grants across 27 manifests, all
+/// unreachable, each reading as *this specialist may dispatch, with a human in
+/// front of it*. The inverse of the quarantined-model finding and found the
+/// same way: by running it rather than reading it.
+///
+/// The positive halves are what make this a refusal rather than a ban, and
+/// there are three of them — declare the authority-bearing field, resolve the
+/// arguments through a plan, or say the call does not mutate.
+#[test]
+fn a_mutating_grant_a_tool_loop_cannot_dispatch_is_refused() {
+    let agent = |kind: &str, extra: &str| {
+        format!(
+            r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: teller, version: '1.0.0' }}
+spec:
+  execution: {{ kind: {kind}, max_turns: 3 }}
+  identity: {{ role: 'Post entries', constraints: 'Be brief.' }}
+  capabilities: {{ provides: [ledger.post] }}
+  models: {{ privileged: {{ provider: fake, model: m-1 }} }}
+  tools:
+    - ref: 'tool://ledger/post'
+      mutates: true
+      description: 'Post an amount to an account'
+{extra}
+  budgets: {{ max_tokens: 1000 }}
+"
+        )
+    };
+
+    let err = Manifest::parse(&agent("tool-calling", ""))
+        .expect_err("a grant that can never fire was accepted");
+    let message = err.to_string();
+    for expected in [
+        "tool://ledger/post",
+        "protected_fields",
+        "tool-calling",
+        "planned",
+        "mutates: false",
+    ] {
+        assert!(
+            message.contains(expected),
+            "the refusal does not name '{expected}': {message}"
+        );
+    }
+
+    // 1. Declare the authority-bearing argument. This is the intended shape:
+    //    ordinary untrusted content may sit beside a protected selector.
+    Manifest::parse(&agent(
+        "tool-calling",
+        "      protected_fields:\n        - path: /account\n          require_trusted: true",
+    ))
+    .expect("a grant that names its protected field is reachable and must parse");
+
+    // 2. A plan resolves its own arguments, so the completion's label never
+    //    reaches them.
+    Manifest::parse(&agent("planned", "")).expect("planned resolves arguments by reference");
+
+    // 3. And a read-only grant was never in question.
+    let read_only = agent("tool-calling", "").replace("mutates: true", "mutates: false");
+    Manifest::parse(&read_only).expect("a non-mutating grant is not affected");
+}
+
+/// Oversight on a plane that cannot ask anybody is refused at build.
+///
+/// The same shape as the tool-loop-with-no-catalogue refusal, and both facts
+/// are in hand at `build`: the manifest says a human must decide, the plane
+/// says there is nowhere to put the decision. Left to run time it arrives at
+/// the first real approval — with the person already waiting — on the one code
+/// path a test suite is least likely to reach.
+#[test]
+fn oversight_on_a_plane_with_no_worklist_is_refused() {
+    use agentplane::runtime::{Agent, BuildError, Runtime};
+
+    const WATCHED: &str = r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: watched, version: '1.0.0' }
+spec:
+  execution: { kind: completion }
+  identity: { role: 'Answer, under review', constraints: 'Be brief.' }
+  capabilities: { provides: [support.answer] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  oversight:
+    approval: required
+    deadline: { name: review, kind: hours, params: { n: 4 } }
+  budgets: { max_tokens: 1000 }
+";
+    let manifest = Manifest::parse(WATCHED).expect("manifest");
+    let store = std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+
+    let err = Runtime::builder(
+        std::sync::Arc::clone(&store) as std::sync::Arc<dyn agentplane::journal::JournalStore>
+    )
+    .provider(
+        "fake",
+        agentplane::testkit::FakeProvider::new()
+            as std::sync::Arc<dyn agentplane::model::ModelProvider>,
+    )
+    .agent(Agent::new(&manifest))
+    .try_build()
+    .expect_err("oversight with nowhere to put a decision must refuse the build");
+    assert!(
+        matches!(&err, BuildError::OversightUnreachable { agent, .. } if agent == "watched"),
+        "wrong refusal: {err}"
+    );
+    assert!(
+        err.to_string().contains("cases"),
+        "the refusal does not name the first thing to wire: {err}"
+    );
+
+    // The positive half: a plane that *can* ask builds. Without it, a change
+    // refusing every oversight declaration would satisfy the assertion above.
+    Runtime::builder(
+        std::sync::Arc::clone(&store) as std::sync::Arc<dyn agentplane::journal::JournalStore>
+    )
+    .provider(
+        "fake",
+        agentplane::testkit::FakeProvider::new()
+            as std::sync::Arc<dyn agentplane::model::ModelProvider>,
+    )
+    .cases(std::sync::Arc::clone(&store) as std::sync::Arc<dyn agentplane::case::CaseStore>)
+    .tasks(std::sync::Arc::clone(&store) as std::sync::Arc<dyn agentplane::case::TaskStore>)
+    .agent(Agent::new(&manifest))
+    .try_build()
+    .expect("a plane with a worklist must accept an agent that asks for one");
 }

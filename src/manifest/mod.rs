@@ -978,6 +978,7 @@ impl Manifest {
         self.validate_oversight()?;
         self.validate_tool_approval()?;
         self.validate_tool_grants()?;
+        self.validate_mutating_grants_can_fire()?;
         self.validate_agent_grants()?;
         self.validate_context_grants()?;
         self.validate_topology()?;
@@ -1087,6 +1088,70 @@ impl Manifest {
                      agent offers its tools to a model by name and description. Without one \
                      the model guesses, and a guessed call is refused at the field check \
                      after it has been paid for",
+                    grant.reference
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// A mutating grant a tool loop can never dispatch is refused at parse.
+    ///
+    /// The three facts compose, and each is right on its own. A model
+    /// completion is labelled **untrusted** unconditionally — its source is the
+    /// model. The tool loop builds a call's arguments from that completion, so
+    /// they carry its label. And a mutating sink whose grant names **no**
+    /// protected fields refuses an untrusted argument bundle outright, because
+    /// a tool that has not been told which of its fields are authority-bearing
+    /// has had no such decision made about it, and fail-closed is the answer to
+    /// a question nobody asked.
+    ///
+    /// Together: `mutates: true` with no `protected_fields`, on a
+    /// `tool-calling` agent, is a grant that cannot fire. It reads to a
+    /// reviewer as *this specialist may dispatch, with a human in front of it*
+    /// and is decoration — the same shape as a `quarantined` model nothing
+    /// selects, found the same way, by running it rather than reading it. The
+    /// run does not even fail cleanly: it succeeds, having quietly done
+    /// nothing the model asked for.
+    ///
+    /// **Not refused for `planned`.** A planned step's arguments are resolved
+    /// by the runtime from `$input/…` and `$stepN/…` references, so they carry
+    /// the *input's* labels rather than a completion's — which is exactly the
+    /// provenance distinction the loop structurally cannot make.
+    ///
+    /// The remedy the message leads with is `protected_fields`, and that
+    /// ordering is deliberate: declaring which arguments are authority-bearing
+    /// is what makes a mutating call reachable *and* governed, and it is the
+    /// feature that exists for this. Moving to `planned` or dropping `mutates`
+    /// are the other two honest answers, and both are smaller agents.
+    fn validate_mutating_grants_can_fire(&self) -> Result<(), ManifestError> {
+        let Some(execution) = &self.spec.execution else {
+            return Ok(());
+        };
+        if execution.kind != ExecutionKind::ToolCalling {
+            return Ok(());
+        }
+        for grant in &self.spec.tools {
+            // An `agent` grant dispatches through commission rather than a
+            // sink, so the taint gate this check is about never runs for it —
+            // and the parser already refuses `mutates` on one.
+            if grant.reference.starts_with("tool://agent/") {
+                continue;
+            }
+            if grant.mutates && grant.protected_fields.is_empty() {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.tools: '{}' declares `mutates: true` with no `protected_fields`, \
+                     and this agent is `execution.kind: tool-calling`. A tool \
+                     loop's arguments come from a model completion, which is \
+                     always untrusted, so a mutating call with no field rules is \
+                     refused by the taint gate on every run — the grant reads as \
+                     a capability and is decoration. Three honest fixes: declare \
+                     the authority-bearing arguments in `protected_fields` \
+                     (ordinary untrusted content may sit beside them, which is \
+                     what the feature is for); or use `execution.kind: planned`, \
+                     whose step arguments are resolved by the runtime and keep \
+                     the input's labels; or set `mutates: false` if the call \
+                     really does not change anything",
                     grant.reference
                 )));
             }

@@ -15,6 +15,109 @@ acceptable at this stage.
 
 ---
 
+## A mutating grant must name its protected fields
+
+A `tool-calling` agent whose grant declares `mutates: true` and no
+`protected_fields` no longer parses.
+
+```yaml
+# before — parsed, and could never dispatch
+- ref: tool://ledger/post
+  mutates: true
+  description: Post an amount to an account.
+
+# after — the authority-bearing argument is named
+- ref: tool://ledger/post
+  mutates: true
+  description: Post an amount to an account.
+  protected_fields:
+    - path: /account
+      require_trusted: true
+```
+
+**Why it is worth your manifests.** The grant could not fire. A model completion
+is untrusted unconditionally, the tool loop builds a call's arguments from it,
+and a mutating sink with no field rules refuses an untrusted argument bundle
+outright — so every such call was refused, and the run **succeeded having done
+nothing the model asked for**. One evaluation had 108 of these across 27
+manifests, each reading to a reviewer as a live capability with a human in front
+of it.
+
+Three fixes and the refusal names all three. Declaring the fields is the one to
+reach for first: it is what makes the call reachable *and* governed, with
+ordinary untrusted content sitting beside the protected selector. Otherwise move
+to `execution.kind: planned`, whose step arguments are resolved by the runtime
+from `$input/…` references and keep the input's labels, or set `mutates: false`
+if the call really does not change anything.
+
+If you had an approval on such a grant, this also removes the worse case: the
+task opened with the exact arguments, a named human approved it, and the taint
+gate refused afterwards.
+
+---
+
+## Oversight needs a plane that can ask somebody
+
+An agent declaring `spec.oversight`, or any grant with `requires_approval: true`,
+now refuses the build unless the runtime has a case store, a worklist and timers.
+
+```rust
+Runtime::builder(store)
+    .cases(cases)
+    .tasks(tasks)
+    .timers(timers)   // ← all three, or the build says which is missing
+    .agent(Agent::new(&manifest))
+    .build();
+```
+
+**Why it is worth the wiring.** It built cleanly before, and failed at the first
+real approval — with a person already waiting, on the code path a test suite is
+least likely to reach.
+
+One half a build cannot check, so it is here instead: a run admitted through
+plain `run(..)` belongs to no case, and nothing on a case-less run can ask a
+human or register a deadline whatever its manifest says. Use `run_correlated(..)`
+or `run_in_case(..)`.
+
+---
+
+## Durations on the public surface are `std::time::Duration`
+
+`StepCtx::deadline`'s `warn_before`, `Runtime::sweep_events`'s `grace` and
+`Runtime::sweep`'s `event_grace` took `time::Duration`, from the `time` crate,
+while `StepCtx::sleep` took the standard one.
+
+```rust
+// before
+cx.deadline("aperak", &DeadlineSpec::days(1), Some(time::Duration::hours(1))).await?;
+rt.sweep(now, time::Duration::hours(1)).await?;
+
+// after
+use std::time::Duration;
+cx.deadline("aperak", &DeadlineSpec::days(1), Some(Duration::from_secs(3600))).await?;
+rt.sweep(now, Duration::from_secs(3600)).await?;
+```
+
+**Why it is worth your call sites.** Two of them. The surface had two types
+spelled `Duration`, and only one came from a crate this one re-exports — so a
+caller with the obvious `use std::time::Duration` met a type error naming a
+dependency no guide mentions, and had to add `time` at a version that matched
+this crate's. And `time::Duration` is **signed**: a negative `warn_before`
+compiled and put the warning *after* the instant it warns about, which is a
+warning that can only fire once the obligation is already breached. A quantity
+that only makes sense non-negative is an unsigned type here, as money already
+is.
+
+`Duration::from_hours` and `from_days` are still unstable on the declared MSRV,
+so spell hours and days in seconds — `from_secs(3600)`, `from_secs(86_400)`.
+
+`DeadlineSpec::minutes` now exists beside `hours` and `days`. The built-in
+`WallClock` always resolved `"minutes"`; nothing spelled it, which is where an
+application and a calendar adapter start disagreeing about whether the kind is
+`"minutes"`, `"minute"` or `"mins"`.
+
+---
+
 ## Admission takes a label, not a bare value
 
 `Runtime::run` and its siblings took a `serde_json::Value` and admitted it as

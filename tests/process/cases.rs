@@ -50,7 +50,11 @@ impl Skill for Obliges {
         input: Tainted<Value>,
     ) -> Result<Outcome, agentplane::core::SkillError> {
         let d = cx
-            .deadline(self.name, &self.spec, Some(time::Duration::hours(1)))
+            .deadline(
+                self.name,
+                &self.spec,
+                Some(std::time::Duration::from_secs(3600)),
+            )
             .await?;
         cx.note(format!("obligation due {}", d.resolved_at)).await?;
         if self.meet {
@@ -106,7 +110,7 @@ impl Calendar for WorkingDays {
         let mut at = from;
         let mut left = n;
         while left > 0 {
-            at += time::Duration::days(1);
+            at += std::time::Duration::from_secs(86_400);
             if !matches!(
                 at.weekday(),
                 time::Weekday::Saturday | time::Weekday::Sunday
@@ -129,7 +133,7 @@ struct Corrected;
 
 impl Calendar for Corrected {
     fn resolve(&self, from: Timestamp, _s: &DeadlineSpec) -> Result<Timestamp, CalendarError> {
-        Ok(from + time::Duration::days(999))
+        Ok(from + std::time::Duration::from_secs(86_313_600))
     }
     fn digest(&self) -> Digest {
         Digest::of(b"test.calendar.corrected")
@@ -514,7 +518,7 @@ async fn the_sweep_surfaces_due_and_approaching_obligations() {
     let overdue = agentplane::core::Deadline {
         case,
         name: "overdue".into(),
-        resolved_at: now - time::Duration::hours(1),
+        resolved_at: now - std::time::Duration::from_secs(3600),
         calendar_digest: Digest::of(b"c"),
         warn_at: None,
         state: DeadlineState::Pending,
@@ -522,7 +526,7 @@ async fn the_sweep_surfaces_due_and_approaching_obligations() {
     let future = agentplane::core::Deadline {
         case,
         name: "distant".into(),
-        resolved_at: now + time::Duration::days(30),
+        resolved_at: now + std::time::Duration::from_secs(2_592_000),
         calendar_digest: Digest::of(b"c"),
         warn_at: None,
         state: DeadlineState::Pending,
@@ -1021,7 +1025,7 @@ async fn a_sweep_that_hits_its_cap_says_so() {
             .register_deadline(&Deadline {
                 case,
                 name: "respond-by".to_owned(),
-                resolved_at: now - time::Duration::hours(1),
+                resolved_at: now - std::time::Duration::from_secs(3600),
                 calendar_digest: Digest::of(b"test-calendar"),
                 warn_at: None,
                 state: DeadlineState::Pending,
@@ -1034,7 +1038,10 @@ async fn a_sweep_that_hits_its_cap_says_so() {
         .cases(Arc::clone(&cases))
         .build();
 
-    let report = rt.sweep(now, time::Duration::minutes(5)).await.unwrap();
+    let report = rt
+        .sweep(now, std::time::Duration::from_mins(5))
+        .await
+        .unwrap();
     assert!(
         report.saturated.deadlines,
         "the sweep took its full batch and reported an ordinary tick — the \
@@ -1047,7 +1054,10 @@ async fn a_sweep_that_hits_its_cap_says_so() {
     assert!(!report.is_quiet(), "a capped sweep is not a quiet one");
 
     // And an ordinary tick is not falsely flagged, so the signal means something.
-    let after = rt.sweep(now, time::Duration::minutes(5)).await.unwrap();
+    let after = rt
+        .sweep(now, std::time::Duration::from_mins(5))
+        .await
+        .unwrap();
     assert!(
         !after.saturated.deadlines,
         "the remaining handful still reported saturation: {after:?}"
@@ -1079,7 +1089,7 @@ async fn a_sweep_records_what_it_did_in_a_sealed_run() {
         .register_deadline(&Deadline {
             case,
             name: "respond-by".to_owned(),
-            resolved_at: now - time::Duration::hours(1),
+            resolved_at: now - std::time::Duration::from_secs(3600),
             calendar_digest: Digest::of(b"test-calendar"),
             warn_at: None,
             state: DeadlineState::Pending,
@@ -1091,7 +1101,10 @@ async fn a_sweep_records_what_it_did_in_a_sealed_run() {
         .cases(Arc::clone(&cases))
         .build();
 
-    let report = rt.sweep(now, time::Duration::minutes(5)).await.unwrap();
+    let report = rt
+        .sweep(now, std::time::Duration::from_mins(5))
+        .await
+        .unwrap();
     assert_eq!(report.breached, 1);
 
     let run = report
@@ -1133,7 +1146,10 @@ async fn a_sweep_records_what_it_did_in_a_sealed_run() {
 
     // A quiet tick writes nothing: a log of nothings is where the somethings
     // hide, and the Merkle log should not fill with evidence of inactivity.
-    let quiet = rt.sweep(now, time::Duration::minutes(5)).await.unwrap();
+    let quiet = rt
+        .sweep(now, std::time::Duration::from_mins(5))
+        .await
+        .unwrap();
     assert!(
         quiet.record.is_none(),
         "a tick that decided nothing still opened a run"
@@ -1171,7 +1187,7 @@ async fn a_sweep_whose_evidence_fails_to_write_is_flagged_not_silent() {
         .register_deadline(&Deadline {
             case,
             name: "respond-by".to_owned(),
-            resolved_at: now - time::Duration::hours(1),
+            resolved_at: now - std::time::Duration::from_secs(3600),
             calendar_digest: Digest::of(b"test-calendar"),
             warn_at: None,
             state: DeadlineState::Pending,
@@ -1187,7 +1203,10 @@ async fn a_sweep_whose_evidence_fails_to_write_is_flagged_not_silent() {
     ));
     let rt = Runtime::builder(journal).cases(Arc::clone(&cases)).build();
 
-    let report = rt.sweep(now, time::Duration::minutes(5)).await.unwrap();
+    let report = rt
+        .sweep(now, std::time::Duration::from_mins(5))
+        .await
+        .unwrap();
     assert_eq!(report.breached, 1, "the breach must still have happened");
     assert!(
         report.record.is_none(),
@@ -1238,7 +1257,7 @@ async fn a_case_s_history_includes_a_sweep_that_escalated_it() {
             .register_deadline(&Deadline {
                 case: c,
                 name: "respond-by".to_owned(),
-                resolved_at: now - time::Duration::hours(1),
+                resolved_at: now - std::time::Duration::from_secs(3600),
                 calendar_digest: Digest::of(b"test-calendar"),
                 warn_at: None,
                 state: DeadlineState::Pending,
@@ -1250,7 +1269,10 @@ async fn a_case_s_history_includes_a_sweep_that_escalated_it() {
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&cases))
         .build();
-    let report = rt.sweep(now, time::Duration::minutes(5)).await.unwrap();
+    let report = rt
+        .sweep(now, std::time::Duration::from_mins(5))
+        .await
+        .unwrap();
     assert_eq!(report.breached, 2);
 
     let history = store.case_history(case, 100).await.unwrap();
@@ -1413,4 +1435,46 @@ async fn a_quarantined_run_can_be_found_afterwards() {
         !succeeded.contains(&out.run_id),
         "a quarantined run appeared under `succeeded`: {succeeded:?}"
     );
+}
+
+/// `case_of` answers from the journal, which is where the binding lives.
+///
+/// The first question an operator surface asks. It reads the run's own records
+/// rather than a column beside them, so it cannot disagree with the history it
+/// describes — and a run in no case is `None` rather than an error, because
+/// that is an honest answer and not a fault.
+#[tokio::test]
+async fn case_of_reads_the_binding_off_the_run() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = runtime_with_cases(&store);
+
+    let correlated = rt
+        .run_correlated(
+            "accumulates",
+            Tainted::trusted(json!("request")),
+            "supplier-switch",
+            &[key("document", "DOC-9")],
+        )
+        .await
+        .unwrap();
+    let case = rt
+        .case_of(correlated.run_id)
+        .await
+        .expect("readable")
+        .expect("a correlated run belongs to a case");
+
+    // The same answer the journal's own stamp gives, which is the point: this
+    // is an accessor over the plan of record, not a second copy of it.
+    let stamped = rt.journal().read(correlated.run_id, 1).await.unwrap()[0]
+        .body
+        .case
+        .expect("the admission record carries the case");
+    assert_eq!(case, stamped);
+
+    // A run in no case is `None` rather than an error.
+    let lone = rt
+        .run("accumulates", Tainted::trusted(json!("alone")))
+        .await
+        .unwrap();
+    assert_eq!(rt.case_of(lone.run_id).await.expect("readable"), None);
 }

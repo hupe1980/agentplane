@@ -401,7 +401,7 @@ async fn a_sweep_emits_every_gauge() {
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(meter.clone());
     runtime(&db)
-        .sweep(t(2_000), time::Duration::hours(1))
+        .sweep(t(2_000), std::time::Duration::from_secs(3600))
         .await
         .unwrap();
     drop(guard);
@@ -438,7 +438,7 @@ async fn every_sample_matches_its_declaration() {
         .await
         .unwrap();
     runtime(&db)
-        .sweep(t(2_000), time::Duration::hours(1))
+        .sweep(t(2_000), std::time::Duration::from_secs(3600))
         .await
         .unwrap();
     drop(guard);

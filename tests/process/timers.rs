@@ -84,7 +84,7 @@ fn later(secs: i64) -> Timestamp {
 /// A sleeping run is a row, not a thread.
 #[tokio::test]
 async fn a_sleeping_run_suspends_and_holds_nothing() {
-    let f = fixture(Duration::from_hours(1));
+    let f = fixture(Duration::from_secs(3600));
 
     let out =
         f.rt.run("demo.sleep", Tainted::trusted(json!({})))
@@ -206,7 +206,7 @@ async fn a_fired_timer_is_reported_but_is_not_an_incident() {
         .unwrap();
 
     let report =
-        f.rt.sweep(later(120), time::Duration::hours(24))
+        f.rt.sweep(later(120), std::time::Duration::from_secs(86_400))
             .await
             .unwrap();
     assert_eq!(report.timers_fired, 1);

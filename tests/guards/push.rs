@@ -129,6 +129,87 @@ async fn a_webhook_resolving_to_a_private_address_is_refused() {
     );
 }
 
+/// The conformance-kit exception is an exception, not an off switch.
+///
+/// The A2A kit's webhook receiver is `http://localhost:PORT`, which both
+/// address controls refuse — correctly, and the cost was that the kit's **ten
+/// push MUSTs could not run at all**, leaving the one surface where an
+/// untrusted party names a destination with no outside-authority evidence.
+/// `PushSender::allow_plaintext_loopback` lifts exactly two refusals for
+/// exactly one shape of address, under `testkit`, which never belongs in a
+/// production build.
+///
+/// Three halves are asserted, and the last two are what make it an exception:
+/// the loopback case is permitted; a **plaintext public** host is still
+/// refused with the flag set; and the **host grant** still has to name the
+/// host, because that is the primary control and this lifts the second lock,
+/// not the first.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn the_loopback_exception_lifts_two_refusals_and_no_others() {
+    use agentplane::push::PushSender;
+
+    let granted = PushPolicy::new().allow_host("localhost");
+    let permissive = PushSender::new(granted.clone()).allow_plaintext_loopback();
+
+    // 1. Permitted: the kit's own shape. Nothing is listening, so the outcome
+    //    is an *unreachable delivery* rather than a refusal — which is the
+    //    distinction that proves the gate opened.
+    let outcome = permissive
+        .deliver(
+            &config("http://localhost:1/hook"),
+            &serde_json::json!({"statusUpdate": {}}),
+        )
+        .await;
+    assert!(
+        matches!(outcome, Ok(agentplane::push::Delivered::Unreachable(_))),
+        "the loopback exception did not open the gate: {outcome:?}"
+    );
+
+    // 2. Still refused: plaintext to a host that is not this machine. If the
+    //    flag were an off switch this would go out in the clear.
+    let public = PushSender::new(PushPolicy::new().allow_host("hooks.acme.example"))
+        .allow_plaintext_loopback();
+    let outcome = public
+        .deliver(
+            &config("http://hooks.acme.example/a2a"),
+            &serde_json::json!({"statusUpdate": {}}),
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(PushError::NotHttps)),
+        "the exception let a public host be posted to in clear: {outcome:?}"
+    );
+
+    // 3. Still refused: loopback the operator never granted. The exception
+    //    lifts the second lock; the host grant is the first.
+    let ungranted = PushSender::new(PushPolicy::new()).allow_plaintext_loopback();
+    let outcome = ungranted
+        .deliver(
+            &config("http://localhost:1/hook"),
+            &serde_json::json!({"statusUpdate": {}}),
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(PushError::HostNotGranted(_))),
+        "the exception skipped the operator's grant: {outcome:?}"
+    );
+
+    // 4. And without the flag, the same call is refused — otherwise this whole
+    //    battery would pass with the gate permanently open.
+    let strict = PushSender::new(granted);
+    let outcome = strict
+        .deliver(
+            &config("http://localhost:1/hook"),
+            &serde_json::json!({"statusUpdate": {}}),
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(PushError::NotHttps)),
+        "plaintext loopback was permitted without asking for it: {outcome:?}"
+    );
+}
+
 // ── What the payload says ───────────────────────────────────────────────────
 
 /// A configuration read back never carries its token.

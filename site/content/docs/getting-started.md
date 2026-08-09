@@ -318,7 +318,7 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `a2a` | A2A peer transport — calling other agents |
 | `a2a-server` | being called: the public Agent Card and the A2A 1.0 JSON-RPC methods |
 | `push` | Persistent A2A registration cursors, retrying worker API, and SSRF-guarded webhook delivery; `a2a-server` includes it |
-| `providers` | Anthropic, OpenAI, Google Gemini and OpenAI-compatible model drivers, plus the `OpenAI`-compatible **embeddings** driver semantic retrieval needs |
+| `providers` | Anthropic, OpenAI, Google Gemini and OpenAI-compatible model drivers, plus the `OpenAI`-compatible and Gemini **embeddings** drivers semantic retrieval needs |
 | `bedrock` | Amazon Bedrock Runtime Converse through the AWS SDK, plus Titan/Cohere **embeddings**; separate because the dependency graph is substantial |
 | `media` | governed remote-media fetch: exact grants, SSRF-safe pinned DNS, redirects, limits, validation, digest and retention |
 | `cedar` | Cedar as the authorization engine |
@@ -406,6 +406,15 @@ let replayed = runtime.replay(outcome.run_id, Mode::Strict).await?;
 assert_eq!(outcome.output, replayed.output);
 ```
 
+`build()` **panics** on a wiring fault, which is right for a binary whose author
+is looking at the code it aborts in. A long-running service wants the diagnosis
+as a value: `try_build()` returns the same `BuildError` instead, and every
+refusal in it is a deployment fault that should exit with a message rather than
+abort — a plane assembled from a manifest that arrived at run time is handling
+an *input*, and a panic there reports one tenant's typo by killing every other
+tenant's in-flight run. Same checks underneath, so the two cannot drift about
+what is refused.
+
 Note `run("demo.greet", …)` takes the **capability**, not the skill name. Plans
 bind capabilities to skills, so what a step needs is decoupled from who provides
 it.
@@ -415,7 +424,7 @@ party that knows:
 
 ```text
 Error: no skill provides capability 'demo.greeet' — this plane provides:
-demo.greet. `run_trusted` takes a capability, not a skill name; a skill declares its own
+demo.greet. `run` takes a capability, not a skill name; a skill declares its own
 with `SkillDescriptor::new(..).provides(..)`
 ```
 

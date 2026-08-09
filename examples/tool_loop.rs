@@ -65,13 +65,21 @@ spec:
       max_sensitivity: internal
       description: Read a ledger account's balance.
     - ref: tool://ledger/post
-      # Declared mutating, and with **no protected fields**. That pair is what
-      # makes the refusal below structural rather than a matter of the model
-      # behaving: a mutating tool that has not been told which fields a model
-      # may influence refuses untrusted arguments outright.
+      # Mutating, and it names the one argument that carries authority. The
+      # amount is ordinary content a model may choose; **which account** is a
+      # selector, and a model does not get to pick it.
+      #
+      # Declaring the field is also what makes the grant *reachable* at all: a
+      # `mutates: true` grant with no `protected_fields` on a tool-calling agent
+      # is refused at parse, because the whole argument bundle carries the
+      # completion's untrusted label and the taint gate would refuse every call
+      # — a grant that reads as a capability and fires never.
       mutates: true
       max_sensitivity: internal
       description: Post an amount to an account.
+      protected_fields:
+        - path: /account
+          require_trusted: true
   execution: { kind: tool-calling, max_turns: 4 }
   budgets:
     max_tokens: 100000
@@ -125,9 +133,10 @@ impl Tool for ReadBalance {
 struct PostEntry {
     /// The account to post to.
     ///
-    /// Never read in this example, and the compiler is right to say so: every
-    /// call to this tool is refused before the body runs. That is the point of
-    /// step 3.
+    /// Never read in this example, and the compiler is right to say so: the
+    /// model picks this field, `/account` is `require_trusted`, and a
+    /// model-chosen value is untrusted — so every call this model makes is
+    /// refused before the body runs. That is the point of step 3.
     #[allow(dead_code)]
     account: String,
     /// The amount, in minor units.
@@ -139,9 +148,9 @@ impl Tool for PostEntry {
     const SERVER: &'static str = "ledger";
     const NAME: &'static str = "post";
 
-    // Mutating, and the manifest declares no protected fields for it. That pair
-    // is what makes the refusal in step 3 structural rather than a matter of the
-    // model behaving.
+    // Mutating, and the manifest protects `/account`. That pair is what makes
+    // the refusal in step 3 structural rather than a matter of the model
+    // behaving: the amount is content, the account is authority.
     async fn call(self) -> Result<Value, ToolFailure> {
         POSTS.fetch_add(1, Ordering::Relaxed);
         Ok(json!({ "posted": self.amount }))
@@ -258,7 +267,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "a model chose the arguments of a mutating call"
     );
     assert_eq!(out.status, RunStatus::Succeeded);
-    println!("   → refused: untrusted arguments may not select a mutating call");
+    println!("   → refused: a model-chosen value may not select the protected `/account`");
+    println!("      (the amount beside it is ordinary content, and would have been fine)");
 
     reset();
     // ── 4. The loop is bounded ─────────────────────────────────────────────

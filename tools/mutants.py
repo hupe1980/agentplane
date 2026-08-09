@@ -2036,7 +2036,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "nothing_a_reader_sees_cites_an_internal_section_number",
         "rustdoc may cite sections of the internal design document, which a "
         "docs.rs reader cannot resolve and which go stale silently",
-        "    if before.contains(\"RFC\") || before.contains(\"C2SP\") {",
+        "    if NAMED_EXTERNAL.iter().any(|doc| before.contains(doc)) {",
         "    if true {",
     ),
     # ── Envelope encryption and cryptographic erasure ───────────────────────
@@ -3088,6 +3088,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if text.is_empty() && calls.is_empty() && !truncated && !emulating {",
         "        if text.is_empty() && !truncated && !emulating {",
     ),
+    "AnEmbeddingCallSkipsTheEgressCeiling": (
+        "src/model/embeddings.rs",
+        "an_embedder_refuses_a_host_nobody_granted",
+        "the embedding driver's egress ceiling is not consulted, so the query "
+        "text — the thing a user typed — is posted to whatever base URL a config "
+        "names, with no operator grant behind it",
+        "    fn check_egress(&self) -> Result<(), StoreError> {\n        let Some(egress) = &self.egress else {\n            return Ok(());\n        };",
+        "    fn check_egress(&self) -> Result<(), StoreError> {\n        return Ok(());\n        #[allow(unreachable_code)]\n        let Some(egress) = &self.egress else {\n            return Ok(());\n        };",
+    ),
     "AWebhookHostIsMatchedBySuffix": (
         "src/push/mod.rs",
         "a_webhook_host_must_be_granted",
@@ -3102,7 +3111,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_webhook_must_be_https",
         "a webhook may be plain http, so a payload describing somebody's task "
         "crosses the network in clear to an address the recipient chose",
-        "        if parsed.scheme() != \"https\" {\n            return Err(PushError::NotHttps);\n        }",
+        "        if parsed.scheme() != \"https\" && !(allow_loopback && is_loopback_name(&host)) {\n            return Err(PushError::NotHttps);\n        }",
         "",
     ),
     "DeliveryTrustsTheRegistrationTimeCheck": (
@@ -3111,16 +3120,64 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the grant is checked only when a webhook is registered, so a host "
         "removed from the allowlist keeps receiving notifications for every task "
         "registered while it was still granted",
-        "        self.policy.check(&config.url)?;",
+        "        self.policy\n            .check_allowing_loopback(&config.url, self.loopback_allowed())?;",
         "",
+    ),
+    "AnUnfireableMutatingGrantParses": (
+        "src/manifest/mod.rs",
+        "a_mutating_grant_a_tool_loop_cannot_dispatch_is_refused",
+        "a `mutates: true` grant with no `protected_fields` parses on a "
+        "tool-calling agent, so a grant the taint gate refuses on every run "
+        "reads to a reviewer as a live capability — and the run succeeds "
+        "having quietly done nothing the model asked for",
+        "            if grant.mutates && grant.protected_fields.is_empty() {",
+        "            if false && grant.mutates && grant.protected_fields.is_empty() {",
+    ),
+    "OversightNeedsNoWorklist": (
+        "src/runtime/executor.rs",
+        "oversight_on_a_plane_with_no_worklist_is_refused",
+        "an agent declaring oversight builds on a plane with no case store, "
+        "worklist or timers, so the refusal arrives at the first real approval "
+        "with a person already waiting",
+        "                    if let Some((missing, remedy)) = missing {",
+        "                    if let Some((missing, remedy)) = None::<(&'static str, &'static str)>.or(missing).filter(|_| false) {",
+    ),
+    "AnUnknownA2aParameterIsIgnored": (
+        "src/api/a2a.rs",
+        "a_parameter_that_belongs_to_another_method_is_refused",
+        "an A2A parameter this method does not take is silently ignored rather "
+        "than refused, so a `ListTasks` whose `contextId` is misspelled drops "
+        "the filter and answers with every task the caller may see — shaped "
+        "exactly like the scoped list that was asked for",
+        "    if let Some((_, allowed)) = FIELDS_BY_METHOD.iter().find(|(m, _)| *m == method)\n        && let Some(stray) = object.keys().find(|k| !allowed.contains(&k.as_str()))\n    {",
+        "    if false\n        && let Some((_, allowed)) = FIELDS_BY_METHOD.iter().find(|(m, _)| *m == method)\n        && let Some(stray) = object.keys().find(|k| !allowed.contains(&k.as_str()))\n    {",
+    ),
+    "APermanentRefusalIsRetriedForever": (
+        "src/api/a2a.rs",
+        "a_permanently_refused_webhook_is_abandoned_rather_than_retried_forever",
+        "a webhook refusal no backoff can change — a host taken off the "
+        "allowlist, a URL that is not https — is rescheduled instead of given "
+        "up on, so the registration is retried until the journal is deleted and "
+        "the operator sees the same info line a rebooting receiver produces",
+        "        let exhausted = attempts.saturating_add(1) >= self.max_attempts;\n        if permanent || exhausted {",
+        "        let exhausted = attempts.saturating_add(1) >= self.max_attempts;\n        if exhausted {",
+    ),
+    "APushCeilingAbandonsOnTheFirstHiccup": (
+        "src/api/a2a.rs",
+        "an_unreachable_receiver_is_retried_up_to_the_ceiling_and_then_abandoned",
+        "every transient delivery failure abandons the registration, so a "
+        "receiver that was merely rebooting loses every notification it had not "
+        "yet acknowledged",
+        "        let exhausted = attempts.saturating_add(1) >= self.max_attempts;",
+        "        let exhausted = true;",
     ),
     "AWebhookMayResolveInward": (
         "src/push/mod.rs",
         "a_webhook_resolving_to_a_private_address_is_refused",
         "resolved webhook addresses are not checked, so a granted hostname "
         "pointing at loopback or a metadata service is connected to",
-        "        let addrs = crate::netguard::all_public(&host, resolved)\n            .map_err(|e| PushError::Unroutable(e.to_string()))?;",
-        "        let addrs: Vec<std::net::SocketAddr> = resolved.collect();",
+        "            crate::netguard::all_public(&host, resolved)\n                .map_err(|e| PushError::Unroutable(e.to_string()))?",
+        "            resolved.collect::<Vec<_>>()",
     ),
     "AWebhookTokenIsEchoedBack": (
         "src/push/mod.rs",

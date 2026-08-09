@@ -1914,9 +1914,20 @@ BedrockEmbedder::from_env("eu-central-1", "amazon.titan-embed-text-v2:0",
 `revision()` names the model **and** the width, because both change the floats:
 a 1536-wide vector and a 512-wide one from the same model rank against different
 geometry, and the effect key is what stops a replay reading one as the other.
-It embeds one text per call on purpose — one effect is one observation, and a
-batching driver would have to decide how a partial failure maps onto several
-effect keys.
+`BedrockEmbedder` puts the **region** in it too, because a Bedrock model id names
+a model rather than a deployment: the same id in two regions is two services, and
+a vector from one has no standing in an index built from the other. It embeds one
+text per call on purpose — one effect is one observation, and a batching driver
+would have to decide how a partial failure maps onto several effect keys.
+
+A reply that cannot be honestly read is **refused**, not repaired, and the two
+that look harmless are the reason. A component no `f32` can hold — `1e39` is an
+ordinary JSON number, and `1e39 as f32` is `inf` — would journal as `null`, so
+every out-of-range component would share one effect key with every other. And a
+vector of zero magnitude has no direction, so cosine against it is `0/0`;
+handing it back would surface layers away as *the retriever returned a
+non-finite score*, naming the retriever for the driver's answer. Both are
+refused where the bytes arrive, naming the driver and the URL.
 
 ### Hybrid retrieval
 

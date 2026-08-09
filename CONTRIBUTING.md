@@ -147,7 +147,7 @@ prose most often gets wrong.
 | 🧠 | [Concepts](site/content/docs/concepts.md) — read this first; it is short |
 | 🏗️ | [Architecture](site/content/docs/architecture.md) — how each mechanism works |
 | 🔐 | [Security model](site/content/docs/security.md) — the trust boundary and its limits |
-| 📋 | [Status](site/content/docs/status.md) — what is built and what is not |
+| 📋 | [Status](site/content/docs/status.md) — what will move, and what is deliberately not built |
 
 The module layout, and the one discipline that matters (`core/` has zero I/O
 dependencies, enforced by a test), is in
