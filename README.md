@@ -322,18 +322,19 @@ deleting it would have failed no test, because the fixtures laundered the taint
 before it reached the check. It was found by accident. The sweep is so the next
 one is not.
 
-It runs on **every push**, and that sentence is the repair rather than the
-original design. The job was gated to pull requests, on the reasoning that a
-push to `main` had already passed the sweep on the way in — true of a repository
-that merges, and this one has never opened a pull request in its history, so the
-gate did not make the sweep cheaper, it switched the sweep off. Three mutations
-then rotted into code that no longer *compiled* — among them the retried draw
-that double-spends a customer's standing authorization — leaving three real
-guarantees unfalsifiable with every check green. `just anchors` reported all
-three present throughout, and correctly: it proves a mutation still **matches**
-the code it names, which is text and not types. The cheap check has that limit
-by construction; what it cannot do is notice that the expensive one is not
-running.
+It runs on **every push**, sharded six ways. It was gated to pull requests, on
+the reasoning that a push to `main` had already passed it — true of a repository
+that merges, and this one has never opened a pull request, so the gate switched
+the sweep off rather than making it cheaper. Three mutations then rotted into
+code that no longer *compiled*, leaving three guarantees unfalsifiable with
+every check green. `just anchors` reported all three present, correctly: it
+checks that a mutation still **matches** the code it names, which is text and
+not types.
+
+`MUTANTS_SHARD=k/n` takes a round-robin slice — round-robin because the table
+groups mutations by subject, so a contiguous split would hand one shard every
+expensive target. Each line carries `[142/379]`, and each shard needs its own
+checkout: the sweep rewrites source in place.
 
 ## 🚫 Non-goals
 

@@ -73,6 +73,9 @@ cleanup() {
     # remove would fail and leak the lock on every clean exit — turning the
     # stale-lock recovery above into the only way the tool ever starts again.
     rm -rf "$LOCK" 2>/dev/null || true
+    # Folded in here rather than given its own `trap ... EXIT`: a second EXIT
+    # trap *replaces* this one, and this one is what puts mutated source back.
+    rm -f "${LIST:-}" 2>/dev/null || true
 }
 
 # `mkdir` is the atomic test-and-set every POSIX shell has.
@@ -107,10 +110,35 @@ trap cleanup EXIT INT TERM
 # Anything left by a run that never got to clean up.
 restore_strays
 
-printf '\n%smutants — each must be caught by its named test%s\n' "$DIM" "$OFF"
+# The work list, materialised once so the run can say how far through it is.
+#
+# A sweep that prints only verdicts gives no way to tell "half done" from
+# "wedged on one mutation", and this one runs for tens of minutes — long enough
+# that the difference matters to whoever is watching CI. `MUTANTS_SHARD=k/n`
+# takes one slice; the count below is the slice's, not the table's, so the
+# numbers a shard prints are about the work that shard is actually doing.
+SHARD="${MUTANTS_SHARD:-1/1}"
+LIST="$(mktemp)"
+if [[ "$SHARD" == "1/1" ]]; then
+    python3 tools/mutants.py --list > "$LIST"
+else
+    python3 tools/mutants.py --list --shard "$SHARD" > "$LIST"
+fi
+total=$(wc -l < "$LIST" | tr -d ' ')
+index=0
+
+if [[ "$SHARD" == "1/1" ]]; then
+    printf '\n%smutants — each must be caught by its named test (%s)%s\n' \
+        "$DIM" "$total" "$OFF"
+else
+    printf '\n%smutants — shard %s, %s of the table, each must be caught by its named test%s\n' \
+        "$DIM" "$SHARD" "$total" "$OFF"
+fi
 
 while IFS=$'\t' read -r name file test desc; do
     current="$name"
+    index=$((index + 1))
+    progress="$(printf '[%*d/%d]' "${#total}" "$index" "$total")"
     # One classifier, not two. `mutants.py --verify` owns *did this guarantee
     # hold* — it applies, runs the named test, falls back to the full suite only
     # when that test held, restores on every path, and distinguishes killed from
@@ -125,16 +153,16 @@ while IFS=$'\t' read -r name file test desc; do
     current=""
 
     case $status in
-        0) printf '  %sPASS%s  %s\n        %s%s%s\n' \
-               "$GREEN" "$OFF" "$desc" "$DIM" "${verdict#*: }" "$OFF" ;;
-        1) printf '  %sFAIL%s  %s\n        %s%s%s\n' \
-               "$RED" "$OFF" "$desc" "$DIM" "${verdict#*: }" "$OFF"
+        0) printf '%s %sPASS%s  %s\n        %s%s%s\n' \
+               "$progress" "$GREEN" "$OFF" "$desc" "$DIM" "${verdict#*: }" "$OFF" ;;
+        1) printf '%s %sFAIL%s  %s\n        %s%s%s\n' \
+               "$progress" "$RED" "$OFF" "$desc" "$DIM" "${verdict#*: }" "$OFF"
            failed=1 ;;
-        *) printf '  %sERROR%s %s\n        %s%s%s\n' \
-               "$RED" "$OFF" "$desc" "$DIM" "$(head -1 <<<"${verdict#*: }")" "$OFF"
+        *) printf '%s %sERROR%s %s\n        %s%s%s\n' \
+               "$progress" "$RED" "$OFF" "$desc" "$DIM" "$(head -1 <<<"${verdict#*: }")" "$OFF"
            failed=1 ;;
     esac
-done < <(python3 tools/mutants.py --list)
+done < "$LIST"
 
 if [[ $failed -eq 0 ]]; then
     printf '\n%severy guarantee is falsifiable, and by the test written for it%s\n' "$GREEN" "$OFF"

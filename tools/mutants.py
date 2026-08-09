@@ -4129,9 +4129,33 @@ def _named_test_failed(out: str, test: str) -> bool:
 def main() -> int:
     if len(sys.argv) == 2 and sys.argv[1] == "--check":
         return check()
-    if len(sys.argv) == 2 and sys.argv[1] == "--list":
-        for name, (path, test, desc, _, _) in MUTANTS.items():
-            print(f"{name}\t{path}\t{test}\t{desc}")
+    if sys.argv[1:2] == ["--list"]:
+        # `--shard k/n` selects one slice, so the sweep can be split across n
+        # machines. Round-robin rather than contiguous: mutations are grouped by
+        # subject in this table, so consecutive entries tend to share a test
+        # target and therefore a build cost — a contiguous split would hand one
+        # shard every expensive target and another every cheap one, and the job
+        # takes as long as its slowest shard.
+        #
+        # Sharding is for separate checkouts. Two shards on one tree would
+        # rewrite the same files under each other, which is what the sweep's
+        # lock refuses.
+        shard, total = 1, 1
+        if sys.argv[2:3] == ["--shard"] and len(sys.argv) == 4:
+            try:
+                shard, total = (int(p) for p in sys.argv[3].split("/", 1))
+            except ValueError:
+                print("--shard takes k/n, as in --shard 2/6", file=sys.stderr)
+                return 2
+            if not 1 <= shard <= total:
+                print(f"--shard {shard}/{total} is out of range", file=sys.stderr)
+                return 2
+        elif len(sys.argv) != 2:
+            print(__doc__, file=sys.stderr)
+            return 2
+        for i, (name, (path, test, desc, _, _)) in enumerate(MUTANTS.items()):
+            if i % total == shard - 1:
+                print(f"{name}\t{path}\t{test}\t{desc}")
         return 0
     if len(sys.argv) != 3 or sys.argv[1] not in MUTANTS:
         print(__doc__, file=sys.stderr)

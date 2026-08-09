@@ -261,6 +261,7 @@ just ci         # lint, feature configurations, examples, docs, packaging
 just ci-full    # the above, plus TLA+ specs and the full mutation sweep
 
 python3 tools/mutants.py <name> --verify   # one guarantee, end to end
+MUTANTS_SHARD=2/6 just mutants           # one slice, for a machine that is not alone
 ```
 
 The mutation sweep is the one that matters for this page: it breaks each
