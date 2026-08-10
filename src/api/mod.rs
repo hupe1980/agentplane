@@ -48,10 +48,13 @@
 //!
 //! The gate hands each route the resolved plane **with** the caller, and this
 //! struct holds no runtime of its own. A handler therefore cannot read a store
-//! without having established whose it is: the cross-tenant read is unspellable
-//! rather than guarded against. A caller whose tenant has no plane is refused,
-//! never served by a default — a fallback would turn an unregistered tenant
-//! into somebody else's data, and it would look like working software.
+//! without having established whose it is, and every lookup on the registry
+//! names a *caller* rather than a tenant — so the tenant a route can reach is
+//! the one its credential resolved to, and reaching another is
+//! [`Planes::cross`], which records the crossing first. A caller whose tenant
+//! has no plane is refused, never served by a default — a fallback would turn
+//! an unregistered tenant into somebody else's data, and it would look like
+//! working software.
 //!
 //! # No authenticator is shipped
 //!
@@ -120,8 +123,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::core::{
-    CaseId, Decision, Delivery, InboundEvent, PolicyDecision, PolicyRequest, RunId, Task, TaskId,
-    TenantId,
+    CaseId, CaseStatus, Decision, Delivery, InboundEvent, PolicyDecision, PolicyRequest, RunId,
+    Task, TaskId, TenantId,
 };
 use crate::journal::RecordKind;
 use crate::runtime::Runtime;
@@ -407,10 +410,89 @@ impl Planes {
         self
     }
 
-    /// The plane answering for this tenant, if this process serves it.
+    /// The plane answering for **this caller's own** tenant, if this process
+    /// serves it.
+    ///
+    /// The tenant is read out of the caller rather than passed beside it, and
+    /// that is the whole of the control. A signature taking a bare
+    /// [`TenantId`] cannot tell *my tenant* from *somebody else's*, so it
+    /// serves both and the difference lives in whether the handler remembered
+    /// to pass the right one — which is a convention, and a control that must
+    /// be invoked is not one. Here the only tenant a handler can name is the
+    /// one its credential resolved to, and reaching any other is spelled
+    /// [`Planes::cross`], which records the crossing first.
+    ///
+    /// What this does **not** claim is that a cross-tenant read is impossible:
+    /// an embedder can build a [`Caller`] naming any tenant. That is the
+    /// [`Authenticator`]'s job and a deliberate act, not a forgotten step, and
+    /// it is the seam where a deployment decides what a credential means. The
+    /// property held here is narrower and worth stating exactly: **no code path
+    /// reaches another tenant's plane by accident**, because none can name one.
     #[must_use]
-    pub fn get(&self, tenant: &TenantId) -> Option<&Arc<Runtime>> {
-        self.by_tenant.get(tenant)
+    pub fn get(&self, caller: &Caller) -> Option<&Arc<Runtime>> {
+        self.by_tenant.get(&caller.tenant)
+    }
+
+    /// Reach a tenant that is **not** the caller's, recording the crossing first.
+    ///
+    /// The one sanctioned exception to isolation, and the only door through
+    /// which it is spelled. [`Runtime::record_break_glass`] writes the record
+    /// and returns an error if it cannot; this makes that record a
+    /// **precondition of holding the plane** rather than a step an admin
+    /// handler is asked to remember. A failure to record is therefore a failure
+    /// to access, by construction — which is the sentence the operations guide
+    /// has always used and, until this existed, described a convention.
+    ///
+    /// That is the same move as the rest of this registry. The tenant gate
+    /// returns the plane *with* the caller so a handler cannot reach an
+    /// unresolved store; a crossing returns the plane only *after* the crossed
+    /// tenant's journal says who crossed it and why. A control that must be
+    /// invoked is not one, and break-glass was the last one here that had to be.
+    ///
+    /// The whole [`Caller`] is taken rather than an actor, a role list and a
+    /// tenant separately, because those three are one fact — who authenticated
+    /// — and splitting them lets a handler record one operator's name against
+    /// another's crossing. Four arguments that must agree are four arguments
+    /// that can disagree, and the disagreement is silent: the record is
+    /// written, it is signed, and it names the wrong person.
+    ///
+    /// The caller's own tenant as `target` is refused: reading your own data is
+    /// not a crossing, and recording it as one would fill the break-glass
+    /// backlog with non-events until nobody reads it.
+    ///
+    /// Who may pull it remains the deployment's policy decision. This decides
+    /// only that pulling it is on the record.
+    ///
+    /// # Errors
+    ///
+    /// * [`RuntimeError::PlanContract`](crate::core::RuntimeError::PlanContract) if `target` is the caller's own
+    ///   tenant, or if the reason is blank.
+    /// * [`RuntimeError::UnknownTenant`](crate::core::RuntimeError::UnknownTenant) if this process serves no plane for
+    ///   `target` — refused rather than defaulted, exactly as [`Planes::get`] is.
+    /// * Whatever the store returned if the record could not be written. The
+    ///   plane is not handed back in that case.
+    pub async fn cross(
+        &self,
+        caller: &Caller,
+        target: &TenantId,
+        reason: &str,
+    ) -> Result<&Arc<Runtime>, crate::core::RuntimeError> {
+        if caller.tenant == *target {
+            return Err(crate::core::RuntimeError::PlanContract(format!(
+                "'{target}' is the caller's own tenant, so this is not a crossing — \
+                 use `Planes::get`. Recording it as break-glass would bury the real \
+                 crossings among routine reads"
+            )));
+        }
+        let plane = self
+            .by_tenant
+            .get(target)
+            .ok_or_else(|| crate::core::RuntimeError::UnknownTenant(target.to_string()))?;
+        // The record first, and the plane only if it landed.
+        plane
+            .record_break_glass(&caller.actor, &caller.roles, reason)
+            .await?;
+        Ok(plane)
     }
 
     /// Every tenant served, for an operator checking their wiring.
@@ -435,7 +517,10 @@ impl From<Arc<Runtime>> for Planes {
 /// The plane travels with the caller, and there is deliberately no other way for
 /// a route to reach one: `Api` holds a *registry*, not a runtime, so a handler
 /// cannot read a store without first having resolved which tenant's store it is.
-/// The cross-tenant read is not guarded against here — it is unspellable.
+/// The registry's own lookups take the caller too, so a route cannot name a
+/// tenant other than the one it authenticated — the accidental cross-tenant
+/// read is not guarded against here, it is unspellable. The deliberate one is
+/// [`Planes::cross`], and it is on the record.
 struct Session {
     caller: Caller,
     plane: Arc<Runtime>,
@@ -515,6 +600,7 @@ impl Api {
             .route("/tasks/{task}/claim", post(claim))
             .route("/tasks/{task}/release", post(release))
             .route("/tasks/{task}/decide", post(decide))
+            .route("/cases", get(cases_by_status))
             .route("/cases/{case}", get(case_view))
             .route("/events", post(deliver))
             .with_state(self)
@@ -541,7 +627,7 @@ impl Api {
         // Refused, never defaulted. Falling back to a default plane would turn
         // an unregistered tenant into somebody else's data, and it would look
         // like working software.
-        let plane = self.planes.get(&caller.tenant).ok_or_else(|| {
+        let plane = self.planes.get(&caller).ok_or_else(|| {
             ApiError(
                 StatusCode::FORBIDDEN,
                 "this deployment serves no plane for your tenant".to_owned(),
@@ -586,14 +672,30 @@ pub mod action {
     pub const TASK_RELEASE: &str = "api:task.release";
     pub const TASK_DECIDE: &str = "api:task.decide";
     pub const CASE_READ: &str = "api:case.read";
+    pub const CASE_LIST: &str = "api:case.list";
     pub const EVENT_DELIVER: &str = "api:event.deliver";
 
     /// Every action this surface can ask about.
     ///
     /// Exists so a deployment can enumerate what it must write rules for, and so
     /// a test can assert the route table and this list agree.
+    ///
+    /// **`RUN_LIST` was missing from this list**, and the omission is worth
+    /// keeping in view because of where it landed. A deployment writes its rules
+    /// by enumerating this, and its engine denies by default — so the verb it
+    /// never saw is the one nobody grants, and the route behind
+    /// `api:run.list` is *what is quarantined right now*. The backlog added
+    /// specifically so a quarantine reaches somebody was, for any operator who
+    /// trusted this list, refused to everybody.
+    ///
+    /// The test meant to catch it agreed with the bug: it compares this list
+    /// against the verbs the gate-denial walk actually asked, and that walk did
+    /// not call `/runs` either. Two omissions that cancel, which is a test
+    /// written from the same misreading as the code — it passes forever and
+    /// makes the wrong contract look pinned. The walk now covers every route.
     pub const ALL: &[&str] = &[
         RUN_READ,
+        RUN_LIST,
         RUN_CANCEL,
         TASK_LIST,
         TASK_READ,
@@ -601,6 +703,7 @@ pub mod action {
         TASK_RELEASE,
         TASK_DECIDE,
         CASE_READ,
+        CASE_LIST,
         EVENT_DELIVER,
     ];
 }
@@ -747,9 +850,18 @@ async fn cancel_run(
 /// operator could ask for. A run started with `spawn` returns before the status
 /// exists at all, so for those the log line was the only trace.
 ///
-/// Every other backlog here is findable by whoever must clear it — escalated
-/// cases, overdue tasks, breached obligations. This one was not, and a finding
-/// nobody can find is one that never reached a human in actionable form.
+/// The sentence that stood here claimed *every other backlog is findable by
+/// whoever must clear it — escalated cases, overdue tasks, breached
+/// obligations*. Overdue tasks were, through the worklist. **Escalated cases
+/// were not**: `CaseStore::by_status` existed and nothing exposed it, so the
+/// answer was available to anyone who already knew the case id — the one group
+/// that did not need to ask. The claim was written on the route that had just
+/// closed exactly this hole one surface over, which is the shape worth
+/// remembering: a statement about the doors you are *not* looking at, made
+/// while looking at this one. [`cases_by_status`] is that door.
+///
+/// A finding nobody can find is one that never reached a human in actionable
+/// form.
 async fn runs_by_outcome(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -956,6 +1068,60 @@ async fn decide(
 /// is shaped exactly like a complete one and a reader who cannot tell will read
 /// absence as evidence.
 const CASE_HISTORY_LIMIT: usize = 200;
+
+/// Cases in a given state — in practice, *what is escalated right now*.
+///
+/// An escalation is the sweeper's most consequential conclusion: an obligation
+/// was missed and somebody was told. Until this route, "told" meant a status
+/// written onto the case and a metric, and the only way to read it back was
+/// [`case_view`] — which needs the case id. So the answer was available to
+/// anyone who already knew which case had escalated, which is the one group
+/// that did not need to ask.
+///
+/// That is detection without delivery, and the sibling route listing quarantined
+/// runs claimed the opposite in as many words: *every other backlog here is
+/// findable by whoever must clear it — escalated cases, overdue tasks, breached
+/// obligations*. Overdue tasks were, through the worklist. Escalated cases were
+/// not, and the claim was made in a comment on the route that had just fixed the
+/// same hole one surface over.
+///
+/// `status` defaults to `escalated` for the same reason the run listing defaults
+/// to `quarantined`: the default should be what somebody is looking for.
+async fn cases_by_status(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Query(q): Query<StatusQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let asked = q.status.unwrap_or_else(|| "escalated".to_owned());
+    let s = api.gate(&headers, action::CASE_LIST, &asked).await?;
+    let status = CaseStatus::parse(&asked).ok_or_else(|| bad("status"))?;
+    let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
+
+    // One more than the page, so a full page and an overflowing one are
+    // distinguishable — a backlog of 140 shown as 100 reads as a backlog of 100,
+    // and the cases that fell off the end are the ones nobody clears.
+    let mut found = cases
+        .by_status(status, api.limit + 1)
+        .await
+        .map_err(|_| store_failed())?;
+    let truncated = found.len() > api.limit;
+    found.truncate(api.limit);
+
+    Ok(Json(json!({
+        "status": status.as_str(),
+        "cases": found
+            .iter()
+            .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
+            .collect::<Vec<_>>(),
+        "truncated": truncated,
+    })))
+}
+
+/// Which case state to list. Defaults to the one somebody is looking for.
+#[derive(serde::Deserialize)]
+struct StatusQuery {
+    status: Option<String>,
+}
 
 async fn case_view(
     State(api): State<Api>,

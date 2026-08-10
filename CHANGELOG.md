@@ -30,6 +30,202 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.13.0] — 2026-08-10
+
+### Changed — security
+
+- **Break-glass is a door, not a step.** `Planes::cross(caller, target, reason)`
+  is how you reach a tenant that is not the caller's, and it returns the plane
+  only once the crossing is sealed into that tenant's journal. Previously
+  `record_break_glass` and reaching for the plane were two calls in a documented
+  order, and nothing enforced it: an admin handler that skipped the first got a
+  cross-tenant read with nothing on the record. The runtime's own rule is that a
+  control which must be invoked is not one, and this was the last place it had
+  to be.
+
+- **`Planes::get` takes the caller, not a tenant** — and this is what made the
+  entry above true rather than aspirational. Building the door left a window
+  beside it for one revision: `cross` was correct, and every artifact called it
+  *the only way to reach a tenant that is not the caller's*, while the ordinary
+  lookup still accepted a bare `TenantId` and handed any registered plane to
+  anyone who named it. `planes.get(&victim_tenant)` was a complete cross-tenant
+  read with no record, and the tenancy table listed the control as built.
+
+  Both halves passed review, because neither was wrong on its own: the new call
+  did everything claimed of it, and the old one had been correct for as long as
+  its only caller passed the tenant it had just authenticated. What was false
+  was the pair. A claim about *the only way* is a claim about every other way,
+  so it cannot be checked by reading the mechanism it names — the review that
+  matters is of the doors it is not.
+
+  Both lookups now take `&Caller`, so the only tenant a handler can name is the
+  one its credential resolved to. The claim is narrowed to what a library can
+  actually hold: **no path reaches another tenant's plane by accident**, since
+  none can name one. A deliberate crossing is still possible — an embedder's
+  `Authenticator` decides what a credential means and can mint a caller for any
+  tenant — and that is a seam a deployment owns, not a forgotten step.
+
+  `cross` now takes the whole `Caller` too. Its actor, roles and tenant are one
+  fact, and passed apart a handler could record one operator's name against
+  another's crossing: written, signed, and wrong.
+
+  **Migration.** `planes.get(&caller.tenant)` becomes `planes.get(&caller)`;
+  `planes.cross(&caller.tenant, &target, &actor, &caller.roles, reason)` becomes
+  `planes.cross(&caller, &target, reason)`.
+
+### Added — a finding has to be findable
+
+- **`GET /cases?status=…` — what is escalated right now.** An escalation is the
+  sweeper saying an obligation was missed and somebody was told, and "told"
+  meant a status written onto the case. `CaseStore::by_status` existed; nothing
+  exposed it. So the only way to read an escalation back was `/cases/{case}`,
+  which needs the id — the answer was available to everyone except the person
+  who had to ask. Newest first, `truncated` when the page overflows, and an
+  unrecognised status is a `400` rather than a quiet fallback to `open`, which
+  would answer *what is escalated* with a list of healthy cases.
+
+  The route listing quarantined runs asserted the opposite in a comment — *every
+  other backlog here is findable by whoever must clear it, escalated cases
+  included* — written on the route that had just closed the same hole one
+  surface over. A claim about the doors you are not looking at, made while
+  looking at this one.
+
+### Fixed — security
+
+- **`api:run.list` was missing from `action::ALL`.** A deployment writes its
+  policy rules by enumerating that list and its engine denies by default, so the
+  verb nobody saw is the verb nobody granted — and the route behind it answers
+  *what is quarantined right now*. The backlog added specifically so that a
+  quarantine reaches a human was, for any operator who trusted the exported
+  vocabulary, refused to everybody.
+
+  The test meant to catch this agreed with the bug. It compares `action::ALL`
+  against the verbs the gate-denial walk actually asked, and that walk did not
+  call `/runs` either: two omissions that cancel, which passes forever and makes
+  the wrong contract look pinned. The walk now covers every route, and both
+  halves are held by mutations.
+
+  **Grant `api:run.list` and `api:case.list` explicitly.** They are the two read
+  verbs an on-call person needs and the two an allowlist built from route names
+  alone will miss.
+
+### Fixed — integrity
+
+- **A plan's digest no longer degrades to a constant.** `PlanIR::digest` read
+  `canon::to_bytes(self).unwrap_or_default()`, and `Digest::of(&[])` is the same
+  value for every plan — so any plan that failed to serialize would have shared
+  one content address with every other, under the digest that is journaled at
+  admission and binds a run to the graph it was authorized to execute. This is
+  the exact fallback `canon::value_bytes` refuses one layer down, in a doc
+  comment explaining why: *a fallback would make two different values hash
+  identically*. One rule, two implementations, and the weaker one was on the
+  authorization identity.
+
+  Now routed through `value_bytes`, so the abort rule lives in one place.
+  Unreachable today — every field is a string, integer, enum, digest or JSON
+  value — and written as an abort because the *reason* it is unreachable is a
+  property of the fields, which a field added later is what would change.
+
+- **A witness's unreadable 409 body is no longer read as size zero.** The body
+  of a stale reply is the witness's own tree size, and the caller acts on it by
+  building a consistency proof from there and resubmitting. `unwrap_or_default()`
+  turned a blank body, an HTML error page or a stray newline into a definite
+  claim of size 0 — which the caller then submits a proof from, the witness
+  rejects, and the rejection is classified as `Forked` or `Shrank`: the
+  **integrity** bucket. So an unreadable reply manufactured a fork alert, the one
+  outcome `WitnessError::Stale`'s own documentation says must not happen, since
+  a team paged twice for a routine cursor mismatch stops believing the alert that
+  matters. A witness is untrusted; what it did not say it does not get to have
+  said. An unparseable size is now `Unavailable` — routine, retried, not escalated.
+
+### Added — assurance
+
+- **The chain that keeps `requires_approval` off a hand-written skill is now
+  pinned by a test.** `StepCtx::sink` does not consult the field, and that is
+  sound only because no manifest can put the two together: a grant needing
+  approval needs `spec.oversight`, oversight needs `spec.execution`, a
+  declarative agent provides exactly one capability, and two skills may not
+  claim one capability. Four refusals across three files, each reading as being
+  about something else, and nothing named the conjunction — so any one of them
+  relaxing would have opened the gap in silence with every existing test still
+  passing. The property was sound and unheld; it is now both.
+
+- **A plan's content address is now checked field by field.** The existing test
+  round-tripped a plan through the journal and asserted the digest matched,
+  which proves stability and not coverage: a digest that ignored topology
+  entirely, or dropped every node, passes it. Twelve identity-bearing changes
+  are now asserted to move the digest, and all of them to be pairwise distinct —
+  the assertion that catches a digest which has become a constant.
+
+- **Each tenant's own policy engine is held to deciding its own requests.** Two
+  planes, two engines that disagree, and each asked exactly once. This is the
+  evidence behind the constitution's claim that per-plane *is* tenant-scoped;
+  the claim rests on the registry resolving the plane before it asks the policy
+  question, and nothing pinned that order.
+
+### Changed — documentation
+
+- **Release blocker 3 was largely an expired premise, and is rewritten.** It
+  read *identities, policy bundles, manifests and egress grants are still
+  plane-wide, and tenant-safe export, restore and witness proofs do not exist*.
+  Three of those four clauses no longer describe this system: "plane-wide"
+  stopped being distinct from tenant-scoped when a plane became single-tenant;
+  witness proofs are tenant-scoped and §9.1's own table said so four lines
+  above, marked **built**; and egress names hosts a deployment may reach rather
+  than tenant state. What survives is export and restore, which do not exist in
+  any form.
+
+  The release-blocker list is the one artifact answering *may this ship yet*, so
+  a stale entry costs more there than anywhere. Every item now has to name the
+  check that would show it discharged, or it outlives its premise while looking
+  like an open question.
+
+  A same-tenant `cross` is refused — that is `Planes::get`, and recording
+  routine access as break-glass buries the real crossings. An unregistered
+  target is refused rather than defaulted, as the ordinary tenant gate is.
+
+  `record_break_glass` stays for an embedder recording a crossing made some
+  other way. New mutation `CrossingServesBeforeItRecords`, killed by
+  `crossing_to_another_tenant_records_before_it_serves`.
+
+- **`RuntimeError::UnknownTenant`** — new variant, for a tenant this process
+  serves no plane for. The enum is `#[non_exhaustive]`, so this is additive.
+
+### Fixed — documentation
+
+- **Twenty-three doc comments had absorbed the one below them.** Inserting an
+  item between an existing doc block and its own item is valid Rust, so the
+  block silently takes on the next item's documentation and the item below is
+  published bare. `EffectError::spend` carried `disposition`'s summary while
+  `disposition` — the accessor that decides `DidNotHappen`/`InDoubt`/`Landed` —
+  had none; `RuntimeBuilder::signing_as` and `lease_ttl` both carried `owner`'s,
+  and `owner` had none; `Tainted::peek`, `Record::seal_signed` and
+  `Record::MAX_RECORD_BYTES` were the same shape. All twenty-three are split
+  back onto the items they describe, across `src/` and `tests/`.
+
+  Nothing was wrong with the *code*; every one of these was a reader following
+  published rustdoc to the wrong method.
+
+### Fixed — assurance
+
+- **The guard for that shape was blind to it.** `no_doc_comment_has_absorbed_-
+  the_one_below_it` fingerprinted a block with two `# Errors` sections, which
+  the two instances that motivated it happened to have and the other
+  twenty-three did not. It also never scanned outside `src/`, so the two
+  instances in the guard's own file were unreachable. Both are fixed: the scan
+  now covers `tests/` and `examples/`, and a second fingerprint runs beside the
+  first — a one-sentence line closing a paragraph directly after another
+  complete sentence, which is what a spliced summary looks like. It carries a
+  self-test that fails on the real instances before it runs over the tree, and
+  states in its own documentation what it therefore does not catch.
+
+  Seven doc blocks were reflowed to give a paragraph-final punchline its own
+  paragraph, which is what makes the second fingerprint exact rather than
+  advisory.
+
+- **A duplicated assertion loop** in the same guard: the `ABSENT_BY_DESIGN`
+  check ran twice, verbatim, the second copy with mangled message whitespace.
+
 ## [0.12.0] — 2026-08-09
 
 ### Fixed — testing

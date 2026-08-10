@@ -342,9 +342,35 @@ impl PlanIR {
     }
 
     /// Content address over the canonical form.
+    ///
+    /// Routed through [`canon::value_bytes`] rather than [`canon::to_bytes`],
+    /// so that the *one* rule about an uncanonicalizable value lives in one
+    /// place and this identity inherits it. That rule is a loud abort, and it
+    /// is stated where the writer is: a fallback makes two different values
+    /// hash identically, which for a plan means two different authorization
+    /// graphs sharing an identity.
+    ///
+    /// This read `to_bytes(self).unwrap_or_default()`, which is exactly the
+    /// fallback `canon` refuses — and the worst available one, because
+    /// `Digest::of(&[])` is a *constant*: every plan that failed to serialize
+    /// would collide with every other, under a digest that is journaled at
+    /// admission and is what binds a run to what it was authorized to do. The
+    /// nodes, arguments, topology and lineage would all be absent from their
+    /// own content address and nothing would say so.
+    ///
+    /// # Panics
+    ///
+    /// Only if a plan cannot be serialized, which is unreachable by
+    /// construction: every field is a string, an integer, an enum, a `Digest`
+    /// or a `serde_json::Value`, and none of those can fail. It is written as
+    /// an abort rather than trusted silently because the *reason* it is
+    /// unreachable is a property of the fields, and a field added later is
+    /// exactly what would change it — loudly here, invisibly before.
     #[must_use]
     pub fn digest(&self) -> Digest {
-        Digest::of(&canon::to_bytes(self).unwrap_or_default())
+        let value = serde_json::to_value(self)
+            .expect("a plan holds only strings, integers, enums, digests and JSON values");
+        Digest::of(&canon::value_bytes(&value))
     }
 
     #[must_use]

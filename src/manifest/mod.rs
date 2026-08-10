@@ -1052,12 +1052,6 @@ impl Manifest {
         Ok(())
     }
 
-    /// The arrangement has to describe something.
-    ///
-    /// Each field here is individually fine; it is the *combination* that can
-    /// describe nothing, which is why these are separate from the empty-value
-    /// checks above.
-    /// A control nothing performs is worse than no control at all.
     /// A tool-calling agent's grants must be describable to a model.
     ///
     /// The model picks from what it is told. A grant with no description gives
@@ -1230,6 +1224,7 @@ impl Manifest {
         Ok(())
     }
 
+    /// A control nothing performs is worse than no control at all.
     fn validate_oversight(&self) -> Result<(), ManifestError> {
         let Some(o) = &self.spec.oversight else {
             return Ok(());
@@ -1312,6 +1307,11 @@ impl Manifest {
         Ok(())
     }
 
+    /// The arrangement has to describe something.
+    ///
+    /// Each field here is individually fine; it is the *combination* that can
+    /// describe nothing, which is why these are separate from the empty-value
+    /// checks above.
     fn validate_topology(&self) -> Result<(), ManifestError> {
         let Some(t) = &self.spec.topology else {
             return Ok(());

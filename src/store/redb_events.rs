@@ -157,22 +157,6 @@ fn load_correlation(
 /// `(run_id, effect_key, case_id, has_case, step, phase)`.
 type Waiter = (String, String, String, u8, u32, String);
 
-/// The oldest subscription waiting on any of `keys` for this event kind.
-///
-/// Separate from [`EventStore::match_waiter`] because it answers a different
-/// question — *who is waiting* — from the one the caller acts on, which is
-/// *may I claim this for them*. Returns the wait's identity and the fields the
-/// caller needs to rebuild it.
-/// Write an event's correlation rows and its match-path index.
-///
-/// Its own function because `buffer` was over the line limit with it inline, and
-/// because "file the event" and "make it findable" are separate jobs that fail
-/// separately.
-///
-/// No tenant here: these rows point at an event, and the event row they point at
-/// is tenant-keyed — so a lookup that crosses tenants finds a correlation entry
-/// and then no event. The isolation is in `EVENTS`, and adding a second copy of
-/// it here would be a second thing to keep in agreement.
 /// Stamp an event row as claimed by one run.
 ///
 /// Extracted because `match_waiter` was over the line limit, and because this is
@@ -196,6 +180,16 @@ fn claim_row(
     Ok(())
 }
 
+/// Write an event's correlation rows and its match-path index.
+///
+/// Its own function because `buffer` was over the line limit with it inline, and
+/// because "file the event" and "make it findable" are separate jobs that fail
+/// separately.
+///
+/// No tenant here: these rows point at an event, and the event row they point at
+/// is tenant-keyed — so a lookup that crosses tenants finds a correlation entry
+/// and then no event. The isolation is in `EVENTS`, and adding a second copy of
+/// it here would be a second thing to keep in agreement.
 fn index_correlation(
     w: &redb::WriteTransaction,
     tenant: &str,
@@ -215,6 +209,12 @@ fn index_correlation(
     Ok(())
 }
 
+/// The oldest subscription waiting on any of `keys` for this event kind.
+///
+/// Separate from [`EventStore::match_waiter`] because it answers a different
+/// question — *who is waiting* — from the one the caller acts on, which is
+/// *may I claim this for them*. Returns the wait's identity and the fields the
+/// caller needs to rebuild it.
 fn oldest_waiter(
     tenant: &str,
     by_key: &impl ReadableTable<SubKey<'static>, ()>,

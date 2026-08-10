@@ -331,6 +331,7 @@ pub trait JournalStore: Send + Sync + Debug {
     /// expiry, and the temptation is to make the owner string constant so that
     /// the replacement "renews" instead — which quietly disables fencing,
     /// because two live instances then read each other's lease as their own.
+    ///
     /// A release primitive is what lets the owner stay unique per process.
     ///
     /// Takes the caller's `epoch` and releases only if it is the one holding the

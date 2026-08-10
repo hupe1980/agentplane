@@ -1117,6 +1117,137 @@ spec:
     );
 }
 
+/// **`requires_approval` is unreachable from a hand-written skill, and four
+/// separate refusals are what make it so.**
+///
+/// The enforcement of `requires_approval` lives in the declarative behaviours.
+/// `StepCtx::sink` — the path a hand-written skill calls a tool through — does
+/// not consult it, and that is sound only because no manifest can put the two
+/// together. Nothing stated that, and no test held it: the property is the
+/// *conjunction* of rules in three files, each of which reads as being about
+/// something else, so any one of them relaxing would open the gap in silence
+/// and every existing test would still pass.
+///
+/// The chain, in the order a manifest hits it:
+///
+/// 1. a grant with `requires_approval` needs `spec.oversight` — otherwise it
+///    claims a human is in the loop when nothing would ask one;
+/// 2. `spec.oversight` needs `spec.execution` — a hand-written skill picks its
+///    own moment to ask, so the runtime has nothing to apply;
+/// 3. a declarative agent provides exactly **one** capability — so there is no
+///    second name a hand-written skill could answer to;
+/// 4. two skills may not claim one capability — so it cannot answer to the
+///    declarative agent's own name either.
+///
+/// Together: an agent that can declare `requires_approval` runs its tools
+/// through the behaviour that enforces it, and there is no seam for a skill.
+///
+/// **What this test covers, and what it therefore does not.** Links 1–3 are
+/// parse-time and are asserted here. Link 4 is a *build*-time refusal
+/// (`BuildError::CapabilityClaimedTwice`) and is held by
+/// `tests/trust/manifest.rs`; it is named here because the argument is the
+/// conjunction, and a reader checking whether the seam is really closed needs
+/// all four — not because this function exercises it.
+#[cfg(feature = "manifest")]
+#[test]
+fn requires_approval_cannot_reach_a_hand_written_skill() {
+    fn refuse(yaml: &str, what: &str) -> String {
+        agentplane::manifest::Manifest::parse(yaml)
+            .err()
+            .map_or_else(|| panic!("{what}"), |e| e.to_string())
+    }
+
+    // 1. The grant needs an oversight policy to ask under.
+    let err = refuse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities: { provides: [desk.pay] }
+  tools:
+    - ref: tool://ledger/transfer
+      description: Move funds.
+      requires_approval: true
+  budgets: {}
+"#,
+        "a grant asking for a human with nobody to ask was accepted",
+    );
+    assert!(
+        err.contains("oversight"),
+        "the refusal must name the missing oversight policy, got: {err}"
+    );
+
+    // 2. An oversight policy needs a declarative behaviour to apply it — this
+    //    is the link that keeps the pair off a hand-written agent.
+    let err = refuse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities: { provides: [desk.pay] }
+  oversight:
+    approval: tools-only
+    deadline: { name: review, kind: hours, params: { n: 4 } }
+  budgets: {}
+"#,
+        "oversight was accepted on an agent with no declarative behaviour",
+    );
+    assert!(
+        err.contains("spec.oversight") && err.contains("hand-written"),
+        "the refusal must say oversight is applied by a declarative agent, got: {err}"
+    );
+
+    // 3. A declarative agent answers to exactly one capability, so a skill
+    //    cannot be given a second name on the same manifest.
+    let err = refuse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities: { provides: [desk.pay, desk.settle] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: tool-calling, max_turns: 4 }
+  budgets: {}
+"#,
+        "a declarative agent was allowed to provide two capabilities",
+    );
+    assert!(
+        err.contains("provides"),
+        "the refusal must name the capability list, got: {err}"
+    );
+
+    // The positive half: the combination the chain *does* permit still parses,
+    // so these are three specific refusals rather than a parser that rejects
+    // anything resembling oversight.
+    agentplane::manifest::Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities: { provides: [desk.pay] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: tool-calling, max_turns: 4 }
+  oversight:
+    approval: tools-only
+    deadline: { name: review, kind: hours, params: { n: 4 } }
+  tools:
+    - ref: tool://ledger/transfer
+      description: Move funds.
+      requires_approval: true
+      mutates: true
+      protected_fields:
+        - path: /amount
+          max_sensitivity: internal
+  budgets: {}
+"#,
+    )
+    .expect("the governed combination the chain permits was refused");
+}
+
 /// A planned step whose grant asks for a human waits, exactly as a loop call
 /// does — and the reviewer sees the **resolved** arguments, references already
 /// bound, because approving `$input/payee` would be approving a name rather

@@ -502,8 +502,6 @@ impl<T> Tainted<T> {
         }
     }
 
-    /// Read without unwrapping. Safe by design: the lattice governs where a
-    /// value may *go*, not whether it may be inspected.
     /// Take the value, dropping the label.
     ///
     /// Deliberately *not* named `unwrap` or `into_inner`: this is the one
@@ -519,6 +517,8 @@ impl<T> Tainted<T> {
         self.value
     }
 
+    /// Read without unwrapping. Safe by design: the lattice governs where a
+    /// value may *go*, not whether it may be inspected.
     pub fn peek(&self) -> &T {
         &self.value
     }

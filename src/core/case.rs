@@ -77,6 +77,32 @@ impl CaseStatus {
         }
     }
 
+    /// The inverse of [`as_str`](Self::as_str), for a status arriving as text.
+    ///
+    /// Written over [`ALL`](Self::ALL) rather than as a second `match`, so the
+    /// two directions cannot disagree. A hand-written match here would be one
+    /// rule with two implementations, and the boundary nobody probes is a
+    /// variant added later: `as_str` gets the new arm because the compiler
+    /// insists, and the parser silently starts refusing a status the rest of
+    /// the system emits.
+    ///
+    /// Unknown text is `None` rather than a default. A status filter that
+    /// silently became `Open` on a typo would answer *what is escalated* with a
+    /// list of healthy cases, which reads as an empty backlog.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+
+    /// Every status, so a caller can enumerate them without matching.
+    pub const ALL: [Self; 5] = [
+        Self::Open,
+        Self::AwaitingExternal,
+        Self::AwaitingHuman,
+        Self::Escalated,
+        Self::Closed,
+    ];
+
     #[must_use]
     pub fn is_closed(self) -> bool {
         self == Self::Closed

@@ -264,16 +264,6 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// Whether a line cites a section of a document the reader does not have.
-///
-/// A named specification before the section is a citation a reader can follow;
-/// a bare one is a pointer into an internal document.
-///
-/// The internal document numbers two things, and for a while this saw only one:
-/// sections are `§9.1` and invariants are `§I1`, so a reference to an invariant
-/// went straight past a detector that required a digit after the sign. It slipped
-/// a fresh leak into shipped rustdoc while the guard reported clean — the shape
-/// this project keeps a second check for, arriving in the check itself.
 /// Documents whose section numbers a reader *can* resolve.
 ///
 /// A published specification's section is not the leak this guard is about:
@@ -284,6 +274,16 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
 /// it means.
 const NAMED_EXTERNAL: &[&str] = &["RFC", "C2SP", "A2A", "MCP", "CloudEvents"];
 
+/// Whether a line cites a section of a document the reader does not have.
+///
+/// A named specification before the section is a citation a reader can follow;
+/// a bare one is a pointer into an internal document.
+///
+/// The internal document numbers two things, and for a while this saw only one:
+/// sections are `§9.1` and invariants are `§I1`, so a reference to an invariant
+/// went straight past a detector that required a digit after the sign. It slipped
+/// a fresh leak into shipped rustdoc while the guard reported clean — the shape
+/// this project keeps a second check for, arriving in the check itself.
 fn cites_internal_section(line: &str) -> bool {
     let Some(at) = line.find('§') else {
         return false;
@@ -408,6 +408,7 @@ fn nothing_a_reader_sees_cites_an_internal_section_number() {
 /// repository enforces, and did — the architecture page's flagship agent
 /// declared `role: specialist` beside `max_delegation_depth: 2`, a pair
 /// [`Manifest::validate`](agentplane::manifest::Manifest::validate) refuses.
+///
 /// A reader following the page got a parse error from the first command.
 ///
 /// The parser is the authority here, deliberately: a guard that re-implemented
@@ -481,6 +482,7 @@ fn every_documented_manifest_parses() {
 /// `just examples` is the only thing that executes example code, so an example
 /// missing from it compiles forever and never runs — which is worse than not
 /// having it, because the README points readers at something nothing checks.
+///
 /// `memory_run` had been in that state.
 ///
 /// The `_live` examples are exempt by name and by design: they spend money
@@ -553,6 +555,30 @@ fn every_example_is_run_by_the_examples_recipe() {
 /// 1124 times on this crate — mostly on builder methods whose names already say
 /// everything, where a doc comment would restate the code rather than explain
 /// it.
+///
+/// **That fingerprint alone missed twenty-three of these**, because most merged
+/// blocks contain no `#` section at all. `RuntimeBuilder::signing_as` and
+/// `lease_ttl` were both published under `owner`'s summary while `owner` had no
+/// documentation; `EffectError::spend` was published under `disposition`'s, and
+/// `disposition` — the accessor that decides `DidNotHappen`/`InDoubt`/`Landed` —
+/// had none. So a second fingerprint runs beside the first, taken from those
+/// twenty-three: **an absorbed summary is a one-sentence line that closes a
+/// paragraph and follows another complete sentence.** A merge splices the next
+/// item's summary directly onto the previous block's final paragraph, with no
+/// blank `///` between, and a summary is always followed by the blank line
+/// rustdoc needs before a body.
+///
+/// The rule that keeps it exact, and the reason seven blocks were reflowed when
+/// it landed: **a sentence that closes a paragraph and follows another complete
+/// sentence starts its own paragraph.** That is a formatting convention this
+/// codebase already follows for punchlines, and holding to it is what makes the
+/// second fingerprint report nothing on a clean tree.
+///
+/// What it therefore does **not** catch, stated because a checker that hides its
+/// reach is worse than one that admits it: a merge whose absorbed summary wraps
+/// onto two lines, one that lands mid-paragraph rather than before a blank, and
+/// a doc block attached to the wrong item where nothing was absorbed at all.
+/// Only the compiler resolves that last one.
 #[test]
 fn no_doc_comment_has_absorbed_the_one_below_it() {
     const SECTIONS: [&str; 4] = ["# Errors", "# Panics", "# Examples", "# Safety"];
@@ -561,10 +587,17 @@ fn no_doc_comment_has_absorbed_the_one_below_it() {
     let mut checked = 0usize;
     let mut merged: Vec<String> = Vec::new();
 
+    // `tests/` and `examples/` as well as `src/`, because the guard's own file
+    // carried two of these and the scan walked straight past them. A pointer at
+    // the wrong item is the same defect wherever it sits, and the repository is
+    // public.
     let mut files: Vec<std::path::PathBuf> = Vec::new();
-    let mut stack = vec![root.join("src")];
+    let mut stack = vec![root.join("src"), root.join("tests"), root.join("examples")];
     while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("src is readable").flatten() {
+        for entry in std::fs::read_dir(&dir)
+            .expect("the tree is readable")
+            .flatten()
+        {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
@@ -607,6 +640,20 @@ fn no_doc_comment_has_absorbed_the_one_below_it() {
                         ));
                     }
                 }
+                for k in 1..block.len().saturating_sub(1) {
+                    if absorbed_summary(block[k - 1], block[k], block[k + 1]) {
+                        merged.push(format!(
+                            "{rel}:{} reads as the summary of a *different* item — \
+                             `{}` closes a paragraph directly after another complete \
+                             sentence, which is what an absorbed doc comment looks \
+                             like. If it belongs to the item below, move it there; if \
+                             it is a punchline for the paragraph above, give it its \
+                             own `///` blank line",
+                            start + k,
+                            block[k]
+                        ));
+                    }
+                }
                 block.clear();
             }
         }
@@ -618,6 +665,90 @@ fn no_doc_comment_has_absorbed_the_one_below_it() {
          matching and this guard is now inert"
     );
     assert!(merged.is_empty(), "{}", merged.join("\n"));
+}
+
+/// Whether `cur` reads as a summary line absorbed from the item below.
+///
+/// Three conditions, all taken from the twenty-three real instances: the line
+/// closes a paragraph (`next` is blank), it follows a line that also ends a
+/// sentence (so it is not ordinary wrapped prose continuing a thought), and it
+/// is a single sentence (a summary is one sentence; a body paragraph is not).
+///
+/// List items are exempt: a bulleted line legitimately ends a sentence directly
+/// after another bulleted line, and `Scope`'s capability list is the case that
+/// proved it.
+fn absorbed_summary(prev: &str, cur: &str, next: &str) -> bool {
+    let is_list = |l: &str| l.starts_with('*') || l.starts_with('-');
+    if !next.is_empty() || is_list(cur) || is_list(prev) {
+        return false;
+    }
+    if !prev.ends_with('.') || !cur.ends_with('.') {
+        return false;
+    }
+    // Two sentences on one line is a paragraph, not a summary.
+    !cur.match_indices(". ")
+        .any(|(i, _)| cur[i + 2..].chars().next().is_some_and(char::is_uppercase))
+}
+
+/// The second fingerprint fires on the defect that motivated it, and not on the
+/// prose next door.
+///
+/// A guard's first act must be to fail on the specific defect it was written
+/// for. On a clean tree a working detector and a disabled one both report
+/// nothing, so without this the rule could be deleted and leave a green test.
+#[test]
+fn the_absorbed_summary_detector_recognises_what_it_is_for() {
+    assert!(
+        absorbed_summary(
+            "one, such as a pod name. An agent's *name* is several.",
+            "How long this plane's run leases last.",
+            ""
+        ),
+        "the detector misses the shape that published `lease_ttl` under `owner`'s summary"
+    );
+    assert!(
+        absorbed_summary(
+            "part of the prefix invalidates every later signature, not just its own.",
+            "The largest a single journal record may be.",
+            ""
+        ),
+        "the detector misses the shape that published `MAX_RECORD_BYTES` under \
+         `seal_signed`'s summary"
+    );
+    assert!(
+        !absorbed_summary(
+            "crate's to declare and a guard that flagged them would be turned",
+            "off, which is why the allowlist exists.",
+            ""
+        ),
+        "the detector fires on ordinary wrapped prose, whose previous line does \
+         not end a sentence"
+    );
+    assert!(
+        !absorbed_summary(
+            "* `\"billing.reconcile\"` — exactly that capability.",
+            "* `\"billing.*\"` — that prefix and everything under it.",
+            ""
+        ),
+        "the detector fires on a bulleted list, where consecutive sentence-final \
+         lines are the normal shape"
+    );
+    assert!(
+        !absorbed_summary(
+            "the sealed block travels to third-party tool servers and peers.",
+            "So the three are separated. They are argued about no longer.",
+            ""
+        ),
+        "the detector fires on a two-sentence paragraph, which is not a summary"
+    );
+    assert!(
+        !absorbed_summary(
+            "the sealed block travels to third-party tool servers and peers.",
+            "So the three are separated rather than argued about.",
+            "and the reasoning is worth keeping."
+        ),
+        "the detector fires on a line that does not close its paragraph"
+    );
 }
 
 /// Every published YAML block is well-formed YAML, whole manifest or fragment.
@@ -1104,29 +1235,6 @@ const FOREIGN_TYPES: &[&str] = &[
     "NaiveDate",
 ];
 
-/// Every `Type::associated_fn` a page publishes exists on that type.
-///
-/// The `StepCtx` guard covers the surface a newcomer programs against, and it
-/// covers **only** `StepCtx` — so a constructor on any other public type could
-/// be invented in prose and nothing would look. One was: the concepts page
-/// taught obligations with `DeadlineSpec::working_days(1)`, which does not
-/// exist and never has. The type has three constructors and none of them is
-/// that, so the first line of the deadline example a reader copies did not
-/// compile — and the comment above it said *five working days* while the call
-/// said one, which is the tell that nobody had run it.
-///
-/// The check is name-based rather than type-resolved, and the trade is stated
-/// because it decides what this can and cannot find. It collects every
-/// `pub fn`/`pub const fn` name declared anywhere in `src/` and refuses a
-/// documented `Type::name` whose `name` is not among them. So it catches an
-/// **invented** name, and it does not catch a real name attached to the wrong
-/// type — resolving that needs the compiler, which for markdown means building
-/// every snippet, which the doc-example harness does for the ones that carry
-/// their own imports.
-///
-/// Std and dependency paths are skipped by an allowlist rather than by
-/// guessing, because `Duration::from_secs` and `Value::String` are not this
-/// crate's to declare and a guard that flagged them would be turned off.
 /// Every public function name this crate declares, inherent or on a trait.
 ///
 /// Name-based on purpose, and the trade decides what the guard can find: it
@@ -1189,6 +1297,29 @@ fn declared_function_names(root: &Path) -> std::collections::BTreeSet<String> {
     declared
 }
 
+/// Every `Type::associated_fn` a page publishes exists on that type.
+///
+/// The `StepCtx` guard covers the surface a newcomer programs against, and it
+/// covers **only** `StepCtx` — so a constructor on any other public type could
+/// be invented in prose and nothing would look. One was: the concepts page
+/// taught obligations with `DeadlineSpec::working_days(1)`, which does not
+/// exist and never has. The type has three constructors and none of them is
+/// that, so the first line of the deadline example a reader copies did not
+/// compile — and the comment above it said *five working days* while the call
+/// said one, which is the tell that nobody had run it.
+///
+/// The check is name-based rather than type-resolved, and the trade is stated
+/// because it decides what this can and cannot find. It collects every
+/// `pub fn`/`pub const fn` name declared anywhere in `src/` and refuses a
+/// documented `Type::name` whose `name` is not among them. So it catches an
+/// **invented** name, and it does not catch a real name attached to the wrong
+/// type — resolving that needs the compiler, which for markdown means building
+/// every snippet, which the doc-example harness does for the ones that carry
+/// their own imports.
+///
+/// Std and dependency paths are skipped by an allowlist rather than by
+/// guessing, because `Duration::from_secs` and `Value::String` are not this
+/// crate's to declare and a guard that flagged them would be turned off.
 #[test]
 fn every_documented_associated_function_exists() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1204,13 +1335,6 @@ fn every_documented_associated_function_exists() {
             !declared.contains(*name),
             "`{ty}::{name}` now exists, and two pages tell readers it deliberately \
              does not. Fix the pages, then remove this row"
-        );
-    }
-
-    for (ty, name) in ABSENT_BY_DESIGN {
-        assert!(
-            !declared.contains(*name),
-            "`{ty}::{name}` now exists, and two pages tell readers it deliberately              does not. Fix the pages, then remove this row"
         );
     }
 

@@ -126,6 +126,7 @@ pub trait Signer: Send + Sync + Debug {
 /// attacker-shaped". Provenance sealing was then added and is exactly that
 /// surface: its payload carries a caller-chosen `target` and an arguments
 /// digest, and the sealed block travels to third-party tool servers and peers.
+///
 /// So the three are separated rather than argued about.
 ///
 /// The **one** signature deliberately not routed through here is the checkpoint

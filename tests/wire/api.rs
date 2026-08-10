@@ -809,6 +809,13 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
             Some("bob"),
             &json!({ "id": "e", "kind": "k", "correlation": [], "payload": {} }),
         ),
+        // The two listing routes. `/runs` was absent here and `api:run.list`
+        // was absent from `action::ALL`, so the equality below held by leaving
+        // the same verb out of both sides — and a deployment enumerating `ALL`
+        // never wrote a rule for the route that answers *what is quarantined
+        // right now*.
+        get("/runs", Some("bob")),
+        get("/cases", Some("bob")),
     ] {
         let uri = req.uri().to_string();
         let (status, body) = send(&router, req).await;
@@ -1202,6 +1209,173 @@ async fn a_caller_cannot_read_another_tenants_run() {
         "the owning tenant lost access to its own run: {body:#}"
     );
     assert_eq!(body["run"], theirs);
+}
+
+/// **Each tenant is judged by its own policy engine, not by whichever one the
+/// process happened to reach first.**
+///
+/// The registry resolves the plane *before* asking the policy question, and the
+/// engine it then asks belongs to that plane. Getting this backwards — one
+/// shared engine in front of many tenants — would let the laxest tenant's rules
+/// set everybody's, and it would look like working software for exactly as long
+/// as every tenant's policy agreed.
+///
+/// This is also the evidence behind a claim the constitution makes about
+/// tenancy: identities, policy bundles and manifests are per-*plane*, and a
+/// plane is one tenant, so per-plane **is** tenant-scoped. That sentence is only
+/// true while the resolution order holds, and nothing else pins it.
+#[tokio::test]
+async fn each_tenants_own_policy_engine_decides_its_requests() {
+    use agentplane::api::Planes;
+    use agentplane::core::TenantId;
+
+    let acme = TenantId::new("acme").expect("valid");
+    let globex = TenantId::new("globex").expect("valid");
+    let base = RedbStore::open_in_memory().unwrap();
+
+    // Two engines that disagree, so which one answered is observable.
+    let permits = Arc::new(Recording::default());
+    let denies = Arc::new(Recording {
+        deny: true,
+        ..Recording::default()
+    });
+
+    let plane = |tenant: TenantId, policy: Arc<Recording>| {
+        let store = Arc::new(base.clone().for_tenant(tenant.clone()));
+        Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+            .cases(store.clone() as Arc<dyn CaseStore>)
+            .tasks(store as Arc<dyn TaskStore>)
+            .policy(policy as Arc<dyn PolicyEngine>)
+            .tenant(tenant)
+            .build()
+    };
+
+    let router = Api::new(
+        Planes::one(plane(acme, Arc::clone(&permits))).and(plane(globex, Arc::clone(&denies))),
+        Arc::new(TenantAuth),
+    )
+    .expect("both planes are governed")
+    .router()
+    .clone();
+
+    let (status, _) = send(&router, get("/tasks", Some("acme:alice"))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "acme's permitting engine did not decide acme's request"
+    );
+    let (status, _) = send(&router, get("/tasks", Some("globex:eve"))).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "globex's denying engine did not decide globex's request — one tenant's \
+         rules were applied to another's, which is how the laxest tenant's \
+         policy becomes everybody's"
+    );
+
+    // And each engine saw only its own tenant's traffic. Without this the
+    // assertions above pass for a router that asks *both* engines and takes
+    // whichever answers first.
+    assert_eq!(
+        permits.asked().len(),
+        1,
+        "acme's engine was asked about a request that was not acme's"
+    );
+    assert_eq!(
+        denies.asked().len(),
+        1,
+        "globex's engine was asked about a request that was not globex's"
+    );
+}
+
+/// **What is escalated right now, without already knowing which case.**
+///
+/// An escalation is the sweeper's most consequential conclusion: an obligation
+/// was missed and somebody was told. "Told" meant a status on the case and a
+/// metric, and the only way to read it back was `/cases/{case}` — which needs
+/// the id. So the answer was available to everyone except the person who needed
+/// to ask it, which is detection without delivery.
+///
+/// The sibling route listing quarantined runs asserted the opposite in a
+/// comment — *every other backlog here is findable by whoever must clear it,
+/// escalated cases included* — on the route that had just closed this same hole
+/// one surface over. A claim about the other doors, made while looking at this
+/// one.
+#[tokio::test]
+async fn escalated_cases_are_listable_without_knowing_the_case_id() {
+    use agentplane::core::CaseStatus;
+
+    let f = fixture();
+    // A run that suspends on a human task, so a real case exists.
+    f.pending_task().await;
+    let cases = Arc::clone(&f.store) as Arc<dyn CaseStore>;
+    let mut found = None;
+    for status in CaseStatus::ALL {
+        if let Some(c) = cases
+            .by_status(status, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+        {
+            found = Some(c.id);
+            break;
+        }
+    }
+    let case = found.expect("the suspended run opened a case");
+
+    let router = f.router();
+
+    // Nothing is escalated yet, and the empty answer is a real answer.
+    let (status, body) = send(&router, get("/cases", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "escalated");
+    assert_eq!(
+        body["cases"].as_array().map(Vec::len),
+        Some(0),
+        "a healthy plane reported an escalation: {body}"
+    );
+    assert_eq!(body["truncated"], false);
+
+    // Now the obligation is breached, exactly as the sweeper would leave it.
+    cases
+        .set_status(case, CaseStatus::Escalated)
+        .await
+        .expect("escalate");
+
+    let (status, body) = send(&router, get("/cases", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = body["cases"].as_array().expect("an array");
+    assert_eq!(
+        listed.len(),
+        1,
+        "the escalated case is not findable by anyone who does not already \
+         know its id — which is the group that does not need to ask: {body}"
+    );
+    assert_eq!(
+        listed[0]["id"],
+        serde_json::to_value(case).expect("a case id serializes"),
+        "the listed case is not the escalated one"
+    );
+
+    // The default is what somebody is looking for, but the filter is real.
+    let (status, body) = send(&router, get("/cases?status=closed", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["cases"].as_array().map(Vec::len),
+        Some(0),
+        "the status filter was ignored: {body}"
+    );
+
+    // An unknown status is refused rather than defaulted. Quietly falling back
+    // to `open` would answer "what is escalated" with a list of healthy cases,
+    // which reads as an empty backlog.
+    let (status, _) = send(&router, get("/cases?status=on-fire", Some("bob"))).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unrecognised status was silently treated as some other one"
+    );
 }
 
 /// A caller whose tenant this process does not serve is refused, not defaulted.

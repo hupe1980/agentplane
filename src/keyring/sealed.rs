@@ -80,11 +80,6 @@ fn corrupt(digest: Digest, why: &str) -> BlobError {
     }
 }
 
-/// An erased scope is not a missing blob and not a corrupt one.
-///
-/// Mapped here rather than at the call site so every backend reports a completed
-/// erasure the same way. `NotFound` would send somebody looking for lost data,
-/// and `Corrupt` would send them looking for a fault.
 /// Split `[u32 len][wrapped][rest]`, refusing anything that does not fit.
 ///
 /// Every length here is checked against the buffer rather than trusted: a
@@ -105,6 +100,11 @@ fn split_envelope(digest: Digest, envelope: &[u8]) -> Result<(WrappedKey, &[u8])
     Ok((wrapped, &envelope[4 + len..]))
 }
 
+/// An erased scope is not a missing blob and not a corrupt one.
+///
+/// Mapped here rather than at the call site so every backend reports a completed
+/// erasure the same way. `NotFound` would send somebody looking for lost data,
+/// and `Corrupt` would send them looking for a fault.
 fn erased(e: KeyError) -> BlobError {
     match e {
         KeyError::Destroyed { scope, at, reason } => BlobError::Expired {

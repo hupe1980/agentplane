@@ -1223,16 +1223,6 @@ async fn a_rejected_batch_writes_nothing(fresh: Factory<'_>, r: &mut Report) {
     }
 }
 
-/// A case's history is a scan over one matter, and only that matter.
-///
-/// The question is *show me everything about this matter*. Answering it by
-/// listing the case's runs and reading each is a join that also **misses**
-/// every record written by a run the case does not own — which is exactly what
-/// a sweep is, since one tick may act on several cases and belongs to none.
-///
-/// Both halves are checked, because either alone passes for the wrong reason: a
-/// scan that returns nothing satisfies "no foreign records", and a scan that
-/// returns everything satisfies "finds its own".
 /// A quarantined run is findable by the person who has to deal with it.
 ///
 /// The most serious conclusion this runtime reaches used to produce a status, a
@@ -1450,6 +1440,16 @@ async fn a_sealed_run_refuses_appends(fresh: Factory<'_>, r: &mut Report) {
     }
 }
 
+/// A case's history is a scan over one matter, and only that matter.
+///
+/// The question is *show me everything about this matter*. Answering it by
+/// listing the case's runs and reading each is a join that also **misses**
+/// every record written by a run the case does not own — which is exactly what
+/// a sweep is, since one tick may act on several cases and belongs to none.
+///
+/// Both halves are checked, because either alone passes for the wrong reason: a
+/// scan that returns nothing satisfies "no foreign records", and a scan that
+/// returns everything satisfies "finds its own".
 async fn a_case_scan_selects_one_matter(fresh: Factory<'_>, r: &mut Report) {
     r.checked += 1;
     let store = fresh().await;

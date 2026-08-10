@@ -147,6 +147,62 @@ async fn a_stale_cursor_is_not_a_fork() {
     }
 }
 
+/// **An unreadable 409 body is not a witness at size zero.**
+///
+/// The 409 body is the witness's own tree size, and the caller acts on it: it
+/// builds a consistency proof from that size and resubmits. Reading an
+/// unparseable body as `0` — which `unwrap_or_default()` did — invents a
+/// numeric claim the witness never made, and the invention is not harmless.
+/// The resubmission carries a proof from 0, the witness rejects it, and that
+/// rejection is classified as `Forked` or `Shrank`: the integrity bucket. So a
+/// blank body, an HTML error page or a stray word would manufacture the exact
+/// 3am page `a_stale_cursor_is_not_a_fork` exists to prevent — arriving from
+/// the other side, through the routine path rather than the alarming one.
+///
+/// A witness is untrusted, so what it did not say it does not get to have said.
+/// An unreadable size is reported as unavailable: routine, retried, and not an
+/// integrity finding.
+#[tokio::test]
+async fn a_stale_reply_without_a_size_is_not_an_integrity_event() {
+    for body in [
+        "",
+        "  \n",
+        "the log is unknown",
+        "<html>502</html>",
+        "-1",
+        "12x",
+    ] {
+        let (url, _) = server(409, body).await;
+        let w = HttpWitness::new(&url, log_sig()).unwrap();
+
+        match w.cosign(&checkpoint(4), 0, &[]).await {
+            Err(WitnessError::Unavailable(_)) => {}
+            Err(WitnessError::Stale { witness_size, .. }) => panic!(
+                "a 409 body of {body:?} was read as the witness being at size \
+                 {witness_size} — a claim it never made, and one the caller acts \
+                 on by resubmitting a proof that comes back as a fork"
+            ),
+            Err(e) => panic!("a 409 with an unreadable size became {e}"),
+            Ok(_) => panic!("a 409 must not yield a cosignature"),
+        }
+    }
+
+    // The positive half, so this is a parse rule rather than a client that has
+    // stopped reading 409 bodies at all.
+    let (url, _) = server(409, "97\n").await;
+    let w = HttpWitness::new(&url, log_sig()).unwrap();
+    assert!(
+        matches!(
+            w.cosign(&checkpoint(4), 0, &[]).await,
+            Err(WitnessError::Stale {
+                witness_size: 97,
+                ..
+            })
+        ),
+        "a well-formed size stopped being carried through"
+    );
+}
+
 /// A 422 is a proof that does not verify, which *is* a fork.
 #[tokio::test]
 async fn an_unverifiable_proof_is_a_fork() {

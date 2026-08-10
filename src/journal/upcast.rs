@@ -92,8 +92,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// A future-dated record means someone deployed a writer before the readers.
-    /// Failing loudly beats silently dropping fields.
     /// A pre-cut journal is refused, not read with fields quietly missing.
     ///
     /// The danger is that v1 *parses*: `RunAdmitted.policy` became
@@ -112,6 +110,8 @@ mod tests {
         );
     }
 
+    /// A future-dated record means someone deployed a writer before the readers.
+    /// Failing loudly beats silently dropping fields.
     #[test]
     fn future_versions_are_refused_not_guessed() {
         let err = Identity.upcast("EffectDone", 7, json!({})).unwrap_err();

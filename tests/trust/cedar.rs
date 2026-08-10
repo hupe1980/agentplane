@@ -132,6 +132,7 @@ fn a_permit_allows_exactly_what_it_names() {
 /// and the two are not redundant: the runtime's gate is structural and always
 /// on, while a policy can express *conditions* the lattice has no vocabulary
 /// for, such as which authorized releases a given agent may rely on.
+///
 /// The **real** context key, not an invented one.
 ///
 /// This policy used to read `context.args_trust` and `context.released`, and

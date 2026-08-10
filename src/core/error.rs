@@ -104,6 +104,17 @@ pub enum RuntimeError {
     #[error("plan contract violation: {0}")]
     PlanContract(String),
 
+    /// This process serves no plane for the tenant named.
+    ///
+    /// Refused rather than defaulted, which is the whole point: a fallback
+    /// plane would answer an unregistered tenant with somebody else's data, and
+    /// it would look exactly like working software.
+    #[error(
+        "this process serves no plane for tenant '{0}' — refused rather than \
+         defaulted, because a fallback would serve another tenant's data"
+    )]
+    UnknownTenant(String),
+
     /// An open run would continue under policy semantics other than the bundle
     /// recorded at admission.
     #[error(
@@ -340,7 +351,6 @@ pub enum EffectError {
 }
 
 impl EffectError {
-    /// What this failure says about whether the call reached the outside world.
     /// What this failure cost, if anything.
     ///
     /// Zero for everything that never reached a meter. The runtime bills this on
@@ -354,6 +364,7 @@ impl EffectError {
         }
     }
 
+    /// What this failure says about whether the call reached the outside world.
     #[must_use]
     pub fn disposition(&self) -> Disposition {
         match self {

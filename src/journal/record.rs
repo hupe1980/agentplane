@@ -424,8 +424,8 @@ pub enum RecordKind {
 
     /// An operator deliberately crossed the tenant boundary.
     ///
-    /// Every other row in the isolation table makes a cross-tenant read
-    /// *unspellable*. This is the designed exception, and an exception with no
+    /// Every other row in the isolation table keeps a cross-tenant read from
+    /// being reached by accident. This is the designed exception, and an exception with no
     /// record is indistinguishable from the breach it is meant to be — so the
     /// access is written into the journal of the tenant whose data was
     /// reached, in a sealed run of its own, **before** any of it is served.
@@ -604,16 +604,7 @@ impl Record {
         Self::seal_signed(body, prev_hash, None)
     }
 
-    /// Seal, and attest it as the given signer.
-    ///
-    /// The signature is taken over the chain hash, which already covers
-    /// `prev_hash ‖ canonical(body)`. Because the hash chains, this signature
-    /// transitively commits to every record before this one — so rewriting any
-    /// part of the prefix invalidates every later signature, not just its own.
     /// The largest a single journal record may be.
-    ///
-    /// Checked here because this is the one function every backend seals
-    /// through, so no store can be added that quietly skips it.
     ///
     /// A megabyte is generous for a record describing an effect and far too
     /// small for an inlined image, which is the intent: media belongs outside a
@@ -621,8 +612,17 @@ impl Record {
     /// field settled on — Temporal caps payloads at 2 MB and claim-checks above
     /// 256 KiB — and is deliberately a hard refusal rather than a truncation,
     /// because a silently shortened record is a journal that lies.
+    ///
+    /// Enforced in [`Record::seal_signed`], which is the one function every
+    /// backend seals through, so no store can be added that quietly skips it.
     pub const MAX_RECORD_BYTES: usize = 1 << 20;
 
+    /// Seal, and attest it as the given signer.
+    ///
+    /// The signature is taken over the chain hash, which already covers
+    /// `prev_hash ‖ canonical(body)`. Because the hash chains, this signature
+    /// transitively commits to every record before this one — so rewriting any
+    /// part of the prefix invalidates every later signature, not just its own.
     pub fn seal_signed(
         body: RecordBody,
         prev_hash: Digest,

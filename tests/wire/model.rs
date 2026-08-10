@@ -143,6 +143,7 @@ async fn live_model_stream_is_labelled_and_strict_replay_is_silent() {
 /// `FakeProvider` could not stream at all, so the only exercise of the observer
 /// seam in this repository was the stub-HTTP test above — which proves the SSE
 /// *parser* works and says nothing about the seam an embedder writes against.
+///
 /// Anyone building a live view had nothing to test their observer with.
 ///
 /// The property under test is byte-exactness, not chunk count. An observer's

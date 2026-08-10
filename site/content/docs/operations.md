@@ -257,7 +257,9 @@ Every conclusion this runtime reaches is queryable by whoever must clear it:
 escalated cases by status, overdue tasks by role, breached obligations by the
 sweep, dead-lettered events by their own list.
 
-Quarantine was the exception, and it was the worst one to have. A quarantine
+That sentence was written once while it was not yet true of two of its own
+items, which is worth saying because the failure it describes is precisely a
+claim nobody re-reads. A quarantine
 means the recorded history can no longer be trusted, or a mutation is in a state
 nobody can establish — and it produced a run status, an `error!` event and a
 counter. None of those can be asked for, and a run started with `spawn` or over
@@ -284,6 +286,33 @@ stops changing, so a plane whose backlog already exceeds one page returns the
 same runs forever and the quarantine that just happened is the one that never
 appears. Emitted, indexed, queryable — and still not delivered.
 
+**Escalated cases were the second exception**, and it survived the fix above by
+being asserted in a comment on it. An escalation is the sweeper saying an
+obligation was missed and somebody was told; "told" meant a status written onto
+the case, and the only way to read it back needed the case id — so the answer
+was available to everyone except the person who had to ask.
+
+```sh
+curl -H "$AUTH" 'https://plane/cases?status=escalated'
+```
+
+Same discipline as the run listing: newest first, `truncated` says whether there
+is more, and `status` defaults to the one somebody is looking for. An
+unrecognised status is a `400` rather than a quiet fallback — answering *what is
+escalated* with a list of healthy cases reads as an empty backlog, which is the
+most reassuring possible way to be wrong.
+
+A third gap sat behind both, in the enumeration rather than the routes.
+`api:run.list` — the verb guarding the quarantine listing — was **missing from
+the exported action vocabulary**, so a deployment that wrote its rules by
+enumerating it never granted that verb, and a default-deny engine refused the
+backlog to everybody. The test that should have caught it compared the
+vocabulary against the routes its own walk exercised, and that walk did not call
+`/runs` either: two omissions that cancelled, agreeing forever. Enumerate the
+vocabulary when writing rules, and grant `api:run.list` and `api:case.list`
+explicitly — they are the two read verbs an on-call person needs and the two an
+allowlist built from route names alone will miss.
+
 The general rule is worth stating because it is easy to satisfy accidentally and
 easy to lose: a control that notices and does not deliver is closer to none than
 to half, because it also manufactures the belief that somebody was told.
@@ -295,8 +324,38 @@ recorded in **that tenant's** journal — actor, roles, and a reason that cannot
 be blank — before anything is served:
 
 ```rust
-let run = plane.record_break_glass(&actor, &roles, "INC-42: stuck settlement").await?;
+let plane = planes.cross(&caller, &target, "INC-42: stuck settlement").await?;
 ```
+
+`Planes::cross` hands back the plane only once the crossing is on that tenant's
+record. That ordering is the control, and making it a door rather than a step is
+what makes it one: a break-glass that serves first and records best-effort works
+exactly as well when its own evidence is lost, which is the state an incident is
+most likely to produce.
+
+The whole `Caller` goes in rather than its actor, roles and tenant separately,
+because those are one fact — who authenticated. Passed apart, a handler can
+record one operator's name against another's crossing, and the record is written,
+signed, and wrong.
+
+The ordinary lookup, `Planes::get`, takes the same `Caller` and serves **its**
+tenant. That is what leaves `cross` as the way to reach another one: a signature
+taking a bare tenant id cannot tell *mine* from *somebody else's*, so it serves
+both and the difference lives in whether the handler remembered which to pass.
+The narrow claim worth making is that no path reaches another tenant's plane by
+accident, because none can name one — not that a cross-tenant read is
+impossible, since an embedder writing its own `Authenticator` decides what a
+credential means and can mint a `Caller` for any tenant. That seam is where a
+deployment defines identity; it is a deliberate act rather than a forgotten step.
+
+This used to be two calls — `record_break_glass`, then reach for the plane —
+and nothing enforced the order. `record_break_glass` remains for an embedder
+recording a crossing they made some other way; `cross` is what an admin surface
+should use.
+
+Same-tenant crossings are refused, because recording routine access as
+break-glass buries the real ones. A tenant this process does not serve is
+refused rather than defaulted, exactly as the ordinary gate refuses one.
 
 The crossing seals like any other run, so it enters the Merkle log, verifies
 offline, and lists with the rest:
@@ -305,9 +364,6 @@ offline, and lists with the rest:
 curl -H "$AUTH" 'https://plane/runs?outcome=broke-glass'
 ```
 
-Writing the record **before** the access is the control. A break-glass that
-serves first and records best-effort works exactly as well when its own
-evidence is lost, which is the state an incident is most likely to produce.
 Who may pull it is your policy engine's decision, not this crate's.
 
 ### One matter, one scan
@@ -681,6 +737,7 @@ whether a run id exists by comparing a `400` against a `404`.
 | `POST /tasks/{task}/claim` | This one is mine — don't let a colleague duplicate it |
 | `POST /tasks/{task}/release` | It isn't mine after all; give it back |
 | `POST /tasks/{task}/decide` | Approve or reject, as myself |
+| `GET /cases?status=…` | What is escalated and has not been cleared? Newest first; defaults to `escalated` |
 | `GET /cases/{case}` | What has happened on this matter, and by when must it end? |
 | `POST /runs/{run}/cancel` | Stop it — `202`, because the run stops at its next boundary |
 | `POST /events` | This message arrived; wake whoever wanted it |

@@ -297,12 +297,6 @@ impl ApiResponse {
             .join("")
     }
 
-    /// The answer a forced tool call carried.
-    ///
-    /// Anthropic returns tool arguments as a decoded object rather than a JSON
-    /// string, so there is nothing to parse — which is also why the emulated
-    /// path cannot produce the "declared a schema and the answer is not JSON"
-    /// failure the native path can.
     /// Tool calls the model asked for, excluding this crate's forced one.
     ///
     /// The buffered twin of `Accumulator::tool_calls`, and it must agree with
@@ -342,6 +336,13 @@ impl ApiResponse {
     }
 
     /// The forced structured-output tool's arguments.
+    ///
+    /// The answer a forced tool call carried.
+    ///
+    /// Anthropic returns tool arguments as a decoded object rather than a JSON
+    /// string, so there is nothing to parse — which is also why the emulated
+    /// path cannot produce the "declared a schema and the answer is not JSON"
+    /// failure the native path can.
     ///
     /// Matched **by name**, not by being the first `tool_use` block. A model may
     /// emit a caller's tool call before this one, and taking whichever came
@@ -474,12 +475,6 @@ fn system(prompt: &Value) -> Option<Value> {
     prompt.get("system").cloned().filter(|s| !s.is_null())
 }
 
-/// Turn an assembled answer into a [`Completion`], or say why it is not one.
-///
-/// Shared by the streaming and buffered paths. The two differ in how bytes
-/// become an answer and **not at all** in what counts as a usable one — and a
-/// second copy of this reasoning would be the place the two quietly disagreed
-/// about whether an empty response is a failure.
 /// Everything a response yielded, however it arrived.
 ///
 /// A struct rather than a parameter list because the buffered and streaming
@@ -497,6 +492,12 @@ struct Assembled {
     continuation: Value,
 }
 
+/// Turn an assembled answer into a [`Completion`], or say why it is not one.
+///
+/// Shared by the streaming and buffered paths. The two differ in how bytes
+/// become an answer and **not at all** in what counts as a usable one — and a
+/// second copy of this reasoning would be the place the two quietly disagreed
+/// about whether an empty response is a failure.
 fn interpret(
     model: &ModelId,
     schema: Option<&Value>,

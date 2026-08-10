@@ -525,8 +525,8 @@ impl Runtime {
     /// Record an operator deliberately crossing into this tenant, and return
     /// the run that holds the record.
     ///
-    /// Every other tenancy control makes a cross-tenant read *unspellable*.
-    /// This is the designed exception, and the rule for it is that an
+    /// Every other tenancy control keeps a cross-tenant read from being reached
+    /// by accident. This is the designed exception, and the rule for it is that an
     /// exception without a record is indistinguishable from the breach it is
     /// meant to be. So the access is written into **this** tenant's journal —
     /// the one whose data is about to be reached — in a sealed run of its own,
@@ -673,11 +673,6 @@ impl Runtime {
         self.governed_by.get(&skill.descriptor().name).cloned()
     }
 
-    /// The ceilings a run gets: its agent's, or the plane's if it has no agent.
-    ///
-    /// Per agent, because that is who declared them. A plane-wide budget would
-    /// let one agent's generosity bound another's runs, which is the whole
-    /// reason a declaration belongs to an identity rather than to a process.
     /// Renew this run's lease until the returned guard is dropped.
     ///
     /// Requires a Tokio runtime, as the rest of this crate's timing does.
@@ -791,6 +786,11 @@ impl Runtime {
         }
     }
 
+    /// The ceilings a run gets: its agent's, or the plane's if it has no agent.
+    ///
+    /// Per agent, because that is who declared them. A plane-wide budget would
+    /// let one agent's generosity bound another's runs, which is the whole
+    /// reason a declaration belongs to an identity rather than to a process.
     fn budget_for(&self, target: &str) -> Budget {
         #[cfg(feature = "manifest")]
         if let Ok(skill) = self.resolve(target)
@@ -1220,12 +1220,6 @@ impl Runtime {
         ))
     }
 
-    /// Admit a plan under a run id the caller already holds.
-    ///
-    /// Exists for batches: an item's run id is written to the batch store
-    /// *before* the run starts, so that a crash leaves a reservation pointing at
-    /// a journal that can be replayed rather than an item that must be guessed
-    /// about. The id therefore has to be minted by the caller, one layer up.
     /// The record that opens a run.
     ///
     /// Its own function because the label matters: journaled rather than
@@ -1440,6 +1434,11 @@ impl Runtime {
     }
 
     /// Admit and execute, which is what every blocking entry point does.
+    ///
+    /// The run id is the caller's rather than minted here, for batches: an
+    /// item's run id is written to the batch store *before* the run starts, so
+    /// that a crash leaves a reservation pointing at a journal that can be
+    /// replayed rather than an item that must be guessed about.
     pub(crate) async fn admit_plan_as(
         &self,
         run: RunId,
@@ -3053,34 +3052,12 @@ fn recorded_step_refusal(records: &[Record]) -> Option<(StepId, String, String)>
     })
 }
 
-/// The principal a run was admitted as.
-///
-/// Read back rather than recomputed, for the same reason the plan is: the
-/// principal a run was authorized as is a fact *about that run*, and deriving it
-/// again from a plan that may since have been edited would silently re-attribute
-/// history.
-/// A lease owner that no other process will accidentally share.
-///
-/// The previous default was the constant `"agentplane"`, which every replica and
-/// every restart used. Two consequences, both silent:
-///
-/// * Two replicas each saw the other's lease as their own and renewed it
-///   without bumping the epoch — two writers on one run, which is the exact
-///   situation fencing exists to make impossible.
-/// * A process restarting after a crash "renewed" the dead process's lease
-///   instead of waiting for expiry and fencing it, so a zombie still holding a
-///   socket could keep writing under the same epoch as its replacement.
-///
-/// A per-process random identity turns both into the correct behaviour: a
-/// different owner cannot renew, so it waits for expiry and takes over with
-/// `epoch + 1`.
+/// Every capability an agent advertises is provided by one of **its own**
+/// skills.
 ///
 /// An agent advertising a capability none of its skills provide is a card that
 /// lies, and the caller who believed it finds out at dispatch — in production —
 /// rather than here at startup.
-#[cfg(feature = "manifest")]
-/// Every capability an agent advertises is provided by one of **its own**
-/// skills.
 ///
 /// This checked a plane-wide map, and the difference is not pedantry. A skill
 /// registered on the *builder* rather than on the agent — `.agent(Agent::new(&m))`
@@ -3094,6 +3071,7 @@ fn recorded_step_refusal(records: &[Record]) -> Option<(StepId, String, String)>
 /// so the only signal was a `None` from `cx.manifest()` that a skill has no
 /// reason to check. That is a declaration reading as a control while governing
 /// nothing, which is the one shape this codebase refuses everywhere.
+#[cfg(feature = "manifest")]
 fn check_advertises_what_it_provides(
     m: &crate::manifest::Manifest,
     mine: &HashSet<Capability>,
@@ -3160,6 +3138,22 @@ fn register_skill(
     Ok(d.name)
 }
 
+/// A lease owner that no other process will accidentally share.
+///
+/// The previous default was the constant `"agentplane"`, which every replica and
+/// every restart used. Two consequences, both silent:
+///
+/// * Two replicas each saw the other's lease as their own and renewed it
+///   without bumping the epoch — two writers on one run, which is the exact
+///   situation fencing exists to make impossible.
+/// * A process restarting after a crash "renewed" the dead process's lease
+///   instead of waiting for expiry and fencing it, so a zombie still holding a
+///   socket could keep writing under the same epoch as its replacement.
+///
+/// A per-process random identity turns both into the correct behaviour: a
+/// different owner cannot renew, so it waits for expiry and takes over with
+/// `epoch + 1`.
+///
 /// Not derived from a hostname or PID: containers reuse both. Randomness is the
 /// property that matters; readability is what the `owner` override is for, and a
 /// deployment with a real instance identity — a pod name — should pass it.
@@ -3227,6 +3221,12 @@ fn recorded_canon(r: &Record) -> Option<u16> {
     }
 }
 
+/// The principal a run was admitted as.
+///
+/// Read back rather than recomputed, for the same reason the plan is: the
+/// principal a run was authorized as is a fact *about that run*, and deriving it
+/// again from a plan that may since have been edited would silently re-attribute
+/// history.
 fn recorded_agent(records: &[Record]) -> String {
     records
         .iter()
@@ -3300,14 +3300,6 @@ fn resolve_arg(
     })
 }
 
-/// Turn a step's result into a run status.
-///
-/// The distinction that matters is between an ordinary failure and a run whose
-/// *history can no longer be trusted*. Divergence and orphaned effects are the
-/// latter: they mean the journal no longer describes what this code does, so a
-/// human has to look before anything else happens. Folding them into `Failed`
-/// would put them in the same bucket as "the invoice was rejected", and they
-/// would be retried like one.
 /// Settle a group the skill left open, because `Drop` cannot.
 ///
 /// A skill that fails with `?` never reaches `commit` or `abort`, so the handle
@@ -3389,6 +3381,14 @@ async fn settle_abandoned_group(
     }
 }
 
+/// Turn a step's result into a run status.
+///
+/// The distinction that matters is between an ordinary failure and a run whose
+/// *history can no longer be trusted*. Divergence and orphaned effects are the
+/// latter: they mean the journal no longer describes what this code does, so a
+/// human has to look before anything else happens. Folding them into `Failed`
+/// would put them in the same bucket as "the invoice was rejected", and they
+/// would be retried like one.
 fn classify(
     meter: &super::metrics::Meter,
     result: Result<Outcome, crate::core::SkillError>,
@@ -3724,8 +3724,6 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Identify this plane instance. Instances that share a store must not share
-    /// an owner id, or they will renew each other's leases instead of fencing.
     /// The workload identity this plane signs its outward claims with.
     ///
     /// What it buys is that a tool or peer can *check* who called it. Without a
@@ -3744,22 +3742,6 @@ impl RuntimeBuilder {
         self
     }
 
-    /// This **process instance's** identity, as it appears in run leases.
-    ///
-    /// Not the agent's name, and the distinction is load-bearing. A lease is
-    /// renewed without bumping the epoch when the holder is *the same owner*, so
-    /// two processes sharing an owner string each read the other's lease as
-    /// their own: no fencing, no epoch bump, and two writers on one run. That is
-    /// precisely the failure the epoch exists to prevent.
-    ///
-    /// So it must be unique per running process, which is what the default is —
-    /// override it only if you have a better instance identity than a random
-    /// one, such as a pod name. An agent's *name* is
-    /// [`Manifest::metadata`](crate::manifest::Metadata::name); several
-    /// instances of one agent are normal and must not share this.
-    ///
-    /// The owner lives in the lease table and never in the chain, so it has no
-    /// bearing on replay.
     /// How long this plane's run leases last.
     ///
     /// The trade is recovery speed against tolerance for a slow instance: a
@@ -3859,6 +3841,22 @@ impl RuntimeBuilder {
         self
     }
 
+    /// This **process instance's** identity, as it appears in run leases.
+    ///
+    /// Not the agent's name, and the distinction is load-bearing. A lease is
+    /// renewed without bumping the epoch when the holder is *the same owner*, so
+    /// two processes sharing an owner string each read the other's lease as
+    /// their own: no fencing, no epoch bump, and two writers on one run. That is
+    /// precisely the failure the epoch exists to prevent.
+    ///
+    /// So it must be unique per running process, which is what the default is —
+    /// override it only if you have a better instance identity than a random
+    /// one, such as a pod name. An agent's *name* is
+    /// [`Manifest::metadata`](crate::manifest::Metadata::name); several
+    /// instances of one agent are normal and must not share this.
+    ///
+    /// The owner lives in the lease table and never in the chain, so it has no
+    /// bearing on replay.
     #[must_use]
     pub fn owner(mut self, o: impl Into<String>) -> Self {
         self.owner = Some(o.into());

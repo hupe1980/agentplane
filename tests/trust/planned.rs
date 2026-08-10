@@ -620,6 +620,113 @@ async fn break_glass_is_recorded_in_the_crossed_tenants_journal() {
     );
 }
 
+/// Reaching another tenant's plane records the crossing *first*, and hands the
+/// plane back only if that record landed.
+///
+/// The half that matters is the refusal. `record_break_glass` has always
+/// returned an error it could not write, but the *access* was a separate call an
+/// admin handler had to remember to make first — a control that must be invoked,
+/// which this codebase refuses everywhere else. `Planes::cross` makes the record
+/// a precondition of holding the plane.
+///
+/// Both directions, because either alone passes for the wrong reason: a `cross`
+/// that always failed would satisfy "no crossing goes unrecorded", and one that
+/// never recorded would satisfy "the operator gets their plane".
+#[tokio::test]
+async fn crossing_to_another_tenant_records_before_it_serves() {
+    use agentplane::api::{Caller, Planes};
+    use agentplane::core::TenantId;
+    use agentplane::journal::RecordKind;
+
+    let acme = TenantId::new("acme").expect("a valid tenant");
+    let globex = TenantId::new("globex").expect("a valid tenant");
+
+    let store: Arc<dyn JournalStore> = Arc::new(
+        agentplane::store::RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(globex.clone()),
+    );
+    let planes = Planes::one(
+        Runtime::builder(Arc::clone(&store))
+            .tenant(globex.clone())
+            .build(),
+    );
+
+    // The positive half: the operator gets the plane, and the crossing is on
+    // the crossed tenant's own record.
+    let carol =
+        Caller::new("carol@ops", vec!["incident-commander".to_owned()]).in_tenant(acme.clone());
+    let plane = planes
+        .cross(&carol, &globex, "INC-42: stuck settlement")
+        .await
+        .expect("a reasoned crossing is served");
+    assert_eq!(plane.tenant(), &globex);
+
+    let crossed = store
+        .runs_by_outcome("broke-glass", 10)
+        .await
+        .expect("by outcome");
+    assert_eq!(
+        crossed.len(),
+        1,
+        "the crossing is not findable in the crossed tenant's journal"
+    );
+    let records = store.read(crossed[0], 1).await.expect("read");
+    assert!(
+        records.iter().any(|r| matches!(
+            r.kind(),
+            RecordKind::BreakGlass { actor, .. } if actor == "carol@ops"
+        )),
+        "the crossing was served without naming who crossed"
+    );
+
+    // The negative half: an unreasoned crossing yields no plane *and* no record.
+    let refused = planes.cross(&carol, &globex, "   ").await;
+    assert!(
+        refused.is_err(),
+        "a blank reason was served — the record exists to make the exception \
+         explicable, and an empty one explains nothing"
+    );
+    assert_eq!(
+        store
+            .runs_by_outcome("broke-glass", 10)
+            .await
+            .expect("by outcome")
+            .len(),
+        1,
+        "the refused crossing still wrote a run"
+    );
+
+    // Reading your own tenant is not a crossing, and recording it as one would
+    // bury the real crossings among routine reads.
+    let local = Caller::new("carol@ops", vec![]).in_tenant(globex.clone());
+    assert!(
+        planes.cross(&local, &globex, "routine").await.is_err(),
+        "a same-tenant read was recorded as break-glass"
+    );
+
+    // A tenant this process does not serve is refused, never defaulted.
+    assert!(
+        planes.cross(&local, &acme, "INC-43").await.is_err(),
+        "an unregistered tenant was served from somebody else's plane"
+    );
+
+    // The property that makes `cross` a door rather than a step: the ordinary
+    // lookup serves the caller's *own* tenant and cannot be handed another's.
+    // An acme caller asking this globex-serving process gets nothing, so the
+    // route to globex's data runs through `cross` and lands on its record.
+    assert!(
+        planes.get(&carol).is_none(),
+        "the ordinary lookup served a tenant that was not the caller's, so a \
+         handler reaches another tenant's store without the crossing being \
+         recorded — which is the whole of the break-glass control"
+    );
+    assert!(
+        planes.get(&local).is_some(),
+        "the ordinary lookup refused the caller their own plane"
+    );
+}
+
 /// An unexplained crossing is refused rather than recorded blank.
 #[tokio::test]
 async fn break_glass_without_a_reason_is_refused() {

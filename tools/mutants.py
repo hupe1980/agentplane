@@ -1228,15 +1228,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "past' — is reported as a forked history, so a routine retry pages "
         "somebody for an integrity incident and the alert that matters stops "
         "being believed",
-        """            409 => Err(WitnessError::Stale {
-                origin: checkpoint.origin.clone(),
-                witness_size: text.trim().parse().unwrap_or_default(),
-            }),""",
-        """            409 => Err(WitnessError::Forked {
-                origin: checkpoint.origin.clone(),
-                seen: old_size,
-                offered: checkpoint.size,
-            }),""",
+        """                Ok(witness_size) => Err(WitnessError::Stale {
+                    origin: checkpoint.origin.clone(),
+                    witness_size,
+                }),""",
+        """                Ok(_) => Err(WitnessError::Forked {
+                    origin: checkpoint.origin.clone(),
+                    seen: old_size,
+                    offered: checkpoint.size,
+                }),""",
     ),
     "ANoteUsesTheWrongDash": (
         "src/journal/note.rs",
@@ -3396,10 +3396,10 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a caller whose tenant has no plane is served by some other tenant's "
         "plane instead of refused, which turns an unregistered tenant into "
         "somebody else's data and looks like working software",
-        "        let plane = self.planes.get(&caller.tenant).ok_or_else(|| {",
+        "        let plane = self.planes.get(&caller).ok_or_else(|| {",
         "        let plane = self\n"
         "            .planes\n"
-        "            .get(&caller.tenant)\n"
+        "            .get(&caller)\n"
         "            .or_else(|| self.planes.by_tenant.values().next())\n"
         "            .ok_or_else(|| {",
     ),
@@ -3409,14 +3409,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the plane is chosen without reference to the caller's tenant, so any "
         "authenticated caller reads any tenant's runs while holding nothing but "
         "a valid id",
-        "        let plane = self.planes.get(&caller.tenant).ok_or_else(|| {",
+        "        let plane = self.planes.get(&caller).ok_or_else(|| {",
         "        let plane = self\n"
         "            .planes\n"
         "            .by_tenant\n"
         "            .iter()\n"
         "            .find(|(t, _)| *t != &caller.tenant)\n"
         "            .map(|(_, p)| p)\n"
-        "            .or_else(|| self.planes.get(&caller.tenant))\n"
+        "            .or_else(|| self.planes.get(&caller))\n"
         "            .ok_or_else(|| {",
     ),
     "ANonBlockingSendBlocksAnyway": (
@@ -3848,6 +3848,94 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "exception that explains nothing",
         "        if reason.trim().is_empty() {",
         "        if false {",
+    ),
+    "AnUnreadableStaleSizeBecomesZero": (
+        "src/journal/witness_http.rs",
+        "a_stale_reply_without_a_size_is_not_an_integrity_event",
+        "a 409 whose body is not a tree size is read as the witness being at "
+        "size 0 — a claim it never made, which the caller acts on by "
+        "resubmitting a proof from 0 that comes back classified as a fork, so "
+        "an unreadable reply manufactures an integrity page",
+        """            409 => match text.trim().parse::<u64>() {
+                Ok(witness_size) => Err(WitnessError::Stale {
+                    origin: checkpoint.origin.clone(),
+                    witness_size,
+                }),""",
+        """            409 => match text.trim().parse::<u64>().or(Ok::<u64, ()>(0)) {
+                Ok(witness_size) => Err(WitnessError::Stale {
+                    origin: checkpoint.origin.clone(),
+                    witness_size,
+                }),""",
+    ),
+    "TheActionListOmitsTheQuarantineVerb": (
+        "src/api/mod.rs",
+        "a_denying_policy_stops_every_route_before_it_touches_anything",
+        "`api:run.list` is missing from the enumerated action vocabulary, so a "
+        "deployment writing rules from it never grants the verb behind *what is "
+        "quarantined right now* — and a default-deny engine then refuses the "
+        "backlog that exists so a quarantine reaches somebody",
+        """        RUN_READ,
+        RUN_LIST,
+        RUN_CANCEL,""",
+        """        RUN_READ,
+        RUN_CANCEL,""",
+    ),
+    "EscalatedCasesAreNotListable": (
+        "src/api/mod.rs",
+        "escalated_cases_are_listable_without_knowing_the_case_id",
+        "the case listing answers with whatever status was asked but ignores "
+        "the store's index, returning nothing — so an escalated case is "
+        "findable only by somebody who already knows its id, which is the group "
+        "that does not need to ask",
+        """    let mut found = cases
+        .by_status(status, api.limit + 1)
+        .await
+        .map_err(|_| store_failed())?;""",
+        """    let mut found = cases
+        .by_status(status, api.limit + 1)
+        .await
+        .map_err(|_| store_failed())?;
+    found.clear();""",
+    ),
+    "APlanDigestIgnoresItsTopology": (
+        "src/core/plan.rs",
+        "every_identity_bearing_field_of_a_plan_changes_its_digest",
+        "the plan's content address is taken over its nodes alone, so topology "
+        "— which decides whether sub-tasks may run on overlapping inputs and "
+        "with what authority — is outside the identity that admission journals "
+        "and binds the run to",
+        """        let value = serde_json::to_value(self)
+            .expect("a plan holds only strings, integers, enums, digests and JSON values");""",
+        """        let value = serde_json::to_value(&self.nodes)
+            .expect("a plan holds only strings, integers, enums, digests and JSON values");""",
+    ),
+    "TheOrdinaryLookupCrossesTenants": (
+        "src/api/mod.rs",
+        "crossing_to_another_tenant_records_before_it_serves",
+        "the ordinary plane lookup serves whatever tenant is asked for rather "
+        "than the caller's own, so a handler reaches another tenant's store "
+        "without the crossing ever being recorded — which leaves `Planes::cross` "
+        "a step somebody has to remember rather than the door it claims to be",
+        "        self.by_tenant.get(&caller.tenant)",
+        "        self.by_tenant\n"
+        "            .get(&caller.tenant)\n"
+        "            .or_else(|| self.by_tenant.values().next())",
+    ),
+    "CrossingServesBeforeItRecords": (
+        "src/api/mod.rs",
+        "crossing_to_another_tenant_records_before_it_serves",
+        "the break-glass gate hands back another tenant's plane whether or not "
+        "the crossing was recorded, so a failure to write the evidence stops "
+        "being a failure to access — which is the whole of the control",
+        """        // The record first, and the plane only if it landed.
+        plane
+            .record_break_glass(&caller.actor, &caller.roles, reason)
+            .await?;
+        Ok(plane)""",
+        """        let _ = plane
+            .record_break_glass(&caller.actor, &caller.roles, reason)
+            .await;
+        Ok(plane)""",
     ),
     "AmbientMutationBesideAGroup": (
         "src/runtime/ctx.rs",

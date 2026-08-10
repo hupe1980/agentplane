@@ -978,14 +978,6 @@ impl<'a> StepCtx<'a> {
         self.bill(spend);
     }
 
-    /// Everything that can refuse an attempt before it is dispatched.
-    ///
-    /// Authorization before accounting: both refuse before dispatch, but an
-    /// unauthorized call should not first consume the run's allowance —
-    /// otherwise a denied agent can still exhaust a budget by asking.
-    ///
-    /// Compensation is exempt from both, for the same reason: refusing to undo
-    /// is how a run ends with a charged card and no order.
     /// The reviewed grant for an effect, if the manifest names one.
     ///
     /// The bridge between a declaration and a dispatch. Without it
@@ -1004,6 +996,14 @@ impl<'a> StepCtx<'a> {
             .tool_grant(&crate::tools::ToolId::new(server, tool).reference())
     }
 
+    /// Everything that can refuse an attempt before it is dispatched.
+    ///
+    /// Authorization before accounting: both refuse before dispatch, but an
+    /// unauthorized call should not first consume the run's allowance —
+    /// otherwise a denied agent can still exhaust a budget by asking.
+    ///
+    /// Compensation is exempt from both, for the same reason: refusing to undo
+    /// is how a run ends with a charged card and no order.
     pub(crate) async fn gate(
         &mut self,
         key: EffectKey,

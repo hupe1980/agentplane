@@ -496,6 +496,129 @@ async fn the_frozen_plan_is_journaled() {
     );
 }
 
+/// **Every field I8 calls part of a plan's identity moves its digest.**
+///
+/// The round trip above proves the digest is *stable*, which is symmetry and
+/// not coverage: a digest that ignored `topology` entirely, or that dropped
+/// every node, would round-trip perfectly and pass it. What has to hold is the
+/// other direction — that changing any field the constitution names as identity
+/// changes the address — because a plan digest is journaled at admission and is
+/// what binds a run to the graph it was authorized to execute. A field the
+/// digest silently stopped covering would let two different authorization
+/// graphs share one identity, and every existing test would still pass.
+///
+/// So each case below perturbs exactly one field of an otherwise identical
+/// plan. The pairwise-distinct assertion at the end is the part that would
+/// catch the worst version of the failure: a digest that had become a constant.
+#[test]
+fn every_identity_bearing_field_of_a_plan_changes_its_digest() {
+    fn base() -> PlanIR {
+        PlanIR::new(vec![
+            PlanNode::new(0, "fetch").arg("id", ArgSource::run_input()),
+            PlanNode::new(1, "settle")
+                .arg("from", ArgSource::node(StepId(0)))
+                .terminal(),
+        ])
+    }
+
+    // (what changed, the plan with that one change)
+    let mut variants: Vec<(&str, PlanIR)> = Vec::new();
+
+    variants.push(("a node's capability", {
+        let mut p = base();
+        p.nodes[1].capability = Capability::from("refund");
+        p
+    }));
+    variants.push(("a node's id", {
+        let mut p = base();
+        p.nodes[1].id = StepId(7);
+        p
+    }));
+    variants.push(("an argument's name", {
+        let mut p = base();
+        p.nodes[0] = PlanNode::new(0, "fetch").arg("other", ArgSource::run_input());
+        p
+    }));
+    variants.push(("an argument's source", {
+        let mut p = base();
+        p.nodes[0] = PlanNode::new(0, "fetch").arg("id", ArgSource::constant(json!("AC-1")));
+        p
+    }));
+    variants.push(("a frozen constant's value", {
+        let mut p = base();
+        p.nodes[0] = PlanNode::new(0, "fetch").arg("id", ArgSource::constant(json!("AC-2")));
+        p
+    }));
+    variants.push(("the dependency edges", {
+        let mut p = base();
+        p.nodes[1].depends_on = vec![];
+        p
+    }));
+    variants.push(("which node is terminal", {
+        let mut p = base();
+        p.nodes[1].terminal = false;
+        p
+    }));
+    variants.push(("whether a node verifies another's work", {
+        let mut p = base();
+        p.nodes[1].verifies = true;
+        p
+    }));
+    variants.push(("the topology", {
+        let mut p = base();
+        p.topology = Topology::Collaborative(Collaboration::ParallelDisjoint);
+        p
+    }));
+    variants.push(("the plan version", {
+        let mut p = base();
+        p.version = 2;
+        p
+    }));
+    variants.push(("the plan it was derived from", {
+        let mut p = base();
+        p.derived_from = Some(base().digest());
+        p
+    }));
+    variants.push(("a node added", {
+        let mut p = base();
+        p.nodes.push(PlanNode::new(2, "notify"));
+        p
+    }));
+
+    let baseline = base().digest();
+    for (what, variant) in &variants {
+        assert_ne!(
+            baseline,
+            variant.digest(),
+            "changing {what} left the plan's digest unmoved, so the content \
+             address does not cover it — two different authorization graphs \
+             share one identity"
+        );
+    }
+
+    // Pairwise distinct. A digest that had degraded to a constant — the shape
+    // `unwrap_or_default()` on the canonical bytes would have produced, since
+    // `Digest::of(&[])` is the same value for every plan — passes none of this.
+    for (i, (what_a, a)) in variants.iter().enumerate() {
+        for (what_b, b) in &variants[i + 1..] {
+            assert_ne!(
+                a.digest(),
+                b.digest(),
+                "a plan differing in {what_a} and one differing in {what_b} \
+                 share a digest"
+            );
+        }
+    }
+
+    // The positive half: identical plans still agree, so these are real
+    // distinctions rather than a digest that has become random.
+    assert_eq!(
+        base().digest(),
+        base().digest(),
+        "a plan does not hash to the same value twice"
+    );
+}
+
 /// A step reads exactly what its arguments declare.
 #[tokio::test]
 async fn arguments_are_assembled_from_their_declared_sources() {

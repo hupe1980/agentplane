@@ -171,7 +171,7 @@ pub enum TaskState {
     AuthRequired,
 }
 
-/// Where a run's status maps onto A2A's task states.
+/// The A2A state a live run's status surfaces as.
 ///
 /// Two of these are worth stating because the obvious mapping is wrong.
 ///
@@ -183,7 +183,6 @@ pub enum TaskState {
 /// declined the work; quarantine means it accepted the work, started, and can no
 /// longer be trusted to describe what it did. Reporting that as a refusal tells
 /// the caller nothing happened, when something did.
-/// The A2A state a live run's status surfaces as.
 ///
 /// This and [`sealed_state`] are the **same question asked on two paths**: this
 /// one answers the caller who receives the immediate `SendMessage` response, and
@@ -674,6 +673,7 @@ impl PushRequest {
 /// outright: A2A §5.5 says JSON field names **MUST** be camelCase, so `context_id` is not an
 /// alternative spelling but a violation. [`FIELDS_BY_METHOD`] refuses a name
 /// this surface knows and *this method* does not (`pageSize` on `CancelTask`).
+///
 /// Neither subsumes the other.
 ///
 /// [`deny_unknown_fields`]: https://serde.rs/container-attrs.html

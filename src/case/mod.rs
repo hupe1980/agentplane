@@ -105,7 +105,6 @@ pub trait CaseStore: Send + Sync + Debug {
     /// If the store cannot be read.
     async fn blobs_of(&self, case: CaseId) -> Result<Vec<Digest>, StoreError>;
 
-    /// Replace the case's opaque state.
     /// Replace a case's state, if it is still at `expected`.
     ///
     /// # Why this takes a version

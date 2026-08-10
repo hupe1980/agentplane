@@ -128,10 +128,36 @@ impl Witness for HttpWitness {
             200 => parse_cosignature(&text, &checkpoint.origin),
             // Stale, not forked. The body is the witness's own size, so the
             // caller can build the right proof instead of guessing.
-            409 => Err(WitnessError::Stale {
-                origin: checkpoint.origin.clone(),
-                witness_size: text.trim().parse().unwrap_or_default(),
-            }),
+            //
+            // A body that is not a size is *not* a size of zero, and the
+            // difference is not cosmetic. `unwrap_or_default()` stood here, and
+            // it turned an unreadable reply into a definite numeric claim
+            // attributed to the witness — which the caller then acts on, by
+            // building a consistency proof from 0 and resubmitting. The witness
+            // refuses that, and the refusal is classified as `Forked` or
+            // `Shrank`: the **integrity** bucket. So a witness that answered
+            // 409 with a blank body, an HTML error page or a stray newline
+            // manufactured a fork alert, and this variant's own documentation
+            // says why that is the worst available outcome — a team paged twice
+            // for a routine cursor mismatch stops believing the alert that
+            // matters.
+            //
+            // A witness is untrusted (its metadata cannot widen authority or,
+            // here, invent an integrity finding), so an unparseable size is
+            // reported as what it is: the witness was unavailable in the only
+            // sense that matters, which is routine and retried rather than
+            // escalated.
+            409 => match text.trim().parse::<u64>() {
+                Ok(witness_size) => Err(WitnessError::Stale {
+                    origin: checkpoint.origin.clone(),
+                    witness_size,
+                }),
+                Err(_) => Err(WitnessError::Unavailable(format!(
+                    "{url}: the witness answered 409 (stale) but its body is not a tree size, \
+                     so there is nothing to build a proof from — refused rather than read as \
+                     size 0, which would resubmit a proof the witness rejects as a fork"
+                ))),
+            },
             422 => Err(WitnessError::Forked {
                 origin: checkpoint.origin.clone(),
                 seen: old_size,

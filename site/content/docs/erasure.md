@@ -384,8 +384,10 @@ cross-tenant read with an authentication step in front of it.
 
 The gate returns the plane **with** the caller, and the surface holds a registry
 rather than a runtime. A handler therefore cannot reach a store without having
-resolved whose it is — the cross-tenant read is unspellable, not guarded
-against.
+resolved whose it is, and every lookup on that registry names a *caller* rather
+than a tenant — so the accidental cross-tenant read is unspellable rather than
+guarded against. The deliberate one is `Planes::cross`, which records the
+crossing in the crossed tenant's own journal before serving anything.
 
 An unregistered tenant is **refused, never defaulted**. A fallback would turn an
 unknown tenant into somebody else's data, and it would look like working

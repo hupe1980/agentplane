@@ -39,11 +39,6 @@ use super::metrics::{self, Census};
 /// policy would mistake for one.
 pub const SOURCE_WORKLIST: &str = "agentplane://worklist";
 
-/// What one tick did, accumulating into a run only if there is anything to say.
-///
-/// Lazy on purpose. A quiet plane sweeps constantly and should leave nothing
-/// behind: opening a run per tick would fill the Merkle log with evidence that
-/// nothing happened, and a log of nothings is where the somethings hide.
 /// The epoch a sweep's own record is written under.
 ///
 /// A sweep run is created here and never taken over, so there is no ownership
@@ -59,6 +54,11 @@ const SWEEP_EPOCH: crate::core::Epoch = 1;
 /// obligations indistinguishable from a plan that completed.
 const SWEEP_OUTCOME: &str = "swept";
 
+/// What one tick did, accumulating into a run only if there is anything to say.
+///
+/// Lazy on purpose. A quiet plane sweeps constantly and should leave nothing
+/// behind: opening a run per tick would fill the Merkle log with evidence that
+/// nothing happened, and a log of nothings is where the somethings hide.
 struct SweepLedger {
     run: Option<RunId>,
     entries: Vec<crate::journal::Append>,
