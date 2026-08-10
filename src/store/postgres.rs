@@ -388,6 +388,25 @@ impl PostgresStore {
     /// If the URL does not parse, the pool cannot be built, or the schema cannot
     /// be applied.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
+        Self::connect_sized(url, None).await
+    }
+
+    /// [`connect`](Self::connect), with an explicit connection ceiling.
+    ///
+    /// The default ceiling is the pool's own (CPU-derived), which is the right
+    /// answer until it is not: a deployment sharing the database with other
+    /// services sizes this deliberately, and a test proving behaviour *under
+    /// pool exhaustion* needs a pool small enough to exhaust — the task-claim
+    /// deadlock this crate shipped reproduced only where the pool was smaller
+    /// than the racers, so every big development machine passed over it.
+    ///
+    /// # Errors
+    ///
+    /// As [`connect`](Self::connect).
+    pub async fn connect_sized(
+        url: &str,
+        max_connections: Option<usize>,
+    ) -> Result<Self, StoreError> {
         let pg: tokio_postgres::Config = url
             .parse()
             .map_err(|e: tokio_postgres::Error| StoreError::Backend(e.to_string()))?;
@@ -404,6 +423,9 @@ impl PostgresStore {
             .map(|p| String::from_utf8_lossy(p).into_owned());
         cfg.dbname = pg.get_dbname().map(ToOwned::to_owned);
 
+        if let Some(max) = max_connections {
+            cfg.pool = Some(deadpool_postgres::PoolConfig::new(max));
+        }
         let pool = cfg
             .create_pool(Some(PoolRuntime::Tokio1), NoTls)
             .map_err(|e| pool_err(&e))?;

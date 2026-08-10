@@ -32,6 +32,27 @@ archaeology presented as a record.
 
 ## [0.14.0] — 2026-08-10
 
+### Fixed — a task claim no longer deadlocks the pool it runs on
+
+- **`TaskStore::claim`, `take_over` and `open` held a pooled connection while
+  re-entering the pool.** Each verb took a connection, then called
+  `Self::task` for its eligibility and re-read steps — which acquired a
+  *second* connection while the first was held. Sixteen reviewers racing one
+  task on a small pool each held a connection and waited for one that only
+  another waiter could release: a deadlock under exactly the concurrency the
+  claim verb exists to survive, and only where the pool is small enough to
+  exhaust — every large development machine passed over the defect a CI
+  runner hung on for an hour and a half. All reads made while a connection is
+  held now go through `task_on`, which reads on the connection the caller
+  already holds; one connection per verb, acquired once.
+
+- **`PostgresStore::connect_sized` names the connection ceiling**, because the
+  fix deserved a test that does not depend on the runner. The race now runs
+  sixteen claimers against a pool of four, making the exhaustion condition a
+  property of the test rather than of whichever machine executes it — and a
+  deployment sharing its database with other services gets the sizing knob it
+  was owed anyway.
+
 ### Changed — canonicalization is a complete RFC 8785 implementation
 
 - **Doubles format by ECMAScript's rules, and `canon::VERSION` is 3.** The one

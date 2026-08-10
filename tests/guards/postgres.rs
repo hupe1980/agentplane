@@ -1182,7 +1182,16 @@ async fn postgres_task_claim_admits_exactly_one_reviewer() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let base = PostgresStore::connect(&url).await.expect("connect");
+    // A pool deliberately smaller than the racers. The deadlock this test
+    // exists to catch — a claim holding one connection while a nested read
+    // waited for a second — reproduces only where the pool can be exhausted,
+    // so with the default CPU-derived size a large machine passes over the
+    // defect a CI runner hangs on. Four connections under sixteen claimers
+    // makes the exhaustion condition a property of the test rather than of
+    // whichever machine runs it.
+    let base = PostgresStore::connect_sized(&url, Some(4))
+        .await
+        .expect("connect");
     let tenant = agentplane::core::TenantId::new("task-race").expect("tenant");
     let store = Arc::new(base.for_tenant(tenant));
 

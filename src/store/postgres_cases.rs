@@ -1448,6 +1448,33 @@ fn timer_from(row: &tokio_postgres::Row) -> Result<Timer, StoreError> {
     })
 }
 
+/// One task's row, read on a connection the caller already holds.
+///
+/// This exists because of a deadlock, not for tidiness. `claim` held its
+/// pooled connection across a `Self::task` call, and `task` acquired a second
+/// connection from the same pool — so every in-flight claim needed two
+/// connections while holding one. Sixteen reviewers racing one task on a small
+/// pool each held a connection and waited for another that only a waiter could
+/// release: a deadlock that reproduces exactly under the concurrency the claim
+/// verb exists to survive, and only where the pool is small enough to exhaust
+/// — a large development machine passes over the defect a CI runner hangs on,
+/// which is how it shipped. Every read made while a connection is held goes
+/// through this instead of re-entering the pool.
+async fn task_on(
+    client: &tokio_postgres::Client,
+    tenant: &str,
+    id: TaskId,
+) -> Result<Option<Task>, StoreError> {
+    let row = client
+        .query_opt(
+            &format!("SELECT {TASK_COLS} FROM tasks WHERE task_id = $1 AND tenant = $2"),
+            &[&id.to_hex(), &tenant],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+    row.as_ref().map(task_from).transpose()
+}
+
 #[async_trait]
 impl TaskStore for PostgresStore {
     async fn open(&self, task: &Task) -> Result<Task, StoreError> {
@@ -1478,28 +1505,32 @@ impl TaskStore for PostgresStore {
             )
             .await
             .map_err(|e| be(&e))?;
-        Ok(self.task(task.id).await?.unwrap_or_else(|| task.clone()))
+        Ok(task_on(&client, &self.tenant_name(), task.id)
+            .await?
+            .unwrap_or_else(|| task.clone()))
     }
 
     async fn task(&self, id: TaskId) -> Result<Option<Task>, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        let row = client
-            .query_opt(
-                &format!("SELECT {TASK_COLS} FROM tasks WHERE task_id = $1 AND tenant = $2"),
-                &[&id.to_hex(), &self.tenant_name()],
-            )
-            .await
-            .map_err(|e| be(&e))?;
-        row.as_ref().map(task_from).transpose()
+        task_on(&client, &self.tenant_name(), id).await
     }
 
     async fn claim(&self, id: TaskId, actor: &str, roles: &[String]) -> Result<Task, ClaimError> {
+        // One connection for the whole verb — every read below goes through
+        // `task_on` rather than `Self::task`, which would take a second
+        // connection while this one is held. See `task_on` for the deadlock
+        // that shape produced under exactly the concurrency this verb exists
+        // to survive.
         let client = self
             .pool()
             .get()
             .await
             .map_err(|e| ClaimError::Store(pool_err(&e)))?;
-        let Some(task) = self.task(id).await.map_err(ClaimError::Store)? else {
+        let tenant = self.tenant_name();
+        let Some(task) = task_on(&client, &tenant, id)
+            .await
+            .map_err(ClaimError::Store)?
+        else {
             return Err(ClaimError::NotFound(id));
         };
         // Eligibility before availability, and the order is load-bearing — see
@@ -1538,15 +1569,14 @@ impl TaskStore for PostgresStore {
             .await
             .map_err(|e| ClaimError::Store(be(&e)))?;
         if updated == 0 {
-            let holder = self
-                .task(id)
+            let holder = task_on(&client, &tenant, id)
                 .await
                 .map_err(ClaimError::Store)?
                 .and_then(|t| t.assignee)
                 .unwrap_or_default();
             return Err(ClaimError::AlreadyClaimed { task: id, holder });
         }
-        self.task(id)
+        task_on(&client, &tenant, id)
             .await
             .map_err(ClaimError::Store)?
             .ok_or(ClaimError::NotFound(id))
@@ -1559,12 +1589,17 @@ impl TaskStore for PostgresStore {
         actor: &str,
         roles: &[String],
     ) -> Result<Task, ClaimError> {
+        // One connection for the whole verb, exactly as `claim` — see `task_on`.
         let client = self
             .pool()
             .get()
             .await
             .map_err(|e| ClaimError::Store(pool_err(&e)))?;
-        let Some(task) = self.task(id).await.map_err(ClaimError::Store)? else {
+        let tenant = self.tenant_name();
+        let Some(task) = task_on(&client, &tenant, id)
+            .await
+            .map_err(ClaimError::Store)?
+        else {
             return Err(ClaimError::NotFound(id));
         };
         // Claim's eligibility-first order, unchanged: a take-over is a claim,
@@ -1613,7 +1648,7 @@ impl TaskStore for PostgresStore {
                 actor: from.to_owned(),
             });
         }
-        self.task(id)
+        task_on(&client, &tenant, id)
             .await
             .map_err(ClaimError::Store)?
             .ok_or(ClaimError::NotFound(id))
