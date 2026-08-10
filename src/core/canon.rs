@@ -331,6 +331,14 @@ mod tests {
     /// differently — which is why the partial implementation survived as long
     /// as it did: `4.5` agrees under both, and ASCII-adjacent tests never
     /// reach `1e+30`.
+    // The over-precise literal is RFC 8785's own input spelling
+    // (`333333333.33333329`), kept because a golden vector should carry the
+    // standard's digits, not this crate's re-derivation of them; it denotes
+    // the same double either way.
+    #[expect(
+        clippy::excessive_precision,
+        reason = "the literal is RFC 8785's own vector, quoted verbatim"
+    )]
     #[test]
     fn doubles_format_per_rfc_8785() {
         let vectors: &[(f64, &str)] = &[

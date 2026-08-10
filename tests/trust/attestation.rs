@@ -923,6 +923,10 @@ async fn an_audit_reports_what_authorized_each_run() {
 /// believed. The decision belongs to the run's own records — a sealing
 /// conclusion with no leaf behind it is history the log no longer commits to,
 /// and that half is the serious one, so both halves are pinned here.
+///
+/// `testkit`-gated because the serious half needs `Schedule::leafless`: a
+/// healthy store cannot lose a leaf on request, sealing always writes one.
+#[cfg(feature = "testkit")]
 #[tokio::test]
 async fn a_missing_leaf_is_a_finding_only_for_a_sealed_conclusion() {
     use agentplane::testkit::faults::{Faulty, Schedule};
