@@ -203,6 +203,75 @@ async fn a_stale_reply_without_a_size_is_not_an_integrity_event() {
     );
 }
 
+/// **A 400 is a shrunken log, and it must reach the integrity bucket.**
+///
+/// C2SP specifies `400 Bad Request` for *old size exceeds checkpoint size*: the
+/// witness is at N, this log now offers a checkpoint smaller than N, and runs it
+/// already cosigned are gone. `WitnessError::Shrank` calls that the single most
+/// important thing a witness catches, and the one an operator auditing itself
+/// structurally cannot — the smaller log is internally perfect and nothing
+/// inside it remembers what is missing.
+///
+/// There was no arm for it. A 400 fell to the catch-all and became
+/// `Unavailable`, which the quorum classifies as **routine** — beside a
+/// timeout. So `Shrank` was reachable only from `MemoryWitness`, the in-process
+/// witness explicitly documented as useless as a trust anchor, and on the only
+/// witness that can be a real one a deleted run raised nothing.
+#[tokio::test]
+async fn a_shrunken_log_is_an_integrity_finding_not_a_routine_one() {
+    // The body is deliberately empty: C2SP does not require 400 to carry the
+    // size, so a client that needed one would be reading a field that may not
+    // be there. Both numbers are already in hand.
+    let (url, _) = server(400, "").await;
+    let w = HttpWitness::new(&url, log_sig()).unwrap();
+
+    match w.cosign(&checkpoint(3), 5, &[]).await {
+        Err(WitnessError::Shrank { seen, offered, .. }) => {
+            assert_eq!(
+                (seen, offered),
+                (5, 3),
+                "the refusal must name where the witness was and what it was offered"
+            );
+        }
+        Err(WitnessError::Unavailable(detail)) => panic!(
+            "a shrunken log was reported as routine unavailability, so it never reaches \
+             the integrity bucket and nobody is paged for the one event a witness exists \
+             to catch: {detail}"
+        ),
+        Err(other) => panic!("wrong refusal: {other}"),
+        Ok(_) => panic!("a witness cosigned a log that had shrunk"),
+    }
+}
+
+/// A 400 for a request whose own numbers do not show a shrink is off-spec,
+/// and off-spec is routine, not an integrity finding.
+///
+/// C2SP's 400 is a statement about the request's two sizes — `old` exceeds the
+/// checkpoint's — and both are in hand before the witness answers. A witness
+/// is untrusted: its reply can *confirm* a shrink the request evidences, and
+/// it must not be able to *invent* one, because a fork alert manufactured by a
+/// confused counterparty is how the alert that matters stops being believed.
+/// The same rule the 409 arm applies to an unparseable size.
+#[tokio::test]
+async fn an_off_spec_400_cannot_invent_a_shrink() {
+    let (url, _) = server(400, "").await;
+    let w = HttpWitness::new(&url, log_sig()).unwrap();
+
+    // old (3) ≤ checkpoint size (5): nothing about this request shows a shrink.
+    match w.cosign(&checkpoint(5), 3, &[]).await {
+        Err(WitnessError::Unavailable(detail)) => assert!(
+            detail.contains("off-spec"),
+            "the refusal must say the witness answered outside its protocol: {detail}"
+        ),
+        Err(WitnessError::Shrank { .. }) => panic!(
+            "a witness answering 400 off-spec manufactured a shrink finding for a \
+             request whose own numbers show none"
+        ),
+        Err(other) => panic!("wrong refusal: {other}"),
+        Ok(_) => panic!("a 400 was read as a cosignature"),
+    }
+}
+
 /// A 422 is a proof that does not verify, which *is* a fork.
 #[tokio::test]
 async fn an_unverifiable_proof_is_a_fork() {

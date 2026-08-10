@@ -704,6 +704,13 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// can add a derivative that the erasure never sees. Implementations must
     /// serialize derivative creation with the complete traversal and deletion.
     ///
+    /// The traversal passes **through tombstones**: a memory forgotten
+    /// individually keeps its derivation edges in both directions, so a later
+    /// cascade from further upstream still reaches everything transitively
+    /// derived — A → B → C with B corrected away must not shelter C from A's
+    /// erasure. Returns the number of ids whose state this call actually
+    /// removed; a tombstone passed through is routed, not counted.
+    ///
     /// # Errors
     ///
     /// If the store cannot be reached.

@@ -376,12 +376,14 @@ impl MemoryStore for PostgresStore {
                 "memory '{id}' is under legal hold"
             )));
         }
-        tx.execute(
-            "DELETE FROM memory_derived WHERE tenant = $1 AND derived_id = $2",
-            &[&tenant, &id],
-        )
-        .await
-        .map_err(|error| be(&error))?;
+        // Edges deliberately stay — both directions. Outgoing, so a correction
+        // that later becomes an erasure request can still find this memory's
+        // derivatives; incoming, so a cascade from further *upstream* routes
+        // through this tombstone to reach them — A → B → C with B forgotten
+        // here must still let a cascade from poisoned A find C. The read path
+        // keeps a kept edge harmless (`derivatives` joins on a current item),
+        // and the tombstone prevents id reuse from attaching this lineage to
+        // unrelated future content.
         let removed = tx
             .execute(
                 "DELETE FROM memory_items WHERE tenant = $1 AND id = $2",
@@ -424,6 +426,16 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|error| be(&error))?;
 
+        // Every edge target is enqueued, **including tombstoned ones**.
+        // `forget` deliberately keeps a forgotten memory's outgoing edges so
+        // that a correction which later becomes an erasure request can still
+        // find what was derived — and a traversal that joined on a current
+        // item row skipped exactly the node it needed to pass through: A → B →
+        // C with B individually erased left C standing after a cascade from A.
+        // Both backends had the identical filter, which is what a contract
+        // written from one misreading looks like; the battery now walks a
+        // cascade through a tombstone. A tombstoned node has nothing to
+        // remove, but its descendants do.
         let mut queue = vec![id.to_owned()];
         let mut doomed = std::collections::BTreeSet::new();
         while let Some(source) = queue.pop() {
@@ -432,13 +444,8 @@ impl MemoryStore for PostgresStore {
             }
             let rows = tx
                 .query(
-                    "SELECT edge.derived_id
-                     FROM memory_derived edge
-                     JOIN memory_items item
-                       ON item.tenant = edge.tenant
-                      AND item.id = edge.derived_id
-                      AND item.current
-                     WHERE edge.tenant = $1 AND edge.source_id = $2",
+                    "SELECT derived_id FROM memory_derived
+                     WHERE tenant = $1 AND source_id = $2",
                     &[&tenant, &source],
                 )
                 .await
@@ -462,6 +469,10 @@ impl MemoryStore for PostgresStore {
             }
         }
 
+        // Counted per node that actually held rows, so a tombstoned
+        // intermediate the traversal passed through is not reported as an
+        // erasure it did not perform.
+        let mut erased = 0usize;
         for memory_id in &doomed {
             tx.execute(
                 "DELETE FROM memory_derived
@@ -470,12 +481,16 @@ impl MemoryStore for PostgresStore {
             )
             .await
             .map_err(|error| be(&error))?;
-            tx.execute(
-                "DELETE FROM memory_items WHERE tenant = $1 AND id = $2",
-                &[&tenant, memory_id],
-            )
-            .await
-            .map_err(|error| be(&error))?;
+            let rows = tx
+                .execute(
+                    "DELETE FROM memory_items WHERE tenant = $1 AND id = $2",
+                    &[&tenant, memory_id],
+                )
+                .await
+                .map_err(|error| be(&error))?;
+            if rows > 0 {
+                erased += 1;
+            }
             tx.execute(
                 "INSERT INTO memory_forgotten (tenant, id) VALUES ($1, $2)
                  ON CONFLICT DO NOTHING",
@@ -486,7 +501,7 @@ impl MemoryStore for PostgresStore {
         }
 
         tx.commit().await.map_err(|error| be(&error))?;
-        Ok(doomed.len())
+        Ok(erased)
     }
 
     async fn forget_subject(&self, subject: &str) -> Result<usize, StoreError> {

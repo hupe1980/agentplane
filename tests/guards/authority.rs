@@ -408,3 +408,76 @@ async fn redb_satisfies_the_authority_store_contract() {
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
     agentplane::testkit::conformance::authority(store as Arc<dyn AuthorityStore>).await;
 }
+
+/// **A revoked draw is an answer: one attempt, a failed run — never a
+/// quarantine claiming it may have been applied.**
+///
+/// The refusal's own documentation says "not retryable, ever", and the module
+/// docs open with the reason the type exists: conflating revoked with
+/// exhausted teaches a caller to retry a decision that has been taken back.
+/// The effect's error mapping then flattened every refusal to `Other`, which
+/// reads as **in-doubt** — so a revoked draw was retried under the full
+/// policy, and reported upward as a call that may have landed. The journal is
+/// the witness here: one `EffectStarted` for the draw means one attempt, and
+/// the run must conclude `Failed` (an answer), not `Quarantined` (a doubt).
+#[tokio::test]
+async fn a_revoked_draw_is_answered_once_and_never_retried() {
+    use agentplane::journal::RecordKind;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    store
+        .issue(&StandingAuthority::new(
+            "mandate-42",
+            "approval:SET-42",
+            Spend::money(50_000),
+        ))
+        .await
+        .expect("issue");
+    store
+        .revoke(
+            &AuthorityId::new("mandate-42"),
+            "customer withdrew consent",
+            Timestamp::from_unix_timestamp(1_760_000_000).expect("time"),
+        )
+        .await
+        .expect("revoke");
+
+    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .authorities(Arc::clone(&store) as Arc<dyn AuthorityStore>)
+        .skill(Buys(Spend::money(10)))
+        .build();
+
+    let outcome = runtime
+        .run("commerce.buy", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    match &outcome.status {
+        RunStatus::Failed(why) => assert!(
+            why.contains("revoked"),
+            "the failure must carry which refusal it was: {why}"
+        ),
+        RunStatus::Quarantined(why) => panic!(
+            "a refusal the store answered with certainty was reported as a doubt \
+             an operator must resolve: {why}"
+        ),
+        other => panic!("expected a failed run, got {other:?}"),
+    }
+
+    let attempts = (Arc::clone(&store) as Arc<dyn JournalStore>)
+        .read(outcome.run_id, 1)
+        .await
+        .expect("journal")
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.kind(),
+                RecordKind::EffectStarted { descriptor, .. } if descriptor.kind == "authority.draw"
+            )
+        })
+        .count();
+    assert_eq!(
+        attempts, 1,
+        "a refusal that will never change was retried — every further attempt \
+         asks the same rule the same question"
+    );
+}

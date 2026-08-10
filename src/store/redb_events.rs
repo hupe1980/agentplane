@@ -436,7 +436,7 @@ impl EventStore for RedbStore {
                             .get((tenant.as_str(), id.as_str()))
                             .map_err(|e| be(&e))?
                             .map(|v| {
-                                let (src, bid, kd, pl, ra, _, _, hc, dead, _) = v.value();
+                                let (src, bid, kd, pl, ra, claimed_by, _, hc, dead, _) = v.value();
                                 (
                                     kd.to_owned(),
                                     pl.to_owned(),
@@ -445,12 +445,25 @@ impl EventStore for RedbStore {
                                     dead,
                                     src.to_owned(),
                                     bid.to_owned(),
+                                    claimed_by.to_owned(),
                                 )
                             })
                         else {
                             continue;
                         };
-                        if row.0 == kind && row.3 == 0 && row.4 == 0 {
+                        // Unclaimed — or already claimed **by this very run**.
+                        // The second arm is crash recovery, and it is the same
+                        // idempotence `deliver_to` grants a retried targeted
+                        // delivery: `match_waiter` claims durably and the run
+                        // resumes in a separate step, so a crash between the
+                        // two leaves an event claimed for a run that never saw
+                        // it. Without this arm the resumed wait re-subscribes,
+                        // finds nothing — its own event filtered out by its own
+                        // claim — and sleeps until the deadline breaches: the
+                        // message arrived in time and was lost anyway. Single
+                        // delivery is untouched, because only the claiming run
+                        // can re-claim.
+                        if row.0 == kind && (row.3 == 0 || row.7 == run) && row.4 == 0 {
                             hit = Some((id, row));
                             break 'outer;
                         }
@@ -459,7 +472,7 @@ impl EventStore for RedbStore {
 
                 match hit {
                     None => None,
-                    Some((id, (kd, payload, received, _, _, src, bid))) => {
+                    Some((id, (kd, payload, received, _, _, src, bid, _))) => {
                         // Claimed in the same transaction that selected it: two
                         // runs waiting on one key must not both consume a single
                         // message.
@@ -526,7 +539,7 @@ impl EventStore for RedbStore {
             // redb's commit consumes it.
             let found = {
                 let by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
-                let subs = w.open_table(SUBS).map_err(|e| be(&e))?;
+                let mut subs = w.open_table(SUBS).map_err(|e| be(&e))?;
                 let hit = oldest_waiter(&tenant, &by_key, &subs, &kind, &keys)?;
                 drop(by_key);
 
@@ -572,6 +585,7 @@ impl EventStore for RedbStore {
                                 .map_err(|e| be(&e))?;
 
                             let mut correlation = Vec::new();
+                            let mut retired = Vec::new();
                             for e in subs
                                 .range(
                                     (tenant.as_str(), run.as_str(), effect.as_str(), "", "")
@@ -585,9 +599,61 @@ impl EventStore for RedbStore {
                                 )
                                 .map_err(|e| be(&e))?
                             {
-                                let (k, _) = e.map_err(|e| be(&e))?;
-                                let (_, _, _, ns, v) = k.value();
-                                correlation.push(CorrelationKey::new(ns.to_owned(), v.to_owned()));
+                                let (k, v) = e.map_err(|e| be(&e))?;
+                                let (_, _, _, ns, val) = k.value();
+                                let (_, _, _, _, sub_kind, created) = v.value();
+                                correlation
+                                    .push(CorrelationKey::new(ns.to_owned(), val.to_owned()));
+                                retired.push((
+                                    ns.to_owned(),
+                                    val.to_owned(),
+                                    sub_kind.to_owned(),
+                                    created,
+                                ));
+                            }
+                            // The claim retires the subscription, in the same
+                            // transaction. Left registered until the run's own
+                            // unsubscribe, it matched a *second* event —
+                            // sequentially, no race required — which was then
+                            // claimed for a run whose wait the first event
+                            // already satisfied: parked under a claim nobody
+                            // consumes, and claimed events never dead-letter.
+                            // The resumed wait re-subscribes idempotently and
+                            // recovers its own claimed event through the
+                            // crash-recovery arm, so nothing legitimate needs
+                            // the stale registration.
+                            for (ns, val, sub_kind, created) in retired {
+                                subs.remove((
+                                    tenant.as_str(),
+                                    run.as_str(),
+                                    effect.as_str(),
+                                    ns.as_str(),
+                                    val.as_str(),
+                                ))
+                                .map_err(|e| be(&e))?;
+                                let mut by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
+                                by_key
+                                    .remove((
+                                        tenant.as_str(),
+                                        sub_kind.as_str(),
+                                        ns.as_str(),
+                                        val.as_str(),
+                                        created,
+                                        run.as_str(),
+                                        effect.as_str(),
+                                    ))
+                                    .map_err(|e| be(&e))?;
+                                let mut by_time = w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
+                                by_time
+                                    .remove((
+                                        tenant.as_str(),
+                                        created,
+                                        run.as_str(),
+                                        effect.as_str(),
+                                        ns.as_str(),
+                                        val.as_str(),
+                                    ))
+                                    .map_err(|e| be(&e))?;
                             }
 
                             Some(Subscription {
@@ -757,6 +823,16 @@ impl EventStore for RedbStore {
                         .map_err(|e| be(&e))?;
                     drop(events);
                     index_correlation(&w, &tenant, &id, &keys, ts(at))?;
+                    // The subscription is deliberately **not** retired here,
+                    // unlike `match_waiter` — the asymmetry is the two paths'
+                    // retry semantics. A retried targeted delivery rebuilds
+                    // its `Matched` from these rows to resume a run that
+                    // crashed between claim and resume; and a second distinct
+                    // message claimed through a satisfied wait is recovered by
+                    // the protocol itself, because the task's next
+                    // continuation re-matches the claimed event for the same
+                    // run. The broadcast path has no such retry loop, which
+                    // is why `match_waiter` retires and this does not.
                     TargetedDelivery::Matched(subscription)
                 }
             };

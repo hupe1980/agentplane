@@ -280,8 +280,30 @@ pub enum EffectError {
 
     /// The peer received the call and refused it. The request is intact and
     /// nothing was applied.
+    ///
+    /// Retried under the effect's policy, because this covers transient
+    /// refusals — an overloaded gateway, a rate limit, a 5xx. A refusal that
+    /// no retry can change is [`Refused`](Self::Refused), and conflating the
+    /// two is how a caller retries a decision that will never change.
     #[error("effect rejected: {0}")]
     Rejected(String),
+
+    /// The peer understood the request and said **no** — an answer, not a
+    /// fault. Nothing was applied, and nothing was metered.
+    ///
+    /// Distinct from [`Rejected`](Self::Rejected) in the one way the retry
+    /// loop can act on: repeating this call asks the same rule the same
+    /// question, so no attempt is spent on it — the first refusal is the
+    /// final one. A model provider's 400 (unknown model, malformed request,
+    /// input filtered) is the canonical case: three retries with backoff
+    /// against a request that is *wrong* burn wall-clock and teach the
+    /// operator that retries are noise.
+    ///
+    /// The bit is recorded on the failure (`EffectFailed.permanent`), because
+    /// the retry decision is replayed from history and a replay that could
+    /// not see it would expect a retry the live run never made.
+    #[error("effect refused: {0}")]
+    Refused(String),
 
     /// The peer accepted the request and never answered in time.
     ///
@@ -369,7 +391,9 @@ impl EffectError {
     pub fn disposition(&self) -> Disposition {
         match self {
             Self::Metered { disposition, .. } | Self::Final { disposition, .. } => *disposition,
-            Self::Unavailable { .. } | Self::Rejected(_) => Disposition::DidNotHappen,
+            Self::Unavailable { .. } | Self::Rejected(_) | Self::Refused(_) => {
+                Disposition::DidNotHappen
+            }
             Self::OutputShape(_) | Self::Performed(_) => Disposition::Landed,
             // `Other` shares the in-doubt arm deliberately: an error that does
             // not say what it did is treated as dangerous. A driver that wants

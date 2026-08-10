@@ -60,13 +60,16 @@ step that did not happen.
 | *Which instructions* produced a decision | The system prompt lives inside the digested manifest (`manifest`), so a rewording is a version bump. A prompt composed in the deployer's code has no version at all: it changes in a deploy, the journal faithfully records every run it affected, and nothing connects the two |
 
 **The limit, stated plainly:** a checkpoint that never leaves the operator's
-store is exactly as trustworthy as the operator. The `Witness` seam now exists
-and enforces the decision that matters — a checkpoint is cosigned only if it
-provably extends the last one seen, so a shrunken log and a *split view* (a
-second history of the same size) are both refused. What does **not** yet exist
-is a remote witness speaking C2SP `tlog-witness`. Until a second party runs one,
-this is a mechanism without a counterparty: a witness you host yourself proves
-nothing about you. See [status](@/docs/status.md).
+store is exactly as trustworthy as the operator. The `Witness` seam enforces the
+decision that matters — a checkpoint is cosigned only if it provably extends the
+last one seen, so a shrunken log and a *split view* (a second history of the same
+size) are both refused — and `HttpWitness` speaks C2SP `tlog-witness`, so the
+counterparty can be an existing public witness rather than a second process you
+also own.
+
+What is missing is therefore **not code but a counterparty**. Until a second
+party runs a witness for your log, a witness you host yourself proves nothing
+about you. See [status](@/docs/status.md).
 
 ### Art. 14 — human oversight, and the ability to intervene and stop
 
@@ -90,7 +93,42 @@ cover.
 
 ### Art. 26 — deployers keep logs
 
-The journal *is* the log, it verifies offline, and it exports in a portable form.
+The journal *is* the log, it verifies offline against a store it did not write,
+and it comes out in a form nothing here has to be present to read:
+
+```sh
+agentplane export --store ./journal.redb > history.jsonl
+agentplane audit  --store ./journal.redb > report.json
+agentplane verify history.jsonl            # check a copy, offline
+agentplane restore history.jsonl --store ./rebuilt.redb
+```
+
+Both verbs take a store and nothing else — no manifest, no source tree, no Rust
+toolchain — because that is what an auditor holds. The export is JSON Lines: a
+header naming the log, its checkpoint and the canonicalization rule the digests
+were computed under; one line per record carrying `prev_hash` and `hash`, so the
+chain can be re-walked from the file alone; and a trailer. The trailer's
+**absence** is how a file cut short by a full disk or a killed pipe is told from
+a complete one, and any run that could not be read is named in it rather than
+quietly missing.
+
+`verify` takes the **file and nothing else** — no store, no manifest, no
+toolchain — and re-seals every record through the same function the store sealed
+with, so agreement is a statement about the bytes rather than about the file
+agreeing with itself. It then rebuilds the Merkle log from the positions the
+export carries and compares the root against the checkpoint in its own header.
+That last step is what catches a whole run deleted from the middle: every
+surviving chain is internally consistent, because a chain links records *within*
+a run and knows nothing about its neighbours.
+
+`restore` is the other direction, and it proves itself the same way: the rebuilt
+store must report the checkpoint the export claimed. Signatures do not survive
+unless the restoring store holds the original key, which the report says rather
+than leaves to be found.
+
+It exports what the chain committed to, which with a key ring configured is
+ciphertext. That is deliberate: an export of plaintext would put a copy beyond
+the reach of key destruction, and undo the erasure below.
 
 **Erasure is possible without breaking the record — for data you kept out of
 the chain.** `BlobStore::expire` drops a blob's bytes and leaves a tombstone;
@@ -138,6 +176,7 @@ case and its adapter is single-node by contract — so wrap it explicitly.
 | **Art. 9** risk management | There is a policy seam and a Cedar adapter, but no risk-tier model. Cedar's `symcc` could *prove* properties of a policy set rather than test them; nothing invokes it |
 | **Art. 13** machine-readable description | A manifest declares an agent's prompt, grants, ceilings, models, result shape and oversight; the registry pins it by digest, can verify a domain-separated publisher attestation, and refuses publisher reassignment; the runtime **refuses** effects the declaration never named; and the A2A Agent Card is derived from that same manifest and served by the optional A2A server. What is still absent: the shipped registry is process-local rather than durable or remote, and trust in publisher keys remains a deployment decision |
 | **Art. 50** transparency to users | An interface obligation, not a runtime one (above) |
+| **A drill over the case layer** | The journal round-trips and proves it by its own checkpoint. Case versions, blob digests and key availability are not yet covered by either `verify` or `restore`, so a full recovery rehearsal still has parts nobody has automated |
 | Anything about your **model** | Bias, accuracy, training data, and evaluation are properties of the model and its use. This is a runtime |
 | A **conformity assessment** | A person does that, about a system, in a context |
 
@@ -147,8 +186,8 @@ case and its adapter is single-node by contract — so wrap it explicitly.
 
 **ISO/IEC 42001** and the **NIST AI RMF** consume the same artifacts — the
 journal answers "what happened and can you prove it" regardless of which
-framework asks. No separate integration exists or is needed; the export is the
-integration.
+framework asks, so no framework-specific integration is needed or planned. The
+export is the integration: JSON Lines goes into whatever collects evidence.
 
 ---
 

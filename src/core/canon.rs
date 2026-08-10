@@ -39,9 +39,25 @@
 //! and `keys_sort_by_utf16_code_unit_not_utf8_byte` is the vector that
 //! distinguishes them.
 //!
-//! One JCS rule is deliberately not implemented: ECMAScript number formatting.
-//! A guard asserts the card carries no numbers, which is the honest way to hold
-//! a partial implementation — see `peers::card_sig`.
+//! # Numbers format per RFC 8785's ECMAScript rules
+//!
+//! A double is written the way `Number::toString(10)` writes it — shortest
+//! round-tripping digits, positional notation between `1e-6` and `1e21`,
+//! exponential with an explicit sign outside it — because that is the one part
+//! of JCS where `serde_json`'s own formatting disagrees (`1e30` where the
+//! standard says `1e+30`, `100.0` where it says `100`), and a signed Agent
+//! Card is verified by software nobody here writes. This used to be the one
+//! JCS rule deliberately not implemented, held honest by a guard that the card
+//! carries no numbers; implementing it retired the guard and the constraint.
+//!
+//! **Integers stay exact, and that is a decision rather than a gap.** JCS
+//! treats every number as an IEEE-754 double, under which two distinct `u64`s
+//! above 2⁵³ collapse into one representation — and a canonicalizer that
+//! collapses two different values into one byte string would give two
+//! different effects one key, which is the fallback [`value_bytes`] exists to
+//! refuse. Inside ±2⁵³ exact and double formatting agree, so nothing
+//! interoperable is lost; outside it, I-JSON draws the same line and the one
+//! externally-verified artifact refuses at signing — see `peers::card_sig`.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -50,7 +66,11 @@ use serde_json::Value;
 ///
 /// **1** was UTF-8 byte ordering of object keys. **2** is RFC 8785's UTF-16
 /// code-unit ordering, adopted so a signed Agent Card verifies against the
-/// standard rather than only against this crate.
+/// standard rather than only against this crate. **3** adds RFC 8785's
+/// ECMAScript number formatting for doubles — `4.5` stays `4.5` but `1e30`
+/// becomes `1e+30` and `100.0` becomes `100` — completing JCS for everything a
+/// `Value` can hold except integers beyond ±2⁵³, which stay exact for the
+/// reason the module docs give.
 ///
 /// # Why a digest is not enough on its own
 ///
@@ -68,7 +88,7 @@ use serde_json::Value;
 /// different sentence from *this run diverged* and the one the evidence
 /// supports. That distinction is the whole point: an audit must report unknown
 /// scope as prominently as corruption, and never as corruption.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 /// Serialize to canonical bytes.
 ///
@@ -152,7 +172,83 @@ fn write_canonical(value: &Value, out: &mut Vec<u8>) {
 /// `String` by construction. See [`value_bytes`] on why this aborts rather than
 /// substituting a placeholder.
 fn write_scalar(value: &Value, out: &mut Vec<u8>) {
+    // Doubles take the RFC 8785 path; integers stay on `serde_json`'s exact
+    // rendering, which agrees with the ECMAScript form for every integer a
+    // double holds exactly (±2⁵³) and refuses to lose information above it.
+    if let Value::Number(n) = value
+        && n.is_f64()
+    {
+        es_number(n.as_f64().expect("is_f64 implies as_f64"), out);
+        return;
+    }
     serde_json::to_writer(&mut *out, value).expect("serde_json cannot fail on a scalar Value");
+}
+
+/// ECMAScript `Number::toString(10)`, which is what RFC 8785 §3.2.2.3 requires
+/// for a JSON number.
+///
+/// Rust's `LowerExp` already selects the same digits ECMAScript does — the
+/// shortest decimal that round-trips through the double — so only *placement*
+/// is implemented here: positional notation while `-6 < n ≤ 21` (where `n` is
+/// the position of the decimal point relative to the digits), exponential with
+/// a mandatory sign outside it. The disagreements this exists for:
+/// `serde_json` writes `1e30`, `100.0` and `1e-7` where the standard writes
+/// `1e+30`, `100` and `1e-7` respectively — close enough to pass every test
+/// that never leaves this crate, which is exactly how it survived.
+///
+/// Negative zero serializes as `0`, per the standard.
+fn es_number(value: f64, out: &mut Vec<u8>) {
+    if value == 0.0 {
+        out.push(b'0');
+        return;
+    }
+    if value.is_sign_negative() {
+        out.push(b'-');
+        es_number(-value, out);
+        return;
+    }
+    let sci = format!("{value:e}");
+    let (mantissa, exponent) = sci
+        .split_once('e')
+        .expect("LowerExp always writes an exponent");
+    let digits: Vec<u8> = mantissa.bytes().filter(|b| *b != b'.').collect();
+    let exponent: i32 = exponent.parse().expect("a LowerExp exponent is an integer");
+    // value = digits × 10^(n − k): k significant digits, point after position n.
+    let k = i32::try_from(digits.len()).expect("shortest f64 digits fit in i32");
+    let n = exponent + 1;
+    if n >= k && n <= 21 {
+        // Whole number: every digit, then the zeros that place the magnitude.
+        out.extend_from_slice(&digits);
+        out.extend(std::iter::repeat_n(
+            b'0',
+            usize::try_from(n - k).expect("n >= k"),
+        ));
+    } else if n > 0 && n <= 21 {
+        // The point falls inside the digits.
+        let split = usize::try_from(n).expect("n > 0");
+        out.extend_from_slice(&digits[..split]);
+        out.push(b'.');
+        out.extend_from_slice(&digits[split..]);
+    } else if n > -6 && n <= 0 {
+        // Small: leading zeros after the point.
+        out.extend_from_slice(b"0.");
+        out.extend(std::iter::repeat_n(
+            b'0',
+            usize::try_from(-n).expect("n <= 0"),
+        ));
+        out.extend_from_slice(&digits);
+    } else {
+        // Exponential, with the sign ECMAScript always writes.
+        out.push(digits[0]);
+        if digits.len() > 1 {
+            out.push(b'.');
+            out.extend_from_slice(&digits[1..]);
+        }
+        out.push(b'e');
+        let e = n - 1;
+        out.push(if e < 0 { b'-' } else { b'+' });
+        out.extend_from_slice(e.unsigned_abs().to_string().as_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -223,5 +319,88 @@ mod tests {
     #[test]
     fn array_order_is_significant() {
         assert_ne!(value_bytes(&json!([1, 2])), value_bytes(&json!([2, 1])));
+    }
+
+    /// RFC 8785's ECMAScript number vectors, from its own Appendix.
+    ///
+    /// These are cross-implementation golden vectors in the load-bearing
+    /// sense: the expected strings are the standard's, not this crate's, so
+    /// agreement is evidence about the bytes rather than the crate agreeing
+    /// with itself.
+    /// Every case here is one `serde_json` formats differently or nearly
+    /// differently — which is why the partial implementation survived as long
+    /// as it did: `4.5` agrees under both, and ASCII-adjacent tests never
+    /// reach `1e+30`.
+    #[test]
+    fn doubles_format_per_rfc_8785() {
+        let vectors: &[(f64, &str)] = &[
+            (0.0, "0"),
+            (-0.0, "0"), // ES String(-0) is "0", and JCS follows it
+            (4.5, "4.5"),
+            (0.002, "0.002"),
+            (1e-6, "0.000001"),              // the last positional small number
+            (1e-7, "1e-7"),                  // the first exponential one
+            (1e20, "100000000000000000000"), // the last positional big number
+            (1e21, "1e+21"),                 // the first exponential one — serde says 1e21
+            (1e30, "1e+30"),
+            (1e-27, "1e-27"),
+            (9_007_199_254_740_992.0, "9007199254740992"), // 2^53, exact
+            (333_333_333.333_333_29, "333333333.3333333"), // shortest round trip
+            (9.999_999_999_999_997e22, "9.999999999999997e+22"),
+            (5e-324, "5e-324"), // smallest subnormal
+            (1.797_693_134_862_315_7e308, "1.7976931348623157e+308"), // largest double
+            (-4.5, "-4.5"),
+            (-1e30, "-1e+30"),
+        ];
+        for (input, expected) in vectors {
+            let mut out = Vec::new();
+            es_number(*input, &mut out);
+            assert_eq!(
+                std::str::from_utf8(&out).unwrap(),
+                *expected,
+                "RFC 8785 formats {input:?} as {expected}"
+            );
+        }
+    }
+
+    /// The whole pipeline on a value that mixes every number shape.
+    ///
+    /// `serde_json` would write `{"big":1e30,"frac":4.5,"int":100,"neg":-0.0,…}`
+    /// — three of the six differently — so this is the vector that fails if
+    /// doubles ever fall back to the default writer.
+    #[test]
+    fn canonical_bytes_carry_rfc_8785_numbers() {
+        let value = json!({
+            "big": 1e30,
+            "frac": 4.5,
+            "int": 100,
+            "neg": -0.0,
+            "small": 1e-7,
+            "whole": 100.0,
+        });
+        assert_eq!(
+            String::from_utf8(value_bytes(&value)).unwrap(),
+            r#"{"big":1e+30,"frac":4.5,"int":100,"neg":0,"small":1e-7,"whole":100}"#
+        );
+    }
+
+    /// Integers beyond ±2⁵³ stay exact instead of collapsing into doubles.
+    ///
+    /// JCS would render both of these as `9007199254740994`? No — as the same
+    /// double, which is the point: two *different* values must never share
+    /// canonical bytes, because a shared byte string is a shared effect key and
+    /// a shared key hands one effect the other's recorded output. The card
+    /// signer refuses this range instead (`peers::card_sig`), which keeps the
+    /// externally-verified artifact inside the range where exact and double
+    /// agree.
+    #[test]
+    fn integers_beyond_double_precision_stay_distinct() {
+        let a = json!(9_007_199_254_740_993_u64); // 2^53 + 1 — not a double
+        let b = json!(9_007_199_254_740_992_u64); // 2^53 — the nearest double
+        assert_ne!(value_bytes(&a), value_bytes(&b));
+        assert_eq!(
+            String::from_utf8(value_bytes(&a)).unwrap(),
+            "9007199254740993"
+        );
     }
 }

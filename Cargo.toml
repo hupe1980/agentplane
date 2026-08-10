@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.13.0"
+version      = "0.14.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -61,7 +61,10 @@ redb = ["dep:redb"]
 # builder calls; the manifest is what makes those declarations reviewable.
 manifest = ["dep:serde_yaml_ng", "dep:base64", "dep:jsonschema"]
 # Everything the `agentplane` binary needs to run a declarative agent.
-cli = ["manifest", "redb", "providers", "bedrock", "testkit", "dep:tracing-subscriber", "dep:clap"]
+# `signing` is here for the audit verbs: an `audit`/`verify` that could not
+# check a signature would send the independent party back to writing Rust,
+# which is the dependency those verbs exist to remove.
+cli = ["manifest", "redb", "providers", "bedrock", "testkit", "signing", "dep:tracing-subscriber", "dep:clap"]
 # Content-addressed blobs on any backend OpenDAL reaches. Bytes too big for the
 # chain go here and the chain commits to their digest. Deliberately not the
 # journal's own store: an object store has no ordered scan, no multi-key

@@ -1062,18 +1062,33 @@ impl JournalStore for RedbStore {
         .await
     }
 
-    async fn recent_runs(&self) -> Result<Vec<(RunId, u64)>, StoreError> {
+    async fn recent_runs(
+        &self,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError> {
         let tenant = self.tenant_name();
         let prefix = format!("{tenant}/");
+        // The cursor's own key, so the range can end *below* it. Skipping in the
+        // iterator instead would still walk every newer row, which is the cost
+        // this page bound exists to remove.
+        let end = after.map(|(updated, run)| (updated, format!("{prefix}{run}")));
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let Ok(activity) = r.open_table(RUN_ACTIVITY) else {
                 return Ok(Vec::new());
             };
-            activity
-                .range((tenant.as_str(), 0, "")..=(tenant.as_str(), u64::MAX, MAX_STR))
-                .map_err(|e| be(&e))?
-                .rev()
+            // Exclusive upper bound at the cursor, so the row the caller last
+            // saw is not served twice.
+            let rows = match &end {
+                Some((updated, key)) => activity
+                    .range((tenant.as_str(), 0, "")..(tenant.as_str(), *updated, key.as_str()))
+                    .map_err(|e| be(&e))?,
+                None => activity
+                    .range((tenant.as_str(), 0, "")..=(tenant.as_str(), u64::MAX, MAX_STR))
+                    .map_err(|e| be(&e))?,
+            };
+            rows.rev()
                 .filter_map(|entry| match entry {
                     Ok((key, _)) => {
                         let (_, updated, stored) = key.value();
@@ -1084,6 +1099,7 @@ impl JournalStore for RedbStore {
                     }
                     Err(error) => Some(Err(be(&error))),
                 })
+                .take(limit)
                 .collect()
         })
         .await

@@ -28,7 +28,7 @@ impl QuotaStore for PostgresStore {
         limit: Option<u32>,
         at: Timestamp,
     ) -> Result<(), QuotaError> {
-        let client = self
+        let mut client = self
             .pool_ref()
             .get()
             .await
@@ -38,7 +38,8 @@ impl QuotaStore for PostgresStore {
 
         let Some(limit) = limit else {
             // No ceiling: still record the run, so `running()` answers honestly
-            // and a ceiling added later starts from the truth.
+            // and a ceiling added later starts from the truth. No lock either —
+            // there is no decision here for two admissions to disagree about.
             client
                 .execute(
                     "INSERT INTO quota_running (tenant, run_id, admitted_at)
@@ -51,18 +52,38 @@ impl QuotaStore for PostgresStore {
             return Ok(());
         };
 
-        // One statement: the count is a subquery of the insert, so the whole
-        // decision happens inside the row lock the write takes. Two instances
-        // racing for one remaining slot serialise here, and exactly one lands.
+        // The count and the insert decide together **under a per-tenant
+        // advisory lock**, because nothing weaker serialises them. This
+        // statement's earlier form ran without the lock, on a comment claiming
+        // the decision happened "inside the row lock the write takes" — and no
+        // such lock exists: two INSERTs of *different* rows lock nothing in
+        // common, each count subquery reads its own statement snapshot under
+        // READ COMMITTED, and two admissions racing for one remaining slot
+        // both passed `count < limit` and both landed. A ceiling that admits
+        // limit+k exactly under concurrent load is the catalogued
+        // yields-under-load shape, on the one control whose whole promise is
+        // surviving a second instance.
         //
-        // A `SELECT COUNT(*)` followed by an `INSERT` would leave a window that
-        // both pass through — and the window widens with load, so the ceiling
-        // fails hardest exactly when it matters.
+        // The lock is transaction-scoped and per tenant — admissions for one
+        // tenant serialise, which is the semantic the ceiling requires; other
+        // tenants' admissions do not wait. The length prefix keeps
+        // `("acme", …)` from colliding with a tenant literally named
+        // `"acme…"` under concatenation.
         //
-        // `ON CONFLICT DO NOTHING` makes a retried admission idempotent: the
-        // run already holds its slot, so re-reserving must neither take a second
-        // nor be refused against a ceiling it is already counted in.
-        let inserted = client
+        // `ON CONFLICT DO NOTHING` keeps a retried admission idempotent: the
+        // run already holds its slot, so re-reserving must neither take a
+        // second nor be refused against a ceiling it is already counted in.
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&format!("quota-admission:{}:{tenant}", tenant.len())],
+        )
+        .await
+        .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
+        let inserted = tx
             .execute(
                 "INSERT INTO quota_running (tenant, run_id, admitted_at)
                  SELECT $1, $2, $3
@@ -76,13 +97,17 @@ impl QuotaStore for PostgresStore {
             .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
 
         if inserted == 1 {
+            tx.commit()
+                .await
+                .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
             return Ok(());
         }
 
         // Nothing was written. Either the tenant is at its ceiling, or the run
         // already held a slot and `DO NOTHING` fired — and those are opposite
-        // answers, so it is read back rather than assumed.
-        let held: i64 = client
+        // answers, so it is read back rather than assumed. Still inside the
+        // transaction, so the counts are the ones the decision was made from.
+        let held: i64 = tx
             .query_one(
                 "SELECT COUNT(*) FROM quota_running WHERE tenant = $1 AND run_id = $2",
                 &[&tenant, &run],
@@ -91,10 +116,13 @@ impl QuotaStore for PostgresStore {
             .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?
             .get(0);
         if held > 0 {
+            tx.commit()
+                .await
+                .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
             return Ok(());
         }
 
-        let running: i64 = client
+        let running: i64 = tx
             .query_one(
                 "SELECT COUNT(*) FROM quota_running WHERE tenant = $1",
                 &[&tenant],
@@ -102,6 +130,9 @@ impl QuotaStore for PostgresStore {
             .await
             .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?
             .get(0);
+        tx.commit()
+            .await
+            .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
         Err(QuotaError::TooManyRuns {
             tenant,
             running: u32::try_from(running).unwrap_or(u32::MAX),

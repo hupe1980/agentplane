@@ -3222,50 +3222,85 @@ fn a_card_naming_its_own_algorithm_is_refused() {
     );
 }
 
-/// The signed payload contains no numbers.
+/// A card carrying ordinary numbers signs and verifies.
 ///
-/// RFC 8785's hardest requirement is ECMAScript number formatting, and a card of
-/// strings, booleans, arrays and objects never reaches it. That is why this
-/// crate can canonicalize a card correctly without a full JCS implementation —
-/// so the constraint is asserted rather than assumed, and the day somebody adds
-/// an integer field this fails instead of two implementations disagreeing about
-/// a signature.
+/// This card used to be forbidden numbers entirely, because the canonicalizer
+/// did not implement RFC 8785's ECMAScript number formatting and a guard held
+/// the partial implementation honest. The canonicalizer now implements it, so
+/// the guard is retired and this is its replacement: the exact shapes
+/// `serde_json` formats differently from the standard — a float, an integral
+/// float, a large exponent — must survive a sign/verify round trip.
+#[cfg(feature = "signing")]
 #[test]
-fn a_card_carries_no_numbers_to_canonicalize() {
-    use agentplane::peers::AgentCard;
+fn a_card_with_ordinary_numbers_signs_and_verifies() {
+    use agentplane::peers::{AgentCard, AgentExtension, CardSigner, CardVerifier};
+    use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
 
-    fn numbers(value: &serde_json::Value, path: &str, found: &mut Vec<String>) {
-        match value {
-            serde_json::Value::Number(_) => found.push(path.to_owned()),
-            serde_json::Value::Object(map) => {
-                for (k, v) in map {
-                    numbers(v, &format!("{path}/{k}"), found);
-                }
-            }
-            serde_json::Value::Array(items) => {
-                for (i, v) in items.iter().enumerate() {
-                    numbers(v, &format!("{path}/{i}"), found);
-                }
-            }
-            _ => {}
-        }
-    }
+    let signer = Ed25519Signer::new("did:example:publisher", &[7u8; 32]);
+    let verifier = Ed25519Verifier::new()
+        .trust("did:example:publisher", &signer.verifying_key())
+        .expect("a valid key");
 
     let m = Manifest::parse(GOOD).expect("parse");
-    let card = AgentCard::derive(&m, "https://plane.internal/a2a").expect("derive");
-    let mut found = Vec::new();
-    numbers(
-        &serde_json::to_value(&card).expect("serialize"),
-        "",
-        &mut found,
-    );
-    assert!(
-        found.is_empty(),
-        "the card now contains numbers at {found:?}. RFC 8785 mandates \
-         ECMAScript number formatting, which this crate's canonicalizer does not \
-         implement — so a signature over this card may not verify elsewhere. \
-         Either format the value as a string or implement JCS numbers."
-    );
+    let mut card = AgentCard::derive(&m, "https://plane.internal/a2a").expect("derive");
+    card.capabilities.extensions.push(AgentExtension {
+        uri: "https://example.com/ext/limits".to_owned(),
+        description: None,
+        required: false,
+        params: Some(serde_json::json!({
+            "ratio": 4.5,
+            "whole": 100.0,
+            "huge": 1e30,
+            "count": 3,
+        })),
+    });
+
+    card.sign(&signer as &dyn CardSigner).expect("sign");
+    card.verify(&verifier as &dyn CardVerifier)
+        .expect("a card with representable numbers must verify");
+}
+
+/// An integer no double can hold is refused at signing, naming its path.
+///
+/// JCS reads every number as an IEEE-754 double. Past ±2^53 two distinct
+/// integers share one double, so this crate would sign exact bytes and a
+/// conforming verifier would recompute rounded ones — both correct under their
+/// own reading, which is the worst kind of mismatch. The refusal happens where
+/// the signature is made, not in a test over the crate's own card, because the
+/// value arrives through extension `params` a deployment controls and no
+/// in-tree fixture would ever see it.
+#[cfg(feature = "signing")]
+#[test]
+fn a_card_with_an_integer_beyond_double_precision_is_refused_at_signing() {
+    use agentplane::peers::{AgentCard, AgentExtension, CardSignatureError, CardSigner};
+    use agentplane::policy::Ed25519Signer;
+
+    let signer = Ed25519Signer::new("did:example:publisher", &[7u8; 32]);
+
+    let m = Manifest::parse(GOOD).expect("parse");
+    let mut card = AgentCard::derive(&m, "https://plane.internal/a2a").expect("derive");
+    card.capabilities.extensions.push(AgentExtension {
+        uri: "https://example.com/ext/limits".to_owned(),
+        description: None,
+        required: false,
+        params: Some(serde_json::json!({ "sequence": 9_007_199_254_740_993_u64 })),
+    });
+
+    let refused = card.sign(&signer as &dyn CardSigner);
+    match refused {
+        Err(CardSignatureError::UnrepresentableNumber { value, path }) => {
+            assert_eq!(value, "9007199254740993");
+            assert!(
+                path.contains("sequence"),
+                "the refusal must name where the value is, not only that one \
+                 exists somewhere: {path}"
+            );
+        }
+        other => panic!(
+            "an integer beyond double precision was signed over — a conforming \
+             verifier will disagree about these bytes: {other:?}"
+        ),
+    }
 }
 
 /// An interface is selected by binding **and** version, in card order.

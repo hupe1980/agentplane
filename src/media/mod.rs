@@ -87,13 +87,33 @@ impl MediaPolicy {
     }
 
     /// Permit one exact host. Wildcards and suffix grants are rejected.
+    ///
+    /// # Panics
+    ///
+    /// If the host is empty, contains a wildcard, or is not a host a URL could
+    /// name. The last is the load-bearing one: a grant is matched against
+    /// `Url::host_str`, which the URL crate has already IDNA-normalised to
+    /// punycode — so an internationalised grant stored only lowercased would
+    /// **silently never match**, refusing every fetch to the host it was meant
+    /// to permit and reading like a wrong URL rather than a wrong grant. The
+    /// grant is therefore canonicalised through the same parser the fetch path
+    /// uses, so `allow_host("münchen.example")` and a URL to that host resolve
+    /// to one string; a host that parser rejects is refused here, loudly, at
+    /// configuration time.
     #[must_use]
     pub fn allow_host(mut self, host: impl AsRef<str>) -> Self {
-        let host = normalize_host(host.as_ref());
+        let raw = host.as_ref().trim();
         assert!(
-            !host.is_empty() && !host.contains('*'),
+            !raw.is_empty() && !raw.contains('*'),
             "media host grants must be non-empty exact hosts"
         );
+        let host = crate::netguard::canonical_host(raw).unwrap_or_else(|| {
+            panic!(
+                "media host grant '{raw}' is not a host a URL can name — an \
+                 internationalised host must be given in a form the URL parser \
+                 accepts, or it would silently never match a fetch"
+            )
+        });
         self.hosts.insert(host);
         self
     }
@@ -1016,6 +1036,47 @@ mod tests {
                 .validate_url("https://media.example.evil/a.png")
                 .is_err()
         );
+    }
+
+    /// **An internationalised host grant matches a URL to that host — and the
+    /// two agree because both go through the URL parser, not because they were
+    /// lowercased the same way.**
+    ///
+    /// The URL crate IDNA-encodes a host to punycode; a grant that was only
+    /// lowercased would store the Unicode form and never match the `xn--` the
+    /// fetch path sees, refusing every fetch it was meant to permit. Case and
+    /// a trailing dot are folded on both sides for the same reason.
+    #[test]
+    fn a_host_grant_is_canonicalised_like_the_url_it_guards() {
+        let idn = MediaPolicy::new()
+            .allow_media_type("image/png")
+            .allow_host("münchen.example");
+        assert!(
+            idn.validate_url("https://münchen.example/a.png").is_ok(),
+            "an internationalised grant did not match a URL to the same host — \
+             the grant was stored Unicode while the URL host is punycode"
+        );
+        assert!(
+            idn.validate_url("https://xn--mnchen-3ya.example/a.png")
+                .is_ok(),
+            "the punycode spelling of the granted host is refused"
+        );
+
+        let folded = MediaPolicy::new()
+            .allow_media_type("image/png")
+            .allow_host("Media.Example.");
+        assert!(
+            folded.validate_url("https://media.example/a.png").is_ok(),
+            "case and trailing-dot folding disagree between grant and URL"
+        );
+    }
+
+    /// A grant that is not a bare host is refused at configuration time, loudly,
+    /// rather than stored as something that will not match.
+    #[test]
+    #[should_panic(expected = "not a host a URL can name")]
+    fn a_grant_smuggling_a_port_is_refused() {
+        let _ = MediaPolicy::new().allow_host("media.example:8443");
     }
 
     #[test]

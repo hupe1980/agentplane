@@ -800,6 +800,11 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
         post("/tasks/not-an-id/claim", Some("bob"), &json!({})),
         post("/tasks/not-an-id/release", Some("bob"), &json!({})),
         post(
+            "/tasks/not-an-id/takeover",
+            Some("bob"),
+            &json!({ "from": "alice" }),
+        ),
+        post(
             "/tasks/not-an-id/decide",
             Some("bob"),
             &json!({ "approved": true, "reason": "" }),

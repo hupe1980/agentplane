@@ -22,9 +22,14 @@ use super::{ModelError, ModelId};
 /// * **429 and 529** are rate limiting. Separate from an ordinary refusal
 ///   because the response is different: this one is worth retrying, and it is
 ///   the one case where retrying is unambiguously safe *and* free.
-/// * **4xx** is a refusal before generating — bad request, unknown model, bad
-///   key, content filtered on the way in. Nothing was metered, and repeating is
-///   pointless rather than merely unsafe.
+/// * **408 and 425** are the transient 4xx: a request the *server* timed out
+///   or declined to process early, not one it judged wrong. Classed with the
+///   retryable failures, because `Refused` means *repeating is pointless* and
+///   these are the two 4xx codes for which repeating is the documented remedy.
+/// * **every other 4xx** is a refusal before generating — bad request, unknown
+///   model, bad key, content filtered on the way in. Nothing was metered, and
+///   repeating is pointless rather than merely unsafe: the retry loop spends
+///   no attempt on it.
 /// * **anything else** reached the provider and did not say what it cost. See
 ///   [`ModelError::Unavailable`]: guessing "free" lets a retry loop spend
 ///   against a ceiling reading zero, and guessing "fatal" makes a transient blip
@@ -33,6 +38,10 @@ pub fn classify_status(model: &ModelId, status: u16, body: &str) -> ModelError {
     let detail = format!("HTTP {status}: {}", trim(body));
     match status {
         429 | 529 => ModelError::RateLimited {
+            model: model.clone(),
+            detail,
+        },
+        408 | 425 => ModelError::Unavailable {
             model: model.clone(),
             detail,
         },
@@ -224,6 +233,28 @@ mod tests {
             let e = classify_status(&model(), s, "");
             assert_eq!(e.disposition(), Disposition::DidNotHappen);
             assert_eq!(e.usage().spend().tokens, 0);
+            assert!(
+                matches!(e, ModelError::Refused { .. }),
+                "HTTP {s} is a judgement about the request, and repeating a \
+                 judged request asks the same rule the same question"
+            );
+        }
+    }
+
+    /// 408 and 425 are the transient 4xx: the server timed out or declined to
+    /// process *early*, not judged the request wrong. Classing them as
+    /// `Refused` would make a hiccup terminal — the retry loop spends no
+    /// attempt on a refusal, and these are the two 4xx codes whose documented
+    /// remedy is the retry.
+    #[test]
+    fn the_transient_4xx_are_not_judgements() {
+        for s in [408u16, 425] {
+            let e = classify_status(&model(), s, "");
+            assert_eq!(e.disposition(), Disposition::DidNotHappen);
+            assert!(
+                matches!(e, ModelError::Unavailable { .. }),
+                "HTTP {s} is transient and must stay retryable, got: {e}"
+            );
         }
     }
 

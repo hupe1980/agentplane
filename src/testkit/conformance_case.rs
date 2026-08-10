@@ -476,6 +476,168 @@ pub async fn check_events(store: &Arc<dyn EventStore>, r: &mut Report) {
     a_waiter_is_matched_by_one_event_only(store, r).await;
     a_targeted_event_resumes_only_its_named_run(store, r).await;
     a_claimed_event_is_never_retired(store, r).await;
+    a_claimed_event_is_recoverable_by_its_own_run(store, r).await;
+    a_satisfied_waiter_does_not_claim_a_second_event(store, r).await;
+}
+
+/// **One subscription consumes one event — the match retires the waiter.**
+///
+/// `match_waiter` claims the event and hands back the subscription, and the
+/// run's resume unsubscribes *later*, in its own store call. Leaving the
+/// subscription registered in between let a second event match the same
+/// waiter and be claimed for the same run — sequentially, on any backend, no
+/// race required. The first event satisfies the wait; the second is parked
+/// under a claim nobody will consume, and a claimed event never dead-letters,
+/// so the parking is invisible: a message that should have aged out with a
+/// reason instead vanishes from every listing an operator reads.
+///
+/// So the claim must retire the subscription in the same transaction. The
+/// resumed wait re-subscribes idempotently and recovers its own claimed
+/// event through the crash-recovery arm, so nothing legitimate needs the
+/// stale registration — and the second event stays live, to be claimed by a
+/// future waiter or dead-lettered honestly.
+async fn a_satisfied_waiter_does_not_claim_a_second_event(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let run = RunId::generate();
+    let sub = Subscription {
+        run,
+        case: None,
+        effect: effect(22),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "ack".into(),
+        correlation: keys("E-ONESHOT"),
+    };
+    let _ = store.subscribe(&sub, ts(1_000)).await;
+
+    let event = |id: &str| InboundEvent {
+        source: "urn:conformance".to_owned(),
+        id: id.into(),
+        kind: "ack".into(),
+        correlation: keys("E-ONESHOT"),
+        payload: serde_json::json!({}),
+    };
+    let first = event("evt-oneshot-1");
+    let second = event("evt-oneshot-2");
+    let _ = store.buffer(&first, ts(1_001)).await;
+    match store.match_waiter(&first, ts(1_002)).await {
+        Ok(Some(matched)) if matched.run == run => {}
+        other => {
+            r.record(
+                "one-shot subscription",
+                format!("the first event did not match the waiter: {other:?}"),
+            );
+            return;
+        }
+    }
+
+    // The waiter is satisfied and merely not yet unsubscribed — the store
+    // state every delivery leaves between the claim and the resume.
+    let _ = store.buffer(&second, ts(1_003)).await;
+    if let Ok(Some(matched)) = store.match_waiter(&second, ts(1_004)).await {
+        r.record(
+            "one-shot subscription",
+            format!(
+                "a second event was claimed for {} through a subscription its                  first event already satisfied — the second is parked under a                  claim nobody will consume, and a claimed event never                  dead-letters, so it vanishes from every listing",
+                matched.run
+            ),
+        );
+    }
+}
+
+/// **The crash between the claim and the resume must not lose the message.**
+///
+/// `match_waiter` claims the event durably; resuming the run is a separate
+/// step. A process that dies between the two leaves an event claimed for a run
+/// that never saw it — the counterparty's retry is answered `Duplicate`, and a
+/// `claim_for` that filters on "unclaimed" hides the run's *own* event from
+/// it. The resumed wait then re-subscribes, finds nothing, and sleeps until
+/// its deadline breaches: a message that arrived in time, lost anyway, in the
+/// failure mode that presents as a process silently never completing.
+///
+/// So the contract is: an event already claimed **by this subscription's run**
+/// is claimable again — the same idempotence `deliver_to` grants a retried
+/// targeted delivery — while any *other* run still finds nothing, which is the
+/// half that keeps single delivery intact.
+async fn a_claimed_event_is_recoverable_by_its_own_run(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let run = RunId::generate();
+    let sub = Subscription {
+        run,
+        case: None,
+        effect: effect(20),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "ack".into(),
+        correlation: keys("E-RECLAIM"),
+    };
+    let _ = store.subscribe(&sub, ts(1_000)).await;
+
+    let event = InboundEvent {
+        source: "urn:conformance".to_owned(),
+        id: "evt-reclaim".into(),
+        kind: "ack".into(),
+        correlation: keys("E-RECLAIM"),
+        payload: serde_json::json!({"n": 1}),
+    };
+    let _ = store.buffer(&event, ts(1_001)).await;
+
+    // The durable claim — and, immediately after it, the crash.
+    match store.match_waiter(&event, ts(1_002)).await {
+        Ok(Some(matched)) if matched.run == run => {}
+        other => {
+            r.record(
+                "claim recovery",
+                format!("the waiter was not matched at all: {other:?}"),
+            );
+            return;
+        }
+    }
+
+    // The resumed wait asks again. Its own claim must not hide its own event.
+    match store.claim_for(&sub, ts(1_003)).await {
+        Ok(Some(recovered)) => {
+            if recovered.event.dedup_key() != event.dedup_key() {
+                r.record(
+                    "claim recovery",
+                    "the resumed wait recovered a different event than the one \
+                     claimed for it",
+                );
+            }
+        }
+        Ok(None) => r.record(
+            "claim recovery",
+            "an event claimed for this very run was hidden from its resumed wait — \
+             the run sleeps until its deadline breaches, and a message that arrived \
+             in time is lost to a crash between the claim and the resume",
+        ),
+        Err(e) => r.record("claim recovery", format!("claim_for failed: {e}")),
+    }
+
+    // The other half: re-claimability is scoped to the claiming run alone.
+    let stranger = Subscription {
+        run: RunId::generate(),
+        case: None,
+        effect: effect(21),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "ack".into(),
+        correlation: keys("E-RECLAIM"),
+    };
+    let _ = store.subscribe(&stranger, ts(1_004)).await;
+    if let Ok(Some(_)) = store.claim_for(&stranger, ts(1_005)).await {
+        r.record(
+            "claim recovery",
+            "another run claimed an event already claimed for its rightful waiter — \
+             recovery re-opened single delivery",
+        );
+    }
 }
 
 /// A protocol carrying a task id must not fall back to ordinary correlation.
@@ -777,6 +939,81 @@ pub async fn check_tasks(store: &Arc<dyn TaskStore>, r: &mut Report) {
     ineligibility_outranks_contention(store, r).await;
     only_the_holder_releases(store, r).await;
     the_backlog_counts_work_somebody_is_holding(store, r).await;
+    a_take_over_names_its_holder_and_keeps_the_exclusions(store, r).await;
+}
+
+/// **The absent-holder case: a take-over displaces exactly the holder it
+/// names, and eligibility does not thin because the previous reviewer left.**
+///
+/// Only the holder may release, so a task claimed by a reviewer who is not
+/// coming back was parked until its deadline breached. `take_over` is the
+/// answer, and its two guards are what this pins. The `from` argument is a
+/// compare-and-swap: a take-over decided from a stale queue view must fail
+/// rather than displace whoever holds the task *now*. And a take-over is a
+/// claim — the four-eyes exclusion refuses the proposer however the task
+/// came to be held.
+async fn a_take_over_names_its_holder_and_keeps_the_exclusions(
+    store: &Arc<dyn TaskStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let t = task(34, Some("mallory"));
+    if store.open(&t).await.is_err() {
+        r.record("tasks", "open failed");
+        return;
+    }
+    let roles = vec!["ops".to_owned()];
+    if store.claim(t.id, "alice", &roles).await.is_err() {
+        r.record("tasks", "the fixture's first claim failed");
+        return;
+    }
+
+    // A stale view: carol believes bob holds it. Nobody is displaced.
+    if store.take_over(t.id, "bob", "carol", &roles).await.is_ok() {
+        r.record(
+            "take-over",
+            "a take-over naming the wrong holder displaced whoever held the task \
+             — the compare-and-swap guard is not one",
+        );
+    }
+    // The excluded proposer cannot acquire the task by displacement either.
+    if store
+        .take_over(t.id, "alice", "mallory", &roles)
+        .await
+        .is_ok()
+    {
+        r.record(
+            "take-over",
+            "the four-eyes exclusion thinned on take-over — the proposer acquired \
+             the decision by displacing its reviewer",
+        );
+    }
+    // The legitimate handover: alice is gone, carol names her and takes over.
+    match store.take_over(t.id, "alice", "carol", &roles).await {
+        Ok(taken) if taken.assignee.as_deref() == Some("carol") => {}
+        Ok(taken) => r.record(
+            "take-over",
+            format!("the take-over succeeded but assigned {:?}", taken.assignee),
+        ),
+        Err(e) => r.record(
+            "take-over",
+            format!("an eligible take-over naming the true holder failed: {e}"),
+        ),
+    }
+    // And an unheld task takes the ordinary claim verb, not this one.
+    let open = task(35, None);
+    let _ = store.open(&open).await;
+    if store
+        .take_over(open.id, "alice", "carol", &roles)
+        .await
+        .is_ok()
+    {
+        r.record(
+            "take-over",
+            "a take-over of an unheld task succeeded — the verb for that is claim, \
+             and accepting it here hides a stale view",
+        );
+    }
 }
 
 /// Claiming a task does not answer it.
@@ -1005,6 +1242,25 @@ pub async fn check_batches(store: &Arc<dyn BatchStore>, r: &mut Report) {
     if store.open(id, "digest").await.is_err() {
         r.record("batches", "open failed");
         return;
+    }
+
+    // A record for an item nobody reserved is a refusal, not a silent no-op:
+    // both backends once returned `Ok` while writing nothing, telling the
+    // caller *recorded* over an outcome that vanished.
+    if store
+        .record(
+            id,
+            "item-unreserved",
+            &ItemOutcome::Succeeded,
+            Spend::default(),
+        )
+        .await
+        .is_ok()
+    {
+        r.record(
+            "batches",
+            "recording an unreserved item reported success while writing nothing",
+        );
     }
     let (first, second) = (RunId::generate(), RunId::generate());
     let Ok(a) = store.reserve(id, "item-001", first).await else {

@@ -828,6 +828,25 @@ impl Effect for DrawOnAuthority {
         self.authorities
             .draw(&self.id, key, self.amount, self.at)
             .await
-            .map_err(|error| EffectError::Other(error.to_string()))
+            .map_err(|error| match &error {
+                // The store could not answer. Retrying is safe *because of*
+                // the receipt dedup — even a draw whose commit acknowledgement
+                // was lost returns its original receipt on the retry — which
+                // is the same reason `recovery()` is `Retry`.
+                crate::authority::AuthorityError::Unavailable(_) => EffectError::Unavailable {
+                    driver: "authority-store".to_owned(),
+                    detail: error.to_string(),
+                },
+                // Answers, not faults: nothing was consumed, and no retry of
+                // the same draw changes a revocation, an expiry, a spent
+                // ceiling or an unknown id. `Other` stood here, and `Other`
+                // reads as **in-doubt** — so a refusal the module docs call
+                // "not retryable, ever" was retried under the full policy,
+                // reported upward as "may well have been applied", and
+                // quarantined any group it was deferred in where the cheap
+                // abort was the truthful settlement. The refusal's own message
+                // still says which of the five it was.
+                _ => EffectError::Refused(error.to_string()),
+            })
     }
 }

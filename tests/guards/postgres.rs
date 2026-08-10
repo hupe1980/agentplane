@@ -1023,3 +1023,275 @@ async fn the_erasure_lock_excludes_a_second_instance() {
     a.release(x).await.expect("release");
     b.release(y).await.expect("release");
 }
+
+/// **The run ceiling holds under the concurrency it exists for.**
+///
+/// This is the backend the guarantee is about: a per-tenant ceiling is
+/// accounted in the store precisely so it survives scaling out, redb gets
+/// that free from a single writer, and the
+/// `PostgreSQL` reserve once ran without any serialisation at all — its comment
+/// claimed the decision happened "inside the row lock the write takes", and no
+/// such lock exists for INSERTs of different rows. Under READ COMMITTED each
+/// racing statement counted its own snapshot, so two admissions racing for one
+/// remaining slot both passed `count < limit` and both landed: a ceiling of N
+/// admitting N+k under exactly the load a ceiling is for.
+///
+/// Sixteen tasks race for four slots on one pool, which is the shape a
+/// sequential battery structurally cannot produce — and why this file's own
+/// header says a sequential test proves the result, not the reason.
+#[tokio::test]
+async fn postgres_run_ceiling_holds_under_concurrent_admission() {
+    use agentplane::quota::{QuotaError, QuotaStore};
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let base = PostgresStore::connect(&url).await.expect("connect");
+    let tenant = agentplane::core::TenantId::new("quota-race").expect("tenant");
+    let store = Arc::new(base.for_tenant(tenant));
+    let (limit, racers) = (4u32, 16usize);
+    let at = agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("time");
+
+    let mut admissions = tokio::task::JoinSet::new();
+    for _ in 0..racers {
+        let store = Arc::clone(&store);
+        admissions.spawn(async move {
+            store
+                .reserve(agentplane::core::RunId::generate(), Some(limit), at)
+                .await
+        });
+    }
+    let mut admitted = 0u32;
+    let mut refused = 0u32;
+    while let Some(outcome) = admissions.join_next().await {
+        match outcome.expect("no task panicked") {
+            Ok(()) => admitted += 1,
+            Err(QuotaError::TooManyRuns { .. }) => refused += 1,
+            Err(other) => panic!("an admission failed for a non-ceiling reason: {other}"),
+        }
+    }
+
+    assert_eq!(
+        admitted, limit,
+        "{admitted} admissions landed through a ceiling of {limit} — the count \
+         and the insert are not serialised, and the ceiling yields under \
+         exactly the load it exists for ({refused} refused)"
+    );
+    let running = QuotaStore::running(store.as_ref()).await.expect("gauge");
+    assert_eq!(
+        running, limit,
+        "the running set disagrees with the admissions that were granted"
+    );
+}
+
+/// **Concurrent draws serialise on the balance row's lock — corroborated as a
+/// race, not assumed from the statement shape.**
+///
+/// The run-ceiling next door made the case for running these: its comment
+/// claimed a serialisation its statement did not have, and every sequential
+/// test agreed with the comment. The draw's `FOR UPDATE` is the real thing —
+/// racing sixteen instances at a ceiling that affords exactly three of them
+/// is what says so with evidence rather than by reading the SQL.
+#[tokio::test]
+async fn postgres_authority_draws_serialise_on_the_row_lock() {
+    use agentplane::authority::{AuthorityError, AuthorityId, AuthorityStore, StandingAuthority};
+    use agentplane::core::{Phase, Spend, StepId};
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let base = PostgresStore::connect(&url).await.expect("connect");
+    let tenant = agentplane::core::TenantId::new("authority-race").expect("tenant");
+    let store = Arc::new(base.for_tenant(tenant));
+
+    store
+        .issue(&StandingAuthority::new(
+            "mandate-race",
+            "approval:RACE-1",
+            Spend::money(100),
+        ))
+        .await
+        .expect("issue");
+
+    let at = agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("time");
+    let mut draws = tokio::task::JoinSet::new();
+    for n in 0..16u32 {
+        let store = Arc::clone(&store);
+        draws.spawn(async move {
+            // A distinct dispatch key per draw: sixteen *different* purchases,
+            // not sixteen retries of one.
+            let key = agentplane::core::EffectKey::for_effect(
+                StepId(0),
+                Phase::Forward,
+                n,
+                1,
+                &agentplane::core::EffectDescriptor::new(
+                    "authority.draw",
+                    serde_json::json!({ "purchase": n }),
+                ),
+            );
+            store
+                .draw(&AuthorityId::new("mandate-race"), key, Spend::money(30), at)
+                .await
+        });
+    }
+    let (mut landed, mut refused) = (0u32, 0u32);
+    while let Some(outcome) = draws.join_next().await {
+        match outcome.expect("no task panicked") {
+            Ok(_) => landed += 1,
+            Err(AuthorityError::Exhausted { .. }) => refused += 1,
+            Err(other) => panic!("a draw failed for a non-ceiling reason: {other}"),
+        }
+    }
+    assert_eq!(
+        (landed, refused),
+        (3, 13),
+        "a €100 mandate affords exactly three €30 draws, however they race"
+    );
+    let state = store
+        .state(&AuthorityId::new("mandate-race"))
+        .await
+        .expect("state")
+        .expect("issued");
+    assert_eq!(
+        state.drawn,
+        Spend::money(90),
+        "the ledger and the admissions disagree"
+    );
+    assert_eq!(state.draws, 3);
+}
+
+/// **Sixteen reviewers race one task; one holds it.** The claim is a single
+/// guarded `UPDATE`, and this is the evidence rather than the SQL-reading.
+#[tokio::test]
+async fn postgres_task_claim_admits_exactly_one_reviewer() {
+    use agentplane::case::{ClaimError, TaskStore};
+    use agentplane::core::{
+        Justification, OnExpiry, Phase, Priority, RunId, StepId, Task, TaskId, TaskState,
+    };
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let base = PostgresStore::connect(&url).await.expect("connect");
+    let tenant = agentplane::core::TenantId::new("task-race").expect("tenant");
+    let store = Arc::new(base.for_tenant(tenant));
+
+    let run = RunId::generate();
+    let effect = agentplane::core::EffectKey::for_effect(
+        StepId(0),
+        Phase::Forward,
+        0,
+        1,
+        &agentplane::core::EffectDescriptor::new("approval", serde_json::json!({})),
+    );
+    let task = Task {
+        id: TaskId::derive(run, effect),
+        run,
+        case: None,
+        kind: "approval".into(),
+        justification: Justification::new("needs a person", serde_json::json!({})),
+        candidate_roles: vec!["ops".into()],
+        assignee: None,
+        priority: Priority::Normal,
+        state: TaskState::Open,
+        on_expiry: OnExpiry::Deny,
+        excluded_actors: Vec::new(),
+        created_at: agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("time"),
+        due_at: None,
+    };
+    store.open(&task).await.expect("open");
+
+    let roles = vec!["ops".to_owned()];
+    let mut claims = tokio::task::JoinSet::new();
+    for n in 0..16 {
+        let store = Arc::clone(&store);
+        let roles = roles.clone();
+        let id = task.id;
+        claims.spawn(async move { store.claim(id, &format!("reviewer-{n}"), &roles).await });
+    }
+    let (mut held, mut contended) = (0u32, 0u32);
+    while let Some(outcome) = claims.join_next().await {
+        match outcome.expect("no task panicked") {
+            Ok(_) => held += 1,
+            Err(ClaimError::AlreadyClaimed { .. }) => contended += 1,
+            Err(other) => panic!("a claim failed for a non-contention reason: {other}"),
+        }
+    }
+    assert_eq!(
+        (held, contended),
+        (1, 15),
+        "two reviewers both believe they hold one task"
+    );
+}
+
+/// **Two sweepers partition the due timers; no wake-up fires twice.** The
+/// `SKIP LOCKED` claim, raced rather than read.
+#[tokio::test]
+async fn postgres_two_sweepers_partition_the_due_timers() {
+    use agentplane::case::TimerStore;
+    use agentplane::core::{Phase, RunId, StepId, Timer};
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let base = PostgresStore::connect(&url).await.expect("connect");
+    let tenant = agentplane::core::TenantId::new("timer-race").expect("tenant");
+    let store = Arc::new(base.for_tenant(tenant));
+
+    let due = agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("time");
+    let mut armed = std::collections::BTreeSet::new();
+    for n in 0..12u8 {
+        let timer = Timer {
+            run: RunId::generate(),
+            case: None,
+            effect: agentplane::core::EffectKey::for_effect(
+                StepId(0),
+                Phase::Forward,
+                u32::from(n),
+                1,
+                &agentplane::core::EffectDescriptor::new("sleep", serde_json::json!({ "n": n })),
+            ),
+            step: StepId(0),
+            phase: Phase::Forward,
+            fire_at: due,
+        };
+        armed.insert(timer.run);
+        store.arm(&timer).await.expect("arm");
+    }
+
+    let later = agentplane::core::Timestamp::from_unix_timestamp(1_760_000_100).expect("time");
+    let (a, b) = tokio::join!(
+        {
+            let store = Arc::clone(&store);
+            async move { store.claim_due(later, 12).await.expect("sweep a") }
+        },
+        {
+            let store = Arc::clone(&store);
+            async move { store.claim_due(later, 12).await.expect("sweep b") }
+        }
+    );
+    let claimed_a: std::collections::BTreeSet<_> = a.iter().map(|t| t.run).collect();
+    let claimed_b: std::collections::BTreeSet<_> = b.iter().map(|t| t.run).collect();
+    assert!(
+        claimed_a.is_disjoint(&claimed_b),
+        "two sweepers claimed the same wake-up — the run it belongs to resumes twice"
+    );
+    let union: std::collections::BTreeSet<_> = claimed_a.union(&claimed_b).copied().collect();
+    assert_eq!(
+        union, armed,
+        "the two sweeps together must fire every due timer exactly once"
+    );
+}

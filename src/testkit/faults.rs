@@ -105,6 +105,8 @@ pub struct Schedule {
     every: Option<(u64, Fault)>,
     at: Vec<(u64, Fault)>,
     on_kind: Vec<(&'static str, Fault)>,
+    unreadable: Vec<RunId>,
+    leafless: Vec<RunId>,
 }
 
 impl Schedule {
@@ -116,6 +118,8 @@ impl Schedule {
             every: None,
             at: Vec::new(),
             on_kind: Vec::new(),
+            unreadable: Vec::new(),
+            leafless: Vec::new(),
         }
     }
 
@@ -130,7 +134,38 @@ impl Schedule {
             every: None,
             at: Vec::new(),
             on_kind: Vec::new(),
+            unreadable: Vec::new(),
+            leafless: Vec::new(),
         }
+    }
+
+    /// Make one run unreadable, as a damaged page or a lost shard would.
+    ///
+    /// Reads had no fault injection at all, and the omission had a shape: this
+    /// module was written for the append path, where the interesting failure is
+    /// a write that lands while the caller is told it did not. But a *reader* of
+    /// history — an audit, an export, a recovery — has its own bad state, and it
+    /// is one a healthy store never produces on request, so a test that wants it
+    /// cannot get there by asking for a run that does not exist. Both backends
+    /// answer an unknown run with an empty read rather than an error, which is
+    /// correct and is exactly why the absent case needs injecting.
+    #[must_use]
+    pub fn unreadable(mut self, run: RunId) -> Self {
+        self.unreadable.push(run);
+        self
+    }
+
+    /// Answer no inclusion for one run, as a log whose leaf was dropped would.
+    ///
+    /// A healthy store cannot produce this state on request — sealing always
+    /// writes the leaf — and it is precisely the state an audit exists to name:
+    /// a run whose own records carry a sealing conclusion, in a log that no
+    /// longer commits to it. Without injection, the finding for the most
+    /// serious integrity state an audit reports would be reachable by no test.
+    #[must_use]
+    pub fn leafless(mut self, run: RunId) -> Self {
+        self.leafless.push(run);
+        self
     }
 
     /// Fail the *n*-th append (1-based) with `fault`.
@@ -293,6 +328,11 @@ impl JournalStore for Faulty {
     }
 
     async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
+        if self.schedule.unreadable.contains(&run) {
+            return Err(StoreError::Backend(format!(
+                "injected: run {run} cannot be read"
+            )));
+        }
         self.inner.read(run, from).await
     }
 
@@ -304,8 +344,12 @@ impl JournalStore for Faulty {
         self.inner.runs_by_outcome(outcome, limit).await
     }
 
-    async fn recent_runs(&self) -> Result<Vec<(RunId, u64)>, StoreError> {
-        self.inner.recent_runs().await
+    async fn recent_runs(
+        &self,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError> {
+        self.inner.recent_runs(after, limit).await
     }
 
     async fn case_history(
@@ -347,6 +391,9 @@ impl JournalStore for Faulty {
         &self,
         run: RunId,
     ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
+        if self.schedule.leafless.contains(&run) {
+            return Ok(None);
+        }
         self.inner.inclusion_proof(run).await
     }
 

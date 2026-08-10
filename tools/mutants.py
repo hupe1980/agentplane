@@ -590,6 +590,52 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "            keys.sort_unstable_by(|a, b| utf16_order(a, b));\n",
         "",
     ),
+    # Doubles fall back to serde_json's formatting — `1e30` where RFC 8785
+    # says `1e+30` — so a signed Agent Card carrying a number verifies against
+    # this crate and is rejected by every conforming verifier. The divergence
+    # is invisible to any test whose numbers happen to agree under both rules,
+    # which is most of them.
+    "DoublesFallBackToSerde": (
+        "src/core/canon.rs",
+        "canonical_bytes_carry_rfc_8785_numbers",
+        "doubles are written by serde_json instead of ECMAScript's rules, so "
+        "canonical bytes disagree with every conforming JCS implementation "
+        "exactly where the two formatters differ",
+        """    if let Value::Number(n) = value
+        && n.is_f64()
+    {""",
+        """    if let Value::Number(n) = value
+        && n.is_f64()
+        && false
+    {""",
+    ),
+    # The exponent loses its mandatory sign — which is serde_json's own form,
+    # so the mutated output is precisely the plausible-looking wrong answer
+    # that survived here for as long as the number rules went unimplemented.
+    "AnExponentDropsItsSign": (
+        "src/core/canon.rs",
+        "doubles_format_per_rfc_8785",
+        "a positive exponent is written without the sign ECMAScript mandates, "
+        "producing serde_json's `1e21` where the standard and every "
+        "conforming verifier write `1e+21`",
+        """        out.push(if e < 0 { b'-' } else { b'+' });""",
+        """        if e < 0 {
+            out.push(b'-');
+        }""",
+    ),
+    # Card signing stops walking the payload for integers no double can hold,
+    # so a deployment's extension params can put 2^53+1 into a signed card —
+    # this crate signs exact bytes, a conforming verifier recomputes rounded
+    # ones, and each side is correct under its own reading.
+    "AnUnrepresentableIntegerIsSigned": (
+        "src/peers/card_sig.rs",
+        "a_card_with_an_integer_beyond_double_precision_is_refused_at_signing",
+        "the card signer no longer refuses integers outside ±2^53, so a "
+        "signature is taken over bytes a conforming JCS verifier will not "
+        "reproduce",
+        """    representable(&value, "")?;""",
+        "",
+    ),
     # ── Cedar adapter ───────────────────────────────────────────────────────
     "ANullDeniesEverything": (
         "src/policy/cedar.rs",
@@ -781,6 +827,25 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "an audit that checked nothing reports itself as sound",
         "    if evidence.prior.is_none() {",
         "    if false {",
+    ),
+    "AnOpenRunAuditsAsDeleted": (
+        "src/audit.rs",
+        "a_missing_leaf_is_a_finding_only_for_a_sealed_conclusion",
+        "any conclusion — including failed, which stays open for resume — is "
+        "treated as sealed, so every healthy resumable run audits as an "
+        "integrity finding: a false alarm on every pass, which is how the true "
+        "alarm stops being believed",
+        """            .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o));""",
+        """            .is_some();""",
+    ),
+    "AMissingLeafAuditsAsSound": (
+        "src/audit.rs",
+        "a_missing_leaf_is_a_finding_only_for_a_sealed_conclusion",
+        "a run whose own records carry a sealing conclusion but which the log "
+        "holds no leaf for is reported sound — history the log no longer "
+        "commits to, waved through by the audit that exists to name it",
+        """            .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o));""",
+        """            .is_some_and(|_| false);""",
     ),
     "TheAuditIgnoresThePriorCheckpoint": (
         "src/audit.rs",
@@ -1220,6 +1285,198 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "submission claims to start at 93 and every witness refuses it",
         "        let url = format!(\"{}/add-checkpoint\", self.prefix);",
         "        let old_size = checkpoint.size.saturating_sub(proof.len() as u64);\n        let url = format!(\"{}/add-checkpoint\", self.prefix);",
+    ),
+    "AParseStepAcceptsProseArguments": (
+        "src/runtime/declarative.rs",
+        "a_parse_step_carrying_args_is_refused",
+        "a plan step that is a parse silently ignores the `args` it carries — "
+        "a field that parses and is never read, manufacturing confidence in "
+        "arguments nothing executes, in the artifact whose whole point is that "
+        "what is accepted is what runs",
+        """                    if step.args.is_some() {""",
+        """                    if step.args.is_some() && false {""",
+    ),
+    "ATakeOverDisplacesWhoeverHoldsIt": (
+        "src/store/redb_tasks.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "the take-over ignores which holder the caller named, so a decision "
+        "made from a stale queue view displaces whoever holds the task now — "
+        "and an unheld task is 'taken over' where the honest verb is claim",
+        """                        } else if task.assignee.as_deref() != Some(from.as_str()) {""",
+        """                        } else if task.assignee.is_none()
+                            && task.assignee.as_deref() != Some(from.as_str())
+                        {""",
+    ),
+    "ATakeOverThinsTheLadder": (
+        "src/store/redb_tasks.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "a take-over skips the eligibility ladder, so the four-eyes exclusion "
+        "thins the moment a reviewer leaves — the proposer acquires the "
+        "decision on their own action by displacing its reviewer",
+        """                        // A take-over is a claim: the ladder does not thin
+                        // because the previous reviewer left.
+                        if let Err(refused) = eligible(&task, id, &actor, &roles) {
+                            Err(refused)
+                        } else if task.assignee.as_deref() != Some(from.as_str()) {""",
+        """                        // A take-over is a claim: the ladder does not thin
+                        // because the previous reviewer left.
+                        if let Err(refused) = eligible(&task, id, &actor, &roles).or(Ok::<(), ClaimError>(())) {
+                            Err(refused)
+                        } else if task.assignee.as_deref() != Some(from.as_str()) {""",
+    ),
+    "AHostGrantSkipsIdnaCanonicalisation": (
+        "src/netguard/mod.rs",
+        "a_host_grant_is_canonicalised_like_the_url_it_guards",
+        "a host grant is returned only lowercased, not put through the URL "
+        "parser both fetch and push paths use — so an internationalised grant "
+        "is stored in its Unicode form and never matches the punycode a URL "
+        "host carries, silently refusing every request it was meant to permit",
+        """    Some(url.host_str()?.trim_end_matches('.').to_ascii_lowercase())""",
+        """    Some(raw.trim().trim_end_matches('.').to_ascii_lowercase())""",
+    ),
+    "ASatisfiedWaiterKeepsMatching": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "the broadcast match claims the event but leaves the subscription "
+        "registered until the run's own unsubscribe, so a second event matches "
+        "the same satisfied waiter — sequentially, no race required — and is "
+        "parked under a claim nobody consumes, invisible to dead-lettering "
+        "and to every listing an operator reads",
+        """                            for (ns, val, sub_kind, created) in retired {""",
+        """                            for (ns, val, sub_kind, created) in retired.into_iter().take(0) {""",
+    ),
+    "AClaimedEventHidesFromItsOwnRun": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "claim_for filters to unclaimed events only, so a crash between "
+        "match_waiter's durable claim and the run's resume leaves the message "
+        "claimed for a run that can never see it — the counterparty's retry is "
+        "answered Duplicate, the resumed wait finds nothing, and a message "
+        "that arrived in time is lost to a deadline breach",
+        """                        if row.0 == kind && (row.3 == 0 || row.7 == run) && row.4 == 0 {""",
+        """                        if row.0 == kind && row.3 == 0 && row.4 == 0 {""",
+    ),
+    "ARevokedDrawReadsAsADoubt": (
+        "src/runtime/effects.rs",
+        "a_revoked_draw_is_answered_once_and_never_retried",
+        "every authority refusal flattens to an error that reads as in-doubt, "
+        "so a draw against a revoked mandate — 'not retryable, ever', per its "
+        "own docs — is retried under the full policy, reported as a call that "
+        "may have landed, and quarantines any group it was deferred in where "
+        "the cheap abort was the truthful settlement",
+        """                _ => EffectError::Refused(error.to_string()),""",
+        """                _ => EffectError::Other(error.to_string()),""",
+    ),
+    "AForgetSeversItsIncomingLineage": (
+        "src/store/redb_memory.rs",
+        "redb_satisfies_the_memory_store_contract",
+        "an individual forget deletes the edges pointing at the memory it "
+        "tombstones, so a later cascade from further upstream cannot route "
+        "through it — a summary-of-a-summary is sheltered from its poisoned "
+        "root's erasure by the correction that was supposed to help",
+        """                // Edges deliberately stay — **both directions**. Outgoing,""",
+        """                {
+                    let mut edges = w.open_table(DERIVED).map_err(|e| be(&e))?;
+                    let stale: Vec<String> = edges
+                        .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                        .map_err(|e| be(&e))?
+                        .filter_map(|entry| match entry {
+                            Ok((key, _)) if key.value().2 == id => {
+                                Some(Ok(key.value().1.to_owned()))
+                            }
+                            Ok(_) => None,
+                            Err(error) => Some(Err(be(&error))),
+                        })
+                        .collect::<Result<_, StoreError>>()?;
+                    for source_id in stale {
+                        edges
+                            .remove((tenant.as_str(), source_id.as_str(), id.as_str()))
+                            .map_err(|e| be(&e))?;
+                    }
+                }
+                // Edges deliberately stay — **both directions**. Outgoing,""",
+    ),
+    "ACascadeCountsItsTombstones": (
+        "src/store/redb_memory.rs",
+        "redb_satisfies_the_memory_store_contract",
+        "the cascade reports every node it visited as erased, tombstones "
+        "included, so the count an erasure request is answered with claims "
+        "removals this call did not perform",
+        """                    if previous.is_some() || !versions.is_empty() {
+                        erased += 1;
+                    }""",
+        """                    erased += 1;
+                    if previous.is_some() || !versions.is_empty() {
+                    }""",
+    ),
+    "AnAnswerIsRetriedAsAFault": (
+        "src/runtime/ctx.rs",
+        "a_refusal_that_is_an_answer_is_not_retried",
+        "a refusal the peer meant as an answer — unknown model, malformed "
+        "request — is retried under the full policy with backoff, burning "
+        "every permitted attempt asking the same rule the same question and "
+        "teaching the operator that retries are noise",
+        """                if permanent {""",
+        """                if permanent && false {""",
+    ),
+    "ARefusalsPermanenceIsNotRecorded": (
+        "src/runtime/ctx.rs",
+        "a_refusal_that_is_an_answer_is_not_retried",
+        "the permanence of a refusal is dropped from the failure record, so "
+        "the live run stops after one attempt while a strict replay — which "
+        "recomputes the retry decision from history — expects the retry the "
+        "live run never made and reports divergence over a faithful history",
+        """                        // An answer, not a fault — recorded so the replayed
+                        // retry decision stops where the live one did.
+                        permanent: matches!(e, crate::core::EffectError::Refused(_)),""",
+        """                        // An answer, not a fault — recorded so the replayed
+                        // retry decision stops where the live one did.
+                        permanent: false,""",
+    ),
+    "ATransientTimeoutIsAJudgement": (
+        "src/model/wire.rs",
+        "the_transient_4xx_are_not_judgements",
+        "HTTP 408 and 425 — the server timing out or declining to process "
+        "early — are classed as the provider judging the request wrong, so a "
+        "hiccup becomes terminal: the retry loop spends no attempt on a "
+        "refusal, and the two 4xx codes whose documented remedy is the retry "
+        "are the two that never get one",
+        """        408 | 425 => ModelError::Unavailable {
+            model: model.clone(),
+            detail,
+        },""",
+        """        408 | 425 => ModelError::Refused {
+            model: model.clone(),
+            detail,
+        },""",
+    ),
+    "AShrunkenLogIsReportedAsRoutine": (
+        "src/journal/witness_http.rs",
+        "a_shrunken_log_is_an_integrity_finding_not_a_routine_one",
+        "a witness answering 400 — 'the log you offer is smaller than where I "
+        "am' — is reported as routine unavailability rather than a shrink, so "
+        "runs deleted from a log the witness already cosigned never reach the "
+        "integrity bucket and nobody is paged for the one event a witness exists "
+        "to catch",
+        """            400 if old_size > checkpoint.size => Err(WitnessError::Shrank {
+                origin: checkpoint.origin.clone(),
+                seen: old_size,
+                offered: checkpoint.size,
+            }),""",
+        """            400 if old_size > checkpoint.size => {
+                Err(WitnessError::Unavailable(format!("{url}: refused")))
+            }""",
+    ),
+    "AConfusedWitnessInventsAShrink": (
+        "src/journal/witness_http.rs",
+        "an_off_spec_400_cannot_invent_a_shrink",
+        "the guard on the 400 arm is dropped, so a witness answering 400 for a "
+        "request whose own numbers show no shrink — an off-spec reply, a "
+        "mis-parse, a proxy's error page — manufactures a fork-class alert, and "
+        "an alert a counterparty can manufacture is one an operator learns to "
+        "ignore",
+        """            400 if old_size > checkpoint.size => Err(WitnessError::Shrank {""",
+        """            400 if old_size <= u64::MAX => Err(WitnessError::Shrank {""",
     ),
     "AStaleWitnessCursorIsCalledAFork": (
         "src/journal/witness_http.rs",
@@ -3550,8 +3807,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/store/redb_tasks.rs",
         "redb_satisfies_the_case_layer_contracts",
         "a barred reviewer is told the task is held rather than that it is not theirs",
-        "                        if task.excluded_actors.iter().any(|a| a == &actor) {",
-        "                        if task.assignee.is_none()\n                            && task.excluded_actors.iter().any(|a| a == &actor)\n                        {",
+        "    if task.excluded_actors.iter().any(|a| a == actor) {",
+        "    if task.assignee.is_none() && task.excluded_actors.iter().any(|a| a == actor) {",
     ),
     "AnyoneCanReleaseAClaim": (
         "src/store/redb_tasks.rs",
@@ -3908,6 +4165,188 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
             .expect("a plan holds only strings, integers, enums, digests and JSON values");""",
         """        let value = serde_json::to_value(&self.nodes)
             .expect("a plan holds only strings, integers, enums, digests and JSON values");""",
+    ),
+    "TheDiscoveryIndexIgnoresItsCursor": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "the discovery index ignores the cursor it was given and restarts from "
+        "the newest run every time, so a paged listing serves page one forever "
+        "and every run past the first page is unreachable",
+        """            let rows = match &end {
+                Some((updated, key)) => activity
+                    .range((tenant.as_str(), 0, "")..(tenant.as_str(), *updated, key.as_str()))
+                    .map_err(|e| be(&e))?,""",
+        """            let rows = match &None::<(u64, String)> {
+                Some((updated, key)) => activity
+                    .range((tenant.as_str(), 0, "")..(tenant.as_str(), *updated, key.as_str()))
+                    .map_err(|e| be(&e))?,""",
+    ),
+    "TheFilterScanHasNoCeiling": (
+        "src/api/a2a.rs",
+        "a_filter_past_its_scan_budget_is_refused_naming_the_lever",
+        "a content-filtered ListTasks reads every candidate journal in the "
+        "tenant with no ceiling, so any authenticated peer buys a scan of the "
+        "whole store per request by adding one field — the cost the paged "
+        "index exists to remove, reintroduced through the filter",
+        """            if content_filtered && reads > server.filter_scan_budget {""",
+        """            if content_filtered && reads > usize::MAX {""",
+    ),
+    "TheTaskTotalCountsHiddenTasks": (
+        "src/api/a2a.rs",
+        "list_tasks_omits_tasks_the_caller_cannot_read",
+        "`totalSize` is counted before the permission check, so the reply "
+        "discloses how many tasks exist that the caller was just refused — the "
+        "listing hides the rows and the number reports them",
+        """            if !server.permits(&caller, action::TASK_READ, &run.to_string()) {
+                continue;
+            }
+            if after.is_some_and(|cutoff| {""",
+        """            if !server.permits(&caller, action::TASK_READ, &run.to_string()) {
+                matched += 1;
+                continue;
+            }
+            if after.is_some_and(|cutoff| {""",
+    ),
+    "ARestoreSealsInFileOrder": (
+        "src/export.rs",
+        "a_restored_store_rebuilds_the_same_checkpoint",
+        "a restore seals runs in whatever order the export listed them rather "
+        "than in the log's own order, so the Merkle tree is rebuilt over the "
+        "same leaves in a different sequence — a store holding identical history "
+        "under a root no checkpoint or witness cosignature matches",
+        """    sealed.sort_by_key(|r| r.index);""",
+        """    sealed.reverse();""",
+    ),
+    "ARestoreFlattensTheEpoch": (
+        "src/export.rs",
+        "a_run_that_changed_hands_restores_with_its_epochs",
+        "a restore writes every record under one epoch instead of the epoch it "
+        "was sealed with, so any run that ever changed hands rehashes — and "
+        "those are exactly the runs a failover produced, which is the history a "
+        "disaster recovery is most likely to be carrying",
+        """            let appends: Vec<Append> = batch.iter().cloned().map(Append::from_body).collect();
+            records += appends.len();
+            store.append(epoch, appends).await?;""",
+        """            let appends: Vec<Append> = batch.iter().cloned().map(Append::from_body).collect();
+            records += appends.len();
+            store.append(1, appends).await?;""",
+    ),
+    "AnExportOmitsItsLogPositions": (
+        "src/export.rs",
+        "a_run_removed_from_the_middle_is_caught_by_the_rebuilt_root",
+        "the export carries no Merkle log position for a sealed run, so a "
+        "verifier can walk every chain and still not notice a whole run deleted "
+        "from the middle — each surviving chain is internally consistent, and "
+        "only the rebuilt tree can see the gap",
+        """        let placed = store.inclusion_proof(run).await.ok().flatten();""",
+        """        let placed: Option<crate::journal::Inclusion> = None;""",
+    ),
+    "AVerifiedExportSkipsTheRehash": (
+        "src/export.rs",
+        "an_edited_record_fails_to_recompute",
+        "verification trusts the hash a record carries instead of recomputing "
+        "it, so an export edited after it was written verifies clean — the "
+        "chain becomes a claim the file makes about itself",
+        """            if record.hash != claimed {""",
+        """            if false && record.hash != claimed {""",
+    ),
+    "AnExportDropsAnUnreadableRun": (
+        "src/export.rs",
+        "a_run_that_cannot_be_read_is_named_in_the_trailer",
+        "a run the export could not read is skipped without being named, so a "
+        "partial export is shaped exactly like a complete one — and the run "
+        "that fails to read is not a random one",
+        """            Err(e) => unreadable.push(Unreadable {
+                run,
+                reason: e.to_string(),
+            }),""",
+        """            Err(_) => {}""",
+    ),
+    "AForeignFormatVersionVerifiesAnyway": (
+        "src/export.rs",
+        "an_export_of_a_foreign_format_version_is_named_not_guessed_at",
+        "the verifier never looks at the header's format version, so a future "
+        "format is parsed as far as its lines happen to look familiar and the "
+        "report describes a file this build never understood — the version a "
+        "reader was told to pin, consulted by nobody",
+        """    if version != Some(u64::from(FORMAT_VERSION)) {""",
+        """    if version != Some(u64::from(FORMAT_VERSION)) && false {""",
+    ),
+    "ARestoreRebuildsAForeignFormat": (
+        "src/export.rs",
+        "an_export_of_a_foreign_format_version_is_named_not_guessed_at",
+        "a restore accepts a format version this build does not read, and "
+        "`parse` skips what it does not recognise — so it rebuilds whatever "
+        "subset happened to look familiar and calls it a history",
+        """    if parsed.version != Some(u64::from(FORMAT_VERSION)) {""",
+        """    if parsed.version != Some(u64::from(FORMAT_VERSION)) && false {""",
+    ),
+    "ADuplicatedLogPositionIsARootMismatch": (
+        "src/export.rs",
+        "a_duplicated_log_position_is_named_rather_than_left_as_a_root_mismatch",
+        "the verifier stops holding run blocks' log positions to the "
+        "contiguous 0..N the checkpoint commits to, so an export spliced from "
+        "two histories rebuilds a tree over duplicated positions and reports "
+        "a bare root mismatch — true, and useless to the auditor asking which "
+        "runs to distrust",
+        """        let contiguous = leaves
+            .iter()
+            .enumerate()
+            .all(|(at, (index, _))| u64::try_from(at) == Ok(*index));""",
+        """        let contiguous = true;""",
+    ),
+    "ARelabelledRunBlockVerifies": (
+        "src/export.rs",
+        "a_relabelled_run_block_is_caught_by_its_own_records",
+        "the verifier never compares a record's own run id against the block it "
+        "sits under, so an export that files run B's records and B's leaf under "
+        "run A's id passes every check — chain, leaf and Merkle all verify B's "
+        "bytes, and only the label lied, which is what a reader looks a run up "
+        "by",
+        """    if body.run != current {""",
+        """    if false && body.run != current {""",
+    ),
+    "AnExportStampsALeafPastItsCheckpoint": (
+        "src/export.rs",
+        "a_run_sealed_after_the_checkpoint_exports_as_still_open",
+        "a run sealed after the export's checkpoint was taken is stamped with a "
+        "log position the header does not commit to, so the export disagrees "
+        "with its own first line and the verifier reports tampering where there "
+        "was only time — a race every busy plane hits",
+        """        let placed = placed.filter(|i| i.index < log_size);""",
+        """        let placed = placed.filter(|i| i.index <= u64::MAX);""",
+    ),
+    "AnOpenRunsFindingsNeverReachItsVerdict": (
+        "src/export.rs",
+        "an_edited_record_in_an_open_run_is_not_sound",
+        "per-record findings never reach the run's verdict, so an edited record "
+        "in an open run — which has no leaf to catch it — produces a finding "
+        "and leaves the run listed sound, two halves of one report "
+        "contradicting each other",
+        """    let mut ok = pass.clean;""",
+        """    let mut ok = true;""",
+    ),
+    "ASealedOutcomeFallsOffTheExportList": (
+        "src/runtime/executor.rs",
+        "the_sealed_outcome_list_agrees_with_the_sealing_rule",
+        "a sealing outcome is dropped from SEALED_OUTCOMES, so the export CLI's "
+        "default sweep silently omits every run sealed with it — and the runs "
+        "dropped are quarantined ones, exactly the runs an auditor came for",
+        """pub const SEALED_OUTCOMES: &[&str] = &[
+    "succeeded",
+    "quarantined",""",
+        """pub const SEALED_OUTCOMES: &[&str] = &[
+    "succeeded",""",
+    ),
+    "AnExportHasNoTrailer": (
+        "src/export.rs",
+        "an_interrupted_export_is_missing_its_trailer",
+        "the export is written without its closing trailer, so a file cut short "
+        "by a full disk or a killed pipe is indistinguishable from a whole one "
+        "to a reader who does not have the source to count against",
+        """    writeln!(out, "{}", to_line(&trailer)?)?;
+    out.flush()?;""",
+        """    out.flush()?;""",
     ),
     "TheOrdinaryLookupCrossesTenants": (
         "src/api/mod.rs",

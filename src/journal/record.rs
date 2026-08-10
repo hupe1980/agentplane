@@ -264,6 +264,16 @@ pub enum RecordKind {
         /// retry taken at the time, and any operator judgement afterwards. A
         /// message can be reworded; a disposition is a fact about the run.
         disposition: Disposition,
+        /// Whether the refusal is an **answer** rather than a fault — the peer
+        /// understood the request and said no, so no retry can change it.
+        ///
+        /// On the record for the same reason the disposition is: the retry
+        /// decision is recomputed on replay, and a replay that could not see
+        /// this bit would expect a retry the live run never made and report
+        /// divergence over a faithful history. Skipped when false, so the
+        /// ordinary failure costs no bytes and no hash input.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        permanent: bool,
     },
 
     /// A limit refused an operation before it started.
@@ -858,6 +868,29 @@ impl Append {
     pub fn effect(mut self, k: EffectKey) -> Self {
         self.effect_key = Some(k);
         self
+    }
+
+    /// Rebuild the append that produced a body.
+    ///
+    /// The inverse of the crate-private `into_body`, and the whole of what a
+    /// restore needs: `seq` and `epoch` are supplied by the write path, and
+    /// everything else travels here. Written as a function rather than left to
+    /// each caller because the field list is the thing that would drift — a
+    /// restore that forgot `phase` would replay a compensation as a forward
+    /// record, and the chain would hash differently for a reason no diff shows.
+    ///
+    /// Ungated, unlike `into_body` below: a restore reads an export rather than
+    /// a store, so it is reachable in a build with no backend compiled in.
+    #[must_use]
+    pub fn from_body(body: RecordBody) -> Self {
+        Self {
+            run: body.run,
+            case: body.case,
+            step: body.step,
+            phase: body.phase,
+            effect_key: body.effect_key,
+            kind: body.kind,
+        }
     }
 
     /// Materialize into a body at a given position.

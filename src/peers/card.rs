@@ -424,9 +424,9 @@ pub struct ExtendedTool {
 ///
 /// The figures serialize as **strings**, for two reasons that happen to agree:
 /// `ProtoJSON` — the encoding A2A documents are defined in — renders 64-bit
-/// integers as strings, and a signed card must carry no JSON numbers because
-/// ECMAScript number formatting is the one JCS rule this crate does not
-/// implement (see `peers::card_sig`).
+/// integers as strings, and a `u64` can exceed ±2⁵³, past which JCS reads two
+/// distinct integers as one double and card signing refuses the value outright
+/// (see `peers::card_sig`). A string never meets either problem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtendedBudget {

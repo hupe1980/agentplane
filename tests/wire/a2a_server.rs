@@ -1215,6 +1215,69 @@ async fn context_id_groups_new_immutable_tasks_across_turns() {
     assert_eq!(err_code(&refused), i64::from(code::UNSUPPORTED_OPERATION));
 }
 
+/// **A content filter's cost has a ceiling, and crossing it is a refusal —
+/// not a truncated total, and not a scan the caller sizes.**
+///
+/// `status` and `contextId` can only be evaluated by reading each candidate's
+/// journal, and the spec's `totalSize` is the exact pre-pagination count — so
+/// an unbounded implementation hands any authenticated peer a scan of every
+/// run the tenant ever wrote, per request, by adding one field. The bound
+/// refuses over-budget filters and names `statusTimestampAfter` as the lever,
+/// because that one is answered from the index and narrows for free. A
+/// truncated count instead would be a lie shaped like an answer: a smaller
+/// tenant, not a bounded scan.
+#[tokio::test]
+async fn a_filter_past_its_scan_budget_is_refused_naming_the_lever() {
+    let f = fixture();
+    for n in 0..2 {
+        let msg = json!({"message": {
+            "messageId": format!("budget-turn-{n}"),
+            "role": "ROLE_USER",
+            "parts": [{"text": "hello"}]
+        }});
+        send(&f.router(), rpc("SendMessage", &msg, Some("peer-a"))).await;
+    }
+    let tight = A2aServer::new(
+        f.rt.clone(),
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &f.manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("the fixture wires a policy engine")
+    .filter_scan_budget(1)
+    .router();
+
+    // Two candidates, a budget of one: the exact total cannot be computed
+    // within the ceiling, so the request is refused with the narrowing lever.
+    let list = json!({"status": "TASK_STATE_COMPLETED", "pageSize": 1});
+    let (_, refused) = send(&tight, rpc("ListTasks", &list, Some("peer-a"))).await;
+    assert_eq!(err_code(&refused), i64::from(code::INVALID_PARAMS));
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("statusTimestampAfter"),
+        "the refusal must name the filter that narrows without reading: {refused}"
+    );
+
+    // The positive halves. An unfiltered listing over the same store is
+    // index-only and unaffected by the budget; and the same filter under the
+    // default budget answers exactly.
+    let unfiltered = json!({"pageSize": 1});
+    let (_, listed) = send(&tight, rpc("ListTasks", &unfiltered, Some("peer-a"))).await;
+    assert_eq!(
+        listed["result"]["totalSize"], 2,
+        "an unfiltered listing reads no journals beyond its page and owes no \
+         budget: {listed}"
+    );
+    let (_, roomy) = send(&f.router(), rpc("ListTasks", &list, Some("peer-a"))).await;
+    assert!(
+        roomy["result"]["totalSize"].is_u64(),
+        "the same filter under the default budget answers exactly: {roomy}"
+    );
+}
+
 #[tokio::test]
 async fn list_tasks_filters_context_and_uses_opaque_cursor_pages() {
     let f = fixture();

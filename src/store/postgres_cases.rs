@@ -922,9 +922,19 @@ impl EventStore for PostgresStore {
     ) -> Result<Option<BufferedEvent>, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         for k in &sub.correlation {
-            // One statement. The `claimed_by IS NULL` predicate and the write
-            // are evaluated together, so two waiters cannot both come away with
-            // the row — there is no window because there is no second statement.
+            // One statement. The claim predicate and the write are evaluated
+            // together, so two waiters cannot both come away with the row —
+            // there is no window because there is no second statement.
+            //
+            // `claimed_by IS NULL` — or already claimed **by this very run**.
+            // The second arm is crash recovery, the same idempotence
+            // `deliver_to` grants a retried targeted delivery: `match_waiter`
+            // claims durably and the run resumes in a separate step, so a
+            // crash between the two leaves an event claimed for a run that
+            // never saw it. Without the arm the resumed wait re-subscribes,
+            // finds nothing — its own event filtered out by its own claim —
+            // and sleeps until its deadline breaches. Single delivery is
+            // untouched: only the claiming run can re-claim.
             let row = client
                 .query_opt(
                     "UPDATE inbound_events SET claimed_by = $1, claimed_at = $2
@@ -934,7 +944,8 @@ impl EventStore for PostgresStore {
                               ON c.tenant = e.tenant AND c.event_id = e.event_id
                            WHERE e.tenant = $6 AND e.kind = $3
                              AND c.namespace = $4 AND c.value = $5
-                             AND e.claimed_by IS NULL AND NOT e.dead
+                             AND (e.claimed_by IS NULL OR e.claimed_by = $1)
+                             AND NOT e.dead
                            ORDER BY e.received_at ASC
                            FOR UPDATE SKIP LOCKED
                            LIMIT 1)
@@ -1008,6 +1019,23 @@ impl EventStore for PostgresStore {
             let case: Option<String> = row.get(2);
             let step: i64 = row.get(3);
             let phase: String = row.get(4);
+            // The claim retires the subscription, in the same transaction —
+            // the same rule the redb backend holds and for the same reason:
+            // left registered until the run's own unsubscribe, it matched a
+            // *second* event, sequentially, which was then claimed for a run
+            // whose wait the first already satisfied — parked under a claim
+            // nobody consumes, invisible to dead-lettering. The resumed wait
+            // re-subscribes idempotently and recovers its own claimed event
+            // through the crash-recovery arm. `deliver_to` deliberately does
+            // not retire, because its retry path rebuilds `Matched` from
+            // these rows.
+            tx.execute(
+                "DELETE FROM subscriptions
+                  WHERE tenant = $1 AND run_id = $2 AND effect_key = $3",
+                &[&self.tenant_name(), &run, &effect],
+            )
+            .await
+            .map_err(|e| be(&e))?;
             tx.commit().await.map_err(|e| be(&e))?;
 
             return Ok(Some(Subscription {
@@ -1524,6 +1552,73 @@ impl TaskStore for PostgresStore {
             .ok_or(ClaimError::NotFound(id))
     }
 
+    async fn take_over(
+        &self,
+        id: TaskId,
+        from: &str,
+        actor: &str,
+        roles: &[String],
+    ) -> Result<Task, ClaimError> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| ClaimError::Store(pool_err(&e)))?;
+        let Some(task) = self.task(id).await.map_err(ClaimError::Store)? else {
+            return Err(ClaimError::NotFound(id));
+        };
+        // Claim's eligibility-first order, unchanged: a take-over is a claim,
+        // and four-eyes exclusion does not thin because the previous reviewer
+        // left.
+        if task.excluded_actors.iter().any(|a| a == actor) {
+            return Err(ClaimError::Excluded {
+                actor: actor.to_owned(),
+            });
+        }
+        if !task.candidate_roles.is_empty()
+            && !task.candidate_roles.iter().any(|r| roles.contains(r))
+        {
+            return Err(ClaimError::WrongRole {
+                actor: actor.to_owned(),
+            });
+        }
+        if !task.state.is_pending() {
+            return Err(ClaimError::NotPending {
+                task: id,
+                state: task.state,
+            });
+        }
+
+        // The displacement is one statement, guarded on the holder still being
+        // the one the caller named — the compare-and-swap that keeps a
+        // take-over decided from a stale view from displacing whoever holds
+        // the task *now*.
+        let updated = client
+            .execute(
+                "UPDATE tasks SET assignee = $2, state = 'claimed'
+                  WHERE task_id = $1 AND tenant = $4
+                    AND assignee = $3 AND state = 'claimed'",
+                &[
+                    &id.to_hex(),
+                    &actor.to_owned(),
+                    &from.to_owned(),
+                    &self.tenant_name(),
+                ],
+            )
+            .await
+            .map_err(|e| ClaimError::Store(be(&e)))?;
+        if updated == 0 {
+            return Err(ClaimError::NotHeld {
+                task: id,
+                actor: from.to_owned(),
+            });
+        }
+        self.task(id)
+            .await
+            .map_err(ClaimError::Store)?
+            .ok_or(ClaimError::NotFound(id))
+    }
+
     async fn release(&self, id: TaskId, actor: &str) -> Result<(), ClaimError> {
         let client = self
             .pool()
@@ -1779,7 +1874,7 @@ impl BatchStore for PostgresStore {
             ItemOutcome::Suspended(d) => ("suspended", Some(d.clone())),
         };
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        client
+        let updated = client
             .execute(
                 "UPDATE batch_items SET outcome = $3, detail = $4, tokens = $5, minor = $6
                   WHERE batch_id = $1 AND item_key = $2 AND tenant = $7",
@@ -1795,6 +1890,12 @@ impl BatchStore for PostgresStore {
             )
             .await
             .map_err(|e| be(&e))?;
+        // The predicate did the work; the row count says whether it matched.
+        // Discarding it reported success for a record that wrote nothing —
+        // the same lie a release that freed nothing tells.
+        if updated == 0 {
+            return Err(StoreError::NotFound(format!("{batch}/{key}")));
+        }
         Ok(())
     }
 

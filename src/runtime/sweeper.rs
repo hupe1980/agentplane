@@ -52,7 +52,10 @@ const SWEEP_EPOCH: crate::core::Epoch = 1;
 /// Not `Succeeded`: a sweep does not succeed or fail at a goal, it reports what
 /// it found. Reusing a run status would make a tick that breached forty
 /// obligations indistinguishable from a plan that completed.
-const SWEEP_OUTCOME: &str = "swept";
+///
+/// `pub(crate)` so [`SEALED_OUTCOMES`](super::SEALED_OUTCOMES) can name it
+/// rather than restate it — the list and the sealer must agree byte for byte.
+pub(crate) const SWEEP_OUTCOME: &str = "swept";
 
 /// What one tick did, accumulating into a run only if there is anything to say.
 ///

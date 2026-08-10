@@ -122,6 +122,17 @@ impl TaskStore for SealedTasks {
         Ok(self.opened(claimed).await)
     }
 
+    async fn take_over(
+        &self,
+        id: TaskId,
+        from: &str,
+        actor: &str,
+        roles: &[String],
+    ) -> Result<Task, ClaimError> {
+        let taken = self.inner.take_over(id, from, actor, roles).await?;
+        Ok(self.opened(taken).await)
+    }
+
     async fn release(&self, id: TaskId, actor: &str) -> Result<(), ClaimError> {
         self.inner.release(id, actor).await
     }

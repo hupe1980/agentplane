@@ -33,6 +33,8 @@ enum Attempt {
     Succeed,
     /// The peer refused it; nothing was applied.
     RefusedCleanly,
+    /// The peer understood the request and said no — an answer, not a fault.
+    AnsweredNo,
     /// It timed out. Whether it was applied is unknowable.
     TimedOut,
     /// It landed and the answer would not decode.
@@ -113,6 +115,9 @@ impl Effect for Scripted {
         match self.script.get(n).copied().unwrap_or(Attempt::Succeed) {
             Attempt::Succeed => Ok(json!({ "attempt": n + 1 })),
             Attempt::RefusedCleanly => Err(EffectError::Rejected("peer said no".into())),
+            Attempt::AnsweredNo => Err(EffectError::Refused(
+                "the model does not exist and never will".into(),
+            )),
             Attempt::TimedOut => Err(EffectError::Timeout {
                 driver: "test".into(),
                 waited_ms: 30_000,
@@ -223,6 +228,53 @@ async fn a_timeout_on_a_mutating_effect_is_never_retried() {
         ),
         other => panic!("expected quarantine, got {other:?}"),
     }
+}
+
+/// **A refusal that is an answer is not retried — the first no is the last.**
+///
+/// `Rejected` covers transient refusals (an overloaded gateway, a 5xx) and is
+/// retried under policy; `Refused` is the peer *understanding* the request and
+/// saying no — an unknown model, a malformed schema — where every further
+/// attempt asks the same rule the same question. The distinction existed in
+/// the model driver's error taxonomy and governed nothing: both collapsed to
+/// the same variant, and a permanently-wrong request burned every permitted
+/// attempt with backoff. Its sibling test above is the positive half — the
+/// same script with `Rejected` retries and succeeds.
+#[tokio::test]
+async fn a_refusal_that_is_an_answer_is_not_retried() {
+    let (e, calls) = scripted(&[Attempt::AnsweredNo, Attempt::Succeed]);
+    let f = fixture(e, calls);
+
+    let out =
+        f.rt.run("demo.once", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    assert_eq!(
+        f.calls.load(Ordering::SeqCst),
+        1,
+        "an answer was retried as though it were a fault — the success scripted \
+         for attempt two proves the loop went back"
+    );
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "a refused run concludes failed (and open for resume), got {:?}",
+        out.status
+    );
+
+    // The bit survives replay: the recorded run stopped after one attempt, and
+    // a strict pass must stop at the same place rather than expecting the
+    // retry the live run never made.
+    let replayed = f.rt.replay(out.run_id, Mode::Strict).await.unwrap();
+    assert!(
+        matches!(replayed.status, RunStatus::Failed(_)),
+        "strict replay reached a different conclusion over the same history: {:?}",
+        replayed.status
+    );
+    assert_eq!(
+        f.calls.load(Ordering::SeqCst),
+        1,
+        "strict replay performed an effect"
+    );
 }
 
 /// The same timeout against something declared safe to repeat *is* retried.
@@ -588,6 +640,7 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                         error: "peer said no".into(),
                         disposition: Disposition::DidNotHappen,
                         spend: agentplane::core::Spend::default(),
+                        permanent: false,
                     },
                 )
                 .step(StepId(0))

@@ -434,6 +434,17 @@ impl MemoryStore for RedbStore {
 
                 // redb admits one writer, so the graph cannot grow between
                 // this traversal and the deletions below.
+                //
+                // Every edge target is enqueued, **including tombstoned ones**.
+                // `forget` deliberately keeps a forgotten memory's outgoing
+                // edges so that a correction which later becomes an erasure
+                // request can still find what was derived — and a traversal
+                // that skipped a node with no current entry would defeat that
+                // provision exactly when it is needed: A → B → C with B
+                // individually erased left C standing after a cascade from A,
+                // in both backends, because both were written from the same
+                // misreading. A tombstoned node has nothing to remove, but its
+                // descendants do.
                 let mut queue = vec![root];
                 let mut doomed = std::collections::BTreeSet::new();
                 while let Some(source) = queue.pop() {
@@ -446,16 +457,10 @@ impl MemoryStore for RedbStore {
                                 ..=(tenant.as_str(), source.as_str(), MAX_STR),
                         )
                         .map_err(|e| be(&e))?
-                        .filter_map(|entry| match entry {
-                            Ok((key, _)) => {
-                                let child = key.value().2.to_owned();
-                                match current.get((tenant.as_str(), child.as_str())) {
-                                    Ok(Some(_)) => Some(Ok(child)),
-                                    Ok(None) => None,
-                                    Err(error) => Some(Err(be(&error))),
-                                }
-                            }
-                            Err(error) => Some(Err(be(&error))),
+                        .map(|entry| {
+                            entry
+                                .map(|(key, _)| key.value().2.to_owned())
+                                .map_err(|error| be(&error))
                         })
                         .collect::<Result<_, StoreError>>()?;
                     queue.extend(children);
@@ -475,6 +480,10 @@ impl MemoryStore for RedbStore {
                     }
                 }
 
+                // Counted per node that actually held state, so a tombstoned
+                // intermediate the traversal passed through is not reported as
+                // an erasure it did not perform.
+                let mut erased = 0usize;
                 for memory_id in &doomed {
                     let previous = current
                         .get((tenant.as_str(), memory_id.as_str()))
@@ -516,6 +525,9 @@ impl MemoryStore for RedbStore {
                                 .map_err(|error| be(&error))
                         })
                         .collect::<Result<_, _>>()?;
+                    if previous.is_some() || !versions.is_empty() {
+                        erased += 1;
+                    }
                     for version in versions {
                         items
                             .remove((tenant.as_str(), memory_id.as_str(), version))
@@ -542,7 +554,7 @@ impl MemoryStore for RedbStore {
                         .remove((tenant.as_str(), source.as_str(), derived.as_str()))
                         .map_err(|e| be(&e))?;
                 }
-                doomed.len()
+                erased
             };
             w.commit().map_err(|e| be(&e))?;
             Ok(removed)
@@ -602,29 +614,18 @@ impl MemoryStore for RedbStore {
                 // Every version, not only the current one. Forgetting that left
                 // history behind would discharge an erasure request while the
                 // data it named was still readable by id and version.
-                // Outgoing edges, where this memory is the source, deliberately
-                // stay: a correction may later become an erasure request, and
-                // losing those edges would make its derived summaries
-                // undiscoverable. The tombstone above prevents id reuse from
-                // attaching that lineage to unrelated future content.
-                let mut edges = w.open_table(DERIVED).map_err(|e| be(&e))?;
-                // Incoming edges no longer point at a current derivative and
-                // are unnecessary for repairing anything upstream.
-                let stale_sources: Vec<String> = edges
-                    .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
-                    .map_err(|e| be(&e))?
-                    .filter_map(|entry| match entry {
-                        Ok((key, _)) if key.value().2 == id => Some(Ok(key.value().1.to_owned())),
-                        Ok(_) => None,
-                        Err(error) => Some(Err(be(&error))),
-                    })
-                    .collect::<Result<_, StoreError>>()?;
-                for source_id in stale_sources {
-                    edges
-                        .remove((tenant.as_str(), source_id.as_str(), id.as_str()))
-                        .map_err(|e| be(&e))?;
-                }
-
+                //
+                // Edges deliberately stay — **both directions**. Outgoing,
+                // because a correction may later become an erasure request and
+                // losing them would make this memory's derived summaries
+                // undiscoverable. Incoming, because a cascade from further
+                // *upstream* routes through this tombstone to reach those same
+                // summaries: A → B → C with B forgotten here must still let a
+                // later cascade from poisoned A find C, and deleting A → B
+                // severed exactly that path. The read path is what keeps a kept
+                // edge harmless — `derivatives` skips targets with no current
+                // entry — and the tombstone prevents id reuse from attaching
+                // this lineage to unrelated future content.
                 let doomed: Vec<u64> = items
                     .range(
                         (tenant.as_str(), id.as_str(), 0)

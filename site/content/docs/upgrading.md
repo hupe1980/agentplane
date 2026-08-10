@@ -9,9 +9,60 @@ call site that stops working is the intended way to find out. What this page owe
 you is the *reason* and the shortest correct fix — a refusal you have to reverse
 engineer costs an afternoon, which is one afternoon more than the change saved.
 
-Every entry here is a **parse-time or build-time** refusal. None of them changes
-what a running agent does silently, which is the property that makes a hard cut
-acceptable at this stage.
+Every entry here is a **parse-time, build-time or replay-time** refusal. None
+of them changes what a running agent does silently, which is the property that
+makes a hard cut acceptable at this stage.
+
+---
+
+## Canonicalization rule 3: numbers format per RFC 8785
+
+A store written under rule 2 still opens and its history still verifies — the
+chain hashes stored bytes, not re-canonicalized ones — but **replaying a run
+recorded under the old rule refuses** with `CanonicalizationChanged`:
+unverifiable by this build, which is a different sentence from *diverged*.
+
+```text
+rule 2   1e30 → "1e30"    100.0 → "100.0"   (serde_json's formatting)
+rule 3   1e30 → "1e+30"   100.0 → "100"     (ECMAScript's, per RFC 8785)
+```
+
+**Why it is worth your store.** A signed Agent Card is verified by conforming
+JCS implementations nobody here writes, and the two formattings agree on
+exactly the values that appear in tests and disagree on the ones that appear in
+production. The pre-freeze remedy is the standing one: recreate the store, or
+keep the old build to read the old history. One bound arrives with it: card
+signing now refuses an integer outside ±2⁵³ — JCS reads every number as a
+double, and past that line two distinct integers share one — so carry values
+that large as strings, which the card's own budget fields already do.
+
+---
+
+## `recent_runs` is a bounded page
+
+`JournalStore::recent_runs` takes a cursor and a limit, so a store you implement
+yourself stops compiling until it pages.
+
+```rust
+// before — every run the tenant ever wrote, in one Vec
+async fn recent_runs(&self) -> Result<Vec<(RunId, u64)>, StoreError>;
+
+// after — a cursored page in a total order: (updated_at, run) descending
+async fn recent_runs(
+    &self,
+    after: Option<(u64, RunId)>,
+    limit: usize,
+) -> Result<Vec<(RunId, u64)>, StoreError>;
+```
+
+**Why it is worth your impl block.** The unbounded form cost O(every record the
+tenant had ever written) on a listing any authenticated peer could request
+repeatedly, and the signature was the cause: it offered nothing to bound with,
+so the caller could not have done better. The tie-break is part of the contract
+— both shipped backends keep whole-second timestamps, so ties are ordinary
+rather than exotic, and a cursor landing mid-tie would drop or duplicate a row.
+The store conformance battery checks the order and the page boundary; run it
+against your backend rather than eyeballing the sort.
 
 ---
 

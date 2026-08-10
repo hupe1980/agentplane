@@ -64,6 +64,13 @@ pub enum EffectReplay {
         /// budget verdict at the same point — the same reason `Done` carries
         /// its spend.
         spend: crate::core::Spend,
+        /// Whether the refusal was an answer no retry can change.
+        ///
+        /// Read back rather than recomputed for the same reason the
+        /// disposition is: the retry decision is replayed, and a replay that
+        /// could not see this bit would expect a retry the live run never
+        /// made.
+        permanent: bool,
     },
     /// A limit refused it before it started.
     ///
@@ -100,6 +107,131 @@ pub struct StepCursor {
 }
 
 impl StepCursor {
+    /// Overwrite the most recent slot for `key` with a terminal replay state.
+    ///
+    /// Newest-first because a retried effect has one slot per attempt, and a
+    /// terminal record always describes the latest one. One implementation
+    /// rather than the same `iter_mut().rev().find(..)` at three call sites,
+    /// where the fourth copy would be the one written subtly differently.
+    fn settle(&mut self, key: EffectKey, state: EffectReplay) {
+        if let Some(slot) = self.effects.iter_mut().rev().find(|(k, _, _)| *k == key) {
+            slot.2 = state;
+        }
+    }
+
+    /// Fold one record into this step's replay sequence.
+    fn apply(&mut self, key: EffectKey, seq: Seq, kind: &RecordKind) {
+        match kind {
+            RecordKind::EffectStarted {
+                descriptor,
+                recovery,
+                ..
+            } => {
+                self.effects.push((
+                    key,
+                    seq,
+                    EffectReplay::Orphan {
+                        descriptor: Box::new(descriptor.clone()),
+                        recovery: recovery.clone(),
+                    },
+                ));
+            }
+            RecordKind::EffectDone {
+                output,
+                source,
+                spend,
+            } => {
+                self.settle(
+                    key,
+                    EffectReplay::Done {
+                        output: output.clone(),
+                        source: source.clone(),
+                        spend: *spend,
+                    },
+                );
+            }
+            // A reconciliation verdict collapses into the vocabulary the
+            // replay loop already speaks, so nothing downstream needs a
+            // separate path for it:
+            //
+            //   Landed        -> the effect is done, with the recovered output
+            //   DidNotHappen  -> a failure that is safe to repeat
+            //   InDoubt       -> a failure that is not
+            //
+            // It overwrites whatever the attempt's earlier record said,
+            // because the probe is the later and better-informed answer.
+            RecordKind::EffectReconciled {
+                disposition,
+                output,
+                spend,
+                ..
+            } => {
+                self.settle(
+                    key,
+                    match (disposition, output) {
+                        (Disposition::Landed, Some(output)) => EffectReplay::Done {
+                            output: output.clone(),
+                            source: None,
+                            spend: *spend,
+                        },
+                        (d, _) => EffectReplay::Failed {
+                            error: "resolved by reconciliation".to_owned(),
+                            disposition: *d,
+                            spend: crate::core::Spend::default(),
+                            permanent: false,
+                        },
+                    },
+                );
+            }
+            // A refusal has no preceding `EffectStarted` — the whole point
+            // is that nothing was announced — so it pushes its own entry
+            // rather than updating one.
+            RecordKind::BudgetRefused { limit, used } => {
+                self.effects.push((
+                    key,
+                    seq,
+                    EffectReplay::Refused {
+                        limit: limit.clone(),
+                        used: used.clone(),
+                    },
+                ));
+            }
+            RecordKind::PolicyDenied {
+                reason,
+                action,
+                resource,
+            } => {
+                self.effects.push((
+                    key,
+                    seq,
+                    EffectReplay::Denied {
+                        reason: reason.clone(),
+                        action: action.clone(),
+                        resource: resource.clone(),
+                    },
+                ));
+            }
+            RecordKind::Released { .. } => self.record_release(key, seq),
+            RecordKind::EffectFailed {
+                error,
+                disposition,
+                spend,
+                permanent,
+            } => {
+                self.settle(
+                    key,
+                    EffectReplay::Failed {
+                        error: error.clone(),
+                        disposition: *disposition,
+                        spend: *spend,
+                        permanent: *permanent,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
     fn record_release(&mut self, key: EffectKey, seq: Seq) {
         self.effects.push((
             key,
@@ -187,114 +319,10 @@ impl ReplayCursor {
             // is treated as belonging to step 0 — which is where the runtime
             // puts effects it writes on a run's behalf.
             let step = r.body.step.unwrap_or(StepId(0));
-            let cursor = by_step.entry((step, r.body.phase)).or_default();
-
-            match r.kind() {
-                RecordKind::EffectStarted {
-                    descriptor,
-                    recovery,
-                    ..
-                } => {
-                    cursor.effects.push((
-                        key,
-                        r.seq(),
-                        EffectReplay::Orphan {
-                            descriptor: Box::new(descriptor.clone()),
-                            recovery: recovery.clone(),
-                        },
-                    ));
-                }
-                RecordKind::EffectDone {
-                    output,
-                    source,
-                    spend,
-                } => {
-                    if let Some(slot) = cursor.effects.iter_mut().rev().find(|(k, _, _)| *k == key)
-                    {
-                        slot.2 = EffectReplay::Done {
-                            output: output.clone(),
-                            source: source.clone(),
-                            spend: *spend,
-                        };
-                    }
-                }
-                // A reconciliation verdict collapses into the vocabulary the
-                // replay loop already speaks, so nothing downstream needs a
-                // separate path for it:
-                //
-                //   Landed        -> the effect is done, with the recovered output
-                //   DidNotHappen  -> a failure that is safe to repeat
-                //   InDoubt       -> a failure that is not
-                //
-                // It overwrites whatever the attempt's earlier record said,
-                // because the probe is the later and better-informed answer.
-                RecordKind::EffectReconciled {
-                    disposition,
-                    output,
-                    spend,
-                    ..
-                } => {
-                    if let Some(slot) = cursor.effects.iter_mut().rev().find(|(k, _, _)| *k == key)
-                    {
-                        slot.2 = match (disposition, output) {
-                            (Disposition::Landed, Some(output)) => EffectReplay::Done {
-                                output: output.clone(),
-                                source: None,
-                                spend: *spend,
-                            },
-                            (d, _) => EffectReplay::Failed {
-                                error: "resolved by reconciliation".to_owned(),
-                                disposition: *d,
-                                spend: crate::core::Spend::default(),
-                            },
-                        };
-                    }
-                }
-                // A refusal has no preceding `EffectStarted` — the whole point
-                // is that nothing was announced — so it pushes its own entry
-                // rather than updating one.
-                RecordKind::BudgetRefused { limit, used } => {
-                    cursor.effects.push((
-                        key,
-                        r.seq(),
-                        EffectReplay::Refused {
-                            limit: limit.clone(),
-                            used: used.clone(),
-                        },
-                    ));
-                }
-                RecordKind::PolicyDenied {
-                    reason,
-                    action,
-                    resource,
-                } => {
-                    cursor.effects.push((
-                        key,
-                        r.seq(),
-                        EffectReplay::Denied {
-                            reason: reason.clone(),
-                            action: action.clone(),
-                            resource: resource.clone(),
-                        },
-                    ));
-                }
-                RecordKind::Released { .. } => cursor.record_release(key, r.seq()),
-                RecordKind::EffectFailed {
-                    error,
-                    disposition,
-                    spend,
-                } => {
-                    if let Some(slot) = cursor.effects.iter_mut().rev().find(|(k, _, _)| *k == key)
-                    {
-                        slot.2 = EffectReplay::Failed {
-                            error: error.clone(),
-                            disposition: *disposition,
-                            spend: *spend,
-                        };
-                    }
-                }
-                _ => {}
-            }
+            by_step
+                .entry((step, r.body.phase))
+                .or_default()
+                .apply(key, r.seq(), r.kind());
         }
 
         Self { by_step }
@@ -648,6 +676,7 @@ mod tests {
                     error: "boom".into(),
                     disposition: Disposition::DidNotHappen,
                     spend: crate::core::Spend::default(),
+                    permanent: false,
                 },
             ),
         ]);
@@ -658,6 +687,7 @@ mod tests {
                 error: "boom".into(),
                 disposition: Disposition::DidNotHappen,
                 spend: crate::core::Spend::default(),
+                permanent: false,
             })
         );
     }

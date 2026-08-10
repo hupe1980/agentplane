@@ -1369,6 +1369,8 @@ src/
              trust decision that implies
   peers/     calling other agents: identity, audience, narrowing authority
   audit      the outsider's verification pass over a journal
+  export     the same history as framed JSON Lines, so the outsider can take
+             it away as well as check it in place
   manifest/  the declaration an agent is built from, and the registry it is
              pinned in (feature `manifest`, off by default)
   api/       the HTTP surface for operators (feature `http`, off by default)
@@ -1708,7 +1710,7 @@ the invariant for the one route nobody would think to check.
 | `CancelTask` | a durable stop request; the task stays `WORKING` |
 | `GetExtendedAgentCard` | the authenticated card |
 | `SendStreamingMessage`, `SubscribeToTask` | SSE status and artifact updates, read from the journal; terminal subscription is refused |
-| `ListTasks` | newest-first, cursor-paginated and per-task-authorized tasks with context/status/time filters, bounded history, and optional artifacts |
+| `ListTasks` | newest-first, cursor-paginated and per-task-authorized tasks with context/status/time filters, bounded history, and optional artifacts. A content filter's cost is bounded (`filter_scan_budget`, default 1024 candidate reads): the spec's `totalSize` is the exact pre-pagination count, so an unbounded filter would let one field buy a scan of every run the tenant ever wrote — over budget is a refusal naming `statusTimestampAfter` as the lever that narrows from the index, never a quietly truncated total |
 | the push-notification configs | durable create/get/list/delete when wired; the protocol-specific refusal otherwise |
 | anything else | `-32601`, method not found |
 
@@ -1819,10 +1821,15 @@ signature taken before they were set would cover a document nobody serves.
 which nobody can verify the card.
 
 Canonicalization is [`core::canon`](#canonical-bytes), which orders keys by
-UTF-16 code unit exactly as RFC 8785 requires. The one JCS rule it does not
-implement is ECMAScript number formatting — and a guard asserts the card carries
-no numbers, so the day somebody adds an integer field that is a failing test
-rather than a signature two implementations disagree about.
+UTF-16 code unit and formats doubles by ECMAScript's rules, exactly as RFC 8785
+requires — `1e+30` where `serde_json` writes `1e30`, which is the difference
+between a signature every conforming verifier accepts and one only this crate
+does. The standard's own number vectors are in the test suite. One bound is
+enforced at the signature itself: an integer outside ±2⁵³ has no double of its
+own, so a conforming verifier would recompute different bytes than were signed,
+and `signing_input` refuses it naming the path — on both the signing and
+verifying sides. This used to be a guard asserting the card carried no numbers
+at all; implementing the number rules retired it.
 
 #### Push: the one URL a caller chooses
 

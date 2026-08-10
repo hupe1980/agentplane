@@ -41,10 +41,14 @@ pub enum TargetedDelivery {
 /// wait forever for something that already happened.
 #[async_trait]
 pub trait EventStore: Send + Sync + Debug {
-    /// Record an inbound event, returning `false` if this id was already seen.
+    /// Record an inbound event, returning `false` if this `(source, id)` was
+    /// already seen.
     ///
-    /// Deduplication is by event id, so a counterparty that retries — which
-    /// they all do — does not deliver the same message twice.
+    /// Deduplication is by the **pair**, never the bare id — an id is unique
+    /// only within one producer, and keying on it alone lets two
+    /// counterparties swallow each other's messages as apparent retries. The
+    /// pair is [`InboundEvent::dedup_key`], the one implementation of that
+    /// identity.
     async fn buffer(&self, event: &InboundEvent, at: Timestamp) -> Result<bool, StoreError>;
 
     /// Register a run's interest in a future event.
@@ -54,6 +58,15 @@ pub trait EventStore: Send + Sync + Debug {
     ///
     /// Claiming is what makes an event single-delivery: two runs waiting on the
     /// same key cannot both consume one message.
+    ///
+    /// An event **already claimed by this subscription's run** is returned
+    /// again rather than filtered out. That is crash recovery, not a second
+    /// delivery: [`match_waiter`](Self::match_waiter) claims durably and the
+    /// run resumes in a separate step, so a crash between the two leaves an
+    /// event claimed for a run that never saw it — and a `claim_for` that
+    /// hid the run's own claim from it would strand the wait until its
+    /// deadline breached, losing a message that arrived in time. Single
+    /// delivery is untouched, because only the claiming run can re-claim.
     async fn claim_for(
         &self,
         sub: &Subscription,

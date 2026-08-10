@@ -86,6 +86,40 @@ pub trait TaskStore: Send + Sync + Debug {
     /// claimed.
     async fn release(&self, id: TaskId, actor: &str) -> Result<(), ClaimError>;
 
+    /// Take a claim over from a holder who is not coming back.
+    ///
+    /// The absent-holder case [`release`](Self::release) cannot reach: only
+    /// the holder may release, so a task claimed by a reviewer who has left is
+    /// parked until its deadline breaches — a routine handover turned into an
+    /// escalation, or "an operator edits the database", which is the
+    /// anti-pattern the release endpoint exists to prevent.
+    ///
+    /// `from` names the holder being displaced and is a compare-and-swap
+    /// guard, not documentation: a take-over decided from a stale view must
+    /// fail rather than displace whoever holds it *now* — the same rule a
+    /// case write follows by naming the version it read. Eligibility is
+    /// re-checked in full for the new actor; a take-over is a claim, and
+    /// four-eyes exclusion does not thin because the previous reviewer left.
+    ///
+    /// A reservation, not a decision: like claim and release it lives in the
+    /// store, and the decision eventually taken still records its decider.
+    /// The API gates it under its own action, so policy can hand it to a
+    /// queue lead without handing it to every reviewer.
+    ///
+    /// # Errors
+    ///
+    /// [`ClaimError`], in claim's eligibility-first order, with
+    /// [`ClaimError::NotHeld`] naming `from` when the task is not currently
+    /// held by them — including when it is not held at all, where the right
+    /// verb is [`claim`](Self::claim).
+    async fn take_over(
+        &self,
+        id: TaskId,
+        from: &str,
+        actor: &str,
+        roles: &[String],
+    ) -> Result<Task, ClaimError>;
+
     async fn set_state(&self, id: TaskId, state: TaskState) -> Result<(), StoreError>;
 
     /// Open work, highest priority and oldest first.

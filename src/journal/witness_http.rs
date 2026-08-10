@@ -158,6 +158,43 @@ impl Witness for HttpWitness {
                      size 0, which would resubmit a proof the witness rejects as a fork"
                 ))),
             },
+            // The shrink, and the only status that carries it. C2SP specifies
+            // 400 for *old size exceeds checkpoint size*: the witness is at N,
+            // this log now offers a checkpoint smaller than N, and runs it
+            // already cosigned are gone.
+            //
+            // There was no arm here, so this fell to the catch-all and became
+            // an `Unavailable` — which the quorum classifies as **routine**,
+            // beside a timeout. `Shrank` is documented as the single most
+            // important thing a witness catches and the one an operator
+            // auditing itself structurally cannot, and it was reachable only
+            // from `MemoryWitness`: the in-process witness that is explicitly
+            // useless as a trust anchor. So on the only witness that can be a
+            // real one, a deleted run raised no alarm.
+            //
+            // `seen` is the size the witness told us it had reached and
+            // `offered` is what this log now claims — the two numbers an
+            // operator needs, and both already in hand without parsing a body
+            // the spec does not require to carry them.
+            //
+            // And the guard on the arm is the same rule the 409 arm holds: a
+            // witness is untrusted, so it cannot *invent* an integrity finding.
+            // The spec's 400 is a statement about this request's own two
+            // numbers — `old` exceeds the checkpoint size — and both are in
+            // hand, so a 400 for a request where old ≤ size is a witness
+            // answering off-spec (or mis-parsing the body), and reading that as
+            // a shrink would page an operator for a counterparty's confusion.
+            400 if old_size > checkpoint.size => Err(WitnessError::Shrank {
+                origin: checkpoint.origin.clone(),
+                seen: old_size,
+                offered: checkpoint.size,
+            }),
+            400 => Err(WitnessError::Unavailable(format!(
+                "{url}: the witness answered 400 (old size exceeds checkpoint size) for a \
+                 request whose old size {old_size} does not exceed {} — an off-spec reply, \
+                 refused rather than read as a shrink it does not evidence",
+                checkpoint.size
+            ))),
             422 => Err(WitnessError::Forked {
                 origin: checkpoint.origin.clone(),
                 seen: old_size,

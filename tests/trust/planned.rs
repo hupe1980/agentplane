@@ -558,6 +558,56 @@ async fn a_parse_shortfall_fails_the_run_rather_than_guessing() {
     }
 }
 
+/// **A parse step carrying `args` is refused, not silently trimmed.**
+///
+/// `args` belongs to a tool step and a parse ignores it — so accepting one
+/// would be a field that parses and is never read, the accepted-prose shape
+/// the manifest refuses for `routed`. What is accepted must be what runs, and
+/// a plan is no less a reviewed-and-executed artifact for having been written
+/// by a model.
+#[tokio::test]
+async fn a_parse_step_carrying_args_is_refused() {
+    let manifest = Manifest::parse(PARSING).expect("parse");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_answer(plan(json!({
+        "steps": [
+            { "tool": "web__fetch", "args": { "url": "$input/url" } },
+            {
+                "args": { "stray": "accepted prose" },
+                "parse": {
+                    "from": "$step0/body",
+                    "schema": {
+                        "type": "object",
+                        "properties": { "email": { "type": "string" } },
+                        "required": ["email"]
+                    }
+                }
+            }
+        ]
+    })));
+    let client = Arc::new(Recorder::default());
+    let catalog = Arc::new(ToolCatalog::new().allow(
+        ToolId::new("web", "fetch"),
+        ToolSafety::read_only().max_sensitivity(agentplane::core::Sensitivity::Internal),
+    ));
+    let rt = wired(&manifest, &provider, catalog, &client);
+
+    let out = rt
+        .run(
+            "read.contact",
+            Tainted::trusted(json!({ "url": "https://example.com" })),
+        )
+        .await
+        .expect("run");
+    match out.status {
+        RunStatus::Failed(reason) => assert!(
+            reason.contains("carries `args`"),
+            "refused for the wrong reason: {reason}"
+        ),
+        other => panic!("a parse step with arguments nothing executes was accepted: {other:?}"),
+    }
+}
+
 // ── Break-glass: the designed exception to tenancy ──────────────────────────
 
 /// An operator crossing the tenant boundary is recorded in **that tenant's**
@@ -741,7 +791,11 @@ async fn break_glass_without_a_reason_is_refused() {
          explicable, and an empty one explains nothing"
     );
     assert!(
-        store.recent_runs().await.expect("recent").is_empty(),
+        store
+            .recent_runs(None, 10)
+            .await
+            .expect("recent")
+            .is_empty(),
         "a refused crossing still wrote a run"
     );
 }

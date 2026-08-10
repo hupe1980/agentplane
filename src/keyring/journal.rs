@@ -161,8 +161,12 @@ impl JournalStore for SealedJournal {
         self.inner.runs_by_outcome(outcome, limit).await
     }
 
-    async fn recent_runs(&self) -> Result<Vec<(RunId, u64)>, StoreError> {
-        self.inner.recent_runs().await
+    async fn recent_runs(
+        &self,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError> {
+        self.inner.recent_runs(after, limit).await
     }
 
     async fn head(&self, run: RunId) -> Result<Head, StoreError> {

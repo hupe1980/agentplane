@@ -37,13 +37,32 @@ use crate::core::{Digest, RunId, StoreError, Verifier, merkle};
 use crate::journal::{Checkpoint, JournalStore, Record};
 
 /// What an audit concluded, and what it could not look at.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` is deliberate and load-bearing: the independent party this
+/// report exists for should not have to link this crate to read it. The
+/// findings render as the sentences they display as, because an auditor reads
+/// prose and a machine that wants structure has the run ids beside it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AuditReport {
     /// The checkpoint the store reports now.
     pub current: Checkpoint,
     /// Runs whose chain, signatures and inclusion all checked out.
+    ///
+    /// An **open** run — one whose last conclusion does not seal, or which has
+    /// no conclusion yet — appears here on chain and signatures alone: it has
+    /// no Merkle leaf, so there is no inclusion to check, and [`not_checked`]
+    /// says so once rather than a finding saying it per run. A run whose own
+    /// records carry a *sealing* conclusion but which the log holds no leaf
+    /// for is the opposite case, and that one is a finding.
+    ///
+    /// [`not_checked`]: Self::not_checked
     pub sound: Vec<RunId>,
     /// What went wrong, in the order found.
+    ///
+    /// Serialised as the rendered sentence rather than as a tagged variant: the
+    /// consumer is a person or a SIEM, and a variant name is this crate's
+    /// internal vocabulary. The run id each finding names is in the text.
+    #[serde(serialize_with = "as_sentences")]
     pub findings: Vec<Finding>,
     /// Checks that were not performed, and why.
     ///
@@ -88,7 +107,7 @@ pub struct AuditReport {
 }
 
 /// What authorized one run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Warrant {
     /// The run this describes.
     pub run: RunId,
@@ -105,7 +124,7 @@ pub struct Warrant {
 }
 
 /// One journaled decision to improve a label.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ReleaseRecord {
     pub run: RunId,
     /// The agent or operator the decision was recorded against.
@@ -162,6 +181,16 @@ impl AuditReport {
                 .join("\n")
         );
     }
+}
+
+/// Render findings as the sentences they display as.
+fn as_sentences<S: serde::Serializer>(f: &[Finding], s: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = s.serialize_seq(Some(f.len()))?;
+    for finding in f {
+        seq.serialize_element(&finding.to_string())?;
+    }
+    seq.end()
 }
 
 /// One thing wrong with a plane's history.
@@ -221,16 +250,81 @@ impl std::fmt::Debug for Evidence<'_> {
     }
 }
 
-/// Check a plane's history.
+/// Where one run stands relative to the Merkle log.
+enum Placement {
+    /// In the log, at a position the root supports.
+    Sound,
+    /// Not in the log because it has not concluded with a sealing outcome —
+    /// a state, not a defect. Chain and signatures were verified upstream.
+    Open,
+    /// The run's own records carry a sealing conclusion, and the log holds no
+    /// leaf for it: history the log no longer commits to.
+    NotInLog,
+    /// In the log by its own claim, at a position the root does not support.
+    BadInclusion,
+    /// The log grew faster than the audit could catch its checkpoint up, so
+    /// nothing ties this run's proof to one root. Honest, and rare: it takes a
+    /// seal landing between two adjacent store calls, twice.
+    Unpinned,
+}
+
+/// Decide one run's [`Placement`], catching `current` up if the log grew.
 ///
-/// `runs` is what to look at — an auditor sampling, or everything they were
-/// given. The log-level checks do not depend on it.
-///
-/// # Errors
-///
-/// [`StoreError`] only when the store cannot be read at all. A *finding* is a
-/// result, not an error: an audit that stopped at the first problem would report
-/// one defect in a store with forty.
+/// The catch-up is the part that earns a comment: the log can grow while the
+/// audit walks it, and a proof computed against a larger tree than the
+/// checkpoint in hand fails for a reason that is time, not tampering — a false
+/// integrity alarm teaches the reader to ignore the true one. One refresh
+/// covers the realistic race; a plane sealing continuously lands in
+/// [`Placement::Unpinned`] rather than in a finding.
+async fn placement(
+    store: &Arc<dyn JournalStore>,
+    run: RunId,
+    records: &[Record],
+    current: &mut Checkpoint,
+) -> Result<Placement, StoreError> {
+    let Some(inc) = store.inclusion_proof(run).await? else {
+        // The store holds no leaf, and whether that is a finding is decided by
+        // the run's own records rather than assumed. An **open** run — failed,
+        // exhausted, still executing — was never in the log; reporting it as a
+        // defect would flag every healthy resumable run and teach the reader
+        // to skim past the flag that matters. The outcome list is the
+        // library's own, not a re-spelling of it.
+        let sealed_conclusion = records
+            .iter()
+            .rev()
+            .find_map(|r| match r.kind() {
+                crate::journal::RecordKind::RunSealed { outcome, .. } => Some(outcome.as_str()),
+                _ => None,
+            })
+            .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o));
+        return Ok(if sealed_conclusion {
+            Placement::NotInLog
+        } else {
+            Placement::Open
+        });
+    };
+
+    if inc.size != current.size {
+        *current = store.checkpoint().await?;
+    }
+    if inc.size != current.size {
+        return Ok(Placement::Unpinned);
+    }
+    let leaf = merkle::leaf_hash(&inc.seal);
+    let ok = merkle::verify_inclusion(
+        &leaf,
+        usize::try_from(inc.index).unwrap_or(usize::MAX),
+        usize::try_from(inc.size).unwrap_or(0),
+        &inc.proof,
+        &current.root,
+    );
+    Ok(if ok {
+        Placement::Sound
+    } else {
+        Placement::BadInclusion
+    })
+}
+
 /// Every label-raising decision in one run's history.
 fn releases_in(run: RunId, records: &[Record]) -> Vec<ReleaseRecord> {
     records
@@ -278,17 +372,28 @@ fn warrant_in(run: RunId, records: &[Record]) -> Option<Warrant> {
     })
 }
 
+/// Check a plane's history.
+///
+/// `runs` is what to look at — an auditor sampling, or everything they were
+/// given. The log-level checks do not depend on it.
+///
+/// # Errors
+///
+/// [`StoreError`] only when the store cannot be read at all. A *finding* is a
+/// result, not an error: an audit that stopped at the first problem would report
+/// one defect in a store with forty.
 pub async fn audit(
     store: &Arc<dyn JournalStore>,
     runs: &[RunId],
     evidence: &Evidence<'_>,
 ) -> Result<AuditReport, StoreError> {
-    let current = store.checkpoint().await?;
+    let mut current = store.checkpoint().await?;
     let mut findings = Vec::new();
     let mut not_checked = Vec::new();
     let mut sound = Vec::new();
     let mut releases = Vec::new();
     let mut warrants = Vec::new();
+    let mut open_runs = 0usize;
 
     if evidence.verifier.is_none() {
         not_checked.push(
@@ -330,28 +435,31 @@ pub async fn audit(
         releases.extend(releases_in(run, &records));
         warrants.extend(warrant_in(run, &records));
 
-        match store.inclusion_proof(run).await? {
-            Some(inc) => {
-                let leaf = merkle::leaf_hash(&inc.seal);
-                let ok = merkle::verify_inclusion(
-                    &leaf,
-                    usize::try_from(inc.index).unwrap_or(usize::MAX),
-                    usize::try_from(inc.size).unwrap_or(0),
-                    &inc.proof,
-                    &current.root,
-                );
-                if ok {
-                    sound.push(run);
-                } else {
-                    findings.push(Finding::BadInclusion { run });
-                }
+        match placement(store, run, &records, &mut current).await? {
+            Placement::Sound => sound.push(run),
+            Placement::Open => {
+                open_runs += 1;
+                sound.push(run);
             }
-            // An unsealed run is not in the log because it has not finished, and
-            // that is not a finding. A *sealed* one missing from the log is —
-            // but only the store knows which, so this is reported as
-            // not-in-log and left to the reader.
-            None => findings.push(Finding::NotInLog { run }),
+            Placement::NotInLog => findings.push(Finding::NotInLog { run }),
+            Placement::BadInclusion => findings.push(Finding::BadInclusion { run }),
+            Placement::Unpinned => not_checked.push(format!(
+                "run {run}: the log grew throughout the audit, so this run's inclusion \
+                 could not be pinned to one checkpoint — re-run against a quiesced store"
+            )),
         }
+    }
+
+    // Said once rather than per run, and in `not_checked` rather than as a
+    // finding: an open run's tail has no leaf to pin it, so truncating it is
+    // undetectable until it seals — a limit of what an open run *is*, reported
+    // so a clean audit over open runs is not read as more than it proved.
+    if open_runs > 0 {
+        not_checked.push(format!(
+            "{open_runs} open run(s): an open run has no Merkle leaf, so nothing pins its \
+             tail — chain and signatures verified, and a truncated tail is undetectable \
+             until the run seals"
+        ));
     }
 
     // ── Against what the auditor brought ───────────────────────────────────

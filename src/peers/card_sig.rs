@@ -25,12 +25,18 @@
 //! [`crate::core::canon`], which orders keys by UTF-16 code unit precisely so
 //! that a verifier elsewhere computes the same bytes.
 //!
-//! **The card carries no numbers**, and that is load-bearing rather than
-//! incidental: RFC 8785's hardest requirement is ECMAScript number formatting,
-//! and a card of strings, booleans, arrays and objects never reaches it. A guard
-//! asserts the card stays that way, so the day somebody adds an integer field
-//! the constraint is a failing test rather than a signature two implementations
-//! disagree about.
+//! **Numbers canonicalize per RFC 8785 with one bound, enforced here.**
+//! [`crate::core::canon`] implements the standard's ECMAScript number
+//! formatting, so a card may carry doubles and ordinary integers. What it may
+//! not carry is an integer outside ±2⁵³: JCS reads every number as an IEEE-754
+//! double, two distinct integers above that line share one double, and a
+//! signature over bytes this crate wrote exactly would be checked by a
+//! conforming verifier against bytes it rounded — the worst kind of mismatch,
+//! because each side is correct under its own reading. [`signing_input`]
+//! refuses the range instead of hoping, on both the signing and verifying
+//! paths, which retires the guard that used to assert the card carried no
+//! numbers at all. I-JSON draws interoperability at the same line, so a value
+//! that big belongs in a string.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -103,6 +109,52 @@ pub enum CardSignatureError {
     Untrusted,
     #[error("the card could not be canonicalized: {0}")]
     Canonical(String),
+    #[error(
+        "the card carries integer {value} at {path}, outside ±2^53 — JCS reads \
+         every number as an IEEE-754 double, so a conforming verifier would \
+         canonicalize this to different bytes than were signed and each side \
+         would be correct under its own reading. Carry a value that large as a \
+         string"
+    )]
+    UnrepresentableNumber { value: String, path: String },
+}
+
+/// The largest integer exact and double formatting agree on: 2⁵³.
+///
+/// Inside this range `serde_json`'s exact integer and ECMAScript's
+/// double-derived string are byte-identical; the first integer past it has no
+/// double of its own.
+const MAX_EXACT_DOUBLE: u64 = 1 << 53;
+
+/// Refuse an integer no double can hold, naming where it is.
+///
+/// Walks the value the signature will cover. Floats pass — a `Value` float *is*
+/// a double, so RFC 8785 formats it faithfully — and so does every integer a
+/// double holds exactly. This runs on both the signing and verifying paths via
+/// [`signing_input`], because a bound enforced only at signing would let this
+/// crate's verifier accept a foreign card its own signer refuses to produce.
+fn representable(value: &Value, path: &str) -> Result<(), CardSignatureError> {
+    match value {
+        Value::Number(n) => {
+            let out_of_range = n.as_u64().is_some_and(|u| u > MAX_EXACT_DOUBLE)
+                || n.as_i64().is_some_and(|i| i < -(1_i64 << 53));
+            if out_of_range {
+                return Err(CardSignatureError::UnrepresentableNumber {
+                    value: n.to_string(),
+                    path: path.to_owned(),
+                });
+            }
+            Ok(())
+        }
+        Value::Object(map) => map
+            .iter()
+            .try_for_each(|(k, v)| representable(v, &format!("{path}/{k}"))),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .try_for_each(|(i, v)| representable(v, &format!("{path}/{i}"))),
+        _ => Ok(()),
+    }
 }
 
 /// The exact bytes a signature covers.
@@ -112,7 +164,8 @@ pub enum CardSignatureError {
 ///
 /// # Errors
 ///
-/// If the card cannot be serialized.
+/// If the card cannot be serialized, or carries an integer outside ±2⁵³ —
+/// see [`CardSignatureError::UnrepresentableNumber`].
 pub fn signing_input(card: &AgentCard, protected_b64: &str) -> Result<Vec<u8>, CardSignatureError> {
     let mut value =
         serde_json::to_value(card).map_err(|e| CardSignatureError::Canonical(e.to_string()))?;
@@ -122,6 +175,7 @@ pub fn signing_input(card: &AgentCard, protected_b64: &str) -> Result<Vec<u8>, C
     if let Some(obj) = value.as_object_mut() {
         obj.remove("signatures");
     }
+    representable(&value, "")?;
     let payload = crate::core::canon::value_bytes(&value);
 
     let mut input = Vec::with_capacity(protected_b64.len() + 1 + payload.len() * 2);

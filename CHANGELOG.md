@@ -30,6 +30,694 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.14.0] — 2026-08-10
+
+### Changed — canonicalization is a complete RFC 8785 implementation
+
+- **Doubles format by ECMAScript's rules, and `canon::VERSION` is 3.** The one
+  JCS rule deliberately left unimplemented is implemented: `1e30` becomes
+  `1e+30`, `100.0` becomes `100`, `1e-7` stays `1e-7` — held to the standard's
+  own Appendix vectors rather than to this crate's opinion of them, which makes
+  them cross-implementation golden vectors for the one format a third party
+  verifies. The gap was survivable only while a guard asserted the signed Agent
+  Card carried no numbers, and that guard had a hole shaped like the tenancy
+  window this project already catalogued: extension `params` are arbitrary
+  deployment JSON, so a number could reach a signed card through data no
+  in-tree fixture ever sees — and the signature would verify against this
+  crate and nothing else. A store written under rule 2 replays as
+  `CanonicalizationChanged` — unverifiable, not divergent; the pre-freeze
+  remedy is recreate.
+
+- **Integers stay exact, and the bound is enforced where it binds.** JCS reads
+  every number as an IEEE-754 double, under which two distinct integers above
+  2⁵³ collapse into one representation — and a canonicalizer that collapses two
+  different values into one byte string would give two different effects one
+  key, the exact fallback `canon::value_bytes` refuses. So integers serialize
+  exactly (identical to the ECMAScript form within ±2⁵³, where I-JSON draws
+  interoperability too), and the one externally-verified artifact refuses the
+  range outside it: `signing_input` walks the card and returns
+  `UnrepresentableNumber` naming the offending path, on both the signing and
+  verifying sides. The test-only guard is retired for the boundary refusal —
+  a control that must be tested for became one that cannot be skipped.
+
+### Changed — an open question settled by reading the API that had answered it
+
+- **The embedder's resumable output stream is the journal read itself.** The
+  open question — whether a resumable cursor over already-journaled events, the
+  A2A stream's own mechanism, should be offered to a coded skill or re-opens
+  the second-truth problem by another name — was settled by observation:
+  `Runtime::journal()` is public and `JournalStore::read(run, from)` *is* that
+  cursor — durable, seq-scoped, reconnect-safe, serveable by any instance, and
+  the only mechanism the A2A stream consumes. The accessor that settles the
+  question was the one undocumented public method in the file, so the answer
+  was true and unfindable; it now documents itself, and the decision record
+  carries the reasoning. No curated event type is added between the records and
+  the wire, deliberately: a third vocabulary drifts from the other two.
+
+### Changed — the export header stops asking the caller for a fact
+
+- **`export::to_jsonl` no longer takes a canonicalization version.** The header
+  names the rule the digests were computed under, and that is a fact about the
+  build that wrote them — yet the writer asked for it as an argument, which made
+  the one self-describing line of the format a line any embedder could make
+  lie. Every call site in the tree passed `canon::VERSION` verbatim, which is
+  what a fact looks like when it is requested as a parameter. The writer now
+  reads the constant itself. **Breaking:** drop the third argument.
+
+### Fixed — a stitched-together log is named for what it is
+
+- **`verify` holds the run blocks' log positions to the contiguous `0..N` the
+  checkpoint commits to.** Two blocks claiming one position — an export spliced
+  from two histories — previously surfaced only as a root mismatch, which tells
+  an auditor that something is wrong but not that two runs claim one place in
+  history; worse, a tree rebuilt over duplicated positions compared garbage
+  against the root and reported the wrong defect. A duplicated or missing
+  position is now its own finding, and the root comparison runs only over a
+  well-formed position set.
+
+### Changed — documentation
+
+- **The "enforcement below the code" claim gained the qualifier the field now
+  requires.** Kernel-level policy enforcement for agent harnesses is published
+  (eBPF over system actions — genuinely below the process), so altitude alone
+  stopped being the distinction, and the constitution now says which pair
+  survives at any altitude: flow on values, and evidence unified with recovery.
+  The open containment-benchmark item likewise records that the
+  adaptive-evaluation methodology for this defence family now exists in
+  published form, with its first small-scale data point — deterministic
+  out-of-band enforcement holding where in-band defences fell.
+
+### Fixed — a witness could not report the one thing it exists to catch
+
+- **A shrunken log was reported as routine unavailability.** C2SP `tlog-witness`
+  specifies `400 Bad Request` for *old size exceeds checkpoint size*: the witness
+  is at N, this log now offers a checkpoint smaller than N, and runs it already
+  cosigned are gone. `HttpWitness` had no arm for 400, so it fell to the
+  catch-all and became `WitnessError::Unavailable` — which the quorum classifies
+  as **routine**, beside a timeout.
+
+  `WitnessError::Shrank` documents itself as *the single most important thing a
+  witness catches, and the one an operator auditing itself structurally cannot*.
+  It was constructed in exactly one place: `MemoryWitness`, the in-process
+  witness explicitly documented as useless as a trust anchor. So on the only
+  witness that can be a real one, a deleted run raised no alarm — and the
+  runtime deliberately provokes that 400, since the quorum sends
+  `old_size > checkpoint.size` when the witness is ahead.
+
+  A fact kept in two places had drifted with it: the security page said no
+  remote C2SP client ships, while the README and getting-started say `HttpWitness`
+  does. What is absent is a **counterparty**, not code, and all three pages now
+  say that.
+
+### Fixed — an internationalised host grant no longer silently never matches, on either surface
+
+- **Host grants are canonicalised the way the URL they guard is** — for both
+  governed media and push webhooks, through one shared
+  `netguard::canonical_host`. A grant is compared against `Url::host_str`,
+  which the URL crate has already IDNA-encoded to punycode — but each grant
+  went only through a lowercase/trim, so `allow_host("münchen.example")`
+  stored the Unicode form and never matched the `xn--mnchen-3ya.example` a
+  URL to that host carries. Fail-closed — every request to the intended host
+  refused — but **silently**, reading like a wrong URL rather than a wrong
+  grant, the quiet-misconfiguration shape this crate refuses loudly
+  everywhere else.
+
+  Found auditing media, then — per the rule that a defect of a shape has a
+  sibling — checked in push and found identical, so the fix is one function
+  in the module both already share for the address rule rather than two that
+  could drift. A grant carrying anything beyond a bare host (a port,
+  userinfo, a path) is now refused at configuration time on both surfaces
+  rather than stored as something that cannot match. The rest of the media
+  SSRF machinery — the `netguard` classifier (every range pinned from both
+  edges, IPv4-mapped judged as v4, one private answer poisoning the whole
+  resolution), per-hop re-resolution and DNS pinning, redirect
+  re-authorisation, decompression refusal, and the streamed byte ceiling —
+  audited clean.
+
+### Audited clean — the first-contact surface, executed rather than read
+
+- Every example in the CI recipe runs green; the CLI's error paths were
+  probed as a newcomer hits them — a typo'd manifest field names itself and
+  the valid set, malformed input JSON names the position, an unknown
+  capability lists what the plane provides — and the getting-started page
+  pre-empts the traps its reader would otherwise find in order (the MSRV
+  patch-component pitfall, the non-re-exported `async-trait`/`tokio` deps,
+  capability-versus-skill-name, `Debug` as the `fn main` reporting path).
+  Two deliberate behaviours observed and left: `--input` defaults to `{}`
+  (documented on the flag; an agent declaring an input contract still
+  refuses), and the CLI's default log filter shows the crate's own INFO
+  events (overridable with `RUST_LOG`, and the answer stays clean on
+  stdout).
+
+### Added — every store-side concurrency claim is now raced against a real PostgreSQL
+
+- Three more Docker-backed race tests join the quota-admission one, so every
+  mechanism whose correctness argument is "this serialises" carries evidence
+  rather than a comment: **authority draws** (sixteen racers against a
+  mandate affording exactly three — three land, the ledger reads exactly
+  €90, thirteen are refused `Exhausted`), **task claims** (sixteen
+  reviewers, one holder, fifteen told who holds it), and **timer sweeps**
+  (two concurrent sweepers partition twelve due wake-ups disjointly and
+  completely — `SKIP LOCKED` doing what it says). All three corroborated —
+  these mechanisms were sound, unlike the quota ceiling raced last — and
+  the distinction between corroborating a race and proving one stays
+  documented where the tests live.
+
+### Fixed — a satisfied waiter no longer swallows a second event
+
+- **A subscription outlived the match that satisfied it, and the window
+  swallowed messages.** `match_waiter` claims the event and hands the run to
+  its resume; the run unsubscribes *later*, in its own store call. Between
+  the two — sequentially, on any backend, no race required — a second event
+  matching the same key was matched to the same already-satisfied waiter and
+  claimed for its run: parked under a claim nobody consumes, and claimed
+  events never dead-letter, so the message vanished from every listing an
+  operator reads instead of aging out with a reason. Proven red with a
+  battery case before the fix. The claim now **retires the subscription in
+  its own transaction** on both backends; the resumed wait re-subscribes
+  idempotently and recovers its own claimed event through the crash-recovery
+  arm, so nothing legitimate needed the stale registration.
+
+  `deliver_to` deliberately does **not** retire, and the asymmetry is the
+  two paths' retry semantics — found by the battery refusing the symmetric
+  fix: a retried targeted delivery rebuilds its `Matched` from the
+  subscription rows to resume a run that crashed between claim and resume,
+  and a second distinct message claimed through a satisfied targeted wait is
+  recovered by the protocol itself, because the task's next continuation
+  re-matches the claimed event for the same run. The broadcast path has no
+  such retry loop, which is why it retires and the targeted path does not.
+  The reasoning is written at both sites, so the next symmetric "cleanup"
+  meets it before the battery does.
+
+### Fixed — the PostgreSQL run ceiling no longer yields under the load it exists for
+
+- **Two admissions racing for one remaining slot both landed.** The reserve
+  ran as a single `INSERT … WHERE (SELECT COUNT(*)…) < limit` statement, on a
+  comment claiming the decision happened "inside the row lock the write
+  takes" — and no such lock exists: two INSERTs of *different* rows lock
+  nothing in common, and under READ COMMITTED each statement's count subquery
+  reads its own snapshot. Falsified against a real server before the fix was
+  trusted: **sixteen concurrent admissions put eight runs through a ceiling
+  of four.** The catalogued yields-under-load shape, on the §9.1 control
+  whose whole promise is surviving scale-out — and invisible to every
+  sequential test, which is why the store had passed. The count and insert
+  now decide under a per-tenant transaction-scoped advisory lock (other
+  tenants' admissions do not wait), and a genuinely concurrent test races
+  sixteen tasks for four slots against a real PostgreSQL in the guards
+  suite. redb was never exposed — its single writer is the serialisation —
+  which is exactly how a two-backend contract hides a one-backend race.
+
+- **Recording an unreserved batch item reported success while writing
+  nothing**, on both backends — told *recorded* over an outcome that
+  vanished, the same lie a release that freed nothing tells. Now
+  `NotFound`, read from the row count the write already produces, and pinned
+  in the shared battery.
+
+- The rest of the quota and batch stores audited clean: the ceiling-of-zero
+  edge compares outside the loop and stops a tenant dead; the running set
+  is a set, not a counter, so a stranded slot names its run; spend accrual
+  saturates; batch reservation returns the original run id so a crashed
+  batch replays instead of re-performing; and the batch cursor is the
+  contiguous terminal prefix, holding position behind a suspended item.
+
+### Audited clean — the push outbox and the card signatures, adversarially
+
+- **The A2A push worker held ten probes across both backends**: the cursor
+  advances only after every payload of a record returned 2xx, monotonically
+  (`GREATEST`/`max`), so racing workers duplicate and never lose; a partial
+  multi-payload delivery redelivers from the record boundary, which
+  at-least-once permits; `attempts` is reset **on success** in both stores,
+  so the abandonment ceiling means consecutive failures as documented, not
+  lifetime ones; permanent refusals abandon immediately while a projection
+  failure — this plane's own bug — stays transient but still ceilinged,
+  because a record that cannot be projected now cannot be projected next
+  tick either and the cursor never moves past it; the ceiling arithmetic
+  makes `max_attempts(1)` mean one attempt; and a receiver answering
+  strangely is transient, not trusted.
+
+- **The card JWS held ten**: the algorithm is compared against the constant
+  and a header's `none` is skipped rather than believed; the signature
+  covers the RFC 7515 signing input itself, not its hash; verification
+  reuses the `protected` segment exactly as it arrived, so there is no
+  re-canonicalization to disagree; `kid` is read only from the
+  signature-covered header, never the unprotected slot; and the payload
+  excludes signatures by *removal*, because an empty array and an absent
+  field canonicalize differently.
+
+### Fixed — a parse step no longer accepts arguments nothing executes
+
+- **A plan step carrying both `parse` and `args` was accepted, and the args
+  silently ignored** — a field that parses and is never read, the
+  accepted-prose shape the manifest refuses for `routed`, arrived in the one
+  artifact whose whole point is that what is accepted is what runs. Refused
+  at execution with the reason named. The rest of the planner held under
+  twelve adversarial probes, recorded because the tier carries the crate's
+  strongest security claim: forward and self references refuse; `$$` escapes
+  exactly one dollar; a planner literal — string, number or bool, at any
+  nesting depth — carries the completion's untrusted label while a reference
+  carries the label of the value it names, which is what makes exfiltration
+  a *gate* decision rather than a routing accident; the final answer is
+  resolvable only as a reference, so a planner cannot fabricate it as a
+  literal; the runtime's escape bit overwrites any planner-declared
+  collision in a parse schema and is read fail-closed; tool names match
+  byte for byte with the wire-name hint derived rather than second-sourced;
+  and the step ceiling is enforced in code as well as in the response
+  schema, because a bound held only by what a provider did with a schema is
+  a bound the next driver quietly loses.
+
+### Audited clean — the label lattice, adversarially
+
+- The information-flow core (`core/label.rs`) was walked with eleven
+  adversarial probes and produced **no finding**, recorded because an audit
+  that only reports defects teaches nothing about where it looked: the
+  `Trust`/`Sensitivity` orderings that make `max` the correct join; the
+  conservative ancestor walk (`/ab` cannot false-match `/a` — truncation is
+  at pointer boundaries only); `object`/`array` assembly maintaining
+  whole-label ≥ join of tracked fields; `map`/`zip` discarding field paths
+  they would invalidate rather than keeping labels that no longer point at
+  their values; field releases refusing where lineage is not tracked instead
+  of borrowing whole-value precision; a released leaf not laundering its
+  parent object's label; `project_pointer`'s rebase unable to capture `/ab`
+  under an `/a` prefix; and RFC 6901 escaping in the order that cannot
+  double-escape. External corroboration on the same pass: the 2024–2026
+  defense literature (CaMeL, FIDES, Progent, RTBAS, FORGE) has converged on
+  deterministic out-of-band enforcement over per-value labels — the shape
+  this module implements — with the known utility trade-off already recorded
+  under the open context-branching question.
+
+### Added — a task can be taken over from a holder who is not coming back
+
+- **`TaskStore::take_over` and `POST /tasks/{task}/takeover`
+  (`api:task.takeover`).** The claim family had three members and three
+  answers to the same crash-or-absence question: events re-claim for the
+  claiming run, timers age their claims out on a lease — and tasks had
+  nothing, because only the holder may release. A task claimed by a reviewer
+  who left was parked until its deadline breached, turning a routine handover
+  into an escalation; the release endpoint's own docs name "an operator edits
+  the database" as the anti-pattern it exists to prevent, and the absent
+  holder was exactly that case. A take-over displaces a **named** holder —
+  `from` is a compare-and-swap, so a decision made from a stale queue view
+  fails rather than displacing whoever holds the task now, the same rule a
+  case write follows by naming the version it read — and re-checks
+  eligibility in full through the same ladder `claim` uses, extracted to one
+  implementation so the two verbs cannot drift a rung: four-eyes exclusion
+  does not thin because the previous reviewer left. An unheld task is
+  refused (`NotHeld`), because the verb for that is `claim`, and accepting
+  it would hide a stale view. Its own policy action lets a deployment hand
+  displacement to a queue lead without handing it to every reviewer. Like
+  claim and release it is a reservation in the store, not a decision — the
+  decision eventually taken still records its decider. The conformance
+  battery pins the stale-view refusal, the exclusion, the legitimate
+  handover and the unheld refusal on both backends; the API denial walk
+  covers the new route, which the route/vocabulary agreement test enforced
+  before the route could ship without it.
+
+### Fixed — a crash between an event's claim and its run's resume no longer loses the message
+
+- **An event claimed for a run was hidden from that run's own recovery.**
+  `match_waiter` claims durably; resuming the claimed run is a separate step;
+  a process can die between the two. The event then sat claimed for a run
+  that never saw it: the counterparty's retry was answered `Duplicate` (the
+  dedup working exactly as designed), the resumed wait re-subscribed and
+  asked `claim_for` — which filtered to *unclaimed* events, hiding the run's
+  own message from it — and the run slept until its deadline breached. A
+  message that arrived in time, lost anyway, in the failure mode §5.2 exists
+  to prevent and the one that presents as a process silently never
+  completing. The targeted path already had the answer: `deliver_to` grants a
+  retried delivery idempotent re-matching for the claiming run. `claim_for`
+  now grants the same — an event claimed **by this subscription's run** is
+  claimable again, on both backends, while any other run still finds nothing.
+  The conformance battery walks the crash sequence store-call by store-call:
+  match, then re-claim by the owner (must succeed), then claim by a stranger
+  (must not).
+
+- Checked sound on the same pass: the `(source, id)` dedup identity built by
+  one function with an unforgeable separator; both API transports setting
+  `source` from the authenticated caller, never the body; claim atomicity in
+  both directions; and the buffer-before-match ordering. The `EventStore`
+  trait docs understated the dedup identity as "by event id" — the exact
+  imprecision §5.2 warns about — and now state the pair and the reason.
+
+### Fixed — a revoked draw is an answer, and now the runtime treats it as one
+
+- **Every standing-authority refusal flattened to an error that reads as
+  in-doubt.** The `AuthorityError` taxonomy is built on the distinction its
+  module docs open with — revoked is *"not retryable, ever"*, exhausted may be
+  followed by a larger authority, and conflating them teaches a caller to
+  retry a decision that has been taken back. The effect's error mapping then
+  collapsed all five refusals to `Other`, whose disposition is **in-doubt**:
+  a revoked draw was retried under the full policy (the store idempotently
+  refusing each attempt), the final failure read *"may well have been
+  applied"* over a refusal the store answered with certainty, and a draw
+  deferred in an effect group quarantined the group — paging an operator —
+  where the cheap abort was the truthful settlement. Refusals now map to
+  `Refused` (an answer: one attempt, a failed run) and store unavailability
+  to `Unavailable` (retried, safe *because of* the receipt dedup). The journal
+  is the test's witness: one `EffectStarted` for the draw, and `Failed`
+  rather than `Quarantined`.
+
+  The sibling `Other` mappings in the same module were checked for the same
+  shape and stand: they wrap `StoreError`, which cannot certify that nothing
+  landed, so the conservative in-doubt default is honest there. The authority
+  case was different in kind — a typed refusal is certainty, and reporting
+  certainty as doubt is the defect.
+
+  The store layers themselves audited clean: draw-receipt idempotence keyed on
+  the dispatch identifier, `FOR UPDATE` with a post-lock receipt re-check on
+  PostgreSQL, refusal ordering shared through one `permits`, first-revocation
+  wins, and terms immutable by canonical-byte comparison.
+
+### Fixed — a cascade now passes through tombstones, on both backends at once
+
+- **Cascading erasure could not route through an individually-forgotten
+  intermediate.** A → B → C, with B corrected away by `forget`: a later
+  cascade from poisoned A never reached C, so the summary-of-a-summary stayed
+  readable after the erasure request that named its root reported success.
+  Two defects composed. The traversal skipped any node with no current entry —
+  in **both** backends, with the identical filter, which is what a contract
+  written from one misreading looks like (the battery's cascade was one level
+  deep, so nothing could see it). And `forget` deleted the tombstone's
+  *incoming* edges, severing the route even for a corrected traversal — the
+  same call whose own comment kept the *outgoing* edges "so a later erasure
+  can still find derived summaries" cut the path by which an upstream erasure
+  would arrive. Edges now survive a forget in both directions (the read path
+  keeps them harmless — `derivatives` skips tombstoned targets — and the
+  tombstone prevents id reuse), the traversal enqueues every edge target, and
+  the count reports only ids whose state the call actually removed: a
+  tombstone is routed, not counted. The shared conformance battery now walks
+  a three-deep chain with the middle link erased first, so both backends are
+  held to it by the same assertion.
+
+### Fixed — a refusal that is an answer is no longer retried as a fault
+
+- **`EffectError::Refused`: the peer understood the request and said no, and
+  the retry loop spends no attempt on it.** The model error taxonomy drew this
+  line — `RateLimited` documented as "worth retrying", `Refused` as "repeating
+  is pointless" — and the distinction governed nothing: both collapsed to one
+  variant at the effect boundary, and the retry loop's only gates were
+  disposition, recovery and attempt count. So a permanently-wrong request (an
+  unknown model, a schema the provider rejects, input filtered on the way in)
+  burned every permitted attempt with backoff, identically to a 429 — the
+  catalogued shape of a declaration that does nothing, wearing the catalogued
+  shape of a caller taught to retry the permanent. The bit is **recorded** on
+  the failure (`EffectFailed.permanent`), because the retry decision is
+  recomputed on replay: a replay that could not see it would expect the retry
+  the live run never made and report divergence over a faithful history — the
+  test pins live behaviour and strict replay both.
+
+- **HTTP 408 and 425 are transient, not judgements.** The shared status
+  classifier put every 4xx in the refused-before-generating class; these two —
+  the server timing out or declining to process *early* — are the 4xx codes
+  whose documented remedy is the retry, and under the rule above they would
+  have become terminal. Now classed with the retryable failures.
+
+### Changed — a landscape claim narrowed to what shipped software permits
+
+- **"Governance cannot be added afterwards" was half-falsified, and the
+  constitution now says which half.** Governance toolkits ship as framework
+  middleware — per-action policy engines on callback/middleware hooks, with
+  identity, capability gating and trust scoring — so per-action allow/deny
+  demonstrably layers on afterwards, and a document claiming otherwise would
+  be arguing with shipped software. The claim is narrowed to the three things
+  the hook position structurally cannot supply, which were always this
+  design's actual claims: enforcement *below* the code it governs (an
+  in-process hook is advisory against its own process), flow (a label travels
+  on the value; no interceptor can reconstruct provenance at the boundary it
+  fires on), and evidence unified with recovery (a middleware audit trail is
+  a second log beside execution). The hook-chain rejection likewise now names
+  the governance-toolkit form beside Strands, since the pattern outgrew one
+  framework's extension point.
+
+  The same pass walked the effect-group machinery (`runtime/group.rs`) and
+  the budget core against their constitutional claims — every commit path,
+  the three-conjunct cheap-abort guard, the `CommitUnknown` split, the
+  reversing-flag scoping, atomic-member replay — and found **no defect**,
+  recorded here because an audit that only reports findings teaches nothing
+  about where it looked.
+
+### Fixed — two ways a counterparty could spend what it should not
+
+- **An off-spec witness can no longer invent a shrink.** C2SP's 400 is a
+  statement about the request's own two numbers — `old` exceeds the checkpoint
+  size — and both are in hand before the witness answers. The arm mapped
+  *every* 400 to `Shrank`, so a witness answering 400 outside its protocol (a
+  mis-parse, a proxy's error page) manufactured a fork-class alert for a
+  request whose own numbers show none. The arm is now guarded by the same rule
+  the 409 arm already held: a witness is untrusted, so its reply can *confirm*
+  an integrity finding the request evidences and must never *invent* one. An
+  off-spec 400 is routine unavailability, named as off-spec.
+
+- **A content-filtered `ListTasks` has a cost ceiling.** The paged index
+  bounded the unfiltered listing — and a `status` or `contextId` filter handed
+  the unbounded scan straight back, because the filter is answerable only by
+  reading each candidate's journal and the spec's `totalSize` is the exact
+  pre-pagination count. One field, and any authenticated peer buys a scan of
+  every run the tenant ever wrote, per request. `filter_scan_budget`
+  (default 1024 candidate reads, settable on `A2aServer`) refuses an
+  over-budget filter naming the lever that narrows without reading —
+  `statusTimestampAfter` is answered from the index. Refused rather than
+  truncated, deliberately: a total that quietly stopped counting reports a
+  smaller tenant, not a bounded scan, and the spec requires the exact count.
+
+### Fixed — the audit engine audited, and the false alarm mattered most
+
+- **An open run no longer audits as an integrity finding.** The audit flagged
+  *every* run the log held no leaf for — and an open run (failed and resumable,
+  exhausted, still executing) legitimately has no leaf, so a healthy plane with
+  ordinary open runs audited as damaged on every pass. A false integrity alarm
+  is how the true one stops being believed. The decision now belongs to the
+  run's own records: a **sealing** conclusion with no leaf behind it is history
+  the log no longer commits to and stays the finding it always should have
+  been; an open run is listed sound on chain and signatures, with the limit
+  said once in `not_checked` — an open run's tail has no leaf to pin it, so
+  truncation is undetectable until it seals. The sealed-or-not rule is
+  `runtime::SEALED_OUTCOMES`, not a re-spelling of it. `testkit` gained
+  `Schedule::leafless(run)` because a healthy store cannot produce the
+  serious half on request — sealing always writes the leaf — and the finding
+  for the most serious state the audit reports was reachable by no test.
+
+- **A mid-audit seal no longer reads as tampering.** The audit captured its
+  checkpoint first and asked for inclusion proofs after, so a run sealed in
+  between carried a proof against a larger tree than the root in hand —
+  `BadInclusion`, on a healthy busy plane. The same race the export had, in
+  its sibling. The checkpoint now catches up once; a plane sealing
+  continuously through the audit lands in `not_checked` as unpinnable, which
+  is the honest answer.
+
+- **Three doc comments had absorbed the item below them** — the catalogued
+  absorbed-doc shape, in the one escape variant its guard names but cannot
+  cheaply catch: a one-line absorbed doc lands as the block's *final* line,
+  where no blank `///` follows and the detector's loop never reaches. `audit`'s whole
+  doc block (its `# Errors` included) sat on `releases_in`, leaving `audit`
+  undocumented; `run_correlated`'s correlation explanation sat on
+  `run_in_case`, whose block then contradicted itself about whether the case
+  exists; the `skills` field's summary sat on `per_agent`. Found by running
+  the final-line variant of the guard's own fingerprint over the whole tree —
+  34 hits, 3 defects — and the guard now documents that sweep as the review
+  prompt, with the measured reason it is not automated: 31 legitimate
+  punchlines to 3 defects is a guard that trains its reader to skim.
+
+### Fixed — the export was audited before it shipped, and five gaps did not survive it
+
+- **The verifier now checks the format version it was told to pin.** The header
+  carried `version: 1` "so a reader pins this" — and no reader did, including
+  this crate's own two. A declaration only the writer consults is a declaration
+  that does nothing: `verify` would have parsed a future format as far as its
+  lines looked familiar and reported findings about a file it never understood,
+  and `restore` — whose parser deliberately skips what it does not recognise —
+  would have rebuilt whatever subset happened to parse and called it a history.
+  `verify` now reports a foreign version as a finding; `restore` refuses it
+  outright, because the two failure modes differ: a misleading report is bad,
+  and an unknowable partial restore reported as complete is worse.
+
+- **A relabelled run block is caught by its own records.** Chain, leaf and
+  Merkle checks all verify *bytes*, so an export that filed run B's records and
+  B's leaf under run A's id passed every one of them — and `sound` then named a
+  run whose history is somebody else's. Only the label lied, and the label is
+  what a reader looks a run up by. Every record's `body.run` is now held to the
+  block it sits under; the record's run id is inside the hashed body, so the
+  check cannot itself be forged around.
+
+- **A run sealed after the export's checkpoint is exported as still open.**
+  `to_jsonl` reads the checkpoint first and each run's log position after, so a
+  run sealed in between carried an index the header's checkpoint does not commit
+  to — and the verifier then rebuilt a tree one leaf larger than the root it
+  compares against, reporting tampering where there was only time. A race every
+  busy plane hits, producing exactly the false alarm that teaches operators to
+  disbelieve the alarm. The export now describes the log *as of its checkpoint*:
+  the late run's records are all present, its seal travels in the next export.
+
+- **An open run with an edited record is no longer listed sound.** A sealed
+  run's tampering surfaces at the leaf comparison; an open run has no leaf, so
+  the per-record findings were the only control — and they never reached the
+  verdict. The report produced a finding *and* listed the run sound, two halves
+  of one artifact contradicting each other. Per-record findings now carry to the
+  run's verdict.
+
+- **The sealed-outcome list moved from the binary into the library.** The
+  export CLI's default sweep named the sealed outcomes as string literals —
+  two implementations of one rule, where a new sealing outcome would have been
+  silently dropped from exactly the artifact an auditor asks for.
+  `runtime::SEALED_OUTCOMES` now lives beside `RunStatus::seals`, and a test
+  holds the two to each other variant by variant, which literals in a binary
+  could never be held to.
+
+### Added — the audit verbs take evidence, not just a store
+
+- **`audit --key <id>=<hex> --prior <report.json> [--require-signatures]` and
+  `verify --key <id>=<hex>`.** The library call has taken a verifier and a prior
+  checkpoint all along; the verbs hardcoded neither, so the signature check and
+  the deletion check were real and unreachable without linking the crate and
+  writing Rust — the exact dependency these verbs exist to remove. `--prior`
+  takes the `current` field of an earlier report, so each audit prints the
+  checkpoint the next one checks against; the loop is the deletion check.
+  `cli` now includes the `signing` feature for this. `--key` on `verify` is
+  strict about unsigned records deliberately — inside a signed history, the
+  unsigned record is the one an attacker who cannot sign would add — while
+  `audit` keeps strictness behind `--require-signatures`, because history
+  written before signing was configured is legitimately unsigned.
+
+### Added — restore, and it proves itself
+
+- **`agentplane restore <export> --store <path>`** rebuilds a journal from an
+  export and proves it by one comparison: equal Merkle roots at equal size. That
+  is stronger than "the rows loaded" — it means every record, in every run, in
+  the order the log recorded them, rebuilt to the same commitment. A restored run
+  **strict-replays on a plane that never executed it**, consuming every effect
+  from history and performing none.
+
+  It replays the ordinary `append` path rather than writing rows, which is the
+  safety argument: `append` maintains six derived indexes — case, exactly-once,
+  outcome plus its ordering counter, and both halves of the discovery index — and
+  a restore that rebuilt five would leave a store that reads perfectly until
+  somebody queries the sixth. The test therefore asserts through the query
+  surfaces, not only the checkpoint.
+
+  Two details reproduce the original bytes rather than similar ones. Runs are
+  **sealed in log-index order**, because that order *is* the Merkle log — seal in
+  file order and the same leaves give a different root. And `epoch` is **carried,
+  not re-derived**: it is inside the hashed body, so a run that ever changed
+  hands would rehash under one fresh lease, and those are exactly the runs a
+  failover produced. Both backends fence only when a lease row *exists*, so
+  restoring into a store with no leases writes each record under its own epoch.
+  `Append::from_body` exists so that field list lives in one place — a restore
+  that forgot `phase` would replay a compensation as a forward record and hash
+  differently for a reason no diff shows.
+
+  What does not survive is named in the report: signatures, unless the restoring
+  store holds the original key (hashes and the root are unaffected, since a
+  signature is over the chain hash and stored beside it), and activity
+  timestamps, which are rebuilt at restore time.
+
+  **The epoch property was very nearly untested.** Every run in the round-trip
+  test had epoch 1, so flattening epochs changed nothing and the mutation
+  survived — on the one behaviour the whole design exists for. There is now a
+  run that changed hands, built by appending with no lease, which reproduces
+  precisely the history a takeover leaves without waiting one out.
+
+### Added — the restore drill
+
+- **`agentplane verify <export>` recomputes an export and checks it against its
+  own checkpoint.** Putting bytes back into a store proves bytes moved; it does
+  not prove they are the bytes that were taken, in the order they were taken,
+  with nothing dropped from the middle. This establishes that — from the file
+  alone, with no store and no runtime.
+
+  Every record is re-sealed through `Record::seal`, the same function the store
+  seals with, so agreement is evidence about the bytes rather than the file
+  agreeing with itself. Sequences must be contiguous, because a removed *tail*
+  breaks no link. Signatures go through `Record::verify_attested` with
+  `require_signature`, so one implementation answers *is this signed history
+  sound* rather than two.
+
+- **The export now carries Merkle log positions, and it could not verify without
+  them.** This was a real gap in what shipped last round: the leaf *order* is
+  store state assigned at seal time and appears in no record, so an export could
+  be walked but not checked against the checkpoint in its own header. Delete a
+  whole run and every surviving chain still verifies perfectly — a chain links
+  records *within* a run and knows nothing about its neighbours. Only the
+  rebuilt tree notices.
+
+  Each run now gets a block line carrying its log index and leaf, and `verify`
+  rebuilds the tree from them. Absent for an open run, which is a state rather
+  than a gap. `Checkpoint` gained `Deserialize` for the same reason it gained
+  `Serialize`: the reader hands it back.
+
+  **Two fixtures in this work were measuring themselves** and are recorded
+  because the shape recurs. One grepped for `RunId::to_string()` — `run_01K…` —
+  while the JSON form is bare, so it removed nothing and the "did the edit
+  land" assertion was satisfied vacuously. The other edited a field the export
+  does not contain. Both now assert the fixture changed something before
+  asserting the control noticed.
+
+### Fixed — a protocol listing read the whole store
+
+- **`tasks/list` cost O(every record the tenant had ever written.)** It called
+  `JournalStore::recent_runs`, which returned **every** run unbounded, then read
+  the *complete journal of each* to build a task it might not even return, and
+  paginated afterwards. Any authenticated peer could ask, repeatedly.
+
+  The signature was the cause: it offered nothing to bound with, so the caller
+  could not have done better. Every other listing in this crate takes a limit
+  and reports truncation; this was the exception, and it was the one a remote
+  party could reach. `recent_runs(after, limit)` is now a bounded, cursored page
+  in a total order — `(updated_at, run)` descending, the tie-break included in
+  the contract because both backends keep whole-second timestamps, so ties are
+  ordinary and a cursor landing mid-tie drops or duplicates a row.
+
+  The listing now reads a journal only when the answer needs one: for the runs on
+  the page, and — where `contextId` or `status` is given — for the candidates it
+  must examine to report an exact total. Permission and `statusTimestampAfter`
+  are index-only and cost nothing.
+
+  **`totalSize` nearly became an information leak in the process.** The first
+  version answered the unfiltered case with a cheap `count_runs()` off the
+  index, which counts rows the caller is not permitted to see — so the listing
+  would hide the tasks and the number would report them. `list_tasks_omits_tasks_the_caller_cannot_read`
+  caught it. Counting now happens after the permission check, and `count_runs`
+  was removed rather than left as a faster wrong answer.
+
+  **Breaking:** `JournalStore::recent_runs` takes `(after, limit)`. An embedder's
+  own store must page in the stated order; the conformance battery now checks
+  it, which it could not before — an unbounded read has no page boundary to get
+  wrong, so there was nothing to check.
+
+### Added — getting the record out
+
+- **`agentplane export` and `agentplane audit`.** The offline audit existed and
+  was a library call, so the independent party the whole evidence argument is
+  built around had to link this crate and write Rust. And there was no export at
+  all — an auditor who can *check* a history but cannot *obtain* it is still
+  dependent on the operator, and a supervisor asking a regulated entity to
+  demonstrate an exit is asking about obtaining.
+
+  Both verbs take a store and nothing else. `export` writes JSON Lines: a header
+  naming the log, its checkpoint and the canonicalization rule the digests were
+  computed under; one line per record carrying `prev_hash` and `hash` so the
+  chain re-walks from the file alone; and a trailer. Three properties are
+  refusals of an easier design — it streams rather than building a `Vec` (the
+  export that matters most is from the largest store); it is framed, so a file
+  cut short by a full disk ends *without* a trailer rather than looking
+  complete; and it names runs it could not read instead of dropping them.
+
+  `ExportedRecord` is written out by hand rather than derived on `Record`,
+  because this is a durable format and a derive makes the wire shape a side
+  effect of a field list. `AuditReport` and `Checkpoint` now implement
+  `Serialize` for the same reason the verbs exist.
+
+  It exports what the chain committed to — ciphertext where a key ring is
+  configured. An export of plaintext would put a copy beyond the reach of key
+  destruction and undo cryptographic erasure.
+
+- **`testkit::faults` can make a run unreadable.** Fault injection covered the
+  append path only, which is where the interesting write failure lives — but a
+  *reader* of history has its own bad state, and a healthy store never produces
+  it on request: both backends answer an unknown run with an empty read rather
+  than an error, correctly. So the export's "names what it could not read" test
+  was written against a run that does not exist, asserted an accounting identity
+  that held either way, and passed with the reporting deleted. `Schedule::unreadable`
+  makes the state reachable; the mutation now dies.
+
 ## [0.13.0] — 2026-08-10
 
 ### Changed — security

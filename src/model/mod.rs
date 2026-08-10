@@ -1220,6 +1220,15 @@ impl Effect for ModelCall {
             // exists to bound a runaway provider counts zero.
             if spend.is_zero() {
                 match e.disposition() {
+                    // A provider's refusal is an answer, not a fault: the
+                    // request is *wrong* — unknown model, malformed schema,
+                    // input filtered — and asking again asks the same rule the
+                    // same question. Carried as `Refused` so the retry loop
+                    // spends no attempt on it, where a rate limit or an
+                    // outage stays `Rejected` and retries under policy.
+                    Disposition::DidNotHappen if matches!(e, ModelError::Refused { .. }) => {
+                        EffectError::Refused(detail)
+                    }
                     Disposition::DidNotHappen => EffectError::Rejected(detail),
                     Disposition::InDoubt => EffectError::Interrupted {
                         driver: self.model.to_string(),

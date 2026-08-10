@@ -198,13 +198,17 @@ impl BatchStore for RedbStore {
                     .get((tenant.as_str(), batch_key.as_str(), item.as_str()))
                     .map_err(|e| be(&e))?
                     .map(|v| v.value().0.to_owned());
-                if let Some(run) = run {
-                    t.insert(
-                        (tenant.as_str(), batch_key.as_str(), item.as_str()),
-                        (run.as_str(), state, 1u8, detail.as_str(), tokens, minor),
-                    )
-                    .map_err(|e| be(&e))?;
-                }
+                // An unreserved item is a refusal, not a no-op: returning `Ok`
+                // while writing nothing tells the caller *recorded* over an
+                // outcome that vanished.
+                let Some(run) = run else {
+                    return Err(StoreError::NotFound(format!("{batch_key}/{item}")));
+                };
+                t.insert(
+                    (tenant.as_str(), batch_key.as_str(), item.as_str()),
+                    (run.as_str(), state, 1u8, detail.as_str(), tokens, minor),
+                )
+                .map_err(|e| be(&e))?;
             }
             w.commit().map_err(|e| be(&e))?;
             Ok(())

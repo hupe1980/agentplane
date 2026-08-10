@@ -274,6 +274,18 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
 /// it means.
 const NAMED_EXTERNAL: &[&str] = &["RFC", "C2SP", "A2A", "MCP", "CloudEvents"];
 
+/// Whether a line names the internal design document itself.
+///
+/// The sibling detector below catches a bare `§11.1`. This catches the other
+/// half of the same leak: naming or linking `CONCEPT.md`, which is not in the
+/// release tarball and is not on the site, so every such reference is a dead
+/// link for the only people who read these pages. It is easy to write while
+/// editing, because the file is open in the author's editor and resolves fine
+/// there — which is precisely why a guard rather than a habit.
+fn names_internal_document(line: &str) -> bool {
+    line.contains("CONCEPT.md")
+}
+
 /// Whether a line cites a section of a document the reader does not have.
 ///
 /// A named specification before the section is a citation a reader can follow;
@@ -348,6 +360,18 @@ fn nothing_a_reader_sees_cites_an_internal_section_number() {
         !cites_internal_section("/// an ordinary line with no citation at all"),
         "the detector fires on a line containing no section reference"
     );
+    assert!(
+        names_internal_document("see https://github.com/x/y/blob/main/CONCEPT.md"),
+        "the detector does not recognise a link to the internal document"
+    );
+    assert!(
+        names_internal_document("/// the reasoning is in CONCEPT.md"),
+        "the detector does not recognise the internal document by name"
+    );
+    assert!(
+        !names_internal_document("/// the reasoning is stated at the mechanism"),
+        "the detector fires on a line naming no document"
+    );
 
     // `src` is what reaches docs.rs, but the repository is public and an
     // evaluator reads `tests` and `examples` to see what the crate can do. A
@@ -380,7 +404,7 @@ fn nothing_a_reader_sees_cites_an_internal_section_number() {
             continue;
         }
         for (n, line) in text.lines().enumerate() {
-            if cites_internal_section(line) {
+            if cites_internal_section(line) || names_internal_document(line) {
                 offenders.push(format!(
                     "{}:{}: {}",
                     path.strip_prefix(root).unwrap_or(path).display(),
@@ -393,9 +417,10 @@ fn nothing_a_reader_sees_cites_an_internal_section_number() {
 
     assert!(
         offenders.is_empty(),
-        "an artifact a reader can see cites internal design-document sections, \
-         which they cannot resolve and which go stale silently when the document \
-         is renumbered — state the reasoning instead:\n{}",
+        "an artifact a reader can see points into the internal design document — \
+         by section number, which they cannot resolve and which goes stale \
+         silently when the document is renumbered, or by name, which is a dead \
+         link because that file ships nowhere. State the reasoning instead:\n{}",
         offenders.join("\n")
     );
 }
@@ -578,7 +603,20 @@ fn every_example_is_run_by_the_examples_recipe() {
 /// reach is worse than one that admits it: a merge whose absorbed summary wraps
 /// onto two lines, one that lands mid-paragraph rather than before a blank, and
 /// a doc block attached to the wrong item where nothing was absorbed at all.
+///
 /// Only the compiler resolves that last one.
+///
+/// **And a fourth escape, found by three real instances after this guard was
+/// green**: an absorbed doc that was a *one-liner* lands as the block's final
+/// line — there is no body below it, so no blank `///` follows and the loop
+/// bound `1..len-1` never reaches it. `audit`'s whole doc block sat on
+/// `releases_in`, `run_correlated`'s explanation sat on `run_in_case`, and the
+/// `skills` field's summary sat on `per_agent` — all final lines. Extending the
+/// detector there was measured and declined: the same predicate over final
+/// lines fires on 31 legitimate closing punchlines against 3 defects, and a
+/// guard that cries ten-to-one trains the reader it exists to protect. The
+/// sweep that found them is the review prompt instead: when auditing, run the
+/// final-line variant by hand and read the hits.
 #[test]
 fn no_doc_comment_has_absorbed_the_one_below_it() {
     const SECTIONS: [&str; 4] = ["# Errors", "# Panics", "# Examples", "# Safety"];

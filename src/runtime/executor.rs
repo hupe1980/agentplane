@@ -175,6 +175,30 @@ impl RunStatus {
     }
 }
 
+/// Every outcome a sealed run can carry, as the outcome index spells them.
+///
+/// The store indexes runs *by* outcome and deliberately has no "all runs"
+/// query — a backlog listing is a range read rather than a table scan — so any
+/// caller that wants every sealed run has to name the outcomes one by one. This
+/// is the list to name them from, and it lives beside [`RunStatus::seals`]
+/// because it is the same rule in its other spelling: the statuses that seal,
+/// plus the two sealed conclusions that are not run statuses at all — a sweep
+/// (`swept`) and a break-glass crossing (`broke-glass`), each sealed at birth
+/// with no goal to have succeeded or failed at.
+///
+/// It lived in the CLI first, as string literals — two implementations of one
+/// rule, where a new sealing outcome would have been exported by nobody and
+/// the export that silently omitted it would have dropped exactly the runs an
+/// auditor came for. A test holds this list to `RunStatus::seals` variant by
+/// variant, which the literals in a binary could never be held to.
+pub const SEALED_OUTCOMES: &[&str] = &[
+    "succeeded",
+    "quarantined",
+    "cancelled",
+    super::sweeper::SWEEP_OUTCOME,
+    BREAK_GLASS_OUTCOME,
+];
+
 /// A run that exists but has not run.
 ///
 /// Produced by admission and consumed by execution, so the two can happen in
@@ -610,6 +634,17 @@ impl Runtime {
         Ok(run)
     }
 
+    /// The journal, for reads the runtime does not mediate.
+    ///
+    /// This is also the embedder's **resumable output stream**:
+    /// [`JournalStore::read`] is a seq-cursored read over a run's records, so
+    /// polling from the last sequence seen is a durable, reconnect-safe
+    /// progress feed that any instance can serve — the exact mechanism the
+    /// A2A streaming surface is built on. There is deliberately no curated
+    /// event type between an embedder and the records: a third vocabulary
+    /// beside the journal's and the wire's would be a second truth wearing
+    /// ergonomics, and the records are already the history the stream must
+    /// agree with.
     pub fn journal(&self) -> &Arc<dyn JournalStore> {
         &self.store
     }
@@ -973,12 +1008,6 @@ impl Runtime {
         .await
     }
 
-    /// Execute a run that belongs to a long-lived case.
-    ///
-    /// Correlation happens **before planning**, because which case a message
-    /// belongs to is a question of fact, not of judgement: it is a deterministic
-    /// lookup on business keys, never a model call. If an open case matches any
-    /// key the run joins it; otherwise a case is opened.
     /// Start a new immutable run inside a case that already exists.
     pub async fn run_in_case(
         &self,
@@ -991,6 +1020,11 @@ impl Runtime {
     }
 
     /// Join or open a case by business key, then run.
+    ///
+    /// Correlation happens **before planning**, because which case a message
+    /// belongs to is a question of fact, not of judgement: it is a deterministic
+    /// lookup on business keys, never a model call. If an open case matches any
+    /// key the run joins it; otherwise a case is opened.
     pub async fn run_correlated(
         &self,
         target: &str,
@@ -5092,6 +5126,35 @@ mod resume_agreement_tests {
                 "'{outcome}' is a conclusion a resume must be able to continue \
                  from — its completed effects are read back from history, which \
                  is the point of having a journal"
+            );
+        }
+    }
+
+    /// `SEALED_OUTCOMES` and `RunStatus::seals` are one rule in two spellings,
+    /// and this holds them together variant by variant.
+    ///
+    /// The list exists so a caller wanting every sealed run — the export CLI —
+    /// does not restate the rule as string literals in a binary, which is where
+    /// a new sealing outcome would have been silently dropped from exactly the
+    /// artifact an auditor asks for. Both directions matter: a sealing status
+    /// missing from the list loses runs, and a non-sealing status present in it
+    /// makes the export ask the outcome index about a backlog that drains.
+    #[test]
+    fn the_sealed_outcome_list_agrees_with_the_sealing_rule() {
+        for status in super::every_status() {
+            assert_eq!(
+                super::SEALED_OUTCOMES.contains(&status.as_str()),
+                status.seals(),
+                "'{}' disagrees between RunStatus::seals and SEALED_OUTCOMES — \
+                 one rule, two spellings, and the export reads the list",
+                status.as_str()
+            );
+        }
+        for special in ["swept", "broke-glass"] {
+            assert!(
+                super::SEALED_OUTCOMES.contains(&special),
+                "'{special}' is sealed at birth by the sweeper or a break-glass \
+                 crossing and must be exportable"
             );
         }
     }

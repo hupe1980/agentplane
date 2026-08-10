@@ -21,6 +21,8 @@ pub use executor::Agent;
 /// decision — resume, sealing, and the A2A state mapping. Test-only.
 #[cfg(test)]
 pub(crate) use executor::every_status;
-pub use executor::{LEASE_TTL, MIN_LEASE_TTL, RunOutcome, RunStatus, Runtime, RuntimeBuilder};
+pub use executor::{
+    LEASE_TTL, MIN_LEASE_TTL, RunOutcome, RunStatus, Runtime, RuntimeBuilder, SEALED_OUTCOMES,
+};
 pub use group::{EffectGroup, Invariant};
 pub use sweeper::{Saturation, SweepReport};

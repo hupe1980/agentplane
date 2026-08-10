@@ -64,6 +64,24 @@ fn a_webhook_host_must_be_granted() {
     ));
 }
 
+/// **An internationalised webhook grant matches a URL to that host.**
+///
+/// The grant is checked against `Url::host_str`, which the URL crate encodes to
+/// punycode — so a grant only lowercased would store the Unicode form and never
+/// match, silently refusing every delivery to the host it was meant to permit.
+/// The sibling of the media-host defect, fixed with the same shared helper so
+/// the two host-granting surfaces cannot drift.
+#[test]
+fn an_internationalised_webhook_host_grant_matches() {
+    let policy = PushPolicy::new().allow_host("café.example");
+    policy
+        .check("https://café.example/a2a")
+        .expect("an internationalised grant did not match a URL to the same host");
+    policy
+        .check("https://xn--caf-dma.example/a2a")
+        .expect("the punycode spelling of the granted host is refused");
+}
+
 /// Plaintext webhooks are refused.
 ///
 /// The payload describes somebody's task. Sending it in clear to an address the

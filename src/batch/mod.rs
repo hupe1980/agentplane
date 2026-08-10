@@ -263,6 +263,14 @@ pub trait BatchStore: Send + Sync + Debug {
     ) -> Result<ItemRecord, StoreError>;
 
     /// Record how an item ended, and what it consumed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when the item was never reserved. Both shipped
+    /// backends once returned `Ok` while writing nothing there — a caller told
+    /// *recorded* over an outcome that vanished, which is the same lie a
+    /// release that freed nothing tells, and it is caught by the row count the
+    /// write already produces.
     async fn record(
         &self,
         batch: BatchId,

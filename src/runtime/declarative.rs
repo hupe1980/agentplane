@@ -687,6 +687,19 @@ impl Declarative {
 
                 // ── A parse: the quarantined model, a bounded schema ───────
                 (None, Some(parse)) => {
+                    // `args` belongs to a tool step, and a parse ignores it —
+                    // so accepting one here would be a field that parses and
+                    // is never read, manufacturing confidence in arguments
+                    // nothing executes. Refused for the same reason the
+                    // manifest refuses `routed`: what is accepted must be
+                    // what runs.
+                    if step.args.is_some() {
+                        return Ok(Outcome::fail(format!(
+                            "plan step {index} is a parse and carries `args` — a parse takes \
+                             `from` and `schema`, and arguments nothing executes would be \
+                             accepted prose"
+                        )));
+                    }
                     let source = match resolve_reference(&parse.from, &input, &outputs) {
                         Ok(source) => source,
                         Err(why) => {

@@ -913,3 +913,96 @@ async fn an_audit_reports_what_authorized_each_run() {
         "the warrant names a different policy bundle than the one that governed the run"
     );
 }
+
+/// **A missing leaf is a finding exactly when the run's own records say it
+/// sealed — an open run is a state, not a defect.**
+///
+/// The audit used to flag *every* run the log held no leaf for, which made a
+/// healthy plane with failed-and-resumable runs audit as damaged: a false
+/// integrity alarm on every pass, which is how the true one stops being
+/// believed. The decision belongs to the run's own records — a sealing
+/// conclusion with no leaf behind it is history the log no longer commits to,
+/// and that half is the serious one, so both halves are pinned here.
+#[tokio::test]
+async fn a_missing_leaf_is_a_finding_only_for_a_sealed_conclusion() {
+    use agentplane::testkit::faults::{Faulty, Schedule};
+
+    #[derive(Debug)]
+    struct Failing;
+
+    #[async_trait::async_trait]
+    impl Skill for Failing {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("failing").provides("demo.failing")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            Err(SkillError::Other("on purpose".into()))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let sealed = sealed_runs(&store, 1).await;
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .skill(Failing)
+        .build();
+    let open = rt
+        .run("demo.failing", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(open.status, agentplane::runtime::RunStatus::Failed(_)),
+        "the fixture needs an open run, and a failed run stays open for resume"
+    );
+
+    // The open run first, against the store as it is: no leaf, and no finding.
+    let s = store.clone() as Arc<dyn JournalStore>;
+    let report = agentplane::audit::audit(
+        &s,
+        &[sealed[0], open.run_id],
+        &agentplane::audit::Evidence::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        report.is_sound(),
+        "an open run was reported as an integrity problem: {:?}",
+        report.findings
+    );
+    assert!(
+        report.sound.contains(&open.run_id),
+        "the open run's chain verified and it should be listed, with the limit \
+         in not_checked rather than silence: {report:?}"
+    );
+    assert!(
+        report.not_checked.iter().any(|s| s.contains("open run")),
+        "the report does not say an open run's tail cannot be pinned: {:?}",
+        report.not_checked
+    );
+
+    // The serious half: the same sealed run, in a store that lost its leaf.
+    let leafless: Arc<dyn JournalStore> = Arc::new(Faulty::new(
+        store.clone() as Arc<dyn JournalStore>,
+        Schedule::healthy().leafless(sealed[0]),
+    ));
+    let report =
+        agentplane::audit::audit(&leafless, &sealed, &agentplane::audit::Evidence::default())
+            .await
+            .unwrap();
+    assert!(
+        !report.is_sound(),
+        "a run whose records carry a sealing conclusion has no leaf, and the \
+         audit called that sound"
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.to_string().contains("not in the log")),
+        "the missing leaf was noticed for the wrong reason: {:?}",
+        report.findings
+    );
+}

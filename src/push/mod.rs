@@ -268,14 +268,26 @@ impl PushPolicy {
     }
 
     /// Permit webhooks to this exact host.
+    ///
+    /// # Panics
+    ///
+    /// If the host is not one a URL could name. The grant is matched against
+    /// `Url::host_str`, which the URL crate IDNA-encodes to punycode — so a
+    /// grant only lowercased would store an internationalised host in a form
+    /// no webhook URL ever presents, silently refusing every delivery to it.
+    /// Canonicalised through the same helper governed media uses, so the two
+    /// host-granting surfaces cannot drift the way they had.
     #[must_use]
     pub fn allow_host(mut self, host: impl AsRef<str>) -> Self {
-        self.hosts.insert(
-            host.as_ref()
-                .trim()
-                .trim_end_matches('.')
-                .to_ascii_lowercase(),
-        );
+        let raw = host.as_ref();
+        let host = crate::netguard::canonical_host(raw).unwrap_or_else(|| {
+            panic!(
+                "push host grant '{raw}' is not a host a URL can name — give an \
+                 internationalised host in the form the URL parser accepts, or it \
+                 would silently never match a webhook"
+            )
+        });
+        self.hosts.insert(host);
         self
     }
 

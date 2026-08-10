@@ -690,16 +690,44 @@ impl JournalStore for PostgresStore {
             .collect())
     }
 
-    async fn recent_runs(&self) -> Result<Vec<(RunId, u64)>, StoreError> {
+    async fn recent_runs(
+        &self,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError> {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
-        let rows = client
-            .query(
-                "SELECT run_id, updated_at FROM run_activity
-                 WHERE tenant = $1 ORDER BY updated_at DESC, run_id DESC",
-                &[&self.tenant_name()],
-            )
-            .await
-            .map_err(|error| be(&error))?;
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        // Row-value comparison, so the composite cursor is one predicate the
+        // `(updated_at DESC, run_id DESC)` index can seek to rather than a
+        // disjunction the planner has to unpick.
+        let rows = match after {
+            Some((updated, run)) => {
+                client
+                    .query(
+                        "SELECT run_id, updated_at FROM run_activity
+                         WHERE tenant = $1 AND (updated_at, run_id) < ($2, $3)
+                         ORDER BY updated_at DESC, run_id DESC LIMIT $4",
+                        &[
+                            &self.tenant_name(),
+                            &i64::try_from(updated).unwrap_or(i64::MAX),
+                            &run.to_string(),
+                            &cap,
+                        ],
+                    )
+                    .await
+            }
+            None => {
+                client
+                    .query(
+                        "SELECT run_id, updated_at FROM run_activity
+                         WHERE tenant = $1
+                         ORDER BY updated_at DESC, run_id DESC LIMIT $2",
+                        &[&self.tenant_name(), &cap],
+                    )
+                    .await
+            }
+        }
+        .map_err(|error| be(&error))?;
         rows.into_iter()
             .map(|row| {
                 let id: String = row.get(0);

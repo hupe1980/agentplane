@@ -110,8 +110,10 @@ impl JournalStore for NoExactlyOnce {
 
     async fn recent_runs(
         &self,
+        after: Option<(u64, agentplane::core::RunId)>,
+        limit: usize,
     ) -> Result<Vec<(agentplane::core::RunId, u64)>, agentplane::core::StoreError> {
-        self.inner.recent_runs().await
+        self.inner.recent_runs(after, limit).await
     }
 
     async fn case_history(

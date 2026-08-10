@@ -599,6 +599,7 @@ impl Api {
             .route("/tasks/{task}", get(task_view))
             .route("/tasks/{task}/claim", post(claim))
             .route("/tasks/{task}/release", post(release))
+            .route("/tasks/{task}/takeover", post(take_over))
             .route("/tasks/{task}/decide", post(decide))
             .route("/cases", get(cases_by_status))
             .route("/cases/{case}", get(case_view))
@@ -670,6 +671,10 @@ pub mod action {
     pub const TASK_READ: &str = "api:task.read";
     pub const TASK_CLAIM: &str = "api:task.claim";
     pub const TASK_RELEASE: &str = "api:task.release";
+    /// Displacing a named absent holder. Its own verb rather than a widened
+    /// `task.claim`, so a policy set can hand it to a queue lead without
+    /// handing displacement to every reviewer.
+    pub const TASK_TAKEOVER: &str = "api:task.takeover";
     pub const TASK_DECIDE: &str = "api:task.decide";
     pub const CASE_READ: &str = "api:case.read";
     pub const CASE_LIST: &str = "api:case.list";
@@ -697,6 +702,7 @@ pub mod action {
         RUN_READ,
         RUN_LIST,
         RUN_CANCEL,
+        TASK_TAKEOVER,
         TASK_LIST,
         TASK_READ,
         TASK_CLAIM,
@@ -990,6 +996,38 @@ async fn release(
         .await
         .map_err(|e| claim_refused(&e))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Take a task over from a holder who is not coming back.
+///
+/// The body names the holder being displaced, and the store treats that as a
+/// compare-and-swap: a take-over decided from a stale queue view fails rather
+/// than displacing whoever holds the task now. Eligibility — four-eyes
+/// exclusion included — is re-checked in full for the caller, who is the new
+/// holder for the same reason the claimant and the decider are the
+/// authenticated caller and never a body field.
+async fn take_over(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Path(task): Path<String>,
+    Json(body): Json<TakeOverBody>,
+) -> Result<Json<TaskView>, ApiError> {
+    let s = api.gate(&headers, action::TASK_TAKEOVER, &task).await?;
+    let id = TaskId::parse(&task).map_err(|_| bad("task"))?;
+    let tasks = s.plane.tasks().ok_or_else(|| unavailable("task"))?;
+
+    let taken = tasks
+        .take_over(id, &body.from, &s.caller.actor, &s.caller.roles)
+        .await
+        .map_err(|e| claim_refused(&e))?;
+    Ok(Json(TaskView::of(taken, &s.caller)))
+}
+
+/// The one field a take-over carries: whose claim is being displaced.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TakeOverBody {
+    from: String,
 }
 
 /// How a refused claim reaches the wire.

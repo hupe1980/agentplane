@@ -48,7 +48,15 @@ pub struct Lease {
 /// rather than a bespoke one means existing verifiers and witness operators
 /// work — and inventing a format here would buy nothing and cost every
 /// integrator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` because a checkpoint is the artifact that has to leave: it heads
+/// every export and appears in every audit report, and a reader who has to link
+/// this crate to parse it is not the independent party either exists for.
+/// `Deserialize` because the same reader hands it back — verifying an export
+/// means comparing a rebuilt root against the checkpoint the file carries.
+/// [`Checkpoint::to_note`] remains the interoperable text form for a witness or
+/// a ticket; these are for a consumer already reading JSON.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Checkpoint {
     /// Which log. A deployment-chosen name, so two planes' checkpoints cannot
     /// be confused for one another.
@@ -281,13 +289,37 @@ pub trait JournalStore: Send + Sync + Debug {
     /// If the store is unreachable.
     async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError>;
 
-    /// Every known run ordered by its last durable append, newest first.
+    /// Runs ordered by last durable append, newest first, one bounded page.
     ///
-    /// This is a derived discovery index for protocol task listing, never the
-    /// authority for status: callers still read each run's journal head. The
-    /// timestamp is store-observed append time and exists only for ordering and
-    /// cursor stability.
-    async fn recent_runs(&self) -> Result<Vec<(RunId, u64)>, StoreError>;
+    /// A derived discovery index for protocol task listing, never the authority
+    /// for status: callers still read each run's journal head. The timestamp is
+    /// store-observed append time and exists only for ordering and cursor
+    /// stability.
+    ///
+    /// # Why this is paged, and why that was not optional
+    ///
+    /// It returned **every run in the tenant**, unbounded, and its one caller
+    /// then read the complete journal of each before paginating. So a single
+    /// `tasks/list` over A2A cost O(every record the tenant has ever written),
+    /// repeatable by any authenticated peer — a scan the caller could not bound
+    /// because the signature offered nothing to bound it with. Every other
+    /// listing in this crate takes a limit and says when it truncated; this one
+    /// was the exception, and it was the one a remote party could call.
+    ///
+    /// `after` is a position in *this* ordering — the `(updated_at, run)` of the
+    /// last row a caller saw — and paging resumes strictly below it. Filtering
+    /// in the caller instead is what forced the whole index into memory: a
+    /// cursor applied after the read is a cursor that read everything first.
+    ///
+    /// Ties are broken by run id descending, so the order is total. Without that
+    /// two runs sharing a timestamp could straddle a page boundary and be served
+    /// twice or not at all, and the timestamp has whole-second granularity on
+    /// both backends — so ties are ordinary rather than exotic.
+    async fn recent_runs(
+        &self,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError>;
 
     /// Every record belonging to a case, oldest first.
     ///

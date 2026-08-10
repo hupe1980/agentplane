@@ -101,6 +101,41 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         || segments[0] == 0x5f00)
 }
 
+/// A host grant, canonicalised the way a fetched or posted URL's host will be.
+///
+/// Both callers that grant a host — governed media and push webhooks — compare
+/// the grant against [`reqwest::Url::host_str`], which the URL crate has
+/// already lowercased and IDNA-encoded to punycode. A grant that was only
+/// lowercased would store an internationalised host in its Unicode form and
+/// **never match** the `xn--…` a URL to that host carries — fail-closed, but
+/// silently, refusing every request to the host it was meant to permit. Both
+/// grants therefore route through this, so the two sides agree by construction.
+///
+/// One implementation, in the module both callers already share for the
+/// address rule, because the copy that diverges is whichever nobody probed at
+/// the boundary — exactly how this crate shipped the same host check twice with
+/// one silent gap.
+///
+/// `None` for anything that is not a bare host a URL could name: a grant
+/// carrying a port, userinfo, a path, a query or a fragment is not the exact
+/// host it appears to be, and is refused rather than stored as something that
+/// cannot match.
+#[cfg(any(feature = "media", feature = "push"))]
+#[must_use]
+pub fn canonical_host(raw: &str) -> Option<String> {
+    let url = reqwest::Url::parse(&format!("https://{}/", raw.trim())).ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url.host_str()?.trim_end_matches('.').to_ascii_lowercase())
+}
+
 /// Refuse unless **every** resolved address is public.
 ///
 /// All of them, not the first: a hostname that answers with one public address

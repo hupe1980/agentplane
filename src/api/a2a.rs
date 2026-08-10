@@ -825,11 +825,16 @@ pub struct A2aServer {
     policy: Arc<dyn crate::core::PolicyEngine>,
     card: AgentCard,
     extended: ExtendedAgentCard,
-    /// The card's advertised skill ids — what a caller may ask for.
     /// Each agent's own card, by agent name.
     per_agent: std::collections::BTreeMap<String, crate::peers::AgentCard>,
+    /// The card's advertised skill ids — what a caller may ask for.
     skills: Vec<String>,
     push: Option<PushRuntime>,
+    /// How many candidate journals one content-filtered `ListTasks` may read.
+    ///
+    /// See [`Self::filter_scan_budget`] for why this is a ceiling and not a
+    /// page size.
+    filter_scan_budget: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1061,7 +1066,28 @@ impl A2aServer {
             per_agent,
             skills,
             push: None,
+            filter_scan_budget: FILTER_SCAN_BUDGET,
         })
+    }
+
+    /// Bound what one content-filtered `ListTasks` may cost.
+    ///
+    /// A `status` or `contextId` filter can only be evaluated by reading a
+    /// candidate task's journal, and the spec's `totalSize` is the exact total
+    /// — so a filtered listing over a large tenant is a request whose cost the
+    /// *caller* chooses. Unbounded, that is the same scan the paged index
+    /// removed, reachable by any authenticated peer who adds one field.
+    ///
+    /// Over budget, the request is refused with the narrowing lever named —
+    /// `statusTimestampAfter` is answered from the index, so tightening it
+    /// shrinks the candidate set without reading anything. A refusal is honest
+    /// where a truncated total would be a lie shaped like an answer: the spec
+    /// requires the exact count, and a bound that quietly stopped counting
+    /// would report a smaller tenant, not a bounded scan.
+    #[must_use]
+    pub fn filter_scan_budget(mut self, budget: usize) -> Self {
+        self.filter_scan_budget = budget.max(1);
+        self
     }
 
     /// Publish a **signed** card.
@@ -2311,6 +2337,23 @@ struct TaskCursor {
     status_timestamp_after: Option<String>,
 }
 
+/// How many index rows `list_tasks` pulls per store round trip.
+///
+/// Bounded so no path holds the tenant's whole index in memory — which is what
+/// the unbounded read this replaced did on *every* call, before going on to
+/// read the complete journal of every run it returned.
+const TASK_SCAN: usize = 256;
+
+/// Default for [`A2aServer::filter_scan_budget`]: the most candidate journals
+/// one content-filtered `ListTasks` may read before being refused as too broad.
+///
+/// The number is a cost ceiling, not a result limit — results are bounded by
+/// `pageSize` already. At the default, the worst request a peer can make costs
+/// on the order of a thousand journal reads, once, and is told how to narrow;
+/// without it the cost was every run the tenant ever wrote, per request,
+/// forever.
+const FILTER_SCAN_BUDGET: usize = 1024;
+
 #[allow(clippy::too_many_lines)]
 async fn list_tasks(
     server: &A2aServer,
@@ -2354,64 +2397,116 @@ async fn list_tasks(
         ));
     }
 
-    let recent = server
-        .runtime
-        .journal()
-        .recent_runs()
-        .await
-        .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the task index could not be read"))?;
-    let mut all = Vec::new();
-    for (run, updated) in &recent {
-        if !server.permits(&caller, action::TASK_READ, &run.to_string()) {
-            continue;
+    // Whether the caller asked anything that can only be answered by reading a
+    // run's journal. `statusTimestampAfter` is not one of those — it compares
+    // against the activity index's own timestamp — and neither is the
+    // permission check, which sees only the run id.
+    //
+    // That split is the whole performance story. The expensive operation is
+    // `read`, which pulls a run's complete journal; everything else here is
+    // index data the store hands back beside the id. So an unfiltered listing
+    // reads exactly the journals that appear on the page, and a content-filtered
+    // one reads the candidates it must examine to answer honestly.
+    let content_filtered = params.context_id.is_some() || params.status.is_some();
+
+    let mut cursor_pos = cursor
+        .as_ref()
+        .and_then(|c| RunId::parse(&c.run).ok().map(|run| (c.updated_at, run)));
+    let mut page: Vec<(RunId, u64, A2aTask)> = Vec::new();
+    let mut matched: u64 = 0;
+    let mut has_more = false;
+    let mut reads: usize = 0;
+
+    loop {
+        let batch = server
+            .runtime
+            .journal()
+            .recent_runs(cursor_pos, TASK_SCAN)
+            .await
+            .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the task index could not be read"))?;
+        if batch.is_empty() {
+            break;
         }
-        if after.is_some_and(|cutoff| {
-            i64::try_from(*updated)
-                .ok()
-                .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
-                .is_none_or(|value| value < cutoff)
-        }) {
-            continue;
-        }
-        let records =
-            server.runtime.journal().read(*run, 1).await.map_err(|_| {
+        cursor_pos = batch.last().map(|(run, updated)| (*updated, *run));
+
+        for (run, updated) in batch {
+            // Both of these read the index only, and the first is load-bearing
+            // for more than cost: a run the caller may not read must not reach
+            // the total either, or `totalSize` discloses the existence of tasks
+            // the policy just refused to show them.
+            if !server.permits(&caller, action::TASK_READ, &run.to_string()) {
+                continue;
+            }
+            if after.is_some_and(|cutoff| {
+                i64::try_from(updated)
+                    .ok()
+                    .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+                    .is_none_or(|value| value < cutoff)
+            }) {
+                continue;
+            }
+
+            // Read only when the answer needs it: to evaluate a content filter,
+            // or to build a task that will actually be returned.
+            let wanted = page.len() < page_size;
+            if !content_filtered && !wanted {
+                matched += 1;
+                has_more = true;
+                continue;
+            }
+
+            // The ceiling on what one filtered listing may cost. A `status` or
+            // `contextId` filter is answerable only by reading the candidate's
+            // journal, and the spec's `totalSize` is the exact pre-pagination
+            // total — so without a bound, one authenticated request costs every
+            // run the tenant ever wrote, which is the scan the paged index
+            // exists to prevent. Refused rather than truncated: a total that
+            // quietly stopped counting is a smaller tenant, not a bounded scan,
+            // and the refusal names the lever that narrows without reading —
+            // `statusTimestampAfter` is answered from the index.
+            reads += 1;
+            if content_filtered && reads > server.filter_scan_budget {
+                return Err(RpcError::new(
+                    code::INVALID_PARAMS,
+                    format!(
+                        "this filter would require examining more than {} tasks to answer \
+                         exactly — narrow it with statusTimestampAfter and page from there",
+                        server.filter_scan_budget
+                    ),
+                ));
+            }
+            let records = server.runtime.journal().read(run, 1).await.map_err(|_| {
                 RpcError::new(code::INTERNAL_ERROR, "a task journal could not be read")
             })?;
-        let task = task_from_records(*run, &records, *updated, params.history_length);
-        if params
-            .context_id
-            .as_ref()
-            .is_some_and(|context| task.context_id.as_ref() != Some(context))
-            || params
-                .status
+            let task = task_from_records(run, &records, updated, params.history_length);
+            if params
+                .context_id
                 .as_ref()
-                .is_some_and(|status| &task.status.state != status)
-        {
-            continue;
+                .is_some_and(|context| task.context_id.as_ref() != Some(context))
+                || params
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| &task.status.state != status)
+            {
+                continue;
+            }
+            matched += 1;
+            if wanted {
+                page.push((run, updated, task));
+            } else {
+                has_more = true;
+            }
         }
-        all.push((*run, *updated, task));
     }
-    let total_size = all.len();
-    // Compare against the cursor's ordering position rather than looking up its
-    // exact row. A working task may append and move to the front between pages;
-    // requiring the old `(updated, run)` pair to remain present would then
-    // truncate the rest of the listing.
-    let allowed: std::collections::BTreeSet<RunId> = recent
-        .iter()
-        .filter(|(run, updated)| {
-            cursor
-                .as_ref()
-                .is_none_or(|cursor| after_cursor(*run, *updated, cursor))
-        })
-        .map(|(run, _)| *run)
-        .collect();
-    let page: Vec<_> = all
-        .into_iter()
-        .filter(|(run, _, _)| allowed.contains(run))
-        .take(page_size + 1)
-        .collect();
-    let has_more = page.len() > page_size;
-    let visible = &page[..page.len().min(page_size)];
+
+    // Exact, and counted over the same rows the caller was allowed to see. The
+    // easy mistake is reporting the page's length, which tells every caller the
+    // total is whatever fits on a screen; the dangerous one is counting the
+    // store's index directly, which is cheaper and reveals the tasks policy
+    // just hid.
+    let total_size = matched;
+
+    let visible = &page[..];
     let next_page_token = if has_more {
         let (run, updated, _) = visible.last().expect("a page with more has a last item");
         encode_task_cursor(&TaskCursor {
@@ -2454,10 +2549,6 @@ fn decode_task_cursor(token: &str) -> Result<TaskCursor, RpcError> {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "pageToken is not a valid task cursor"))
-}
-
-fn after_cursor(run: RunId, updated: u64, cursor: &TaskCursor) -> bool {
-    updated < cursor.updated_at || (updated == cursor.updated_at && run.to_string() < cursor.run)
 }
 
 fn task_from_records(
@@ -2995,30 +3086,5 @@ mod state_agreement_tests {
             state_of(&crate::runtime::RunStatus::Succeeded),
             TaskState::Completed
         );
-    }
-}
-
-#[cfg(test)]
-mod cursor_tests {
-    use super::*;
-
-    #[test]
-    fn a_cursor_survives_its_anchor_moving_to_the_front() {
-        let anchor = RunId::generate();
-        let older = RunId::generate();
-        let cursor = TaskCursor {
-            updated_at: 20,
-            run: anchor.to_string(),
-            context_id: None,
-            status: None,
-            status_timestamp_after: None,
-        };
-        let recent = [(anchor, 30), (older, 10)];
-        let after: Vec<_> = recent
-            .iter()
-            .filter(|(run, updated)| after_cursor(*run, *updated, &cursor))
-            .map(|(run, _)| *run)
-            .collect();
-        assert_eq!(after, vec![older]);
     }
 }

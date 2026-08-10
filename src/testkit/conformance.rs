@@ -253,6 +253,64 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
             .expect("forgotten summary")
             .is_none()
     );
+    // A cascade must pass **through** a tombstone. `forget` keeps a forgotten
+    // memory's outgoing edges precisely so that a correction which later
+    // becomes an erasure request can still find what was derived — and both
+    // backends' traversals skipped a node with no current entry, which
+    // defeated that provision exactly when it was needed: A → B → C with B
+    // individually erased left C standing after a cascade from A. One-level
+    // cascades cannot see this, which is why the chain here is three deep with
+    // the middle link erased first.
+    store
+        .remember(&make("chain-a", "team-chain", "support", json!({"n": 1})))
+        .await
+        .expect("chain root");
+    let chain_a = store
+        .version("chain-a", 1)
+        .await
+        .expect("read root")
+        .expect("root exists");
+    let mut chain_b = make("chain-b", "team-chain", "support", json!({"n": 2}));
+    chain_b.derived_from = vec![Selected {
+        id: chain_a.id.clone(),
+        version: chain_a.version,
+        digest: chain_a.selection_digest(),
+    }];
+    store.remember(&chain_b).await.expect("chain middle");
+    let chain_b = store
+        .version("chain-b", 1)
+        .await
+        .expect("read middle")
+        .expect("middle exists");
+    let mut chain_c = make("chain-c", "team-chain", "support", json!({"n": 3}));
+    chain_c.derived_from = vec![Selected {
+        id: chain_b.id.clone(),
+        version: chain_b.version,
+        digest: chain_b.selection_digest(),
+    }];
+    store.remember(&chain_c).await.expect("chain leaf");
+
+    store.forget("chain-b").await.expect("erase the middle");
+    assert_eq!(
+        store
+            .forget_cascading("chain-a")
+            .await
+            .expect("cascade through the tombstone"),
+        2,
+        "the cascade must erase the root and the leaf — and count only what it \
+         erased, not the tombstone it passed through"
+    );
+    assert!(
+        store
+            .version("chain-c", 1)
+            .await
+            .expect("leaf lookup")
+            .is_none(),
+        "a derivative reached only through an already-erased intermediate \
+         survived the cascade — the poisoned source's summary of a summary is \
+         still readable"
+    );
+
     assert_eq!(
         store
             .forget_subject("team-a")
@@ -457,7 +515,114 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     a_released_lease_is_free_at_once(fresh, &mut r).await;
     a_release_does_not_forget_the_epoch(fresh, &mut r).await;
     a_fenced_caller_cannot_release_the_new_owners_lease(fresh, &mut r).await;
+    the_discovery_index_pages_in_a_total_order(fresh, &mut r).await;
     r
+}
+
+/// The discovery index is newest-first, bounded, and resumes without gap or
+/// repeat.
+///
+/// This contract had **no battery entry at all** while the method was
+/// unbounded, and the two facts belong together: a signature returning
+/// everything has no page boundary to get wrong, so there was nothing to
+/// check. Bounding it created the boundary, and a paged read has exactly two
+/// silent failure modes — an item served twice, and an item served never —
+/// and both look like working software from a single page.
+///
+/// The order must be **total**, which is why the tie-break on run id is part of
+/// the contract rather than an implementation detail. Timestamps here have
+/// whole-second granularity on both backends, so runs sharing one are ordinary;
+/// without a tie-break the store may order them differently between two calls
+/// and a cursor lands in the middle of the tie, dropping or duplicating
+/// whichever moved.
+async fn the_discovery_index_pages_in_a_total_order(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+
+    // Four runs written back to back, so they very likely share a timestamp —
+    // which is the case the tie-break exists for.
+    let mut written = Vec::new();
+    for _ in 0..4 {
+        let run = RunId::generate();
+        let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+            return;
+        };
+        if store
+            .append(lease.epoch, vec![admitted(run)])
+            .await
+            .is_err()
+        {
+            return;
+        }
+        written.push(run);
+    }
+
+    let whole = match store.recent_runs(None, 100).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            r.record("chaining", format!("recent_runs failed: {e}"));
+            return;
+        }
+    };
+    if whole.len() != 4 {
+        r.record(
+            "chaining",
+            format!("recent_runs returned {} rows for 4 runs", whole.len()),
+        );
+        return;
+    }
+
+    // Descending by (updated, run). A caller pages on this order, so a store
+    // that returns its own order serves a cursor that means nothing.
+    let mut sorted = whole.clone();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    if whole != sorted {
+        r.record(
+            "chaining",
+            "recent_runs is not ordered by (updated_at, run) descending, so a \
+             cursor into it cannot resume a page"
+                .to_owned(),
+        );
+    }
+
+    // The limit is a limit.
+    match store.recent_runs(None, 2).await {
+        Ok(rows) if rows.len() > 2 => r.record(
+            "chaining",
+            format!("recent_runs(limit=2) returned {} rows", rows.len()),
+        ),
+        Err(e) => r.record("chaining", format!("recent_runs(limit=2) failed: {e}")),
+        Ok(_) => {}
+    }
+
+    // Paging two at a time must reassemble the whole index exactly: every run
+    // once, in the same order. This is the assertion that catches an inclusive
+    // cursor bound (one row served twice) and an off-by-one (one row skipped).
+    let mut paged = Vec::new();
+    let mut cursor: Option<(u64, RunId)> = None;
+    for _ in 0..4 {
+        let Ok(rows) = store.recent_runs(cursor, 2).await else {
+            r.record("chaining", "a cursored recent_runs page failed".to_owned());
+            return;
+        };
+        if rows.is_empty() {
+            break;
+        }
+        cursor = rows.last().map(|(run, updated)| (*updated, *run));
+        paged.extend(rows);
+    }
+    if paged != whole {
+        r.record(
+            "chaining",
+            format!(
+                "paging recent_runs two at a time did not reassemble the index: \
+                 {} rows paged against {} whole — a page boundary either repeats \
+                 a run or drops one, and both read as a healthy listing",
+                paged.len(),
+                whole.len()
+            ),
+        );
+    }
 }
 
 /// A released lease is available immediately, without waiting out the TTL.

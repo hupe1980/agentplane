@@ -105,6 +105,126 @@ enum Verb {
     Validate(FileArgs),
     /// Print the identity a registry pins.
     Digest(FileArgs),
+    /// Check a journal's history and print what could not be checked.
+    Audit(AuditArgs),
+    /// Write a journal's records out as JSON Lines.
+    Export(StoreArgs),
+    /// Recompute an export and check it against its own checkpoint.
+    Verify(VerifyArgs),
+    /// Rebuild a store from an export, and prove it by its own checkpoint.
+    Restore(RestoreArgs),
+}
+
+/// Rebuild a journal from an export.
+#[derive(clap::Args, Debug)]
+struct RestoreArgs {
+    /// The export to read.
+    file: String,
+
+    /// Where to write the rebuilt journal. Must not already hold these runs —
+    /// this rebuilds a history rather than merging one.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: String,
+}
+
+/// The restore drill: an export, and nothing else.
+///
+/// Takes a *file* rather than a store on purpose. This is the one verb that
+/// needs neither the runtime that wrote the data nor the store it came from —
+/// which is what makes it usable by somebody who was handed a copy and asked
+/// whether it is the whole of it.
+#[derive(clap::Args, Debug)]
+struct VerifyArgs {
+    /// The export to check. `-` reads standard input.
+    file: String,
+
+    /// Trust records signed by this key, as `<key-id>=<64 hex chars>`.
+    /// Repeatable. With a key supplied, an unsigned record is a finding —
+    /// that is the auditor's posture, since an unsigned record inside a
+    /// signed history is the one an attacker who cannot sign would add.
+    #[arg(long)]
+    key: Vec<String>,
+}
+
+/// What `audit` takes beyond the shared store arguments: the evidence.
+///
+/// These flags exist because the library call has taken this evidence all
+/// along, while the verb hardcoded none of it — so the signature check and the
+/// deletion check were real and unreachable without writing Rust, which is the
+/// dependency these verbs exist to remove. A control that must be linked
+/// against is not one an independent party holds.
+#[derive(clap::Args, Debug)]
+struct AuditArgs {
+    #[command(flatten)]
+    store: StoreArgs,
+
+    /// Trust records signed by this key, as `<key-id>=<64 hex chars>`.
+    /// Repeatable. Without one, the report says signatures went unchecked.
+    #[arg(long)]
+    key: Vec<String>,
+
+    /// A checkpoint saved earlier, as JSON — the `current` field of a previous
+    /// audit report. This is the deletion check: a log that shrank or forked
+    /// since that checkpoint is a finding, and without one the report says
+    /// deletion went unchecked.
+    #[arg(long)]
+    prior: Option<String>,
+
+    /// Treat an unsigned record as a failure.
+    ///
+    /// Off by default because history written before signing was configured is
+    /// legitimately unsigned, and a wall of failures over a healthy plane
+    /// teaches the reader to ignore the report.
+    #[arg(long)]
+    require_signatures: bool,
+}
+
+/// The arguments the two journal verbs share.
+///
+/// Both read a store and neither reads a manifest, which is the point: an
+/// auditor holds a database file and a checkpoint somebody gave them, not the
+/// deployment's source tree.
+#[derive(clap::Args, Debug)]
+struct StoreArgs {
+    /// The journal to read. Required — there is nothing to audit or export in
+    /// a memory store that this process did not itself write.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: String,
+
+    /// Which runs, by outcome. Repeatable. Defaults to every sealed outcome.
+    #[arg(long)]
+    outcome: Vec<String>,
+
+    /// How many runs to consider per outcome.
+    #[arg(long, default_value_t = 1000)]
+    limit: usize,
+}
+
+/// Build a verifier from repeated `--key <key-id>=<hex>` flags.
+///
+/// `None` when no key was given, so the report's `not_checked` half can say
+/// signatures went unchecked — which is a different statement from checked and
+/// clean, and the difference is the whole reason the field exists.
+fn verifier_from(keys: &[String]) -> Result<Option<agentplane::policy::Ed25519Verifier>, String> {
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let mut verifier = agentplane::policy::Ed25519Verifier::new();
+    for entry in keys {
+        let Some((id, hex_key)) = entry.split_once('=') else {
+            return Err(format!(
+                "--key takes <key-id>=<64 hex chars>, got '{entry}' — the id is what records \
+                 name as their signer, and the hex is the Ed25519 public key"
+            ));
+        };
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(hex_key, &mut bytes)
+            .map_err(|e| format!("--key {id}: not 64 hex characters: {e}"))?;
+        verifier = verifier
+            .trust(id, &bytes)
+            .map_err(|e| format!("--key {id}: not a valid Ed25519 public key: {e}"))?;
+    }
+    Ok(Some(verifier))
 }
 
 #[derive(clap::Args, Debug)]
@@ -202,6 +322,129 @@ struct ServeArgs {
     mcp: Vec<String>,
 }
 
+/// The two verbs that read a journal instead of a manifest.
+///
+/// One function because they differ only in what they do with the run list, and
+/// the half that is easy to get wrong — *which* runs, and saying so when the
+/// limit truncated — is the half they share. `audit` is `None` for an export,
+/// and carries the evidence flags for an audit.
+fn journal_verb(opts: &StoreArgs, audit: Option<&AuditArgs>) -> Result<ExitCode, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    rt.block_on(async {
+        let store: Arc<dyn JournalStore> =
+            Arc::new(RedbStore::open(&opts.store).map_err(|e| e.to_string())?);
+
+        // The library's own list, not literals restated here: the store indexes
+        // runs *by* outcome and has no "all runs" query, so an export has to
+        // name every sealed outcome — and a copy of that list in a binary is
+        // where a new sealing outcome would be silently dropped from exactly
+        // the artifact an auditor asks for.
+        let wanted: Vec<String> = if opts.outcome.is_empty() {
+            agentplane::runtime::SEALED_OUTCOMES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect()
+        } else {
+            opts.outcome.clone()
+        };
+
+        let mut runs = Vec::new();
+        let mut truncated = Vec::new();
+        for outcome in &wanted {
+            let found = store
+                .runs_by_outcome(outcome, opts.limit + 1)
+                .await
+                .map_err(|e| e.to_string())?;
+            // One more than asked for, so a full page and an overflowing one are
+            // distinguishable. An export that quietly stopped at the limit is
+            // shaped exactly like a complete one.
+            if found.len() > opts.limit {
+                truncated.push(outcome.clone());
+            }
+            runs.extend(found.into_iter().take(opts.limit));
+        }
+
+        // Said on stderr so it survives `> out.jsonl`, and said before the work
+        // rather than after: an operator who pipes this somewhere is not going
+        // to re-read the tail.
+        if !truncated.is_empty() {
+            eprintln!(
+                "warning: --limit {} was reached for: {}. This is a partial view; \
+                 raise --limit or narrow --outcome",
+                opts.limit,
+                truncated.join(", ")
+            );
+        }
+
+        let Some(audit) = audit else {
+            let stdout = std::io::stdout();
+            let trailer =
+                agentplane::export::to_jsonl(&store, &runs, std::io::BufWriter::new(stdout.lock()))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            eprintln!(
+                "exported {} record(s) from {}/{} run(s)",
+                trailer.records, trailer.runs_exported, trailer.runs_requested
+            );
+            if !trailer.unreadable.is_empty() {
+                for u in &trailer.unreadable {
+                    eprintln!("unreadable: {} — {}", u.run, u.reason);
+                }
+                return Ok(ExitCode::FAILURE);
+            }
+            return Ok(ExitCode::SUCCESS);
+        };
+
+        // An audit with no prior checkpoint and no key still checks every
+        // chain, and reports the two things it could not do. That is the
+        // honest default for somebody who has just been handed a database —
+        // and the flags are how they narrow it on the second pass, with the
+        // key the operator published and the checkpoint the first pass printed.
+        let verifier = verifier_from(&audit.key)?;
+        let prior: Option<agentplane::journal::Checkpoint> = match &audit.prior {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("reading --prior {path}: {e}"))
+                    .and_then(|text| {
+                        serde_json::from_str(&text).map_err(|e| {
+                            format!(
+                                "--prior {path} is not a checkpoint — expected the `current` \
+                                 field of an earlier audit report: {e}"
+                            )
+                        })
+                    })?,
+            ),
+            None => None,
+        };
+        let evidence = agentplane::audit::Evidence {
+            prior: prior.as_ref(),
+            verifier: verifier
+                .as_ref()
+                .map(|v| v as &dyn agentplane::core::Verifier),
+            require_signatures: audit.require_signatures,
+        };
+        let report = agentplane::audit::audit(&store, &runs, &evidence)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+        // Findings are a failure; `not_checked` is not. An auditor who supplied
+        // nothing gets a clean exit and a populated `not_checked`, and it is
+        // their call whether that is enough.
+        Ok(if report.is_sound() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        })
+    })
+}
+
 /// Read and validate the manifests, for every verb.
 ///
 /// A manifest that does not validate is not a thing to run, digest, or reason
@@ -239,6 +482,64 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 }
             }
             Ok(ExitCode::SUCCESS)
+        }
+        Verb::Audit(a) => journal_verb(&a.store, Some(&a)),
+        Verb::Export(a) => journal_verb(&a, None),
+        Verb::Restore(a) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("could not start the async runtime: {e}"))?;
+            rt.block_on(async {
+                let store: Arc<dyn JournalStore> =
+                    Arc::new(RedbStore::open(&a.store).map_err(|e| e.to_string())?);
+                let file =
+                    std::fs::File::open(&a.file).map_err(|e| format!("reading {}: {e}", a.file))?;
+                let report = agentplane::export::from_jsonl(&store, std::io::BufReader::new(file))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                );
+                // The result is the comparison, not the loading. Equal roots at
+                // equal size means every record, in every run, in the order the
+                // log recorded them, rebuilt to the same commitment.
+                Ok(if report.is_faithful() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                })
+            })
+        }
+        Verb::Verify(a) => {
+            let verifier = verifier_from(&a.key)?;
+            let verifier = verifier
+                .as_ref()
+                .map(|v| v as &dyn agentplane::core::Verifier);
+            let report = if a.file == "-" {
+                agentplane::export::verify(std::io::stdin().lock(), verifier)
+            } else {
+                std::fs::File::open(&a.file)
+                    .map_err(|e| format!("reading {}: {e}", a.file))
+                    .and_then(|f| {
+                        agentplane::export::verify(std::io::BufReader::new(f), verifier)
+                            .map_err(|e| e.to_string())
+                    })
+                    .map_err(std::io::Error::other)
+            }
+            .map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+            );
+            // Findings fail; `not_checked` does not. A pass with no key has
+            // established less, and saying so is different from failing.
+            Ok(if report.is_sound() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
         }
         Verb::Run(a) => {
             let manifests = manifests_at(&a.manifest)?;

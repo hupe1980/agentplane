@@ -1008,8 +1008,10 @@ async fn a_forgotten_id_cannot_be_reused_and_later_erasure_still_reaches_derivat
             .forget_cascading("source")
             .await
             .expect("erase corrected source later"),
-        2,
-        "the correction discarded lineage needed by a later erasure"
+        1,
+        "the cascade must erase exactly the derivative — the root is already a \
+         tombstone, and counting it would report an erasure this call did not \
+         perform"
     );
     assert!(store.version("reused", 1).await.expect("derived").is_none());
 }

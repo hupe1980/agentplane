@@ -144,6 +144,32 @@ fn load(
     }
 }
 
+/// Claim's eligibility ladder, in its load-bearing order — see
+/// `TaskStore::claim` for why eligibility outranks availability.
+///
+/// One implementation serving both acquisition verbs, so `take_over` cannot
+/// drift a rung: two copies of an ordered ladder agree everywhere except the
+/// rung nobody probed.
+fn eligible(task: &Task, id: TaskId, actor: &str, roles: &[String]) -> Result<(), ClaimError> {
+    if task.excluded_actors.iter().any(|a| a == actor) {
+        return Err(ClaimError::Excluded {
+            actor: actor.to_owned(),
+        });
+    }
+    if !task.candidate_roles.is_empty() && !task.candidate_roles.iter().any(|r| roles.contains(r)) {
+        return Err(ClaimError::WrongRole {
+            actor: actor.to_owned(),
+        });
+    }
+    if !task.state.is_pending() {
+        return Err(ClaimError::NotPending {
+            task: id,
+            state: task.state,
+        });
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl TaskStore for RedbStore {
     async fn open(&self, task: &Task) -> Result<Task, StoreError> {
@@ -230,27 +256,68 @@ impl TaskStore for RedbStore {
                 match load(&tasks, &tenant, &key)? {
                     None => Err(ClaimError::NotFound(id)),
                     Some(task) => {
-                        // Eligibility before availability, and the order is
-                        // load-bearing — see `TaskStore::claim`.
-                        //
-                        // Four eyes: whoever proposed the action does not
-                        // approve it.
-                        if task.excluded_actors.iter().any(|a| a == &actor) {
-                            Err(ClaimError::Excluded { actor })
-                        } else if !task.candidate_roles.is_empty()
-                            && !task.candidate_roles.iter().any(|r| roles.contains(r))
-                        {
-                            Err(ClaimError::WrongRole { actor })
-                        } else if !task.state.is_pending() {
-                            Err(ClaimError::NotPending {
-                                task: id,
-                                state: task.state,
-                            })
+                        if let Err(refused) = eligible(&task, id, &actor, &roles) {
+                            Err(refused)
                         } else if let Some(holder) = task.assignee.as_ref().filter(|h| *h != &actor)
                         {
                             Err(ClaimError::AlreadyClaimed {
                                 task: id,
                                 holder: holder.clone(),
+                            })
+                        } else {
+                            let mut updated = task.clone();
+                            updated.assignee = Some(actor);
+                            updated.state = TaskState::Claimed;
+                            tasks
+                                .insert(
+                                    (tenant.as_str(), key.as_str()),
+                                    serde_json::to_string(&updated)?.as_str(),
+                                )
+                                .map_err(|e| be(&e))?;
+                            drop(tasks);
+                            reindex(&w, &tenant, &key, &task, TaskState::Claimed)?;
+                            Ok(updated)
+                        }
+                    }
+                }
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn take_over(
+        &self,
+        id: TaskId,
+        from: &str,
+        actor: &str,
+        roles: &[String],
+    ) -> Result<Task, ClaimError> {
+        let tenant = self.tenant_name();
+        let key = id.to_hex();
+        let from = from.to_owned();
+        let actor = actor.to_owned();
+        let roles = roles.to_vec();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let out = {
+                let mut tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
+                match load(&tasks, &tenant, &key)? {
+                    None => Err(ClaimError::NotFound(id)),
+                    Some(task) => {
+                        // A take-over is a claim: the ladder does not thin
+                        // because the previous reviewer left.
+                        if let Err(refused) = eligible(&task, id, &actor, &roles) {
+                            Err(refused)
+                        } else if task.assignee.as_deref() != Some(from.as_str()) {
+                            // The compare-and-swap guard. A take-over decided
+                            // from a stale view must not displace whoever
+                            // holds the task *now* — and an unheld task takes
+                            // the ordinary claim verb, not this one.
+                            Err(ClaimError::NotHeld {
+                                task: id,
+                                actor: from,
                             })
                         } else {
                             let mut updated = task.clone();

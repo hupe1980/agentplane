@@ -138,6 +138,25 @@ Postgres settles several more cleanly than the embedded store: `UPDATE … RETUR
 a read-then-write into one statement, so there is no window to reason about
 because there is no second statement.
 
+#### A paged read is part of the contract
+
+`JournalStore::recent_runs(after, limit)` is the discovery index behind A2A task
+listing, and the battery checks three things a paged read gets silently wrong:
+the order is `(updated_at, run)` descending and **total**, the limit is
+honoured, and paging through it in twos reassembles the whole index exactly —
+no run served twice, none skipped.
+
+The tie-break on run id is contract rather than detail. Both backends keep
+whole-second timestamps, so runs written back to back share one; without a
+tie-break the store may order them differently between two calls, and a cursor
+landing inside the tie drops or duplicates whichever moved. From a single page
+both look like a healthy listing.
+
+This method used to return *everything*, and had no battery entry — the two
+facts belong together. A signature with no page boundary has no boundary to get
+wrong, so there was nothing to check, and the one caller paid for it by reading
+every run's complete journal on every request.
+
 #### A sequential test cannot detect a race
 
 Sequential checks prove the *result* is right, not that it is right for the right
@@ -157,6 +176,17 @@ run, and mutation-testing the battery is what proves the check can fail.
 A store that serialises internally — redb admits one writer at a time — passes
 trivially and correctly, having no race to lose. That is not a reason to skip it:
 the check exists for the backend where the race is real.
+
+The lesson was paid for once. The PostgreSQL run ceiling shipped with a comment
+claiming its count-and-insert serialised "inside the row lock the write takes" —
+no such lock exists for inserts of different rows, and racing it put eight runs
+through a ceiling of four while every sequential test stayed green. So the
+guards suite now **races every store-side concurrency claim against a real
+PostgreSQL**: quota admission (sixteen racers, four slots), authority draws
+(sixteen racers, a mandate affording three), task claims (sixteen reviewers,
+one holder), timer sweeps (two sweepers partitioning twelve due wake-ups), case
+correlation and case-state writes. A claim about concurrency that has only been
+read is a claim; raced, it is evidence.
 
 ### Postgres
 
@@ -316,6 +346,109 @@ allowlist built from route names alone will miss.
 The general rule is worth stating because it is easy to satisfy accidentally and
 easy to lose: a control that notices and does not deliver is closer to none than
 to half, because it also manufactures the belief that somebody was told.
+
+### Taking the record away
+
+Two verbs read a journal and nothing else — no manifest, no source tree, no Rust
+toolchain — because that is what an auditor or a departing tenant holds:
+
+```sh
+agentplane export --store ./journal.redb > history.jsonl
+agentplane audit  --store ./journal.redb > report.json
+agentplane verify history.jsonl            # check a copy, offline
+agentplane restore history.jsonl --store ./rebuilt.redb
+```
+
+`export` writes JSON Lines: a header naming the log, its checkpoint and the
+canonicalization rule the digests were computed under; one line per record
+carrying `prev_hash` and `hash`, so the chain re-walks from the file alone; and a
+trailer. The trailer's **absence** is the signal — a file cut short by a full
+disk or a killed pipe ends without one, and every line in it is still valid JSON,
+so counting is no help to a reader who does not have the source. Runs that could
+not be read are named in the trailer rather than quietly missing.
+
+`audit` prints the report as JSON and exits non-zero on findings — but **not** on
+`not_checked`, which is a separate list and the one worth reading. An audit given
+no public key and no earlier checkpoint still walks every chain, and says in that
+list that it could establish neither authorship nor deletion. Supply them to
+narrow it:
+
+```sh
+agentplane audit --store ./journal.redb \
+  --key plane-1=<64 hex chars> \        # the signer's Ed25519 public key
+  --prior last-report.json              # the `current` field of an earlier report
+```
+
+`--key` is the authorship check, repeatable per trusted signer; add
+`--require-signatures` to make an unsigned record a failure rather than a note —
+off by default, because history written before signing was configured is
+legitimately unsigned. `--prior` is the deletion check: the report's own
+`current` field, saved from an earlier pass, and a log that shrank or forked
+since then is a finding. The loop is deliberate — each audit prints the
+checkpoint the next one checks against.
+
+Both verbs default to every sealed outcome. `--outcome` narrows, `--limit`
+bounds, and reaching the limit prints a warning on **stderr** — so it survives
+`> out.jsonl` and an operator piping the export somewhere still learns the view
+was partial.
+
+Auditing open runs (`--outcome failed`, say) is not an alarm: an open run has
+no Merkle leaf, so it is checked on chain and signatures and the report says in
+`not_checked` that nothing pins its tail until it seals. The finding is the
+opposite case — a run whose own records carry a *sealing* conclusion, in a log
+that holds no leaf for it. That is history the log no longer commits to.
+
+`verify` is the drill, and it takes the file alone. It re-seals every record
+through the same function the store sealed with — so agreement is evidence about
+the bytes, not the file agreeing with itself — checks sequences are contiguous,
+holds every record to the run block it sits under (a relabelled block passes
+chain, leaf and Merkle checks, because those verify the bytes and only the label
+lied), then rebuilds the Merkle log from the positions each run block carries
+and compares the root against the checkpoint in the header. With `--key` it
+also verifies signatures, strictly: inside a signed history, an unsigned record
+is the one an attacker who cannot sign would add.
+
+That last check is the one worth understanding. Delete a whole run from an
+export and every remaining chain still verifies perfectly: a chain links records
+*within* a run and knows nothing about its neighbours. Only the rebuilt tree
+notices the missing leaf. It is also the reason each run block carries its log
+position at all — without it an export is a transcript rather than evidence.
+
+Exit codes: findings fail, `not_checked` does not. A pass with no public key has
+established less rather than failed, and the report says which.
+
+`restore` rebuilds a journal from an export and proves it by one comparison:
+**equal Merkle roots at equal size**. That is a far stronger statement than "the
+rows loaded" — it means every record, in every run, in the order the log
+recorded them, rebuilt to the same commitment. A run restored this way
+strict-replays on a plane that never executed it.
+
+It replays the ordinary `append` path rather than writing rows, and that is the
+safety argument: `append` maintains six derived indexes — case, exactly-once,
+outcome and its ordering counter, and both halves of the discovery index — and a
+restore that rebuilt five of them would produce a store that reads perfectly
+until somebody queries the sixth.
+
+Two details make that reproduce the original bytes rather than similar ones.
+Runs are **sealed in log-index order**, because that order *is* the Merkle log —
+seal them in file order and the same leaves give a different root. And `epoch` is
+**carried, not re-derived**: it is inside the hashed body, so a run that ever
+changed hands would rehash under a single fresh lease, and those are exactly the
+runs a failover produced. Both backends fence only when a lease row exists, so
+restoring into a store with no leases writes each record under its own epoch.
+
+What does not survive is named in the report rather than left to be discovered.
+**Signatures**: `append` attests as the restoring store's signer, so a history
+signed by a key this store does not hold comes back unsigned — hashes and the
+root are unaffected, since a signature is taken over the chain hash and stored
+beside it, but authorship is gone. Configure the same signer if you are restoring
+your own log. **Activity timestamps**: the discovery index is rebuilt at restore
+time, so `recent_runs` orders by when history was restored. It is documented as
+ordering and cursor stability only, and nothing derives a decision from it.
+
+What is exported is what the chain committed to. With a key ring configured that
+is ciphertext, deliberately: an export of plaintext would put a copy beyond the
+reach of key destruction and undo the erasure the key ring exists for.
 
 ### Break-glass
 

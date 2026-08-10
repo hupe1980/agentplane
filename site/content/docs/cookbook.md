@@ -438,6 +438,13 @@ applied*, so the runtime may retry; `Timeout` and `Interrupted` mean *it may
 have landed*, so it will not. Map a timeout to `Rejected` and a card gets
 charged twice.
 
+One more distinction pays for itself on the failure path: `Refused` means the
+peer *understood the request and said no* — an answer, not a fault — and the
+runtime spends no retry on it. Use it for the refusals no repeat can change (a
+validation error, an unknown account); keep `Rejected` for the ones a repeat
+might (an overloaded gateway). Conflating them is how a wrong request burns
+every permitted attempt with backoff before failing anyway.
+
 `recovery` says what to do with a call that may have landed: `Retry` (safe to
 repeat), `Reconcile` (ask the provider what happened — implement `reconcile`),
 or `RequiresOperator`. A mutating effect that declares nothing gets
@@ -1564,6 +1571,17 @@ timers every 30s, and — on a **separate** listener — the operator surface:
 `GET /runs?outcome=quarantined`, the worklist, task decisions. The two are
 separated by *policy* (`peer` reaches `a2a:*`, `operator` reaches `api:*`), so
 the port split is defence in depth rather than the control.
+
+The worklist's claim protocol has three verbs, and the third has its own
+policy action on purpose. A reviewer `claim`s a task and only the holder can
+`release` it — which leaves the absent-holder case: a task claimed by someone
+who is not coming back is parked until its deadline breaches. `POST
+/tasks/{task}/takeover` (`api:task.takeover`) displaces a **named** holder —
+the body's `from` is a compare-and-swap, so a stale queue view fails rather
+than displacing whoever holds it now — and re-checks eligibility in full: a
+take-over is a claim, and four-eyes exclusion does not thin because the
+previous reviewer left. Its own verb means a policy set can hand it to a queue
+lead without handing displacement to every reviewer.
 
 `--policy`, `--tokens` and `--store` have no defaults. A served task's id is a
 promise it can be fetched again, which an in-memory journal breaks at the next

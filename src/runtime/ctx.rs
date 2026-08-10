@@ -688,6 +688,7 @@ impl<'a> StepCtx<'a> {
                         error,
                         disposition,
                         spend,
+                        permanent,
                     }) => {
                         attempt = self.replay_recorded_failure(
                             &descriptor,
@@ -699,6 +700,7 @@ impl<'a> StepCtx<'a> {
                             &error,
                             disposition,
                             spend,
+                            permanent,
                         )?;
                         continue;
                     }
@@ -768,6 +770,7 @@ impl<'a> StepCtx<'a> {
                 attempt,
                 &policy,
                 &failure.to_string(),
+                matches!(failure, crate::core::EffectError::Refused(_)),
             ) {
                 return Err(stop);
             }
@@ -1390,6 +1393,7 @@ impl<'a> StepCtx<'a> {
         policy: &crate::core::RetryPolicy,
         error: &str,
         disposition: crate::core::Disposition,
+        permanent: bool,
     ) -> Result<u32, StepError> {
         // Billed on replay exactly as it was live, or a run that exhausted its
         // budget on failures would replay as healthy under the same limit.
@@ -1413,7 +1417,15 @@ impl<'a> StepCtx<'a> {
         // History ends here. Recompute what the recorded run would have done
         // next — a pure function of the disposition, the recovery mode, and the
         // policy. If it would have stopped, this failure was final.
-        if let Some(stop) = Self::stop_reason(disposition, recovery, key, attempt, policy, error) {
+        if let Some(stop) = Self::stop_reason(
+            disposition,
+            recovery,
+            key,
+            attempt,
+            policy,
+            error,
+            permanent,
+        ) {
             return Err(stop);
         }
 
@@ -1440,6 +1452,7 @@ impl<'a> StepCtx<'a> {
     ///    have already cleared.
     ///
     /// Returns `None` when another attempt is permitted.
+    #[allow(clippy::too_many_arguments)]
     fn stop_reason(
         disposition: crate::core::Disposition,
         recovery: &crate::core::Recovery,
@@ -1447,6 +1460,7 @@ impl<'a> StepCtx<'a> {
         attempt: u32,
         policy: &crate::core::RetryPolicy,
         message: &str,
+        permanent: bool,
     ) -> Option<StepError> {
         use crate::core::{Disposition, Recovery};
 
@@ -1485,7 +1499,22 @@ impl<'a> StepCtx<'a> {
                     });
                 }
             },
-            Disposition::DidNotHappen => {}
+            Disposition::DidNotHappen => {
+                // An answer, not a fault. The peer understood the request and
+                // said no, so a second attempt asks the same rule the same
+                // question — every further attempt would be spent teaching the
+                // operator that retries are noise. The bit comes from the
+                // failure itself live and from the record on replay, so both
+                // stop at the same attempt.
+                if permanent {
+                    return Some(StepError::Effect(crate::core::EffectError::Final {
+                        detail: format!(
+                            "effect {key} was refused on attempt {attempt}, and the refusal                              is an answer rather than a fault ({message}); no retry would                              change it"
+                        ),
+                        disposition,
+                    }));
+                }
+            }
         }
 
         // The disposition travels with the failure. Flattening it to `Other`
@@ -2027,6 +2056,7 @@ impl<'a> StepCtx<'a> {
         error: &str,
         disposition: crate::core::Disposition,
         spend: crate::core::Spend,
+        permanent: bool,
     ) -> Result<u32, StepError> {
         self.bill(spend);
         self.recorded_failure(
@@ -2038,6 +2068,7 @@ impl<'a> StepCtx<'a> {
             policy,
             error,
             disposition,
+            permanent,
         )
     }
 
@@ -2159,6 +2190,9 @@ impl<'a> StepCtx<'a> {
                         error: e.to_string(),
                         spend,
                         disposition: e.disposition(),
+                        // An answer, not a fault — recorded so the replayed
+                        // retry decision stops where the live one did.
+                        permanent: matches!(e, crate::core::EffectError::Refused(_)),
                     },
                 )
                 .await?;
