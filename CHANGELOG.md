@@ -32,6 +32,22 @@ archaeology presented as a record.
 
 ## [0.14.0] — 2026-08-10
 
+### Fixed — the mutation sweep stops paying for two defaults that fight it
+
+- **A shard outgrew its CI job, at roughly five minutes per mutation.** Two
+  ambient settings compounded: the CI cache action exports
+  `CARGO_INCREMENTAL=0` — right for a one-shot build that will be cached,
+  wrong for a loop recompiling the crate once per one-line mutation — and
+  full debuginfo made linking each large test binary the second cost, buying
+  line numbers no verdict reads, since the classifier parses test names and
+  never opens a backtrace. `mutants.py --verify` now runs cargo with
+  incremental on and debuginfo off, in the verifier itself rather than the
+  sweep script so a bare `--verify` behaves identically — one implementation,
+  for the reason the two classifiers were merged. `*_MUTANTS` environment
+  variables are the opt-out, mirroring `RUSTFLAGS_MUTANTS`. Measured on one
+  mutation at steady state: 458 CPU-seconds to 67, which on a two-core runner
+  is the difference between a sweep and a timeout.
+
 ### Fixed — a task claim no longer deadlocks the pool it runs on
 
 - **`TaskStore::claim`, `take_over` and `open` held a pooled connection while

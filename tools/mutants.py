@@ -4705,9 +4705,34 @@ def verify(name: str) -> int:
         features = ",".join(sorted(feats))
         selector = ["--features", features, "--test", target]
 
+    # The cost model here is one library rebuild per mutation, and two ambient
+    # defaults fight it — hard enough that a six-way CI shard outgrew its job.
+    #
+    # CI cache actions export CARGO_INCREMENTAL=0, which is right for a
+    # one-shot build that will be cached and wrong for a loop recompiling the
+    # crate once per one-line mutation: it is the difference between an
+    # incremental rebuild measured in seconds and a full one measured in
+    # minutes, 72 times per shard. And full debuginfo makes linking each large
+    # test binary the second cost, buying line numbers no verdict reads — the
+    # classifier parses test names, never backtraces.
+    #
+    # Overridden here rather than in the sweep script so a bare `--verify`
+    # behaves identically to the sweep — one implementation, because the two
+    # briefly disagreed about everything else and this would be no different.
+    # `*_MUTANTS` variables are the opt-out, mirroring RUSTFLAGS_MUTANTS.
+    env = dict(os.environ)
+    env["CARGO_INCREMENTAL"] = env.get("CARGO_INCREMENTAL_MUTANTS", "1")
+    env["CARGO_PROFILE_DEV_DEBUG"] = env.get("CARGO_PROFILE_DEV_DEBUG_MUTANTS", "0")
+    env["CARGO_PROFILE_TEST_DEBUG"] = env.get("CARGO_PROFILE_TEST_DEBUG_MUTANTS", "0")
+
     def run(args: list[str]) -> str:
         proc = subprocess.run(
-            ["cargo", "test", *args], capture_output=True, text=True, cwd=ROOT, check=False
+            ["cargo", "test", *args],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+            check=False,
+            env=env,
         )
         return proc.stdout + proc.stderr
 
