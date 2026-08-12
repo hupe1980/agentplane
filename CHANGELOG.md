@@ -30,7 +30,7 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
-## [Unreleased]
+## [0.15.0] — 2026-08-12
 
 Six things a regulated deployment ran into, and each is the same shape: a
 mechanism that was correct for the case it was built for and had no spelling for
