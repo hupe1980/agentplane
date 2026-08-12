@@ -45,11 +45,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{Budget, Digest, Sensitivity, canon};
 
+mod binding;
+pub use binding::MemorySubject;
+
 mod error;
 pub use error::ManifestError;
 
 mod registry;
 pub use registry::{MemoryRegistry, Registry, RegistryError};
+
+mod triage;
+pub use triage::{Condition, Predicate, TriagePriority, TriageRule};
 
 /// The only API group this crate understands.
 pub const API_VERSION: &str = "agentplane.hupe1980.github.io/v1alpha1";
@@ -199,7 +205,15 @@ pub struct ContextResource {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryFormation {
-    pub subject: String,
+    /// Where the formed memories are filed.
+    ///
+    /// A literal names one fixed pile. A **binding** —
+    /// `$correlation/<namespace>`, `$case`, `$input/<pointer>` — resolves per
+    /// run, which is what lets one declaration serve every customer without
+    /// pooling their facts under one key. See [`MemorySubject`] for why the
+    /// sources are those three and why an unrecognised `$` value is refused
+    /// rather than taken as a constant.
+    pub subject: MemorySubject,
     pub purpose: String,
     pub instruction: String,
     #[serde(default = "default_formation_items")]
@@ -283,15 +297,23 @@ impl Identity {
 /// declared expiry behaviour. A field naming an oversight this runtime could not
 /// perform would fail the binding rule.
 ///
-/// **There is no condition here, and that is deliberate.** "Require approval
-/// when severity is high" is a predicate, and a predicate is one step from an
+/// **[`approval`](Self::approval) carries no condition, and that is
+/// deliberate.** "Require approval when severity is high" changes what the
+/// agent *does*, and a predicate that changes behaviour is one step from an
 /// `if` — the point where a config format stops being config. An agent whose
-/// oversight depends on what it found is a skill, written in a language built
-/// for decisions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// conduct depends on what it found is a skill, written in a language built for
+/// decisions.
+///
+/// [`triage`](Self::triage) does carry one, and the distinction is the whole
+/// justification: a triage rule changes nothing about the run. The answer is
+/// produced, validated, returned and remembered identically whether a rule
+/// matched or not; the only effect is a row in a worklist. That is *reporting*,
+/// and reporting is the one place a declaration can hold a predicate without
+/// becoming control flow. See [`TriageRule`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Oversight {
-    /// Unconditional. The only value, because the alternative is a predicate.
+    /// What a human decides **before** the run continues.
     pub approval: Approval,
     /// Who may decide. Empty means anyone — a choice worth making on purpose
     /// rather than by omission.
@@ -309,6 +331,15 @@ pub struct Oversight {
     /// variant they picked off a list.
     #[serde(default)]
     pub allow_unattended: bool,
+    /// Tasks opened **beside** a completed answer, not in front of it.
+    ///
+    /// Each rule is a predicate over [`Output::schema`] and an audience. The run
+    /// finishes and returns; a matching rule adds a worklist row. Requires
+    /// `spec.output` — a predicate over a shape nothing declares is a rule
+    /// nobody can check — and every condition is typed against that schema at
+    /// parse time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triage: Vec<TriageRule>,
 }
 
 /// The obligation that bounds an oversight wait.
@@ -356,11 +387,12 @@ impl OversightDeadline {
     }
 }
 
-/// What a human decides on.
+/// What a human decides on **before the run continues**.
 ///
-/// Two values, both enforced, and neither is a predicate — "require approval
-/// when severity is high" is one step from an `if`, which is where a config
-/// format stops being config.
+/// Three values, all enforced, and none is a predicate — "require approval when
+/// severity is high" is one step from an `if`, which is where a config format
+/// stops being config. A condition that only *reports* is
+/// [`Oversight::triage`], which is a different thing and says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Approval {
@@ -375,6 +407,27 @@ pub enum Approval {
     /// already happened. Gating the **call** is the control the answer gate
     /// reads like.
     ToolsOnly,
+    /// Nothing waits. The run completes and
+    /// [`Oversight::triage`] decides what a person is shown afterwards.
+    ///
+    /// # The mode an advisory agent needs
+    ///
+    /// A `tool-calling` agent that grants no mutating tool **cannot act**: its
+    /// arguments come from a model completion, so a mutating call with no
+    /// protected fields is refused by the taint gate on every run — which is
+    /// why [`Manifest::validate`] refuses that grant outright rather than
+    /// letting it read as a capability. A whole class of agents is therefore
+    /// advisory by construction, and for those the other two modes are both
+    /// wrong: `tools-only` gates nothing because there is no mutating call to
+    /// gate, and `required` suspends every run until somebody approves a
+    /// *report* — a worklist that blocks, at whatever rate the world produces
+    /// findings.
+    ///
+    /// `none` is not "no oversight". It is refused unless something else in the
+    /// block does work: a `triage` rule, or a grant asking for per-call
+    /// approval. An oversight block that performs nothing is the decoration
+    /// this format exists to reject.
+    None,
 }
 
 /// What happens when the approval window closes.
@@ -819,6 +872,36 @@ const fn yes() -> bool {
     true
 }
 
+/// Every `tool://server/name` written in a piece of prose.
+///
+/// Scans for the scheme and takes the run of characters a reference may
+/// contain, so surrounding punctuation — a backtick, a comma, a closing
+/// parenthesis, the end of a sentence — is not swallowed into the name. Anything
+/// the reference parser then refuses is skipped rather than reported: prose
+/// containing the literal text `tool://` in a sentence about the scheme itself
+/// is not a grant somebody forgot.
+fn tool_references_in(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(crate::tools::TOOL_SCHEME) {
+        let candidate: String = rest[at..]
+            .chars()
+            .take_while(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '-' | '_' | '.' | '+')
+            })
+            .collect();
+        if crate::tools::ToolId::parse(&candidate).is_some() {
+            found.push(candidate.clone());
+        }
+        // Advance past the scheme, never past the candidate: two references
+        // written back to back must both be seen.
+        rest = &rest[at + crate::tools::TOOL_SCHEME.len()..];
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
 impl Manifest {
     /// Begin a programmatic declaration with the required identity fields.
     ///
@@ -921,6 +1004,67 @@ impl Manifest {
         Ok(manifests)
     }
 
+    /// Parse a **set of separately embedded documents**, keyed by declared name.
+    ///
+    /// # The shape [`parse_all`](Self::parse_all) does not cover
+    ///
+    /// `parse_all` is for a *room*: several agents in one file, because they are
+    /// one deployable thing. The other common layout is one file per agent, a
+    /// directory of them, and `include_str!` in the binary — and it had no
+    /// support at all, so every embedder wrote the same table by hand:
+    ///
+    /// ```text
+    /// const AGENTS: &[(&str, &str)] = &[
+    ///     ("obligation-watch", include_str!(agents/obligation-watch.yaml)),
+    ///     ("clearing-triage",  include_str!(agents/clearing-triage.yaml)),
+    /// ];
+    /// ```
+    ///
+    /// That table has two defects and both are silent. The name beside each path
+    /// is **already in the document** as `metadata.name`, so it is one fact
+    /// written twice and nothing checks that the two agree. And a file included
+    /// under two constants — a copy-paste while adding the next agent — builds,
+    /// runs, and registers one agent twice while the other is simply absent.
+    ///
+    /// This takes `(origin, yaml)` pairs, where `origin` is used **only in
+    /// diagnostics**, and keys the result by the name each document declares.
+    /// A name declared twice is refused and the message names both origins.
+    /// [`manifests!`](crate::manifests) writes the pairs for you from path
+    /// literals.
+    ///
+    /// # Errors
+    ///
+    /// [`ManifestError::Syntax`] naming the failing document's origin, the same
+    /// validation errors [`parse`](Self::parse) raises, and a refusal for two
+    /// documents declaring one `metadata.name`.
+    pub fn parse_each<'a>(
+        documents: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<std::collections::BTreeMap<String, Self>, ManifestError> {
+        let mut out: std::collections::BTreeMap<String, Self> = std::collections::BTreeMap::new();
+        let mut origins: std::collections::BTreeMap<String, &str> =
+            std::collections::BTreeMap::new();
+        for (origin, yaml) in documents {
+            let m =
+                Self::parse(yaml).map_err(|e| ManifestError::Syntax(format!("{origin}: {e}")))?;
+            if let Some(first) = origins.get(&m.metadata.name) {
+                return Err(ManifestError::Syntax(format!(
+                    "'{origin}' and '{first}' both declare agent '{}' — a name resolves to \
+                     one declaration, so one of the two would silently not be the one that \
+                     runs. Two agents need two names; one agent needs one file",
+                    m.metadata.name
+                )));
+            }
+            origins.insert(m.metadata.name.clone(), origin);
+            out.insert(m.metadata.name.clone(), m);
+        }
+        if out.is_empty() {
+            return Err(ManifestError::Syntax(
+                "no manifest documents were supplied".to_owned(),
+            ));
+        }
+        Ok(out)
+    }
+
     fn normalize(&mut self) {
         for grant in &mut self.spec.tools {
             grant
@@ -975,6 +1119,7 @@ impl Manifest {
                          room file, each with its own digest",
             });
         }
+        self.validate_prompt_tool_references()?;
         self.validate_oversight()?;
         self.validate_tool_approval()?;
         self.validate_tool_grants()?;
@@ -1224,6 +1369,63 @@ impl Manifest {
         Ok(())
     }
 
+    /// A prompt naming a tool this agent was never granted is refused.
+    ///
+    /// # The failure it closes, and the half it cannot
+    ///
+    /// An unknown tool name is reported back to the model as a **failed call**
+    /// rather than ending the run — deliberately, so the model can correct
+    /// itself and never gets the tool it nearly named. The cost is that a
+    /// *procedure* naming an ungranted tool does not fail loudly: the model
+    /// asks, is refused, improvises, and the step silently does not happen.
+    /// Nothing in the journal says the instruction was unfollowable, because
+    /// from the runtime's side nothing went wrong.
+    ///
+    /// So the check runs where the two facts are in one document. Any
+    /// `tool://server/name` written in [`Identity::role`] or
+    /// [`Identity::constraints`] must be a tool `spec.tools` grants.
+    ///
+    /// **It only sees references spelled as references.** A prompt that says
+    /// *"call `list_overdue_processes`"* names a tool in prose, and prose is not
+    /// something this crate can tell from an ordinary noun — a check that
+    /// guessed would refuse manifests over the word "search". Writing the
+    /// grant's own `ref` in the prompt is therefore the spelling that gets
+    /// checked, and it is also the spelling a reviewer can follow.
+    ///
+    /// It is deliberately not softened for *illustrative* references either: a
+    /// prompt containing the literal text `tool://server/name` as a placeholder
+    /// is refused. The trade is one-sided — a false positive is a parse error
+    /// naming the exact string, and a false negative is an instruction the agent
+    /// silently cannot follow.
+    fn validate_prompt_tool_references(&self) -> Result<(), ManifestError> {
+        let Some(identity) = &self.spec.identity else {
+            return Ok(());
+        };
+        let granted: std::collections::BTreeSet<&str> = self
+            .spec
+            .tools
+            .iter()
+            .map(|g| g.reference.as_str())
+            .collect();
+        for (field, text) in [
+            ("spec.identity.role", identity.role.as_str()),
+            ("spec.identity.constraints", identity.constraints.as_str()),
+        ] {
+            for reference in tool_references_in(text) {
+                if !granted.contains(reference.as_str()) {
+                    return Err(ManifestError::Syntax(format!(
+                        "{field} instructs the agent to use '{reference}', which \
+                         `spec.tools` does not grant. An ungranted name is reported to the \
+                         model as a failed call, so the model improvises and the \
+                         instruction silently does not happen — grant the tool, or stop \
+                         naming it"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A control nothing performs is worse than no control at all.
     fn validate_oversight(&self) -> Result<(), ManifestError> {
         let Some(o) = &self.spec.oversight else {
@@ -1246,11 +1448,10 @@ impl Manifest {
         if o.deadline.kind.trim().is_empty() {
             return Err(ManifestError::Empty("spec.oversight.deadline.kind"));
         }
+        let gates_a_call = self.spec.tools.iter().any(|grant| grant.requires_approval);
         // `tools-only` with nothing asking for it gates nothing at all, and
         // reads in review as oversight that is present.
-        if o.approval == Approval::ToolsOnly
-            && !self.spec.tools.iter().any(|grant| grant.requires_approval)
-        {
+        if o.approval == Approval::ToolsOnly && !gates_a_call {
             return Err(ManifestError::Unenforceable {
                 field: "spec.oversight.approval",
                 detail: "'tools-only' with no tool grant requesting approval gates nothing — \
@@ -1258,6 +1459,20 @@ impl Manifest {
                          use 'required' to gate the answer",
             });
         }
+        // `none` is the advisory mode, not an off switch: something in the
+        // block still has to perform. Without this, `approval: none` with an
+        // empty `triage` is a whole oversight declaration that does nothing
+        // while reading in review as a human control.
+        if o.approval == Approval::None && !gates_a_call && o.triage.is_empty() {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.oversight.approval",
+                detail: "'none' with no `triage` rule and no grant requesting approval is an \
+                         oversight block that performs nothing — declare the rules that open \
+                         a task beside the answer, set `requires_approval: true` on the calls \
+                         a person must see, or remove `spec.oversight` entirely",
+            });
+        }
+        self.validate_triage(&o.triage)?;
         // The same explicitness the runtime demands, demanded in the file.
         if o.on_expiry == Expiry::Proceed && !o.allow_unattended {
             return Err(ManifestError::Unenforceable {
@@ -1422,6 +1637,89 @@ impl Manifest {
         Ok(())
     }
 
+    /// Triage rules, checked against the shape they claim to read.
+    ///
+    /// Two refusals carry the weight, and both are the same rule: a worklist
+    /// nobody is filling reads exactly like one that is.
+    ///
+    /// * **`triage` needs `spec.output`.** The predicate is over the answer, and
+    ///   an answer with no declared shape is one no reviewer can check a pointer
+    ///   against — so the rule would be prose about a document nobody wrote.
+    /// * **Every condition is typed against that schema.** Only where the schema
+    ///   *provably* closes the door, which is deliberately narrower than a
+    ///   validator would be. See [`Condition::check_against`].
+    fn validate_triage(&self, rules: &[TriageRule]) -> Result<(), ManifestError> {
+        if rules.is_empty() {
+            return Ok(());
+        }
+        // No check here that `spec.execution` is present. `validate_oversight`
+        // already refuses the whole block beside a coded skill, and it is the
+        // only caller — a second copy would read as a control and never run,
+        // which is the shape this format refuses in the documents it parses and
+        // should not carry in the parser.
+        let Some(schema) = self.output_schema() else {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.oversight.triage",
+                detail: "a triage rule is a predicate over the agent's answer, and this \
+                         agent declares no `spec.output.schema` — so there is no shape a \
+                         reviewer could check the rule's pointers against. Declare the \
+                         answer's schema, or drop the rules",
+            });
+        };
+        let mut names = std::collections::BTreeSet::new();
+        for rule in rules {
+            if rule.name.trim().is_empty() {
+                return Err(ManifestError::Empty("spec.oversight.triage[].name"));
+            }
+            if rule.summary.trim().is_empty() {
+                return Err(ManifestError::Empty("spec.oversight.triage[].summary"));
+            }
+            if rule.deadline.name.trim().is_empty() {
+                return Err(ManifestError::Empty(
+                    "spec.oversight.triage[].deadline.name",
+                ));
+            }
+            if rule.deadline.kind.trim().is_empty() {
+                return Err(ManifestError::Empty(
+                    "spec.oversight.triage[].deadline.kind",
+                ));
+            }
+            if !names.insert(rule.name.as_str()) {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.oversight.triage: two rules are both named '{}' — a worklist \
+                     filtered on the kind could not tell them apart",
+                    rule.name
+                )));
+            }
+            // An empty `when` matches every answer, which is a task per run
+            // wearing the shape of a filter.
+            if rule.when.is_empty() {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.oversight.triage: rule '{}' has no conditions, so it matches \
+                     every answer — that is a task on every run, and writing it as a rule \
+                     hides the decision. State the condition, or use \
+                     `approval: required` if a person really must see every answer",
+                    rule.name
+                )));
+            }
+            for condition in &rule.when {
+                condition.validate().map_err(|detail| {
+                    ManifestError::Syntax(format!(
+                        "spec.oversight.triage: rule '{}': {detail}",
+                        rule.name
+                    ))
+                })?;
+                condition.check_against(schema).map_err(|detail| {
+                    ManifestError::Syntax(format!(
+                        "spec.oversight.triage: rule '{}': {detail}",
+                        rule.name
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     fn validate_memory_formation(&self) -> Result<(), ManifestError> {
         let Some(formation) = &self.spec.memory_formation else {
             return Ok(());
@@ -1445,7 +1743,6 @@ impl Manifest {
             });
         }
         for (field, value) in [
-            ("spec.memory_formation.subject", formation.subject.as_str()),
             ("spec.memory_formation.purpose", formation.purpose.as_str()),
             (
                 "spec.memory_formation.instruction",
@@ -1455,6 +1752,16 @@ impl Manifest {
             if value.trim().is_empty() {
                 return Err(ManifestError::Empty(field));
             }
+        }
+        match &formation.subject {
+            MemorySubject::Literal(literal) if literal.trim().is_empty() => {
+                return Err(ManifestError::Empty("spec.memory_formation.subject"));
+            }
+            // Whether the run has a case is a deployment fact this document
+            // cannot see — `RuntimeBuilder::try_build` refuses a plane with no
+            // case store, and the run itself refuses if it was admitted without
+            // correlation keys. Both are loud, and neither can be decided here.
+            _ => {}
         }
         if !(1..=10).contains(&formation.max_items) {
             return Err(ManifestError::Syntax(

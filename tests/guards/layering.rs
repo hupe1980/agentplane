@@ -1095,7 +1095,7 @@ fn every_metric_explains_itself() {
 /// is a prompt injection reaching a mutating tool.
 #[test]
 fn every_trusted_effect_is_named() {
-    // Eight, and each is the runtime's own machinery rather than the world's:
+    // Nine, and each is the runtime's own machinery rather than the world's:
     //
     //   Clock           — the journaled instant, written by the runtime.
     //   Recorded        — a value the runtime recorded for itself; adds no trust.
@@ -1126,7 +1126,13 @@ fn every_trusted_effect_is_named() {
     //                     the worst a second writer can do is a wrong-but-valid
     //                     variant, and it reaches nothing but the `from` field
     //                     of a record.
-    const KNOWN_TRUSTED: usize = 8;
+    //   OpenTask        — the runtime opening a worklist row whose id it
+    //                     derived from its own effect key, and that id is the
+    //                     effect's whole output. The *justification* the row
+    //                     carries is untrusted model content by construction and
+    //                     is not what this labels — see `effects::OpenTask` on
+    //                     why a worklist is deliberately not a sink.
+    const KNOWN_TRUSTED: usize = 9;
 
     // Anchored on the *declaration*, not on the token. `Trust::Trusted` also
     // appears in the doc comment that explains the rule and in the match arm

@@ -15,6 +15,122 @@ makes a hard cut acceptable at this stage.
 
 ---
 
+## `memory_formation.subject` may be a binding, and a `$` typo is now refused
+
+Existing literals are unchanged. What changed is that a subject beginning with
+`$` is parsed rather than taken as a constant, so an unrecognised binding is a
+**parse error**:
+
+```text
+'$correlaton/malo' is not a binding this crate understands. Use
+'$correlation/<namespace>', '$case', '$input/<pointer>', or write '$$' for a
+literal that really begins with a dollar sign
+```
+
+A literal that genuinely begins with `$` is now spelled `$$`.
+
+**Why it is worth a hard cut.** A subject is the unit `forget_subject` erases. A
+literal one pools every party the agent reasoned about under a single key, so one
+party's facts are recalled into another's run and an erasure request naming one
+person cannot be satisfied without destroying everybody's. Filing memories under
+a *typo* is the same defect with a worse cause, and it is invisible until
+somebody asks to be forgotten — so an unrecognised binding is refused rather than
+stored.
+
+The shortest fix for a per-party agent:
+
+```yaml
+memory_formation:
+  subject: "$correlation/malo"   # was: "agent:clearing"
+```
+
+Two build-time refusals arrive with it, both of facts knowable at `build`:
+`FormationWithoutMemory` (formation runs *after* the answer, so a missing memory
+store fails once the run has already paid for its model calls) and
+`MemorySubjectUnbindable` (a case-bound subject on a plane with no case store
+could never resolve).
+
+---
+
+## `spec.oversight.approval` gained `none`, and a block that does nothing is refused
+
+`approval: none` with an empty `triage` and no grant asking for approval is now
+**refused at parse**. Nothing had that shape before — `approval` was required and
+had only two values — so this breaks nothing that parsed; it is stated here
+because the new value makes the shape expressible.
+
+The value exists for agents that **cannot act**: a `tool-calling` agent granting
+no mutating tool is advisory by construction, and for those `tools-only` gates
+nothing while `required` suspends every run until somebody approves a report. See
+[`spec.oversight.triage`](@/docs/manifest.md#spec-oversight-triage).
+
+---
+
+## A prompt may not name a tool the agent was not granted
+
+Any `tool://server/name` written in `spec.identity.role` or `constraints` must be
+a tool `spec.tools` grants, or the manifest is **refused at parse**.
+
+**Why.** An ungranted name comes back to the model as a *failed call*, which is
+right — the model can correct itself and never gets the tool it nearly named.
+The cost is that a **procedure** naming an ungranted tool fails quietly: the
+model asks, is refused, improvises, and the step silently does not happen with
+nothing in the journal saying the instruction was unfollowable. One deployment
+found twelve such instructions across eleven manifests.
+
+The check only sees references spelled as references — prose naming a tool by
+bare identifier is indistinguishable from an ordinary noun — and it does not
+exempt illustrative ones: a prompt containing the literal text
+`tool://server/name` as a placeholder is refused. The trade is one-sided, since a
+false positive is a parse error naming the exact string.
+
+---
+
+## Timestamps on a wire are RFC 3339
+
+`MemoryItem::{created_at, expires_at, superseded_at}` and `Recall::as_of` now
+serialise as RFC 3339 strings rather than `time`'s **component array**, and the
+`memory.remember`, `memory.touch`, `memory.sweep-expired` and `authority.draw`
+effect descriptors do the same. Stored memories and journals written by an
+earlier build no longer deserialise; recreate them, per the standing pre-freeze
+remedy.
+
+**The hazard, because `Timestamp` is public API and lands in your payloads too.**
+It is a re-export of `time::OffsetDateTime`, whose *derived* `Serialize` — absent
+the `serde-human-readable` feature, which this crate does not enable — emits nine
+numbers:
+
+```text
+[2027, 15, 8, 0, 0, 0, 0, 0, 0]
+ year  ordinal-day  h  m  s  ns  offset-h  offset-m  offset-s
+```
+
+It parses, it round-trips, and every consumer expecting a date gets an array
+whose first element looks like a year. A model asked to do arithmetic on one
+answers confidently and wrongly.
+
+Use `#[serde(with = "time::serde::rfc3339")]` on a struct field, and
+`agentplane::core::format_timestamp` inside a `json!` literal. `tests/guards`
+walks the crate's serialized types and fails on a component array, so this is now
+enforced rather than remembered.
+
+---
+
+## `PushSweepReport` moved to `agentplane::push`
+
+The delivery loop — read past the cursor, POST, advance on 2xx, back off, abandon
+a permanent refusal — is now `push::DeliveryWorker`, parameterised by a
+`Projection`. `A2aPushWorker` is a thin binding of it to the A2A projection and
+its API is unchanged; `api::a2a::PushSweepReport` is a re-export.
+
+It moved because the cursor discipline has nothing to do with A2A. It lived
+inside the A2A server because A2A was the first caller, which made the one
+mechanism an operator most wants reachable only by speaking somebody else's
+protocol and only for a caller-supplied URL. See
+[emit an event per run](@/docs/cookbook.md#emit-an-event-per-run-without-an-outbox-table).
+
+---
+
 ## Canonicalization rule 3: numbers format per RFC 8785
 
 A store written under rule 2 still opens and its history still verifies — the

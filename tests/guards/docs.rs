@@ -1058,7 +1058,16 @@ fn every_documented_step_ctx_method_exists() {
 /// is gone, and does not demand that every field be tabulated.
 #[test]
 fn every_tabulated_manifest_field_exists() {
-    let source = read("src/manifest/mod.rs");
+    // The whole module, not only `mod.rs`: the declaration's types are spread
+    // across files — `triage.rs` holds the rule and condition shapes — and a
+    // scan of one file reports every field in the others as documented-but-
+    // nonexistent, which is a guard failing for its own reason.
+    let source: String =
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/manifest"))
+            .iter()
+            .map(|f| std::fs::read_to_string(f).expect("read a manifest module file"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
     let mut real: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for line in source.lines() {

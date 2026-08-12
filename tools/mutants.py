@@ -3046,10 +3046,10 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "an answer is written into durable memory before oversight decides, so "
         "a reviewer's refusal fails the run while the refused answer stays a "
         "standing fact the next run reads as established",
-        "        if let Some(spec) = oversight.filter(Proposal::gates_the_answer) {",
-        "        self.form_answer(cx, formation, formed_source.clone(), model)\n"
+        "        if let Some(spec) = oversight.as_ref().filter(|s| s.gates_the_answer()) {",
+        "        self.form_answer(cx, formation, formed_source.clone(), input, model)\n"
         "            .await?;\n"
-        "        if let Some(spec) = oversight.filter(Proposal::gates_the_answer) {",
+        "        if let Some(spec) = oversight.as_ref().filter(|s| s.gates_the_answer()) {",
     ),
     "ToolCallingSkipsOversight": (
         "src/runtime/declarative.rs",
@@ -3377,8 +3377,57 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the grant is checked only when a webhook is registered, so a host "
         "removed from the allowlist keeps receiving notifications for every task "
         "registered while it was still granted",
-        "        self.policy\n            .check_allowing_loopback(&config.url, self.loopback_allowed())?;",
+        "            self.policy\n                .check_allowing_loopback(&config.url, self.loopback_allowed())?;",
         "",
+    ),
+    "AnUnresolvableSubjectFallsBackToTheLiteral": (
+        "src/runtime/declarative.rs",
+        "an_unresolvable_binding_fails_the_run",
+        "a memory subject binding that cannot resolve falls back to the "
+        "declaration's literal text, so every party's durable facts are pooled "
+        "under one key — one party's history recalled into another's run, and "
+        "an erasure request naming one person unsatisfiable without destroying "
+        "everybody's",
+        "        MemorySubject::Correlation(namespace) => cx\n            .correlation_value(namespace)\n            .map(ToOwned::to_owned)\n            .ok_or_else(|| {",
+        "        MemorySubject::Correlation(namespace) => cx\n            .correlation_value(namespace)\n            .map(ToOwned::to_owned)\n            .or_else(|| Some(format!(\"$correlation/{namespace}\")))\n            .ok_or_else(|| {",
+    ),
+    "AnUntrustedInputMayChooseTheSubject": (
+        "src/runtime/declarative.rs",
+        "an_untrusted_input_may_not_choose_the_subject",
+        "a memory subject bound to `$input` is accepted from an untrusted "
+        "field, so whoever supplied the input chooses whose durable memories "
+        "this run writes into — strictly worse than the pooling the binding "
+        "exists to fix, and invisible at the time",
+        "            if selected.label().trust != crate::core::Trust::Trusted {",
+        "            if false && selected.label().trust != crate::core::Trust::Trusted {",
+    ),
+    "APromptMayNameAnUngrantedTool": (
+        "src/manifest/mod.rs",
+        "a_prompt_naming_an_ungranted_tool_is_refused",
+        "a prompt instructs the agent to use a tool `spec.tools` never granted, "
+        "so the model asks, is refused, improvises, and the step silently does "
+        "not happen — with nothing in the journal saying the instruction was "
+        "unfollowable",
+        "                if !granted.contains(reference.as_str()) {",
+        "                if false && !granted.contains(reference.as_str()) {",
+    ),
+    "ATriageRuleIsNotTypedAgainstTheAnswer": (
+        "src/manifest/mod.rs",
+        "a_triage_rule_is_checked_against_the_declared_output",
+        "a triage condition naming a field the declared output schema provably "
+        "cannot carry is accepted, so a compliance alert that can never fire "
+        "reads in review exactly like one that does",
+        "                condition.check_against(schema).map_err(|detail| {",
+        "                Ok::<(), String>(()).map_err(|detail| {",
+    ),
+    "AnOperatorWorkerServesACallersWebhook": (
+        "src/push/outbox.rs",
+        "an_operator_worker_leaves_a_callers_webhook_alone",
+        "the outbox worker claims every registration in the store rather than "
+        "only its own, so the deployment's own event is POSTed to a peer's A2A "
+        "webhook — a disclosure to a party that registered for something else",
+        "    fn owns(&self, registration: &PushRegistration) -> bool {\n        is_operator_id(&registration.config.id)",
+        "    fn owns(&self, registration: &PushRegistration) -> bool {\n        let _ = registration;\n        true",
     ),
     "AnUnfireableMutatingGrantParses": (
         "src/manifest/mod.rs",
@@ -3459,7 +3508,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "    if false\n        && let Some((_, allowed)) = FIELDS_BY_METHOD.iter().find(|(m, _)| *m == method)\n        && let Some(stray) = object.keys().find(|k| !allowed.contains(&k.as_str()))\n    {",
     ),
     "APermanentRefusalIsRetriedForever": (
-        "src/api/a2a.rs",
+        "src/push/delivery.rs",
         "a_permanently_refused_webhook_is_abandoned_rather_than_retried_forever",
         "a webhook refusal no backoff can change — a host taken off the "
         "allowlist, a URL that is not https — is rescheduled instead of given "
@@ -3469,7 +3518,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        let exhausted = attempts.saturating_add(1) >= self.max_attempts;\n        if exhausted {",
     ),
     "APushCeilingAbandonsOnTheFirstHiccup": (
-        "src/api/a2a.rs",
+        "src/push/delivery.rs",
         "an_unreachable_receiver_is_retried_up_to_the_ceiling_and_then_abandoned",
         "every transient delivery failure abandons the registration, so a "
         "receiver that was merely rebooting loses every notification it had not "

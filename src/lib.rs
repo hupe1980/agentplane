@@ -155,6 +155,48 @@ const _: fn() = || {
     let _: Option<&crate::model::embeddings::BedrockEmbedder> = None;
 };
 
+/// Embed a directory of single-agent manifests, keyed by declared name.
+///
+/// One `include_str!` per path, handed to [`Manifest::parse_each`] with the path
+/// literal as the origin for diagnostics. The result is
+/// `Result<BTreeMap<String, Manifest>, ManifestError>` keyed by each document's
+/// own `metadata.name`.
+///
+/// ```ignore
+/// let agents = agentplane::manifests![
+///     "agents/obligation-watch.yaml",
+///     "agents/clearing-triage.yaml",
+/// ]?;
+/// let watch = &agents["obligation-watch"];
+/// ```
+///
+/// # Why this exists rather than a hand-written table
+///
+/// The obvious form is `&[(&str, &str)]` with a name typed beside each path.
+/// The name is **already in the document**, so that table is one fact written
+/// twice with nothing checking that the two agree — and a file included under
+/// two constants, which is what happens while adding the next agent, builds and
+/// runs with one agent registered twice and another silently absent. Here the
+/// key comes from the document and a duplicate name is a compile-time-embedded,
+/// run-time-refused error naming both paths.
+///
+/// Paths are relative to the invoking file, exactly as `include_str!` resolves
+/// them, and each is recorded in the diagnostic for the document it failed on.
+/// There is no glob: a macro that expanded a directory listing would make the
+/// set of agents a plane runs depend on what is on disk at build time rather
+/// than on what is in the source a reviewer reads.
+///
+/// [`Manifest::parse_each`]: crate::manifest::Manifest::parse_each
+#[cfg(feature = "manifest")]
+#[macro_export]
+macro_rules! manifests {
+    ($($path:literal),+ $(,)?) => {
+        $crate::manifest::Manifest::parse_each([
+            $(($path, include_str!($path))),+
+        ])
+    };
+}
+
 pub use crate::core::{
     AgentRef, Capability, CaseId, Digest, EffectKey, Label, Outcome, Recovery, RunId, RuntimeError,
     Sensitivity, Seq, Skill, SkillDescriptor, SourceId, StepId, Tainted, Trust,

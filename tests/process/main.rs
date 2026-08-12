@@ -19,6 +19,7 @@ mod batches;
 mod cases;
 mod plans;
 mod replanning;
+mod scoping;
 mod tasks;
 mod telemetry;
 mod timers;

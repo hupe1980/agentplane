@@ -91,19 +91,28 @@ pub struct MemoryItem {
     pub written_by: String,
     /// Monotonic per `id`. A write appends; nothing is edited in place.
     pub version: u64,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: Timestamp,
     /// When this version stops being eligible for fresh recall.
     ///
     /// Exact-version reads remain available for replay until an explicit
     /// lifecycle sweep erases the memory. The cutoff is evaluated against the
     /// journaled `Recall::as_of`, never an ambient store clock.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expires_at: Option<Timestamp>,
     /// Sliding retention window refreshed only by an explicit journaled touch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_retention_seconds: Option<u64>,
     /// Set when a later version replaced this one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub superseded_at: Option<Timestamp>,
     /// The memories this one was derived from, at the versions actually read.
     ///
@@ -213,8 +222,8 @@ impl MemoryItem {
             "sensitivity": self.sensitivity,
             "trust": self.trust,
             "written_by": self.written_by,
-            "created_at": self.created_at,
-            "expires_at": self.expires_at,
+            "created_at": crate::core::format_timestamp(self.created_at),
+            "expires_at": self.expires_at.map(crate::core::format_timestamp),
             "access_retention_seconds": self.access_retention_seconds,
             "derived_from": self.derived_from,
         })))
@@ -238,7 +247,11 @@ pub struct Recall {
     /// journaled clock; direct store callers may choose one explicitly.
     ///
     /// [`StepCtx::recall`]: crate::runtime::StepCtx::recall
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub as_of: Option<Timestamp>,
     /// Refresh sliding retention for selected memories as a second effect.
     #[serde(default)]

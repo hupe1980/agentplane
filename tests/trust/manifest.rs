@@ -4578,3 +4578,457 @@ spec:
     .try_build()
     .expect("a plane with a worklist must accept an agent that asks for one");
 }
+
+// ── Bindings, triage, and the prompt/grant check ─────────────────────────────
+
+/// A subject that is not a literal is parsed, refused, or round-tripped exactly.
+///
+/// The refusal is the important half. Reading `$correlaton/malo` as the constant
+/// string `"$correlaton/malo"` would file every customer's memories under the
+/// typo — a scoping failure that looks like a working agent until somebody asks
+/// to be forgotten.
+#[test]
+fn a_memory_subject_binding_parses_or_is_refused() {
+    use agentplane::manifest::MemorySubject;
+
+    let with = |subject: &str| {
+        format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: filer, version: "1.0.0" }}
+spec:
+  capabilities: {{ provides: [file.facts] }}
+  models: {{ privileged: {{ provider: fake, model: m-1 }} }}
+  execution: {{ kind: completion }}
+  memory_formation:
+    subject: "{subject}"
+    purpose: clearing
+    instruction: Extract stable facts only.
+  budgets: {{}}
+"#
+        )
+    };
+
+    for (written, expected) in [
+        (
+            "$correlation/malo",
+            MemorySubject::Correlation("malo".to_owned()),
+        ),
+        ("$case", MemorySubject::Case),
+        (
+            "$input/party/id",
+            MemorySubject::Input("/party/id".to_owned()),
+        ),
+        (
+            "team:billing",
+            MemorySubject::Literal("team:billing".to_owned()),
+        ),
+    ] {
+        let m = Manifest::parse(&with(written)).expect(written);
+        assert_eq!(
+            m.spec.memory_formation.as_ref().expect("formation").subject,
+            expected
+        );
+        // The written form is what the digest covers, so it must survive a
+        // round trip byte for byte.
+        assert_eq!(
+            m.spec
+                .memory_formation
+                .as_ref()
+                .expect("formation")
+                .subject
+                .as_written(),
+            written
+        );
+    }
+
+    let refused = Manifest::parse(&with("$correlaton/malo"))
+        .expect_err("a mistyped binding is refused, not taken as a constant");
+    assert!(
+        refused.to_string().contains("$correlation/<namespace>"),
+        "{refused}"
+    );
+
+    // Changing a binding changes the identity, like every other declared fact.
+    assert_ne!(
+        Manifest::parse(&with("$correlation/malo"))
+            .expect("a")
+            .digest()
+            .expect("digest"),
+        Manifest::parse(&with("$correlation/meter"))
+            .expect("b")
+            .digest()
+            .expect("digest"),
+    );
+}
+
+/// A memory subject binding needs a plane that has cases.
+#[test]
+fn a_case_bound_subject_on_a_plane_with_no_cases_is_refused() {
+    use agentplane::runtime::{Agent, BuildError, Runtime};
+
+    const FILER: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: filer, version: "1.0.0" }
+spec:
+  capabilities: { provides: [file.facts] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: completion }
+  memory_formation:
+    subject: "$correlation/malo"
+    purpose: clearing
+    instruction: Extract stable facts only.
+  budgets: {}
+"#;
+    let manifest = Manifest::parse(FILER).expect("manifest");
+    let store = std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let plane = || {
+        Runtime::builder(
+            std::sync::Arc::clone(&store) as std::sync::Arc<dyn agentplane::journal::JournalStore>
+        )
+        .provider(
+            "fake",
+            agentplane::testkit::FakeProvider::new()
+                as std::sync::Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+    };
+
+    // No memory store at all: formation would fail *after* the answer, having
+    // already paid for the model call.
+    let err = plane()
+        .try_build()
+        .expect_err("formation with nowhere to write must refuse the build");
+    assert!(
+        matches!(&err, BuildError::FormationWithoutMemory { agent } if agent == "filer"),
+        "wrong refusal: {err}"
+    );
+
+    // Memory but no cases: the binding could never resolve.
+    let err =
+        plane()
+            .memory(std::sync::Arc::clone(&store)
+                as std::sync::Arc<dyn agentplane::memory::MemoryStore>)
+            .try_build()
+            .expect_err("a case-bound subject on a plane with no cases must refuse the build");
+    assert!(
+        matches!(&err, BuildError::MemorySubjectUnbindable { subject, .. }
+            if subject == "$correlation/malo"),
+        "wrong refusal: {err}"
+    );
+
+    // Both wired: it builds. Without this half, a change refusing every
+    // declaration would satisfy the assertions above.
+    plane()
+        .memory(std::sync::Arc::clone(&store) as std::sync::Arc<dyn agentplane::memory::MemoryStore>)
+        .cases(std::sync::Arc::clone(&store) as std::sync::Arc<dyn agentplane::case::CaseStore>)
+        .try_build()
+        .expect("a plane with memory and cases accepts a bound subject");
+}
+
+/// Triage is typed against the shape it claims to read.
+#[test]
+fn a_triage_rule_is_checked_against_the_declared_output() {
+    const OUTPUT: &str = r"  output:
+    schema:
+      type: object
+      additionalProperties: false
+      required: [deadline_status]
+      properties:
+        deadline_status: { type: string }";
+    const BREACH: &str = r"      - name: breach
+        summary: 'a deadline was missed'
+        audience: [grid-operations]
+        when:
+          - path: /deadline_status
+            equals: BREACH
+        deadline: { name: triage, kind: hours, params: { n: 8 } }";
+
+    let with = |output: &str, rules: &str| {
+        format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: watcher, version: "1.0.0" }}
+spec:
+  capabilities: {{ provides: [watch.deadline] }}
+  models: {{ privileged: {{ provider: fake, model: m-1 }} }}
+  execution: {{ kind: completion }}
+{output}
+  oversight:
+    approval: none
+    deadline: {{ name: unused, kind: hours, params: {{ n: 4 }} }}
+    triage:
+{rules}
+  budgets: {{}}
+"#
+        )
+    };
+    Manifest::parse(&with(OUTPUT, BREACH)).expect("a well-typed rule parses");
+
+    // A pointer the schema provably cannot produce: the rule would never fire
+    // while reading in review as an alert that does.
+    let typo = BREACH.replace("/deadline_status", "/deadline_stauts");
+    let refused = Manifest::parse(&with(OUTPUT, &typo))
+        .expect_err("a pointer a closed schema forbids must be refused");
+    assert!(refused.to_string().contains("never fire"), "{refused}");
+
+    // No declared shape at all: nothing to check the rule against.
+    let refused = Manifest::parse(&with("", BREACH))
+        .expect_err("triage without `spec.output` must be refused");
+    assert!(
+        refused.to_string().contains("spec.output.schema"),
+        "{refused}"
+    );
+
+    // A rule with no conditions matches every answer, which is a task per run
+    // written as a filter.
+    let always = BREACH.replace(
+        "        when:\n          - path: /deadline_status\n            equals: BREACH\n",
+        "        when: []\n",
+    );
+    let refused =
+        Manifest::parse(&with(OUTPUT, &always)).expect_err("an unconditional rule must be refused");
+    assert!(refused.to_string().contains("every answer"), "{refused}");
+}
+
+/// `approval: none` must still do something.
+#[test]
+fn an_oversight_block_that_performs_nothing_is_refused() {
+    const IDLE: &str = r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: idle, version: '1.0.0' }
+spec:
+  capabilities: { provides: [idle.answer] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: completion }
+  oversight:
+    approval: none
+    deadline: { name: unused, kind: hours, params: { n: 4 } }
+  budgets: {}
+";
+    let refused = Manifest::parse(IDLE)
+        .expect_err("an oversight block with no triage and no gated call is refused");
+    assert!(
+        matches!(&refused, ManifestError::Unenforceable { field, .. }
+            if *field == "spec.oversight.approval"),
+        "wrong refusal: {refused}"
+    );
+}
+
+/// A prompt may not instruct the agent to use a tool it was never granted.
+///
+/// The model is told about exactly the granted tools, so an ungranted name comes
+/// back as a failed call — deliberately, so the model can correct itself. The
+/// cost is that a *procedure* naming an ungranted tool fails **quietly**: the
+/// model asks, is refused, improvises, and the step silently does not happen.
+#[test]
+fn a_prompt_naming_an_ungranted_tool_is_refused() {
+    let with = |role: &str| {
+        format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: procedural, version: "1.0.0" }}
+spec:
+  capabilities: {{ provides: [do.thing] }}
+  models: {{ privileged: {{ provider: fake, model: m-1 }} }}
+  execution: {{ kind: tool-calling }}
+  identity:
+    role: "{role}"
+  tools:
+    - ref: "tool://obsd/list_overdue"
+      mutates: false
+      description: "List overdue processes."
+  budgets: {{}}
+"#
+        )
+    };
+
+    Manifest::parse(&with("Call tool://obsd/list_overdue, then summarise."))
+        .expect("naming a granted tool is fine");
+    // Prose about the scheme with no reference in it is untouched.
+    Manifest::parse(&with("Use only the tools you were granted."))
+        .expect("a sentence with no reference in it is not a grant somebody forgot");
+
+    let refused = Manifest::parse(&with(
+        "First call tool://obsd/close_process, then summarise.",
+    ))
+    .expect_err("a prompt naming an ungranted tool must be refused");
+    assert!(
+        refused.to_string().contains("tool://obsd/close_process"),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("improvises"), "{refused}");
+}
+
+/// A directory of embedded manifests is keyed by what each document declares.
+#[test]
+fn embedded_manifests_are_keyed_by_declared_name_and_a_duplicate_is_refused() {
+    let doc = |name: &str| {
+        format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: {name}, version: "1.0.0" }}
+spec:
+  capabilities: {{ provides: [{name}.answer] }}
+  budgets: {{}}
+"#
+        )
+    };
+    let watch = doc("watch");
+    let triage = doc("triage");
+
+    let agents = Manifest::parse_each([
+        ("agents/watch.yaml", watch.as_str()),
+        ("agents/triage.yaml", triage.as_str()),
+    ])
+    .expect("two agents");
+    assert_eq!(
+        agents.keys().collect::<Vec<_>>(),
+        vec!["triage", "watch"],
+        "the key comes from metadata.name, not from the path"
+    );
+
+    // The mistake this exists to catch: one file included twice while adding
+    // the next agent. It builds, it runs, and one agent is silently absent.
+    let twice = Manifest::parse_each([
+        ("agents/watch.yaml", watch.as_str()),
+        ("agents/watch-v2.yaml", watch.as_str()),
+    ])
+    .expect_err("two documents declaring one agent must be refused");
+    assert!(twice.to_string().contains("agents/watch.yaml"), "{twice}");
+    assert!(
+        twice.to_string().contains("agents/watch-v2.yaml"),
+        "{twice}"
+    );
+
+    // A failing document names its origin, which a bare parse error would not.
+    let broken = Manifest::parse_each([("agents/broken.yaml", "kind: NotAnAgent")])
+        .expect_err("a bad document is refused");
+    assert!(
+        broken.to_string().contains("agents/broken.yaml"),
+        "{broken}"
+    );
+}
+
+/// A skill's reach is its manifest's reach, and `cx.call_tool` is what makes
+/// that so by construction rather than by discipline.
+///
+/// The hole it closes: a hand-built `ToolCatalog` inside a skill is checked by
+/// nothing. `try_build` refuses a *stated* catalogue laxer than a grant — a
+/// read-only entry for a tool the manifest calls mutating exempts it from the
+/// whole-value taint gate and makes a timed-out payment retryable — and a
+/// catalogue constructed inside a skill never passed under that check.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn a_skill_reaching_tools_through_the_plane_cannot_exceed_its_manifest() {
+    use std::sync::Arc;
+
+    use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError};
+    use agentplane::runtime::{Agent, RunStatus, Runtime, StepCtx};
+    use agentplane::tools::{ToolCatalog, ToolClient, ToolError, ToolId, ToolSafety};
+
+    const GRANTS_ONE: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: reacher, version: "1.0.0" }
+spec:
+  capabilities: { provides: [reach] }
+  budgets: {}
+  tools:
+    - ref: "tool://ledger/read"
+      mutates: false
+"#;
+
+    #[derive(Debug, Default)]
+    struct Anything {
+        called: std::sync::Mutex<Vec<ToolId>>,
+    }
+    #[async_trait::async_trait]
+    impl ToolClient for Anything {
+        async fn call(
+            &self,
+            tool: &ToolId,
+            _arguments: &serde_json::Value,
+            _provenance: Option<&agentplane::core::Provenance>,
+        ) -> Result<serde_json::Value, ToolError> {
+            self.called.lock().unwrap().push(tool.clone());
+            Ok(serde_json::json!({ "ok": true }))
+        }
+    }
+
+    /// Asks for whichever tool the input names.
+    #[derive(Debug)]
+    struct Reaches;
+    #[async_trait::async_trait]
+    impl Skill for Reaches {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("reaches").provides("reach")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            input: Tainted<serde_json::Value>,
+        ) -> Result<Outcome, SkillError> {
+            let name = input.peek()["tool"].as_str().unwrap_or_default().to_owned();
+            Ok(Outcome::done(
+                cx.call_tool(
+                    ToolId::new("ledger", name),
+                    Tainted::trusted(serde_json::json!({})),
+                )
+                .await?,
+            ))
+        }
+    }
+
+    let manifest = Manifest::parse(GRANTS_ONE).expect("manifest");
+    let client = Arc::new(Anything::default());
+    let store = std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    // The plane's catalogue holds **two** tools; the manifest grants one. That
+    // is the ordinary shape — one catalogue, several agents — and it is exactly
+    // where a skill could previously reach past its own declaration.
+    let catalog = ToolCatalog::new()
+        .allow(ToolId::new("ledger", "read"), ToolSafety::read_only())
+        .allow(ToolId::new("ledger", "transfer"), ToolSafety::default());
+    let rt = Runtime::builder(
+        std::sync::Arc::clone(&store) as std::sync::Arc<dyn agentplane::journal::JournalStore>
+    )
+    .tools(
+        Arc::new(catalog),
+        Arc::clone(&client) as Arc<dyn ToolClient>,
+    )
+    .agent(Agent::new(&manifest).skill(Reaches))
+    .try_build()
+    .expect("a coherent plane");
+
+    let granted = rt
+        .run(
+            "reach",
+            Tainted::trusted(serde_json::json!({ "tool": "read" })),
+        )
+        .await
+        .expect("the run completes");
+    assert_eq!(granted.status, RunStatus::Succeeded);
+
+    let ungranted = rt
+        .run(
+            "reach",
+            Tainted::trusted(serde_json::json!({ "tool": "transfer" })),
+        )
+        .await
+        .expect("the run reaches a verdict");
+    assert!(
+        matches!(ungranted.status, RunStatus::Failed(_)),
+        "a skill reached a tool its manifest never granted: {ungranted:?}"
+    );
+    assert_eq!(
+        client.called.lock().unwrap().as_slice(),
+        &[ToolId::new("ledger", "read")],
+        "the ungranted call must be refused before the transport is reached"
+    );
+}

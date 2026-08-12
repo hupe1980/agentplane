@@ -30,6 +30,208 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [Unreleased]
+
+Six things a regulated deployment ran into, and each is the same shape: a
+mechanism that was correct for the case it was built for and had no spelling for
+the mirror-image case beside it.
+
+### Added — a memory subject may name the party the run is about
+
+- **`memory_formation.subject` accepts a binding.** `$correlation/<namespace>`,
+  `$case` and `$input/<pointer>` resolve per run; a literal still means what it
+  says, and a literal that genuinely begins with `$` is now spelled `$$`.
+
+  **Why this is a defect and not a caveat.** A subject is the unit
+  `MemoryStore::forget_subject` erases, so a literal one pools every customer,
+  meter and matter the agent ever reasoned about under one key. One party's facts
+  are then recalled into another party's run, and an erasure request naming one
+  person cannot be satisfied without destroying everybody's. A **coded** skill
+  never had the problem — `MemoryWrite::new` takes the subject as a runtime value
+  — so only the declarative tier was stuck with a compile-time literal, and the
+  declarative tier is the one this crate otherwise pushes people toward. A
+  deployment of 28 specialists reasoning about one metering point at a time
+  shipped memory on two of them for exactly this reason, and wrote a test to stop
+  a 27th being added without the argument being made again.
+
+  Four refusals, because every wrong answer here is silent until an erasure
+  request: an unrecognised `$` value is refused rather than filed as a constant
+  (`$correlaton/malo` would file every party under the typo); a binding that
+  cannot resolve **fails the run** rather than falling back to the literal or to
+  a default; `$input` is refused unless the field it names is **trusted**, since
+  a subject taken from untrusted input is whoever supplied it choosing whose
+  memories this run writes into; and a case-bound subject on a plane with no case
+  store is refused at `build` (`MemorySubjectUnbindable`), as is any formation on
+  a plane with no memory store (`FormationWithoutMemory`) — formation runs after
+  the answer, so left to run time it fails once the run has already paid for its
+  model calls.
+
+  The keys a binding resolves against are recorded on the run's `CaseBound`
+  journal record and read back from there on resume, never re-read from the case.
+  A case accumulates business keys over months; re-reading them would let a
+  resumed run resolve a subject the live run never saw, write a second memory
+  under a second scope, and produce a history that disagrees with itself.
+  `StepCtx::correlation()` and `correlation_value(namespace)` expose the same
+  values, so a hand-written skill reading those memories back does not have to
+  guess at a naming convention.
+
+### Added — `oversight.triage`: a task beside the answer, not in front of it
+
+- **`approval: none` plus `triage` rules.** A rule is a predicate over the
+  declared `output.schema` and an audience; a matching answer is returned *and*
+  opens a worklist row.
+
+  **The shape neither existing mode could express.** `Approval::ToolsOnly`'s
+  argument is right — gating a tool-calling agent's *answer* is a review that
+  arrives after the money moved — but it does not hold for an agent that
+  **cannot** act, and this runtime guarantees a whole class of those: a
+  `tool-calling` agent's arguments come from a model completion, so a mutating
+  grant with no `protected_fields` is refused by the taint gate on every run,
+  which is why the parser refuses that grant outright. For an advisory agent
+  `tools-only` gates nothing and `required` is a worklist that *blocks* — one
+  suspended run per finding, at whatever rate counterparties miss their
+  deadlines.
+
+  **Why this may hold a predicate when `approval` may not.** `approval` has no
+  condition deliberately: *"require approval when severity is high"* changes what
+  the agent **does**, and that is one step from an `if`. A triage rule changes
+  nothing — same answer, same validation, same memories — and its only effect is
+  a row in a worklist. That is reporting, and reporting is the one place a
+  declaration can carry a condition without becoming control flow.
+
+  Five total operators (`equals`, `in`, `at_least`, `at_most`, `exists`), no
+  nesting, no `or`, no negation; conditions within a rule are conjunctive and
+  rules are independent. `triage` requires `spec.output`, and every condition is
+  typed against that schema — refused where the schema *provably* cannot produce
+  the pointer, and deliberately silent where the walk cannot decide (`$ref`,
+  `anyOf`, an open object), because a rule that can never fire reads in review
+  exactly like one that does. An oversight block that performs nothing —
+  `approval: none`, empty `triage`, no grant asking for approval — is refused.
+
+- **`StepCtx::open_task`**, the coded equivalent: a journaled effect that opens a
+  row and returns, with the task id derived from the effect key so a resume
+  addresses the row it already opened rather than growing a worklist by one per
+  restart. It is deliberately **not** a sink: a worklist row's whole purpose is to
+  put untrusted content in front of a person, so refusing untrusted content there
+  would mean a task could only carry findings nobody needs to review.
+
+### Added — `StepCtx::call_tool`, so a skill's reach is its manifest's reach
+
+- **A coded skill dispatches through the plane's own catalogue.** It had to
+  construct and carry one, and nothing bound that catalogue to the manifest
+  governing the skill. `ToolCatalog::from_manifest` was the right primitive and
+  one call away — but the *obvious* thing, hand-building a catalogue with the
+  tools you know you call, compiles, runs, and grants reach the declaration never
+  described. Worse, it can be **laxer**: a `ToolSafety::read_only` entry for a
+  tool the manifest calls mutating exempts it from the whole-value taint gate and
+  carries `Recovery::Retry`, so a timed-out money-moving call is sent again.
+  `try_build` refuses exactly that divergence for the plane's catalogue; a
+  catalogue built inside a skill never passed under that check.
+
+  `examples/governed_transfer.rs` demonstrated the hand-built form, which is what
+  a reader copies, and now demonstrates the governed one. `ToolCall::prepare`
+  documents when it is still the right call and what to derive it from.
+
+### Added — an operator-configured outbox, on the same journal cursor
+
+- **`push::Outbox`, `push::Destination`, `push::DeliveryWorker`,
+  `push::Projection`, `push::RunCompleted`, `RuntimeBuilder::outbox`.** A
+  destination the *deployment* configured, receiving a payload the embedder
+  shapes, for every run.
+
+  `PushConfig` is A2A-shaped by construction — a **caller** supplies the URL, it
+  is scoped to one task, it carries a `StreamResponse` — and the three controls
+  around it (host allowlist, HTTPS, all-answer public-address checks) exist
+  because of that first fact. The mirror image had no spelling at all, so
+  services emitted their result event at request time with retries and dropped it
+  on failure: the one outbound path with no persist-before-dispatch, in a system
+  whose whole argument is that the journal is the plan of record.
+
+  Destinations are registered at **admission**, so no run exists unwatched, and
+  delivery reads the run's own records past a cursor that advances only on 2xx.
+  The three URL controls are lifted for an operator destination and only for one,
+  each for a stated reason: there is no caller to check against an allowlist; an
+  in-cluster collector on plaintext HTTP is ordinary, and refusing it pushes
+  operators toward a TLS-terminating sidecar that forwards in clear; and
+  resolving inward is the entire point. Everything else is unchanged. Both kinds
+  of registration share one store and are told apart by an `operator:` prefix a
+  caller cannot use — the A2A server refuses a `pushNotificationConfig.id` that
+  begins with it.
+
+### Changed — the delivery loop moved out of the A2A server
+
+- **`PushSweepReport` is `agentplane::push::PushSweepReport`**, re-exported from
+  `api::a2a`, and the cursor loop is `push::DeliveryWorker` parameterised by a
+  `Projection`. `A2aPushWorker` is a thin binding of it and its API is unchanged.
+  The discipline — read past the cursor, POST, advance on 2xx, back off, abandon
+  a permanent refusal — has nothing to do with A2A; it lived there because A2A
+  was the first caller, which made the mechanism an operator most wants reachable
+  only by speaking somebody else's protocol.
+
+### Added — `Manifest::parse_each` and the `manifests!` macro
+
+- **A directory of single-agent files, embedded, keyed by declared name.**
+  `parse_all` covers a *room* — several agents in one file, because they are one
+  deployable thing — and the other common layout had no support, so every
+  embedder wrote `&[(&str, &str)]` with a name typed beside each path. The name
+  is **already in the document** as `metadata.name`, so that table is one fact
+  written twice with nothing checking that the two agree; and a file included
+  under two constants, which is what happens while adding the next agent, builds
+  and runs with one agent registered twice and another silently absent. A
+  duplicate name is now refused, naming both paths. No glob: a macro expanding a
+  directory listing would make the set of agents a plane runs depend on what is
+  on disk rather than on what a reviewer reads.
+
+### Added — a prompt may not name a tool the agent was not granted
+
+- **Any `tool://server/name` in `spec.identity.role` or `constraints` must be
+  granted.** An ungranted name comes back to the model as a *failed call*, which
+  is right — it can correct itself and never gets the tool it nearly named — but
+  it means a **procedure** naming an ungranted tool fails quietly: the model
+  asks, is refused, improvises, and the step silently does not happen with
+  nothing in the journal saying the instruction was unfollowable. One deployment
+  found twelve such instructions across eleven manifests, five naming things that
+  were not tools at all.
+
+  It only sees references spelled as references — prose naming a tool by bare
+  identifier is indistinguishable from an ordinary noun, and a check that guessed
+  would refuse manifests over the word "search".
+
+### Fixed — a timestamp on a wire is RFC 3339, and the build now says so
+
+- **`MemoryItem::{created_at, expires_at, superseded_at}` and `Recall::as_of`
+  serialised as `time`'s component array**, as did the `memory.remember`,
+  `memory.touch`, `memory.sweep-expired` and `authority.draw` effect descriptors
+  — so a journal an independent party reads carried
+  `[2027, 15, 8, 0, 0, 0, 0, 0, 0]` where it should carry a date. It parses, it
+  round-trips, and every consumer expecting a date gets nine numbers whose first
+  element looks like a year.
+
+  `core::format_timestamp` is the answer inside a `json!` literal, where there is
+  no field to hang `#[serde(with = ...)]` on, and the `Timestamp` alias now
+  documents the hazard — it is public API, so it lands in *your* tool payloads
+  too, where this crate cannot check it. `tests/guards/timestamps.rs` walks the
+  crate's serialized types and fails on the shape, with the detector exercised on
+  a known input first so it cannot pass by being inert.
+
+### Fixed — smaller things found on the way
+
+- **`Task::created_at` was the deadline instant.** Both fields then said *when
+  this is due*, so a worklist reported every row as created in the future and
+  "oldest first" silently meant "soonest due" — a defensible ordering under a
+  field name that denies it, which is the worst combination for an operator
+  explaining a backlog. It is now the run's journaled clock.
+- **`RuntimeBuilder::agent` carried a `# Panics` section describing refusals it
+  does not raise.** They are `build`'s, and `try_build` returns them — which is
+  the whole point of the split for a daemon assembling a plane from files it did
+  not write. The section sent readers looking for a fallible variant of the wrong
+  call.
+- **`FakeProvider::will_structure`**, for scripting a schema-declaring agent.
+  `will_say` sets the completion's *text* and leaves `structured` empty, so a
+  test scripted with it gets `{"text": "..."}` where it expected its own shape.
+  The diagnostic for that existed; the constructor avoiding it did not, so every
+  such test spelled a five-field `Completion` literal by hand.
+
 ## [0.14.0] — 2026-08-10
 
 ### Fixed — the mutation sweep stops paying for two defaults that fight it

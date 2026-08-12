@@ -113,6 +113,28 @@ impl FakeProvider {
         })
     }
 
+    /// Queue a **structured** answer, the shape a schema-declaring agent needs.
+    ///
+    /// [`will_say`](Self::will_say) sets the completion's *text* and leaves
+    /// `structured` empty, which is right for a prose agent and wrong for every
+    /// agent that declares `output.schema` — those read `structured`, so a test
+    /// scripted with `will_say` gets `{"text": "..."}` where it expected its own
+    /// shape. The diagnostic for that exists; the constructor that avoids it did
+    /// not, so every such test spelled a five-field `Completion` literal by hand
+    /// and four of those fields were the same four every time.
+    pub fn will_structure(&self, value: serde_json::Value) -> &Self {
+        let usage = usage_for(&value);
+        self.will_answer(Completion {
+            tool_calls: Vec::new(),
+            text: String::new(),
+            usage,
+            stop_reason: Some("end_turn".to_owned()),
+            truncated: false,
+            structured: Some(value),
+            continuation: None,
+        })
+    }
+
     /// Queue a turn in which the model asks for a tool.
     ///
     /// The id is the one a real provider would issue and the loop must echo

@@ -11,7 +11,65 @@ use sha2::{Digest as _, Sha256};
 
 /// Wall-clock instant. Only ever obtained through a journaled effect
 /// (`StepCtx::now`), never by reading the ambient clock.
+///
+/// # Format it before it reaches a wire
+///
+/// This is a re-export of [`time::OffsetDateTime`], and that type's **derived**
+/// `Serialize` is not a date. Unless the `time` crate's `serde-human-readable`
+/// feature is on — it is not here, and enabling it would silently change every
+/// stored shape — a bare `Timestamp` field serialises to its **component
+/// array**:
+///
+/// ```text
+/// [2027, 15, 8, 0, 0, 0, 0, 0, 0]
+///  year  ordinal-day  h  m  s  ns  offset-h  offset-m  offset-s
+/// ```
+///
+/// It parses, it round-trips, and every consumer that expected a date gets nine
+/// numbers. A model asked to do arithmetic on one produces confident nonsense; a
+/// dashboard renders `2027` as the hour. The failure is quiet in exactly the way
+/// a format error is not.
+///
+/// So **every timestamp on a wire in this crate is RFC 3339**, and the two ways
+/// to spell that are:
+///
+/// ```
+/// # use agentplane::core::Timestamp;
+/// #[derive(serde::Serialize, serde::Deserialize)]
+/// struct Deadline {
+///     #[serde(with = "time::serde::rfc3339")]
+///     resolved_at: Timestamp,
+///     #[serde(default, with = "time::serde::rfc3339::option")]
+///     warn_at: Option<Timestamp>,
+/// }
+/// ```
+///
+/// and [`format_timestamp`] where the value is being placed into a
+/// `serde_json::json!` literal rather than a struct field — an effect
+/// descriptor, a `CloudEvents` envelope, a log line.
+///
+/// `tests/guards` walks the crate's serialized types and fails on a component
+/// array, so this is a rule the build enforces rather than one a reviewer has to
+/// remember. The hazard is worth stating here anyway, because `Timestamp` is
+/// public API: it lands in **your** tool payloads too, and the crate cannot
+/// check those.
 pub type Timestamp = time::OffsetDateTime;
+
+/// One instant, RFC 3339, for a place that is not a struct field.
+///
+/// `#[serde(with = "time::serde::rfc3339")]` is the answer wherever there is a
+/// field to attach it to. This is the answer where there is not — inside a
+/// `json!` literal, where a bare `Timestamp` would take the derived component
+/// array with nothing in the source to hint at it. See [`Timestamp`].
+///
+/// Falls back to the numeric Unix second if formatting fails, which needs an
+/// instant outside RFC 3339's representable range. That is not a case worth
+/// failing an effect key over, and a number is at least unambiguous.
+#[must_use]
+pub fn format_timestamp(at: Timestamp) -> String {
+    at.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| at.unix_timestamp().to_string())
+}
 
 /// Per-run monotonic journal position, starting at 1.
 pub type Seq = u64;

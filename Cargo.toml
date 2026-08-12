@@ -329,7 +329,7 @@ required-features = ["redb"]
 
 [[example]]
 name              = "governed_transfer"
-required-features = ["redb"]
+required-features = ["redb", "manifest"]
 
 [[example]]
 name              = "saga_checkout"

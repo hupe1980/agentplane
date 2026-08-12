@@ -211,15 +211,25 @@ async fn the_case_binding_is_journaled() {
 
     let records = store.read(out.run_id, 1).await.unwrap();
     let bound = records.iter().find_map(|r| match r.kind() {
-        RecordKind::CaseBound { case_kind, opened } => {
-            Some((r.body.case, case_kind.clone(), *opened))
-        }
+        RecordKind::CaseBound {
+            case_kind,
+            opened,
+            correlation,
+        } => Some((r.body.case, case_kind.clone(), *opened, correlation.clone())),
         _ => None,
     });
-    let (case, kind, opened) = bound.expect("CaseBound must be journaled");
+    let (case, kind, opened, correlation) = bound.expect("CaseBound must be journaled");
     assert_eq!(kind, "matter");
     assert!(opened, "the first message opens the case");
     assert!(case.is_some(), "the case id rides on the record body");
+    // The business keys are on the record too, because a resumed run resolves
+    // manifest bindings from history rather than from a case that has since
+    // accumulated more keys.
+    assert_eq!(
+        correlation,
+        vec![key("meter", "M-1")],
+        "the binding records the keys this run's case was identified by"
+    );
 
     // Every record of a case-bound run carries the case, so the matter's whole
     // history is one indexed range scan rather than a join.

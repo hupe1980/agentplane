@@ -706,6 +706,28 @@ pub struct ToolCall {
 impl ToolCall {
     /// Prepare a call, if the operator permits this tool.
     ///
+    /// # Prefer `StepCtx::call_tool`
+    ///
+    /// This takes whatever catalogue it is handed, and **nothing here binds that
+    /// catalogue to the manifest governing the caller**. A hand-built one —
+    /// which is the obvious thing to write, and what an older version of
+    /// `examples/governed_transfer.rs` demonstrated — compiles, runs, and can be
+    /// *laxer* than the declaration: a [`ToolSafety::read_only`] entry for a tool
+    /// the manifest calls mutating exempts it from the whole-value taint gate and
+    /// carries [`Recovery::Retry`], so a timed-out money-moving call is sent
+    /// again. The plane's own catalogue is refused at build for exactly that
+    /// divergence; a skill's is not checked by anything.
+    ///
+    /// [`StepCtx::call_tool`](crate::runtime::StepCtx::call_tool) dispatches
+    /// over the plane's checked catalogue and makes the drift unrepresentable.
+    /// Where a skill genuinely needs its own — a catalogue assembled before a
+    /// runtime exists, or one for a test — build it with
+    /// [`ToolCatalog::from_manifest`], which derives the reach from the
+    /// declaration rather than restating it.
+    ///
+    /// [`ToolSafety::read_only`]: ToolSafety::read_only
+    /// [`Recovery::Retry`]: crate::core::Recovery::Retry
+    ///
     /// # Errors
     ///
     /// [`ToolError::Unreachable`] when the tool is not in the catalogue. It is

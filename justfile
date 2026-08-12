@@ -191,7 +191,7 @@ examples:
     cargo run --example durable_pipeline
     cargo run --example clearing_case
     cargo run --example plan_graph
-    cargo run --example governed_transfer
+    cargo run --example governed_transfer --features redb,manifest
     cargo run --example saga_checkout
     cargo run --example effect_group
     cargo run --example tool_loop --features redb,testkit,manifest

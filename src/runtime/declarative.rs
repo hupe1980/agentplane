@@ -103,6 +103,13 @@ impl Declarative {
 
         let (offered, declared) = offered_tools(&catalog, &granted);
 
+        // Kept beside the prompt rather than only inside it. `$input/…` in a
+        // memory subject resolves against the run's input *with its labels*, and
+        // the prompt has already folded it under a `/input` key beside a trusted
+        // instruction — resolving against that would make every pointer in a
+        // reviewed file wrong by one level.
+        let bindable_input = input.clone();
+
         // `Tainted::object`, not `input.map(...)`. The instruction comes from the
         // manifest — reviewed, and inside the digest — so it is trusted; the
         // input is whoever called us and stays whatever it arrived as. `map`
@@ -169,6 +176,7 @@ impl Declarative {
                         cx,
                         answer,
                         formed_source,
+                        &bindable_input,
                         oversight,
                         formation.as_ref(),
                         &model,
@@ -359,16 +367,18 @@ impl Declarative {
     /// It also ran when oversight *failed* for an unrelated reason — a missing
     /// case store, an expired window — so the write did not even need a rejection
     /// to survive a decision nobody made.
+    #[allow(clippy::too_many_arguments)]
     async fn settle(
         &self,
         cx: &mut StepCtx<'_>,
         answer: Tainted<Value>,
         formed_source: Tainted<Value>,
+        input: &Tainted<Value>,
         oversight: Option<Proposal>,
         formation: Option<&crate::manifest::MemoryFormation>,
         model: &ModelId,
     ) -> Result<Outcome, SkillError> {
-        if let Some(spec) = oversight.filter(Proposal::gates_the_answer) {
+        if let Some(spec) = oversight.as_ref().filter(|s| s.gates_the_answer()) {
             // Register the obligation the wait is bounded by. A declarative
             // agent writes no code, so nothing else can — and naming an
             // unregistered obligation is what made this feature fail outright
@@ -389,9 +399,63 @@ impl Declarative {
                 )));
             }
         }
-        self.form_answer(cx, formation, formed_source, model)
+        self.form_answer(cx, formation, formed_source, input, model)
             .await?;
+        // **After** the approval gate and after formation, for the same reason
+        // formation is after the gate: a triage row raised from an answer a
+        // reviewer then refused is a compliance desk acting on a finding this
+        // plane retracted. Ordering it last means every row in a worklist
+        // corresponds to an answer that was actually returned.
+        if let Some(spec) = oversight.as_ref() {
+            self.triage(cx, spec, &answer).await?;
+        }
         Ok(Outcome::done(answer))
+    }
+
+    /// Open a task beside the answer for every rule that matches it.
+    ///
+    /// Rules are independent: two matching rules open two rows, because a
+    /// breached deadline and an implausible reading are two things two different
+    /// desks act on, and collapsing them would put one desk's work in the
+    /// other's queue. Evaluation order is declaration order, so a worklist's
+    /// arrival sequence is a property of the reviewed file rather than of a
+    /// hash map.
+    ///
+    /// What a reviewer sees is the **answer itself**, not a description of it —
+    /// a reviewer who cannot see what was found is not reviewing. It is untrusted
+    /// content, deliberately: a worklist whose rows had to be trusted could only
+    /// carry findings nobody needs to look at.
+    async fn triage(
+        &self,
+        cx: &mut StepCtx<'_>,
+        oversight: &Proposal,
+        answer: &Tainted<Value>,
+    ) -> Result<(), SkillError> {
+        for rule in oversight.triage.iter().filter(|r| r.matches(answer.peek())) {
+            // Each rule's own obligation, registered by the agent for the same
+            // reason the approval deadline is: a file-only agent writes no code,
+            // so nothing else could register it, and a task naming an
+            // unregistered obligation has no horizon.
+            cx.deadline(rule.deadline.name.clone(), &rule.deadline.spec(), None)
+                .await?;
+            let mut spec = crate::core::TaskSpec::new(
+                rule.task_kind(),
+                crate::core::Justification::new(rule.summary.clone(), answer.peek().clone()),
+                rule.deadline.name.clone(),
+            );
+            spec.candidate_roles.clone_from(&rule.audience);
+            spec.priority = rule.priority.into();
+            // Never `Proceed`: there is nothing to proceed past, and
+            // `StepCtx::open_task` refuses it. Escalation stays available
+            // because widening the audience of an unanswered row is a real
+            // thing to want.
+            spec.on_expiry = match oversight.on_expiry {
+                crate::core::OnExpiry::Escalate => crate::core::OnExpiry::Escalate,
+                _ => crate::core::OnExpiry::Deny,
+            };
+            cx.open_task(&spec).await?;
+        }
+        Ok(())
     }
 
     async fn form_answer(
@@ -399,11 +463,13 @@ impl Declarative {
         cx: &mut StepCtx<'_>,
         declaration: Option<&crate::manifest::MemoryFormation>,
         answer: Tainted<Value>,
+        input: &Tainted<Value>,
         model: &ModelId,
     ) -> Result<(), SkillError> {
         let Some(declaration) = declaration else {
             return Ok(());
         };
+        let subject = resolve_subject(cx, &declaration.subject, input)?;
         // The extraction runs on the **quarantined** model when one is
         // declared. Formation is the dual-model pattern's quarantined job to
         // the letter — it reads content derived from untrusted input, is
@@ -424,7 +490,7 @@ impl Declarative {
         };
         cx.form_memories(
             crate::memory::Formation {
-                subject: declaration.subject.clone(),
+                subject,
                 purpose: declaration.purpose.clone(),
                 instruction: declaration.instruction.clone(),
                 max_items: declaration.max_items,
@@ -796,6 +862,7 @@ impl Declarative {
             cx,
             answer,
             formed_source,
+            &input,
             oversight,
             formation.as_ref(),
             &model,
@@ -872,6 +939,9 @@ impl Skill for Declarative {
                 // result and the *declared* instruction becomes indistinguishable from
                 // the caller's data. `/system` is a protected field precisely so that
                 // conflation is refused rather than obeyed.
+                // See `tool_loop`: a subject binding resolves against the run's
+                // own input, not against the prompt object it is folded into.
+                let bindable_input = input.clone();
                 let prompt = Tainted::object([
                     ("system".to_owned(), Tainted::trusted(json!(system))),
                     ("input".to_owned(), input),
@@ -924,6 +994,7 @@ impl Skill for Declarative {
                     cx,
                     answer,
                     formed_source,
+                    &bindable_input,
                     oversight,
                     formation.as_ref(),
                     &model,
@@ -975,6 +1046,8 @@ struct Proposal {
     deadline: crate::manifest::OversightDeadline,
     on_expiry: crate::core::OnExpiry,
     allow_unattended: bool,
+    /// Rules that open a task *beside* the answer rather than in front of it.
+    triage: Vec<crate::manifest::TriageRule>,
 }
 
 impl Proposal {
@@ -990,6 +1063,7 @@ impl Proposal {
                 Expiry::Proceed => crate::core::OnExpiry::Proceed,
             },
             allow_unattended: o.allow_unattended,
+            triage: o.triage.clone(),
         }
     }
 
@@ -1251,6 +1325,97 @@ fn bounded_parse_schema(declared: &Value) -> Option<Value> {
         required.push(json!("have_enough_information"));
     }
     Some(schema)
+}
+
+/// Resolve `memory_formation.subject` for this run.
+///
+/// # Every refusal here is the same refusal
+///
+/// A subject decides which pile a durable fact lands in, and the pile is the
+/// unit an erasure request names. Resolving one wrongly does not fail loudly at
+/// the time — it files a customer's facts under somebody else's key, where they
+/// are recalled into that person's next run and survive their own erasure. So
+/// every case this cannot answer exactly is a run that fails, and none is
+/// answered with a fallback.
+///
+/// The trust rule is the one worth stating twice. `$input/…` is refused unless
+/// the field it names is **trusted**, because a subject taken from untrusted
+/// input is the attacker choosing whose file to write into — a strictly worse
+/// outcome than the pooling a binding exists to fix. Correlation keys and the
+/// case id need no such check: correlation is a deterministic lookup performed
+/// at admission from keys an operator's edge supplied, and the case id is the
+/// runtime's own.
+fn resolve_subject(
+    cx: &StepCtx<'_>,
+    subject: &crate::manifest::MemorySubject,
+    input: &Tainted<Value>,
+) -> Result<String, SkillError> {
+    use crate::manifest::MemorySubject;
+
+    let refuse = SkillError::Other;
+    match subject {
+        MemorySubject::Literal(literal) => Ok(literal.clone()),
+        MemorySubject::Case => cx.case_id().map(|id| id.to_string()).ok_or_else(|| {
+            refuse(
+                "`memory_formation.subject: $case` needs the run to belong to a case, and \
+                 this run has none. Admit it with `run_correlated(..)` or `run_in_case(..)` \
+                 — filing the memory under a constant instead would pool every matter's \
+                 facts under one key"
+                    .to_owned(),
+            )
+        }),
+        MemorySubject::Correlation(namespace) => cx
+            .correlation_value(namespace)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                let held: Vec<&str> = cx
+                    .correlation()
+                    .iter()
+                    .map(|key| key.namespace.as_str())
+                    .collect();
+                refuse(format!(
+                    "`memory_formation.subject: $correlation/{namespace}` found no key in \
+                     that namespace; this run's case is keyed by {held:?}. A memory filed \
+                     under the wrong scope is recalled into another subject's run and \
+                     survives that subject's erasure, so the run fails rather than \
+                     guessing"
+                ))
+            }),
+        MemorySubject::Input(pointer) => {
+            let selected = input.project_pointer(pointer).ok_or_else(|| {
+                refuse(format!(
+                    "`memory_formation.subject: $input{pointer}` selects nothing in this \
+                     run's input"
+                ))
+            })?;
+            if selected.label().trust != crate::core::Trust::Trusted {
+                return Err(refuse(format!(
+                    "`memory_formation.subject: $input{pointer}` names an **untrusted** \
+                     field, and a subject taken from untrusted input lets whoever supplied \
+                     it choose whose memories this run writes into. Bind the subject to a \
+                     correlation key instead — those are settled at admission by a \
+                     deterministic lookup — or release the field explicitly if it really is \
+                     the plane's own"
+                )));
+            }
+            match selected.peek() {
+                Value::String(value) if !value.trim().is_empty() => Ok(value.clone()),
+                Value::Number(value) => Ok(value.to_string()),
+                other => Err(refuse(format!(
+                    "`memory_formation.subject: $input{pointer}` selects {}, and a subject \
+                     is a scope name — it must be a non-empty string or a number",
+                    match other {
+                        Value::String(_) => "an empty string",
+                        Value::Null => "null",
+                        Value::Bool(_) => "a boolean",
+                        Value::Array(_) => "an array",
+                        Value::Object(_) => "an object",
+                        Value::Number(_) => unreachable!("numbers are accepted above"),
+                    }
+                ))),
+            }
+        }
+    }
 }
 
 /// The model for untrusted contact: the quarantined role when one is

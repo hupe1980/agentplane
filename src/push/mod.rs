@@ -39,6 +39,12 @@
 //! after HTTP 2xx. A crash after POST but before cursor persistence duplicates
 //! an event instead of losing it, which is A2A's at-least-once contract.
 
+mod delivery;
+mod outbox;
+
+pub use delivery::{DeliveryWorker, Projection, PushSweepReport};
+pub use outbox::{Destination, OPERATOR_PREFIX, Outbox, RunCompleted, is_operator_id};
+
 use std::fmt::Debug;
 
 use async_trait::async_trait;
@@ -356,6 +362,16 @@ pub struct PushSender {
     /// on this machine. `testkit` only, and absent from any other build.
     #[cfg(feature = "testkit")]
     plaintext_loopback: bool,
+    /// Whether the destination is the **operator's own**, not a caller's.
+    ///
+    /// Set only by [`PushSender::for_operator_destinations`]. It lifts the three
+    /// controls that exist because a caller names the URL — the host grant,
+    /// HTTPS, and the public-address check — and nothing else. See
+    /// [`outbox`](crate::push::Outbox) for why each does not apply, and note
+    /// what stays: the cursor still advances only on 2xx, the retry ceiling
+    /// still applies, and the request still carries no proxy, no cookie jar and
+    /// no redirects.
+    operator: bool,
 }
 
 /// Delivery transport used by the durable worker.
@@ -382,6 +398,31 @@ impl PushSender {
             timeout: Self::DEFAULT_TIMEOUT,
             #[cfg(feature = "testkit")]
             plaintext_loopback: false,
+            operator: false,
+        }
+    }
+
+    /// A sender for destinations the **deployment** configured.
+    ///
+    /// Takes no [`PushPolicy`], because a host allowlist answers *may this
+    /// caller name this host?* and there is no caller: the URL comes from the
+    /// deployment's own configuration, written by whoever would have written the
+    /// allowlist. HTTPS and the public-address check are lifted for the same
+    /// reason — an in-cluster collector on plaintext HTTP at a private address
+    /// is the ordinary shape here, and it is the *only* shape the inward-facing
+    /// case has.
+    ///
+    /// This is not an off switch for push. It cannot deliver to a
+    /// caller-registered webhook at all: [`Outbox`] owns the rows this serves,
+    /// the A2A worker owns the others, and the two id namespaces do not overlap.
+    #[must_use]
+    pub fn for_operator_destinations() -> Self {
+        Self {
+            policy: PushPolicy::new(),
+            timeout: Self::DEFAULT_TIMEOUT,
+            #[cfg(feature = "testkit")]
+            plaintext_loopback: false,
+            operator: true,
         }
     }
 
@@ -472,7 +513,19 @@ impl PushSender {
         let resolved = tokio::net::lookup_host((host.as_str(), port))
             .await
             .map_err(|e| PushError::Unroutable(format!("DNS for '{host}': {e}")))?;
-        let addrs = if self.loopback_allowed() && is_loopback_name(&host) {
+        let addrs = if self.operator {
+            // The destination is the deployment's own, and resolving inward is
+            // the point of it — an internal bus has no public address. Refusing
+            // that would leave an operator with a sidecar that terminates TLS
+            // and forwards in clear, which is the same exposure with a hop.
+            let addrs: Vec<_> = resolved.collect();
+            if addrs.is_empty() {
+                return Err(PushError::Unroutable(format!(
+                    "DNS for '{host}' returned no addresses"
+                )));
+            }
+            addrs
+        } else if self.loopback_allowed() && is_loopback_name(&host) {
             // Named rather than inferred: the exception applies to a host that
             // *is* a loopback literal or `localhost`, not to one that merely
             // resolved to one. A name that resolves inward is the rebinding
@@ -535,8 +588,16 @@ impl PushSender {
 #[async_trait]
 impl PushTransport for PushSender {
     fn validate(&self, config: &PushConfig) -> Result<(), PushError> {
-        self.policy
-            .check_allowing_loopback(&config.url, self.loopback_allowed())?;
+        // The URL checks are about a **caller-supplied** address. An operator
+        // destination still has its authentication header validated, because a
+        // malformed one is a malformed one whoever wrote it — and it would fail
+        // at `HeaderValue::from_str` mid-delivery instead of at configuration.
+        if self.operator {
+            reqwest::Url::parse(&config.url).map_err(|e| PushError::Malformed(e.to_string()))?;
+        } else {
+            self.policy
+                .check_allowing_loopback(&config.url, self.loopback_allowed())?;
+        }
         if let Some(authentication) = &config.authentication {
             authentication.validate()?;
         }

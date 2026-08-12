@@ -58,7 +58,7 @@ spec:
     approval: required
     deadline: { name: refund-review, kind: working-days, params: { n: 1 } }
   memory_formation:
-    subject: "agent:triage"
+    subject: "$correlation/customer"     # per-party, resolved at run time
     purpose: "support"
     instruction: "Record durable facts about this customer."
 ```
@@ -177,6 +177,20 @@ no state injection. A templated instruction has no reviewable identity, and
 the instruction slot is the trusted slot: run-time values spliced into it
 would wear its trust. Per-run data goes in the **input**, journaled and
 labelled, beside the instruction.
+
+**A prompt naming a tool the agent was never granted is refused.** An ungranted
+name comes back to the model as a *failed call* — deliberately, so it can correct
+itself and never gets the tool it nearly named. The cost is that a **procedure**
+naming an ungranted tool fails quietly: the model asks, is refused, improvises,
+and the step silently does not happen, with nothing in the journal saying the
+instruction was unfollowable. So any `tool://server/name` written in `role` or
+`constraints` must be a tool `spec.tools` grants.
+
+It only sees references spelled as references. *"call `list_overdue_processes`"*
+names a tool in prose, and prose is not something this crate can tell from an
+ordinary noun — a check that guessed would refuse manifests over the word
+"search". Writing the grant's own `ref` in the prompt is therefore both the
+spelling that gets checked and the spelling a reviewer can follow.
 
 ## `spec.topology`
 
@@ -368,11 +382,12 @@ human is in the loop when none is.
 
 | Field | Default | Notes |
 |---|---|---|
-| `approval` | **required** | `required` gates every answer. `tools-only` gates only the grants that set `requires_approval`, leaving the answer unattended — the shape most deployments want, since gating a tool-calling agent's *answer* is a review that arrives after the tool already ran. Neither is a predicate: *"require approval when severity is high"* is one step from an `if`. |
+| `approval` | **required** | `required` gates every answer. `tools-only` gates only the grants that set `requires_approval`, leaving the answer unattended — the shape most deployments want, since gating a tool-calling agent's *answer* is a review that arrives after the tool already ran. `none` gates nothing and leaves the deciding to `triage`. None is a predicate: *"require approval when severity is high"* changes what the agent **does**, and that is one step from an `if`. |
 | `approvers` | anyone | Roles that may decide. Empty means anyone — worth choosing on purpose rather than by omission. |
 | `deadline` | **required** | The obligation that bounds the wait: `{ name, kind, params }`. The agent **registers** it, which is why the declaration carries more than a name — a file-only agent writes no code, so naming an obligation nothing registers made oversight fail outright. `kind` and `params` go to the deployment's `Calendar` unchanged, so "one working day" means whatever that domain says and this crate never guesses. |
 | `on_expiry` | deny | What happens when the window closes. |
 | `allow_unattended` | `false` | Explicit consent required for `on_expiry: proceed`, so acting with no human is a greppable decision somebody made rather than an enum variant they picked off a list. |
+| `triage` | none | Tasks opened **beside** a completed answer. See below. |
 
 The agent registers the obligation, opens a task carrying its **actual answer**,
 and returns only on approval. It applies to **both** execution kinds — a
@@ -384,7 +399,75 @@ Nothing is written until the answer is approved. In particular
 refused answer would be read by the next run as established fact — a control that
 governed the reply and not the write would govern the less important half.
 
+An oversight block that performs nothing is **refused**: `approval: none` with an
+empty `triage` and no grant asking for approval is a declaration that reads in
+review as a human control and is not one.
+
 See [human oversight](@/docs/concepts.md#oversight).
+
+### `spec.oversight.triage`
+
+The mode an **advisory** agent needs. A `tool-calling` agent that grants no
+mutating tool cannot act at all — its arguments come from a model completion, so
+a mutating call with no `protected_fields` is refused by the taint gate on every
+run, which is why that grant is refused outright. For a whole class of agents the
+other two modes are therefore both wrong: `tools-only` gates nothing because
+there is no mutating call to gate, and `required` suspends every run until
+somebody approves a *report*.
+
+`triage` says: **return the answer, and open a task when it says something a
+person must see.**
+
+```yaml
+oversight:
+  approval: none
+  deadline: { name: unused, kind: hours, params: { n: 4 } }
+  triage:
+    - name: breach
+      summary: "a regulatory deadline was missed"
+      audience: [grid-operations]
+      priority: high                     # low | normal | high | urgent
+      when:
+        - path: /deadline_status
+          equals: BREACH
+      deadline: { name: triage-breach, kind: working-days, params: { n: 2 } }
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `name` | **required** | Unique within the block. The task's kind is `agent.triage/<name>`, so a worklist can filter on it and a rule cannot collide with a runtime kind. |
+| `when` | **required** | Conditions, **all** of which must hold. Empty is refused: a rule matching every answer is a task per run written as a filter. |
+| `summary` | **required** | What the worklist row says, in the words a reviewer reads — in the file, and digest-covered, for the same reason the system prompt is. |
+| `audience` | anyone | Roles the row is offered to. |
+| `deadline` | **required** | The obligation bounding the row. Its own, not the block's: how long a *run* waits for approval and how long a *row* may sit are different questions. |
+| `priority` | normal | How the row is ranked. |
+
+A condition is one JSON Pointer and one of five total operators — `equals`,
+`in`, `at_least`, `at_most`, `exists`. There is no nesting, no `or`, and no
+negation. Rules are independent: two matching rules open two rows, because two
+findings are two desks' work.
+
+**Why this may hold a predicate when `approval` may not.** A triage rule changes
+nothing about the run. The answer is produced, validated against `output.schema`,
+returned, and the memories are formed identically whether a rule matched or not;
+the only effect is a row in a worklist. That is *reporting*, and reporting is the
+one place a declaration can carry a condition without becoming control flow.
+
+Two refusals keep it honest:
+
+* **`triage` requires `spec.output`.** A predicate over an answer with no
+  declared shape is prose about a document nobody wrote.
+* **Every condition is typed against that schema**, and refused where the schema
+  *provably* cannot produce the pointer — a `type: object` with
+  `additionalProperties: false` whose `properties` lack the field. Deliberately
+  narrower than a validator: anything the walk cannot decide (`$ref`, `anyOf`, an
+  open object) passes, because a check that guessed would refuse valid manifests.
+  A rule that can never fire reads in review exactly like one that does.
+
+Rows are opened **after** the approval gate and after formation, so every row in
+a worklist corresponds to an answer that was actually returned. The task carries
+the answer itself; it is untrusted model content, deliberately — a worklist whose
+rows had to be trusted could only carry findings nobody needs to look at.
 
 ## `spec.memory_formation`
 
@@ -394,7 +477,7 @@ a declared `privileged` model.
 
 | Field | Default | Notes |
 |---|---|---|
-| `subject` | **required** | Sharing scope. An agent-private subject names one agent; a team subject is shared by several in one tenant. A naming convention, not an ACL — access is authorized as `memory.remember`/`memory.recall`. |
+| `subject` | **required** | Where the memories are filed — a literal, or a **binding** resolved per run. See below. |
 | `purpose` | **required** | Mandatory retrieval partition. |
 | `instruction` | **required** | What the extraction model is asked to record. |
 | `max_items` | `3` | Between 1 and 10. |
@@ -404,6 +487,58 @@ a declared `privileged` model.
 
 The model proposes bounded key/content pairs; the **runtime** derives ids, taint,
 provenance and retention. Trust is never taken from what the content says.
+
+### Binding the subject to the party a run is about
+
+A **subject is the unit `forget_subject` erases**, so a literal one pools every
+customer, meter and matter the agent ever reasoned about under one key. One
+party's facts are then recalled into another party's run, and an erasure request
+naming one person cannot be satisfied without destroying everybody's. Under a
+data-protection regime that is a defect, not a caveat.
+
+A binding resolves the subject from something the **run** already established:
+
+| Binding | Resolves to |
+|---|---|
+| `$correlation/<namespace>` | The value of one of the run's correlation keys. |
+| `$case` | The case id. |
+| `$input/<pointer>` | An RFC 6901 pointer into the run's input — **only if that field is trusted**. |
+| anything else | A literal, exactly as written. `$$x` is the literal `$x`. |
+
+```yaml
+memory_formation:
+  subject: "$correlation/malo"     # one pile per metering point
+  purpose: clearing
+  instruction: "Record stable facts stated in the source."
+```
+
+Four rules, each a refusal:
+
+* **An unrecognised `$` value is refused**, never taken as a constant. Reading
+  `$correlaton/malo` as the string `"$correlaton/malo"` would file every
+  customer's memories under a typo, and nothing would look wrong until an
+  erasure request.
+* **A binding that cannot resolve fails the run.** No fallback: filing under the
+  literal pools every party, and filing under a default moves one party's facts
+  into another's pile. Both are silent.
+* **`$input` requires a trusted field.** A subject taken from untrusted input is
+  whoever supplied it choosing whose memories this run writes into — strictly
+  worse than the pooling bindings exist to fix. Correlation keys need no such
+  check: correlation is a deterministic lookup performed at admission from keys
+  the deployment's edge supplied, and no model touches it.
+* **A case-bound subject on a plane with no case store is refused at `build`**,
+  because nothing could ever resolve it.
+
+The keys a binding resolves against are the ones recorded on the run's
+`CaseBound` journal record — **not** the case's keys as they stand now. A case
+accumulates keys over months, so re-reading them would let a resumed run resolve
+a subject the live run never saw. A hand-written skill reaches the same values
+with `cx.correlation()` and `cx.correlation_value(namespace)`, so reading these
+memories back does not mean guessing at a naming convention.
+
+A plane declaring `memory_formation` with no memory store is also refused at
+`build`: formation runs *after* the answer, so left to run time it fails once the
+run has already paid for its model calls.
 
 The extraction runs on the **quarantined** model when `spec.models` declares
 one, and on the privileged model otherwise — see `spec.models` above for why.

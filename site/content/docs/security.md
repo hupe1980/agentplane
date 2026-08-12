@@ -460,6 +460,35 @@ none of them.
 question and correctly narrower. Nothing requires an item to have been formed to
 be recalled.
 
+### A subject is an erasure unit, so it has to name the party
+
+`forget_subject` is what an erasure request actually names, so the subject an
+agent files under decides whether that request can be satisfied at all. A literal
+subject pools every party the agent ever reasoned about under one key: one
+party's facts are recalled into another party's run, and erasing one destroys
+everybody's.
+
+So `memory_formation.subject` accepts a **binding** — `$correlation/<namespace>`,
+`$case`, `$input/<pointer>` — resolved per run. Three properties make it a
+control rather than a convenience:
+
+* **An unrecognised `$` value is refused at parse.** Reading `$correlaton/malo`
+  as a constant would file every party under a typo, and nothing looks wrong
+  until the erasure request.
+* **An unresolvable binding fails the run.** There is no fallback, because both
+  candidate fallbacks — the literal, or a default — silently put one party's
+  facts in another's pile.
+* **`$input` requires the field to be trusted.** A subject taken from untrusted
+  input is whoever supplied it choosing whose memories this run writes into,
+  which is strictly worse than the pooling the feature exists to fix. Correlation
+  keys need no such check: correlation is a deterministic lookup performed at
+  admission from keys the deployment's edge supplied, and no model touches it.
+
+The keys a binding resolves against are recorded on the run's `CaseBound` journal
+record, not read from the case. A case accumulates business keys over months, so
+re-reading them would let a resumed run resolve a subject the live run never saw
+— a second memory under a second scope, and a history that disagrees with itself.
+
 ### Retrieval ranks by trust, not only by recency
 
 A memory recall is bounded — a caller asks for ten — and what fills that window

@@ -280,6 +280,20 @@ pub struct Runtime {
     /// Where this plane's agents remember things, when a deployment wires one.
     memories: Option<Arc<dyn crate::memory::MemoryStore>>,
     authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
+    /// The catalogue and transport a **skill** reaches tools through.
+    ///
+    /// Held by the plane rather than handed to each skill, and that is the
+    /// point. A skill that built its own [`ToolCatalog`] could declare a tool
+    /// read-only that its manifest calls mutating — and `ToolSafety::read_only`
+    /// carries `Recovery::Retry`, so a timed-out money-moving call gets sent
+    /// again. `check_catalogue_not_laxer_than_grants` refuses exactly that for
+    /// the plane's catalogue at build; a hand-built one never passed under it.
+    /// `StepCtx::call_tool` is the path that cannot.
+    #[cfg(feature = "manifest")]
+    tools: Option<(
+        Arc<crate::tools::ToolCatalog>,
+        Arc<dyn crate::tools::ToolClient>,
+    )>,
     /// How this plane attributes its metrics.
     meter: super::metrics::Meter,
     /// Durable per-tenant ceilings, when a deployment wires them.
@@ -301,6 +315,13 @@ pub struct Runtime {
     replanner: Option<Arc<dyn crate::plan::Replanner>>,
     calendar: Arc<dyn Calendar>,
     signer: Option<Arc<dyn crate::core::Signer>>,
+    /// Where this plane sends its own events, when a deployment configures it.
+    ///
+    /// Registered per run **at admission**: a destination attached after the
+    /// first record would silently miss it, and "the journal is the outbox" only
+    /// holds if the cursor starts at sequence one.
+    #[cfg(feature = "push")]
+    outbox: Option<Arc<crate::push::Outbox>>,
 }
 
 impl Runtime {
@@ -341,6 +362,8 @@ impl Runtime {
             agents: Vec::new(),
             #[cfg(feature = "manifest")]
             providers: HashMap::new(),
+            #[cfg(feature = "push")]
+            outbox: None,
         }
     }
 
@@ -1074,6 +1097,37 @@ impl Runtime {
         .await
     }
 
+    /// Rebuild a run's case binding **from its history**, never by re-deriving.
+    ///
+    /// Two facts are read back rather than recomputed, and each has its own
+    /// failure if it is not.
+    ///
+    /// The **case id**, because re-correlating could land on a different case if
+    /// the keys were since released — silently rewriting which business fact the
+    /// run belongs to.
+    ///
+    /// The **business keys**, because a case accumulates them over months. A run
+    /// that resolved `memory_formation.subject: $correlation/meter` would
+    /// otherwise resolve it against a set the live run never saw, write a second
+    /// memory under a second subject, and produce a history that disagrees with
+    /// itself with nothing on the record explaining why.
+    fn recorded_case(&self, records: &[Record]) -> Option<CaseContext> {
+        let (case_id, correlation) = records.iter().find_map(|r| match r.kind() {
+            RecordKind::CaseBound { correlation, .. } => {
+                r.body.case.map(|case_id| (case_id, correlation.clone()))
+            }
+            _ => None,
+        })?;
+        self.cases.as_ref().map(|cases| CaseContext {
+            cases: Arc::clone(cases),
+            tasks: self.tasks.clone(),
+            events: self.events.clone(),
+            calendar: Arc::clone(&self.calendar),
+            case_id,
+            correlation,
+        })
+    }
+
     /// The contract this runtime enforces on every plan.
     pub(crate) fn contract(&self) -> crate::plan::Contract {
         crate::plan::Contract::new(self.by_capability.keys().cloned())
@@ -1355,6 +1409,13 @@ impl Runtime {
                     .attach_run(case_id, run)
                     .await
                     .map_err(RuntimeError::from_store)?;
+                // The case's own keys, not the ones this message carried. A run
+                // that *joined* an existing case may have been admitted with one
+                // key while the case holds three, and a binding naming any of
+                // them must resolve — which is the difference between "the keys
+                // in this request" and "the business facts this matter is
+                // identified by".
+                let bound_keys = case_correlation(cases.as_ref(), case_id, &keys).await?;
                 // Stamp the case on the records already queued as well: every
                 // record of a case-bound run carries its case, which is what
                 // makes "show me everything about this matter" one range scan.
@@ -1367,6 +1428,7 @@ impl Runtime {
                         RecordKind::CaseBound {
                             case_kind: kind,
                             opened: correlation.is_new(),
+                            correlation: bound_keys.clone(),
                         },
                     )
                     .case(case_id),
@@ -1377,6 +1439,7 @@ impl Runtime {
                     events: self.events.clone(),
                     calendar: Arc::clone(&self.calendar),
                     case_id,
+                    correlation: bound_keys,
                 })
             }
             (Some(CaseBinding::Existing(case_id)), Some(cases)) => {
@@ -1405,6 +1468,7 @@ impl Runtime {
                         RecordKind::CaseBound {
                             case_kind: existing.kind,
                             opened: false,
+                            correlation: existing.correlation.clone(),
                         },
                     )
                     .case(case_id),
@@ -1415,6 +1479,7 @@ impl Runtime {
                     events: self.events.clone(),
                     calendar: Arc::clone(&self.calendar),
                     case_id,
+                    correlation: existing.correlation,
                 })
             }
             (Some(_), None) => {
@@ -1431,6 +1496,20 @@ impl Runtime {
             .append(lease.epoch, records)
             .await
             .map_err(RuntimeError::from_store)?;
+
+        // Registered before the run is handed back, and its failure fails
+        // admission. A run that started with its destinations unregistered would
+        // produce a history nothing is watching, and the events it missed are
+        // unrecoverable without a scan nobody schedules — which is the exact
+        // failure a durable outbox exists to remove, arriving one layer up.
+        //
+        // After the append rather than before: the cursor starts at sequence
+        // one, so a registration written for a run whose admission then failed
+        // would sit against an empty journal forever.
+        #[cfg(feature = "push")]
+        if let Some(outbox) = &self.outbox {
+            outbox.open(run).await.map_err(RuntimeError::from_store)?;
+        }
 
         Ok(Admitted {
             run,
@@ -1588,25 +1667,7 @@ impl Runtime {
             self.ensure_resume_policy_bundle(&records)?;
         }
 
-        // The case binding is read back from history rather than recomputed.
-        // Re-correlating could land on a different case if the keys were since
-        // released, which would silently rewrite which business fact this run
-        // belongs to.
-        let case_ctx = records
-            .iter()
-            .find_map(|r| match r.kind() {
-                RecordKind::CaseBound { .. } => r.body.case,
-                _ => None,
-            })
-            .and_then(|case_id| {
-                self.cases.as_ref().map(|cases| CaseContext {
-                    cases: Arc::clone(cases),
-                    tasks: self.tasks.clone(),
-                    events: self.events.clone(),
-                    calendar: Arc::clone(&self.calendar),
-                    case_id,
-                })
-            });
+        let case_ctx = self.recorded_case(&records);
 
         let mut cursor = ReplayCursor::from_records(&records);
 
@@ -2469,6 +2530,8 @@ impl Runtime {
                 blobs: self.blobs.clone(),
                 memories: self.memories.clone(),
                 authorities: self.authorities.clone(),
+                #[cfg(feature = "manifest")]
+                tools: self.tools.clone(),
                 meter: self.meter.clone(),
                 #[cfg(feature = "keyring")]
                 keyring: self.keyring.clone(),
@@ -2677,6 +2740,8 @@ impl Runtime {
                 blobs: self.blobs.clone(),
                 memories: self.memories.clone(),
                 authorities: self.authorities.clone(),
+                #[cfg(feature = "manifest")]
+                tools: self.tools.clone(),
                 meter: self.meter.clone(),
                 #[cfg(feature = "keyring")]
                 keyring: self.keyring.clone(),
@@ -3170,6 +3235,42 @@ fn register_skill(
     }
     skills.insert(d.name.clone(), skill);
     Ok(d.name)
+}
+
+/// The business keys a case is identified by, for the binding record.
+///
+/// Read from the case rather than taken from the request, because a run joining
+/// an existing case is admitted with whichever key its message carried while the
+/// case may be identified by several — and a manifest binding naming any of them
+/// must resolve.
+///
+/// Falls back to the admitted keys if the case cannot be read back. That is not
+/// defensive padding: `correlate_or_open` has already committed the binding, so
+/// a failure here is a read that lost a race with nothing, and the keys the run
+/// was admitted with are a true subset of the case's. Recording them is strictly
+/// better than recording none, and *nothing* is what would silently make a
+/// binding unresolvable for a run whose case is perfectly well identified.
+async fn case_correlation(
+    cases: &dyn CaseStore,
+    case_id: crate::core::CaseId,
+    admitted: &[CorrelationKey],
+) -> Result<Vec<CorrelationKey>, RuntimeError> {
+    let stored = cases
+        .case(case_id)
+        .await
+        .map_err(RuntimeError::from_store)?
+        .map(|case| case.correlation)
+        .unwrap_or_default();
+    let mut keys = if stored.is_empty() {
+        admitted.to_vec()
+    } else {
+        stored
+    };
+    // Canonical order, so the record is byte-stable for a given set and two
+    // stores that answer in different orders produce the same journal.
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
 }
 
 /// A lease owner that no other process will accidentally share.
@@ -3749,6 +3850,9 @@ pub struct RuntimeBuilder {
     identity: Option<crate::core::Delegation>,
     replanner: Option<Arc<dyn crate::plan::Replanner>>,
     calendar: Option<Arc<dyn Calendar>>,
+    /// Destinations this deployment sends its own run events to.
+    #[cfg(feature = "push")]
+    outbox: Option<Arc<crate::push::Outbox>>,
 }
 
 impl RuntimeBuilder {
@@ -3915,6 +4019,25 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Send this plane's own events to destinations the deployment configured.
+    ///
+    /// Every run registers each destination **at admission**, so there is no
+    /// window in which a run exists and nothing is watching it. Delivery is a
+    /// separate, operator-scheduled sweep — see
+    /// [`DeliveryWorker`](crate::push::DeliveryWorker) — reading each run's
+    /// journal past a cursor that advances only on 2xx.
+    ///
+    /// This is the mirror image of A2A push, and the mirror is the point: there
+    /// the *caller* names a URL and three controls exist because of it. Here the
+    /// deployment names it, and the run's own history is the outbox rather than
+    /// a queue that can fall out of sync with it.
+    #[cfg(feature = "push")]
+    #[must_use]
+    pub fn outbox(mut self, outbox: Arc<crate::push::Outbox>) -> Self {
+        self.outbox = Some(outbox);
+        self
+    }
+
     /// Attach inbound-event storage, enabling durable waits.
     #[must_use]
     pub fn events(mut self, events: Arc<dyn EventStore>) -> Self {
@@ -3972,10 +4095,19 @@ impl RuntimeBuilder {
     /// plane running four agents is still one process — see
     /// [`owner`](Self::owner).
     ///
-    /// # Panics
+    /// # This call never fails
     ///
-    /// If the agent advertises a capability none of its skills provide, or
-    /// declares `spec.execution` naming a provider no driver is registered for.
+    /// It records the agent and returns. Every refusal an agent can cause — a
+    /// capability none of its skills provide, a provider no driver is registered
+    /// for, oversight with nowhere to put a decision — is raised at
+    /// [`build`](Self::build), which panics, or returned by
+    /// [`try_build`](Self::try_build), which does not.
+    ///
+    /// That split matters for a daemon assembling a plane from files it did not
+    /// write: a bad manifest is an *input* there, and a panic takes down every
+    /// other tenant in the process to report it. This method's documentation
+    /// used to carry a `# Panics` section describing `build`'s refusals, which
+    /// sent readers looking for a fallible variant of the wrong call.
     #[cfg(feature = "manifest")]
     #[must_use]
     pub fn agent(mut self, agent: Agent) -> Self {
@@ -4719,6 +4851,24 @@ impl RuntimeBuilder {
                     }
                 }
 
+                // Formation writes after the answer, so a missing store is a
+                // failure the run pays for in full before reaching. Both facts
+                // are here: the file says memories are written, the plane says
+                // there is nowhere to write them.
+                if let Some(formation) = &m.spec.memory_formation {
+                    if self.memories.is_none() {
+                        return Err(BuildError::FormationWithoutMemory {
+                            agent: m.metadata.name.clone(),
+                        });
+                    }
+                    if formation.subject.needs_case() && self.cases.is_none() {
+                        return Err(BuildError::MemorySubjectUnbindable {
+                            agent: m.metadata.name.clone(),
+                            subject: formation.subject.as_written(),
+                        });
+                    }
+                }
+
                 for cap in &m.spec.capabilities.provides {
                     let skill: Arc<dyn Skill> = Arc::new(super::declarative::Declarative::new(
                         execution.kind,
@@ -4784,6 +4934,8 @@ impl RuntimeBuilder {
             lease_ttl: self.lease_ttl,
             memories: self.memories,
             authorities: self.authorities,
+            #[cfg(feature = "manifest")]
+            tools: self.tools,
             quotas: self.quotas,
             quota: self.quota,
             budget: self.budget,
@@ -4799,6 +4951,8 @@ impl RuntimeBuilder {
             identity: self.identity,
             replanner: self.replanner,
             calendar: self.calendar.unwrap_or_else(|| Arc::new(WallClock)),
+            #[cfg(feature = "push")]
+            outbox: self.outbox,
             #[cfg(feature = "manifest")]
             governed_by,
         }))

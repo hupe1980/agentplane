@@ -975,6 +975,43 @@ capability nothing provides, two agents claiming one capability, two skills
 sharing a name, a catalogue laxer than a reviewed grant, a declarative agent
 naming an unregistered provider, or a plane whose store serves another tenant.
 
+## 📚 Embed a directory of manifests
+
+One file per agent, embedded in the binary, keyed by what each document declares:
+
+```rust
+let agents = agentplane::manifests![
+    "agents/obligation-watch.yaml",
+    "agents/clearing-triage.yaml",
+]?;
+
+let rt = agents.values().fold(Runtime::builder(store), |b, m| {
+    b.agent(Agent::new(m))
+}).try_build()?;
+```
+
+`Manifest::parse_all` is for a **room** — several agents in one file, because
+they are one deployable thing. This is the other layout, and it had no support at
+all, so every embedder wrote the same table by hand:
+
+```text
+const AGENTS: &[(&str, &str)] = &[
+    ("obligation-watch", include_str!(agents/obligation-watch.yaml)),
+    ...
+];
+```
+
+**Two defects, both silent.** The name beside each path is *already in the
+document* as `metadata.name`, so it is one fact written twice with nothing
+checking that the two agree. And a file included under two constants — which is
+what happens while adding the next agent — builds, runs, and registers one agent
+twice while the other is simply absent. The macro keys on the declared name and
+refuses a duplicate, naming both paths.
+
+There is deliberately no glob: a macro that expanded a directory listing would
+make the set of agents a plane runs depend on what is on disk at build time
+rather than on what is in the source a reviewer reads.
+
 ---
 
 ## ✨ Use Google Gemini
@@ -1117,6 +1154,49 @@ spoof what they cannot express.
 a *second* opt-in (`allow_unattended()`). One enum variant among four is too easy
 to pick off a list, and "the human didn't answer so we did it anyway" should be
 greppable.
+
+## 🔔 Tell a desk without stopping the run
+
+`cx.task` asks and blocks, which is right when the answer decides what happens
+next and wrong when nothing does. An agent that has *finished*, whose finding a
+compliance desk must see, does not need its run suspended — it needs a row in a
+worklist. Gating the answer to achieve that costs one suspended run per finding,
+at whatever rate the world produces them.
+
+```rust
+cx.open_task(
+    &TaskSpec::new("deadline.breach", justification, "triage-breach")
+        .role("grid-operations")
+        .priority(Priority::High),
+).await?;
+// The run keeps going. Nothing resumes on the decision, because nothing waits.
+```
+
+Declaratively, that is `spec.oversight.triage` — a predicate over the declared
+`output.schema` and an audience:
+
+```yaml
+oversight:
+  approval: none
+  deadline: { name: unused, kind: hours, params: { n: 4 } }
+  triage:
+    - name: breach
+      summary: "a regulatory deadline was missed"
+      audience: [grid-operations]
+      when:
+        - { path: /deadline_status, equals: BREACH }
+      deadline: { name: triage-breach, kind: working-days, params: { n: 2 } }
+```
+
+**The trap:** expecting the taint gate to apply. It does not, on either path. A
+worklist row's whole purpose is to put untrusted content in front of a person, so
+refusing untrusted content there would mean a task could only ever carry findings
+nobody needs to review. The label is still on the run's journal; the control the
+reviewer *is* is the review.
+
+**The other trap:** `approval: none` with an empty `triage`. That is an oversight
+block that performs nothing while reading in review as a human control, and it is
+refused at parse.
 
 ## 😴 Sleep for five working days
 
@@ -1377,6 +1457,34 @@ What you get instead: `execution.kind` is the built-in *behaviour* —
 the part that runs outside the journal — and a typed `Tool` is about fifteen
 lines.
 
+## 🛠️ Call a tool from a skill you wrote
+
+Use `cx.call_tool`. It dispatches over the **plane's own** catalogue — the one
+`try_build` already checked against every agent's declaration:
+
+```rust
+let overdue = cx
+    .call_tool(
+        ToolId::new("obsd", "list_overdue_processes"),
+        Tainted::trusted(json!({ "since": cutoff })),
+    )
+    .await?;
+```
+
+**The trap it removes:** building a `ToolCatalog` inside the skill. That is the
+obvious thing to write, it compiles, it runs, and **nothing binds it to the
+manifest governing the skill** — so the reach it grants is whatever the code
+says. Worse, it can be *laxer*: `ToolSafety::read_only` for a tool the manifest
+calls mutating exempts it from the whole-value taint gate and carries
+`Recovery::Retry`, so a timed-out money-moving call is sent a second time.
+`try_build` refuses exactly that divergence for the plane's catalogue; a
+catalogue constructed inside a skill never passed under that check.
+
+Where a skill genuinely needs its own — assembled before a runtime exists, or one
+for a test — derive it with `ToolCatalog::from_manifest(&m)`, which reads the
+reach off the declaration instead of restating it. See
+`examples/governed_transfer.rs`.
+
 ## 🔌 Call tools on an MCP server you already run
 
 The tool tier is not "your tools, MCP-shaped". `tools::McpClient` is a real MCP
@@ -1587,6 +1695,58 @@ lead without handing displacement to every reviewer.
 promise it can be fetched again, which an in-memory journal breaks at the next
 restart. Needs `--features cli,a2a-server,cedar`, or the `:full` image. The full
 walkthrough is in [getting started](@/docs/getting-started.md).
+
+## 📤 Emit an event per run, without an outbox table
+
+A2A push is **caller-shaped**: the URL comes from whoever created the task, which
+is why three controls sit around it. The shape a service wants beside it is the
+mirror — one destination the *deployment* configured, receiving one payload the
+embedder shapes, for every run.
+
+```rust
+use agentplane::push::{Destination, DeliveryWorker, Outbox, PushSender, RunCompleted};
+
+let outbox = Arc::new(Outbox::new(
+    Arc::clone(&store) as Arc<dyn PushStore>,
+    vec![Destination::new("bus", "http://events.internal/ingest")],
+));
+let rt = Runtime::builder(store).agent(..).outbox(Arc::clone(&outbox)).try_build()?;
+
+// Scheduled by the operator, like every other sweep.
+let worker = DeliveryWorker::new(
+    Arc::clone(rt.journal()),
+    Arc::clone(&store) as Arc<dyn PushStore>,
+    Arc::new(PushSender::for_operator_destinations()),
+    Arc::new(RunCompleted::new("urn:mako:agentd")),
+);
+let report = worker.run_once(now_secs, 100).await?;
+```
+
+Each destination is registered against a run **at admission**, so there is no
+window in which a run exists and nothing is watching it; delivery then reads the
+run's own records past a durable cursor that advances only on 2xx. There is no
+outbox table to fall out of sync with the history — **the journal is the outbox**,
+which is the point.
+
+`RunCompleted` emits one `CloudEvents` message per sealed run carrying the run
+id, the case, the outcome and the chain head. It deliberately does **not** carry
+the answer: a run's output is domain data with a label on it, and a default that
+shipped it would make an egress decision nobody declared. Implement `Projection`
+to shape your own.
+
+**What is relaxed, and why it is not a weakening.** An operator destination skips
+the host allowlist (there is no caller to check — the URL is in the deployment's
+own configuration), HTTPS (an in-cluster collector on plaintext HTTP is ordinary,
+and refusing it pushes operators toward a TLS-terminating sidecar that forwards in
+clear) and the public-address check (resolving inward is the entire point). The
+cursor discipline, the retry ceiling, the abandon-and-report on a permanent
+refusal, and the no-proxy/no-redirect posture are all unchanged.
+
+**The trap:** reusing an id in the operator namespace. Both kinds of registration
+share one store and are told apart by the `operator:` prefix; the A2A server
+refuses a caller-supplied `pushNotificationConfig.id` that begins with it,
+because operator destinations are exempt from the URL controls precisely on the
+grounds that there is no caller involved.
 
 ## 🔐 Restrict where the plane may connect
 
@@ -2035,6 +2195,32 @@ instruction, item bound and retention. The model proposes only `key/content`;
 runtime derives stable ids and security labels. Coded skills invoke
 `cx.form_memories` explicitly. There is intentionally no generic post-model hook
 that silently stores every conversation.
+
+**The third trap, and the one with legal teeth: a literal subject.** The subject
+is the unit `forget_subject` erases, so
+
+```yaml
+memory_formation:
+  subject: "agent:triage"       # every customer, one pile
+```
+
+pools every party the agent ever reasoned about under one key. One party's facts
+are then recalled into another party's run, and an erasure request naming one
+person cannot be satisfied without destroying everybody's. Bind it instead:
+
+```yaml
+memory_formation:
+  subject: "$correlation/customer"   # resolved from the run's business keys
+```
+
+`$correlation/<namespace>`, `$case` and `$input/<pointer>` are the three sources;
+an unrecognised `$` value is refused rather than filed as a constant, and
+`$input` is refused unless the field it names is **trusted** — a subject taken
+from untrusted input is whoever supplied it choosing whose memories this run
+writes into. A hand-written skill reads the same values back with
+`cx.correlation_value("customer")`, so the two tiers agree on the scope without
+sharing a naming convention nobody wrote down. Full rules:
+[`spec.memory_formation`](@/docs/manifest.md#spec-memory-formation).
 
 With feature `keyring`, wrap a single-node memory backend in
 `EncryptedMemoryStore::new`. Content is ciphertext in the backing

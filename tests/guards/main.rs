@@ -24,9 +24,11 @@ mod layering;
 mod media;
 mod memory;
 mod metrics;
+mod outbox;
 mod postgres;
 mod push;
 mod quota;
+mod timestamps;
 mod vault;
 
 /// Serialises tests that install an ambient `tracing` subscriber.

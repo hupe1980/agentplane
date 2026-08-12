@@ -638,6 +638,29 @@ struct PushRequest {
 }
 
 impl PushRequest {
+    /// Refuse an id in the namespace an operator destination owns.
+    ///
+    /// A caller and the deployment share one push store, and the two are told
+    /// apart by an id prefix. A caller allowed to write into that namespace could
+    /// point one of the deployment's own destinations at an address it chose —
+    /// and operator destinations are deliberately exempt from the host
+    /// allowlist, HTTPS and the public-address check, because there is supposed
+    /// to be no caller involved. This is the check that keeps that supposition
+    /// true.
+    fn validate(&self) -> Result<(), RpcError> {
+        if self.id.as_deref().is_some_and(crate::push::is_operator_id) {
+            return Err(RpcError::new(
+                code::INVALID_PARAMS,
+                format!(
+                    "a pushNotificationConfig id may not begin with '{}': that namespace \
+                     belongs to destinations this deployment configured for itself",
+                    crate::push::OPERATOR_PREFIX
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn config(&self, task: RunId) -> crate::push::PushConfig {
         crate::push::PushConfig {
             id: self.id.clone().unwrap_or_else(|| format!("push-{task}")),
@@ -844,43 +867,55 @@ struct PushRuntime {
 }
 
 /// Durable A2A webhook delivery, driven by an operator scheduler.
+///
+/// A thin binding of [`DeliveryWorker`](crate::push::DeliveryWorker) to the A2A
+/// projection. The cursor discipline lives in `push` because it has nothing to
+/// do with A2A — it lived here only because A2A was the first caller, which made
+/// the one mechanism an operator most wants reachable only by speaking somebody
+/// else's protocol.
 #[derive(Debug, Clone)]
 pub struct A2aPushWorker {
-    runtime: Arc<Runtime>,
-    push: PushRuntime,
-    max_attempts: u32,
+    inner: crate::push::DeliveryWorker,
 }
 
 /// Outcome of one bounded push sweep.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PushSweepReport {
-    pub registrations: usize,
-    pub records: usize,
-    pub deliveries: usize,
-    pub retries: usize,
-    pub completed: usize,
-    /// Registrations this sweep gave up on: a permanent refusal, or a receiver
-    /// that stayed unreachable past [`A2aPushWorker::max_attempts`].
-    ///
-    /// Counted separately from `completed` because they are opposite outcomes
-    /// wearing one shape — both remove the registration, and only one of them
-    /// delivered anything.
-    pub abandoned: usize,
-    pub saturated: bool,
+///
+/// Re-exported from [`crate::push`], which owns the delivery loop now.
+pub use crate::push::PushSweepReport;
+
+/// `StreamResponse` payloads, for **caller-registered** webhooks only.
+///
+/// It claims exactly the registrations an operator destination does not — see
+/// [`crate::push::Outbox`] on why the two share one store and must not serve
+/// each other's rows.
+#[derive(Clone)]
+struct A2aProjection {
+    runtime: Arc<Runtime>,
 }
 
-impl PushSweepReport {
-    /// Whether this tick found anything a human should see.
-    ///
-    /// The sweeper's own report has had this since I13 was written down, and
-    /// this one did not — so a webhook that will never be delivered to produced
-    /// `retries: 1` on an *info* line, byte-identical to a receiver that is
-    /// merely rebooting. Detection without delivery, in the report whose whole
-    /// job is delivery.
-    #[must_use]
-    pub const fn needs_attention(&self) -> bool {
-        // A backlog and a quiet plane must not produce the same numbers.
-        self.saturated || self.abandoned > 0
+impl std::fmt::Debug for A2aProjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("A2aProjection").finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::push::Projection for A2aProjection {
+    async fn payloads(
+        &self,
+        record: &crate::journal::Record,
+    ) -> Result<Vec<serde_json::Value>, crate::core::StoreError> {
+        let case = record.body.case.map(|case| case.to_string());
+        super::a2a_stream::payloads_for_record(&self.runtime, record, case.as_deref())
+            .await
+            // A projection failure is this plane's own bug and always transient
+            // to the worker; the shape it travels in is the store's error type
+            // because that is what the seam speaks.
+            .map_err(|error| crate::core::StoreError::Backend(error.to_string()))
+    }
+
+    fn owns(&self, registration: &crate::push::PushRegistration) -> bool {
+        !crate::push::is_operator_id(&registration.config.id)
     }
 }
 
@@ -1140,9 +1175,14 @@ impl A2aServer {
     #[must_use]
     pub fn push_worker(&self) -> Option<A2aPushWorker> {
         self.push.clone().map(|push| A2aPushWorker {
-            runtime: Arc::clone(&self.runtime),
-            push,
-            max_attempts: A2aPushWorker::DEFAULT_MAX_ATTEMPTS,
+            inner: crate::push::DeliveryWorker::new(
+                Arc::clone(self.runtime.journal()),
+                push.store,
+                push.transport,
+                Arc::new(A2aProjection {
+                    runtime: Arc::clone(&self.runtime),
+                }),
+            ),
         })
     }
 
@@ -1314,13 +1354,10 @@ impl A2aServer {
 impl A2aPushWorker {
     /// How many consecutive failures a receiver gets before it is abandoned.
     ///
-    /// Backoff is `1 << min(attempts, 8)` seconds, so it caps at 256 s: this
-    /// default is a little over two hours of a receiver being down, which is a
-    /// reboot, a deploy or a certificate renewal and not a webhook that has
-    /// gone away. Past it the registration is removed and *reported*, because
-    /// the alternative is a row that is retried until the journal is deleted —
-    /// and a queue that only ever grows is one nobody can read.
-    pub const DEFAULT_MAX_ATTEMPTS: u32 = 32;
+    /// The delivery loop's own default, named here too because it is part of
+    /// this type's contract and a reader should not have to follow a link to
+    /// find out what happens to a webhook that stops answering.
+    pub const DEFAULT_MAX_ATTEMPTS: u32 = crate::push::DeliveryWorker::DEFAULT_MAX_ATTEMPTS;
 
     /// Change the ceiling above.
     ///
@@ -1334,14 +1371,10 @@ impl A2aPushWorker {
     ///
     /// [`WitnessQuorum`]: crate::journal::WitnessQuorum
     #[must_use]
-    pub const fn max_attempts(mut self, attempts: u32) -> Self {
-        assert!(
-            attempts > 0,
-            "a push retry ceiling of zero abandons every receiver on its first \
-             hiccup; configure no push instead"
-        );
-        self.max_attempts = attempts;
-        self
+    pub fn max_attempts(self, attempts: u32) -> Self {
+        Self {
+            inner: self.inner.max_attempts(attempts),
+        }
     }
 
     /// Deliver at most `limit` due registrations once.
@@ -1352,198 +1385,20 @@ impl A2aPushWorker {
     /// must tolerate; cursor updates use monotonic advancement, so they cannot
     /// lose an event.
     ///
-    /// # Giving up is an outcome, not an omission
+    /// Rows belonging to an operator [`Outbox`](crate::push::Outbox) are left
+    /// alone: they share this store, and delivering one with the A2A projection
+    /// would post a `StreamResponse` to a deployment's own bus.
     ///
-    /// Two failures end a registration rather than rescheduling it, and both
-    /// are counted in [`PushSweepReport::abandoned`] so an operator can see
-    /// them: a **permanent** refusal ([`PushError::is_permanent`](crate::push::PushError::is_permanent) — a host
-    /// taken off the allowlist, a URL that is not HTTPS, a URL that does not
-    /// parse), which no backoff improves; and a transient failure that has
-    /// happened [`max_attempts`](Self::max_attempts) times, which is a
-    /// receiver that is not coming back.
+    /// # Errors
+    ///
+    /// [`StoreError`](crate::core::StoreError) when the push store or a
+    /// journal cannot be read.
     pub async fn run_once(
         &self,
         at: u64,
         limit: usize,
     ) -> Result<PushSweepReport, crate::core::StoreError> {
-        let due = self.push.store.due(at, limit.saturating_add(1)).await?;
-        let saturated = due.len() > limit;
-        let mut report = PushSweepReport {
-            registrations: due.len().min(limit),
-            saturated,
-            ..PushSweepReport::default()
-        };
-        for registration in due.into_iter().take(limit) {
-            let mut attempts = registration.attempts;
-            let records = self
-                .runtime
-                .journal()
-                .read(registration.config.task, registration.next_seq)
-                .await?;
-            if records.is_empty() && self.cleanup_acknowledged_terminal(&registration).await? {
-                report.completed += 1;
-                continue;
-            }
-            for record in records {
-                let case = record.body.case.map(|case| case.to_string());
-                let payloads = match super::a2a_stream::payloads_for_record(
-                    &self.runtime,
-                    &record,
-                    case.as_deref(),
-                )
-                .await
-                {
-                    Ok(payloads) => payloads,
-                    Err(error) => {
-                        // A projection failure is this plane's own bug, never
-                        // the receiver's, so it is always transient here — the
-                        // ceiling still applies, because a record that cannot
-                        // be projected cannot be projected on the next tick
-                        // either and the cursor never moves past it.
-                        self.give_up_or_retry(
-                            &registration,
-                            at,
-                            attempts,
-                            &error.to_string(),
-                            false,
-                            &mut report,
-                        )
-                        .await?;
-                        break;
-                    }
-                };
-                let mut failed = None;
-                for payload in payloads {
-                    match self
-                        .push
-                        .transport
-                        .deliver(&registration.config, &payload)
-                        .await
-                    {
-                        Ok(crate::push::Delivered::Accepted) => {
-                            report.deliveries += 1;
-                        }
-                        Ok(other) => failed = Some((format!("receiver outcome: {other:?}"), false)),
-                        Err(error) => failed = Some((error.to_string(), error.is_permanent())),
-                    }
-                    if failed.is_some() {
-                        break;
-                    }
-                }
-                if let Some((error, permanent)) = failed {
-                    self.give_up_or_retry(
-                        &registration,
-                        at,
-                        attempts,
-                        &error,
-                        permanent,
-                        &mut report,
-                    )
-                    .await?;
-                    break;
-                }
-                self.push
-                    .store
-                    .advance(
-                        registration.config.task,
-                        &registration.config.id,
-                        record.body.seq.saturating_add(1),
-                    )
-                    .await?;
-                attempts = 0;
-                report.records += 1;
-                if matches!(record.kind(), RecordKind::RunSealed { .. }) {
-                    self.push
-                        .store
-                        .delete(registration.config.task, &registration.config.id)
-                        .await?;
-                    report.completed += 1;
-                    break;
-                }
-            }
-        }
-        Ok(report)
-    }
-
-    /// Reschedule one failed registration, or stop.
-    ///
-    /// One implementation, because the two call sites above are the same
-    /// decision and a second copy of it is the shape that agrees everywhere
-    /// except the boundary nobody probed.
-    async fn give_up_or_retry(
-        &self,
-        registration: &crate::push::PushRegistration,
-        at: u64,
-        attempts: u32,
-        error: &str,
-        permanent: bool,
-        report: &mut PushSweepReport,
-    ) -> Result<(), crate::core::StoreError> {
-        // `attempts` counts the failures *before* this one, so the ceiling is
-        // reached when this failure makes it up to the ceiling — not one tick
-        // later, which would make `max_attempts(1)` mean two attempts.
-        let exhausted = attempts.saturating_add(1) >= self.max_attempts;
-        if permanent || exhausted {
-            let reason = if permanent {
-                "the deployment no longer permits this destination"
-            } else {
-                "the receiver did not answer within the retry ceiling"
-            };
-            tracing::warn!(
-                task = %registration.config.task,
-                config = %registration.config.id,
-                url = %registration.config.url,
-                attempts = attempts.saturating_add(1),
-                %error,
-                "abandoning a push registration: {reason}"
-            );
-            self.push
-                .store
-                .delete(registration.config.task, &registration.config.id)
-                .await?;
-            report.abandoned += 1;
-            return Ok(());
-        }
-        let exponent = attempts.min(8);
-        self.push
-            .store
-            .retry(
-                registration.config.task,
-                &registration.config.id,
-                at.saturating_add(1u64 << exponent),
-                error,
-            )
-            .await?;
-        report.retries += 1;
-        Ok(())
-    }
-
-    async fn cleanup_acknowledged_terminal(
-        &self,
-        registration: &crate::push::PushRegistration,
-    ) -> Result<bool, crate::core::StoreError> {
-        if registration.next_seq <= 1 {
-            return Ok(false);
-        }
-        let previous = self
-            .runtime
-            .journal()
-            .read(
-                registration.config.task,
-                registration.next_seq.saturating_sub(1),
-            )
-            .await?;
-        let completed = previous.last().is_some_and(|record| {
-            record.body.seq.saturating_add(1) == registration.next_seq
-                && matches!(record.kind(), RecordKind::RunSealed { .. })
-        });
-        if completed {
-            self.push
-                .store
-                .delete(registration.config.task, &registration.config.id)
-                .await?;
-        }
-        Ok(completed)
+        self.inner.run_once(at, limit).await
     }
 }
 
@@ -2862,6 +2717,7 @@ fn push_request(params: &CommonParams) -> Result<PushRequest, RpcError> {
 
 fn validate_push_request(server: &A2aServer, request: &PushRequest) -> Result<(), RpcError> {
     let push = push_runtime(server)?;
+    request.validate()?;
     let config = request.config(RunId::generate());
     if let Some(authentication) = &config.authentication {
         authentication
@@ -2912,6 +2768,7 @@ async fn register_push(
             "push configuration taskId does not match its task",
         ));
     }
+    request.validate()?;
     let config = request.config(task);
     if let Some(authentication) = &config.authentication {
         authentication

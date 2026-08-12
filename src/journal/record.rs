@@ -153,6 +153,22 @@ pub enum RecordKind {
     CaseBound {
         case_kind: String,
         opened: bool,
+        /// The case's business keys **as they stood when this run bound to it**.
+        ///
+        /// Recorded rather than looked up, for the reason the case binding
+        /// itself is: a resume re-reads history instead of re-correlating,
+        /// because a case accumulates keys over months and a later message can
+        /// add one. A run that resolved its memory subject from
+        /// `$correlation/meter` would otherwise resolve it against a *different*
+        /// set on resume, write a second memory under a second subject, and
+        /// diverge from its own journal with nothing on the record saying why.
+        ///
+        /// `#[serde(default)]` because a journal written before bindings existed
+        /// has no such field. An empty list is honest there and fails loudly at
+        /// the one thing that reads it — resolving a binding — rather than
+        /// resolving to something plausible.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        correlation: Vec<crate::core::CorrelationKey>,
     },
 
     /// An obligation was registered with a **resolved instant**.

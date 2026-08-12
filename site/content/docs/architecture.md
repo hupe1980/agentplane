@@ -1348,7 +1348,9 @@ src/
              retrieval, and labels taken from provenance rather than content
   netguard/  which IP addresses this plane will connect to — one rule, shared
              by governed media and webhook delivery
-  push/      Durable A2A webhook cursors and SSRF-guarded delivery
+  push/      Durable outbound delivery: the journal-as-outbox cursor loop, A2A
+             webhook cursors with SSRF-guarded delivery for caller-supplied URLs,
+             and an operator-configured outbox for the deployment's own events
              (feature `push`)
   quota/     per-tenant ceilings on concurrent work and spend, accounted in
              the store so they survive a second instance

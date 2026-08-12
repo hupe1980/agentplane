@@ -121,6 +121,35 @@ pub enum BuildError {
         remedy: &'static str,
     },
 
+    /// An agent forms memories on a plane that has nowhere to keep them.
+    ///
+    /// Knowable at build, and expensive at run time in a way most wiring
+    /// mistakes are not: formation happens **after** the answer, so the run has
+    /// already paid for its model calls, opened its approval task and waited for
+    /// a person before failing on a store nobody wired.
+    #[error(
+        "agent '{agent}' declares `spec.memory_formation`, so every run ends by writing \
+         durable facts — but this plane has no memory store. Wire one with \
+         `RuntimeBuilder::memory(..)`, or drop the declaration. Formation runs after the \
+         answer, so left to run time this fails once the run has already paid for its \
+         model calls"
+    )]
+    FormationWithoutMemory { agent: String },
+
+    /// A memory subject binds to a case on a plane with no cases.
+    ///
+    /// The failure this prevents is worse than an error, which is why it is one:
+    /// a binding that cannot resolve leaves the operator's fallback options as
+    /// *fail the run* or *file everybody's memories under one key*, and the
+    /// second is the defect bindings exist to remove.
+    #[error(
+        "agent '{agent}' files memories under '{subject}', which resolves from the run's \
+         case — and this plane has no case store, so nothing could ever resolve it. Wire \
+         one with `RuntimeBuilder::cases(..)` and admit runs with `run_correlated(..)`, or \
+         declare a literal subject and accept that every subject's facts share one key"
+    )]
+    MemorySubjectUnbindable { agent: String, subject: String },
+
     /// An agent grant names a capability no agent on this plane provides.
     #[error(
         "agent '{agent}' grants 'tool://agent/{capability}', and no agent on \

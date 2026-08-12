@@ -541,7 +541,10 @@ impl Effect for TouchMemory {
     type Output = ();
 
     fn descriptor(&self) -> EffectDescriptor {
-        EffectDescriptor::new("memory.touch", json!({ "ids": self.ids, "at": self.at }))
+        EffectDescriptor::new(
+            "memory.touch",
+            json!({ "ids": self.ids, "at": crate::core::format_timestamp(self.at) }),
+        )
     }
 
     fn recovery(&self) -> Recovery {
@@ -582,8 +585,8 @@ impl Effect for RememberMemory {
                 "provenance": self.item.provenance,
                 "sensitivity": self.item.sensitivity,
                 "trust": self.item.trust,
-                "created_at": self.item.created_at,
-                "expires_at": self.item.expires_at,
+                "created_at": crate::core::format_timestamp(self.item.created_at),
+                "expires_at": self.item.expires_at.map(crate::core::format_timestamp),
                 "derived_from": self.item.derived_from,
                 // The content's digest, not the content: an effect key is
                 // recorded verbatim, and a memory's content belongs in a store
@@ -613,7 +616,10 @@ impl Effect for SweepExpiredMemory {
     type Output = usize;
 
     fn descriptor(&self) -> EffectDescriptor {
-        EffectDescriptor::new("memory.sweep-expired", json!({ "at": self.at }))
+        EffectDescriptor::new(
+            "memory.sweep-expired",
+            json!({ "at": crate::core::format_timestamp(self.at) }),
+        )
     }
 
     async fn perform(&self) -> Result<Self::Output, EffectError> {
@@ -746,6 +752,143 @@ impl Effect for TransitionDeadline {
     }
 }
 
+/// Opening a human task **without waiting for it**.
+///
+/// # Why this is not `StepCtx::task` with the wait removed
+///
+/// [`StepCtx::task`] is a *decision*: it opens the row, subscribes to the
+/// answer, and suspends until somebody gives one. Its whole shape is the wait.
+/// This is a *notification*: the run has already reached its answer, and a
+/// person is being told rather than asked. Nothing resumes on the decision,
+/// because nothing is blocked on it.
+///
+/// Both derive the task id from the effect key rather than minting one, and for
+/// the same reason: a resumed run must address the row it already opened instead
+/// of opening a second one for the same finding. That is also what makes this
+/// safe to [`Retry`](Recovery::Retry) — `TaskStore::open` is idempotent on the
+/// id, so an interrupted attempt cannot leave two rows in a worklist.
+///
+/// [`StepCtx::task`]: crate::runtime::StepCtx::task
+#[derive(Debug, Clone)]
+pub struct OpenTask {
+    pub(crate) tasks: std::sync::Arc<dyn crate::case::TaskStore>,
+    pub(crate) run: crate::core::RunId,
+    pub(crate) case: crate::core::CaseId,
+    pub(crate) spec: crate::core::TaskSpec,
+    /// When the row was created, from the run's journaled clock.
+    pub(crate) at: Timestamp,
+    /// When the obligation bounding it falls due.
+    pub(crate) due_at: Timestamp,
+    /// Filled by [`Effect::attach`]; the runtime owns the key, not the caller.
+    pub(crate) key: Option<crate::core::EffectKey>,
+}
+
+#[async_trait]
+impl Effect for OpenTask {
+    type Output = crate::core::TaskId;
+
+    /// Trusted: the id is derived by the runtime from its own effect key.
+    ///
+    /// The *justification* carried into the row may well be untrusted, and it
+    /// arrives at this effect through the sink gate like any other outbound
+    /// value — see [`StepCtx::open_task`](crate::runtime::StepCtx::open_task).
+    fn trust(&self) -> crate::core::Trust {
+        crate::core::Trust::Trusted
+    }
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "task.open",
+            json!({
+                "case": self.case.to_string(),
+                "kind": self.spec.kind,
+                "deadline": self.spec.deadline,
+                "roles": self.spec.candidate_roles,
+                "priority": self.spec.priority.as_str(),
+                // In the key: two findings that differ only in what they say
+                // are two rows, and collapsing them would silently drop one.
+                "justification": self.spec.justification,
+            }),
+        )
+    }
+
+    /// It creates durable state a person acts on. That is what mutating means,
+    /// and saying otherwise would exempt the justification from the taint gate.
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    /// Idempotent on the derived id, so a lost acknowledgement costs a repeated
+    /// write rather than a second row.
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    /// # This is not a sink, and that is the one decision here worth arguing
+    ///
+    /// It binds no outbound arguments, so the whole-value taint gate and the
+    /// egress ceiling do not run — the same arrangement the blocking
+    /// [`StepCtx::task`](crate::runtime::StepCtx::task) has always had, and for
+    /// the same reason.
+    ///
+    /// A worklist row's *entire purpose* is to put untrusted content in front of
+    /// a person. The gate refuses an untrusted value at a mutating sink with no
+    /// protected fields, which is right for a payment and exactly wrong here: it
+    /// would mean a task could only ever carry content nobody needs to review,
+    /// and every real finding — a model's answer, by construction untrusted —
+    /// would be refused. The control a reviewer is for *is* the review.
+    ///
+    /// A ceiling on what a worklist may hold is a coherent thing to want, and if
+    /// it is ever added it belongs on both paths at once. One of the two
+    /// enforcing it would make *notifying* a compliance desk stricter than
+    /// *asking* one, which is a distinction nobody could defend from the
+    /// outside.
+    fn max_sensitivity(&self) -> Sensitivity {
+        Sensitivity::Secret
+    }
+
+    fn attach(&mut self, provenance: &crate::core::Provenance) {
+        // `dispatch` when the runtime supplied one, so two attempts at one
+        // notification address one row. `effect` otherwise, which is the
+        // single-attempt case where the two are the same call.
+        self.key = Some(provenance.dispatch.unwrap_or(provenance.effect));
+    }
+
+    async fn perform(&self) -> Result<Self::Output, EffectError> {
+        let key = self.key.ok_or_else(|| {
+            // Unreachable through `StepCtx`, which always attaches. Loud rather
+            // than minting an id: a task whose id is not derived from the run
+            // reopens on every resume, and a worklist that grows a row per
+            // resume is worse than a run that fails.
+            EffectError::Other(
+                "a task was opened without its effect key — an id that is not derived \
+                 from the run would open a second row on every resume"
+                    .to_owned(),
+            )
+        })?;
+        let id = crate::core::TaskId::derive(self.run, key);
+        self.tasks
+            .open(&crate::core::Task {
+                id,
+                run: self.run,
+                case: Some(self.case),
+                kind: self.spec.kind.clone(),
+                justification: self.spec.justification.clone(),
+                candidate_roles: self.spec.candidate_roles.clone(),
+                excluded_actors: self.spec.excluded_actors.clone(),
+                assignee: None,
+                priority: self.spec.priority,
+                state: crate::core::TaskState::Open,
+                on_expiry: self.spec.on_expiry,
+                created_at: self.at,
+                due_at: Some(self.due_at),
+            })
+            .await
+            .map_err(|e| EffectError::Other(e.to_string()))?;
+        Ok(id)
+    }
+}
+
 /// Drawing on a standing authority, as an effect.
 ///
 /// # Why this cannot be a plain call
@@ -789,7 +932,7 @@ impl Effect for DrawOnAuthority {
             json!({
                 "authority": self.id,
                 "amount": self.amount,
-                "at": self.at,
+                "at": crate::core::format_timestamp(self.at),
             }),
         )
     }

@@ -620,6 +620,66 @@ async fn push_configuration_crud_is_authorized_and_redacted() {
     assert_eq!(err_code(&missing), i64::from(code::TASK_NOT_FOUND));
 }
 
+/// A caller may not register into the namespace an operator destination owns.
+///
+/// Both share one push store and are told apart by an id prefix. A caller
+/// allowed to write into that namespace could point one of the deployment's own
+/// destinations at an address it chose — and operator destinations are
+/// deliberately exempt from the host allowlist, HTTPS and the public-address
+/// check, precisely because there is supposed to be no caller involved.
+#[tokio::test]
+async fn a_caller_may_not_register_in_the_operator_namespace() {
+    let f = fixture();
+    let (server, _worker, _transport) = f.push_server();
+    let router = server.router();
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({
+                "message": text("go"),
+                "configuration": {
+                    "taskPushNotificationConfig": {
+                        "id": format!("{}bus", agentplane::push::OPERATOR_PREFIX),
+                        "url": "https://client.example/hook"
+                    }
+                }
+            }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(err_code(&sent), i64::from(code::INVALID_PARAMS), "{sent:#}");
+    assert!(
+        sent["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("this deployment configured for itself"),
+        "{sent:#}"
+    );
+
+    // The ordinary id is accepted, so the refusal is about the namespace and
+    // not about ids being refused generally.
+    let (_, ok) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({
+                "message": text("go"),
+                "configuration": {
+                    "taskPushNotificationConfig": {
+                        "id": "peer-hook",
+                        "url": "https://client.example/hook"
+                    }
+                }
+            }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert!(ok["result"]["task"]["id"].is_string(), "{ok:#}");
+}
+
 #[tokio::test]
 async fn push_worker_retries_from_the_same_journal_cursor_and_cleans_terminal_tasks() {
     let f = fixture();

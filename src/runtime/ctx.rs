@@ -43,6 +43,15 @@ pub(crate) struct CaseContext {
     pub events: Option<Arc<dyn EventStore>>,
     pub calendar: Arc<dyn Calendar>,
     pub case_id: CaseId,
+    /// The case's business keys as recorded at binding.
+    ///
+    /// Carried on the context rather than fetched on demand because a fetch is
+    /// a store read, and a store read inside the deterministic zone is exactly
+    /// the non-determinism the effect protocol exists to forbid — a key added
+    /// to the case next month would change what a replayed run resolves. The
+    /// journal's `CaseBound` record is the source on both the live and the
+    /// resumed path.
+    pub correlation: Vec<crate::core::CorrelationKey>,
 }
 
 impl CaseContext {
@@ -114,6 +123,12 @@ pub(crate) struct Frame {
     pub blobs: Option<Arc<dyn crate::blob::BlobStore>>,
     pub memories: Option<Arc<dyn crate::memory::MemoryStore>>,
     pub authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
+    /// The plane's checked catalogue and transport, for [`StepCtx::call_tool`].
+    #[cfg(feature = "manifest")]
+    pub tools: Option<(
+        Arc<crate::tools::ToolCatalog>,
+        Arc<dyn crate::tools::ToolClient>,
+    )>,
     pub meter: crate::runtime::metrics::Meter,
     #[cfg(feature = "keyring")]
     pub keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
@@ -164,6 +179,11 @@ pub struct StepCtx<'a> {
     blobs: Option<Arc<dyn crate::blob::BlobStore>>,
     memories: Option<Arc<dyn crate::memory::MemoryStore>>,
     authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
+    #[cfg(feature = "manifest")]
+    tools: Option<(
+        Arc<crate::tools::ToolCatalog>,
+        Arc<dyn crate::tools::ToolClient>,
+    )>,
     meter: crate::runtime::metrics::Meter,
     #[cfg(feature = "keyring")]
     keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
@@ -218,6 +238,8 @@ impl<'a> StepCtx<'a> {
             blobs,
             memories,
             authorities,
+            #[cfg(feature = "manifest")]
+            tools,
             meter,
             #[cfg(feature = "keyring")]
             keyring,
@@ -246,6 +268,8 @@ impl<'a> StepCtx<'a> {
             blobs,
             memories,
             authorities,
+            #[cfg(feature = "manifest")]
+            tools,
             meter,
             #[cfg(feature = "keyring")]
             keyring,
@@ -436,6 +460,79 @@ impl<'a> StepCtx<'a> {
     #[must_use]
     pub fn manifest(&self) -> Option<&crate::manifest::Manifest> {
         self.manifest.as_deref()
+    }
+
+    /// Call a tool through the **plane's own** catalogue.
+    ///
+    /// # Why this exists, and why the obvious alternative is a hole
+    ///
+    /// A declarative agent gets its [`ToolCatalog`] from the runtime. A
+    /// hand-written skill had to construct and carry one:
+    ///
+    /// ```ignore
+    /// ToolCall::prepare(&self.catalog, Arc::clone(&self.client), id, args)?
+    /// ```
+    ///
+    /// and nothing bound `self.catalog` to the manifest governing that skill.
+    /// [`ToolCatalog::from_manifest`] is the right primitive and it is one call
+    /// away — but the *obvious* thing, hand-building a catalogue with the tools
+    /// you know you call, compiles, runs, and grants the skill reach its
+    /// declaration never described. Worse, it can be **laxer**: a
+    /// [`ToolSafety::read_only`] entry for a tool the manifest calls mutating
+    /// exempts it from the whole-value taint gate and carries
+    /// [`Recovery::Retry`](crate::core::Recovery::Retry), so a timed-out
+    /// money-moving call is sent a second time.
+    ///
+    /// [`RuntimeBuilder::try_build`](crate::runtime::RuntimeBuilder::try_build)
+    /// refuses exactly that divergence — for the *plane's* catalogue. A
+    /// catalogue built inside a skill never passed under that check. So this is
+    /// the same dispatch a declarative agent performs, over the same checked
+    /// catalogue, and the drift is unrepresentable rather than merely
+    /// discouraged.
+    ///
+    /// # Everything else is unchanged
+    ///
+    /// The manifest gate still refuses a tool this agent's declaration does not
+    /// grant, the protected-field rules still have to match, the egress ceiling
+    /// still applies, and the result still comes back
+    /// [`Tainted`] and untrusted. This narrows what a skill can reach; it grants
+    /// nothing.
+    ///
+    /// ```ignore
+    /// let overdue = cx
+    ///     .call_tool(ToolId::new("obsd", "list_overdue_processes"), args)
+    ///     .await?;
+    /// ```
+    ///
+    /// [`ToolCatalog`]: crate::tools::ToolCatalog
+    /// [`ToolCatalog::from_manifest`]: crate::tools::ToolCatalog::from_manifest
+    /// [`ToolSafety::read_only`]: crate::tools::ToolSafety::read_only
+    ///
+    /// # Errors
+    ///
+    /// [`StepError`] when this plane has no tool catalogue, when the tool is not
+    /// in it, when this agent's manifest does not grant it, or when the
+    /// arguments' label is refused at the sink.
+    #[cfg(feature = "manifest")]
+    pub async fn call_tool(
+        &mut self,
+        tool: crate::tools::ToolId,
+        arguments: Tainted<Value>,
+    ) -> Result<Tainted<Value>, StepError> {
+        let (catalog, client) = self.tools.clone().ok_or_else(|| {
+            StepError::Effect(crate::core::EffectError::Other(
+                "this plane has no tool catalogue — `RuntimeBuilder::toolbox(..)` derives \
+                 one from the agents' declarations, and `.tools(catalog, client)` states \
+                 it explicitly"
+                    .into(),
+            ))
+        })?;
+        let prepared =
+            crate::tools::ToolCall::prepare(&catalog, client, tool, arguments.peek().clone())
+                .map_err(|e| {
+                    StepError::Effect(crate::core::EffectError::Rejected(e.to_string()))
+                })?;
+        self.sink(prepared, &arguments).await
     }
 
     /// What this run tells a callee about itself, sealed for one call.
@@ -2293,6 +2390,35 @@ impl StepCtx<'_> {
         self.case.as_ref().map(|c| c.case_id)
     }
 
+    /// The business keys this run's case is identified by.
+    ///
+    /// Empty when the run has no case. These are the keys **as recorded when the
+    /// run bound to the case**, not as the case stands now: a case accumulates
+    /// keys over months, and reading the store here would make a resumed run see
+    /// a set the live run never did.
+    ///
+    /// The intended use is scoping durable state to the party a run is about —
+    /// `Recall::about(cx.correlation_value("meter")?)` reads back exactly what a
+    /// declarative agent's `subject: "$correlation/meter"` wrote.
+    #[must_use]
+    pub fn correlation(&self) -> &[CorrelationKey] {
+        self.case.as_ref().map_or(&[], |c| c.correlation.as_slice())
+    }
+
+    /// One correlation value by namespace.
+    ///
+    /// `None` for a run with no case, and for a namespace the case is not keyed
+    /// by. Two keys sharing a namespace is a correlation the deployment set up,
+    /// not something to arbitrate here, so the first in canonical order wins and
+    /// the choice is stable across runs rather than dependent on store order.
+    #[must_use]
+    pub fn correlation_value(&self, namespace: &str) -> Option<&str> {
+        self.correlation()
+            .iter()
+            .find(|key| key.namespace == namespace)
+            .map(|key| key.value.as_str())
+    }
+
     fn case_ctx(&self) -> Result<&CaseContext, StepError> {
         self.case.as_ref().ok_or_else(|| {
             StepError::Effect(crate::core::EffectError::Other(
@@ -3318,6 +3444,14 @@ impl StepCtx<'_> {
         }
 
         let due_at = self.deadline_instant(&cx, &spec.deadline).await?;
+        // The run's journaled clock, not the obligation's instant.
+        //
+        // `created_at` was the deadline. Both fields then said *when this is
+        // due*, so a worklist reported every row as created in the future and
+        // "oldest first" silently meant "soonest due" — a reasonable ordering
+        // under a field name that denies it, which is the worst combination for
+        // an operator trying to explain a backlog.
+        let created_at = self.now().await?;
         let run = self.run;
         let case_id = cx.case_id;
         let spec = spec.clone();
@@ -3350,7 +3484,7 @@ impl StepCtx<'_> {
                                 priority: spec.priority,
                                 state: TaskState::Open,
                                 on_expiry: spec.on_expiry,
-                                created_at: due_at,
+                                created_at,
                                 due_at: Some(due_at),
                             })
                             .await?;
@@ -3363,6 +3497,75 @@ impl StepCtx<'_> {
         // A decision is a human's assertion, not a fact the engine verified.
         let decision: Decision = serde_json::from_value(answer.peek().clone())?;
         Ok(decision)
+    }
+
+    /// Put something in front of a person **without waiting for them**.
+    ///
+    /// # The control an advisory agent needs
+    ///
+    /// [`task`](Self::task) asks and blocks. That is the right shape when the
+    /// answer decides what happens next, and the wrong one when nothing does: an
+    /// agent that has finished, whose finding a compliance desk must see, does
+    /// not need its run suspended — it needs a row in a worklist. Gating the
+    /// *answer* to achieve that is a worklist that blocks, and it costs one
+    /// suspended run per finding at whatever rate the world produces them.
+    ///
+    /// So this opens the row and returns its id. The run continues, and nothing
+    /// resumes on the decision because nothing is waiting on it.
+    ///
+    /// # Journaled, and the id is derived
+    ///
+    /// It is an ordinary mutating effect: replay reads the id back rather than
+    /// opening a second row, and the id is derived from the effect key so a
+    /// *resume* addresses the row it already opened. `TaskStore::open` is
+    /// idempotent on that id, which is what makes an interrupted attempt safe to
+    /// repeat.
+    ///
+    /// # The justification is untrusted, deliberately
+    ///
+    /// What a reviewer is shown usually came from a model, and this does **not**
+    /// route it through the sink gate — the same arrangement [`task`](Self::task)
+    /// has always had. Refusing untrusted content at a worklist would mean a
+    /// task could only ever carry content nobody needs to review. See
+    /// [`OpenTask`](crate::runtime::effects::OpenTask) for the whole argument.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError`] if this run has no case, if no task store is wired, or if
+    /// the named obligation is not registered on the case.
+    pub async fn open_task(&mut self, spec: &TaskSpec) -> Result<TaskId, StepError> {
+        let cx = self.case_ctx()?.clone();
+        let tasks = cx.tasks.clone().ok_or_else(|| {
+            StepError::Effect(crate::core::EffectError::Other(
+                "human tasks need a task store — build the runtime with `.tasks(store)`".into(),
+            ))
+        })?;
+        // A notification is not a decision, so `OnExpiry::Proceed` has nothing
+        // to proceed *past* and the unattended consent it demands would be
+        // consent to nothing. Refused rather than accepted-and-ignored.
+        if spec.on_expiry == OnExpiry::Proceed {
+            return Err(StepError::Effect(crate::core::EffectError::Other(
+                "a task opened beside an answer has no decision to wait for, so \
+                 `OnExpiry::Proceed` describes nothing — the run has already proceeded. \
+                 Use `Deny` to let the window close, or `Escalate` to widen the audience"
+                    .into(),
+            )));
+        }
+        let due_at = self.deadline_instant(&cx, &spec.deadline).await?;
+        let at = self.now().await?;
+        let run = self.run;
+        Ok(self
+            .effect(crate::runtime::effects::OpenTask {
+                tasks,
+                run,
+                case: cx.case_id,
+                spec: spec.clone(),
+                at,
+                due_at,
+                key: None,
+            })
+            .await?
+            .into_unlabelled())
     }
 
     /// The shared machinery behind [`Self::await_event`] and [`Self::task`].
