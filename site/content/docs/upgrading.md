@@ -127,7 +127,7 @@ It moved because the cursor discipline has nothing to do with A2A. It lived
 inside the A2A server because A2A was the first caller, which made the one
 mechanism an operator most wants reachable only by speaking somebody else's
 protocol and only for a caller-supplied URL. See
-[emit an event per run](@/docs/cookbook.md#emit-an-event-per-run-without-an-outbox-table).
+[emit an event per run](@/docs/cookbook.md#outbox-tray-emit-an-event-per-run-without-an-outbox-table).
 
 ---
 
