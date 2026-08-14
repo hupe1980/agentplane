@@ -70,6 +70,28 @@ the case layer crossed the export boundary.
   wires it always — an optional flag would be a way to quietly produce the
   file the verifier flags.
 
+### Added — `Runtime::drill`, the live half of the case-layer drill
+
+- **The two questions no exported file can answer, answered where they live.**
+  `Runtime::drill` walks every case with the plane's own stores: each blob
+  digest is **read and re-hashed** (`get`, never `has` — presence without
+  integrity passes over altered bytes), and sealed case state is **proven to
+  open** with the plaintext dropped on the spot, so the probe cannot become a
+  decryption oracle.
+
+  **The three-way verdict is the point.** Intact; *erased by design* — a
+  tombstone or a destroyed key is retention reporting itself, counted and
+  never a finding; and lost — bytes gone with no tombstone, bytes altered, or
+  sealed state that neither opens nor was destroyed. Only the third pages
+  anyone, because a drill that alarms on erasure teaches operators that
+  findings are noise, which is how a real loss gets ignored six months later.
+  A store the drill was not given is `not_checked`, not silently passed.
+
+  On `Runtime` rather than only the free `drill::drill`, so it runs against
+  the stores the runs actually used — a hand-wired drill can pass over the
+  wrong bucket. `keyring::probe_sealed_case_state` is the new probe seam,
+  beside `SealedCases` because the AAD rule is that decorator's own.
+
 ### Added — the sweep recovers the runs an instance died holding
 
 - **`JournalStore::abandoned_runs`** (breaking: a required method on the store

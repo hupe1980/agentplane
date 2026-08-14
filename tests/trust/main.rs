@@ -19,6 +19,7 @@ mod attestation;
 mod boundary;
 mod budgets;
 mod cedar;
+mod drill;
 mod export;
 mod identity;
 #[cfg(feature = "keyring")]

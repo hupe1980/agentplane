@@ -433,6 +433,16 @@ offline, and `verify` reports them as unchecked instead of passed: whether the
 blob bytes behind the exported digests are present, and whether sealed state's
 keys still unwrap.
 
+Those two are `Runtime::drill`'s job, run with the stores the plane actually
+runs with: every case's blob digests read and re-hashed (`get`, never `has` —
+presence without integrity passes over altered bytes), and sealed state proven
+to open with the plaintext dropped on the spot. The report's verdict is
+three-way, and the middle answer is the one worth trusting the tooling for:
+**intact**, **erased by design** — a tombstone or a destroyed key is retention
+reporting itself, counted and never a finding — and **lost**, which is the only
+one that pages. A drill that alarmed on erasure would teach you its findings
+are noise, and that is how a real loss gets ignored six months later.
+
 `audit` prints the report as JSON and exits non-zero on findings — but **not** on
 `not_checked`, which is a separate list and the one worth reading. An audit given
 no public key and no earlier checkpoint still walks every chain, and says in that

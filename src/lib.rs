@@ -91,6 +91,7 @@ pub mod batch;
 pub mod blob;
 pub mod case;
 pub mod core;
+pub mod drill;
 pub mod export;
 pub mod journal;
 #[cfg(feature = "keyring")]

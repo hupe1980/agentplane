@@ -1373,6 +1373,8 @@ src/
   audit      the outsider's verification pass over a journal
   export     the same history as framed JSON Lines, so the outsider can take
              it away as well as check it in place
+  drill      the live half of that check: blob bytes re-hashed and sealed
+             state proven to open, with erasure told from loss
   manifest/  the declaration an agent is built from, and the registry it is
              pinned in (feature `manifest`, off by default)
   api/       the HTTP surface for operators (feature `http`, off by default)

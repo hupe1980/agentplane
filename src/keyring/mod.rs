@@ -213,7 +213,7 @@ pub fn scope(tenant: &crate::core::TenantId, unit: &str) -> String {
 mod envelope;
 
 mod cases;
-pub use cases::SealedCases;
+pub use cases::{SealedCases, probe_sealed_case_state};
 
 mod events;
 pub use events::SealedEvents;

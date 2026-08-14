@@ -4632,6 +4632,32 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                    if Some(id) == cursor.as_deref() {\n                        continue;\n                    }",
         "",
     ),
+    "ErasureReadsAsIntact": (
+        "src/drill.rs",
+        "the_drill_tells_erasure_from_loss",
+        "the drill counts a tombstoned blob as present, so the erased and the "
+        "intact collapse into one number and an erasure can no longer be shown "
+        "to have happened — the three-way distinction is the pass's entire value",
+        "            Err(BlobError::Expired { .. }) => report.blobs_erased += 1,",
+        "            Err(BlobError::Expired { .. }) => report.blobs_present += 1,",
+    ),
+    "ALostBlobIsSilent": (
+        "src/drill.rs",
+        "the_drill_tells_erasure_from_loss",
+        "bytes gone with no tombstone produce no finding, so unexplained loss "
+        "passes the drill silently — the exact state the tombstone vocabulary "
+        "exists to make loud, muted by the checker written for it",
+        "            Err(BlobError::NotFound(_)) => report.findings.push(format!(",
+        "            Err(BlobError::NotFound(_)) => drop(format!(",
+    ),
+    "TamperedBytesPassTheDrill": (
+        "src/drill.rs",
+        "altered_bytes_are_a_finding_not_a_presence",
+        "altered bytes are reported as presence, so the one state somebody must "
+        "be paged about is the one the drill waves through",
+        "            Err(e @ BlobError::Corrupt { .. }) => report.findings.push(format!(",
+        "            Err(e @ BlobError::Corrupt { .. }) => drop(format!(",
+    ),
 }
 
 

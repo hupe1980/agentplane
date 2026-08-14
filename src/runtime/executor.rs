@@ -402,6 +402,40 @@ impl Runtime {
         self.blobs.as_ref()
     }
 
+    /// Run the live half of the case-layer drill with this plane's own stores.
+    ///
+    /// The wiring is the point of this method existing: the drill's value is
+    /// holding each case's references against the stores the plane *actually
+    /// runs with*, and an embedder assembling `drill::Stores` by hand could
+    /// hand it a different blob store than the one their runs write to —
+    /// a drill that passes over the wrong bucket. Stores this runtime does
+    /// not have are reported as unchecked by the drill itself, which is a
+    /// different and better answer than an error: a plane with no blob store
+    /// has no bytes to lose.
+    ///
+    /// # Errors
+    ///
+    /// If this runtime has no case store — the drill walks cases, so there is
+    /// nothing to drill — or if the case layer cannot be enumerated.
+    pub async fn drill(&self) -> Result<crate::drill::DrillReport, RuntimeError> {
+        let cases = self.cases().ok_or_else(|| {
+            RuntimeError::PlanContract(
+                "this runtime has no case store — the drill walks cases, so there is \
+                 nothing to drill; build it with `.cases(store)`"
+                    .into(),
+            )
+        })?;
+        let stores = crate::drill::Stores {
+            cases,
+            blobs: self.blobs(),
+            #[cfg(feature = "keyring")]
+            keys: self.keyring.as_ref(),
+        };
+        crate::drill::drill(&stores)
+            .await
+            .map_err(RuntimeError::from_store)
+    }
+
     /// The timer store, if this runtime has one.
     #[must_use]
     pub fn timers(&self) -> Option<&Arc<dyn TimerStore>> {

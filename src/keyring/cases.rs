@@ -91,6 +91,33 @@ impl SealedCases {
     }
 }
 
+/// Prove a case's sealed state still opens, without keeping the plaintext.
+///
+/// `None` for state that is not sealed — an ordinary answer, not a defect.
+/// `Some(Ok(()))` means the ring opened it; the opened bytes are dropped here,
+/// which is the property that makes this a probe rather than a decryption
+/// oracle. `Some(Err(..))` carries the ring's own vocabulary, whose
+/// [`Destroyed`](super::KeyError::Destroyed) variant is the one a caller must
+/// keep distinct: a destroyed key is a completed erasure reporting itself.
+///
+/// This lives beside [`SealedCases`] rather than in the drill because the AAD
+/// rule — the state is bound to its case id — is this decorator's own, and a
+/// second spelling of it in another module is the sign/verify split that fails
+/// silently in one direction.
+pub async fn probe_sealed_case_state(
+    keys: &dyn KeyRing,
+    case: CaseId,
+    state: &Value,
+) -> Option<Result<(), super::KeyError>> {
+    let envelope = payload::unwrap(state)?;
+    let aad = SealedCases::aad(case);
+    Some(
+        super::envelope::open(keys, aad.as_bytes(), &envelope)
+            .await
+            .map(drop),
+    )
+}
+
 #[async_trait]
 impl CaseStore for SealedCases {
     async fn put_state(
