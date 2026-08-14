@@ -700,9 +700,8 @@ mod unwinding {
         let entries = log.lock().unwrap().clone();
         assert_eq!(
             entries,
-            vec!["do:alpha", "do:boom", "undo:boom", "undo:alpha"],
-            "the successor's failure unwinds work done under its predecessor — \
-             and the failed step's own announced mutation before it"
+            vec!["do:alpha", "do:boom", "undo:alpha"],
+            "the successor's failure unwinds work done under its predecessor"
         );
     }
 
@@ -731,7 +730,7 @@ mod unwinding {
         let entries = log.lock().unwrap().clone();
         assert_eq!(
             entries,
-            vec!["do:alpha", "do:boom", "undo:boom", "undo:alpha"],
+            vec!["do:alpha", "do:boom", "undo:alpha"],
             "dropping a step from the successor does not un-run it"
         );
     }

@@ -2,11 +2,7 @@
 //!
 //! A plan that touches real systems cannot be a transaction — there is nothing
 //! to roll back across a payment provider and a warehouse. The saga answer is
-//! to undo forward: compensate in reverse order every step that either
-//! completed or announced a mutating effect — announcement, not completion,
-//! is the evidence, because a step can land a mutation and then fail or be
-//! interrupted, and the landed work must not be left standing while the run
-//! is closed to resume by the compensation of everything around it.
+//! to undo forward: compensate the completed steps in reverse order.
 //!
 //! Two rules here are not the usual ones, and both come from taking distributed
 //! systems seriously rather than tidying up and hoping:
@@ -201,16 +197,9 @@ fn runtime(store: &Arc<RedbStore>, steps: Vec<Step>) -> Arc<Runtime> {
 
 // ── The basic unwind ────────────────────────────────────────────────────────
 
-/// **The saga.** Steps a and b complete, c fails, and the runtime undoes c,
-/// then b, then a — in reverse order, which is the only order that is safe
-/// when later steps depend on earlier ones.
-///
-/// The failed step itself is in the unwind. Its mutating effect was announced,
-/// and announcement — not completion — is the evidence the unwind reads: a
-/// step can land a mutation and then fail for an unrelated reason, and walking
-/// only completed steps would leave that landed work standing forever, since
-/// the compensation of the *other* steps closes the run to resume. The step's
-/// declared compensation is what knows whether anything actually stands.
+/// **The saga.** Steps a and b complete, c fails, and the runtime undoes b then
+/// a — in reverse order, which is the only order that is safe when later steps
+/// depend on earlier ones.
 #[tokio::test]
 async fn a_failing_step_unwinds_the_completed_ones_in_reverse() {
     let l = log();
@@ -235,9 +224,8 @@ async fn a_failing_step_unwinds_the_completed_ones_in_reverse() {
     );
     assert_eq!(
         entries(&l),
-        vec!["do:a", "do:b", "do:c", "undo:c", "undo:b", "undo:a"],
-        "every step that announced a mutation is undone, in reverse — \
-         including the one that failed, whose mutation may have landed"
+        vec!["do:a", "do:b", "do:c", "undo:b", "undo:a"],
+        "completed steps are undone in reverse; the failed step is not"
     );
 }
 
@@ -277,9 +265,8 @@ async fn compensating_effects_are_journaled_in_their_own_phase() {
         .collect();
     assert_eq!(
         compensated,
-        vec![StepId(2), StepId(1), StepId(0)],
-        "and name which steps were undone, in the order it happened — the \
-         failed step's own announced mutation first"
+        vec![StepId(1), StepId(0)],
+        "and name which steps were undone, in the order it happened"
     );
 }
 
@@ -319,8 +306,6 @@ async fn compensation_effects_do_not_collide_with_forward_ones() {
 // ── Declarations ────────────────────────────────────────────────────────────
 
 /// The pivot is the point of no return: nothing at or before it is undone.
-/// Work *after* it still is — the failed step's announced mutation sits past
-/// the pivot, so undoing it contradicts nothing the business committed to.
 #[tokio::test]
 async fn a_pivot_stops_the_unwind() {
     let l = log();
@@ -341,9 +326,8 @@ async fn a_pivot_stops_the_unwind() {
     assert!(matches!(out.status, RunStatus::Failed(_)));
     assert_eq!(
         entries(&l),
-        vec!["do:a", "do:b", "do:c", "undo:c"],
-        "once the business has committed, nothing at or before the pivot is \
-         reversed — the failed step after it still is"
+        vec!["do:a", "do:b", "do:c"],
+        "once the business has committed, nothing before the pivot is reversed"
     );
 }
 
@@ -367,11 +351,7 @@ async fn an_unnecessary_declaration_is_skipped_without_stopping_the_unwind() {
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));
-    assert_eq!(
-        entries(&l),
-        vec!["do:a", "do:b", "do:c", "undo:c", "undo:a"],
-        "b is skipped; a and the failed c are still undone"
-    );
+    assert_eq!(entries(&l), vec!["do:a", "do:b", "do:c", "undo:a"]);
 }
 
 /// **Undeclared is judged on evidence, not waved through.**
@@ -402,11 +382,7 @@ async fn an_undeclared_step_that_changed_nothing_needs_no_compensation() {
         "got {:?}",
         out.status
     );
-    assert_eq!(
-        entries(&l),
-        vec!["do:a", "b:pure", "do:c", "undo:c", "undo:a"],
-        "the pure undeclared step is waved through on evidence; the rest unwind"
-    );
+    assert_eq!(entries(&l), vec!["do:a", "b:pure", "do:c", "undo:a"]);
 }
 
 /// **The one that matters.** A step that *did* change something and declared
@@ -438,9 +414,8 @@ async fn an_undeclared_step_that_changed_something_escalates() {
     }
     assert_eq!(
         entries(&l),
-        vec!["do:a", "do:b", "do:c", "undo:c"],
-        "the reverse walk stops at the step nobody described — c, behind it, \
-         was already undone, but a is never reached past b"
+        vec!["do:a", "do:b", "do:c"],
+        "and nothing is unwound past the step nobody described"
     );
 }
 
@@ -474,7 +449,7 @@ async fn a_failed_compensation_quarantines_and_names_the_step() {
     }
     assert_eq!(
         entries(&l),
-        vec!["do:a", "do:b", "do:c", "undo:c", "undo:b"],
+        vec!["do:a", "do:b", "do:c", "undo:b"],
         "unwinding stops at the failure rather than continuing past it"
     );
 }
@@ -627,10 +602,7 @@ async fn replay_reproduces_an_unwind_without_repeating_it() {
         .await
         .unwrap();
     let during = entries(&l);
-    assert_eq!(
-        during,
-        vec!["do:a", "do:b", "do:c", "undo:c", "undo:b", "undo:a"]
-    );
+    assert_eq!(during, vec!["do:a", "do:b", "do:c", "undo:b", "undo:a"]);
 
     let again = rt.replay(first.run_id, Mode::Strict).await.unwrap();
     assert_eq!(
@@ -744,9 +716,8 @@ async fn a_compensation_may_wait_for_a_human_and_the_unwind_resumes() {
     );
     assert_eq!(
         entries(&l),
-        vec!["do:a", "do:b", "do:c", "undo:c", "undo:b:waiting"],
-        "the unwind undoes the failed step's announced mutation, then stops \
-         at b's wait"
+        vec!["do:a", "do:b", "do:c", "undo:b:waiting"],
+        "the unwind stops at the wait, having undone nothing yet"
     );
 
     // The approval arrives.
@@ -774,7 +745,6 @@ async fn a_compensation_may_wait_for_a_human_and_the_unwind_resumes() {
             "do:a",
             "do:b",
             "do:c",
-            "undo:c",
             "undo:b:waiting",
             "undo:b:waiting",
             "undo:b",
@@ -793,7 +763,7 @@ async fn a_compensation_may_wait_for_a_human_and_the_unwind_resumes() {
         .collect();
     assert_eq!(
         compensated,
-        vec![StepId(2), StepId(1), StepId(0)],
+        vec![StepId(1), StepId(0)],
         "each step is recorded compensated exactly once across the suspension"
     );
     store.verify(out.run_id).await.unwrap();
@@ -854,10 +824,8 @@ async fn a_succeeding_sibling_is_compensated_when_its_neighbour_fails() {
         "and having run, it must be undone: {entries:?}"
     );
     assert!(
-        entries.contains(&"undo:left".to_string()),
-        "the failed step announced a mutation of its own, and announcement is \
-         the unwind's evidence — its declared compensation decides what \
-         actually stands: {entries:?}"
+        !entries.contains(&"undo:left".to_string()),
+        "the step that failed is not compensated: {entries:?}"
     );
 }
 
@@ -1091,5 +1059,128 @@ async fn a_failures_unwind_compensates_the_interrupted_siblings_landed_mutation(
             matches!(r.kind(), RecordKind::StepCompensated { .. }) && r.body.step == Some(StepId(1))
         }),
         "the sibling's compensation must be on the record, not only in memory"
+    );
+}
+
+/// **What marks a step as having mutated is the outcome, not the announcement.**
+///
+/// Two failing steps, told apart only by what their effect did to the world.
+/// `lands` performs its mutation successfully and *then* fails for its own
+/// reasons: the posting stands, so the unwind must undo it — and it never
+/// completed, so a walk over completed steps alone would leave it standing
+/// while compensating everything around it and closing the run to resume.
+/// `refuses` is the mirror: its effect was rejected before it acted, the
+/// journal records `DidNotHappen`, and compensating it would be a refund for
+/// money nobody took.
+///
+/// The pair is the point. Either assertion alone passes under a rule that
+/// reads only announcements (both steps announced) or only completions
+/// (neither completed); only outcome-as-evidence satisfies both.
+#[tokio::test]
+async fn a_failed_steps_landed_mutation_is_undone_and_its_rejected_one_is_not() {
+    /// Mutates successfully, then fails on its own account.
+    #[derive(Debug)]
+    struct LandsThenFails(Log);
+
+    #[async_trait::async_trait]
+    impl Skill for LandsThenFails {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("lands").provides("lands")
+        }
+        fn compensation(&self) -> Compensation {
+            Compensation::Compensatable
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            cx.effect(Mutation {
+                what: "do:lands".into(),
+                log: Arc::clone(&self.0),
+                fails: false,
+            })
+            .await?;
+            Ok(Outcome::fail("the posting stood, the step did not"))
+        }
+        async fn compensate(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _o: &Tainted<Value>,
+        ) -> Result<(), SkillError> {
+            cx.effect(Mutation {
+                what: "undo:lands".into(),
+                log: Arc::clone(&self.0),
+                fails: false,
+            })
+            .await?;
+            Ok(())
+        }
+    }
+
+    // The landed half: `a` completes, `lands` posts and then fails.
+    let l = log();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(Step::new("a", &l))
+        .skill(LandsThenFails(Arc::clone(&l)))
+        .build();
+    let out = rt
+        .run_plan(
+            PlanIR::new(vec![
+                PlanNode::new(0, "a").arg("input", ArgSource::run_input()),
+                PlanNode::new(1, "lands")
+                    .arg("x", ArgSource::node(StepId(0)))
+                    .terminal(),
+            ]),
+            Tainted::trusted(json!({})),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+    assert_eq!(
+        entries(&l),
+        vec!["do:a", "do:lands", "undo:lands", "undo:a"],
+        "a mutation that landed under a step that then failed was left \
+         standing while the run compensated around it and closed to resume"
+    );
+
+    // The rejected half: the same shape, with the effect refused before it
+    // acted. Nothing to undo, and undoing it anyway is the refund for money
+    // nobody took.
+    let l2 = log();
+    let store2 = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt2 = Runtime::builder(store2.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(Step::new("a", &l2))
+        .skill(Step::new("refuses", &l2).failing())
+        .build();
+    let out2 = rt2
+        .run_plan(
+            PlanIR::new(vec![
+                PlanNode::new(0, "a").arg("input", ArgSource::run_input()),
+                PlanNode::new(1, "refuses")
+                    .arg("x", ArgSource::node(StepId(0)))
+                    .terminal(),
+            ]),
+            Tainted::trusted(json!({})),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(out2.status, RunStatus::Failed(_)),
+        "{:?}",
+        out2.status
+    );
+    assert_eq!(
+        entries(&l2),
+        vec!["do:a", "do:refuses", "undo:a"],
+        "an effect the journal records as never having happened was \
+         compensated anyway"
     );
 }

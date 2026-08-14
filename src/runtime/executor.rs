@@ -3048,6 +3048,20 @@ impl Runtime {
     /// Evidence, not bookkeeping. The journal already knows both, it knows the
     /// same thing on replay, and nothing has to be threaded through the executor
     /// to keep a parallel copy honest.
+    ///
+    /// **A mutating effect that provably did not happen does not mark its
+    /// step.** The announcement alone is not the evidence: an effect whose
+    /// terminal record classifies it `DidNotHappen` — a peer that refused
+    /// before acting, a call that never left — changed nothing, and
+    /// compensating it is a refund for money nobody took. Everything else
+    /// counts, and the defaults lean that way: an announcement with no
+    /// terminal record is an orphan and therefore in doubt, and each new
+    /// attempt starts from doubt again, so a retry that lands after a refusal
+    /// is still evidence the step touched the world.
+    ///
+    /// What this does **not** establish is that a `DidNotHappen` classification
+    /// is true — that is the driver's claim, and a driver that mislabels a
+    /// landed call leaves a mutation nothing here will undo.
     async fn unwind_evidence(&self, run: RunId) -> Result<UnwindEvidence, RuntimeError> {
         let records = self
             .store
@@ -3055,13 +3069,27 @@ impl Runtime {
             .await
             .map_err(RuntimeError::from_store)?;
 
-        let mut mutated = BTreeSet::new();
+        // Per mutating forward effect: the step it belongs to, and whether the
+        // record leaves it capable of having touched the world.
+        let mut touching: BTreeMap<crate::core::EffectKey, (StepId, bool)> = BTreeMap::new();
         let mut undone = BTreeSet::new();
         for r in &records {
             let Some(step) = r.body.step else { continue };
+            let key = r.effect_key();
             match r.kind() {
                 RecordKind::EffectStarted { mutates: true, .. } if r.body.phase.is_forward() => {
-                    mutated.insert(step);
+                    if let Some(key) = key {
+                        // A fresh attempt is undecided until its own terminal
+                        // record says otherwise, so it supersedes whatever the
+                        // previous attempt concluded.
+                        touching.insert(key, (step, true));
+                    }
+                }
+                RecordKind::EffectFailed { disposition, .. }
+                | RecordKind::EffectReconciled { disposition, .. } => {
+                    if let Some(entry) = key.and_then(|k| touching.get_mut(&k)) {
+                        entry.1 = *disposition != crate::core::Disposition::DidNotHappen;
+                    }
                 }
                 RecordKind::StepCompensated { .. } => {
                     undone.insert(step);
@@ -3069,6 +3097,10 @@ impl Runtime {
                 _ => {}
             }
         }
+        let mutated = touching
+            .into_values()
+            .filter_map(|(step, touched)| touched.then_some(step))
+            .collect();
         Ok(UnwindEvidence {
             mutated,
             undone,

@@ -118,12 +118,15 @@ whose only caller is a crash needs its negative test to *be* a crash.
 - **The failure unwind now takes the same gates as cancellation — exactly
   when it closes the run.** A failure that will compensate something closes
   the run to resume, so it now also refuses to unwind around an unknown
-  outcome and extends its list to every step that mutated without completing:
-  the suspended sibling severity ordering stranded holding a landed mutation,
-  and the failing step itself, whose landed effects otherwise stood forever
-  in a world where everything around them was reversed. A failure that
-  compensates nothing keeps its resume and takes neither gate, because the
-  resume is what resolves its orphans and re-registers its waits.
+  outcome and extends its list to every step that mutated without completing
+  — chiefly the suspended sibling that severity ordering stranded holding a
+  landed mutation, whose work otherwise stood forever in a world where
+  everything around it was reversed. A failure that compensates nothing keeps
+  its resume and takes neither gate, because the resume is what resolves its
+  orphans and re-registers its waits. What counts as having mutated is the
+  effect's recorded outcome, not its announcement: a call the driver
+  classified `DidNotHappen` is not undone, because a compensation for work
+  that never landed is the refund for money nobody took.
 
 - **An orphaned wait re-registers on resume.** A crash — or a transient store
   error — between announcing a durable sleep or event wait and registering
@@ -162,10 +165,7 @@ whose only caller is a crash needs its negative test to *be* a crash.
   resume of a still-failing run appended another `GroupOpened`, another
   `GroupSettled` and another `RunSealed{failed}`. All three are now read back
   and deduplicated — by count, not by name, so a step that legitimately opens
-  and settles the same group name twice keeps both pairs. The unwind's own
-  evidence changed with it: announcement, not completion, is what marks a
-  step for compensation, so the failed step's landed mutation is undone
-  beside the interrupted sibling's.
+  and settles the same group name twice keeps both pairs.
 
 - **A batch item at a ceiling reads `exhausted`, not `failed`.** (Breaking:
   `ItemOutcome::Exhausted` is a new non-terminal variant.) Exhaustion is a
