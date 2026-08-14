@@ -1616,8 +1616,8 @@ async fn a_foreign_canon_rule_is_narrowed_coverage_not_a_finding() {
         .join("\n");
     assert_ne!(foreign, text, "the fixture edited nothing");
 
-    let report = agentplane::export::verify(std::io::Cursor::new(foreign.as_bytes()), None)
-        .expect("verify");
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(foreign.as_bytes()), None).expect("verify");
     assert!(
         report.is_sound(),
         "an honest export written under another canonicalization rule was \
@@ -1640,8 +1640,8 @@ async fn a_foreign_canon_rule_is_narrowed_coverage_not_a_finding() {
         .replace("\\\"n\\\":1", "\\\"n\\\":9")
         .replace("\"n\":1", "\"n\":9");
     assert_ne!(edited, foreign, "the fixture edited nothing");
-    let caught = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None)
-        .expect("verify");
+    let caught =
+        agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None).expect("verify");
     assert!(
         caught
             .findings
@@ -1698,7 +1698,10 @@ async fn a_sealing_record_claiming_a_foreign_head_is_caught_offline() {
         )
         .await
         .expect("append");
-    store.seal(run, lease.epoch, "succeeded").await.expect("seal");
+    store
+        .seal(run, lease.epoch, "succeeded")
+        .await
+        .expect("seal");
 
     let mut out = Vec::new();
     agentplane::export::to_jsonl(&store, None, &[run], &mut out)
@@ -1752,7 +1755,10 @@ async fn a_truncated_export_refuses_to_restore() {
     let lines: Vec<&str> = text.lines().collect();
     let cut = lines[..lines.len() - 1].join("\n");
     assert!(
-        lines.last().expect("lines").contains("agentplane.export.end"),
+        lines
+            .last()
+            .expect("lines")
+            .contains("agentplane.export.end"),
         "the fixture did not cut the trailer, so this test would measure itself"
     );
 

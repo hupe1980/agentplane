@@ -234,11 +234,7 @@ fn every_readme_example_command_names_the_features_it_needs() {
         let mut words = rest.split_whitespace();
         let example = words.next().unwrap_or_default();
         let listed: Vec<&str> = match words.next() {
-            Some("--features") => words
-                .next()
-                .unwrap_or_default()
-                .split(',')
-                .collect(),
+            Some("--features") => words.next().unwrap_or_default().split(',').collect(),
             _ => Vec::new(),
         };
         let Some(needs) = required.get(example) else {

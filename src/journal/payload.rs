@@ -160,11 +160,9 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         // reason in the skill author's words over the caller's values — "hold
         // h-73 does not cover order for alice@…" — while `outcome` is the
         // routing fact and stays clear.
-        K::GroupSettled { detail, .. } => detail
-            .as_mut()
-            .map(SealedField::Text)
-            .into_iter()
-            .collect(),
+        K::GroupSettled { detail, .. } => {
+            detail.as_mut().map(SealedField::Text).into_iter().collect()
+        }
         // The message is free text a provider or tool wrote — it quotes the
         // request it refused, which is the caller's data. `disposition` and
         // `permanent` MUST stay clear: retry and reconciliation route on them,

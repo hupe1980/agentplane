@@ -494,9 +494,7 @@ impl Skill for SpendThenSleep {
 /// non-determinism past the journal — the same exemption the sweep tests take.
 #[allow(clippy::disallowed_methods)]
 fn this_period(quota: &TenantQuota) -> String {
-    quota
-        .period
-        .key_for(agentplane::core::Timestamp::now_utc())
+    quota.period.key_for(agentplane::core::Timestamp::now_utc())
 }
 
 /// A suspend/resume cycle accrues each token once, not once per pass.

@@ -462,9 +462,7 @@ impl MemoryStore for RedbStore {
             }
             // `neg_created` is the negated timestamp, so ascending order here
             // is newest-first — the same trick the index itself plays.
-            keys.sort_unstable_by(|a, b| {
-                (a.0, a.1, a.2.as_str()).cmp(&(b.0, b.1, b.2.as_str()))
-            });
+            keys.sort_unstable_by(|a, b| (a.0, a.1, a.2.as_str()).cmp(&(b.0, b.1, b.2.as_str())));
 
             let mut out: Vec<MemoryItem> = Vec::new();
             for (_, _, id, version) in keys {
@@ -576,7 +574,13 @@ impl MemoryStore for RedbStore {
             for e in edges
                 .range(
                     (tenant.as_str(), source.as_str(), 0, "", 0)
-                        ..=(tenant.as_str(), source.as_str(), u64::MAX, MAX_STR, u64::MAX),
+                        ..=(
+                            tenant.as_str(),
+                            source.as_str(),
+                            u64::MAX,
+                            MAX_STR,
+                            u64::MAX,
+                        ),
                 )
                 .map_err(|e| be(&e))?
             {
@@ -694,22 +698,14 @@ impl MemoryStore for RedbStore {
                         if current_version == Some(derived_version) {
                             id_queue.push(derived_id);
                         } else {
-                            if !doomed_versions
-                                .insert((derived_id.clone(), derived_version))
-                            {
+                            if !doomed_versions.insert((derived_id.clone(), derived_version)) {
                                 continue;
                             }
                             // Only this version's own onward lineage: what a
                             // superseded summary was itself read into.
                             for entry in edges
                                 .range(
-                                    (
-                                        tenant.as_str(),
-                                        derived_id.as_str(),
-                                        derived_version,
-                                        "",
-                                        0,
-                                    )
+                                    (tenant.as_str(), derived_id.as_str(), derived_version, "", 0)
                                         ..=(
                                             tenant.as_str(),
                                             derived_id.as_str(),

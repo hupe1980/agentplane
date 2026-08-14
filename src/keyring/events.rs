@@ -289,10 +289,7 @@ mod aad_tests {
                 crate::core::EffectKey::from_hex(&format!("{:064x}", 7)).expect("hex key"),
             ),
         );
-        let other_tenant = SealedEvents::aad(
-            &TenantId::new("globex").expect("tenant"),
-            &colliding,
-        );
+        let other_tenant = SealedEvents::aad(&TenantId::new("globex").expect("tenant"), &colliding);
 
         #[cfg(feature = "push")]
         assert_ne!(
@@ -307,9 +304,10 @@ mod aad_tests {
         );
 
         let plain = b"the counterparty's payload";
-        let envelope = super::super::envelope::seal(&ring, "acme/anything", event_aad.as_bytes(), plain)
-            .await
-            .expect("seal");
+        let envelope =
+            super::super::envelope::seal(&ring, "acme/anything", event_aad.as_bytes(), plain)
+                .await
+                .expect("seal");
         assert_eq!(
             super::super::envelope::open(&ring, event_aad.as_bytes(), &envelope)
                 .await
@@ -370,7 +368,10 @@ mod aad_tests {
         // The positive half: before erasure the sealed store opens its own
         // dead letter.
         let letters = sealed.dead_letters(10).await.expect("dead letters");
-        assert_eq!(letters[0].event.payload, serde_json::json!({"pii": "erase me"}));
+        assert_eq!(
+            letters[0].event.payload,
+            serde_json::json!({"pii": "erase me"})
+        );
 
         assert!(
             sealed

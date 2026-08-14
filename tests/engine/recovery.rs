@@ -882,7 +882,11 @@ async fn an_orphan_whose_reperformance_succeeds_resumes_to_success() {
         1,
         "the interrupted attempt is resumed as one performance"
     );
-    assert_eq!(undone.load(Ordering::SeqCst), 0, "nothing unwinds on success");
+    assert_eq!(
+        undone.load(Ordering::SeqCst),
+        0,
+        "nothing unwinds on success"
+    );
 
     let records = store.read(run, 1).await.unwrap();
     let announcements = records

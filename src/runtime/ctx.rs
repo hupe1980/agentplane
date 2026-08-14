@@ -975,8 +975,7 @@ impl<'a> StepCtx<'a> {
                         continue;
                     }
                     Some(EffectReplay::Orphan {
-                        recovery: recorded,
-                        ..
+                        recovery: recorded, ..
                     }) => {
                         if let Some(output) = self
                             .orphan_verdict(&effect, key, attempt, &recorded, &recovery, &policy)
@@ -1164,14 +1163,16 @@ impl<'a> StepCtx<'a> {
             // one interrupted attempt was resumed. A failure is handed back to
             // the attempt loop, not decided here.
             Recovery::Retry | Recovery::Idempotent { .. } => {
-                self.perform_once(effect, key, attempt, 0, false, None).await
+                self.perform_once(effect, key, attempt, 0, false, None)
+                    .await
             }
             // Ask, rather than assume. This is the only branch that turns an
             // undecidable outcome into a decided one without betting on it.
             Recovery::Reconcile => match self.reconcile_and_record(effect, key).await? {
                 Reconciliation::Landed(output) => Ok(Ok(output)),
                 Reconciliation::DidNotHappen => {
-                    self.perform_once(effect, key, attempt, 0, false, None).await
+                    self.perform_once(effect, key, attempt, 0, false, None)
+                        .await
                 }
                 Reconciliation::Inconclusive => Err(StepError::Undecidable {
                     key,

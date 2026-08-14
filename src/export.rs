@@ -647,10 +647,17 @@ fn read_trailer(value: &serde_json::Value, report: &mut VerifyReport, claims: &m
             report.cases
         ));
     }
-    claims.runs_requested = value.get("runs_requested").and_then(serde_json::Value::as_u64);
-    claims.runs_exported = value.get("runs_exported").and_then(serde_json::Value::as_u64);
+    claims.runs_requested = value
+        .get("runs_requested")
+        .and_then(serde_json::Value::as_u64);
+    claims.runs_exported = value
+        .get("runs_exported")
+        .and_then(serde_json::Value::as_u64);
     claims.records = value.get("records").and_then(serde_json::Value::as_u64);
-    if let Some(list) = value.get("unreadable").and_then(serde_json::Value::as_array) {
+    if let Some(list) = value
+        .get("unreadable")
+        .and_then(serde_json::Value::as_array)
+    {
         for entry in list {
             let Some(run) = entry
                 .get("run")

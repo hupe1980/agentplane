@@ -1211,14 +1211,14 @@ impl JournalStore for RedbStore {
                 // silently thinned out of this page is the unreachable-signal
                 // failure the method exists to remove.
                 let key = v.value();
-                let id = key.strip_prefix(prefix.as_str()).ok_or_else(|| {
-                    StoreError::Corrupt {
+                let id = key
+                    .strip_prefix(prefix.as_str())
+                    .ok_or_else(|| StoreError::Corrupt {
                         seq: 0,
                         detail: format!(
                             "run_by_outcome points at '{key}', which is outside tenant '{tenant}'"
                         ),
-                    }
-                })?;
+                    })?;
                 let run = RunId::parse(id).map_err(|e| StoreError::Corrupt {
                     seq: 0,
                     detail: format!("run_by_outcome holds an unparsable run id '{id}': {e}"),
@@ -1444,7 +1444,10 @@ mod tests {
             vec![stranded]
         );
         assert_eq!(
-            store.runs_by_outcome("failed", 10).await.expect("a clean scan"),
+            store
+                .runs_by_outcome("failed", 10)
+                .await
+                .expect("a clean scan"),
             vec![stranded]
         );
 

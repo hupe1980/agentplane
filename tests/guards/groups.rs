@@ -2497,5 +2497,8 @@ async fn two_settlements_of_one_name_both_record_and_neither_repeats() {
         .await
         .expect("resume");
     assert_eq!(done.status, RunStatus::Succeeded);
-    assert_eq!(group_kind_count(&store, out.run_id, "GroupSettled").await, 2);
+    assert_eq!(
+        group_kind_count(&store, out.run_id, "GroupSettled").await,
+        2
+    );
 }

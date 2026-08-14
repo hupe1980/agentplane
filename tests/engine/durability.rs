@@ -425,7 +425,11 @@ async fn a_strict_pass_that_stops_early_still_checks_unconsumed_effects() {
         "an unchanged build must verify the failed run quietly: {:?}",
         verified.status
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "verification performs nothing");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "verification performs nothing"
+    );
 
     // Shipped change: the step now fails immediately, requesting neither of
     // the two effects the journal holds.

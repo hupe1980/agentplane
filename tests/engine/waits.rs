@@ -45,11 +45,7 @@ fn later(secs: i64) -> Timestamp {
 }
 
 /// The key of the one recorded wait of `kind` in a run's journal.
-async fn wait_key(
-    store: &Arc<RedbStore>,
-    run: RunId,
-    kind: &str,
-) -> agentplane::core::EffectKey {
+async fn wait_key(store: &Arc<RedbStore>, run: RunId, kind: &str) -> agentplane::core::EffectKey {
     (store.clone() as Arc<dyn JournalStore>)
         .read(run, 1)
         .await
@@ -125,7 +121,10 @@ async fn an_orphaned_sleep_is_rearmed_on_resume_and_then_fires() {
         })
         .build();
 
-    let out = rt.run("demo.nap", Tainted::trusted(json!({}))).await.unwrap();
+    let out = rt
+        .run("demo.nap", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
     assert_eq!(store.armed_timers(out.run_id).await.unwrap(), 1);
 
@@ -273,8 +272,13 @@ async fn an_orphaned_event_wait_is_resubscribed_on_resume() {
     // this is the assertion that the resume re-registered it.
     let delivery = rt
         .deliver(
-            &InboundEvent::new("urn:test:approver", "EV-1", "go.ahead", json!({ "ok": true }))
-                .correlate(CorrelationKey::new("matter", "M-1")),
+            &InboundEvent::new(
+                "urn:test:approver",
+                "EV-1",
+                "go.ahead",
+                json!({ "ok": true }),
+            )
+            .correlate(CorrelationKey::new("matter", "M-1")),
         )
         .await
         .unwrap();
@@ -419,7 +423,10 @@ async fn a_timer_wake_resumes_under_its_own_lease_and_releases_it_after() {
         })
         .build();
 
-    let out = rt.run("demo.nap", Tainted::trusted(json!({}))).await.unwrap();
+    let out = rt
+        .run("demo.nap", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
     assert!(out.status.is_suspended());
 
     // Count only the wake's choreography, not the admission's.

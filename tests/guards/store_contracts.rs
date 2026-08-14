@@ -113,7 +113,9 @@ mod embedded {
     #[tokio::test]
     async fn pending_count_is_scoped_to_the_tenant() {
         let base = RedbStore::open_in_memory().expect("store");
-        let acme = base.clone().for_tenant(TenantId::new("acme").expect("tenant"));
+        let acme = base
+            .clone()
+            .for_tenant(TenantId::new("acme").expect("tenant"));
         let globex = base.for_tenant(TenantId::new("globex").expect("tenant"));
 
         let arm = |store: RedbStore, n: u32| async move {
@@ -184,8 +186,14 @@ mod embedded {
         let store = RedbStore::open_in_memory().expect("store");
         let old_normal = task(0, Priority::Normal, 1_000);
         store.open(&old_normal).await.expect("open");
-        store.open(&task(1, Priority::Normal, 1_001)).await.expect("open");
-        store.open(&task(2, Priority::Normal, 1_002)).await.expect("open");
+        store
+            .open(&task(1, Priority::Normal, 1_001))
+            .await
+            .expect("open");
+        store
+            .open(&task(2, Priority::Normal, 1_002))
+            .await
+            .expect("open");
         let young_urgent = task(3, Priority::Urgent, 2_000);
         store.open(&young_urgent).await.expect("open");
 
@@ -223,8 +231,14 @@ mod embedded {
         // The higher key is registered *first* and *earlier*, so an
         // implementation electing by registration time picks it — the drift
         // this test exists to refuse.
-        store.subscribe(&sub(high), at(1_000)).await.expect("subscribe");
-        store.subscribe(&sub(low), at(2_000)).await.expect("subscribe");
+        store
+            .subscribe(&sub(high), at(1_000))
+            .await
+            .expect("subscribe");
+        store
+            .subscribe(&sub(low), at(2_000))
+            .await
+            .expect("subscribe");
 
         let event = InboundEvent {
             source: "erp".to_owned(),
@@ -233,7 +247,11 @@ mod embedded {
             correlation: vec![CorrelationKey::new("shipment", "SHP-1")],
             payload: serde_json::json!({ "ok": true }),
         };
-        match store.deliver_to(run, &event, at(3_000)).await.expect("deliver") {
+        match store
+            .deliver_to(run, &event, at(3_000))
+            .await
+            .expect("deliver")
+        {
             agentplane::case::TargetedDelivery::Matched(matched) => {
                 assert_eq!(
                     matched.effect, low,
@@ -259,7 +277,10 @@ mod embedded {
         };
 
         store.buffer(&event(1), at(1_000)).await.expect("buffer");
-        assert_eq!(store.sweep_unclaimed(at(1_000), "").await.expect("sweep"), 1);
+        assert_eq!(
+            store.sweep_unclaimed(at(1_000), "").await.expect("sweep"),
+            1
+        );
         store.buffer(&event(2), at(2_000)).await.expect("buffer");
         assert_eq!(
             store
@@ -352,9 +373,7 @@ mod shared {
                 let barrier = Arc::clone(&barrier);
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    let outcome = store
-                        .acquire(run, owner, Duration::from_secs(60))
-                        .await;
+                    let outcome = store.acquire(run, owner, Duration::from_secs(60)).await;
                     (store, owner, outcome)
                 })
             };
@@ -558,7 +577,10 @@ mod shared {
         // backend used to answer `AlreadyClaimed { holder: yourself }`.
         let held = task(0, Priority::Normal, 1_760_000_000);
         store.open(&held).await.expect("open");
-        store.claim(held.id, "alice", &[]).await.expect("first claim");
+        store
+            .claim(held.id, "alice", &[])
+            .await
+            .expect("first claim");
         let again = store
             .claim(held.id, "alice", &[])
             .await
@@ -575,8 +597,14 @@ mod shared {
         // priority and oldest first", which this backend served as age-only.
         let old_normal = task(1, Priority::Normal, 1_000);
         store.open(&old_normal).await.expect("open");
-        store.open(&task(2, Priority::Normal, 1_001)).await.expect("open");
-        store.open(&task(3, Priority::Normal, 1_002)).await.expect("open");
+        store
+            .open(&task(2, Priority::Normal, 1_001))
+            .await
+            .expect("open");
+        store
+            .open(&task(3, Priority::Normal, 1_002))
+            .await
+            .expect("open");
         let young_urgent = task(4, Priority::Urgent, 2_000);
         store.open(&young_urgent).await.expect("open");
 
@@ -619,8 +647,14 @@ mod shared {
             kind: "ack.received".to_owned(),
             correlation: vec![CorrelationKey::new("shipment", "SHP-1")],
         };
-        store.subscribe(&sub(high), at(1_000)).await.expect("subscribe");
-        store.subscribe(&sub(low), at(2_000)).await.expect("subscribe");
+        store
+            .subscribe(&sub(high), at(1_000))
+            .await
+            .expect("subscribe");
+        store
+            .subscribe(&sub(low), at(2_000))
+            .await
+            .expect("subscribe");
         let event = InboundEvent {
             source: "erp".to_owned(),
             id: "evt-1".to_owned(),
@@ -628,7 +662,11 @@ mod shared {
             correlation: vec![CorrelationKey::new("shipment", "SHP-1")],
             payload: serde_json::json!({ "ok": true }),
         };
-        match store.deliver_to(run, &event, at(3_000)).await.expect("deliver") {
+        match store
+            .deliver_to(run, &event, at(3_000))
+            .await
+            .expect("deliver")
+        {
             agentplane::case::TargetedDelivery::Matched(matched) => {
                 assert_eq!(
                     matched.effect, low,
@@ -648,7 +686,10 @@ mod shared {
             payload: serde_json::json!({}),
         };
         store.buffer(&stray(1), at(1_000)).await.expect("buffer");
-        assert_eq!(store.sweep_unclaimed(at(1_000), "").await.expect("sweep"), 1);
+        assert_eq!(
+            store.sweep_unclaimed(at(1_000), "").await.expect("sweep"),
+            1
+        );
         store.buffer(&stray(2), at(2_000)).await.expect("buffer");
         assert_eq!(
             store
@@ -677,8 +718,9 @@ mod shared {
             tx: &dyn agentplane::journal::AtomicTx,
         ) -> Result<Vec<agentplane::journal::Append>, agentplane::core::EffectError> {
             use agentplane::journal::SqlValue;
-            let fail =
-                |e: agentplane::core::StoreError| agentplane::core::EffectError::Other(e.to_string());
+            let fail = |e: agentplane::core::StoreError| {
+                agentplane::core::EffectError::Other(e.to_string())
+            };
             tx.execute(
                 "INSERT INTO run_lease (tenant, run_id, owner, epoch, expires_at)
                  VALUES ($1, 'not-a-run-id', 'w', 1, 0)",
@@ -703,7 +745,6 @@ mod shared {
     /// exactly why a silent skip would hide them forever.
     #[tokio::test]
     async fn postgres_reports_an_unparsable_run_id_as_corruption() {
-
         let Ok(container) = Postgres::default().with_tag(PG).start().await else {
             eprintln!("skipping: no Docker daemon available");
             return;

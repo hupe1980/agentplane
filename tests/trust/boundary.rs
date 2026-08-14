@@ -968,7 +968,11 @@ async fn a_released_value_written_to_memory_keeps_its_base_trust() {
         .run("remembers", Tainted::trusted(json!({})))
         .await
         .unwrap();
-    assert!(matches!(out.status, RunStatus::Succeeded), "{:?}", out.status);
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "{:?}",
+        out.status
+    );
 
     let items = (Arc::clone(&store) as Arc<dyn MemoryStore>)
         .recall(&Recall::about("acct"))

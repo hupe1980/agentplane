@@ -577,12 +577,7 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
     // stores take max(existing, at + window), so a late touch opens a new
     // window rather than being refused — refusing would make the answer depend
     // on how recently the sweeper ran, an ambient race no journal records.
-    let mut lazarus = make(
-        "memory-lazarus",
-        "team-lazarus",
-        "support",
-        json!({"n": 1}),
-    );
+    let mut lazarus = make("memory-lazarus", "team-lazarus", "support", json!({"n": 1}));
     lazarus.access_retention_seconds = Some(60);
     store.remember(&lazarus).await.expect("lazarus memory");
     // The untouched window closed at 1_760_000_060; nobody swept. The touch
@@ -741,10 +736,16 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
     // every backend rather than left as a ranking choice.
     let mut order_old = make("order-old", "team-order", "alpha", json!({"n": 1}));
     order_old.created_at = at(1_760_000_300);
-    store.remember(&order_old).await.expect("older, first purpose");
+    store
+        .remember(&order_old)
+        .await
+        .expect("older, first purpose");
     let mut order_new = make("order-new", "team-order", "zeta", json!({"n": 2}));
     order_new.created_at = at(1_760_000_400);
-    store.remember(&order_new).await.expect("newest, last purpose");
+    store
+        .remember(&order_new)
+        .await
+        .expect("newest, last purpose");
     let mut order_trusted = make("order-trusted", "team-order", "middle", json!({"n": 3}));
     order_trusted.trust = Trust::Trusted;
     order_trusted.created_at = at(1_760_000_100);
@@ -774,10 +775,7 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
     // The erasure path's enumeration: every current id of the subject, in
     // stable order, with no page size to fall off.
     assert_eq!(
-        store
-            .subject_ids("team-order")
-            .await
-            .expect("subject ids"),
+        store.subject_ids("team-order").await.expect("subject ids"),
         vec!["order-new", "order-old", "order-trusted"],
         "subject_ids must name every current id of the subject"
     );
@@ -804,7 +802,9 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
 /// Panics when the backend violates the contract.
 #[allow(clippy::too_many_lines)]
 pub async fn event_erasure(store: Arc<dyn crate::case::EventStore>) {
-    use crate::core::{CorrelationKey, InboundEvent, Phase, RunId, StepId, Subscription, Timestamp};
+    use crate::core::{
+        CorrelationKey, InboundEvent, Phase, RunId, StepId, Subscription, Timestamp,
+    };
     use serde_json::json;
 
     let at = |seconds| Timestamp::from_unix_timestamp(seconds).expect("representable time");
@@ -840,7 +840,10 @@ pub async fn event_erasure(store: Arc<dyn crate::case::EventStore>) {
         .await
         .expect("claim")
         .expect("a buffered event matches");
-    assert_eq!(claimed.event.payload, pii, "delivery hands over the payload");
+    assert_eq!(
+        claimed.event.payload, pii,
+        "delivery hands over the payload"
+    );
 
     // Crash recovery happens *before* the run acknowledges, so the buffer's
     // copy must survive until the unsubscribe — the journal may not hold the

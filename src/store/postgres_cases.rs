@@ -1140,26 +1140,26 @@ impl EventStore for PostgresStore {
         let tx = client.transaction().await.map_err(|e| be(&e))?;
         for k in &sub.correlation {
             tx.execute(
-                    "INSERT INTO subscriptions
+                "INSERT INTO subscriptions
                        (run_id, effect_key, case_id, step, phase, event_kind,
                         namespace, value, created_at, tenant)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                      ON CONFLICT DO NOTHING",
-                    &[
-                        &sub.run.to_string(),
-                        &sub.effect.to_hex(),
-                        &sub.case.map(|c| c.to_string()),
-                        &i64::from(sub.step.0),
-                        &phase_str(sub.phase),
-                        &sub.kind,
-                        &k.namespace,
-                        &k.value,
-                        &at.unix_timestamp(),
-                        &self.tenant_name(),
-                    ],
-                )
-                .await
-                .map_err(|e| be(&e))?;
+                &[
+                    &sub.run.to_string(),
+                    &sub.effect.to_hex(),
+                    &sub.case.map(|c| c.to_string()),
+                    &i64::from(sub.step.0),
+                    &phase_str(sub.phase),
+                    &sub.kind,
+                    &k.namespace,
+                    &k.value,
+                    &at.unix_timestamp(),
+                    &self.tenant_name(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
         }
         tx.commit().await.map_err(|e| be(&e))?;
         Ok(())

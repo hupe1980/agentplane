@@ -3318,7 +3318,9 @@ fn a_card_with_an_integer_beyond_double_precision_is_refused_at_signing() {
 #[cfg(feature = "signing")]
 #[test]
 fn a_card_with_an_integer_beyond_double_precision_is_refused_at_verification() {
-    use agentplane::peers::{AgentCard, AgentExtension, CardSignatureError, CardSigner, CardVerifier};
+    use agentplane::peers::{
+        AgentCard, AgentExtension, CardSignatureError, CardSigner, CardVerifier,
+    };
     use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
 
     let signer = Ed25519Signer::new("did:example:publisher", &[7u8; 32]);

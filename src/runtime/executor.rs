@@ -2847,8 +2847,10 @@ impl Runtime {
             let l = ledger.lock().expect("budget mutex");
             (l.consumed().spend, l.live_spend())
         };
-        self.conclude(run, epoch, unwound, output, writing, case_id, spend, live_spend)
-            .await
+        self.conclude(
+            run, epoch, unwound, output, writing, case_id, spend, live_spend,
+        )
+        .await
     }
 
     /// Undo the completed steps, if the way the run stopped calls for it.
@@ -3046,10 +3048,7 @@ impl Runtime {
     /// Evidence, not bookkeeping. The journal already knows both, it knows the
     /// same thing on replay, and nothing has to be threaded through the executor
     /// to keep a parallel copy honest.
-    async fn unwind_evidence(
-        &self,
-        run: RunId,
-    ) -> Result<UnwindEvidence, RuntimeError> {
+    async fn unwind_evidence(&self, run: RunId) -> Result<UnwindEvidence, RuntimeError> {
         let records = self
             .store
             .read(run, 1)
@@ -3215,15 +3214,14 @@ impl Runtime {
         mutated: &BTreeSet<StepId>,
     ) -> bool {
         completed.iter().any(|(step, capability)| {
-            self.resolve(&capability.0).map_or(true, |skill| {
-                match skill.compensation() {
+            self.resolve(&capability.0)
+                .map_or(true, |skill| match skill.compensation() {
                     crate::core::Compensation::Compensatable => true,
                     crate::core::Compensation::Undeclared => mutated.contains(step),
                     crate::core::Compensation::Pivot | crate::core::Compensation::Unnecessary => {
                         false
                     }
-                }
-            })
+                })
         })
     }
 

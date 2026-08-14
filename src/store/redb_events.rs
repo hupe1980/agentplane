@@ -993,7 +993,10 @@ impl EventStore for RedbStore {
                 // resume, whose recovery re-reads it from the buffer.
                 let mut claimed = w.open_table(EVENTS_CLAIMED).map_err(|e| be(&e))?;
                 let held: Vec<String> = claimed
-                    .range((tenant.as_str(), run.as_str(), "")..=(tenant.as_str(), run.as_str(), MAX_STR))
+                    .range(
+                        (tenant.as_str(), run.as_str(), "")
+                            ..=(tenant.as_str(), run.as_str(), MAX_STR),
+                    )
                     .map_err(|e| be(&e))?
                     .map(|entry| {
                         entry

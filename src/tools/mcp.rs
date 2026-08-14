@@ -276,15 +276,14 @@ impl McpClient {
         // effect exists — nothing was sent, and the refusal says why. This
         // does NOT validate the responses against the server's declared input
         // schema; the server still judges them on `tasks/update`.
-        let arguments = serde_json::to_value(&input_responses).map_err(|error| {
-            ToolError::Refused {
+        let arguments =
+            serde_json::to_value(&input_responses).map_err(|error| ToolError::Refused {
                 tool: ToolId::new(&self.server, format!("task/{}", task.id)),
                 detail: format!(
                     "the input responses could not be serialized for policy \
                      inspection, so they were not sent: {error}"
                 ),
-            }
-        })?;
+            })?;
         Ok(McpTaskUpdate {
             task,
             input_responses,

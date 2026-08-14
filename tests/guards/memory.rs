@@ -84,8 +84,7 @@ async fn redb_event_buffer_erases_payloads() {
 async fn every_redb_erasure_path_removes_access_expiry_residue() {
     use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
-    const ACCESS: TableDefinition<(&str, &str), i64> =
-        TableDefinition::new("memory_access_expiry");
+    const ACCESS: TableDefinition<(&str, &str), i64> = TableDefinition::new("memory_access_expiry");
 
     // Wall clock for a unique temp-dir name only — never run-visible state.
     #[allow(clippy::disallowed_methods)]
@@ -102,7 +101,12 @@ async fn every_redb_erasure_path_removes_access_expiry_residue() {
     {
         let store = RedbStore::open(&path).expect("store");
         let with_window = |id: &str, subject: &str, window: u64| {
-            let mut item = item(id, subject, json!({"kept": "for a while"}), Trust::Untrusted);
+            let mut item = item(
+                id,
+                subject,
+                json!({"kept": "for a while"}),
+                Trust::Untrusted,
+            );
             item.access_retention_seconds = Some(window);
             item
         };
@@ -132,10 +136,7 @@ async fn every_redb_erasure_path_removes_access_expiry_residue() {
             1
         );
         assert_eq!(
-            store
-                .sweep_expired(at(1_760_000_060))
-                .await
-                .expect("sweep"),
+            store.sweep_expired(at(1_760_000_060)).await.expect("sweep"),
             1,
             "exactly the short-window id expires"
         );
@@ -534,7 +535,10 @@ impl MemoryStore for Counted {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.recall(query).await
     }
-    async fn subject_ids(&self, subject: &str) -> Result<Vec<String>, agentplane::core::StoreError> {
+    async fn subject_ids(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<String>, agentplane::core::StoreError> {
         self.inner.subject_ids(subject).await
     }
     async fn version(
@@ -601,7 +605,10 @@ impl MemoryStore for RejectsComposedCascade {
         self.inner.recall(query).await
     }
 
-    async fn subject_ids(&self, subject: &str) -> Result<Vec<String>, agentplane::core::StoreError> {
+    async fn subject_ids(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<String>, agentplane::core::StoreError> {
         self.inner.subject_ids(subject).await
     }
 

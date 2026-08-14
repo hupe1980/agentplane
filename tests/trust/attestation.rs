@@ -1363,7 +1363,11 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
         ) -> Result<Vec<(RunId, u64)>, StoreError> {
             self.inner.recent_runs(after, limit).await
         }
-        async fn case_history(&self, case: CaseId, limit: usize) -> Result<Vec<Record>, StoreError> {
+        async fn case_history(
+            &self,
+            case: CaseId,
+            limit: usize,
+        ) -> Result<Vec<Record>, StoreError> {
             self.inner.case_history(case, limit).await
         }
         async fn head(&self, run: RunId) -> Result<Head, StoreError> {

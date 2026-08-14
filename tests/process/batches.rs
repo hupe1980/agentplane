@@ -594,7 +594,10 @@ async fn an_exhausted_item_is_a_held_pause_not_a_failure() {
 
     // One step allowed, two needed: the item pauses at the ceiling.
     let report = capped(&store, &world, 1)
-        .run_batch(id, &BatchSpec::new(two_step_plan(), Arc::new(Keys::upto(1))))
+        .run_batch(
+            id,
+            &BatchSpec::new(two_step_plan(), Arc::new(Keys::upto(1))),
+        )
         .await
         .unwrap();
 
@@ -628,7 +631,10 @@ async fn an_exhausted_item_is_a_held_pause_not_a_failure() {
     // completes without re-settling what already landed.
     let after: World = Arc::default();
     let done = capped(&store, &after, 10)
-        .run_batch(id, &BatchSpec::new(two_step_plan(), Arc::new(Keys::upto(1))))
+        .run_batch(
+            id,
+            &BatchSpec::new(two_step_plan(), Arc::new(Keys::upto(1))),
+        )
         .await
         .unwrap();
 

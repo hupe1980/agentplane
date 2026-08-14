@@ -286,6 +286,9 @@ mod refusal_tests {
             "get_raw on a sealed handle handed out raw envelopes"
         );
         // The refusal changed nothing: the sealed payload still opens.
-        assert_eq!(store.get(digest).await.expect("still sealed"), b"the payload");
+        assert_eq!(
+            store.get(digest).await.expect("still sealed"),
+            b"the payload"
+        );
     }
 }

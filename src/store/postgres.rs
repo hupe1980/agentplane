@@ -826,7 +826,9 @@ impl JournalStore for PostgresStore {
         // In-doubt classification, not only on the atomic path: see
         // `commit_refused_or_in_doubt` for the double-append a retried
         // "failure" here used to produce.
-        tx.commit().await.map_err(|e| commit_refused_or_in_doubt(&e))?;
+        tx.commit()
+            .await
+            .map_err(|e| commit_refused_or_in_doubt(&e))?;
         Ok(sealed)
     }
 
@@ -1096,10 +1098,7 @@ impl JournalStore for PostgresStore {
                 run: key,
                 owner: row.get(0),
                 epoch: row.get::<_, i64>(1).cast_unsigned(),
-                remaining_secs: row
-                    .get::<_, i64>(2)
-                    .cast_unsigned()
-                    .saturating_sub(now),
+                remaining_secs: row.get::<_, i64>(2).cast_unsigned().saturating_sub(now),
             }),
             // Lease rows are never deleted (the epoch lives in them), so a
             // refused claim over a missing row is a store this code does not
@@ -1272,7 +1271,9 @@ impl JournalStore for PostgresStore {
         .map_err(|e| be(&e))?;
         // A seal is a write like any other: a lost commit acknowledgement is
         // in doubt, not retryable — see `commit_refused_or_in_doubt`.
-        tx.commit().await.map_err(|e| commit_refused_or_in_doubt(&e))?;
+        tx.commit()
+            .await
+            .map_err(|e| commit_refused_or_in_doubt(&e))?;
 
         Ok(head)
     }
@@ -1595,7 +1596,9 @@ impl AtomicJournal for PostgresStore {
         let sealed = self.append_within(&tx, run, epoch, batch).await?;
         // The shared classification: a refusal is a clean rollback, a lost
         // acknowledgement is in doubt. See `commit_refused_or_in_doubt`.
-        tx.commit().await.map_err(|e| commit_refused_or_in_doubt(&e))?;
+        tx.commit()
+            .await
+            .map_err(|e| commit_refused_or_in_doubt(&e))?;
         Ok(sealed)
     }
 }

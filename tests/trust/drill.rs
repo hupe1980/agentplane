@@ -250,7 +250,11 @@ async fn a_ring_with_nothing_sealed_is_unestablished_coverage() {
     let redb = Arc::new(RedbStore::open_in_memory().expect("store"));
     let cases = redb as Arc<dyn CaseStore>;
     let case = cases
-        .correlate_or_open("matter", &[CorrelationKey::new("doc", "PLAIN-1")], ts(1_000))
+        .correlate_or_open(
+            "matter",
+            &[CorrelationKey::new("doc", "PLAIN-1")],
+            ts(1_000),
+        )
         .await
         .expect("open")
         .case_id();

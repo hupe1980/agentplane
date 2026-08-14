@@ -896,7 +896,12 @@ impl Tainted<serde_json::Value> {
     #[must_use]
     pub fn effective_label_at(&self, destination: &str, path: &str) -> Option<Label> {
         let base = self.label_at(path)?;
-        Some(Self::improved(base, &self.label.releases, destination, path))
+        Some(Self::improved(
+            base,
+            &self.label.releases,
+            destination,
+            path,
+        ))
     }
 
     fn improved(
@@ -1117,7 +1122,8 @@ mod tests {
         );
         let note = released.project_field("note").unwrap();
         assert!(
-            note.effective_label("tool://ledger/transfer").is_untrusted(),
+            note.effective_label("tool://ledger/transfer")
+                .is_untrusted(),
             "projecting a sibling acquired a mark that never covered it"
         );
 

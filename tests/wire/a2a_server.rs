@@ -893,7 +893,10 @@ async fn a_receiver_answering_500_is_rejected_and_the_cursor_does_not_advance() 
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://127.0.0.1:{}/hook", listener.local_addr().unwrap().port());
+    let url = format!(
+        "http://127.0.0.1:{}/hook",
+        listener.local_addr().unwrap().port()
+    );
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -958,7 +961,10 @@ async fn a_receiver_answering_500_is_rejected_and_the_cursor_does_not_advance() 
     let before = receiver.bodies.lock().unwrap().len();
     let rejected = worker.run_once(10, 10).await.expect("failed sweep");
     assert_eq!(rejected.deliveries, 0, "a 500 was counted as delivered");
-    assert_eq!(rejected.retries, 1, "a rejected delivery must be rescheduled");
+    assert_eq!(
+        rejected.retries, 1,
+        "a rejected delivery must be rescheduled"
+    );
 
     // The receiver has recovered; the retry must carry the exact payload the
     // 500 answered, which is only possible if the cursor did not move.
@@ -2406,7 +2412,10 @@ async fn a_full_quota_is_back_pressure_with_no_arithmetic_in_the_answer() {
         ),
     )
     .await;
-    assert_eq!(ok["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+    assert_eq!(
+        ok["result"]["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
 }
 
 /// This crate's own A2A client, calling this crate's own A2A server.
