@@ -73,7 +73,17 @@ bad = []
 # again — silently, because a version that happens to be current today reads as
 # correct.
 pattern = re.compile(r'agentplane\s*=\s*(?:\{[^}]*?version\s*=\s*)?"[0-9]+\.[0-9]+')
-for page in sorted((root / "site/content").rglob("*.md")) + [root / "README.md"]:
+# Templates as well as prose. The landing page is the *first* install
+# instruction anybody reads and it is not Markdown, so scanning only
+# `site/content` let it pin `agentplane = "0.1"` while this check reported
+# that no page pins a version — a checker whose message outran its reach,
+# which is worse than one that admits a narrow scope.
+pages = (
+    sorted((root / "site/content").rglob("*.md"))
+    + sorted((root / "site/templates").rglob("*.html"))
+    + [root / "README.md"]
+)
+for page in pages:
     for n, line in enumerate(page.read_text().splitlines(), 1):
         if pattern.search(line):
             bad.append(
