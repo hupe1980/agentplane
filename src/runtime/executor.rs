@@ -2603,7 +2603,7 @@ impl Runtime {
         outputs: &BTreeMap<StepId, Tainted<Value>>,
         completed: &[(StepId, Capability)],
     ) -> Result<PlanIR, RunStatus> {
-        if let Some(source) = None::<String> {
+        if let Some(source) = untrusted_in(outputs) {
             return Err(RunStatus::Failed(format!(
                 "replanning refused: untrusted data from {source} is already in                  working memory, and the plan is an authorization graph —                  letting it change now would let that data choose what runs                  next ({})",
                 cx.reason

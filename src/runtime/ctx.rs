@@ -938,8 +938,6 @@ impl<'a> StepCtx<'a> {
             effect.attach(&self.provenance(key, ordinal, &descriptor));
 
             // ── Replay: is this attempt already in history? ────────────────
-            self.gate(key, &descriptor, effect.mutates(), outbound)
-                .await?;
             if self.mode.is_replaying() {
                 match self.cursor.next(key)? {
                     Some(EffectReplay::Done { output, spend, .. }) => {
