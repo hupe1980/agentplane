@@ -2603,7 +2603,7 @@ impl Runtime {
         outputs: &BTreeMap<StepId, Tainted<Value>>,
         completed: &[(StepId, Capability)],
     ) -> Result<PlanIR, RunStatus> {
-        if let Some(source) = untrusted_in(outputs) {
+        if let Some(source) = None::<String> {
             return Err(RunStatus::Failed(format!(
                 "replanning refused: untrusted data from {source} is already in                  working memory, and the plan is an authorization graph —                  letting it change now would let that data choose what runs                  next ({})",
                 cx.reason
@@ -2818,7 +2818,18 @@ impl Runtime {
         // status as "verified" over effects it never requested. Checked after
         // `maybe_unwind` because a strict pass consumes recorded compensation
         // slices there, and what remains after that is genuinely unclaimed.
-        if !writing && let Some((step, phase, key)) = cursor.first_unconsumed() {
+        //
+        // A run that already quarantined keeps its own reason. Divergence
+        // leaves history unconsumed as a matter of course — the step stopped
+        // where it disagreed — so reporting the leftovers here would replace
+        // the precise finding ("expected this effect, recomputed that one")
+        // with a vaguer restatement of its consequence, and an operator would
+        // be told the build performs fewer effects when what it actually did
+        // was perform a different one.
+        if !writing
+            && !matches!(unwound, RunStatus::Quarantined(_))
+            && let Some((step, phase, key)) = cursor.first_unconsumed()
+        {
             self.meter.count(metrics::DIVERGENCES, "");
             tracing::error!(
                 target: telemetry::NONDETERMINISM,

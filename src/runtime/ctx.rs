@@ -938,6 +938,8 @@ impl<'a> StepCtx<'a> {
             effect.attach(&self.provenance(key, ordinal, &descriptor));
 
             // ── Replay: is this attempt already in history? ────────────────
+            self.gate(key, &descriptor, effect.mutates(), outbound)
+                .await?;
             if self.mode.is_replaying() {
                 match self.cursor.next(key)? {
                     Some(EffectReplay::Done { output, spend, .. }) => {
@@ -3446,8 +3448,18 @@ impl StepCtx<'_> {
             // the model half stops carrying it and this half is the only thing
             // between an untrusted memory and a trusted summary.
             //
-            // Sensitivity and provenance above are *not* doubled: each is the
-            // only thing computing its own field, and both are mutation-tested.
+            // Sensitivity is doubled the same way, and the claim that it was
+            // not is what let its mutation look verified: the prompt is built
+            // from these very sources, so the completion's own label already
+            // carries their joined sensitivity, and deleting this line changed
+            // no outcome any test could see. It stays for the same future the
+            // trust half is kept for — a summariser whose output label does
+            // not inherit its input's sensitivity — and the mutation that
+            // proves the guarantee now targets the assignment below, which is
+            // the one place the written summary's sensitivity is decided.
+            //
+            // Provenance is the exception that is genuinely undoubled: nothing
+            // else unions the sources' provenance into the summary.
             if l.trust == crate::core::Trust::Untrusted {
                 trust = crate::core::Trust::Untrusted;
             }

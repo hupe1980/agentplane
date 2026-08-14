@@ -1184,3 +1184,91 @@ async fn a_failed_steps_landed_mutation_is_undone_and_its_rejected_one_is_not() 
          compensated anyway"
     );
 }
+
+/// **A quarantine is never unwound, including where the doubt gate is silent.**
+///
+/// The companion above quarantines on a mutating effect left in doubt, and the
+/// unwind's own doubt check would refuse that case even if the status arm did
+/// not — two controls over one situation, so removing either changes nothing
+/// and the arm reads as verified while nothing tests it. Here the undecided
+/// effect does not mutate: the run still quarantines, because its recovery
+/// mode forbids guessing, and the doubt check counts only mutating effects, so
+/// it sees nothing to object to. What stands between a quarantined run and an
+/// unwind is the status arm alone.
+#[tokio::test]
+async fn a_quarantined_run_is_never_unwound_without_a_mutating_doubt() {
+    // The same refusal where the *evidence* gate cannot help. Above, the
+    // quarantine came from a mutating effect left in doubt, and the unwind's
+    // own doubt check would refuse it even if this status arm did not — two
+    // controls over one case, so removing either changes nothing and the arm
+    // reads as verified while nothing tests it. Here the undecided effect
+    // does not mutate: the run still quarantines (its recovery mode forbids
+    // guessing), and the doubt check, which counts only mutating effects,
+    // sees nothing to object to. The status arm is the only thing standing
+    // between a quarantined run and an unwind.
+    #[derive(Debug)]
+    struct UndecidableRead(Log);
+
+    #[async_trait::async_trait]
+    impl Skill for UndecidableRead {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("c").provides("c")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            #[derive(Debug)]
+            struct ReadsAndTimesOut;
+            #[async_trait::async_trait]
+            impl Effect for ReadsAndTimesOut {
+                type Output = Value;
+                fn descriptor(&self) -> EffectDescriptor {
+                    EffectDescriptor::nullary("test.read")
+                }
+                fn mutates(&self) -> bool {
+                    false
+                }
+                fn recovery(&self) -> Recovery {
+                    Recovery::RequiresOperator
+                }
+                fn retry(&self) -> RetryPolicy {
+                    RetryPolicy::never()
+                }
+                async fn perform(&self) -> Result<Value, EffectError> {
+                    Err(EffectError::Timeout {
+                        driver: "x".into(),
+                        waited_ms: 1,
+                    })
+                }
+            }
+            self.0.lock().unwrap().push("do:c".into());
+            let v = cx.effect(ReadsAndTimesOut).await?;
+            Ok(Outcome::done(v))
+        }
+    }
+
+    let l = log();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let out = Runtime::builder(store as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(Step::new("a", &l))
+        .skill(Step::new("b", &l))
+        .skill(UndecidableRead(Arc::clone(&l)))
+        .build()
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Quarantined(_)),
+        "an undecidable read must still quarantine: {:?}",
+        out.status
+    );
+    assert_eq!(
+        entries(&l),
+        vec!["do:a", "do:b", "do:c"],
+        "a quarantined run was unwound — everything before the undecidable \
+         effect was taken back while the run waits for a human to look at it"
+    );
+}

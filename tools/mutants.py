@@ -131,7 +131,12 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     "UnwindUnderDoubt": (
         "src/runtime/executor.rs",
-        "a_quarantined_run_is_never_unwound",
+        # The companion `a_quarantined_run_is_never_unwound` cannot kill this:
+        # its quarantine comes from a mutating effect in doubt, which the
+        # unwind's own doubt check refuses independently of the status arm.
+        # This one quarantines on a *non-mutating* undecidable effect, where
+        # the arm is the only control standing.
+        "a_quarantined_run_is_never_unwound_without_a_mutating_doubt",
         "a run holding an unknown outcome is unwound anyway",
         "            RunStatus::Failed(_) | RunStatus::Cancelled { .. } => {}",
         "            RunStatus::Failed(_)\n            | RunStatus::Cancelled { .. }\n            | RunStatus::Quarantined(_) => {}",
@@ -2600,8 +2605,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_summary_inherits_the_join_of_what_it_summarised",
         "a summary takes a lower sensitivity than its most sensitive input, so "
         "summarising is a declassification nobody authorised",
-        "            sensitivity = sensitivity.max(l.sensitivity);",
-        "",
+        "        summary_label.sensitivity = sensitivity;",
+        "        summary_label.sensitivity = crate::core::Sensitivity::Public;",
     ),
     "CompactionIgnoresTheCeiling": (
         "src/runtime/ctx.rs",
@@ -2987,8 +2992,12 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a tick that decided nothing still opens and seals a run, so the Merkle "
         "log fills with evidence of inactivity — and a log of nothings is where "
         "the somethings hide",
-        "    const fn new() -> Self {\n        Self {\n            run: None,\n            wrote: false,\n        }\n    }",
-        "    fn new() -> Self {\n        Self {\n            run: Some(RunId::generate()),\n            wrote: false,\n        }\n    }",
+        # Both gates in one edit, because either alone is caught by the other:
+        # a quiet tick has no run *and* has written nothing, so a mutation that
+        # removes only one of them changes no outcome and reports a guarantee
+        # as verified that nothing checked.
+        "        let Some(run) = self.run else {\n            return SweepRecord::Quiet;\n        };\n        if !self.wrote {",
+        "        let run = self.run.unwrap_or_else(RunId::generate);\n        if false {",
     ),
     "ASweepRecordIsNotReachableFromItsCase": (
         "src/runtime/sweeper.rs",
@@ -3100,7 +3109,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a reviewer's refusal fails the run while the refused answer stays a "
         "standing fact the next run reads as established",
         "        if let Some(spec) = oversight.as_ref().filter(|s| s.gates_the_answer()) {",
-        "        self.form_answer(cx, formation, formed_source.clone(), input, model_role)\n"
+        "        self.form_answer(cx, formation, formed_source.clone(), input, role)\n"
         "            .await?;\n"
         "        if let Some(spec) = oversight.as_ref().filter(|s| s.gates_the_answer()) {",
     ),

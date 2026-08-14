@@ -335,11 +335,20 @@ async fn changing_release_evidence_is_replay_divergence() {
         .replay(first.run_id, Mode::Strict)
         .await
         .unwrap();
-    assert!(
-        matches!(replay.status, RunStatus::Quarantined(_)),
-        "changed release evidence rewrote history: {:?}",
-        replay.status
-    );
+    // The *reason* is the assertion, not the quarantine. A strict pass that
+    // stopped consulting history at all would also quarantine this run — it
+    // would fall through to the live path, request an effect the journal has
+    // no room for, and report a replay overrun — so "it quarantined" is a
+    // symptom the environment produces without the control under test. The
+    // recorded release has to be compared and found different.
+    match replay.status {
+        RunStatus::Quarantined(why) => assert!(
+            why.contains("non-determinism"),
+            "the release was not compared against the recorded one; the run \
+             quarantined for another reason entirely: {why}"
+        ),
+        other => panic!("changed release evidence rewrote history: {other:?}"),
+    }
 }
 
 /// A denied effect never reaches the world, and the one before it still did.
