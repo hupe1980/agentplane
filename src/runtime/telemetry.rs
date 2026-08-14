@@ -133,6 +133,8 @@ pub const DEAD_LETTERED: &str = "agentplane.event.dead_lettered";
 pub const DEADLINE_BREACHED: &str = "agentplane.deadline.breached";
 /// A sleeping run's instant arrived.
 pub const TIMER_FIRED: &str = "agentplane.timer.fired";
+/// A run an instance died holding was taken over and resumed.
+pub const RUN_RECOVERED: &str = "agentplane.run.recovered";
 /// Policy refused an action before it was attempted.
 pub const POLICY_DENIED: &str = "agentplane.policy.denied";
 /// A run changed its plan; the successor is journaled beside its predecessor.
@@ -153,6 +155,7 @@ pub const LOUD_EVENTS: &[&str] = &[
     DEAD_LETTERED,
     DEADLINE_BREACHED,
     TIMER_FIRED,
+    RUN_RECOVERED,
     REPLANNED,
     POLICY_DENIED,
 ];

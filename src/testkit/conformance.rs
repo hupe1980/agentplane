@@ -516,7 +516,68 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     a_release_does_not_forget_the_epoch(fresh, &mut r).await;
     a_fenced_caller_cannot_release_the_new_owners_lease(fresh, &mut r).await;
     the_discovery_index_pages_in_a_total_order(fresh, &mut r).await;
+    abandonment_names_the_dead_not_the_finished(fresh, &mut r).await;
     r
+}
+
+/// `abandoned_runs` returns exactly the runs an instance died holding.
+///
+/// The recovery sweep resumes everything this method returns, so both error
+/// directions are expensive: a lapsed-but-held lease it misses is a run
+/// stranded forever, and a released lease it includes is a clean exit
+/// "recovered" — an epoch bump and a replay — on every tick for the rest of
+/// the store's life.
+async fn abandonment_names_the_dead_not_the_finished(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+
+    // One of each fate. The dead instance stops renewing without releasing;
+    // the clean exit releases; the live one holds a lease that has not lapsed.
+    let dead = RunId::generate();
+    let finished = RunId::generate();
+    let alive = RunId::generate();
+    let Ok(_) = store.acquire(dead, "instance-a", SHORT).await else {
+        return;
+    };
+    let Ok(f) = store.acquire(finished, "instance-b", SHORT).await else {
+        return;
+    };
+    if store.release_lease(finished, f.epoch).await.is_err() {
+        r.record("recovery", "release_lease of a held lease failed");
+        return;
+    }
+    let Ok(_) = store.acquire(alive, "instance-c", LEASE).await else {
+        return;
+    };
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    match store.abandoned_runs(10).await {
+        Ok(listed) => {
+            if !listed.contains(&dead) {
+                r.record(
+                    "recovery",
+                    "a lease that expired while still naming an owner was not listed — \
+                     the run its instance died holding is stranded forever",
+                );
+            }
+            if listed.contains(&finished) {
+                r.record(
+                    "recovery",
+                    "a released lease was listed as abandoned — every clean exit would \
+                     be 'recovered' on every tick",
+                );
+            }
+            if listed.contains(&alive) {
+                r.record(
+                    "recovery",
+                    "a live lease was listed as abandoned — the sweep would take a run \
+                     over from under its working owner's heartbeat",
+                );
+            }
+        }
+        Err(e) => r.record("recovery", format!("abandoned_runs failed: {e}")),
+    }
 }
 
 /// The discovery index is newest-first, bounded, and resumes without gap or

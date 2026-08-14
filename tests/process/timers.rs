@@ -145,12 +145,12 @@ async fn a_sweep_wakes_a_run_whose_instant_arrived() {
 
     // Nothing is due yet.
     let quiet = f.rt.fire_timers(Timestamp::now_utc()).await.unwrap();
-    assert_eq!(quiet, 0, "a timer that is not due must not fire");
+    assert_eq!(quiet.fired, 0, "a timer that is not due must not fire");
     assert_eq!(f.woke.load(Ordering::SeqCst), 0);
 
     // Time passes.
     let fired = f.rt.fire_timers(later(120)).await.unwrap();
-    assert_eq!(fired, 1);
+    assert_eq!(fired.fired, 1);
     assert_eq!(
         f.woke.load(Ordering::SeqCst),
         1,
@@ -172,6 +172,70 @@ async fn a_sweep_wakes_a_run_whose_instant_arrived() {
     f.store.verify(out.run_id).await.unwrap();
 }
 
+/// A wake recorded before a crash is not recorded again when the claim
+/// re-fires.
+///
+/// The crash window: last tick appended the wake's `EffectDone` and died
+/// before disarming the timer, so the claim lapses and this tick fires the
+/// same timer again. The retry must be a second *resume*, never a second
+/// record — the journal is the one place a retry may not show up twice.
+#[tokio::test]
+async fn a_refired_timer_does_not_duplicate_the_recorded_wake() {
+    let f = fixture(Duration::from_mins(1));
+    let out =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    let fired = f.rt.fire_timers(later(120)).await.unwrap();
+    assert_eq!(fired.fired, 1);
+
+    // Reconstruct the crash's leftover state: the wake is in the journal, and
+    // the timer row is still armed because the disarm never ran.
+    let records = f.store.read(out.run_id, 1).await.unwrap();
+    let wake = records
+        .iter()
+        .find(|r| {
+            matches!(r.kind(), RecordKind::EffectDone { output, .. }
+                if output.get("fired_at").is_some())
+        })
+        .expect("the wake is on the record");
+    let timer = agentplane::core::Timer {
+        run: out.run_id,
+        case: None,
+        effect: wake.effect_key().unwrap(),
+        step: wake.body.step.unwrap(),
+        phase: wake.body.phase,
+        fire_at: later(60),
+    };
+    (f.store.clone() as Arc<dyn TimerStore>)
+        .arm(&timer)
+        .await
+        .unwrap();
+
+    let refired = f.rt.fire_timers(later(120)).await.unwrap();
+    assert_eq!((refired.fired, refired.failed), (1, 0));
+
+    let after = f.store.read(out.run_id, 1).await.unwrap();
+    let wakes = after
+        .iter()
+        .filter(|r| {
+            matches!(r.kind(), RecordKind::EffectDone { output, .. }
+                if output.get("fired_at").is_some())
+        })
+        .count();
+    assert_eq!(wakes, 1, "the retried wake was appended a second time");
+    assert_eq!(
+        f.store.armed_timers(out.run_id).await.unwrap(),
+        0,
+        "the re-fired timer is retired"
+    );
+    assert_eq!(
+        f.woke.load(Ordering::SeqCst),
+        1,
+        "the work ran exactly once"
+    );
+}
+
 /// **A wake-up is single-delivery.** Two sweeps racing over one store must not
 /// both resume the same run — the same requirement event delivery has, for the
 /// same reason.
@@ -187,7 +251,11 @@ async fn a_timer_fires_exactly_once_across_two_sweeps() {
     let first = f.rt.fire_timers(later(120)).await.unwrap();
     let second = f.rt.fire_timers(later(120)).await.unwrap();
 
-    assert_eq!((first, second), (1, 0), "the second sweep finds nothing");
+    assert_eq!(
+        (first.fired, second.fired),
+        (1, 0),
+        "the second sweep finds nothing"
+    );
     assert_eq!(
         f.woke.load(Ordering::SeqCst),
         1,
@@ -515,7 +583,7 @@ async fn two_concurrent_siblings_can_both_sleep() {
     );
 
     let fired = rt.fire_timers(later(120)).await.unwrap();
-    assert_eq!(fired, 2);
+    assert_eq!(fired.fired, 2);
     assert_eq!(store.armed_timers(out.run_id).await.unwrap(), 0);
 
     let seals: Vec<String> = store

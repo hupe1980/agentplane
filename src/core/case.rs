@@ -321,4 +321,12 @@ pub enum SweptAction {
     TaskExpired,
     /// A task's audience was widened because nobody answered in time.
     TaskEscalated,
+    /// A run an instance died holding was taken over and resumed.
+    ///
+    /// The one action in this vocabulary that is the system healing rather
+    /// than a finding — recorded anyway, because a takeover bumps the run's
+    /// epoch and fences its previous owner, and *who fenced whom, and why*
+    /// must be answerable from the journal rather than inferred from an epoch
+    /// gap. The detail names the outcome the resume reached.
+    RunRecovered,
 }

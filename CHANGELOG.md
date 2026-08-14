@@ -30,6 +30,105 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [Unreleased]
+
+Two audit rounds, two structural closures: recovery gained its initiator, and
+the case layer crossed the export boundary.
+
+### Added — the case layer exports, verifies and restores (format 2)
+
+- **Export format 2 carries every case** — state as stored (sealed stays
+  sealed; plaintext would quietly undo erasure), version, status, correlation,
+  runs, deadlines and blob digests — as `agentplane.export.case` lines, with
+  the count in the trailer. A hard cut from format 1: a reader that tolerated
+  the lines' absence could not tell *this plane had no cases* from *the case
+  layer was dropped*.
+
+  **Why.** Case rows are the one durable structure a journal replay cannot
+  rebuild: they live beside the history, not in it. `agentplane restore` used
+  to rebuild a journal whose records stamp cases that then did not exist —
+  every matter's obligations, correlation and erasure unit gone, in a store
+  whose Merkle roots proved the *journal* faithful.
+
+- **The verifier holds the two halves to each other.** A record stamped with a
+  case the file does not carry is a finding; the trailer's case count against
+  the blocks read is what catches the layer stripped *whole*. The two live
+  questions an offline file cannot answer — blob bytes behind the digests, and
+  sealed-state keys — are reported as unchecked rather than passed.
+
+- **`CaseStore::cases` and `CaseStore::import_case`** (breaking: required
+  trait methods). Enumeration is paged with a cursor, because `by_status`'s
+  uncursored bound would enumerate a prefix and call it everything.
+  `import_case` is the same deployment-authority seam governed memory keeps
+  for direct writes: the ordinary paths cannot say "version 41, escalated,
+  this exact id". The conformance battery holds the import to **every read
+  path** (`case`, `correlate`, `by_status`, `due`, `blobs_of`) on both
+  backends, because an import that rebuilds five indexes out of six reads
+  perfectly until somebody queries the sixth.
+
+- **`to_jsonl`/`from_jsonl` take an optional case store** (breaking); the CLI
+  wires it always — an optional flag would be a way to quietly produce the
+  file the verifier flags.
+
+### Added — the sweep recovers the runs an instance died holding
+
+- **`JournalStore::abandoned_runs`** (breaking: a required method on the store
+  trait) answers one precise question: which leases expired while still naming
+  an owner. The set is exact rather than heuristic because every clean exit —
+  sealed, failed, *suspended* — releases its lease; only a crash skips that
+  call. redb scans its lease table; Postgres gets a partial index
+  (`run_lease_abandoned`) over held rows.
+
+  **Why.** Every resume had an event-shaped driver: an inbound message, a
+  fired timer, an operator, a batch retry. A run crashed mid-step with none of
+  those pending had *no driver at all* — it concluded nothing, so no outcome
+  listing carried it; its wake was consumed, so no waiting list named it; and
+  the operations guide's sentence "lease expires, another instance claims at
+  `epoch + 1`, resumes via replay" described a mechanism with no subject. I13's
+  failure mode, applied to the recovery mechanism itself, and invisible
+  precisely because every *part* was built.
+
+- **The sweep's recovery pass** drains that queue: bounded batch (32, small on
+  purpose — a recovered run executes live from its frontier, which may
+  dispatch a model call), per-run failure containment, `LeaseHeld` treated as
+  another instance getting there first rather than as an error, and the one
+  degenerate case — a lease over an **empty** journal, an admission that died
+  before its first append — cleared rather than retried forever. Each takeover
+  is written into the sweep's own sealed run as **`SweptAction::RunRecovered`**
+  (breaking: new enum variant), because a takeover fences the previous owner
+  and *who fenced whom* must be answerable from the journal. `SweepReport`
+  carries `runs_recovered` and `recovery_failures`; only failures page.
+
+### Fixed — sweep evidence survives the tick's own failure
+
+- **The ledger sealed only after every phase succeeded**, so an error in a
+  later phase (the timer backend unreachable, say) left with the account of
+  breaches and expiries the earlier phases had already applied to state — no
+  sealed run, and not even `evidence_lost`, because the report died with the
+  error. Evidence already earned is now sealed before any phase's error
+  propagates. A mutation that reorders the two is killed by
+  `sweep_evidence_survives_a_later_phase_failure`.
+
+### Fixed — one bad run no longer blocks the timer batch
+
+- **`fire_timers` returns `WokenRuns { fired, failed }`** (breaking: it
+  returned the fired count) and contains per-timer failures instead of
+  aborting the batch at the first error — a single unresumable run held a veto
+  over every later wake in the tick. A failed wake is not lost: the lease it
+  acquired lapses unreleased, and the recovery pass picks the run up.
+- **A re-fired timer no longer appends a duplicate wake.** A crash between the
+  wake's append and the timer's disarm left both standing, and the re-claimed
+  timer wrote the wake into the chain a second time. The retry is now a second
+  *resume*, never a second record.
+
+### Audit notes
+
+- MCP 2026-07-28 and A2A 1.0.x remain the current baselines; no spec drift.
+- [2608.02645] (verified tool calls under non-atomic failures) recorded in
+  §11.1 as experimental corroboration of the reconciliation design, not a gap.
+
+[2608.02645]: https://arxiv.org/abs/2608.02645
+
 ## [0.15.0] — 2026-08-12
 
 Six things a regulated deployment ran into, and each is the same shape: a

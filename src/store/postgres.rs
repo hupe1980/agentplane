@@ -115,6 +115,15 @@ CREATE TABLE IF NOT EXISTS run_lease (
     PRIMARY KEY (tenant, run_id)
 );
 
+-- The recovery sweep's read: leases that expired without being released. A
+-- partial index over held rows only, because released rows blank the owner and
+-- dominate the table — every run ever admitted leaves one, since the epoch
+-- lives in the row and deleting it would un-fence the run. Without the WHERE
+-- clause this index would be mostly rows the query filters out.
+CREATE INDEX IF NOT EXISTS run_lease_abandoned
+    ON run_lease (tenant, expires_at)
+    WHERE owner <> '';
+
 -- An operator's stop request. Beside the chain rather than in it, and
 -- deliberately not fenced: whoever wants a run stopped is not its owner, holds
 -- no epoch, and is usually asking because the owner is busy. The primary key
@@ -897,6 +906,36 @@ impl JournalStore for PostgresStore {
             owner: owner.to_owned(),
             epoch,
         })
+    }
+
+    async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        // `owner <> ''` is the released/held distinction — release blanks the
+        // owner rather than deleting the row, because the epoch lives in it.
+        // The partial index `run_lease_abandoned` serves exactly this shape.
+        //
+        // Oldest expiry first, so a bounded page cannot starve the run that has
+        // been stranded longest behind fresher failures.
+        let rows = client
+            .query(
+                "SELECT run_id FROM run_lease
+                  WHERE tenant = $1 AND owner <> '' AND expires_at <= $2
+                  ORDER BY expires_at ASC
+                  LIMIT $3",
+                &[
+                    &self.tenant_name(),
+                    &now_secs().cast_signed(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        rows.iter()
+            .map(|row| {
+                let id: String = row.get(0);
+                RunId::parse(&id).map_err(|e| StoreError::Backend(format!("bad run id: {e}")))
+            })
+            .collect()
     }
 
     async fn release_lease(&self, run: RunId, epoch: Epoch) -> Result<(), StoreError> {

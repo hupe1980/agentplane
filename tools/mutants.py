@@ -4564,6 +4564,74 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
             ) {""",
         """            if false {""",
     ),
+    "TheRecoverySweepNeverRuns": (
+        "src/runtime/sweeper.rs",
+        "the_sweep_recovers_a_run_its_owner_died_holding",
+        "the sweep stops taking over the runs an instance died holding, so a "
+        "crashed run with no pending timer and no inbound event has no driver "
+        "— it appears in no backlog and waits forever while looking exactly "
+        "like work in progress",
+        "            self.recover_abandoned(&mut report, &mut ledger).await?;",
+        "",
+    ),
+    "AReleasedLeaseReadsAsAbandoned": (
+        "src/store/redb.rs",
+        "an_expired_unreleased_lease_marks_a_run_abandoned",
+        "the abandonment scan stops distinguishing a released lease from a "
+        "lapsed one, so every run that ever exited cleanly is 'recovered' on "
+        "every tick — an epoch bump and a replay per run per tick, forever, "
+        "reported as healing",
+        "                if owner.is_empty() || expires_at > now {",
+        "                if expires_at > now {",
+    ),
+    "SweepEvidenceLeavesWithTheError": (
+        "src/runtime/sweeper.rs",
+        "sweep_evidence_survives_a_later_phase_failure",
+        "the ledger is sealed only after every phase succeeds, so a later "
+        "phase's error drops the account of decisions the earlier phases "
+        "already applied to state — the exact failure the ledger exists to "
+        "prevent, reintroduced by control flow",
+        "        match ledger.seal(self.store()).await {\n            SweepRecord::Quiet => {}\n            SweepRecord::Recorded(run) => report.record = Some(run),\n            SweepRecord::EvidenceLost => report.evidence_lost = true,\n        }\n        phases?;",
+        "        phases?;\n        match ledger.seal(self.store()).await {\n            SweepRecord::Quiet => {}\n            SweepRecord::Recorded(run) => report.record = Some(run),\n            SweepRecord::EvidenceLost => report.evidence_lost = true,\n        }",
+    ),
+    "ARefiredWakeIsRecordedTwice": (
+        "src/runtime/sweeper.rs",
+        "a_refired_timer_does_not_duplicate_the_recorded_wake",
+        "a timer re-fired after a crash between append and disarm writes its "
+        "wake into the journal a second time — and the journal is the one "
+        "place a retry must never show up twice",
+        "        if !already_recorded {",
+        "        if true {",
+    ),
+    "ACutCaseLayerReadsAsComplete": (
+        "src/export.rs",
+        "a_dropped_case_layer_is_a_finding_not_a_quiet_file",
+        "the verifier stops comparing the trailer's case count against the "
+        "blocks it read, so an export stripped of its whole case layer reads "
+        "as a complete, sound file from a plane that simply had no cases — "
+        "while its own trailer says otherwise",
+        "    if let Some(declared) = value.get(\"cases\").and_then(serde_json::Value::as_u64)\n        && declared != report.cases as u64",
+        "    if let Some(declared) = value.get(\"cases\").and_then(serde_json::Value::as_u64)\n        && false && declared != report.cases as u64",
+    ),
+    "AnImportForgetsCorrelation": (
+        "src/store/redb_cases.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "import_case rebuilds every index except the open-correlation half, so "
+        "a restored matter is invisible to correlation and the next inbound "
+        "message about it opens a duplicate case — the index-drift failure the "
+        "read-path battery exists to catch",
+        "                    if case.status != CaseStatus::Closed {\n                        let prior = corr_open",
+        "                    if false && case.status != CaseStatus::Closed {\n                        let prior = corr_open",
+    ),
+    "CaseEnumerationServesAPageTwice": (
+        "src/store/redb_cases.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "the enumeration cursor stops excluding the id the caller already saw, "
+        "so consecutive pages overlap and an export carries a matter twice — "
+        "which the verifier then reads as a duplicate",
+        "                    if Some(id) == cursor.as_deref() {\n                        continue;\n                    }",
+        "",
+    ),
 }
 
 

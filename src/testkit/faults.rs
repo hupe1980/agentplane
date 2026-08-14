@@ -372,6 +372,10 @@ impl JournalStore for Faulty {
         self.inner.release_lease(run, epoch).await
     }
 
+    async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
+        self.inner.abandoned_runs(limit).await
+    }
+
     async fn seal(&self, run: RunId, epoch: Epoch, outcome: &str) -> Result<Digest, StoreError> {
         self.inner.seal(run, epoch, outcome).await
     }

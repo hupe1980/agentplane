@@ -25,4 +25,4 @@ pub use executor::{
     LEASE_TTL, MIN_LEASE_TTL, RunOutcome, RunStatus, Runtime, RuntimeBuilder, SEALED_OUTCOMES,
 };
 pub use group::{EffectGroup, Invariant};
-pub use sweeper::{Saturation, SweepReport};
+pub use sweeper::{Saturation, SweepReport, WokenRuns};

@@ -814,3 +814,158 @@ fn a_lease_too_short_to_renew_is_refused() {
         .lease_ttl(Duration::from_secs(1))
         .build();
 }
+
+/// The harness establishing "now" for a sweep tick — a test driving the
+/// runtime from outside, not a step smuggling non-determinism past the
+/// journal, which is what the lint guards against.
+#[allow(clippy::disallowed_methods)]
+fn sweep_now() -> agentplane::core::Timestamp {
+    agentplane::core::Timestamp::now_utc()
+}
+
+// ── The recovery sweep ──────────────────────────────────────────────────────
+//
+// Fencing makes takeover safe and replay makes it correct, but neither makes
+// it *happen*. A run whose owner died holding it has no driver: it concluded
+// nothing, so no outcome listing carries it; its wake was consumed, so no
+// waiting list names it. The sweep's recovery pass is the component that
+// notices — an expired lease that still names an owner is exactly "an
+// instance died holding this run", because every clean exit releases.
+
+/// The store-level contract: live and released leases are invisible; an
+/// expired, unreleased one is the abandonment signal.
+#[tokio::test]
+async fn an_expired_unreleased_lease_marks_a_run_abandoned() {
+    use std::time::Duration;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let journal: Arc<dyn JournalStore> = store;
+    let run = agentplane::core::RunId::generate();
+
+    // Held and live: not abandoned, whoever holds it is presumed working.
+    let lease = journal
+        .acquire(run, "instance-a", Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(
+        journal.abandoned_runs(10).await.unwrap().is_empty(),
+        "a live lease is not abandonment"
+    );
+
+    // Released: the owner exited cleanly, whatever the outcome was.
+    journal.release_lease(run, lease.epoch).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        journal.abandoned_runs(10).await.unwrap().is_empty(),
+        "a released lease is a clean exit, not a death"
+    );
+
+    // Held and lapsed: the owner stopped renewing without handing it back.
+    journal
+        .acquire(run, "instance-b", Duration::from_secs(2))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        journal.abandoned_runs(10).await.unwrap(),
+        vec![run],
+        "an expired lease that still names an owner is an instance that died \
+         holding the run"
+    );
+}
+
+/// **The liveness property.** A run stranded by a dead instance is found and
+/// resumed by the sweep — no event, no timer, no operator.
+#[tokio::test]
+async fn the_sweep_recovers_a_run_its_owner_died_holding() {
+    use std::time::Duration;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let crash_at = Arc::new(AtomicUsize::new(0));
+    let calls = tally();
+    let rt = Runtime::builder(store.clone())
+        .skill(pipeline(&crash_at, &calls))
+        .build();
+
+    // A run dies after stage 0 — and, unlike an orderly failure, its "owner"
+    // then vanishes holding the lease, the way a killed process does.
+    let first = rt
+        .run("pipeline", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(matches!(first.status, RunStatus::Failed(_)));
+    (store.clone() as Arc<dyn JournalStore>)
+        .acquire(first.run_id, "dead-instance", Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    crash_at.store(NO_CRASH, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let report = rt
+        .sweep(sweep_now(), Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!(report.runs_recovered, 1, "the sweep took the run over");
+    assert_eq!(report.recovery_failures, 0);
+    assert!(
+        report.record.is_some(),
+        "a takeover bumps the epoch and fences the dead owner; who fenced \
+         whom must be answerable from the sweep's own sealed run"
+    );
+
+    // The resume continued rather than restarted: stage 0 once ever.
+    assert_eq!(calls[0].load(Ordering::SeqCst), 1);
+    assert_eq!(calls[1].load(Ordering::SeqCst), 1);
+    assert_eq!(calls[2].load(Ordering::SeqCst), 1);
+    assert!(
+        (store.clone() as Arc<dyn JournalStore>)
+            .runs_by_outcome("succeeded", 10)
+            .await
+            .unwrap()
+            .contains(&first.run_id)
+    );
+
+    // Recovered means recovered: the next tick finds nothing.
+    let again = rt
+        .sweep(sweep_now(), Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!(again.runs_recovered, 0, "recovery is not a loop");
+    assert_eq!(again.recovery_failures, 0);
+}
+
+/// A lease with nothing under it — admission died between acquiring and its
+/// first append — is cleared rather than retried forever.
+#[tokio::test]
+async fn a_lease_over_an_empty_journal_is_cleared_not_retried() {
+    use std::time::Duration;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone()).build();
+
+    let ghost = agentplane::core::RunId::generate();
+    (store.clone() as Arc<dyn JournalStore>)
+        .acquire(ghost, "dead-instance", Duration::from_secs(2))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let report = rt
+        .sweep(sweep_now(), Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.runs_recovered, report.recovery_failures),
+        (1, 0),
+        "no run exists, so clearing the lease is the whole recovery — the \
+         failure arm would retry a resume that cannot exist, every tick, forever"
+    );
+
+    let again = rt
+        .sweep(sweep_now(), Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!(again.runs_recovered, 0);
+    assert_eq!(again.recovery_failures, 0);
+}

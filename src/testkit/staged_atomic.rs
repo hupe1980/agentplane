@@ -168,6 +168,10 @@ impl JournalStore for StagedAtomic {
         self.inner.release_lease(run, epoch).await
     }
 
+    async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
+        self.inner.abandoned_runs(limit).await
+    }
+
     async fn runs_by_outcome(
         &self,
         outcome: &str,

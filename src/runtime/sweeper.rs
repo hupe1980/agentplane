@@ -6,19 +6,22 @@
 //! window that nothing announced is indistinguishable, from the outside, from
 //! one that was met.
 //!
-//! One tick does five things:
+//! One tick does six things:
 //!
 //! | Finding | What happens |
 //! |---|---|
+//! | An instance died holding a run | The run is taken over at the next epoch and resumed |
 //! | An obligation is approaching | `DeadlineTransition` to `Warned` |
 //! | An obligation has passed unmet | `DeadlineTransition` to `Breached`; the case is escalated |
 //! | A human task's window closed | The declared `on_expiry` is applied — never decided in the moment |
 //! | An event nobody claimed aged out | Dead-lettered with a reason |
 //! | A sleeping run's instant arrived | The wake-up is journaled and the run resumes |
 //!
-//! Four of those are loud. The fifth is the system working: a fired timer is
-//! reported so a quiet plane is distinguishable from a stalled one, not so
-//! somebody is paged.
+//! The middle four are loud. The first and the last are the system working — a
+//! recovered run and a fired timer are reported so a quiet plane is
+//! distinguishable from a stalled one, not so somebody is paged. A recovery
+//! still means an *instance* died, which is worth a look for a different
+//! reason than any run.
 
 use std::sync::Arc;
 
@@ -174,6 +177,21 @@ enum SweepRecord {
     EvidenceLost,
 }
 
+/// What one timer pass did: wakes delivered, and wakes that died trying.
+///
+/// Two numbers rather than one, because they call for opposite responses. A
+/// fired timer is the system working; a failed one is a run whose wake is now
+/// late, healing through the recovery pass rather than through this one. A
+/// single count would let the second hide inside the first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WokenRuns {
+    /// Sleeping runs resumed because their instant arrived.
+    pub fired: usize,
+    /// Due timers whose wake or resume failed; retried by claim expiry, and a
+    /// wake that was already recorded reaches the recovery pass.
+    pub failed: usize,
+}
+
 /// Which sweeps hit their cap this tick.
 ///
 /// A bounded query returns a list shaped exactly like a complete one, so a tick
@@ -186,6 +204,12 @@ enum SweepRecord {
 /// on deadlines specifically should not be matching on a message, and a field
 /// added here is a field the compiler makes every reader consider.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// Four bools is what this struct *is*: one independent yes/no per capped
+// sweep, each meaning "that backlog may be deeper than this tick saw". They
+// are not a state machine wearing flags — no combination is invalid — and an
+// enum over sixteen combinations would be the lint satisfied at the reader's
+// expense.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Saturation {
     /// Timers fired up to the cap; more may have been due.
     pub timers: bool,
@@ -193,6 +217,8 @@ pub struct Saturation {
     pub deadlines: bool,
     /// Expired tasks handled up to the cap; more may have been overdue.
     pub tasks: bool,
+    /// Abandoned runs recovered up to the cap; more may have been stranded.
+    pub recovery: bool,
 }
 
 impl Saturation {
@@ -202,7 +228,7 @@ impl Saturation {
     /// cap was all there was.
     #[must_use]
     pub const fn any(self) -> bool {
-        self.timers || self.deadlines || self.tasks
+        self.timers || self.deadlines || self.tasks || self.recovery
     }
 }
 
@@ -219,6 +245,13 @@ impl Saturation {
 const TIMER_BATCH: usize = 128;
 const DEADLINE_BATCH: usize = 512;
 const TASK_BATCH: usize = 512;
+/// The smallest cap of the four, deliberately. Recovering a run is not a row
+/// update: it replays the run's journal and then executes **live** from the
+/// frontier, which may dispatch a model call. One tick therefore takes on a
+/// bounded number of resurrections, and a mass failure — a whole instance's
+/// worth of runs orphaned at once — drains over several ticks with the
+/// saturation flag up rather than holding one tick hostage for the duration.
+const RECOVERY_BATCH: usize = 32;
 
 /// What one tick found and did.
 ///
@@ -237,6 +270,27 @@ pub struct SweepReport {
     /// Not a number to alert on — a fired timer is the system working. It is
     /// reported so a quiet plane is distinguishable from a stalled one.
     pub timers_fired: usize,
+    /// Wake-ups whose resume failed after the wake was durably recorded.
+    ///
+    /// The timer is gone but the run has not moved. It is not lost: the lease
+    /// the wake acquired lapses unreleased, and the recovery pass picks the
+    /// run up on a later tick — but a failure on this path means wakes are
+    /// arriving late, and a human should know why the first attempt died.
+    pub wake_failures: usize,
+    /// Runs taken over and resumed because their owner's lease lapsed without
+    /// release — an instance died holding them.
+    ///
+    /// Each is a crash the plane healed. The healing is routine; the dying is
+    /// not, so [`needs_attention`](Self::needs_attention) stays quiet about
+    /// this count only when it is zero **and** nothing failed — a steady
+    /// recovery rate with healthy instances is a contradiction worth seeing.
+    pub runs_recovered: usize,
+    /// Abandoned runs the recovery pass tried to resume and could not.
+    ///
+    /// The run stays listed and is retried next tick, so a persistent count
+    /// here is one stuck run rather than many — but it is stuck, nothing else
+    /// will unstick it, and the reason is in the log of the tick that failed.
+    pub recovery_failures: usize,
     /// Which sweeps came back **full**, and therefore may not have seen
     /// everything that was waiting.
     pub saturated: Saturation,
@@ -276,6 +330,12 @@ impl SweepReport {
             // A decision whose evidence never landed is the I13 failure this
             // report exists to surface: the state moved and the record did not.
             || self.evidence_lost
+            // A recovery that keeps failing is a run nothing else will
+            // unstick; a wake whose resume died is a run arriving late.
+            // Recoveries that *succeeded* stay off this list — they are the
+            // plane healing, findable in the report and the sweep's own run.
+            || self.recovery_failures > 0
+            || self.wake_failures > 0
     }
 
     #[must_use]
@@ -296,6 +356,9 @@ impl SweepReport {
             && self.tasks_escalated == 0
             && self.dead_lettered == 0
             && self.timers_fired == 0
+            && self.wake_failures == 0
+            && self.runs_recovered == 0
+            && self.recovery_failures == 0
     }
 }
 
@@ -316,30 +379,48 @@ impl Runtime {
         let mut report = SweepReport::default();
         let mut ledger = SweepLedger::new();
 
-        report.warned += self.sweep_deadlines(now, &mut report, &mut ledger).await?;
-        self.sweep_tasks(now, &mut report, &mut ledger).await?;
+        // The fallible phases, folded into one result so the ledger outlives
+        // whichever of them fails. The deadline pass may have breached an
+        // obligation *into state* before a later phase errored, and evidence
+        // already earned must not leave with the error — a `?` past an
+        // unsealed ledger is the sweep silently dropping the account of
+        // decisions it already applied, which is the exact failure the ledger
+        // exists to prevent, reintroduced by control flow.
+        let phases: Result<(), RuntimeError> = async {
+            // Recovery first: an abandoned run may be one step from meeting a
+            // deadline the pass below would otherwise breach.
+            self.recover_abandoned(&mut report, &mut ledger).await?;
+            report.warned += self.sweep_deadlines(now, &mut report, &mut ledger).await?;
+            self.sweep_tasks(now, &mut report, &mut ledger).await?;
 
-        if self.events().is_some() {
-            report.dead_lettered = self.sweep_events(event_grace).await?;
-        }
-        if self.timers().is_some() {
-            report.timers_fired = self.fire_timers(now).await?;
-            // `fire_timers` is public and answers "how many fired", so the cap
-            // is checked here rather than folded into its return type: a
-            // caller asking for a count should not have to destructure a
-            // saturation signal it did not ask about.
-            if report.timers_fired >= TIMER_BATCH {
-                report.saturated.timers = true;
+            if self.events().is_some() {
+                report.dead_lettered = self.sweep_events(event_grace).await?;
             }
+            if self.timers().is_some() {
+                let woken = self.fire_timers(now).await?;
+                report.timers_fired = woken.fired;
+                report.wake_failures = woken.failed;
+                // Failed wakes consumed claims too, so the cap is judged on
+                // the whole batch: a tick that failed its way through the cap
+                // has seen as little of the backlog as one that fired it.
+                if woken.fired + woken.failed >= TIMER_BATCH {
+                    report.saturated.timers = true;
+                }
+            }
+            Ok(())
         }
+        .await;
 
         // Written before the census so the record covers the decisions, not the
-        // reading. A tick that decided nothing writes nothing.
+        // reading. A tick that decided nothing writes nothing — and a tick that
+        // decided something and then *errored* still writes, which is why this
+        // sits outside the block above rather than after a `?`.
         match ledger.seal(self.store()).await {
             SweepRecord::Quiet => {}
             SweepRecord::Recorded(run) => report.record = Some(run),
             SweepRecord::EvidenceLost => report.evidence_lost = true,
         }
+        phases?;
 
         // Observed last, so the reading reflects what this sweep just resolved
         // rather than the backlog it was about to clear.
@@ -347,6 +428,104 @@ impl Runtime {
         self.meter().census(&report.census);
 
         Ok(report)
+    }
+
+    /// Take over and resume the runs an instance died holding.
+    ///
+    /// The candidate set is exact, not heuristic: every clean exit — sealed,
+    /// failed, suspended — hands its lease back, so a lease that **expired
+    /// without release** names a run somebody was executing when their process
+    /// stopped. Fencing makes this takeover safe (the resume bumps the epoch,
+    /// and the store refuses the dead owner's next append), replay makes it
+    /// correct (completed effects are read back, never redone), and this pass
+    /// is what makes it *happen* — without it, a crashed run with no pending
+    /// timer and no inbound event has no driver, appears in no backlog, and
+    /// waits forever while looking exactly like work in progress.
+    ///
+    /// Per-run failures are contained: one unresumable run is counted, logged
+    /// and retried next tick rather than blocking the runs behind it. A lease
+    /// held by someone else is not a failure at all — another instance got
+    /// there first, which is the mechanism working.
+    async fn recover_abandoned(
+        &self,
+        report: &mut SweepReport,
+        ledger: &mut SweepLedger,
+    ) -> Result<(), RuntimeError> {
+        let stranded = self
+            .store()
+            .abandoned_runs(RECOVERY_BATCH)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        if stranded.len() >= RECOVERY_BATCH {
+            report.saturated.recovery = true;
+        }
+        for run in stranded {
+            match self.replay(run, Mode::Resume).await {
+                Ok(outcome) => {
+                    // A resume that concluded released its lease on the way
+                    // out. The one path that does not is the closed-run
+                    // no-op — a crash landed between `seal` and the release —
+                    // and without this the same sealed run would be "recovered"
+                    // every tick forever. Acquire-then-release is how a party
+                    // with no epoch clears a lease it does not hold; a live
+                    // lease refuses the acquire, which is the guard working.
+                    if let Ok(lease) = self.store().acquire(run, self.owner_id(), LEASE_TTL).await {
+                        let _ = self.store().release_lease(run, lease.epoch).await;
+                    }
+                    let status = outcome.status.as_str().to_owned();
+                    tracing::info!(
+                        target: super::telemetry::RUN_RECOVERED,
+                        %run,
+                        outcome = %status,
+                    );
+                    self.meter().count(metrics::RUNS_RECOVERED, &status);
+                    ledger.note(
+                        None,
+                        run.to_string(),
+                        SweptAction::RunRecovered,
+                        Some(format!(
+                            "taken over after its owner's lease lapsed without \
+                             release; resumed to '{status}'"
+                        )),
+                    );
+                    report.runs_recovered += 1;
+                }
+                // Someone else holds it live: a second instance's recovery —
+                // or the owner back from a stall, about to be fenced. Either
+                // way it is being handled, and counting it as a failure would
+                // page an operator about a race the design already settles.
+                Err(RuntimeError::Store(StoreError::LeaseHeld { .. })) => {}
+                // A lease over an **empty** journal: admission acquired and
+                // died before its first append landed. There is no run — the
+                // atomic admission batch never committed, so nothing was
+                // declared, authorized or performed. Clearing the lease is the
+                // whole recovery; leaving this to the failure arm below would
+                // retry a resume that cannot exist, every tick, forever.
+                Err(RuntimeError::Store(StoreError::NotFound(_))) => {
+                    if let Ok(lease) = self.store().acquire(run, self.owner_id(), LEASE_TTL).await {
+                        let _ = self.store().release_lease(run, lease.epoch).await;
+                    }
+                    ledger.note(
+                        None,
+                        run.to_string(),
+                        SweptAction::RunRecovered,
+                        Some(
+                            "its owner died between acquiring the lease and the \
+                             admission append; no run exists, so clearing the \
+                             lease is the whole recovery"
+                                .to_owned(),
+                        ),
+                    );
+                    report.runs_recovered += 1;
+                }
+                Err(error) => {
+                    tracing::error!(%run, %error, "an abandoned run could not be resumed");
+                    self.meter().count(metrics::RECOVERY_FAILURES, "");
+                    report.recovery_failures += 1;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Read the gauges: how much is open right now.
@@ -383,7 +562,15 @@ impl Runtime {
     /// wake-up as the sleeping effect's result, then let replay do the rest.
     /// The resumed run reads the timer back like any other completed effect,
     /// so none of the suspension machinery exists twice.
-    pub async fn fire_timers(&self, now: Timestamp) -> Result<usize, RuntimeError> {
+    ///
+    /// One run's failure does not block the runs behind it. The batch used to
+    /// stop at the first error, which handed a single unresumable run a veto
+    /// over every later wake in the tick — and the failed run heals anyway:
+    /// its wake was recorded under a lease this pass acquired and never
+    /// released, so the recovery pass finds it once that lease lapses. The
+    /// failure is counted rather than returned, because a caller that got a
+    /// count and an error would have neither.
+    pub async fn fire_timers(&self, now: Timestamp) -> Result<WokenRuns, RuntimeError> {
         let timers = self.timers().ok_or_else(|| {
             RuntimeError::PlanContract(
                 "this runtime has no timer store — build it with `.timers(store)`".into(),
@@ -394,14 +581,51 @@ impl Runtime {
             .claim_due(now, TIMER_BATCH)
             .await
             .map_err(RuntimeError::from_store)?;
-        let mut fired = 0;
+        let mut woken = WokenRuns::default();
         for timer in due {
-            let lease = self
-                .store()
-                .acquire(timer.run, self.owner_id(), LEASE_TTL)
-                .await
-                .map_err(RuntimeError::from_store)?;
+            match self.fire_one(&timer).await {
+                Ok(()) => woken.fired += 1,
+                Err(error) => {
+                    tracing::error!(
+                        run = %timer.run,
+                        step = %timer.step,
+                        %error,
+                        "a due timer's wake failed; the claim lease retries it, \
+                         and a wake recorded before the failure reaches the \
+                         recovery pass",
+                    );
+                    woken.failed += 1;
+                }
+            }
+        }
 
+        Ok(woken)
+    }
+
+    /// Record one timer's wake and resume its run.
+    async fn fire_one(&self, timer: &crate::core::Timer) -> Result<(), RuntimeError> {
+        let lease = self
+            .store()
+            .acquire(timer.run, self.owner_id(), LEASE_TTL)
+            .await
+            .map_err(RuntimeError::from_store)?;
+
+        // A crash between last tick's append and its disarm leaves the wake
+        // recorded and the timer armed, so this claim fires again. The check
+        // makes that a second *resume*, not a second record: an append here
+        // would put a duplicate wake in the chain, and the journal is the one
+        // place a retry must never show up twice.
+        let already_recorded = self
+            .store()
+            .read(timer.run, 1)
+            .await
+            .map_err(RuntimeError::from_store)?
+            .iter()
+            .any(|record| {
+                record.effect_key() == Some(timer.effect)
+                    && matches!(record.kind(), RecordKind::EffectDone { .. })
+            });
+        if !already_recorded {
             let mut record = Append::new(
                 timer.run,
                 RecordKind::EffectDone {
@@ -427,24 +651,23 @@ impl Runtime {
                 .append(lease.epoch, vec![record])
                 .await
                 .map_err(RuntimeError::from_store)?;
-
-            timers
-                .disarm(timer.run, timer.effect)
-                .await
-                .map_err(RuntimeError::from_store)?;
-
-            tracing::info!(
-                target: super::telemetry::TIMER_FIRED,
-                run = %timer.run,
-                step = %timer.step,
-                due = %timer.fire_at,
-            );
-            self.meter().count(metrics::TIMERS_FIRED, "");
-            self.replay(timer.run, Mode::Resume).await?;
-            fired += 1;
         }
 
-        Ok(fired)
+        self.timers()
+            .ok_or_else(|| RuntimeError::PlanContract("timer store vanished mid-sweep".into()))?
+            .disarm(timer.run, timer.effect)
+            .await
+            .map_err(RuntimeError::from_store)?;
+
+        tracing::info!(
+            target: super::telemetry::TIMER_FIRED,
+            run = %timer.run,
+            step = %timer.step,
+            due = %timer.fire_at,
+        );
+        self.meter().count(metrics::TIMERS_FIRED, "");
+        self.replay(timer.run, Mode::Resume).await?;
+        Ok(())
     }
 
     /// Warn on approaching obligations; escalate breached ones.

@@ -114,7 +114,7 @@ async fn a_compensation_may_sleep_before_it_reverses() {
         "a compensation that sleeps suspends the run"
     );
     assert_eq!(
-        rt.fire_timers(later(120)).await.unwrap(),
+        rt.fire_timers(later(120)).await.unwrap().fired,
         1,
         "the compensation's own timer fires"
     );

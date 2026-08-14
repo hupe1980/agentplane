@@ -73,6 +73,52 @@ pub trait CaseStore: Send + Sync + Debug {
     /// call site ambiguous.
     async fn case(&self, id: CaseId) -> Result<Option<Case>, StoreError>;
 
+    /// Every case, one bounded page at a time, in stable id order.
+    ///
+    /// This is the export's read. `by_status` cannot serve it: a bounded list
+    /// with no cursor enumerates a prefix and calls it everything — the silent
+    /// truncation this project refuses elsewhere, at the one boundary whose
+    /// whole job is completeness. `after` is the last id a caller saw, and
+    /// paging resumes strictly beyond it.
+    ///
+    /// Ordered by id rather than by anything business-shaped, because the
+    /// order's only job is that two pages never overlap and never gap.
+    ///
+    /// Returns state **as stored**. A sealing decorator does not open it here,
+    /// unlike [`case`](Self::case): this read exists for the export, and an
+    /// export of plaintext would quietly undo erasure — the key destroyed
+    /// tomorrow would no longer reach the copy taken today.
+    async fn cases(&self, after: Option<CaseId>, limit: usize) -> Result<Vec<Case>, StoreError>;
+
+    /// Write one complete case, exactly as given — an **import authority**, not
+    /// a runtime path.
+    ///
+    /// The ordinary write paths refuse to say some of what a restore must:
+    /// `put_state` allocates versions one at a time, `correlate_or_open` mints
+    /// a fresh id, and neither can reproduce a case at version 4 000 with the
+    /// id every exported record already names. This is the same seam governed
+    /// memory keeps for the same reason — direct complete-item writes are a
+    /// deployment/import authority at the store boundary, never something a
+    /// skill reaches.
+    ///
+    /// Implementations must leave the imported case reachable by **every**
+    /// read path — `case`, `correlate`, `by_status`, `due`, `blobs_of` — which
+    /// is what the conformance battery holds them to: the read paths are the
+    /// check on this method's index maintenance, because an import that
+    /// rebuilds five indexes out of six reads perfectly until somebody queries
+    /// the sixth.
+    ///
+    /// # Errors
+    ///
+    /// A store that already holds this case id refuses: a restore rebuilds a
+    /// case layer, it does not merge one.
+    async fn import_case(
+        &self,
+        case: &Case,
+        deadlines: &[Deadline],
+        blobs: &[Digest],
+    ) -> Result<(), StoreError>;
+
     /// Record that a run touched this case.
     async fn attach_run(&self, case: CaseId, run: RunId) -> Result<(), StoreError>;
 

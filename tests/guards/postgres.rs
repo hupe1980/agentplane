@@ -484,6 +484,29 @@ async fn journal_is_apart(acme: &PostgresStore, globex: &PostgresStore) {
         0,
         "another tenant's chain head leaked, which tells them a run exists"
     );
+
+    // A dead run is not another tenant's to recover. The recovery sweep
+    // *resumes* everything `abandoned_runs` returns, so a cross-tenant row is
+    // not a leaked identifier — it is another tenant's run executed under this
+    // plane's identity, policy engine and budget.
+    let dead = RunId::generate();
+    acme.acquire(dead, "acme-doomed", std::time::Duration::from_secs(1))
+        .await
+        .expect("acme leases");
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    let theirs = globex.abandoned_runs(10).await.expect("globex sweeps");
+    assert!(
+        !theirs.contains(&dead),
+        "another tenant's dead run was offered for recovery"
+    );
+    assert!(
+        acme.abandoned_runs(10)
+            .await
+            .expect("acme sweeps")
+            .contains(&dead),
+        "the owning tenant must still find its own dead run, or the scoping \
+         removed the feature rather than isolating it"
+    );
 }
 
 /// A business key two tenants both use opens two cases, not one.

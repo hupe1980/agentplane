@@ -107,10 +107,15 @@ Both verbs take a store and nothing else — no manifest, no source tree, no Rus
 toolchain — because that is what an auditor holds. The export is JSON Lines: a
 header naming the log, its checkpoint and the canonicalization rule the digests
 were computed under; one line per record carrying `prev_hash` and `hash`, so the
-chain can be re-walked from the file alone; and a trailer. The trailer's
-**absence** is how a file cut short by a full disk or a killed pipe is told from
-a complete one, and any run that could not be read is named in it rather than
-quietly missing.
+chain can be re-walked from the file alone; one line per **case**, carrying the
+matter's status, version, correlation, obligations and blob digests — the case
+layer is beside the journal, not derivable from it, and a regulator's question
+is usually about a matter; and a trailer. The trailer's **absence** is how a
+file cut short by a full disk or a killed pipe is told from a complete one, any
+run that could not be read is named in it rather than quietly missing, and its
+case count is what catches the case layer stripped whole. Case state travels
+as stored — sealed stays sealed, because an export of plaintext would quietly
+undo erasure.
 
 `verify` takes the **file and nothing else** — no store, no manifest, no
 toolchain — and re-seals every record through the same function the store sealed

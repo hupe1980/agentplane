@@ -953,6 +953,46 @@ impl JournalStore for RedbStore {
         .await
     }
 
+    async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
+        let prefix = format!("{}/", self.tenant);
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let leases = r.open_table(RUN_LEASE).map_err(|e| be(&e))?;
+            let now = now_secs();
+            // A full scan over this tenant's lease rows, released ones
+            // included — they keep the epoch, so they cannot be deleted, and
+            // an embedded store has no second index to range instead. That is
+            // an accepted cost, not an oversight: the table holds one small
+            // row per run ever admitted, the sweep reads it once per tick, and
+            // redb walks it in memory-mapped pages. The shared-store backend
+            // pays for an index because its table is shared by every instance;
+            // this one is not.
+            let mut expired: Vec<(u64, RunId)> = Vec::new();
+            for entry in leases.range(prefix.as_str()..).map_err(|e| be(&e))? {
+                let (k, v) = entry.map_err(|e| be(&e))?;
+                let key = k.value();
+                if !key.starts_with(prefix.as_str()) {
+                    break;
+                }
+                let (owner, _, expires_at) = v.value();
+                // Released rows blank the owner; live rows have not lapsed.
+                // What remains is the set this method exists for: an owner
+                // that stopped renewing without handing the run back.
+                if owner.is_empty() || expires_at > now {
+                    continue;
+                }
+                if let Ok(run) = RunId::parse(&key[prefix.len()..]) {
+                    expired.push((expires_at, run));
+                }
+            }
+            // Oldest expiry first, so a bounded page cannot starve the run
+            // that has been stranded longest behind fresher failures.
+            expired.sort_unstable_by_key(|(at, _)| *at);
+            Ok(expired.into_iter().take(limit).map(|(_, r)| r).collect())
+        })
+        .await
+    }
+
     async fn seal(&self, run: RunId, epoch: Epoch, outcome: &str) -> Result<Digest, StoreError> {
         let key = self.run_key(run);
         let tenant = self.tenant.clone();

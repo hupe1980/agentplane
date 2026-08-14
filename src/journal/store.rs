@@ -356,6 +356,43 @@ pub trait JournalStore: Send + Sync + Debug {
     /// owner. Renewing an owned lease keeps it.
     async fn acquire(&self, run: RunId, owner: &str, ttl: Duration) -> Result<Lease, StoreError>;
 
+    /// Runs whose lease **expired without being released** — the runs an
+    /// instance died holding.
+    ///
+    /// The lease discipline makes this set precise. Every clean exit hands its
+    /// lease back through [`release_lease`](Self::release_lease), whatever the
+    /// outcome — sealed, failed, suspended. Only a crash skips that call, so an
+    /// expired lease that still names an owner is not "a run that is resting":
+    /// it is a run somebody was executing when their process stopped, and
+    /// nothing else in the system will ever touch it again unless an event, a
+    /// timer or an operator happens to.
+    ///
+    /// That "happens to" is the gap this query closes. Fencing makes takeover
+    /// *safe* and replay makes it *correct*, but neither makes it **happen** —
+    /// a run crashed mid-step with no pending timer and no inbound event has no
+    /// driver, appears in no backlog (it concluded nothing, so no outcome
+    /// listing carries it; its subscriptions were consumed, so no waiting list
+    /// names it), and waits forever while looking exactly like work in
+    /// progress. Detection without delivery, applied to the recovery mechanism
+    /// itself. The sweeper drains this queue; this method is what makes the
+    /// queue exist.
+    ///
+    /// **Oldest expiry first**, so the longest-stranded run is recovered first
+    /// and a bounded page cannot starve it behind fresher failures. Bounded,
+    /// and the bound is visible: `limit` results means *at least* that many.
+    ///
+    /// Expiry is judged by the store's own clock — the same clock
+    /// [`acquire`](Self::acquire) stamps leases with, because two clocks
+    /// disagreeing about one row is how a live owner gets recovered out from
+    /// under its own heartbeat. A recovered run that was in fact still owned is
+    /// not corrupted either way: the recovering instance bumps the epoch, and
+    /// the store fences the previous owner's next append.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable.
+    async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError>;
+
     /// Hand a lease back, so the next instance need not wait out the TTL.
     ///
     /// The counterpart to [`acquire`](Self::acquire), and the difference between

@@ -57,7 +57,12 @@ use crate::journal::{Append, Checkpoint, JournalStore};
 /// a declaration that does nothing — a reader would parse a future format as
 /// far as the lines happened to look familiar, and report findings about a
 /// file it never understood.
-pub const FORMAT_VERSION: u32 = 1;
+/// Version 2 added the case layer: `agentplane.export.case` lines between the
+/// last run block and the trailer, and the `cases` count in both. A hard cut
+/// rather than an optional extension, because a reader that tolerated their
+/// absence could not tell *this plane has no cases* from *the case layer was
+/// dropped from this file* — and the second is the finding that matters.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The first line of an export: what this is and how to read it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -142,6 +147,30 @@ pub struct RunBlock {
     pub seal: Option<crate::core::Digest>,
 }
 
+/// One case, as an export line — the case layer's whole account of one matter.
+///
+/// Emitted after the run blocks because the two halves answer different
+/// questions: the journal is *what happened*, the case is *what it happened
+/// to*. A restore of the journal alone rebuilds every index the journal owns
+/// and none of these rows, because case state is not derivable from records —
+/// which is exactly why the export has to carry it.
+///
+/// `state` travels **as stored**: sealed on a sealed plane. Exporting
+/// plaintext would quietly undo erasure — see the module docs, which make the
+/// same refusal for record payloads.
+///
+/// `blobs` carries digests, never bytes. Presence and integrity of the bytes
+/// are a question about a live blob store, which an offline file cannot
+/// answer and honestly reports as unchecked.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CaseBlock {
+    /// Always `"agentplane.export.case"`.
+    pub kind: &'static str,
+    pub case: crate::core::Case,
+    pub deadlines: Vec<crate::core::Deadline>,
+    pub blobs: Vec<crate::core::Digest>,
+}
+
 /// The last line of an export: what it contains, and what it does not.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Trailer {
@@ -156,6 +185,12 @@ pub struct Trailer {
     pub runs_exported: usize,
     /// How many records were written.
     pub records: usize,
+    /// How many cases the case layer contributed.
+    ///
+    /// Zero means this plane has no case store — a state, not a gap. A plane
+    /// *with* one exports every case it holds, so a record stamped with a case
+    /// this file does not carry is a finding the verifier makes.
+    pub cases: usize,
     /// Runs that could not be read, and why.
     ///
     /// Named rather than counted. A count tells an auditor that something is
@@ -190,6 +225,7 @@ pub struct Unreadable {
 /// it was given, and an auditor needs the part that survived.
 pub async fn to_jsonl<W: std::io::Write>(
     store: &Arc<dyn JournalStore>,
+    cases: Option<&Arc<dyn crate::case::CaseStore>>,
     runs: &[RunId],
     mut out: W,
 ) -> Result<Trailer, std::io::Error> {
@@ -256,17 +292,58 @@ pub async fn to_jsonl<W: std::io::Write>(
         }
     }
 
+    // The case layer, after the runs and before the trailer. Every case, not
+    // the cases these runs touch: a case is the unit an erasure request or a
+    // regulator names, and a subset chosen by run membership would silently
+    // drop the matter whose runs happened not to be asked for.
+    let mut case_count = 0usize;
+    if let Some(case_store) = cases {
+        let mut after: Option<crate::core::CaseId> = None;
+        loop {
+            let page = case_store
+                .cases(after, CASE_PAGE)
+                .await
+                .map_err(|e| as_io(&e))?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.id);
+            let full = page.len() >= CASE_PAGE;
+            for case in page {
+                let deadlines = case_store.deadlines(case.id).await.map_err(|e| as_io(&e))?;
+                let blobs = case_store.blobs_of(case.id).await.map_err(|e| as_io(&e))?;
+                writeln!(
+                    out,
+                    "{}",
+                    to_line(&CaseBlock {
+                        kind: "agentplane.export.case",
+                        case,
+                        deadlines,
+                        blobs,
+                    })?
+                )?;
+                case_count += 1;
+            }
+            if !full {
+                break;
+            }
+        }
+    }
+
     let trailer = Trailer {
         kind: "agentplane.export.end",
         runs_requested: runs.len(),
         runs_exported: exported,
         records,
+        cases: case_count,
         unreadable,
     };
     writeln!(out, "{}", to_line(&trailer)?)?;
     out.flush()?;
     Ok(trailer)
 }
+
+/// How many cases one enumeration page holds. Interior to the export: the
+/// stream out is unbounded either way, and the page only bounds memory.
+const CASE_PAGE: usize = 256;
 
 /// One value as one line, refusing to write a line that is not valid JSON.
 fn to_line<T: serde::Serialize>(value: &T) -> Result<String, std::io::Error> {
@@ -298,6 +375,8 @@ pub struct VerifyReport {
     pub not_checked: Vec<String>,
     /// How many records were read.
     pub records: usize,
+    /// How many case blocks were read.
+    pub cases: usize,
     /// Whether the file ended with its trailer.
     ///
     /// A truncated export is otherwise a valid prefix: every line parses, every
@@ -364,6 +443,7 @@ pub fn verify<R: std::io::BufRead>(
         findings: Vec::new(),
         not_checked: Vec::new(),
         records: 0,
+        cases: 0,
         complete: false,
     };
     if verifier.is_none() {
@@ -379,6 +459,14 @@ pub fn verify<R: std::io::BufRead>(
     // order rather than in the order the export happened to walk.
     let mut leaves: Vec<(u64, Digest)> = Vec::new();
     let mut pass: Option<RunPass> = None;
+    // The two halves of the case cross-check: what the records name, and what
+    // the case layer carries. Settled at the end, because either side can
+    // arrive first in the file.
+    let mut stamped: std::collections::BTreeSet<crate::core::CaseId> =
+        std::collections::BTreeSet::new();
+    let mut carried: std::collections::BTreeSet<crate::core::CaseId> =
+        std::collections::BTreeSet::new();
+    let mut blob_digests = 0usize;
 
     for line in input.lines() {
         let line = line?;
@@ -395,6 +483,9 @@ pub fn verify<R: std::io::BufRead>(
             Some("agentplane.export") => {
                 header_seen = true;
                 read_header(&value, &mut report);
+            }
+            Some("agentplane.export.case") => {
+                read_case_block(&value, &mut report, &mut carried, &mut blob_digests);
             }
             Some("agentplane.export.run") => {
                 finish_run(&mut report, pass.take(), verifier);
@@ -421,7 +512,7 @@ pub fn verify<R: std::io::BufRead>(
                     leaves.push((index, merkle::leaf_hash(&seal)));
                 }
             }
-            Some("agentplane.export.end") => report.complete = true,
+            Some("agentplane.export.end") => read_trailer(&value, &mut report),
             _ => {
                 report.records += 1;
                 let Some(pass) = pass.as_mut() else {
@@ -432,14 +523,121 @@ pub fn verify<R: std::io::BufRead>(
                     );
                     continue;
                 };
-                read_record(&value, pass, &mut report);
+                read_record(&value, pass, &mut report, &mut stamped);
             }
         }
     }
     finish_run(&mut report, pass, verifier);
 
     settle(&mut report, header_seen, leaves);
+    settle_cases(&mut report, &stamped, &carried, blob_digests);
     Ok(report)
+}
+
+/// Read the trailer: the file is complete, and its own counts hold.
+///
+/// The count comparison is what catches the case layer stripped *whole*: with
+/// every block gone the coverage cross-check has nothing to compare, and the
+/// file would read as an export of a plane that simply had no cases — while
+/// its trailer still says otherwise.
+fn read_trailer(value: &serde_json::Value, report: &mut VerifyReport) {
+    report.complete = true;
+    if let Some(declared) = value.get("cases").and_then(serde_json::Value::as_u64)
+        && declared != report.cases as u64
+    {
+        report.findings.push(format!(
+            "the trailer says {declared} case(s) were exported and this file \
+             carries {} — the case layer was cut after the export was taken",
+            report.cases
+        ));
+    }
+}
+
+/// Read one case block: count it, collect its id for the coverage settlement,
+/// and flag the malformations a reader would otherwise trip over silently.
+fn read_case_block(
+    value: &serde_json::Value,
+    report: &mut VerifyReport,
+    carried: &mut std::collections::BTreeSet<crate::core::CaseId>,
+    blob_digests: &mut usize,
+) {
+    use serde_json::Value;
+
+    report.cases += 1;
+    match serde_json::from_value::<crate::core::Case>(
+        value.get("case").cloned().unwrap_or(Value::Null),
+    ) {
+        Ok(case) => {
+            carried.insert(case.id);
+        }
+        Err(e) => report
+            .findings
+            .push(format!("a case block is malformed: {e}")),
+    }
+    if value
+        .get("deadlines")
+        .is_none_or(|d| serde_json::from_value::<Vec<crate::core::Deadline>>(d.clone()).is_err())
+    {
+        report
+            .findings
+            .push("a case block's deadlines are malformed".to_owned());
+    }
+    *blob_digests += value
+        .get("blobs")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+}
+
+/// The case layer's own settlement: coverage, and what a file cannot check.
+///
+/// The coverage rule has a deliberate asymmetry. A record stamped with a case
+/// the file does not carry is a **finding** — this plane had a case layer (the
+/// stamp proves it) and the export is missing a matter the journal names. The
+/// reverse is not: a case whose runs are absent is the ordinary result of
+/// exporting a subset of runs, and every case travels regardless of which runs
+/// were asked for.
+///
+/// A file with records stamped and **no** case blocks at all is reported as
+/// unchecked rather than as a finding, because the export may honestly have
+/// been taken from a plane whose journal was written by a case-configured
+/// runtime while the export ran without the case store — the CLI wires it when
+/// present, but the library caller may not. The trailer's `cases` count is
+/// what distinguishes *none existed* from *none were asked for*.
+fn settle_cases(
+    report: &mut VerifyReport,
+    stamped: &std::collections::BTreeSet<crate::core::CaseId>,
+    carried: &std::collections::BTreeSet<crate::core::CaseId>,
+    blob_digests: usize,
+) {
+    if carried.is_empty() {
+        if !stamped.is_empty() {
+            report.not_checked.push(format!(
+                "the case layer — {} case(s) are stamped on records and this file carries no \
+                 case blocks, so either the plane's case store was not supplied to the export \
+                 or the layer was dropped; the two cannot be told apart from the file alone",
+                stamped.len()
+            ));
+        }
+        return;
+    }
+    for case in stamped.difference(carried) {
+        report.findings.push(format!(
+            "case {case} is stamped on exported records and missing from the case layer — \
+             the journal names a matter this file does not carry"
+        ));
+    }
+    if blob_digests > 0 {
+        report.not_checked.push(format!(
+            "blob bytes — the case layer references {blob_digests} blob digest(s) and this \
+             file carries digests, not bytes; presence and integrity are a question about a \
+             live blob store"
+        ));
+    }
+    report.not_checked.push(
+        "sealed-state keys — whether sealed case state can still be opened is a question \
+         about a live key ring, which an offline file cannot answer"
+            .to_owned(),
+    );
 }
 
 /// The verifier's working state for the run block it is inside.
@@ -569,7 +767,12 @@ fn read_header(value: &serde_json::Value, report: &mut VerifyReport) {
 /// editor who recomputed the chain also achieves; putting the body back through
 /// the function the store sealed with is what makes agreement evidence about the
 /// bytes.
-fn read_record(value: &serde_json::Value, pass: &mut RunPass, report: &mut VerifyReport) {
+fn read_record(
+    value: &serde_json::Value,
+    pass: &mut RunPass,
+    report: &mut VerifyReport,
+    stamped: &mut std::collections::BTreeSet<crate::core::CaseId>,
+) {
     let current = pass.run;
     let (Some(body), Some(claimed)) = (
         value
@@ -585,6 +788,11 @@ fn read_record(value: &serde_json::Value, pass: &mut RunPass, report: &mut Verif
         pass.clean = false;
         return;
     };
+    // Collected for the case-coverage settlement: a stamp is the journal
+    // naming a matter, and the case layer must carry every matter it names.
+    if let Some(case) = body.case {
+        stamped.insert(case);
+    }
     // The record's own body names its run, and it must be the run the block
     // claims. Without this comparison an export could relabel a whole history —
     // run B's records and B's leaf filed under A's id — and every other check
@@ -702,6 +910,8 @@ pub struct RestoreReport {
     pub rebuilt: Checkpoint,
     pub runs: usize,
     pub records: usize,
+    /// Cases rebuilt from the export's case layer.
+    pub cases: usize,
     /// What did not survive, named rather than counted.
     pub not_carried: Vec<String>,
 }
@@ -765,6 +975,7 @@ impl RestoreReport {
 /// not merge one.
 pub async fn from_jsonl<R: std::io::BufRead>(
     store: &Arc<dyn JournalStore>,
+    cases: Option<&Arc<dyn crate::case::CaseStore>>,
     input: R,
 ) -> Result<RestoreReport, StoreError> {
     let parsed = parse(input).map_err(|e| StoreError::Backend(e.to_string()))?;
@@ -817,7 +1028,35 @@ pub async fn from_jsonl<R: std::io::BufRead>(
         store.seal(run.run, epoch, outcome).await?;
     }
 
+    // The case layer, after the journal. Order matters only for the operator's
+    // mental model — the two halves share no constraint — but the journal is
+    // the half whose restore can fail on a constraint, and failing before any
+    // case row landed leaves the cleaner wreck.
+    let mut imported = 0usize;
     let mut not_carried = Vec::new();
+    match (cases, parsed.cases.is_empty()) {
+        (Some(case_store), false) => {
+            for block in &parsed.cases {
+                case_store
+                    .import_case(&block.case, &block.deadlines, &block.blobs)
+                    .await?;
+                imported += 1;
+            }
+            not_carried.push(
+                "blob link timestamps — the export carries a case's blob digests without \
+                 the instant each link was written, so erasure reachability survives and \
+                 the original ordering does not"
+                    .to_owned(),
+            );
+        }
+        (None, false) => not_carried.push(format!(
+            "the case layer — the export carries {} case(s) and no case store was supplied, \
+             so the journal is rebuilt and the matters it names are not",
+            parsed.cases.len()
+        )),
+        (_, true) => {}
+    }
+
     if parsed.canon != Some(u64::from(crate::core::canon::VERSION)) {
         not_carried.push(format!(
             "the digests — the export was written under canonicalization rule {:?} and this \
@@ -848,6 +1087,7 @@ pub async fn from_jsonl<R: std::io::BufRead>(
         rebuilt: store.checkpoint().await?,
         runs: parsed.runs.len(),
         records,
+        cases: imported,
         not_carried,
     })
 }
@@ -868,7 +1108,15 @@ struct Parsed {
     /// The canonicalization rule the header names, `None` when absent.
     canon: Option<u64>,
     runs: Vec<RestoredRun>,
+    cases: Vec<RestoredCase>,
     signed: usize,
+}
+
+/// One case block, as a restore replays it.
+struct RestoredCase {
+    case: crate::core::Case,
+    deadlines: Vec<crate::core::Deadline>,
+    blobs: Vec<crate::core::Digest>,
 }
 
 /// Read an export into the shape a restore replays.
@@ -890,6 +1138,7 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
         version: None,
         canon: None,
         runs: Vec::new(),
+        cases: Vec::new(),
         signed: 0,
     };
     for line in input.lines() {
@@ -921,6 +1170,29 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
                         bodies: Vec::new(),
                     });
                 }
+            }
+            Some("agentplane.export.case") => {
+                // Malformed blocks are skipped here and found by `verify`,
+                // per this function's no-checking rule: a restore that
+                // refused the file would refuse the healthy cases in it too.
+                let (Ok(case), Some(deadlines), Some(blobs)) = (
+                    serde_json::from_value::<crate::core::Case>(
+                        value.get("case").cloned().unwrap_or(Value::Null),
+                    ),
+                    value.get("deadlines").and_then(|d| {
+                        serde_json::from_value::<Vec<crate::core::Deadline>>(d.clone()).ok()
+                    }),
+                    value.get("blobs").and_then(|b| {
+                        serde_json::from_value::<Vec<crate::core::Digest>>(b.clone()).ok()
+                    }),
+                ) else {
+                    continue;
+                };
+                parsed.cases.push(RestoredCase {
+                    case,
+                    deadlines,
+                    blobs,
+                });
             }
             Some("agentplane.export.end") => {}
             _ => {

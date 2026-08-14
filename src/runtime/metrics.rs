@@ -214,6 +214,28 @@ pub const TIMERS_FIRED: Instrument = Instrument {
                   distinguishable from a stalled one.",
 };
 
+pub const RUNS_RECOVERED: Instrument = Instrument {
+    name: "agentplane.runs.recovered",
+    kind: Kind::Counter,
+    unit: "1",
+    dimension: Some("outcome"),
+    description: "Runs taken over and resumed after their owner's lease lapsed \
+                  without release — an instance died holding them. Each one is a \
+                  crash the plane healed; a steady rate means instances are dying \
+                  steadily, which the recovery hides from everything but this.",
+};
+
+pub const RECOVERY_FAILURES: Instrument = Instrument {
+    name: "agentplane.runs.recovery_failures",
+    kind: Kind::Counter,
+    unit: "1",
+    dimension: None,
+    description: "Abandoned runs the recovery sweep tried to resume and could \
+                  not. The run stays listed and is retried next tick, so a \
+                  persistent count here is one stuck run, not many — but it is \
+                  stuck, and nothing else will unstick it.",
+};
+
 pub const REPLANS: Instrument = Instrument {
     name: "agentplane.replans",
     kind: Kind::Counter,
@@ -307,6 +329,8 @@ pub const CATALOGUE: &[Instrument] = &[
     DEAD_LETTERS,
     DEADLINE_BREACHES,
     TIMERS_FIRED,
+    RUNS_RECOVERED,
+    RECOVERY_FAILURES,
     REPLANS,
     BATCH_ITEMS,
     POLICY_DENIALS,

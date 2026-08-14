@@ -85,7 +85,7 @@ async fn an_export_carries_what_a_reader_needs_to_check_it_without_us() {
     let (store, run) = one_run().await;
 
     let mut out = Vec::new();
-    let trailer = agentplane::export::to_jsonl(&store, &[run], &mut out)
+    let trailer = agentplane::export::to_jsonl(&store, None, &[run], &mut out)
         .await
         .expect("export");
 
@@ -95,7 +95,7 @@ async fn an_export_carries_what_a_reader_needs_to_check_it_without_us() {
     let header = &lines[0];
     assert_eq!(header["kind"], "agentplane.export");
     assert_eq!(
-        header["version"], 1,
+        header["version"], 2,
         "the format version is what a reader pins; it must not be absent"
     );
     assert_eq!(
@@ -165,7 +165,7 @@ async fn an_interrupted_export_is_missing_its_trailer() {
     let (store, run) = one_run().await;
 
     let mut whole = Vec::new();
-    agentplane::export::to_jsonl(&store, &[run], &mut whole)
+    agentplane::export::to_jsonl(&store, None, &[run], &mut whole)
         .await
         .expect("export");
 
@@ -227,7 +227,7 @@ async fn a_run_that_cannot_be_read_is_named_in_the_trailer() {
     ));
 
     let mut out = Vec::new();
-    let trailer = agentplane::export::to_jsonl(&faulty, &[healthy, damaged], &mut out)
+    let trailer = agentplane::export::to_jsonl(&faulty, None, &[healthy, damaged], &mut out)
         .await
         .expect("a damaged run does not fail the whole export");
 
@@ -291,7 +291,7 @@ async fn a_faithful_export_verifies_from_the_file_alone() {
     let store: Arc<dyn JournalStore> = store;
 
     let mut out = Vec::new();
-    agentplane::export::to_jsonl(&store, &runs, &mut out)
+    agentplane::export::to_jsonl(&store, None, &runs, &mut out)
         .await
         .expect("export");
 
@@ -343,7 +343,7 @@ async fn a_run_removed_from_the_middle_is_caught_by_the_rebuilt_root() {
     let store: Arc<dyn JournalStore> = store;
 
     let mut out = Vec::new();
-    agentplane::export::to_jsonl(&store, &runs, &mut out)
+    agentplane::export::to_jsonl(&store, None, &runs, &mut out)
         .await
         .expect("export");
 
@@ -412,7 +412,7 @@ async fn a_run_removed_from_the_middle_is_caught_by_the_rebuilt_root() {
 async fn an_edited_record_fails_to_recompute() {
     let (store, run) = one_run().await;
     let mut out = Vec::new();
-    agentplane::export::to_jsonl(&store, &[run], &mut out)
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
         .await
         .expect("export");
 
@@ -476,13 +476,13 @@ async fn a_restored_store_rebuilds_the_same_checkpoint() {
     let before = origin.checkpoint().await.expect("checkpoint");
 
     let mut out = Vec::new();
-    agentplane::export::to_jsonl(&origin, &runs, &mut out)
+    agentplane::export::to_jsonl(&origin, None, &runs, &mut out)
         .await
         .expect("export");
 
     // A different store, with nothing in it.
     let fresh: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
-    let report = agentplane::export::from_jsonl(&fresh, std::io::Cursor::new(&out))
+    let report = agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(&out))
         .await
         .expect("restore");
 
@@ -558,7 +558,7 @@ async fn a_restored_store_rebuilds_the_same_checkpoint() {
 
     // And the restored history verifies on its own terms.
     let mut again = Vec::new();
-    agentplane::export::to_jsonl(&fresh, &runs, &mut again)
+    agentplane::export::to_jsonl(&fresh, None, &runs, &mut again)
         .await
         .expect("re-export");
     let verified = agentplane::export::verify(std::io::Cursor::new(&again), None).expect("verify");
@@ -639,12 +639,12 @@ async fn a_run_that_changed_hands_restores_with_its_epochs() {
     );
 
     let mut out = Vec::new();
-    agentplane::export::to_jsonl(&origin, &[run], &mut out)
+    agentplane::export::to_jsonl(&origin, None, &[run], &mut out)
         .await
         .expect("export");
 
     let fresh: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
-    let report = agentplane::export::from_jsonl(&fresh, std::io::Cursor::new(&out))
+    let report = agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(&out))
         .await
         .expect("restore");
 
@@ -689,12 +689,12 @@ async fn a_run_that_changed_hands_restores_with_its_epochs() {
 async fn an_export_of_a_foreign_format_version_is_named_not_guessed_at() {
     let (store, run) = one_run().await;
     let mut out = Vec::new();
-    agentplane::export::to_jsonl(&store, &[run], &mut out)
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
         .await
         .expect("export");
 
     let original = String::from_utf8(out).expect("utf8");
-    let foreign = original.replace("\"version\":1", "\"version\":2");
+    let foreign = original.replace("\"version\":2", "\"version\":3");
     assert_ne!(
         original, foreign,
         "the fixture edited nothing, so this test would pass against a reader \
@@ -711,7 +711,8 @@ async fn an_export_of_a_foreign_format_version_is_named_not_guessed_at() {
 
     let fresh: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
     let refused =
-        agentplane::export::from_jsonl(&fresh, std::io::Cursor::new(foreign.as_bytes())).await;
+        agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(foreign.as_bytes()))
+            .await;
     let Err(e) = refused else {
         panic!("a restore rebuilt a format it cannot fully parse");
     };
@@ -721,9 +722,10 @@ async fn an_export_of_a_foreign_format_version_is_named_not_guessed_at() {
     );
 
     // The positive half: the same file under its own version restores.
-    let ok = agentplane::export::from_jsonl(&fresh, std::io::Cursor::new(original.as_bytes()))
-        .await
-        .expect("restore");
+    let ok =
+        agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(original.as_bytes()))
+            .await
+            .expect("restore");
     assert!(ok.is_faithful(), "the untouched export did not restore");
 }
 
@@ -738,7 +740,7 @@ async fn an_export_of_a_foreign_format_version_is_named_not_guessed_at() {
 async fn a_relabelled_run_block_is_caught_by_its_own_records() {
     let (store, run) = one_run().await;
     let mut out = Vec::new();
-    agentplane::export::to_jsonl(&store, &[run], &mut out)
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
         .await
         .expect("export");
 
@@ -804,7 +806,7 @@ async fn a_duplicated_log_position_is_named_rather_than_left_as_a_root_mismatch(
     let store: Arc<dyn JournalStore> = store;
 
     let mut out = Vec::new();
-    agentplane::export::to_jsonl(&store, &runs, &mut out)
+    agentplane::export::to_jsonl(&store, None, &runs, &mut out)
         .await
         .expect("export");
 
@@ -864,6 +866,9 @@ impl JournalStore for StaleCheckpoint {
     }
     async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError> {
         self.inner.runs_by_outcome(outcome, limit).await
+    }
+    async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
+        self.inner.abandoned_runs(limit).await
     }
     async fn recent_runs(
         &self,
@@ -944,7 +949,7 @@ async fn a_run_sealed_after_the_checkpoint_exports_as_still_open() {
         at,
     });
     let mut out = Vec::new();
-    agentplane::export::to_jsonl(&stale, &[first, late], &mut out)
+    agentplane::export::to_jsonl(&stale, None, &[first, late], &mut out)
         .await
         .expect("export");
 
@@ -1018,7 +1023,7 @@ async fn an_edited_record_in_an_open_run_is_not_sound() {
     let store: Arc<dyn JournalStore> = store;
 
     let mut bytes = Vec::new();
-    agentplane::export::to_jsonl(&store, &[out.run_id], &mut bytes)
+    agentplane::export::to_jsonl(&store, None, &[out.run_id], &mut bytes)
         .await
         .expect("export");
 
@@ -1050,4 +1055,173 @@ async fn an_edited_record_in_an_open_run_is_not_sound() {
         "a run with an edited record was reported sound — there is no leaf to \
          catch it for an open run, so the per-record findings must"
     );
+}
+
+// ── The case layer crosses the boundary ─────────────────────────────────────
+//
+// A restore of the journal alone rebuilds every index the journal owns and no
+// case rows, because case state is not derivable from records. The export
+// therefore carries the case layer, the verifier holds the two halves to each
+// other — a record stamped with a case the file does not carry is a finding —
+// and the restore rebuilds the rows so the matter is queryable again.
+
+/// **The drill.** A matter with an obligation and an artifact round-trips:
+/// export, verify, restore into a fresh store, and every read path answers.
+#[tokio::test]
+async fn the_case_layer_survives_export_and_restore() {
+    use agentplane::case::CaseStore;
+    use agentplane::core::{CaseStatus, CorrelationKey, DeadlineState, Digest, Timestamp};
+
+    let origin = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&origin) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&origin) as Arc<dyn agentplane::case::CaseStore>)
+        .skill(Trivial)
+        .build();
+    let keys = [CorrelationKey::new("document", "DOC-77")];
+    let out = rt
+        .run_correlated("demo.trivial", Tainted::trusted(json!(1)), "matter", &keys)
+        .await
+        .expect("run");
+    let case_id = (Arc::clone(&origin) as Arc<dyn CaseStore>)
+        .correlate(&keys)
+        .await
+        .expect("correlate")
+        .expect("case exists");
+    let at = Timestamp::from_unix_timestamp(1_800_000_000).expect("instant");
+    let cases: Arc<dyn CaseStore> = Arc::clone(&origin) as Arc<dyn CaseStore>;
+    cases
+        .register_deadline(&agentplane::core::Deadline {
+            case: case_id,
+            name: "respond-by".to_owned(),
+            resolved_at: at,
+            calendar_digest: Digest::of(b"cal"),
+            warn_at: None,
+            state: DeadlineState::Pending,
+        })
+        .await
+        .expect("deadline");
+    cases
+        .link_blob(case_id, Digest::of(b"artifact"), at)
+        .await
+        .expect("blob link");
+
+    let store: Arc<dyn JournalStore> = origin;
+    let mut bytes = Vec::new();
+    let trailer = agentplane::export::to_jsonl(&store, Some(&cases), &[out.run_id], &mut bytes)
+        .await
+        .expect("export");
+    assert_eq!(trailer.cases, 1, "the matter travelled");
+
+    // The file alone: sound, and the two halves cover each other.
+    let verified = agentplane::export::verify(std::io::Cursor::new(&bytes), None).expect("verify");
+    assert!(
+        verified.is_sound(),
+        "the export does not verify: {:#?}",
+        verified.findings
+    );
+    assert_eq!(verified.cases, 1);
+    assert!(
+        verified
+            .not_checked
+            .iter()
+            .any(|n| n.contains("blob bytes")),
+        "an offline pass cannot check blob presence and must say so: {:#?}",
+        verified.not_checked
+    );
+
+    // A fresh plane, rebuilt from the file.
+    let fresh = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let fresh_journal: Arc<dyn JournalStore> = Arc::clone(&fresh) as Arc<dyn JournalStore>;
+    let fresh_cases: Arc<dyn CaseStore> = fresh as Arc<dyn CaseStore>;
+    let report = agentplane::export::from_jsonl(
+        &fresh_journal,
+        Some(&fresh_cases),
+        std::io::Cursor::new(&bytes),
+    )
+    .await
+    .expect("restore");
+    assert!(report.is_faithful(), "journal roots differ");
+    assert_eq!(report.cases, 1);
+
+    // Every read path answers about the restored matter.
+    let restored = fresh_cases
+        .case(case_id)
+        .await
+        .expect("read")
+        .expect("the case is back");
+    assert_eq!(restored.kind, "matter");
+    assert_eq!(restored.status, CaseStatus::Open);
+    assert_eq!(restored.runs, vec![out.run_id]);
+    assert_eq!(
+        fresh_cases.correlate(&keys).await.expect("correlate"),
+        Some(case_id),
+        "the next message about this matter must attach, not open a duplicate"
+    );
+    let deadlines = fresh_cases.deadlines(case_id).await.expect("deadlines");
+    assert_eq!(deadlines.len(), 1);
+    assert_eq!(deadlines[0].name, "respond-by");
+    assert!(
+        fresh_cases
+            .blobs_of(case_id)
+            .await
+            .expect("blobs")
+            .contains(&Digest::of(b"artifact")),
+        "erasure can no longer find the artifact from the case that names it"
+    );
+}
+
+/// A matter the journal names, missing from the case layer, is a finding.
+///
+/// The per-run chains, the leaves and the Merkle root all still verify — the
+/// case layer is beside the journal, not inside it — so only the coverage
+/// cross-check notices. Without it, dropping every case line produces a file
+/// that reads as a complete, sound export of a plane that simply had no cases.
+#[tokio::test]
+async fn a_dropped_case_layer_is_a_finding_not_a_quiet_file() {
+    use agentplane::case::CaseStore;
+    use agentplane::core::CorrelationKey;
+
+    let origin = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&origin) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&origin) as Arc<dyn CaseStore>)
+        .skill(Trivial)
+        .build();
+    let out = rt
+        .run_correlated(
+            "demo.trivial",
+            Tainted::trusted(json!(1)),
+            "matter",
+            &[CorrelationKey::new("document", "DOC-88")],
+        )
+        .await
+        .expect("run");
+
+    let cases: Arc<dyn CaseStore> = Arc::clone(&origin) as Arc<dyn CaseStore>;
+    let store: Arc<dyn JournalStore> = origin;
+    let mut bytes = Vec::new();
+    agentplane::export::to_jsonl(&store, Some(&cases), &[out.run_id], &mut bytes)
+        .await
+        .expect("export");
+
+    let text = String::from_utf8(bytes).expect("utf8");
+    let dropped: String = text
+        .lines()
+        .filter(|l| !l.contains("agentplane.export.case"))
+        .fold(String::new(), |mut s, l| {
+            s.push_str(l);
+            s.push('\n');
+            s
+        });
+    assert_ne!(text, dropped, "the fixture removed nothing");
+
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(dropped.as_bytes()), None).expect("verify");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.contains("case layer was cut")),
+        "a file stripped of its case layer read as complete: {report:#?}"
+    );
+    assert!(!report.is_sound(), "a stripped export still reported sound");
 }

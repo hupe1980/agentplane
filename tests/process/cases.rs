@@ -1232,6 +1232,103 @@ async fn a_sweep_whose_evidence_fails_to_write_is_flagged_not_silent() {
     );
 }
 
+/// Evidence already earned survives a later phase's error.
+///
+/// The deadline pass breaches an obligation *into state*, then the timer phase
+/// fails. The sweep returns the error — but the breach's sealed record must
+/// exist anyway, because the state already changed and a `?` past an unsealed
+/// ledger would be the sweep silently dropping the account of decisions it
+/// already applied. That is the exact failure the ledger exists to prevent,
+/// reintroduced by control flow — and it is invisible to every test that only
+/// exercises phases which succeed.
+#[tokio::test]
+async fn sweep_evidence_survives_a_later_phase_failure() {
+    use agentplane::core::{Deadline, DeadlineState, RunId, StoreError, SweptAction, Timer};
+
+    /// A timer store whose claim always fails, the way a partitioned backend's
+    /// would.
+    #[derive(Debug)]
+    struct ClaimFails;
+
+    #[async_trait::async_trait]
+    impl agentplane::case::TimerStore for ClaimFails {
+        async fn arm(&self, _: &Timer) -> Result<(), StoreError> {
+            Ok(())
+        }
+        async fn claim_due(&self, _: Timestamp, _: usize) -> Result<Vec<Timer>, StoreError> {
+            Err(StoreError::Backend(
+                "the timer backend is unreachable".into(),
+            ))
+        }
+        async fn disarm(&self, _: RunId, _: agentplane::core::EffectKey) -> Result<(), StoreError> {
+            Ok(())
+        }
+        async fn pending_count(&self) -> Result<u64, StoreError> {
+            Ok(0)
+        }
+        async fn pending(&self, _: usize) -> Result<Vec<Timer>, StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let cases = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let now = Timestamp::from_unix_timestamp(1_800_000_000).unwrap();
+
+    let case = cases
+        .correlate_or_open("matter", &[key("matter", "M-99")], now)
+        .await
+        .unwrap()
+        .case_id();
+    cases
+        .register_deadline(&Deadline {
+            case,
+            name: "respond-by".to_owned(),
+            resolved_at: now - std::time::Duration::from_secs(3600),
+            calendar_digest: Digest::of(b"test-calendar"),
+            warn_at: None,
+            state: DeadlineState::Pending,
+        })
+        .await
+        .unwrap();
+
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&cases))
+        .timers(Arc::new(ClaimFails))
+        .build();
+
+    let err = rt
+        .sweep(now, std::time::Duration::from_mins(5))
+        .await
+        .expect_err("the timer phase's failure must reach the caller");
+    assert!(
+        err.to_string().contains("unreachable"),
+        "the error is the phase's own: {err}"
+    );
+
+    // The state changed — the breach applied before the failing phase ran —
+    // and its evidence is sealed in the journal despite the error.
+    let swept = store.runs_by_outcome("swept", 10).await.unwrap();
+    let run = *swept
+        .first()
+        .expect("the breach's evidence left with the error");
+    let records = store.read(run, 1).await.unwrap();
+    assert!(
+        records.iter().any(|r| matches!(
+            r.kind(),
+            RecordKind::Swept {
+                action: SweptAction::DeadlineBreached,
+                ..
+            }
+        )),
+        "the sealed sweep run does not carry the breach"
+    );
+    store
+        .verify(run)
+        .await
+        .expect("the sweep's own chain does not verify");
+}
+
 /// A case's history includes what happened *to* it, not only what its runs did.
 ///
 /// "Show me everything about this matter" is answered by a range scan over the

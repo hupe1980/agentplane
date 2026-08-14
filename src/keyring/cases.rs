@@ -143,6 +143,28 @@ impl CaseStore for SealedCases {
         self.inner.correlate_or_open(kind, keys, at).await
     }
 
+    // Deliberately **not** opened, either direction — and this is the one place
+    // the decorator's job is to stand aside. `cases` is the export's read, and
+    // an export that carried plaintext would quietly undo erasure: destroying
+    // the wrapping key would no longer reach the copy somebody exported last
+    // month. The rows travel sealed, restore writes them back sealed, and a
+    // plane holding the same ring reads them through `case()` exactly as
+    // before. A caller who wants readable state has `case()`; this pair wants
+    // the stored representation, which is the same thing the journal export
+    // carries.
+    async fn cases(&self, after: Option<CaseId>, limit: usize) -> Result<Vec<Case>, StoreError> {
+        self.inner.cases(after, limit).await
+    }
+
+    async fn import_case(
+        &self,
+        case: &Case,
+        deadlines: &[crate::core::Deadline],
+        blobs: &[crate::core::Digest],
+    ) -> Result<(), StoreError> {
+        self.inner.import_case(case, deadlines, blobs).await
+    }
+
     async fn attach_run(&self, case: CaseId, run: RunId) -> Result<(), StoreError> {
         self.inner.attach_run(case, run).await
     }

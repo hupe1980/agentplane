@@ -719,3 +719,47 @@ async fn erasing_one_tenants_blob_leaves_another_tenants_alone() {
         "the erasure reached nothing at all"
     );
 }
+
+/// One tenant's dead runs are not another tenant's to recover.
+///
+/// `abandoned_runs` feeds the recovery sweep, which **resumes** everything it
+/// returns — so a cross-tenant row here is not a leaked identifier but another
+/// tenant's run executed under this plane's identity, policy engine and
+/// budget. The attacker half holds a *valid* dead lease from the other tenant,
+/// because a guessed id proves nothing; the positive half proves the scoping
+/// isolated the feature rather than removing it.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn one_tenants_dead_runs_are_not_another_tenants_to_recover() {
+    use agentplane::core::{RunId, TenantId};
+    use agentplane::journal::JournalStore;
+    use agentplane::store::RedbStore;
+
+    let base = RedbStore::open_in_memory().expect("store");
+    let acme = base
+        .clone()
+        .for_tenant(TenantId::new("acme").expect("valid"));
+    let globex = base.for_tenant(TenantId::new("globex").expect("valid"));
+
+    // A real acme instance dies holding a real acme run.
+    let dead = RunId::generate();
+    acme.acquire(dead, "acme-worker", std::time::Duration::from_secs(1))
+        .await
+        .expect("acme leases");
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+    let theirs = globex.abandoned_runs(10).await.expect("globex sweeps");
+    assert!(
+        theirs.is_empty(),
+        "another tenant's dead run was offered for recovery — it would be \
+         resumed under this plane's identity and policy: {theirs:?}"
+    );
+
+    let ours = acme.abandoned_runs(10).await.expect("acme sweeps");
+    assert_eq!(
+        ours,
+        vec![dead],
+        "the owning tenant must still find its own dead run, or the scoping \
+         removed the feature rather than isolating it"
+    );
+}

@@ -373,6 +373,216 @@ impl CaseStore for RedbStore {
         .await
     }
 
+    async fn cases(&self, after: Option<CaseId>, limit: usize) -> Result<Vec<Case>, StoreError> {
+        let tenant = self.tenant_name();
+        let cursor = after.map(|c| c.to_string());
+        // Ids first, rows second — through `case()`, so the assembly of a case
+        // from its five tables exists exactly once. A second copy here would be
+        // the one that drifts when a table is added, and the export is the
+        // reader least able to notice a field quietly missing.
+        let page: Vec<CaseId> = self
+            .with_db(move |db| {
+                let r = db.begin_read().map_err(|e| be(&e))?;
+                let cases = r.open_table(CASES).map_err(|e| be(&e))?;
+                let lower = cursor.as_deref().unwrap_or("");
+                let mut out = Vec::new();
+                for e in cases
+                    .range((tenant.as_str(), lower)..=(tenant.as_str(), MAX_STR))
+                    .map_err(|e| be(&e))?
+                {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    let (k, _) = e.map_err(|e| be(&e))?;
+                    let (_, id) = k.value();
+                    // The range's lower bound is inclusive; the cursor is the
+                    // last id the caller saw, so it is skipped rather than
+                    // served twice.
+                    if Some(id) == cursor.as_deref() {
+                        continue;
+                    }
+                    out.push(parse_case_id(id)?);
+                }
+                Ok(out)
+            })
+            .await?;
+        let mut out = Vec::with_capacity(page.len());
+        for id in page {
+            if let Some(case) = self.case(id).await? {
+                out.push(case);
+            }
+        }
+        Ok(out)
+    }
+
+    // One transaction, deliberately: an import that committed the case row
+    // and then failed on an index would leave exactly the partially-indexed
+    // matter the read-path battery exists to catch. Length is the cost of
+    // atomicity here, not of doing several jobs.
+    #[allow(clippy::too_many_lines)]
+    async fn import_case(
+        &self,
+        case: &Case,
+        deadlines: &[Deadline],
+        blobs: &[Digest],
+    ) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
+        let case = case.clone();
+        let deadlines = deadlines.to_vec();
+        let blobs = blobs.to_vec();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            {
+                let key = case.id.to_string();
+                let state = serde_json::to_string(&case.state)
+                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+                let opened = ts(case.opened_at);
+                let mut cases = w.open_table(CASES).map_err(|e| be(&e))?;
+                if cases
+                    .get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .is_some()
+                {
+                    return Err(StoreError::Backend(format!(
+                        "case {} already exists — a restore rebuilds a case layer, it does \
+                         not merge one",
+                        case.id
+                    )));
+                }
+                cases
+                    .insert(
+                        (tenant.as_str(), key.as_str()),
+                        (
+                            case.kind.as_str(),
+                            case.status.as_str(),
+                            state.as_str(),
+                            case.version.0,
+                            opened,
+                        ),
+                    )
+                    .map_err(|e| be(&e))?;
+
+                // Correlation, both halves. The open half is the one with a
+                // constraint to respect: one open case per business key, and a
+                // restore that overwrote a claim would silently merge two
+                // matters.
+                let mut corr_all = w.open_table(CORR_ALL).map_err(|e| be(&e))?;
+                let mut corr_open = w.open_table(CORR_OPEN).map_err(|e| be(&e))?;
+                for k in &case.correlation {
+                    corr_all
+                        .insert(
+                            (
+                                tenant.as_str(),
+                                key.as_str(),
+                                k.namespace.as_str(),
+                                k.value.as_str(),
+                            ),
+                            (),
+                        )
+                        .map_err(|e| be(&e))?;
+                    if case.status != CaseStatus::Closed {
+                        let prior = corr_open
+                            .insert(
+                                (tenant.as_str(), k.namespace.as_str(), k.value.as_str()),
+                                key.as_str(),
+                            )
+                            .map_err(|e| be(&e))?;
+                        if let Some(prior) = prior
+                            && prior.value() != key
+                        {
+                            return Err(StoreError::Backend(format!(
+                                "correlation key {k} is already claimed by another open case — \
+                                 importing this one would merge two matters"
+                            )));
+                        }
+                    }
+                }
+
+                // Runs, in the order the export recorded them attaching.
+                let mut runs = w.open_table(CASE_RUNS).map_err(|e| be(&e))?;
+                let mut seen = w.open_table(CASE_RUN_SEEN).map_err(|e| be(&e))?;
+                for (at, run) in case.runs.iter().enumerate() {
+                    let run = run.to_string();
+                    let seq = at as u64;
+                    runs.insert((tenant.as_str(), key.as_str(), seq), run.as_str())
+                        .map_err(|e| be(&e))?;
+                    seen.insert((tenant.as_str(), key.as_str(), run.as_str()), seq)
+                        .map_err(|e| be(&e))?;
+                }
+
+                // The status indexes, exactly as the ordinary paths keep them:
+                // every case in `by_status`, only unclosed ones in the census.
+                w.open_table(CASES_BY_STATUS)
+                    .map_err(|e| be(&e))?
+                    .insert(
+                        (tenant.as_str(), case.status.as_str(), -opened, key.as_str()),
+                        (),
+                    )
+                    .map_err(|e| be(&e))?;
+                if case.status != CaseStatus::Closed {
+                    w.open_table(CASES_OPEN)
+                        .map_err(|e| be(&e))?
+                        .insert((tenant.as_str(), opened, key.as_str()), ())
+                        .map_err(|e| be(&e))?;
+                }
+
+                let mut d = w.open_table(DEADLINES).map_err(|e| be(&e))?;
+                let mut due = w.open_table(DEADLINES_DUE).map_err(|e| be(&e))?;
+                for deadline in &deadlines {
+                    let resolved = ts(deadline.resolved_at);
+                    let warn = deadline.warn_at.map(ts);
+                    let digest = deadline.calendar_digest.as_bytes().to_vec();
+                    let state = deadline.state.as_str();
+                    d.insert(
+                        (tenant.as_str(), key.as_str(), deadline.name.as_str()),
+                        (
+                            resolved,
+                            digest.as_slice(),
+                            warn.unwrap_or(0),
+                            u8::from(warn.is_some()),
+                            state,
+                        ),
+                    )
+                    .map_err(|e| be(&e))?;
+                    if is_outstanding(state) {
+                        due.insert(
+                            (
+                                tenant.as_str(),
+                                trigger_at(resolved, warn),
+                                key.as_str(),
+                                deadline.name.as_str(),
+                            ),
+                            resolved,
+                        )
+                        .map_err(|e| be(&e))?;
+                    }
+                }
+
+                // Blob links. The export carries digests without their link
+                // timestamps, so these are stamped from `opened_at` plus an
+                // ordinal — the key needs uniqueness and erasure needs
+                // reachability, and neither needs the original instant.
+                let mut case_blobs = w.open_table(CASE_BLOBS).map_err(|e| be(&e))?;
+                for (at, digest) in blobs.iter().enumerate() {
+                    case_blobs
+                        .insert(
+                            (
+                                tenant.as_str(),
+                                key.as_str(),
+                                opened + i64::try_from(at).unwrap_or(i64::MAX),
+                                digest.as_bytes().as_slice(),
+                            ),
+                            (),
+                        )
+                        .map_err(|e| be(&e))?;
+                }
+            }
+            w.commit().map_err(|e| be(&e))?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn attach_run(&self, case: CaseId, run: RunId) -> Result<(), StoreError> {
         let tenant = self.tenant_name();
         let (c, r) = (case.to_string(), run.to_string());

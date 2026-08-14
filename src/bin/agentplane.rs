@@ -335,8 +335,12 @@ fn journal_verb(opts: &StoreArgs, audit: Option<&AuditArgs>) -> Result<ExitCode,
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let store: Arc<dyn JournalStore> =
-            Arc::new(RedbStore::open(&opts.store).map_err(|e| e.to_string())?);
+        let redb = Arc::new(RedbStore::open(&opts.store).map_err(|e| e.to_string())?);
+        let store: Arc<dyn JournalStore> = redb.clone();
+        // The same file holds the case layer, so the export always carries it.
+        // An optional flag here would be a way to quietly produce the file the
+        // verifier flags — the matters the journal names, missing.
+        let cases: Arc<dyn agentplane::case::CaseStore> = redb;
 
         // The library's own list, not literals restated here: the store indexes
         // runs *by* outcome and has no "all runs" query, so an export has to
@@ -382,13 +386,17 @@ fn journal_verb(opts: &StoreArgs, audit: Option<&AuditArgs>) -> Result<ExitCode,
 
         let Some(audit) = audit else {
             let stdout = std::io::stdout();
-            let trailer =
-                agentplane::export::to_jsonl(&store, &runs, std::io::BufWriter::new(stdout.lock()))
-                    .await
-                    .map_err(|e| e.to_string())?;
+            let trailer = agentplane::export::to_jsonl(
+                &store,
+                Some(&cases),
+                &runs,
+                std::io::BufWriter::new(stdout.lock()),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             eprintln!(
-                "exported {} record(s) from {}/{} run(s)",
-                trailer.records, trailer.runs_exported, trailer.runs_requested
+                "exported {} record(s) from {}/{} run(s) and {} case(s)",
+                trailer.records, trailer.runs_exported, trailer.runs_requested, trailer.cases
             );
             if !trailer.unreadable.is_empty() {
                 for u in &trailer.unreadable {
@@ -491,13 +499,18 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 .build()
                 .map_err(|e| format!("could not start the async runtime: {e}"))?;
             rt.block_on(async {
-                let store: Arc<dyn JournalStore> =
-                    Arc::new(RedbStore::open(&a.store).map_err(|e| e.to_string())?);
+                let redb = Arc::new(RedbStore::open(&a.store).map_err(|e| e.to_string())?);
+                let store: Arc<dyn JournalStore> = redb.clone();
+                let cases: Arc<dyn agentplane::case::CaseStore> = redb;
                 let file =
                     std::fs::File::open(&a.file).map_err(|e| format!("reading {}: {e}", a.file))?;
-                let report = agentplane::export::from_jsonl(&store, std::io::BufReader::new(file))
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let report = agentplane::export::from_jsonl(
+                    &store,
+                    Some(&cases),
+                    std::io::BufReader::new(file),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
@@ -761,7 +774,10 @@ fn spawn_sweeper(runtime: &Arc<Runtime>, every: u32) {
             #[allow(clippy::disallowed_methods)]
             let now = time::OffsetDateTime::now_utc();
             match sweeper.fire_timers(now).await {
-                Ok(n) if n > 0 => tracing::info!(fired = n, "timers fired"),
+                Ok(w) if w.failed > 0 => {
+                    tracing::warn!(fired = w.fired, failed = w.failed, "timer wakes failed");
+                }
+                Ok(w) if w.fired > 0 => tracing::info!(fired = w.fired, "timers fired"),
                 Ok(_) => {}
                 Err(error) => tracing::error!(%error, "firing timers failed"),
             }

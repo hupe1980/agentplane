@@ -496,6 +496,155 @@ impl CaseStore for PostgresStore {
         }))
     }
 
+    async fn cases(&self, after: Option<CaseId>, limit: usize) -> Result<Vec<Case>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // Ids first, rows second — through `case()`, so the assembly of a case
+        // from its tables exists exactly once and the export cannot drift from
+        // the ordinary reader.
+        let cursor = after.map(|c| c.to_string()).unwrap_or_default();
+        let rows = client
+            .query(
+                "SELECT case_id FROM cases
+                  WHERE tenant = $1 AND case_id > $2
+                  ORDER BY case_id ASC
+                  LIMIT $3",
+                &[
+                    &self.tenant_name(),
+                    &cursor,
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        drop(client);
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.get(0);
+            let id = CaseId::parse(&id).map_err(|e| corrupt("bad case id", e))?;
+            if let Some(case) = self.case(id).await? {
+                out.push(case);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn import_case(
+        &self,
+        case: &Case,
+        deadlines: &[Deadline],
+        blobs: &[Digest],
+    ) -> Result<(), StoreError> {
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        let key = case.id.to_string();
+        let tenant = self.tenant_name();
+        let state = serde_json::to_string(&case.state)?;
+
+        // Refused rather than upserted: a restore rebuilds a case layer, it
+        // does not merge one, and an `ON CONFLICT DO UPDATE` here would let a
+        // second restore silently rewrite a matter.
+        let inserted = tx
+            .execute(
+                "INSERT INTO cases (tenant, case_id, kind, status, state, version, opened_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT DO NOTHING",
+                &[
+                    &tenant,
+                    &key,
+                    &case.kind,
+                    &case.status.as_str(),
+                    &state,
+                    &i64::try_from(case.version.0).unwrap_or(i64::MAX),
+                    &case.opened_at.unix_timestamp(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if inserted == 0 {
+            return Err(StoreError::Backend(format!(
+                "case {} already exists — a restore rebuilds a case layer, it does not \
+                 merge one",
+                case.id
+            )));
+        }
+
+        for k in &case.correlation {
+            // The partial unique index over open correlation rows is the
+            // arbiter, exactly as it is for `correlate_or_open`: importing an
+            // open case whose key another open case claims must fail rather
+            // than merge two matters.
+            tx.execute(
+                "INSERT INTO case_correlation (tenant, case_id, namespace, value, open)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &tenant,
+                    &key,
+                    &k.namespace,
+                    &k.value,
+                    &(case.status != CaseStatus::Closed),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+
+        for (at, run) in case.runs.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO case_runs (tenant, case_id, run_id, seq)
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    &tenant,
+                    &key,
+                    &run.to_string(),
+                    &i64::try_from(at).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+
+        for deadline in deadlines {
+            tx.execute(
+                "INSERT INTO case_deadlines
+                    (tenant, case_id, name, resolved_at, calendar_digest, warn_at, state)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &tenant,
+                    &key,
+                    &deadline.name,
+                    &deadline.resolved_at.unix_timestamp(),
+                    &deadline.calendar_digest.as_bytes().to_vec(),
+                    &deadline.warn_at.map(time::OffsetDateTime::unix_timestamp),
+                    &deadline.state.as_str(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+
+        // Blob links, stamped from `opened_at` plus an ordinal: the export
+        // carries digests without their link timestamps, the key needs
+        // uniqueness and erasure needs reachability, and neither needs the
+        // original instant.
+        for (at, digest) in blobs.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO case_blobs (tenant, case_id, digest, written_at)
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    &tenant,
+                    &key,
+                    &digest.as_bytes().to_vec(),
+                    &(case.opened_at.unix_timestamp() + i64::try_from(at).unwrap_or(i64::MAX)),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(())
+    }
+
     async fn attach_run(&self, case: CaseId, run: RunId) -> Result<(), StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client

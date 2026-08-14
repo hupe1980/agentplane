@@ -54,6 +54,173 @@ pub async fn check_cases(store: &Arc<dyn CaseStore>, r: &mut Report) {
     a_stale_state_write_is_refused(store, r).await;
     a_state_write_to_a_missing_case_is_not_found(store, r).await;
     only_one_of_several_racing_writers_wins(store, r).await;
+    enumeration_pages_without_gap_or_overlap(store, r).await;
+    an_imported_case_is_reachable_by_every_read_path(store, r).await;
+}
+
+/// `cases` pages exhaustively: every case exactly once, whatever the limit.
+///
+/// A bounded list with no cursor enumerates a prefix and calls it everything —
+/// and this method's one caller is the export, whose whole job is
+/// completeness. The check drives the cursor with a page size smaller than the
+/// population, which is the shape a big store forces and a small test forgets.
+async fn enumeration_pages_without_gap_or_overlap(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let mut opened = std::collections::BTreeSet::new();
+    for n in 0..5 {
+        let Ok(c) = store
+            .correlate_or_open("page", &keys(&format!("PAGE-{n}")), ts(2_000 + n))
+            .await
+        else {
+            r.record("enumeration", "correlate_or_open failed while seeding");
+            return;
+        };
+        opened.insert(c.case_id());
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut after = None;
+    loop {
+        let Ok(page) = store.cases(after, 2).await else {
+            r.record("enumeration", "cases() failed mid-page");
+            return;
+        };
+        let full = page.len() >= 2;
+        for case in page {
+            if !seen.insert(case.id) {
+                r.record(
+                    "enumeration",
+                    "cases() served one case on two pages — an export would carry \
+                     the matter twice and the verifier would read a duplicate",
+                );
+                return;
+            }
+            after = Some(case.id);
+        }
+        if !full {
+            break;
+        }
+    }
+    // Superset, not equality: earlier checks leave their own cases behind, and
+    // holding this check to an exact count would couple it to their fixtures.
+    if !opened.is_subset(&seen) {
+        r.record(
+            "enumeration",
+            "cases() finished without serving every case — an export taken from \
+             this store silently drops matters",
+        );
+    }
+}
+
+/// An imported case is indistinguishable from one the store built itself.
+///
+/// `import_case` maintains every index by hand, which is the shape that drifts:
+/// an import that rebuilds five indexes out of six reads perfectly until
+/// somebody queries the sixth. So the read paths are the check — `case`,
+/// `correlate`, `by_status`, `due`, `blobs_of` — and a second import of the
+/// same id must refuse, because a restore rebuilds a case layer rather than
+/// merging one.
+async fn an_imported_case_is_reachable_by_every_read_path(
+    store: &Arc<dyn CaseStore>,
+    r: &mut Report,
+) {
+    use crate::core::{Case, CaseStatus, CaseVersion, Deadline, DeadlineState, Digest};
+    r.checked += 1;
+
+    let id = crate::core::CaseId::generate();
+    let case = Case {
+        id,
+        kind: "imported".to_owned(),
+        status: CaseStatus::Escalated,
+        correlation: vec![CorrelationKey::new("doc", "IMPORT-1")],
+        state: serde_json::json!({"carried": true}),
+        version: CaseVersion(41),
+        opened_at: ts(3_000),
+        runs: vec![crate::core::RunId::generate()],
+    };
+    let deadline = Deadline {
+        case: id,
+        name: "respond-by".to_owned(),
+        resolved_at: ts(9_000),
+        calendar_digest: Digest::of(b"cal"),
+        warn_at: Some(ts(8_000)),
+        state: DeadlineState::Pending,
+    };
+    let blob = Digest::of(b"artifact");
+    if store
+        .import_case(&case, &[deadline], &[blob])
+        .await
+        .is_err()
+    {
+        r.record("import", "import_case refused a fresh case");
+        return;
+    }
+
+    let Ok(Some(read)) = store.case(id).await else {
+        r.record("import", "an imported case is not readable by `case`");
+        return;
+    };
+    // Version and status are the fields a restore exists to carry —
+    // `put_state` cannot say "version 41" and `correlate_or_open` cannot say
+    // "escalated".
+    if read.version != CaseVersion(41)
+        || read.status != CaseStatus::Escalated
+        || read.runs != case.runs
+        || read.correlation != case.correlation
+    {
+        r.record(
+            "import",
+            "an imported case read back with different fields than it was \
+             given — the restore is lossy where it claims fidelity",
+        );
+    }
+    if !matches!(
+        store.correlate(&case.correlation).await,
+        Ok(Some(found)) if found == id
+    ) {
+        r.record(
+            "import",
+            "an imported open case is invisible to correlation — the next inbound \
+             message about this matter opens a duplicate",
+        );
+    }
+    if !matches!(
+        store.by_status(CaseStatus::Escalated, 100).await,
+        Ok(cases) if cases.iter().any(|c| c.id == id)
+    ) {
+        r.record(
+            "import",
+            "an imported escalated case is missing from the status worklist — \
+             whoever clears escalations cannot find it",
+        );
+    }
+    if !matches!(
+        store.due(ts(10_000), 500).await,
+        Ok(due) if due.iter().any(|d| d.case == id)
+    ) {
+        r.record(
+            "import",
+            "an imported pending obligation is invisible to the sweep — the \
+             deadline breaches and nothing notices",
+        );
+    }
+    if !matches!(
+        store.blobs_of(id).await,
+        Ok(blobs) if blobs.contains(&blob)
+    ) {
+        r.record(
+            "import",
+            "an imported blob link is unreachable — erasure cannot find the \
+             artifact from the case that names it",
+        );
+    }
+    if store.import_case(&case, &[], &[]).await.is_ok() {
+        r.record(
+            "import",
+            "importing an existing case succeeded — a second restore can silently \
+             rewrite a matter",
+        );
+    }
 }
 
 /// The lost update, refused.

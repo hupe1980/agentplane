@@ -182,8 +182,10 @@ Add `--operator-addr 127.0.0.1:9090` and the worklist, task decisions and
 `GET /runs?outcome=quarantined` are served too — on their **own** listener, off
 unless asked for, and separated from the peer surface by *policy* (`peer` reaches
 `a2a:*`, `operator` reaches `api:*`) rather than by the port. A served plane also
-sweeps deadlines, task expiry, dead letters and due timers, so a run that sleeps
-or waits actually wakes up.
+sweeps deadlines, task expiry, dead letters, due timers **and abandoned runs**
+— a lease that expired while still naming an owner is an instance that died
+holding the run, and the sweep takes it over and resumes it — so a run that
+sleeps, waits or loses its instance actually finishes.
 
 Both `--policy` and `--tokens` are required and have no defaults. That is the
 design rather than an inconvenience: a permissive engine and no engine are the
@@ -197,8 +199,8 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | | |
 |---|---|
 | 🧾 | **A journal you can audit** — append-only, hash-chained, per-record signatures naming the workload that wrote them, and a per-plane Merkle log so deleting a whole run is detectable |
-| 📤 | **A record you can take away** — `agentplane export` writes framed JSON Lines an auditor reads with no Rust toolchain; `audit --key --prior` checks authorship and deletion against a store it did not write; `verify` re-walks a copy offline, from the file alone; `restore` rebuilds a store and proves it by one comparison — equal Merkle roots at equal size. A truncated export is told from a whole one by its missing trailer, and runs that could not be read are named, not counted |
-| ⏱️ | **Durable execution** — crash mid-run and resume from the last completed effect; a suspended run costs a row on disk, not a task |
+| 📤 | **A record you can take away** — `agentplane export` writes framed JSON Lines an auditor reads with no Rust toolchain; `audit --key --prior` checks authorship and deletion against a store it did not write; `verify` re-walks a copy offline, from the file alone; `restore` rebuilds a store — journal **and** case layer, since a matter's status, obligations and blob links are beside the history, not derivable from it — and proves the journal by one comparison — equal Merkle roots at equal size. A truncated export is told from a whole one by its missing trailer, and runs that could not be read are named, not counted |
+| ⏱️ | **Durable execution** — crash mid-run and resume from the last completed effect; a suspended run costs a row on disk, not a task. Recovery is *initiated*, not merely possible: the sweep finds every run whose owner died holding it — an expired, unreleased lease — and resumes it, journaling the takeover in its own sealed run |
 | 🗂️ | **Cases, not long-lived workflows** — runs stay minutes, business processes span months, so a deploy never has to migrate an in-flight workflow |
 | 🚫 | **There is no `AllowAll`** — the default is `DenyAll`, and a permissive engine and no engine are the same behaviour, so having two ways to spell it is how a plane ends up with a policy layer everyone believes is on. The same reason there is no `Egress::allow_all()`. Note the direction: a catch-all `permit` left in a policy set makes every later rule redundant, because Cedar allows on *any* matching permit — a baseline is something to remove deliberately, not to inherit |
 | 🛡️ | **Policy before live dispatch** — a total, I/O-free gate; denials are journaled, strict replay never re-judges history, and plan authority is checked before step 1 |

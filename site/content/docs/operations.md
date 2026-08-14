@@ -30,6 +30,17 @@ Failover is not a special code path — it is the crash-recovery path. Lease
 expires, another instance claims at `epoch + 1`, resumes via replay. That is the
 payoff of building on replay: HA costs one lease table and an epoch column.
 
+The claim is **initiated by the sweep**, and that sentence used to be missing
+its subject. Fencing makes takeover safe and replay makes it correct, but for a
+release neither made it *happen*: every resume had an event-shaped driver — an
+inbound message, a fired timer, an operator — so a run crashed mid-step with
+none of those pending had no driver at all, appeared in no backlog (it
+concluded nothing, and its wake was already consumed), and waited forever while
+looking exactly like work in progress. The sweep's recovery pass closes that:
+an expired lease that still names an owner is precisely "an instance died
+holding this run", because every clean exit — sealed, failed, suspended —
+releases. See [the sweeper](#the-sweeper).
+
 ### A live run renews; only a dead owner's lease expires
 
 Expiry answers *is this owner dead?* Without renewal it also answers a question
@@ -264,10 +275,12 @@ Until something runs on a clock, a deadline is a number in a table and an
 unclaimed event is a row nobody reads. That is the failure this runtime is built
 against — not a crash, but a silence.
 
-One tick, four findings, all of them loud:
+One tick, five findings — four of them loud, and the first one routine healing
+that still means an instance died:
 
 | Finding | What happens |
 |---|---|
+| An instance died holding a run | The run is taken over at `epoch + 1` and resumed |
 | An obligation is approaching | `DeadlineTransition` → `Warned` |
 | An obligation passed unmet | `DeadlineTransition` → `Breached`; the **case** is escalated |
 | A task's window closed | The declared `on_expiry` is applied |
@@ -280,6 +293,48 @@ through in milliseconds.
 Every field of `SweepReport` is a number worth alerting on. `is_quiet()` is the
 useful predicate: a healthy plane sweeps silently, so a non-silent sweep means
 something happened.
+
+### The recovery pass: who resumes a crashed run
+
+The candidate set is exact, not heuristic. Every clean exit hands its lease
+back — sealed, failed, *suspended* — so `JournalStore::abandoned_runs` answers
+one precise question: which leases expired while still naming an owner. That is
+the set of runs somebody was executing when their process stopped, and the
+sweep resumes each one: takeover bumps the epoch, the store fences the dead
+owner's next append, and replay reads completed effects back rather than
+redoing them.
+
+Three details are worth knowing at 3 a.m.:
+
+- **`runs_recovered` above zero means an instance died**, even though the runs
+  themselves are fine. The healing is routine; the dying is not. A steady
+  recovery rate with allegedly healthy instances is a contradiction — go look
+  at why leases are lapsing (GC stalls and CPU starvation produce exactly
+  this).
+- **`recovery_failures` is one stuck run, not many.** The run stays listed and
+  is retried every tick, so a persistent count is the same run failing
+  repeatedly — and nothing else will unstick it. The reason is in the log line
+  of the failing tick. This is the one recovery number `needs_attention()`
+  fires on.
+- **The batch is small (32) on purpose.** Recovering a run replays its journal
+  and then executes live from the frontier — which may dispatch a model call —
+  so a mass failure drains over several ticks with `saturated.recovery` up
+  rather than holding one tick hostage. The flag means *at least* a batch was
+  waiting, never that the batch was all there was.
+
+Each takeover is written into the sweep's own sealed run as `run_recovered`,
+because a takeover fences the previous owner and *who fenced whom, and why*
+must be answerable from the journal rather than inferred from an epoch gap.
+
+One state recovers to nothing, deliberately: a lease over an **empty** journal
+means admission acquired and died before its first append landed. No run
+exists — the atomic admission batch never committed, so nothing was declared,
+authorized or performed — and clearing the lease is the whole recovery.
+
+What the pass does **not** cover, stated rather than implied: a crash inside
+the one store-commit between an event's claim and the lease acquisition that
+resumes it. That window is one transaction wide; its symptom is later events
+for the same correlation dead-lettering, which the sweep already reports.
 
 ### A finding has to be findable
 
@@ -361,11 +416,22 @@ agentplane restore history.jsonl --store ./rebuilt.redb
 
 `export` writes JSON Lines: a header naming the log, its checkpoint and the
 canonicalization rule the digests were computed under; one line per record
-carrying `prev_hash` and `hash`, so the chain re-walks from the file alone; and a
-trailer. The trailer's **absence** is the signal — a file cut short by a full
-disk or a killed pipe ends without one, and every line in it is still valid JSON,
-so counting is no help to a reader who does not have the source. Runs that could
-not be read are named in the trailer rather than quietly missing.
+carrying `prev_hash` and `hash`, so the chain re-walks from the file alone;
+**one line per case** — the case layer is beside the journal, not derivable
+from it, so a file without it rebuilds a journal whose records name matters
+that no longer exist; and a trailer. The trailer's **absence** is the signal —
+a file cut short by a full disk or a killed pipe ends without one, and every
+line in it is still valid JSON, so counting is no help to a reader who does not
+have the source. Runs that could not be read are named in the trailer rather
+than quietly missing, and the trailer's case count is what catches the case
+layer stripped whole.
+
+Case state travels **as stored**: on a sealed plane that is ciphertext, because
+an export of plaintext would quietly undo erasure — the key destroyed tomorrow
+would no longer reach the copy taken today. Two questions stay live rather than
+offline, and `verify` reports them as unchecked instead of passed: whether the
+blob bytes behind the exported digests are present, and whether sealed state's
+keys still unwrap.
 
 `audit` prints the report as JSON and exits non-zero on findings — but **not** on
 `not_checked`, which is a separate list and the one worth reading. An audit given
@@ -422,6 +488,14 @@ established less rather than failed, and the report says which.
 rows loaded" — it means every record, in every run, in the order the log
 recorded them, rebuilt to the same commitment. A run restored this way
 strict-replays on a plane that never executed it.
+
+It rebuilds the case layer beside the journal: every matter is queryable again
+— `case`, correlation, the status worklist, the deadline sweep, the blob links
+erasure walks — and the conformance battery holds the import to every one of
+those read paths on both backends, because an import that rebuilds five
+indexes out of six reads perfectly until somebody queries the sixth. A store
+that already holds a case refuses it: a restore rebuilds a case layer, it does
+not merge one.
 
 It replays the ordinary `append` path rather than writing rows, and that is the
 safety argument: `append` maintains six derived indexes — case, exactly-once,
