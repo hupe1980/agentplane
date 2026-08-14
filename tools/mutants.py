@@ -3150,12 +3150,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "untrusted memory writes `limit` of them and evicts every trusted one "
         "from the window — silently, because each item is honestly labelled and "
         "the caller gets exactly the number it asked for",
-        "            keys.sort_unstable_by(|a, b| {\n"
-        "                (a.0, a.1, a.2.as_str()).cmp(&(b.0, b.1, b.2.as_str()))\n"
-        "            });",
-        "            keys.sort_unstable_by(|a, b| {\n"
-        "                (a.1, a.2.as_str()).cmp(&(b.1, b.2.as_str()))\n"
-        "            });",
+        "            keys.sort_unstable_by(|a, b| (a.0, a.1, a.2.as_str()).cmp(&(b.0, b.1, b.2.as_str())));",
+        "            keys.sort_unstable_by(|a, b| (a.1, a.2.as_str()).cmp(&(b.1, b.2.as_str())));",
     ),
     "AHaltDoesNotStopAnUnlimitedTenant": (
         "src/runtime/executor.rs",

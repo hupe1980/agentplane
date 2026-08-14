@@ -120,10 +120,45 @@ impl Skill for Settler {
     }
 }
 
+/// A second step for the item: one more settlement, so a one-step ceiling
+/// pauses the item halfway with real work already landed.
+#[derive(Debug)]
+struct Finishes {
+    world: World,
+}
+
+#[async_trait::async_trait]
+impl Skill for Finishes {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("finish").provides("finish")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _i: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.effect(Settle {
+            meter: "final".into(),
+            world: Arc::clone(&self.world),
+        })
+        .await?;
+        Ok(Outcome::done(Tainted::trusted(json!({ "finished": true }))))
+    }
+}
+
 fn plan() -> PlanIR {
     PlanIR::new(vec![
         PlanNode::new(0, "settle")
             .arg("input", ArgSource::run_input())
+            .terminal(),
+    ])
+}
+
+fn two_step_plan() -> PlanIR {
+    PlanIR::new(vec![
+        PlanNode::new(0, "settle").arg("input", ArgSource::run_input()),
+        PlanNode::new(1, "finish")
+            .arg("x", ArgSource::node(agentplane::core::StepId(0)))
             .terminal(),
     ])
 }
@@ -135,6 +170,23 @@ fn runtime(db: &Arc<RedbStore>, world: &World, fails: Vec<&'static str>) -> Arc<
         .skill(Settler {
             world: Arc::clone(world),
             fails,
+        })
+        .build()
+}
+
+/// A plane whose runs may take at most `steps` steps, for the ceiling the
+/// exhaustion claim needs.
+fn capped(db: &Arc<RedbStore>, world: &World, steps: usize) -> Arc<Runtime> {
+    Runtime::builder(Arc::clone(db) as Arc<dyn JournalStore>)
+        .owner("batch")
+        .batches(Arc::clone(db) as Arc<dyn BatchStore>)
+        .budget(agentplane::core::Budget::default().steps(steps))
+        .skill(Settler {
+            world: Arc::clone(world),
+            fails: vec![],
+        })
+        .skill(Finishes {
+            world: Arc::clone(world),
         })
         .build()
 }
@@ -536,58 +588,6 @@ async fn reserving_twice_returns_the_original_run() {
 /// was the resumable pause it claims to be.
 #[tokio::test]
 async fn an_exhausted_item_is_a_held_pause_not_a_failure() {
-    use agentplane::core::Budget;
-
-    /// The item's second step: one more settlement, so a one-step ceiling
-    /// pauses the item halfway with real work already landed.
-    #[derive(Debug)]
-    struct Finishes {
-        world: World,
-    }
-
-    #[async_trait::async_trait]
-    impl Skill for Finishes {
-        fn descriptor(&self) -> SkillDescriptor {
-            SkillDescriptor::new("finish").provides("finish")
-        }
-        async fn invoke(
-            &self,
-            cx: &mut StepCtx<'_>,
-            _i: Tainted<Value>,
-        ) -> Result<Outcome, SkillError> {
-            cx.effect(Settle {
-                meter: "final".into(),
-                world: Arc::clone(&self.world),
-            })
-            .await?;
-            Ok(Outcome::done(Tainted::trusted(json!({ "finished": true }))))
-        }
-    }
-
-    fn two_step_plan() -> PlanIR {
-        PlanIR::new(vec![
-            PlanNode::new(0, "settle").arg("input", ArgSource::run_input()),
-            PlanNode::new(1, "finish")
-                .arg("x", ArgSource::node(agentplane::core::StepId(0)))
-                .terminal(),
-        ])
-    }
-
-    fn capped(db: &Arc<RedbStore>, world: &World, steps: usize) -> Arc<Runtime> {
-        Runtime::builder(Arc::clone(db) as Arc<dyn JournalStore>)
-            .owner("batch")
-            .batches(Arc::clone(db) as Arc<dyn BatchStore>)
-            .budget(Budget::default().steps(steps))
-            .skill(Settler {
-                world: Arc::clone(world),
-                fails: vec![],
-            })
-            .skill(Finishes {
-                world: Arc::clone(world),
-            })
-            .build()
-    }
-
     let store = db();
     let world: World = Arc::default();
     let id = BatchId::generate();
