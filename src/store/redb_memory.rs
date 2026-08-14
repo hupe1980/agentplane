@@ -54,13 +54,119 @@ const fn trust_rank(trust: crate::core::Trust) -> u8 {
 const CURRENT: TableDefinition<(&str, &str), (&str, &str, i64, u64)> =
     TableDefinition::new("memory_current");
 
-/// `(tenant, source_id, derived_id) -> ()`, the derivation edges.
+/// `(tenant, source_id, source_version, derived_id, derived_version) -> ()`,
+/// the derivation edges — **per version on both ends**.
 ///
 /// Written when a summary is stored, and read when one is repaired. Without it a
 /// poisoned memory can be forgotten while every summary that absorbed it stays
 /// readable — the attack outliving its own remedy, which is the failure the
 /// whole memory model is shaped to avoid.
-const DERIVED: TableDefinition<(&str, &str, &str), ()> = TableDefinition::new("memory_derived");
+///
+/// Per-version rather than per-id, because supersession does not un-absorb
+/// anything: a summary re-derived from other sources still *contains* what its
+/// superseded version read, and that version stays readable through
+/// `version()`. Id-level edges were replaced on every revision, so a cascade
+/// from the original source no longer found the superseded summary that had
+/// absorbed it. Keeping every version's edges makes the traversal see the
+/// union of what was ever derived, and lets it erase exactly the superseded
+/// versions that named a doomed source while sparing a current version that
+/// did not.
+const DERIVED: TableDefinition<(&str, &str, u64, &str, u64), ()> =
+    TableDefinition::new("memory_derived");
+
+/// `(tenant, derived_id, derived_version, source_id, source_version) -> ()`,
+/// the same edges keyed from the target side.
+///
+/// The reverse lookup erasure needs: removing a memory must find the edges
+/// *pointing at it* without ranging over every edge the tenant has, which is a
+/// scan that grows with the corpus and runs inside every erasure transaction.
+/// Written and removed in the same transaction as [`DERIVED`], always — the two
+/// tables are one index, not two facts.
+const DERIVED_BY_TARGET: TableDefinition<(&str, &str, u64, &str, u64), ()> =
+    TableDefinition::new("memory_derived_by_target");
+
+/// One derivation edge, both endpoints versioned, as erasure collects them.
+type Edge = (String, u64, String, u64);
+
+/// Every edge touching any version of `id`, in either direction.
+///
+/// Both tables are ranged by their leading id, so this is proportional to the
+/// node's own degree rather than to the tenant's edge count. An edge whose two
+/// endpoints are both being erased is collected twice; removal is idempotent,
+/// so the duplicate costs a lookup and nothing else.
+fn collect_edges_of_id(
+    forward: &impl ReadableTable<(&'static str, &'static str, u64, &'static str, u64), ()>,
+    reverse: &impl ReadableTable<(&'static str, &'static str, u64, &'static str, u64), ()>,
+    tenant: &str,
+    id: &str,
+    out: &mut Vec<Edge>,
+) -> Result<(), StoreError> {
+    for entry in forward
+        .range((tenant, id, 0, "", 0)..=(tenant, id, u64::MAX, MAX_STR, u64::MAX))
+        .map_err(|e| be(&e))?
+    {
+        let (key, _) = entry.map_err(|e| be(&e))?;
+        let (_, source_id, source_version, derived_id, derived_version) = key.value();
+        out.push((
+            source_id.to_owned(),
+            source_version,
+            derived_id.to_owned(),
+            derived_version,
+        ));
+    }
+    for entry in reverse
+        .range((tenant, id, 0, "", 0)..=(tenant, id, u64::MAX, MAX_STR, u64::MAX))
+        .map_err(|e| be(&e))?
+    {
+        let (key, _) = entry.map_err(|e| be(&e))?;
+        let (_, derived_id, derived_version, source_id, source_version) = key.value();
+        out.push((
+            source_id.to_owned(),
+            source_version,
+            derived_id.to_owned(),
+            derived_version,
+        ));
+    }
+    Ok(())
+}
+
+/// Every edge touching exactly `(id, version)`, in either direction.
+fn collect_edges_of_version(
+    forward: &impl ReadableTable<(&'static str, &'static str, u64, &'static str, u64), ()>,
+    reverse: &impl ReadableTable<(&'static str, &'static str, u64, &'static str, u64), ()>,
+    tenant: &str,
+    id: &str,
+    version: u64,
+    out: &mut Vec<Edge>,
+) -> Result<(), StoreError> {
+    for entry in forward
+        .range((tenant, id, version, "", 0)..=(tenant, id, version, MAX_STR, u64::MAX))
+        .map_err(|e| be(&e))?
+    {
+        let (key, _) = entry.map_err(|e| be(&e))?;
+        let (_, source_id, source_version, derived_id, derived_version) = key.value();
+        out.push((
+            source_id.to_owned(),
+            source_version,
+            derived_id.to_owned(),
+            derived_version,
+        ));
+    }
+    for entry in reverse
+        .range((tenant, id, version, "", 0)..=(tenant, id, version, MAX_STR, u64::MAX))
+        .map_err(|e| be(&e))?
+    {
+        let (key, _) = entry.map_err(|e| be(&e))?;
+        let (_, derived_id, derived_version, source_id, source_version) = key.value();
+        out.push((
+            source_id.to_owned(),
+            source_version,
+            derived_id.to_owned(),
+            derived_version,
+        ));
+    }
+    Ok(())
+}
 
 /// `(tenant, id) -> ()`, identities whose content was erased.
 ///
@@ -212,31 +318,42 @@ impl MemoryStore for RedbStore {
                     )
                     .map_err(|e| be(&e))?;
 
-                // One edge per source. Written on every version, so a summary
-                // revised to read different sources is findable from the new
-                // ones. Remove the old incoming edges first: otherwise a source
-                // no longer present in the current summary can still erase it,
-                // even though the current summary no longer contains it.
+                // One edge per source, keyed by **this version** on the
+                // derived end and the exact version read on the source end.
+                // Earlier versions' edges are deliberately left in place: a
+                // superseded summary still contains what it absorbed, and it
+                // stays readable through `version()`, so its lineage must stay
+                // traversable for exactly as long as the version itself
+                // exists. Erasure — not supersession — is what removes edges.
                 let mut derived = w.open_table(DERIVED).map_err(|e| be(&e))?;
-                let stale_sources: Vec<String> = derived
-                    .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
-                    .map_err(|e| be(&e))?
-                    .filter_map(|entry| match entry {
-                        Ok((key, _)) if key.value().2 == id => Some(Ok(key.value().1.to_owned())),
-                        Ok(_) => None,
-                        Err(error) => Some(Err(be(&error))),
-                    })
-                    .collect::<Result<_, StoreError>>()?;
-                for source_id in stale_sources {
-                    derived
-                        .remove((tenant.as_str(), source_id.as_str(), id.as_str()))
-                        .map_err(|e| be(&e))?;
-                }
+                let mut derived_rev = w.open_table(DERIVED_BY_TARGET).map_err(|e| be(&e))?;
                 for source in &item.derived_from {
                     derived
-                        .insert((tenant.as_str(), source.id.as_str(), id.as_str()), ())
+                        .insert(
+                            (
+                                tenant.as_str(),
+                                source.id.as_str(),
+                                source.version,
+                                id.as_str(),
+                                version,
+                            ),
+                            (),
+                        )
+                        .map_err(|e| be(&e))?;
+                    derived_rev
+                        .insert(
+                            (
+                                tenant.as_str(),
+                                id.as_str(),
+                                version,
+                                source.id.as_str(),
+                                source.version,
+                            ),
+                            (),
+                        )
                         .map_err(|e| be(&e))?;
                 }
+                drop(derived_rev);
 
                 // Sliding retention starts at the write, not at the first
                 // touch. Initialized lazily, an item with a window and no
@@ -320,28 +437,42 @@ impl MemoryStore for RedbStore {
                 ),
             };
 
-            // Two buckets, each bounded by `limit`, filled in one pass — so a
-            // trusted memory is never evicted by a newer untrusted one, and the
-            // scan still reads at most `2 * limit` items rather than the whole
-            // subject. The index range is walked to its end because the rank is
-            // in the value: stopping early would be the recency-only truncation
-            // this exists to remove.
-            let mut trusted: Vec<MemoryItem> = Vec::new();
-            let mut untrusted: Vec<MemoryItem> = Vec::new();
+            // The selection rule, stated once for every backend: most trusted
+            // first, then newest, then id — **globally across purposes** when
+            // no purpose narrows the range. The index is keyed with the purpose
+            // *before* the timestamp (that ordering is what makes a purposeful
+            // recall a contiguous range), so a purpose-less scan arrives
+            // purpose-lexicographic and has to be re-sorted here; truncating
+            // the raw scan order would let whichever purpose sorts first evict
+            // newer, equally trusted memories from every other purpose.
+            //
+            // Trust still leads recency because recall truncates, and
+            // truncating by recency alone is an eviction an attacker steers:
+            // anything able to write an untrusted memory writes `limit` of
+            // them and the trusted ones silently lose. Only the index keys are
+            // collected and sorted — item rows are read after the cut, at most
+            // until `limit` survivors are found — so the memory cost is one
+            // key per current item in the subject, not one item.
+            let mut keys: Vec<(u8, i64, String, u64)> = Vec::new();
             for entry in by_subject.range(from..=to).map_err(|e| be(&e))? {
-                if trusted.len() >= limit {
-                    break;
-                }
                 let (k, v) = entry.map_err(|e| be(&e))?;
                 let (version, rank) = v.value();
-                // A full untrusted bucket cannot improve the answer, and
-                // deserializing into it would be work thrown away.
-                if rank != 0 && untrusted.len() >= limit {
-                    continue;
+                let (_, _, _, neg_created, id) = k.value();
+                keys.push((rank, neg_created, id.to_owned(), version));
+            }
+            // `neg_created` is the negated timestamp, so ascending order here
+            // is newest-first — the same trick the index itself plays.
+            keys.sort_unstable_by(|a, b| {
+                (a.0, a.1, a.2.as_str()).cmp(&(b.0, b.1, b.2.as_str()))
+            });
+
+            let mut out: Vec<MemoryItem> = Vec::new();
+            for (_, _, id, version) in keys {
+                if out.len() >= limit {
+                    break;
                 }
-                let id = k.value().4;
                 let Some(raw) = items
-                    .get((tenant.as_str(), id, version))
+                    .get((tenant.as_str(), id.as_str(), version))
                     .map_err(|e| be(&e))?
                 else {
                     continue;
@@ -350,7 +481,7 @@ impl MemoryStore for RedbStore {
                     .map_err(|e| StoreError::Backend(e.to_string()))?;
                 let access_expiry = access
                     .as_ref()
-                    .and_then(|table| table.get((tenant.as_str(), id)).ok().flatten())
+                    .and_then(|table| table.get((tenant.as_str(), id.as_str())).ok().flatten())
                     .and_then(|value| {
                         crate::core::Timestamp::from_unix_timestamp(value.value()).ok()
                     });
@@ -364,17 +495,42 @@ impl MemoryStore for RedbStore {
                 if as_of.is_some_and(|at| effective.is_some_and(|expires| expires <= at)) {
                     continue;
                 }
-                if rank == 0 {
-                    trusted.push(item);
-                } else {
-                    untrusted.push(item);
-                }
+                out.push(item);
             }
-            trusted.truncate(limit);
-            let room = limit - trusted.len();
-            untrusted.truncate(room);
-            trusted.append(&mut untrusted);
-            Ok(trusted)
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn subject_ids(&self, subject: &str) -> Result<Vec<String>, StoreError> {
+        let tenant = self.tenant_name();
+        let subject = subject.to_owned();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(by_subject) = r.open_table(BY_SUBJECT) else {
+                return Ok(Vec::new());
+            };
+            // The whole subject range, unconditionally: this is the erasure
+            // path's enumeration, and a page size here would be a page size on
+            // how much of a subject an erasure reaches.
+            let mut ids = std::collections::BTreeSet::new();
+            for entry in by_subject
+                .range(
+                    (tenant.as_str(), subject.as_str(), "", i64::MIN, "")
+                        ..=(
+                            tenant.as_str(),
+                            subject.as_str(),
+                            MAX_STR,
+                            i64::MAX,
+                            MAX_STR,
+                        ),
+                )
+                .map_err(|e| be(&e))?
+            {
+                let (key, _) = entry.map_err(|e| be(&e))?;
+                ids.insert(key.value().4.to_owned());
+            }
+            Ok(ids.into_iter().collect())
         })
         .await
     }
@@ -416,20 +572,25 @@ impl MemoryStore for RedbStore {
             };
 
             let mut out = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
             for e in edges
                 .range(
-                    (tenant.as_str(), source.as_str(), "")
-                        ..=(tenant.as_str(), source.as_str(), MAX_STR),
+                    (tenant.as_str(), source.as_str(), 0, "", 0)
+                        ..=(tenant.as_str(), source.as_str(), u64::MAX, MAX_STR, u64::MAX),
                 )
                 .map_err(|e| be(&e))?
             {
                 let (k, _) = e.map_err(|e| be(&e))?;
-                let derived_id = k.value().2;
+                let (_, _, _, derived_id, derived_version) = k.value();
 
                 // Through `current`, so a derivative that has since been
                 // forgotten is absent rather than a dangling edge every caller
                 // has to filter — and so a repair reads what is believed now
-                // rather than a version nobody would act on.
+                // rather than a version nobody would act on. Edges are
+                // per-version, so only the edge written by the *current*
+                // version counts here: a summary re-derived from other sources
+                // is no longer a live derivative of this one, even though its
+                // superseded versions keep their lineage for erasure.
                 let Some(v) = current
                     .get((tenant.as_str(), derived_id))
                     .map_err(|e| be(&e))?
@@ -437,6 +598,9 @@ impl MemoryStore for RedbStore {
                     continue;
                 };
                 let version = v.value().3;
+                if version != derived_version || !seen.insert(derived_id.to_owned()) {
+                    continue;
+                }
                 let Some(raw) = items
                     .get((tenant.as_str(), derived_id, version))
                     .map_err(|e| be(&e))?
@@ -464,45 +628,117 @@ impl MemoryStore for RedbStore {
                 let mut current = w.open_table(CURRENT).map_err(|e| be(&e))?;
                 let mut by_subject = w.open_table(BY_SUBJECT).map_err(|e| be(&e))?;
                 let mut edges = w.open_table(DERIVED).map_err(|e| be(&e))?;
+                let mut edges_rev = w.open_table(DERIVED_BY_TARGET).map_err(|e| be(&e))?;
                 let mut forgotten = w.open_table(FORGOTTEN).map_err(|e| be(&e))?;
 
                 // redb admits one writer, so the graph cannot grow between
                 // this traversal and the deletions below.
                 //
-                // Every edge target is enqueued, **including tombstoned ones**.
-                // `forget` deliberately keeps a forgotten memory's outgoing
-                // edges so that a correction which later becomes an erasure
-                // request can still find what was derived — and a traversal
-                // that skipped a node with no current entry would defeat that
-                // provision exactly when it is needed: A → B → C with B
-                // individually erased left C standing after a cascade from A,
-                // in both backends, because both were written from the same
-                // misreading. A tombstoned node has nothing to remove, but its
-                // descendants do.
-                let mut queue = vec![root];
+                // The traversal is **version-granular**. Edges are kept per
+                // derivative version, and a doomed source propagates to
+                // exactly the derivative versions that read it:
+                //
+                //   * a derivative whose *current* version absorbed a doomed
+                //     node is doomed as a whole id — its content is believed
+                //     now, so the id, every version, and everything derived
+                //     onward all go;
+                //   * a derivative whose only absorbing versions are
+                //     **superseded** loses those versions and keeps its
+                //     current one — a summary honestly re-derived from clean
+                //     sources is not destroyed by its own history, but the
+                //     history that named the doomed source stops being
+                //     readable through `version()`.
+                //
+                // Every edge target is enqueued, **including tombstoned
+                // ones**: `forget` deliberately keeps a forgotten memory's
+                // edges so a later cascade from further upstream can route
+                // through the tombstone. A tombstoned node has nothing to
+                // remove, but its descendants do.
+                let mut id_queue = vec![root];
+                let mut version_queue: Vec<(String, u64)> = Vec::new();
                 let mut doomed = std::collections::BTreeSet::new();
-                while let Some(source) = queue.pop() {
-                    if !doomed.insert(source.clone()) {
-                        continue;
+                let mut doomed_versions: std::collections::BTreeSet<(String, u64)> =
+                    std::collections::BTreeSet::new();
+                loop {
+                    if let Some(source) = id_queue.pop() {
+                        if !doomed.insert(source.clone()) {
+                            continue;
+                        }
+                        // Every outgoing edge, from every version of a fully
+                        // doomed id.
+                        for entry in edges
+                            .range(
+                                (tenant.as_str(), source.as_str(), 0, "", 0)
+                                    ..=(
+                                        tenant.as_str(),
+                                        source.as_str(),
+                                        u64::MAX,
+                                        MAX_STR,
+                                        u64::MAX,
+                                    ),
+                            )
+                            .map_err(|e| be(&e))?
+                        {
+                            let (key, _) = entry.map_err(|e| be(&e))?;
+                            let (_, _, _, derived_id, derived_version) = key.value();
+                            version_queue.push((derived_id.to_owned(), derived_version));
+                        }
+                    } else if let Some((derived_id, derived_version)) = version_queue.pop() {
+                        if doomed.contains(&derived_id) {
+                            continue;
+                        }
+                        let current_version = current
+                            .get((tenant.as_str(), derived_id.as_str()))
+                            .map_err(|e| be(&e))?
+                            .map(|value| value.value().3);
+                        if current_version == Some(derived_version) {
+                            id_queue.push(derived_id);
+                        } else {
+                            if !doomed_versions
+                                .insert((derived_id.clone(), derived_version))
+                            {
+                                continue;
+                            }
+                            // Only this version's own onward lineage: what a
+                            // superseded summary was itself read into.
+                            for entry in edges
+                                .range(
+                                    (
+                                        tenant.as_str(),
+                                        derived_id.as_str(),
+                                        derived_version,
+                                        "",
+                                        0,
+                                    )
+                                        ..=(
+                                            tenant.as_str(),
+                                            derived_id.as_str(),
+                                            derived_version,
+                                            MAX_STR,
+                                            u64::MAX,
+                                        ),
+                                )
+                                .map_err(|e| be(&e))?
+                            {
+                                let (key, _) = entry.map_err(|e| be(&e))?;
+                                let (_, _, _, next_id, next_version) = key.value();
+                                version_queue.push((next_id.to_owned(), next_version));
+                            }
+                        }
+                    } else {
+                        break;
                     }
-                    let children: Vec<String> = edges
-                        .range(
-                            (tenant.as_str(), source.as_str(), "")
-                                ..=(tenant.as_str(), source.as_str(), MAX_STR),
-                        )
-                        .map_err(|e| be(&e))?
-                        .map(|entry| {
-                            entry
-                                .map(|(key, _)| key.value().2.to_owned())
-                                .map_err(|error| be(&error))
-                        })
-                        .collect::<Result<_, StoreError>>()?;
-                    queue.extend(children);
                 }
 
                 let holds = w.open_table(HOLDS).map_err(|e| be(&e))?;
                 let mut access = w.open_table(ACCESS_EXPIRY).map_err(|e| be(&e))?;
-                for memory_id in &doomed {
+                // A hold blocks every erasure path, version-level included: an
+                // id under hold must not lose even a superseded version.
+                let held_candidates = doomed
+                    .iter()
+                    .cloned()
+                    .chain(doomed_versions.iter().map(|(id, _)| id.clone()));
+                for memory_id in held_candidates {
                     if holds
                         .get((tenant.as_str(), memory_id.as_str()))
                         .map_err(|e| be(&e))?
@@ -569,23 +805,60 @@ impl MemoryStore for RedbStore {
                     }
                 }
 
+                // Superseded versions that absorbed a doomed source, on ids
+                // that stay alive. Only the version row goes: the id keeps its
+                // current entry, its index row, its access window and — no
+                // tombstone — its future.
+                let mut partly: std::collections::BTreeSet<&str> =
+                    std::collections::BTreeSet::new();
+                for (memory_id, version) in &doomed_versions {
+                    if doomed.contains(memory_id) {
+                        continue;
+                    }
+                    if items
+                        .remove((tenant.as_str(), memory_id.as_str(), *version))
+                        .map_err(|e| be(&e))?
+                        .is_some()
+                    {
+                        partly.insert(memory_id.as_str());
+                    }
+                }
+                erased += partly.len();
+
                 // Cascading erasure no longer needs repair lineage for any
-                // vertex it removed. Delete both incoming and outgoing edges.
-                let stale_edges: Vec<(String, String)> = edges
-                    .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
-                    .map_err(|e| be(&e))?
-                    .filter_map(|entry| match entry {
-                        Ok((key, _)) => {
-                            let (_, source, derived) = key.value();
-                            (doomed.contains(source) || doomed.contains(derived))
-                                .then(|| Ok((source.to_owned(), derived.to_owned())))
-                        }
-                        Err(error) => Some(Err(be(&error))),
-                    })
-                    .collect::<Result<_, StoreError>>()?;
-                for (source, derived) in stale_edges {
+                // vertex — id or version — it removed. Delete the edges
+                // touching them in both directions, through the indexes rather
+                // than a tenant-wide scan.
+                let mut stale: Vec<(String, u64, String, u64)> = Vec::new();
+                for memory_id in &doomed {
+                    collect_edges_of_id(&edges, &edges_rev, &tenant, memory_id, &mut stale)?;
+                }
+                for (memory_id, version) in &doomed_versions {
+                    if doomed.contains(memory_id) {
+                        continue;
+                    }
+                    collect_edges_of_version(
+                        &edges, &edges_rev, &tenant, memory_id, *version, &mut stale,
+                    )?;
+                }
+                for (source_id, source_version, derived_id, derived_version) in stale {
                     edges
-                        .remove((tenant.as_str(), source.as_str(), derived.as_str()))
+                        .remove((
+                            tenant.as_str(),
+                            source_id.as_str(),
+                            source_version,
+                            derived_id.as_str(),
+                            derived_version,
+                        ))
+                        .map_err(|e| be(&e))?;
+                    edges_rev
+                        .remove((
+                            tenant.as_str(),
+                            derived_id.as_str(),
+                            derived_version,
+                            source_id.as_str(),
+                            source_version,
+                        ))
                         .map_err(|e| be(&e))?;
                 }
                 erased
@@ -635,6 +908,15 @@ impl MemoryStore for RedbStore {
                         .map_err(|e| be(&e))?;
                 }
                 current
+                    .remove((tenant.as_str(), id.as_str()))
+                    .map_err(|e| be(&e))?;
+                // The sliding-retention row goes with the memory it describes.
+                // Left behind, it is residue about an erased id — and worse, a
+                // future write under a recycled id would inherit a window it
+                // never asked for. Every erasure path removes it; this one
+                // used to leave it to `forget_cascading` alone.
+                w.open_table(ACCESS_EXPIRY)
+                    .map_err(|e| be(&e))?
                     .remove((tenant.as_str(), id.as_str()))
                     .map_err(|e| be(&e))?;
 
@@ -691,7 +973,9 @@ impl MemoryStore for RedbStore {
                 let mut current = w.open_table(CURRENT).map_err(|e| be(&e))?;
                 let mut by_subject = w.open_table(BY_SUBJECT).map_err(|e| be(&e))?;
                 let mut edges = w.open_table(DERIVED).map_err(|e| be(&e))?;
+                let mut edges_rev = w.open_table(DERIVED_BY_TARGET).map_err(|e| be(&e))?;
                 let mut forgotten = w.open_table(FORGOTTEN).map_err(|e| be(&e))?;
+                let mut access = w.open_table(ACCESS_EXPIRY).map_err(|e| be(&e))?;
                 let holds = w.open_table(HOLDS).map_err(|e| be(&e))?;
                 let ids: Vec<String> = by_subject
                     .range(
@@ -747,20 +1031,50 @@ impl MemoryStore for RedbStore {
                     forgotten
                         .insert((tenant.as_str(), id.as_str()), ())
                         .map_err(|e| be(&e))?;
-                    let incoming: Vec<String> = edges
-                        .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                    // Sliding-retention residue goes with the memory — see
+                    // `forget` for why every erasure path removes this row.
+                    access
+                        .remove((tenant.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?;
+                    // Incoming edges only, and through the reverse index
+                    // rather than a tenant-wide scan: a derivative must stay
+                    // in its source's subject, so every source of this id is
+                    // in this same erasure and the edge is intra-subject
+                    // cleanup, not lineage a later cascade could still need.
+                    let incoming: Vec<(String, u64, u64)> = edges_rev
+                        .range(
+                            (tenant.as_str(), id.as_str(), 0, "", 0)
+                                ..=(tenant.as_str(), id.as_str(), u64::MAX, MAX_STR, u64::MAX),
+                        )
                         .map_err(|e| be(&e))?
-                        .filter_map(|entry| match entry {
-                            Ok((key, _)) if key.value().2 == id => {
-                                Some(Ok(key.value().1.to_owned()))
-                            }
-                            Ok(_) => None,
-                            Err(error) => Some(Err(be(&error))),
+                        .map(|entry| {
+                            entry
+                                .map(|(key, _)| {
+                                    let (_, _, derived_version, source_id, source_version) =
+                                        key.value();
+                                    (source_id.to_owned(), source_version, derived_version)
+                                })
+                                .map_err(|error| be(&error))
                         })
                         .collect::<Result<_, StoreError>>()?;
-                    for source in incoming {
+                    for (source_id, source_version, derived_version) in incoming {
                         edges
-                            .remove((tenant.as_str(), source.as_str(), id.as_str()))
+                            .remove((
+                                tenant.as_str(),
+                                source_id.as_str(),
+                                source_version,
+                                id.as_str(),
+                                derived_version,
+                            ))
+                            .map_err(|e| be(&e))?;
+                        edges_rev
+                            .remove((
+                                tenant.as_str(),
+                                id.as_str(),
+                                derived_version,
+                                source_id.as_str(),
+                                source_version,
+                            ))
                             .map_err(|e| be(&e))?;
                     }
                     let versions: Vec<u64> = items
@@ -849,7 +1163,7 @@ impl MemoryStore for RedbStore {
                 let mut by_subject = w.open_table(BY_SUBJECT).map_err(|e| be(&e))?;
                 let mut forgotten = w.open_table(FORGOTTEN).map_err(|e| be(&e))?;
                 let holds = w.open_table(HOLDS).map_err(|e| be(&e))?;
-                let access = w.open_table(ACCESS_EXPIRY).map_err(|e| be(&e))?;
+                let mut access = w.open_table(ACCESS_EXPIRY).map_err(|e| be(&e))?;
                 let entries: Vec<(String, String, String, i64, u64)> = current
                     .range((tenant.as_str(), "")..=(tenant.as_str(), MAX_STR))
                     .map_err(|e| be(&e))?
@@ -918,6 +1232,12 @@ impl MemoryStore for RedbStore {
                         .map_err(|e| be(&e))?;
                     forgotten
                         .insert((tenant.as_str(), id.as_str()), ())
+                        .map_err(|e| be(&e))?;
+                    // The window row that (possibly) triggered this erasure is
+                    // itself removed: an expired id must not keep sliding-
+                    // retention residue, exactly as the other erasure paths.
+                    access
+                        .remove((tenant.as_str(), id.as_str()))
                         .map_err(|e| be(&e))?;
                     // Edges deliberately stay — both directions, exactly as
                     // `forget` keeps them. An expired memory becomes a

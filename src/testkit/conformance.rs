@@ -571,6 +571,399 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
             .expect("swept sliding version")
             .is_none()
     );
+
+    // A lapsed-but-unswept window is resurrected by a touch, on every backend.
+    // Expiry becomes fact at the sweep, not at the instant the window closes:
+    // stores take max(existing, at + window), so a late touch opens a new
+    // window rather than being refused — refusing would make the answer depend
+    // on how recently the sweeper ran, an ambient race no journal records.
+    let mut lazarus = make(
+        "memory-lazarus",
+        "team-lazarus",
+        "support",
+        json!({"n": 1}),
+    );
+    lazarus.access_retention_seconds = Some(60);
+    store.remember(&lazarus).await.expect("lazarus memory");
+    // The untouched window closed at 1_760_000_060; nobody swept. The touch
+    // at 1_760_000_100 must reopen it to 1_760_000_160.
+    store
+        .touch(&["memory-lazarus".to_owned()], at(1_760_000_100))
+        .await
+        .expect("touch a lapsed window");
+    assert_eq!(
+        store
+            .recall(&Recall::about("team-lazarus").at(at(1_760_000_150)))
+            .await
+            .expect("inside the reopened window")
+            .len(),
+        1,
+        "a touch on a lapsed-but-unswept id must resurrect it — expiry \
+         becomes fact at the sweep, and until then the id is alive to touch"
+    );
+    assert!(
+        store
+            .recall(&Recall::about("team-lazarus").at(at(1_760_000_160)))
+            .await
+            .expect("after the reopened window")
+            .is_empty(),
+        "the reopened window is a window, not immortality"
+    );
+
+    // The rolling-summary hole, closed: superseding a derivative does not
+    // un-absorb its sources. S v1 summarises A; T summarises S v1; S is then
+    // re-derived from B alone, so S v2 is clean — but S v1, which contains
+    // A's content, stays readable through version(). A cascade from A must
+    // erase S's superseded v1 and reach T *through* it, while sparing S v2:
+    // an honest re-derivation is not destroyed by its own history.
+    let sel = |item: &MemoryItem| Selected {
+        id: item.id.clone(),
+        version: item.version,
+        digest: item.selection_digest(),
+    };
+    store
+        .remember(&make("roll-a", "team-roll", "support", json!({"n": 1})))
+        .await
+        .expect("roll source a");
+    store
+        .remember(&make("roll-b", "team-roll", "support", json!({"n": 2})))
+        .await
+        .expect("roll source b");
+    let roll_a = store
+        .version("roll-a", 1)
+        .await
+        .expect("read a")
+        .expect("a exists");
+    let roll_b = store
+        .version("roll-b", 1)
+        .await
+        .expect("read b")
+        .expect("b exists");
+    let mut summary = make("roll-s", "team-roll", "support", json!({"sum": "of a"}));
+    summary.derived_from = vec![sel(&roll_a)];
+    store.remember(&summary).await.expect("summary v1");
+    let summary_v1 = store
+        .version("roll-s", 1)
+        .await
+        .expect("read v1")
+        .expect("v1 exists");
+    let mut over = make("roll-t", "team-roll", "support", json!({"sum": "of s v1"}));
+    over.derived_from = vec![sel(&summary_v1)];
+    store.remember(&over).await.expect("summary of the summary");
+    let mut summary2 = make("roll-s", "team-roll", "support", json!({"sum": "of b"}));
+    summary2.created_at = at(1_760_000_001);
+    summary2.derived_from = vec![sel(&roll_b)];
+    store.remember(&summary2).await.expect("summary v2");
+
+    // The positive half: before the cascade, the superseded version is
+    // readable and still names A — this is exactly the copy the cascade must
+    // reach.
+    let v1 = store
+        .version("roll-s", 1)
+        .await
+        .expect("v1 read")
+        .expect("v1 kept before the cascade");
+    assert_eq!(v1.derived_from[0].id, "roll-a");
+    // And the *live* derivative view has moved on: repairs act on v2.
+    assert!(
+        store
+            .derivatives("roll-a")
+            .await
+            .expect("derivatives of a")
+            .is_empty(),
+        "a re-derived summary is no longer a live derivative of its old source"
+    );
+
+    assert_eq!(
+        store
+            .forget_cascading("roll-a")
+            .await
+            .expect("cascade from the superseded source"),
+        3,
+        "the cascade must erase roll-a, roll-s's superseded v1 (counted once) \
+         and roll-t, which was derived from exactly that version"
+    );
+    assert!(
+        store
+            .version("roll-a", 1)
+            .await
+            .expect("a lookup")
+            .is_none()
+    );
+    assert!(
+        store
+            .version("roll-s", 1)
+            .await
+            .expect("superseded v1 lookup")
+            .is_none(),
+        "the superseded summary version that absorbed the erased source is \
+         still readable — supersession sheltered absorbed content from the \
+         cascade"
+    );
+    assert!(
+        store
+            .version("roll-t", 1)
+            .await
+            .expect("roll-t lookup")
+            .is_none(),
+        "a derivative of the superseded version survived — the cascade did \
+         not route through the version it erased"
+    );
+    let kept = store
+        .version("roll-s", 2)
+        .await
+        .expect("v2 read")
+        .expect("the clean re-derivation survives");
+    assert_eq!(kept.derived_from[0].id, "roll-b");
+    assert!(
+        store
+            .recall(&Recall::about("team-roll"))
+            .await
+            .expect("recall after the cascade")
+            .iter()
+            .any(|item| item.id == "roll-s"),
+        "the re-derived current summary must stay recallable"
+    );
+    assert!(
+        store
+            .version("roll-b", 1)
+            .await
+            .expect("b lookup")
+            .is_some(),
+        "the clean source is untouched"
+    );
+
+    // The purpose-less selection rule is global: most trusted first, then
+    // newest **across purposes**, then id. An index that leads with the
+    // purpose hands back whichever purpose sorts first, so an implementation
+    // truncating in scan order returns every label correct and the newest
+    // memory silently missing — which is why the rule is pinned here for
+    // every backend rather than left as a ranking choice.
+    let mut order_old = make("order-old", "team-order", "alpha", json!({"n": 1}));
+    order_old.created_at = at(1_760_000_300);
+    store.remember(&order_old).await.expect("older, first purpose");
+    let mut order_new = make("order-new", "team-order", "zeta", json!({"n": 2}));
+    order_new.created_at = at(1_760_000_400);
+    store.remember(&order_new).await.expect("newest, last purpose");
+    let mut order_trusted = make("order-trusted", "team-order", "middle", json!({"n": 3}));
+    order_trusted.trust = Trust::Trusted;
+    order_trusted.created_at = at(1_760_000_100);
+    store
+        .remember(&order_trusted)
+        .await
+        .expect("trusted, oldest");
+    let picked = store
+        .recall(&Recall::about("team-order").limit(2))
+        .await
+        .expect("ordered recall");
+    assert_eq!(
+        picked.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        vec!["order-trusted", "order-new"],
+        "a purpose-less recall must rank trust first and then recency \
+         globally across purposes — not whichever purpose sorts first"
+    );
+    let all = store
+        .recall(&Recall::about("team-order").limit(3))
+        .await
+        .expect("full ordered recall");
+    assert_eq!(
+        all.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        vec!["order-trusted", "order-new", "order-old"]
+    );
+
+    // The erasure path's enumeration: every current id of the subject, in
+    // stable order, with no page size to fall off.
+    assert_eq!(
+        store
+            .subject_ids("team-order")
+            .await
+            .expect("subject ids"),
+        vec!["order-new", "order-old", "order-trusted"],
+        "subject_ids must name every current id of the subject"
+    );
+    assert!(
+        store
+            .subject_ids("team-nobody")
+            .await
+            .expect("empty subject")
+            .is_empty()
+    );
+}
+
+/// Exercise the event buffer's erasure contract against any backend.
+///
+/// The buffer keeps a copy of every inbound payload — claimed rows for dedup,
+/// dead-lettered rows for the operator — and this battery pins the three ways
+/// that copy is allowed to die: shed at `unsubscribe` once the journal holds
+/// the delivered copy, and removed by `erase_payload` for rows nobody claimed
+/// or that dead-lettered. In every case the **row itself survives**, because
+/// dedup and dead-letter accounting are identity, not content.
+///
+/// # Panics
+///
+/// Panics when the backend violates the contract.
+#[allow(clippy::too_many_lines)]
+pub async fn event_erasure(store: Arc<dyn crate::case::EventStore>) {
+    use crate::core::{CorrelationKey, InboundEvent, Phase, RunId, StepId, Subscription, Timestamp};
+    use serde_json::json;
+
+    let at = |seconds| Timestamp::from_unix_timestamp(seconds).expect("representable time");
+    let event = |id: &str, payload: serde_json::Value| InboundEvent {
+        source: "counterparty".to_owned(),
+        id: id.to_owned(),
+        kind: "reply".to_owned(),
+        correlation: vec![CorrelationKey::new("order", id.to_owned())],
+        payload,
+    };
+    let sub = |run: RunId, effect, id: &str| Subscription {
+        run,
+        case: None,
+        effect,
+        step: StepId(1),
+        phase: Phase::Forward,
+        kind: "reply".to_owned(),
+        correlation: vec![CorrelationKey::new("order", id.to_owned())],
+    };
+
+    // ── A delivered payload is shed at unsubscribe, and dedup survives ─────
+    let run = RunId::generate();
+    let effect = key(201);
+    let pii = json!({"pii": "the counterparty's content"});
+    let first = event("A-1", pii.clone());
+    assert!(store.buffer(&first, at(1_000)).await.expect("buffer"));
+    store
+        .subscribe(&sub(run, effect, "A-1"), at(1_001))
+        .await
+        .expect("subscribe");
+    let claimed = store
+        .claim_for(&sub(run, effect, "A-1"), at(1_002))
+        .await
+        .expect("claim")
+        .expect("a buffered event matches");
+    assert_eq!(claimed.event.payload, pii, "delivery hands over the payload");
+
+    // Crash recovery happens *before* the run acknowledges, so the buffer's
+    // copy must survive until the unsubscribe — the journal may not hold the
+    // payload yet, and recovery re-reads it from here.
+    let recovered = store
+        .claim_for(&sub(run, effect, "A-1"), at(1_003))
+        .await
+        .expect("re-claim")
+        .expect("the run's own claim is returned to it");
+    assert_eq!(
+        recovered.event.payload, pii,
+        "a payload stripped at the claim is lost to a run that crashed \
+         between claim and resume — stripping must wait for the unsubscribe"
+    );
+
+    store.unsubscribe(run, effect).await.expect("unsubscribe");
+    store
+        .subscribe(&sub(run, effect, "A-1"), at(1_004))
+        .await
+        .expect("resubscribe");
+    let after = store
+        .claim_for(&sub(run, effect, "A-1"), at(1_005))
+        .await
+        .expect("claim after the strip")
+        .expect("the row keeps its identity");
+    assert_eq!(
+        after.event.payload,
+        serde_json::Value::Null,
+        "a delivered payload outlived its delivery in the buffer — the \
+         journal holds the delivered copy, and the buffer needs only the \
+         (source, id) identity"
+    );
+    store.unsubscribe(run, effect).await.expect("clean up");
+    assert!(
+        !store.buffer(&first, at(1_006)).await.expect("replay"),
+        "shedding the payload deleted the dedup row — a replay of the \
+         delivered message was accepted as new, so erasure reopened the door \
+         it was supposed to close"
+    );
+
+    // ── An unclaimed payload is erasable, and dead-lettering still counts ──
+    let unclaimed = event("B-1", json!({"pii": "unclaimed"}));
+    assert!(store.buffer(&unclaimed, at(2_000)).await.expect("buffer"));
+    assert!(
+        store
+            .erase_payload("counterparty", "B-1")
+            .await
+            .expect("erase the unclaimed payload"),
+        "the row exists, so the erasure must report having acted"
+    );
+    assert_eq!(
+        store
+            .sweep_unclaimed(at(2_100), "aged out")
+            .await
+            .expect("sweep"),
+        1,
+        "an erased event still dead-letters — erasure removes content, never \
+         accounting"
+    );
+    let letters = store.dead_letters(10).await.expect("dead letters");
+    let erased = letters
+        .iter()
+        .find(|letter| letter.event.id == "B-1")
+        .expect("the erased event is still listed");
+    assert_eq!(
+        erased.event.payload,
+        serde_json::Value::Null,
+        "an erased unclaimed event still yielded its payload"
+    );
+    assert_eq!(erased.reason, "aged out");
+    assert_eq!(
+        erased.event.correlation,
+        vec![CorrelationKey::new("order", "B-1")],
+        "correlation keys are the identity the operator routes on, not content"
+    );
+
+    // ── A dead-lettered payload is erasable in place ───────────────────────
+    let dead = event("C-1", json!({"pii": "dead"}));
+    assert!(store.buffer(&dead, at(3_000)).await.expect("buffer"));
+    assert_eq!(
+        store
+            .sweep_unclaimed(at(3_100), "nobody came")
+            .await
+            .expect("sweep"),
+        1
+    );
+    // The positive half: a dead letter is readable until somebody erases it —
+    // that list is how a wrong correlation key gets found.
+    let letters = store.dead_letters(10).await.expect("dead letters");
+    assert_eq!(
+        letters
+            .iter()
+            .find(|letter| letter.event.id == "C-1")
+            .expect("listed")
+            .event
+            .payload,
+        json!({"pii": "dead"})
+    );
+    assert!(
+        store
+            .erase_payload("counterparty", "C-1")
+            .await
+            .expect("erase the dead letter")
+    );
+    let letters = store.dead_letters(10).await.expect("dead letters");
+    assert_eq!(
+        letters
+            .iter()
+            .find(|letter| letter.event.id == "C-1")
+            .expect("still listed")
+            .event
+            .payload,
+        serde_json::Value::Null,
+        "an erased dead letter still yielded its payload"
+    );
+
+    // Erasing a message that never arrived reports that truthfully.
+    assert!(
+        !store
+            .erase_payload("counterparty", "never-arrived")
+            .await
+            .expect("absent row")
+    );
 }
 
 fn admitted(run: RunId) -> Append {

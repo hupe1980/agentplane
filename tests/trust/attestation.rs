@@ -957,7 +957,7 @@ async fn the_audit_reports_who_raised_a_label_and_on_what_evidence() {
             // per-field labels, and the runtime refuses to invent precision
             // after provenance was flattened.
             let secret = Tainted::object([(
-                "iban".to_owned(),
+                "iban",
                 Tainted::from_source(serde_json::json!("DE00"), SourceId::new("vault")),
             )]);
             let plain = cx
@@ -965,10 +965,10 @@ async fn the_audit_reports_who_raised_a_label_and_on_what_evidence() {
                     secret,
                     Release::fields(
                         ReleaseScope::trust(),
-                        ["/iban".to_owned()],
+                        ["/iban"],
                         "operator matched the account to settlement SET-42",
                         "tool://ledger/transfer",
-                        ["approval:SET-42".to_owned()],
+                        ["approval:SET-42"],
                     ),
                 )
                 .await
@@ -1220,4 +1220,238 @@ async fn a_missing_leaf_is_a_finding_only_for_a_sealed_conclusion() {
         "the missing leaf was noticed for the wrong reason: {:?}",
         report.findings
     );
+}
+
+/// **A run the store holds nothing for is unchecked, never sound.**
+///
+/// Both backends answer an unknown run with an empty read rather than an
+/// error, and every downstream check holds vacuously over nothing: the chain
+/// of zero records verifies, no seal claim exists, and a missing leaf reads
+/// as an ordinary open run — so a mistyped or vanished run id used to audit
+/// as "chain and signatures verified" without one record ever being looked
+/// at. It is not a finding either: an unknown id and a run whose records are
+/// gone cannot be told apart from an empty read, and deletion is the
+/// prior-checkpoint check's question.
+#[tokio::test]
+async fn a_run_with_no_records_is_unchecked_not_sound() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let runs = sealed_runs(&store, 1).await;
+    let s = store.clone() as Arc<dyn JournalStore>;
+
+    let ghost = agentplane::core::RunId::generate();
+    let report = agentplane::audit::audit(&s, &[ghost], &agentplane::audit::Evidence::default())
+        .await
+        .unwrap();
+    assert!(
+        !report.sound.contains(&ghost),
+        "the audit vouched for a run it never read one record of"
+    );
+    assert!(
+        report
+            .not_checked
+            .iter()
+            .any(|n| n.contains(&ghost.to_string())),
+        "the empty run is not named as unchecked, so its absence from `sound` \
+         is silence rather than a statement: {:?}",
+        report.not_checked
+    );
+    assert!(
+        report.is_sound(),
+        "an unknown run id is not evidence of tampering: {:?}",
+        report.findings
+    );
+
+    // The positive half: a run the store does hold still audits sound, so the
+    // empty-read arm is not swallowing healthy runs.
+    let real = agentplane::audit::audit(&s, &runs, &agentplane::audit::Evidence::default())
+        .await
+        .unwrap();
+    assert!(real.sound.contains(&runs[0]), "{:?}", real.findings);
+}
+
+/// **A sampled audit says what fraction it looked at.**
+///
+/// `runs` is whatever the caller sampled, and the log commits to
+/// `current.size` sealed runs. A clean report over one run of a three-run log
+/// is a true statement about one run — and before this entry existed, nothing
+/// in the report said so, so a reader had to notice the shortfall by
+/// comparing a list length against a checkpoint field. Coverage must be
+/// findable, not implied.
+#[tokio::test]
+async fn a_sampled_audit_states_its_scope() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let runs = sealed_runs(&store, 3).await;
+    let s = store.clone() as Arc<dyn JournalStore>;
+
+    let sampled = agentplane::audit::audit(&s, &runs[..1], &agentplane::audit::Evidence::default())
+        .await
+        .unwrap();
+    assert!(
+        sampled
+            .not_checked
+            .iter()
+            .any(|n| n.contains("scope") && n.contains("3 sealed run(s)")),
+        "an audit of 1 run out of 3 does not state its scope: {:?}",
+        sampled.not_checked
+    );
+
+    // The positive half: full coverage skipped nothing, so nothing lands in
+    // `not_checked` about scope — an entry there would be a check that was
+    // not performed, and every run was.
+    let full = agentplane::audit::audit(&s, &runs, &agentplane::audit::Evidence::default())
+        .await
+        .unwrap();
+    assert!(
+        !full.not_checked.iter().any(|n| n.contains("scope")),
+        "a full audit reported unexamined scope: {:?}",
+        full.not_checked
+    );
+}
+
+/// **The append-only check does not cry wolf over a checkpoint race.**
+///
+/// The log can grow between the audit reading its checkpoint and asking for
+/// the consistency proof, and a proof computed over the larger log fails
+/// against the smaller checkpoint for a reason that is time, not tampering.
+/// `placement` already refreshes once for exactly this race on the inclusion
+/// side; the consistency side used to report it as `NotAppendOnly` — the most
+/// serious finding the audit makes, raised by a busy plane doing nothing
+/// wrong, which is how the true alarm stops being believed.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
+    use agentplane::core::{CaseId, Epoch, RunId, Seq, StoreError};
+    use agentplane::journal::{Append, Cancellation, Checkpoint, Head, Inclusion, Lease};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Serves a stale checkpoint exactly once — the state an audit is in when
+    /// the log grew right after its opening `checkpoint()` call — and the
+    /// truth from then on.
+    #[derive(Debug)]
+    struct StaleOnce {
+        inner: Arc<dyn JournalStore>,
+        stale: Checkpoint,
+        served: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl JournalStore for StaleOnce {
+        async fn append(&self, e: Epoch, b: Vec<Append>) -> Result<Vec<Record>, StoreError> {
+            self.inner.append(e, b).await
+        }
+        fn is_shared(&self) -> bool {
+            self.inner.is_shared()
+        }
+        async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
+            self.inner.read(run, from).await
+        }
+        async fn runs_by_outcome(
+            &self,
+            outcome: &str,
+            limit: usize,
+        ) -> Result<Vec<RunId>, StoreError> {
+            self.inner.runs_by_outcome(outcome, limit).await
+        }
+        async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
+            self.inner.abandoned_runs(limit).await
+        }
+        async fn recent_runs(
+            &self,
+            after: Option<(u64, RunId)>,
+            limit: usize,
+        ) -> Result<Vec<(RunId, u64)>, StoreError> {
+            self.inner.recent_runs(after, limit).await
+        }
+        async fn case_history(&self, case: CaseId, limit: usize) -> Result<Vec<Record>, StoreError> {
+            self.inner.case_history(case, limit).await
+        }
+        async fn head(&self, run: RunId) -> Result<Head, StoreError> {
+            self.inner.head(run).await
+        }
+        async fn acquire(&self, run: RunId, o: &str, t: Duration) -> Result<Lease, StoreError> {
+            self.inner.acquire(run, o, t).await
+        }
+        async fn release_lease(&self, run: RunId, e: Epoch) -> Result<(), StoreError> {
+            self.inner.release_lease(run, e).await
+        }
+        async fn renew(
+            &self,
+            run: RunId,
+            o: &str,
+            e: Epoch,
+            t: Duration,
+        ) -> Result<Lease, StoreError> {
+            self.inner.renew(run, o, e, t).await
+        }
+        async fn seal(&self, run: RunId, e: Epoch, o: &str) -> Result<Digest, StoreError> {
+            self.inner.seal(run, e, o).await
+        }
+        async fn checkpoint(&self) -> Result<Checkpoint, StoreError> {
+            if self.served.swap(true, Ordering::SeqCst) {
+                self.inner.checkpoint().await
+            } else {
+                Ok(self.stale.clone())
+            }
+        }
+        async fn consistency_proof(&self, old: u64) -> Result<Vec<Digest>, StoreError> {
+            self.inner.consistency_proof(old).await
+        }
+        async fn inclusion_proof(&self, run: RunId) -> Result<Option<Inclusion>, StoreError> {
+            self.inner.inclusion_proof(run).await
+        }
+        async fn request_cancel(
+            &self,
+            run: RunId,
+            actor: &str,
+            reason: &str,
+        ) -> Result<bool, StoreError> {
+            self.inner.request_cancel(run, actor, reason).await
+        }
+        async fn cancellation(&self, run: RunId) -> Result<Option<Cancellation>, StoreError> {
+            self.inner.cancellation(run).await
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    // What the auditor was handed earlier.
+    sealed_runs(&store, 1).await;
+    let prior = (store.clone() as Arc<dyn JournalStore>)
+        .checkpoint()
+        .await
+        .unwrap();
+    // What the audit reads at its start.
+    sealed_runs(&store, 1).await;
+    let stale = (store.clone() as Arc<dyn JournalStore>)
+        .checkpoint()
+        .await
+        .unwrap();
+    // What the log has grown to by the time the proof is asked for.
+    sealed_runs(&store, 1).await;
+
+    let racing: Arc<dyn JournalStore> = Arc::new(StaleOnce {
+        inner: store.clone() as Arc<dyn JournalStore>,
+        stale,
+        served: AtomicBool::new(false),
+    });
+    let report = agentplane::audit::audit(
+        &racing,
+        &[],
+        &agentplane::audit::Evidence {
+            prior: Some(&prior),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| matches!(f, agentplane::audit::Finding::NotAppendOnly { .. })),
+        "a log that only grew during the audit was reported as not append-only \
+         — a false integrity alarm on every busy plane: {:?}",
+        report.findings
+    );
+    assert!(report.is_sound(), "{:?}", report.findings);
 }

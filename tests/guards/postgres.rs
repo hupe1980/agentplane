@@ -353,6 +353,241 @@ async fn memory_erasure_serializes_with_derivative_creation(
     );
 }
 
+/// Cryptographic subject erasure completes on the active-active backend.
+///
+/// The negative half of this test is history: the erasure enumerated the
+/// subject through `recall(limit = usize::MAX)`, and this backend refuses
+/// recall limits beyond BIGINT — so **every** cryptographic subject erasure on
+/// Postgres failed, unconditionally. The enumeration now goes through
+/// `subject_ids`, which has no limit to refuse.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn postgres_cryptographic_subject_erasure_completes() {
+    use agentplane::keyring::EncryptedMemoryStore;
+    use agentplane::memory::{MemoryStore, Recall};
+    use agentplane::testkit::MemoryKeyRing;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let base = PostgresStore::connect(&url).await.expect("connect");
+    let tenant = agentplane::core::TenantId::new("crypto-erase").expect("tenant");
+    let inner = Arc::new(base.for_tenant(tenant.clone())) as Arc<dyn MemoryStore>;
+    let encrypted = EncryptedMemoryStore::new(inner, Arc::new(MemoryKeyRing::new()), tenant);
+
+    for i in 0..3 {
+        encrypted
+            .remember(&mem_item(&format!("erase-{i}"), "person-7"))
+            .await
+            .expect("write");
+    }
+    assert_eq!(
+        encrypted
+            .erase_subject(
+                "person-7",
+                agentplane::core::Timestamp::from_unix_timestamp(1_760_000_500).expect("time"),
+                "erasure request",
+            )
+            .await
+            .expect(
+                "subject erasure failed on Postgres — the enumeration must not \
+                 ride a bounded recall this backend refuses"
+            ),
+        3
+    );
+    assert!(
+        encrypted
+            .recall(&Recall::about("person-7"))
+            .await
+            .expect("recall after erasure")
+            .is_empty()
+    );
+}
+
+/// Every Postgres erasure path removes the sliding-retention row.
+///
+/// White-box through SQL on purpose: the residue is invisible through the
+/// trait — an erased id is tombstoned and nothing reads its access row again —
+/// which is exactly what let three of the four erasure paths leave it behind.
+/// A row about an erased id is retained data about a subject the store just
+/// reported erased, so the check asks the table.
+#[tokio::test]
+async fn postgres_erasure_leaves_no_access_expiry_residue() {
+    use agentplane::memory::MemoryStore;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let store = PostgresStore::connect(&url)
+        .await
+        .expect("connect")
+        .for_tenant(agentplane::core::TenantId::new("residue").expect("tenant"));
+
+    let with_window = |id: &str, subject: &str, window: u64| {
+        let mut item = mem_item(id, subject);
+        item.access_retention_seconds = Some(window);
+        item
+    };
+    for (id, subject) in [
+        ("res-forget", "subj-forget"),
+        ("res-cascade", "subj-cascade"),
+        ("res-subject", "subj-subject"),
+    ] {
+        store
+            .remember(&with_window(id, subject, 60))
+            .await
+            .expect("remember");
+    }
+    // The control: its row must remain, so the positive half shows the rows
+    // exist at all while an id lives.
+    store
+        .remember(&with_window("res-live", "subj-live", 1_000_000))
+        .await
+        .expect("remember control");
+
+    store.forget("res-forget").await.expect("forget");
+    assert_eq!(
+        store
+            .forget_cascading("res-cascade")
+            .await
+            .expect("cascade"),
+        1
+    );
+    assert_eq!(
+        store
+            .forget_subject("subj-subject")
+            .await
+            .expect("forget subject"),
+        1
+    );
+
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("raw connection");
+    tokio::spawn(connection);
+    let rows = client
+        .query(
+            "SELECT id FROM memory_access_expiry WHERE tenant = 'residue' ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("query residue");
+    let remaining: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(
+        remaining,
+        vec!["res-live".to_owned()],
+        "an erasure path left its sliding-retention row behind — residue \
+         about an id the store reported erased"
+    );
+}
+
+/// The event buffer's erasure contract, on the active-active backend — the
+/// same battery redb runs.
+#[tokio::test]
+async fn postgres_event_buffer_erases_payloads() {
+    use agentplane::case::EventStore;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let store = PostgresStore::connect(&url)
+        .await
+        .expect("connect")
+        .for_tenant(agentplane::core::TenantId::new("event-erasure").expect("tenant"));
+    conformance::event_erasure(Arc::new(store) as Arc<dyn EventStore>).await;
+}
+
+/// Issuing an authority is one transaction, and even legacy half-state heals.
+///
+/// The terms row and the balance row exist as a pair: `draw` treats a missing
+/// balance as the store being unavailable. Three autocommit statements could
+/// crash between the two inserts and leave an authority that could never be
+/// drawn on; under the transaction that state is unreachable, and — the part
+/// this test can observe without fault injection — a re-issue over such
+/// half-state repairs it rather than reading the terms match as done.
+#[tokio::test]
+async fn postgres_issue_repairs_a_half_issued_authority() {
+    use agentplane::authority::{AuthorityId, AuthorityStore, StandingAuthority};
+    use agentplane::core::{EffectKey, Spend, Timestamp};
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let store = PostgresStore::connect(&url)
+        .await
+        .expect("connect")
+        .for_tenant(agentplane::core::TenantId::new("authority-atomic").expect("tenant"));
+
+    let authority = StandingAuthority::new("mandate-1", "ticket-4711", Spend::money(1_000));
+    store.issue(&authority).await.expect("issue");
+
+    // Manufacture the legacy crash artifact: terms without balance.
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("raw connection");
+    tokio::spawn(connection);
+    client
+        .execute(
+            "DELETE FROM authority_balance
+             WHERE tenant = 'authority-atomic' AND authority = 'mandate-1'",
+            &[],
+        )
+        .await
+        .expect("simulate the crash window");
+
+    let id = AuthorityId::new("mandate-1");
+    let key = EffectKey::from_hex(&format!("{:064x}", 41)).expect("key");
+    assert!(
+        store
+            .draw(&id, key, Spend::money(100), Timestamp::UNIX_EPOCH)
+            .await
+            .is_err(),
+        "half-issued state must not be drawable"
+    );
+
+    // The identical re-issue repairs the pair instead of stopping at the
+    // terms match.
+    store.issue(&authority).await.expect("re-issue heals");
+    let drawn = store
+        .draw(&id, key, Spend::money(100), Timestamp::UNIX_EPOCH)
+        .await
+        .expect("drawable after the repair");
+    assert_eq!(drawn.remaining, Spend::money(900));
+}
+
+/// A memory item for the erasure-focused Postgres tests.
+fn mem_item(id: &str, subject: &str) -> agentplane::memory::MemoryItem {
+    use agentplane::core::{Sensitivity, SourceId, Timestamp, Trust};
+    agentplane::memory::MemoryItem {
+        id: id.to_owned(),
+        subject: subject.to_owned(),
+        purpose: "support".to_owned(),
+        content: serde_json::json!({"kept": true}),
+        provenance: vec![SourceId::new("test")],
+        sensitivity: Sensitivity::Internal,
+        trust: Trust::Untrusted,
+        written_by: "test".to_owned(),
+        version: 0,
+        created_at: Timestamp::from_unix_timestamp(1_760_000_000).expect("time"),
+        expires_at: None,
+        access_retention_seconds: None,
+        superseded_at: None,
+        derived_from: Vec::new(),
+    }
+}
+
 /// The case layer, against the same battery `SQLite` is held to.
 #[tokio::test]
 async fn postgres_satisfies_the_case_layer_contracts() {

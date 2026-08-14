@@ -1819,6 +1819,7 @@ impl Runtime {
                 successors: Vec::new(),
                 started: BTreeSet::new(),
                 finished: BTreeSet::new(),
+                recorded_groups: BTreeMap::new(),
             },
             &mut cursor,
         )
@@ -1897,6 +1898,34 @@ impl Runtime {
             None
         };
 
+        self.replay_releasing(run, mode, lease).await
+    }
+
+    /// Resume a run under a lease the caller already holds.
+    ///
+    /// The wake path's handover: a timer or event delivery records the wake
+    /// under its own lease and then resumes the run. Releasing that lease and
+    /// letting the resume acquire a fresh one opened a window — a crash
+    /// between the two left a *released* lease over a run whose timer was
+    /// disarmed and whose subscription was retired, which no queue in the
+    /// system names: the abandonment sweep looks only for leases that expired
+    /// while still holding an owner. Handing the lease over closes the window;
+    /// the run is owned continuously from wake to conclusion, and a crash
+    /// anywhere in between leaves an expired *owned* lease the sweep drains.
+    pub(crate) async fn resume_holding(
+        &self,
+        run: RunId,
+        lease: crate::journal::Lease,
+    ) -> Result<RunOutcome, RuntimeError> {
+        self.replay_releasing(run, Mode::Resume, Some(lease)).await
+    }
+
+    async fn replay_releasing(
+        &self,
+        run: RunId,
+        mode: Mode,
+        lease: Option<crate::journal::Lease>,
+    ) -> Result<RunOutcome, RuntimeError> {
         let outcome = self.replay_under(run, mode, lease.as_ref()).await;
 
         // Idempotent: a resume that reached execution already handed its lease
@@ -2061,6 +2090,7 @@ impl Runtime {
                     .collect(),
                 started: recorded_started_steps(&records),
                 finished: recorded_finished_steps(&records),
+                recorded_groups: recorded_groups(&records),
             },
             &mut cursor,
         )
@@ -2120,6 +2150,7 @@ impl Runtime {
             successors,
             started,
             finished,
+            recorded_groups,
         } = plan;
         let writing = !matches!(mode, Mode::Strict);
         let case_id = case.as_ref().map(super::ctx::CaseContext::id);
@@ -2263,6 +2294,7 @@ impl Runtime {
                         outputs: &outputs,
                         started: &started,
                         finished: &finished,
+                        recorded_groups: &recorded_groups,
                     },
                 )
                 .await;
@@ -2307,6 +2339,7 @@ impl Runtime {
                                 None,
                                 writing,
                                 case_id,
+                                Spend::default(),
                                 Spend::default(),
                             )
                             .await;
@@ -2400,6 +2433,7 @@ impl Runtime {
                     writing,
                     case_id,
                     Spend::default(),
+                    Spend::default(),
                 )
                 .await;
         }
@@ -2410,7 +2444,10 @@ impl Runtime {
         // the same shape as the `Span::enter()` bug: a guard whose
         // scope is wider than it looks, and invisible until something else
         // needs the lock.
-        let spend = ledger.lock().expect("budget mutex").consumed().spend;
+        let (spend, live_spend) = {
+            let l = ledger.lock().expect("budget mutex");
+            (l.consumed().spend, l.live_spend())
+        };
         self.conclude(
             run,
             epoch,
@@ -2419,6 +2456,7 @@ impl Runtime {
             writing,
             case_id,
             spend,
+            live_spend,
         )
         .await
     }
@@ -2465,6 +2503,12 @@ impl Runtime {
                         stamp: batch.stamp,
                         already_started: batch.started.contains(&step),
                         already_finished: batch.finished.contains(&step),
+                        recorded_groups: batch
+                            .recorded_groups
+                            .iter()
+                            .filter(|((s, p, _), _)| *s == step && *p == Phase::Forward)
+                            .map(|((_, _, name), n)| (name.clone(), *n))
+                            .collect(),
                     },
                     batch.input,
                     batch.outputs,
@@ -2764,10 +2808,46 @@ impl Runtime {
         let unwound = self
             .maybe_unwind(cx, status, completed, outputs, cursor)
             .await?;
+        // A strict pass that stops early is still a verification, and its
+        // verdict must not outrun what it consumed. The ready loop's
+        // unconsumed-effects check runs only when the loop drains normally,
+        // and every early conclusion — a failure, an unwind, a recorded
+        // suspension — comes through here instead; without this check a build
+        // that performs fewer effects than the record (a compensation that
+        // shrank, a step that now suspends earlier) would return the recorded
+        // status as "verified" over effects it never requested. Checked after
+        // `maybe_unwind` because a strict pass consumes recorded compensation
+        // slices there, and what remains after that is genuinely unclaimed.
+        if !writing && let Some((step, phase, key)) = cursor.first_unconsumed() {
+            self.meter.count(metrics::DIVERGENCES, "");
+            tracing::error!(
+                target: telemetry::NONDETERMINISM,
+                %step, %key, unconsumed = true,
+            );
+            return self
+                .conclude(
+                    run,
+                    epoch,
+                    RunStatus::Quarantined(format!(
+                        "strict replay verified less than the run recorded: journaled \
+                         effect {key} (step {step}, {phase:?} phase) was never requested \
+                         — this build performs fewer effects than the recorded one"
+                    )),
+                    None,
+                    writing,
+                    case_id,
+                    Spend::default(),
+                    Spend::default(),
+                )
+                .await;
+        }
         // Scoped before the await — see `execute_inner` on why an inline guard
         // outlives the call it is passed to.
-        let spend = ledger.lock().expect("budget mutex").consumed().spend;
-        self.conclude(run, epoch, unwound, output, writing, case_id, spend)
+        let (spend, live_spend) = {
+            let l = ledger.lock().expect("budget mutex");
+            (l.consumed().spend, l.live_spend())
+        };
+        self.conclude(run, epoch, unwound, output, writing, case_id, spend, live_spend)
             .await
     }
 
@@ -2787,22 +2867,29 @@ impl Runtime {
     /// business has committed, reversing the decisions leading up to it would
     /// contradict something the outside world has already acted on.
     ///
-    /// # Two rules that apply only to a stop
+    /// # Two rules every unwind takes
     ///
-    /// **It must not unwind around an unknown outcome.** The same rule quarantine
-    /// already enforces, applied to the door cancellation opened. Scoped to
-    /// cancellation deliberately: an ordinary failure that leaves an orphan is
-    /// not stuck — the announcement is journaled, the effect declared a
-    /// `Recovery`, and resuming resolves it. Quarantining there would turn every
-    /// recoverable orphan into a permanent operator obligation. A cancelled run
-    /// gets no second pass, so an unresolved outcome stays unresolved.
+    /// **It must not unwind around an unknown outcome.** The same rule
+    /// quarantine already enforces, applied at the unwind's own door. For a
+    /// cancelled run the check is unconditional — cancellation gets no second
+    /// pass, so an unresolved outcome stays unresolved forever. For a failed
+    /// run it is conditional on the unwind list: an orphan under a failure is
+    /// resolvable, because the announcement is journaled, the effect declared
+    /// a `Recovery`, and resuming resolves it — but only while nothing was
+    /// compensated, since compensation closes the run to resume. A failure
+    /// that would compensate around doubt therefore quarantines instead; a
+    /// failure with nothing to unwind stays a failure and keeps its resume.
     ///
-    /// **It must undo the step it interrupted.** Compensation walks *completed*
-    /// steps, which is right for a failure. A stop arrives from outside while a
-    /// step is typically suspended — holding effects it performed and never
-    /// completing — so unwinding only completed steps would leave exactly the
-    /// work the operator was stopping: a run that posted to a ledger and then
-    /// suspended for approval would "stop" with the posting still standing.
+    /// **It must undo the steps it interrupted.** Compensation walks
+    /// *completed* steps, which covers the step that failed only if it never
+    /// mutated. A stop arrives from outside while a step is typically
+    /// suspended — holding effects it performed and never completing — and a
+    /// failure in one concurrent sibling interrupts the others the same way:
+    /// severity ordering can conclude the run while a suspended sibling holds
+    /// a landed mutation. Unwinding only completed steps would leave exactly
+    /// that work standing — a run that posted to a ledger and then suspended
+    /// for approval would conclude with the posting still in the world and,
+    /// once anything else was compensated, no resume left to finish it.
     async fn maybe_unwind(
         &self,
         cx: Unwind<'_>,
@@ -2832,28 +2919,16 @@ impl Runtime {
             other => return Ok(other),
         }
 
-        // Which steps actually changed something outside. Read from the journal
-        // rather than tracked in memory: it is the same evidence live and on
-        // replay, and it is what lets an *undeclared* step be judged on what it
-        // did instead of on what nobody said about it.
-        let (mutated, already_undone) = self.unwind_evidence(cx.run).await?;
-
-        // Both stop-only rules, in one place — see the doc comment.
-        let extended;
-        let completed = if status.is_cancelled() {
-            match self
-                .stop_list(cx.run, completed, cx.ir, &mutated, &already_undone)
-                .await?
-            {
-                Ok(list) => {
-                    extended = list;
-                    &extended[..]
-                }
-                Err(quarantine) => return Ok(quarantine),
-            }
-        } else {
-            completed
+        let (list, evidence) = match self.gated_unwind_list(&cx, &status, completed).await? {
+            Ok(scope) => scope,
+            Err(quarantine) => return Ok(quarantine),
         };
+        let UnwindEvidence {
+            mutated,
+            undone: already_undone,
+            recorded_groups,
+        } = evidence;
+        let completed = &list[..];
 
         for (step, capability) in completed.iter().rev().cloned() {
             // Resolved from what ran, not from the plan in force. After a replan
@@ -2882,7 +2957,18 @@ impl Runtime {
             }
 
             let result = self
-                .run_compensation(&cx, step, skill.as_ref(), outputs, cursor)
+                .run_compensation(
+                    &cx,
+                    step,
+                    skill.as_ref(),
+                    outputs,
+                    cursor,
+                    recorded_groups
+                        .iter()
+                        .filter(|((s, p, _), _)| *s == step && *p == Phase::Compensating)
+                        .map(|((_, _, name), n)| (name.clone(), *n))
+                        .collect(),
+                )
                 .await;
 
             // A compensation may legitimately need to wait — a refund that needs
@@ -2963,7 +3049,7 @@ impl Runtime {
     async fn unwind_evidence(
         &self,
         run: RunId,
-    ) -> Result<(BTreeSet<StepId>, BTreeSet<StepId>), RuntimeError> {
+    ) -> Result<UnwindEvidence, RuntimeError> {
         let records = self
             .store
             .read(run, 1)
@@ -2984,7 +3070,11 @@ impl Runtime {
                 _ => {}
             }
         }
-        Ok((mutated, undone))
+        Ok(UnwindEvidence {
+            mutated,
+            undone,
+            recorded_groups: recorded_groups(&records),
+        })
     }
 
     /// Run one step's `compensate`, in its own phase and cursor slice.
@@ -3000,6 +3090,7 @@ impl Runtime {
         skill: &dyn Skill,
         outputs: &BTreeMap<StepId, Tainted<Value>>,
         cursor: &mut ReplayCursor,
+        recorded_groups: BTreeMap<String, super::ctx::RecordedGroup>,
     ) -> Result<(), crate::core::SkillError> {
         // A step with no recorded output still gets compensated: the absence of
         // a result says nothing about whether it changed anything, and the
@@ -3037,6 +3128,7 @@ impl Runtime {
                 #[cfg(feature = "manifest")]
                 manifest: self.governing(skill),
                 signer: self.signer.clone(),
+                recorded_groups,
             },
         );
 
@@ -3045,18 +3137,56 @@ impl Runtime {
         result
     }
 
+    /// What the unwind walks, gated — or the quarantine that replaces it.
+    ///
+    /// Reads the journal's evidence and applies the stop gates. The gates run
+    /// exactly when this conclusion closes the run to resume: always for a
+    /// cancellation (it gets no second pass), and for a failure precisely
+    /// when the unwind will compensate something — compensation is what
+    /// closes resume, and a failure that compensates nothing stays open, so
+    /// its orphans resolve and its suspended siblings re-register on the
+    /// resume instead of being unwound around.
+    async fn gated_unwind_list(
+        &self,
+        cx: &Unwind<'_>,
+        status: &RunStatus,
+        completed: &[(StepId, Capability)],
+    ) -> Result<Result<(Vec<(StepId, Capability)>, UnwindEvidence), RunStatus>, RuntimeError> {
+        // Which steps actually changed something outside. Read from the
+        // journal rather than tracked in memory: it is the same evidence live
+        // and on replay, and it is what lets an *undeclared* step be judged
+        // on what it did instead of on what nobody said about it.
+        let evidence = self.unwind_evidence(cx.run).await?;
+        let list = if status.is_cancelled() || self.will_compensate(completed, &evidence.mutated) {
+            match self
+                .stop_list(cx.run, completed, cx.ir, &evidence.mutated)
+                .await?
+            {
+                Ok(list) => list,
+                Err(quarantine) => return Ok(Err(quarantine)),
+            }
+        } else {
+            completed.to_vec()
+        };
+        Ok(Ok((list, evidence)))
+    }
+
     /// The unwind list for a stop, or the quarantine that replaces it.
     ///
-    /// Both rules in `maybe_unwind`'s doc comment, applied in order: refuse
-    /// outright if an outcome is unknown, otherwise extend the list with the
-    /// step the stop interrupted.
+    /// Both rules in `maybe_unwind`'s doc comment, applied in order: refuse to
+    /// unwind while an outcome is unknown, and extend the list with the steps
+    /// the stop interrupted. Called only for a conclusion that closes the run
+    /// to resume — a cancellation, or a failure whose unwind will compensate
+    /// — so doubt quarantines unconditionally here: there is no later pass on
+    /// which an unresolved outcome could still resolve, and compensating
+    /// around the one call nobody can account for would destroy the evidence
+    /// an operator needs to resolve it by hand.
     async fn stop_list(
         &self,
         run: RunId,
         completed: &[(StepId, Capability)],
         ir: &PlanIR,
         mutated: &BTreeSet<StepId>,
-        undone: &BTreeSet<StepId>,
     ) -> Result<Result<Vec<(StepId, Capability)>, RunStatus>, RuntimeError> {
         if let Some(step) = self.undecided_effect(run).await? {
             return Ok(Err(RunStatus::Quarantined(format!(
@@ -3066,30 +3196,58 @@ impl Runtime {
                  it would undo everything except the one thing nobody can account for"
             ))));
         }
-        Ok(Ok(Self::with_interrupted_steps(
-            completed, ir, mutated, undone,
-        )))
+        Ok(Ok(Self::with_interrupted_steps(completed, ir, mutated)))
     }
 
-    /// The unwind list for a cancelled run: completed steps, plus the one it was
-    /// stopped in.
+    /// Whether an unwind over these completed steps would compensate anything.
     ///
-    /// Only reachable through cancellation. An ordinary failure ends *at* the step
-    /// that failed; a stop arrives from outside while a step is typically suspended
-    /// — holding effects it already performed and never completing. The interrupted
-    /// steps go last, so the caller's reverse walk undoes them first.
+    /// The question that decides whether a failure closes its run: a declared
+    /// `Compensatable` step will be compensated, and an `Undeclared` step
+    /// that provably mutated quarantines inside the loop — either way the
+    /// conclusion is not one a resume can reopen. `Pivot` and `Unnecessary`
+    /// steps compensate nothing. Deliberately conservative on a capability
+    /// that no longer resolves: an unresolvable skill is treated as
+    /// compensating, so the unwind path — which will surface the resolution
+    /// error loudly — is taken rather than silently skipped.
+    fn will_compensate(
+        &self,
+        completed: &[(StepId, Capability)],
+        mutated: &BTreeSet<StepId>,
+    ) -> bool {
+        completed.iter().any(|(step, capability)| {
+            self.resolve(&capability.0).map_or(true, |skill| {
+                match skill.compensation() {
+                    crate::core::Compensation::Compensatable => true,
+                    crate::core::Compensation::Undeclared => mutated.contains(step),
+                    crate::core::Compensation::Pivot | crate::core::Compensation::Unnecessary => {
+                        false
+                    }
+                }
+            })
+        })
+    }
+
+    /// The unwind list for a stop: completed steps, plus any step that mutated
+    /// without completing — the one a cancellation interrupted, or the sibling
+    /// a failure stranded mid-suspension. The interrupted steps go last, so
+    /// the caller's reverse walk undoes them first.
+    ///
+    /// A step whose compensation is already on the record stays in the list,
+    /// exactly as a completed step does. The walk re-runs its compensation
+    /// with every effect served from the journal and the `StepCompensated`
+    /// dedup keeps the record single — while filtering it out here made a
+    /// *replayed* unwind walk fewer steps than the recorded one, so a strict
+    /// pass over an honestly-unwound run left the interrupted step's
+    /// compensation slice unconsumed and quarantined a history that was
+    /// telling the truth.
     fn with_interrupted_steps(
         completed: &[(StepId, Capability)],
         ir: &PlanIR,
         mutated: &BTreeSet<StepId>,
-        undone: &BTreeSet<StepId>,
     ) -> Vec<(StepId, Capability)> {
         let mut out = completed.to_vec();
         let done: BTreeSet<StepId> = out.iter().map(|(s, _)| *s).collect();
-        for step in mutated
-            .iter()
-            .filter(|s| !done.contains(s) && !undone.contains(s))
-        {
+        for step in mutated.iter().filter(|s| !done.contains(s)) {
             if let Some(node) = ir.node(*step) {
                 out.push((*step, node.capability.clone()));
             }
@@ -3251,6 +3409,7 @@ impl Runtime {
             agent,
             already_started,
             already_finished,
+            recorded_groups,
         } = ctx;
         let step = node.id;
         let skill = self.resolve(&node.capability.0)?;
@@ -3312,6 +3471,7 @@ impl Runtime {
                 #[cfg(feature = "manifest")]
                 manifest: self.governing(skill.as_ref()),
                 signer: self.signer.clone(),
+                recorded_groups,
             },
         );
         let result = skill.invoke(&mut cx, step_input).await;
@@ -3368,6 +3528,7 @@ impl Runtime {
         writing: bool,
         case: Option<crate::core::CaseId>,
         spend: Spend,
+        live_spend: Spend,
     ) -> Result<RunOutcome, RuntimeError> {
         // Loud toward the operator, ordinary toward the caller. A failed run is
         // a conclusion a resume can honestly answer, so it is not an incident —
@@ -3396,34 +3557,63 @@ impl Runtime {
                 .head(run)
                 .await
                 .map_err(RuntimeError::from_store)?;
-            let mut sealed = Append::new(
-                run,
-                RecordKind::RunSealed {
-                    outcome: status.as_str().to_owned(),
-                    chain_head: before.hash,
-                },
-            );
-            if let Some(c) = case {
-                sealed = sealed.case(c);
-            }
-            let concluded = self
-                .store
-                .append(epoch, vec![sealed])
-                .await
-                .map_err(RuntimeError::from_store)?;
-
-            // Only a conclusion nothing may resume freezes the journal and
-            // enters the Merkle log. A failed or exhausted run stays open: its
-            // conclusion is in the chain — indexed, findable, tamper-covered —
-            // but a leaf published for it would be a checkpoint attesting a
-            // history its own resume is permitted to grow past.
-            if status.seals() {
-                self.store
-                    .seal(run, epoch, status.as_str())
+            // A resume that did nothing new reaches the same open conclusion
+            // the record already carries, and appending it again would grow
+            // the journal by one identical conclusion per resume. The chain's
+            // own last record is the authority: only when it already *is*
+            // this conclusion is the append skipped — a resume that worked
+            // and then concluded the same way has its work between the two
+            // conclusions, so its last record is not a conclusion and both
+            // are kept. Scoped to open conclusions, because a sealing one is
+            // unreachable twice: the seal refuses further appends and a
+            // sealed run's replay is a no-op long before here.
+            let repeated = !status.seals()
+                && self
+                    .store
+                    .read(run, before.seq)
                     .await
                     .map_err(RuntimeError::from_store)?
+                    .last()
+                    .is_some_and(|r| {
+                        matches!(
+                            r.kind(),
+                            RecordKind::RunSealed { outcome, .. }
+                                if outcome == status.as_str()
+                        )
+                    });
+            if repeated {
+                before.hash
             } else {
-                concluded.last().map_or(before.hash, |r| r.hash)
+                let mut sealed = Append::new(
+                    run,
+                    RecordKind::RunSealed {
+                        outcome: status.as_str().to_owned(),
+                        chain_head: before.hash,
+                    },
+                );
+                if let Some(c) = case {
+                    sealed = sealed.case(c);
+                }
+                let concluded = self
+                    .store
+                    .append(epoch, vec![sealed])
+                    .await
+                    .map_err(RuntimeError::from_store)?;
+
+                // Only a conclusion nothing may resume freezes the journal and
+                // enters the Merkle log. A failed or exhausted run stays open:
+                // its conclusion is in the chain — indexed, findable,
+                // tamper-covered — but a leaf published for it would be a
+                // checkpoint attesting a history its own resume is permitted
+                // to grow past.
+                if status.seals() {
+                    self.store
+                        .seal(run, epoch, status.as_str())
+                        .await
+                        .map_err(RuntimeError::from_store)?
+                } else {
+                    concluded.last().map_or(before.hash, |r| r.hash)
+                }
             }
         } else {
             self.store
@@ -3444,21 +3634,39 @@ impl Runtime {
         // Best-effort on purpose. A release that fails costs a TTL of patience;
         // turning it into a run failure would convert a tidiness problem into a
         // correctness one, after the work is already done and journaled.
-        if let Err(e) = self.store.release_lease(run, epoch).await {
-            tracing::debug!(
-                %run,
-                error = %e,
-                "could not hand back the lease; it will expire on its own"
-            );
+        //
+        // Only when this pass held a lease at all. A strict pass acquires
+        // nothing — it is a read — and both stores release on epoch match
+        // alone, so a strict verification of a run whose owner is live under
+        // that same epoch would mark the *owner's* lease released: its
+        // heartbeat stops renewing and any delivery or sweep may fence a
+        // healthy run mid-step. The same guard keeps a read-only pass out of
+        // the quota ledger and the metrics: a verification is not work the
+        // tenant did today, and accruing a historical run's spend into the
+        // current period on every audit would bill the past once per look.
+        if writing {
+            if let Err(e) = self.store.release_lease(run, epoch).await {
+                tracing::debug!(
+                    %run,
+                    error = %e,
+                    "could not hand back the lease; it will expire on its own"
+                );
+            }
+
+            // Beside the lease, and for the same reason: this instance is
+            // finished with the run whatever the outcome. A **suspended** run
+            // gives its slot back too — it costs a row, not a thread, and
+            // holding the slot would mean a tenant waiting on a hundred
+            // approvals could start nothing.
+            //
+            // The figure accrued is what *this pass* dispatched, not the run's
+            // cumulative spend: `spend` includes the replayed prefix so the
+            // caller sees what the run has cost in total, but accruing it
+            // would bill the prefix once per suspend/resume cycle.
+            self.settle_quota(run, live_spend).await;
+
+            announce(&self.meter, run, &status);
         }
-
-        // Beside the lease, and for the same reason: this instance is finished
-        // with the run whatever the outcome. A **suspended** run gives its slot
-        // back too — it costs a row, not a thread, and holding the slot would
-        // mean a tenant waiting on a hundred approvals could start nothing.
-        self.settle_quota(run, spend).await;
-
-        announce(&self.meter, run, &status);
 
         Ok(RunOutcome {
             run_id: run,
@@ -3648,6 +3856,19 @@ struct Batch<'a> {
     /// Steps whose `StepFinished` the journal already holds. Empty on a live
     /// run.
     finished: &'a BTreeSet<StepId>,
+    /// Group records the journal already holds, by writing step and phase.
+    /// Empty on a live run.
+    recorded_groups: &'a BTreeMap<(StepId, Phase, String), super::ctx::RecordedGroup>,
+}
+
+/// What the journal proves about a run an unwind is deciding over.
+struct UnwindEvidence {
+    /// Steps that announced a mutating forward effect.
+    mutated: BTreeSet<StepId>,
+    /// Steps whose compensation is already on the record.
+    undone: BTreeSet<StepId>,
+    /// Group records already on the journal, by writing step and phase.
+    recorded_groups: BTreeMap<(StepId, Phase, String), super::ctx::RecordedGroup>,
 }
 
 /// What producing a successor plan needs.
@@ -3714,6 +3935,8 @@ struct StepRun<'a> {
     /// Whether the journal already records this step finishing. Always
     /// `false` live.
     already_finished: bool,
+    /// Group records this step and phase already wrote. Always empty live.
+    recorded_groups: BTreeMap<String, super::ctx::RecordedGroup>,
 }
 
 /// Where the recorded run was refused by a *step* limit, if the refusal still
@@ -3802,6 +4025,36 @@ fn recorded_finished_steps(records: &[Record]) -> BTreeSet<StepId> {
             _ => None,
         })
         .collect()
+}
+
+/// The group records already on the journal, by writing step and phase.
+///
+/// Read back for the same reason the step sets are: group records are not
+/// effects, so the cursor cannot dedup them, and a resumed step that re-opens
+/// its group or reaches its end at the frontier — cursor exhausted, writes
+/// enabled — would otherwise write the same record a second time.
+fn recorded_groups(
+    records: &[Record],
+) -> BTreeMap<(StepId, Phase, String), super::ctx::RecordedGroup> {
+    let mut recorded: BTreeMap<(StepId, Phase, String), super::ctx::RecordedGroup> =
+        BTreeMap::new();
+    for r in records {
+        let (group, opened) = match r.kind() {
+            RecordKind::GroupOpened { group, .. } => (group, true),
+            RecordKind::GroupSettled { group, .. } => (group, false),
+            _ => continue,
+        };
+        let Some(step) = r.body.step else { continue };
+        let entry = recorded
+            .entry((step, r.body.phase, group.clone()))
+            .or_default();
+        if opened {
+            entry.opened += 1;
+        } else {
+            entry.settled += 1;
+        }
+    }
+    recorded
 }
 
 /// Every capability an agent advertises is provided by one of **its own**
@@ -4284,6 +4537,13 @@ struct Execution<'a> {
     /// Steps whose `StepFinished` is already on the record. Empty on a live
     /// run.
     finished: BTreeSet<StepId>,
+    /// Group records already on the journal, keyed by the step and phase
+    /// that wrote them. Empty on a live run. Read back for the same reason
+    /// `finished` is: group records are not effects, so the cursor cannot
+    /// dedup them, and a resumed step that re-opens or re-settles its group
+    /// at the frontier — where its cursor is exhausted and writes are
+    /// enabled — would report one group as two.
+    recorded_groups: BTreeMap<(StepId, Phase, String), super::ctx::RecordedGroup>,
     run: RunId,
     epoch: u64,
     plan: &'a PlanIR,
@@ -4561,25 +4821,19 @@ impl RuntimeBuilder {
     /// must renew within it. The runtime heartbeats while a run executes, so
     /// this bounds *crash* detection rather than how long a run may take.
     ///
-    /// # Panics
-    ///
-    /// Below [`MIN_LEASE_TTL`]. Both stores keep lease expiry in **whole
-    /// seconds** and treat `expires_at <= now` as lapsed, so a one-second lease
-    /// expires the moment the clock ticks past the second it was written in — no
-    /// matter how often it is renewed. Such a lease cannot be held by a live
-    /// run, and a run that cannot hold its lease is one any instance may take
-    /// away mid-flight. Refused here rather than left as a footgun that only
-    /// shows up under load.
+    /// A TTL below [`MIN_LEASE_TTL`] is refused at
+    /// [`build`](Self::build)/[`try_build`](Self::try_build) as
+    /// [`BuildError::LeaseUnrenewable`](crate::runtime::BuildError::LeaseUnrenewable).
+    /// Both stores keep lease expiry in **whole seconds** and treat
+    /// `expires_at <= now` as lapsed, so a one-second lease expires the moment
+    /// the clock ticks past the second it was written in — no matter how often
+    /// it is renewed. Such a lease cannot be held by a live run, and a run that
+    /// cannot hold its lease is one any instance may take away mid-flight.
+    /// Refused where a manifest-serving plane can report it as a diagnostic
+    /// rather than left as a panic in a setter, which `try_build`'s callers
+    /// could never see as a value.
     #[must_use]
     pub fn lease_ttl(mut self, ttl: Duration) -> Self {
-        assert!(
-            ttl >= MIN_LEASE_TTL,
-            "a lease of {ttl:?} cannot be renewed: the store keeps expiry in \
-             whole seconds and treats `expires_at <= now` as lapsed, so anything \
-             under {MIN_LEASE_TTL:?} expires between renewals however often they \
-             run — and a run that cannot hold its lease can be taken over while \
-             it is still working"
-        );
         self.lease_ttl = ttl;
         self
     }
@@ -5378,6 +5632,12 @@ impl RuntimeBuilder {
     #[cfg_attr(not(feature = "manifest"), allow(unused_mut))]
     #[allow(clippy::too_many_lines)]
     pub fn try_build(mut self) -> Result<Arc<Runtime>, BuildError> {
+        if self.lease_ttl < MIN_LEASE_TTL {
+            return Err(BuildError::LeaseUnrenewable {
+                ttl: self.lease_ttl,
+                minimum: MIN_LEASE_TTL,
+            });
+        }
         check_same_tenant(
             self.store.as_ref(),
             self.blobs.as_ref(),
@@ -5879,19 +6139,19 @@ impl Runtime {
             .await
             .map_err(RuntimeError::from_store)?;
 
-        // The bookkeeping lease has done its work — the event is recorded as
-        // the awaited effect's result. `replay` claims its own lease before it
-        // reads (which fences this epoch, under which nothing is left to
-        // write), so this one is handed back first rather than deadlocking
-        // the resume against its own delivery.
-        if let Err(e) = self.store.release_lease(sub.run, lease.epoch).await {
-            tracing::debug!(run = %sub.run, error = %e, "could not hand back the delivery lease");
-        }
-        match self.replay(sub.run, Mode::Resume).await {
-            // A `LeaseHeld` means somebody claimed the run in the gap — a
-            // concurrent delivery, a recovery sweep. The event is durably
-            // recorded, so whoever holds the lease replays it; this delivery
-            // still delivered.
+        // The event is recorded as the awaited effect's result, and the resume
+        // continues under the *same* lease. Releasing here and letting the
+        // resume re-acquire opened the window this function's own doc names —
+        // a crash between the release and the acquire left a released lease
+        // over a run whose subscription was just retired: no driver, and
+        // invisible to the abandonment queue, which lists only leases that
+        // expired while still naming an owner. The handover keeps the run
+        // owned continuously from delivery to conclusion.
+        match self.resume_holding(sub.run, lease).await {
+            // A `LeaseHeld` means this lease lapsed mid-resume and somebody
+            // claimed the run — a concurrent delivery, a recovery sweep. The
+            // event is durably recorded, so whoever holds the lease replays
+            // it; this delivery still delivered.
             Ok(_) | Err(RuntimeError::LeaseHeld { .. }) => {}
             Err(e) => return Err(e),
         }

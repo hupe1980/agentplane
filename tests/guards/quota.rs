@@ -441,3 +441,183 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
         "work did not resume on the second instance after the halt was lifted"
     );
 }
+
+// ── Accrual across passes ───────────────────────────────────────────────────
+
+/// A metered effect for the accrual tests: real spend, no other behaviour.
+#[derive(Debug)]
+struct Costs(u64);
+
+#[async_trait::async_trait]
+impl agentplane::core::Effect for Costs {
+    type Output = Value;
+    fn descriptor(&self) -> agentplane::core::EffectDescriptor {
+        agentplane::core::EffectDescriptor::new("test.costly", json!(null))
+    }
+    fn mutates(&self) -> bool {
+        false
+    }
+    fn recovery(&self) -> agentplane::core::Recovery {
+        agentplane::core::Recovery::Retry
+    }
+    fn spend(&self, _out: &Value) -> Spend {
+        Spend::tokens(self.0)
+    }
+    async fn perform(&self) -> Result<Value, agentplane::core::EffectError> {
+        Ok(json!({"ok": true}))
+    }
+}
+
+/// Spends 100 tokens, then sleeps a minute, then finishes.
+#[derive(Debug)]
+struct SpendThenSleep;
+
+#[async_trait::async_trait]
+impl Skill for SpendThenSleep {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("spender").provides("spender")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.effect(Costs(100)).await?;
+        cx.sleep(std::time::Duration::from_secs(60)).await?;
+        Ok(Outcome::done(Tainted::trusted(json!({"ok": true}))))
+    }
+}
+
+/// The period key settlement writes under, derived the same way it derives it.
+///
+/// The clock read is the test harness establishing "now", not a step smuggling
+/// non-determinism past the journal — the same exemption the sweep tests take.
+#[allow(clippy::disallowed_methods)]
+fn this_period(quota: &TenantQuota) -> String {
+    quota
+        .period
+        .key_for(agentplane::core::Timestamp::now_utc())
+}
+
+/// A suspend/resume cycle accrues each token once, not once per pass.
+///
+/// The run's own budget deliberately re-bills replayed history so a resume
+/// exhausts where the original did — but the tenant's period ledger must not,
+/// or a run that suspends N times accrues its prefix N times and the ceiling
+/// fills with phantom spend. The positive half: the total does arrive — one
+/// hundred tokens spent is one hundred accrued, on whichever pass dispatched
+/// them.
+#[tokio::test]
+async fn a_resumed_run_accrues_its_spend_once() {
+    use agentplane::case::TimerStore;
+
+    let quota = TenantQuota {
+        max_tokens_per_period: Some(1_000_000),
+        ..TenantQuota::default()
+    };
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.clone().for_tenant(tenant("acme")));
+    let rt = Runtime::builder(scoped.clone() as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .owner("t")
+        .timers(scoped.clone() as Arc<dyn TimerStore>)
+        .quota(scoped.clone() as Arc<dyn QuotaStore>, quota)
+        .skill(SpendThenSleep)
+        .build();
+
+    let out = rt
+        .run("spender", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(out.status.is_suspended(), "the sleep must suspend the run");
+
+    let period = this_period(&quota);
+    let after_suspend = QuotaStore::spent(scoped.as_ref(), &period)
+        .await
+        .expect("read");
+    assert_eq!(
+        after_suspend.tokens, 100,
+        "the suspending pass dispatched the effect, so it accrues it"
+    );
+
+    // Fire the timer far in the future; the resume replays the effect from
+    // history and finishes the run.
+    #[allow(clippy::disallowed_methods)]
+    let later = agentplane::core::Timestamp::now_utc() + std::time::Duration::from_secs(3600);
+    assert_eq!(rt.fire_timers(later).await.expect("fire").fired, 1);
+
+    let after_resume = QuotaStore::spent(scoped.as_ref(), &period)
+        .await
+        .expect("read");
+    assert_eq!(
+        after_resume.tokens, 100,
+        "the resume read the effect back from history and accrued it again — \
+         every suspend/resume cycle re-bills the prefix"
+    );
+}
+
+/// A strict verification accrues nothing and releases nobody's lease.
+///
+/// Strict is a read: it dispatches nothing, so billing its pass into the
+/// current period would charge the tenant once per audit for work done long
+/// ago. The positive half is above — the live pass did accrue.
+#[tokio::test]
+async fn a_strict_pass_accrues_no_spend() {
+    use agentplane::runtime::Mode;
+
+    let quota = TenantQuota {
+        max_tokens_per_period: Some(1_000_000),
+        ..TenantQuota::default()
+    };
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.clone().for_tenant(tenant("acme")));
+    let rt = Runtime::builder(scoped.clone() as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .owner("t")
+        .quota(scoped.clone() as Arc<dyn QuotaStore>, quota)
+        .skill(SpendsOnce)
+        .build();
+
+    let out = rt
+        .run("spends-once", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    let period = this_period(&quota);
+    let live = QuotaStore::spent(scoped.as_ref(), &period)
+        .await
+        .expect("read");
+    assert_eq!(live.tokens, 100, "the live run accrues its spend");
+
+    for _ in 0..2 {
+        rt.replay(out.run_id, Mode::Strict).await.expect("strict");
+    }
+    let after = QuotaStore::spent(scoped.as_ref(), &period)
+        .await
+        .expect("read");
+    assert_eq!(
+        after.tokens, 100,
+        "a strict verification billed a historical run's spend into the \
+         current period"
+    );
+}
+
+/// Spends 100 tokens and finishes — the strict test's fixture.
+#[derive(Debug)]
+struct SpendsOnce;
+
+#[async_trait::async_trait]
+impl Skill for SpendsOnce {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("spends-once").provides("spends-once")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.effect(Costs(100)).await?;
+        Ok(Outcome::done(Tainted::trusted(json!({"ok": true}))))
+    }
+}

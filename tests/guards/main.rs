@@ -30,6 +30,7 @@ mod outbox;
 mod postgres;
 mod push;
 mod quota;
+mod store_contracts;
 mod timestamps;
 mod vault;
 

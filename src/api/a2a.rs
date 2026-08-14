@@ -105,6 +105,26 @@ pub mod code {
     pub const CONTENT_TYPE_NOT_SUPPORTED: i32 = -32005;
     pub const EXTENDED_CARD_NOT_CONFIGURED: i32 = -32007;
     pub const VERSION_NOT_SUPPORTED: i32 = -32009;
+
+    /// Admission back-pressure: a quota ceiling refused the request before any
+    /// work was admitted.
+    ///
+    /// Not in A2A 1.0's error table — the spec defines only permanent
+    /// missing-capability codes in `-32001..-32009` and offers no transient or
+    /// back-pressure signal at all. This server previously answered a full
+    /// quota with `-32004 UnsupportedOperationError`, which taught a compliant
+    /// caller that the *operation does not exist here* — the correct response
+    /// to which is to abandon, never to retry — when the truthful answer is
+    /// "not right now". So the code is drawn from JSON-RPC's server-defined
+    /// range (`-32000..-32099`), outside the spec's table so no compliant
+    /// client can mistake it for a defined permanent condition, and shared
+    /// with no other refusal this server emits so it stays unambiguous.
+    ///
+    /// What this code does NOT carry is the quota arithmetic: declines on this
+    /// surface are deliberately uniform, and counters or limits in the message
+    /// would hand an unauthenticated prober the tenant's ceilings. The message
+    /// beside this code is a fixed sentence with no numbers in it.
+    pub const QUOTA_EXHAUSTED: i32 = -32029;
 }
 
 /// Actions this surface asks the policy engine about.
@@ -131,6 +151,16 @@ pub mod action {
 
 /// The `A2A-Version` service parameter.
 const VERSION_HEADER: &str = "a2a-version";
+
+/// The one sentence a full quota answers with, beside
+/// [`code::QUOTA_EXHAUSTED`].
+///
+/// A single constant rather than `why.to_string()` at each site, because the
+/// quota error's own rendering names the counter and its ceiling — numbers an
+/// external caller has no business learning from a decline. Deliberately
+/// digit-free; the test on this path asserts exactly that.
+const QUOTA_EXHAUSTED_MESSAGE: &str =
+    "this agent cannot take the request on right now; retry later";
 
 /// A task's lifecycle state, as A2A names them.
 ///
@@ -1634,8 +1664,11 @@ async fn stream_method(
                         "this agent declined the request",
                     ));
                 }
-                Err(crate::core::RuntimeError::QuotaExceeded(why)) => {
-                    return Err(RpcError::new(code::UNSUPPORTED_OPERATION, why.to_string()));
+                Err(crate::core::RuntimeError::QuotaExceeded(_)) => {
+                    return Err(RpcError::new(
+                        code::QUOTA_EXHAUSTED,
+                        QUOTA_EXHAUSTED_MESSAGE,
+                    ));
                 }
                 Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
             }
@@ -1969,9 +2002,10 @@ async fn send_message(
             Err(crate::core::RuntimeError::PolicyDenied(_)) => {
                 Ok(json!({ "message": declined(&skill) }))
             }
-            Err(crate::core::RuntimeError::QuotaExceeded(why)) => {
-                Err(RpcError::new(code::UNSUPPORTED_OPERATION, why.to_string()))
-            }
+            Err(crate::core::RuntimeError::QuotaExceeded(_)) => Err(RpcError::new(
+                code::QUOTA_EXHAUSTED,
+                QUOTA_EXHAUSTED_MESSAGE,
+            )),
             Err(crate::core::RuntimeError::PlanContract(why)) if message.context_id.is_some() => {
                 Err(RpcError::new(code::TASK_NOT_FOUND, why))
             }
@@ -1995,9 +2029,14 @@ async fn send_message(
         // Back-pressure, not a fault. `-32603` reads as "the far side is
         // broken, retry later" and a caller may well retry the same second;
         // this says *the agent cannot take this on right now*, which is what a
-        // ceiling means and what a caller should back off from.
-        Err(crate::core::RuntimeError::QuotaExceeded(why)) => {
-            return Err(RpcError::new(code::UNSUPPORTED_OPERATION, why.to_string()));
+        // ceiling means and what a caller should back off from. The code and
+        // message are fixed — see `code::QUOTA_EXHAUSTED` for why neither is
+        // the spec's `-32004` and why the quota arithmetic stays out of it.
+        Err(crate::core::RuntimeError::QuotaExceeded(_)) => {
+            return Err(RpcError::new(
+                code::QUOTA_EXHAUSTED,
+                QUOTA_EXHAUSTED_MESSAGE,
+            ));
         }
         Err(crate::core::RuntimeError::PlanContract(why)) if message.context_id.is_some() => {
             return Err(RpcError::new(code::TASK_NOT_FOUND, why));

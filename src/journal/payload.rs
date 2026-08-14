@@ -145,11 +145,24 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         K::EffectDone { output, .. } => vec![SealedField::Value(output)],
         // A reconciled effect's recovered result is the same object an
         // `EffectDone.output` is — caller data a probe happened to fetch —
-        // while `disposition` and `detail`'s *absence or presence* drive
-        // recovery and stay clear.
-        K::EffectReconciled { output, .. } => output
+        // and its `detail` is the same free text an `EffectFailed.error` is:
+        // a probe's failure message from a provider, which echoes the request
+        // it was asked about. `disposition` stays clear, and so does the
+        // detail's *presence* — recovery routes on whether the probe spoke,
+        // never on what it said, so the Option survives while the words seal.
+        K::EffectReconciled { output, detail, .. } => output
             .as_mut()
             .map(SealedField::Value)
+            .into_iter()
+            .chain(detail.as_mut().map(SealedField::Text))
+            .collect(),
+        // A settlement's `detail` names the failing invariant or the abort
+        // reason in the skill author's words over the caller's values — "hold
+        // h-73 does not cover order for alice@…" — while `outcome` is the
+        // routing fact and stays clear.
+        K::GroupSettled { detail, .. } => detail
+            .as_mut()
+            .map(SealedField::Text)
             .into_iter()
             .collect(),
         // The message is free text a provider or tool wrote — it quotes the

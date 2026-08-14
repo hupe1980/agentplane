@@ -59,6 +59,261 @@ async fn redb_satisfies_the_memory_store_contract() {
     agentplane::testkit::conformance::memory(store).await;
 }
 
+/// The event buffer's erasure contract, on the embedded backend.
+///
+/// Lives beside the memory guards because it is the same data-protection
+/// surface: an inbound payload is somebody's content held indefinitely, and
+/// this battery pins the only three ways that copy is allowed to die.
+#[tokio::test]
+#[cfg(feature = "testkit")]
+async fn redb_event_buffer_erases_payloads() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"))
+        as Arc<dyn agentplane::case::EventStore>;
+    agentplane::testkit::conformance::event_erasure(store).await;
+}
+
+/// Every redb erasure path removes the sliding-retention row, observed in the
+/// file itself.
+///
+/// White-box on purpose: the residue is invisible through the trait — a
+/// forgotten id is tombstoned, so nothing ever reads its access row again —
+/// which is exactly what let three of the four erasure paths leave it behind.
+/// A row about an erased id is retained data about a subject the store just
+/// reported erased, so the check opens the database file and looks.
+#[tokio::test]
+async fn every_redb_erasure_path_removes_access_expiry_residue() {
+    use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+
+    const ACCESS: TableDefinition<(&str, &str), i64> =
+        TableDefinition::new("memory_access_expiry");
+
+    // Wall clock for a unique temp-dir name only — never run-visible state.
+    #[allow(clippy::disallowed_methods)]
+    let dir = std::env::temp_dir().join(format!(
+        "agentplane-residue-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("residue.redb");
+    {
+        let store = RedbStore::open(&path).expect("store");
+        let with_window = |id: &str, subject: &str, window: u64| {
+            let mut item = item(id, subject, json!({"kept": "for a while"}), Trust::Untrusted);
+            item.access_retention_seconds = Some(window);
+            item
+        };
+        for (id, subject) in [
+            ("res-forget", "subj-forget"),
+            ("res-subject", "subj-subject"),
+            ("res-sweep", "subj-sweep"),
+        ] {
+            store
+                .remember(&with_window(id, subject, 60))
+                .await
+                .expect("remember");
+        }
+        // The control: a window long enough to survive the sweep below, so
+        // the positive half shows the row exists at all when the id lives.
+        store
+            .remember(&with_window("res-live", "subj-live", 1_000_000))
+            .await
+            .expect("remember control");
+
+        store.forget("res-forget").await.expect("forget");
+        assert_eq!(
+            store
+                .forget_subject("subj-subject")
+                .await
+                .expect("forget subject"),
+            1
+        );
+        assert_eq!(
+            store
+                .sweep_expired(at(1_760_000_060))
+                .await
+                .expect("sweep"),
+            1,
+            "exactly the short-window id expires"
+        );
+    }
+    let db = redb::Database::open(&path).expect("reopen the file");
+    let read = db.begin_read().expect("read txn");
+    let table = read.open_table(ACCESS).expect("access table");
+    let remaining: Vec<String> = table
+        .iter()
+        .expect("iterate")
+        .map(|entry| entry.map(|(key, _)| key.value().1.to_owned()))
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(
+        remaining,
+        vec!["res-live".to_owned()],
+        "an erasure path left its sliding-retention row behind — residue \
+         about an id the store reported erased"
+    );
+    drop(read);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Cryptographic subject erasure enumerates the whole subject, not a page.
+///
+/// The enumeration used to ride `recall(limit = usize::MAX)`, which is a
+/// bounded content query pressed into erasure service — and on the backend
+/// that refuses absurd limits it failed every single erasure. Here the redb
+/// half: more items than any recall page size, all reached.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn erase_subject_reaches_every_item_however_many() {
+    use agentplane::keyring::EncryptedMemoryStore;
+    use agentplane::testkit::MemoryKeyRing;
+
+    let inner = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let encrypted = EncryptedMemoryStore::new(
+        Arc::clone(&inner) as Arc<dyn MemoryStore>,
+        Arc::new(MemoryKeyRing::new()),
+        TenantId::new("bulk-erase").expect("tenant"),
+    );
+    for i in 0..37 {
+        encrypted
+            .remember(&item(
+                &format!("bulk-{i:02}"),
+                "person-bulk",
+                json!({"n": i}),
+                Trust::Untrusted,
+            ))
+            .await
+            .expect("write");
+    }
+    assert_eq!(
+        encrypted
+            .subject_ids("person-bulk")
+            .await
+            .expect("enumerate")
+            .len(),
+        37,
+        "the erasure enumeration must see every id, not a recall page"
+    );
+    assert_eq!(
+        encrypted
+            .erase_subject("person-bulk", at(1_760_000_500), "erasure request")
+            .await
+            .expect("erase the subject"),
+        37
+    );
+    for i in 0..37 {
+        assert!(
+            inner
+                .version(&format!("bulk-{i:02}"), 1)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "item {i} survived the subject erasure"
+        );
+    }
+}
+
+/// A destroyed subject key reads as absence; corruption stays loud.
+///
+/// The scenario is a completed erasure whose ciphertext cleanup failed — the
+/// key is gone, the rows are not. The read paths must skip those rows (the
+/// convention `SealedJournal` and `SealedCases` set) rather than turn every later
+/// recall of the subject into a persistent error; and a row that is broken in
+/// any *other* way must keep erroring, or tampering reads as erasure.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn a_destroyed_subject_key_reads_as_absence_not_an_error() {
+    use agentplane::keyring::{EncryptedMemoryStore, KeyRing};
+    use agentplane::testkit::MemoryKeyRing;
+
+    let tenant = TenantId::new("skip-destroyed").expect("tenant");
+    let inner = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let ring = Arc::new(MemoryKeyRing::new());
+    let encrypted = EncryptedMemoryStore::new(
+        Arc::clone(&inner) as Arc<dyn MemoryStore>,
+        Arc::clone(&ring) as Arc<dyn KeyRing>,
+        tenant.clone(),
+    );
+    encrypted
+        .remember(&item(
+            "gone-1",
+            "person-gone",
+            json!({"secret": "erased"}),
+            Trust::Untrusted,
+        ))
+        .await
+        .expect("write erased subject");
+    encrypted
+        .remember(&item(
+            "kept-1",
+            "person-kept",
+            json!({"fact": "alive"}),
+            Trust::Untrusted,
+        ))
+        .await
+        .expect("write live subject");
+
+    // The erasure that completed where it counts and failed at cleanup: the
+    // key is destroyed, the ciphertext rows remain.
+    ring.destroy(
+        &agentplane::keyring::scope(&tenant, "memory/person-gone"),
+        at(1_760_000_500),
+        "erasure request",
+    )
+    .await
+    .expect("destroy the subject key");
+
+    assert!(
+        encrypted
+            .recall(&Recall::about("person-gone"))
+            .await
+            .expect("a destroyed key is a completed erasure, not an outage")
+            .is_empty(),
+        "rows sealed to a destroyed key must be absent, not returned"
+    );
+    assert!(
+        encrypted
+            .version("gone-1", 1)
+            .await
+            .expect("version read after erasure")
+            .is_none(),
+        "an erased version answers None, exactly as a forgotten one does"
+    );
+    // The positive half: the untouched subject still reads.
+    assert_eq!(
+        encrypted
+            .recall(&Recall::about("person-kept"))
+            .await
+            .expect("live subject recall")
+            .len(),
+        1
+    );
+
+    // And the skip covers *only* destroyed keys: a row that is not a valid
+    // envelope is corruption, and corruption must stay loud.
+    inner
+        .remember(&item(
+            "garbage-1",
+            "person-kept",
+            json!({"not": "an envelope"}),
+            Trust::Untrusted,
+        ))
+        .await
+        .expect("plant a corrupt row");
+    assert!(
+        encrypted
+            .recall(&Recall::about("person-kept"))
+            .await
+            .is_err(),
+        "a row that is not an envelope was skipped as if erased — tampering \
+         must not read as erasure"
+    );
+}
+
 #[cfg(all(feature = "keyring", feature = "testkit"))]
 #[tokio::test]
 async fn memory_subject_erasure_makes_backup_ciphertext_unreadable() {
@@ -117,9 +372,15 @@ async fn memory_subject_erasure_makes_backup_ciphertext_unreadable() {
         keys as Arc<dyn agentplane::keyring::KeyRing>,
         tenant,
     );
+    // `Ok(None)`, not an error: the key is destroyed, so the row reads as a
+    // completed erasure — the skip-sealed convention the read paths follow.
+    // What must never come back is `Ok(Some(_))` with the plaintext, and an
+    // `Err` here would be the old behavior of treating a finished erasure as
+    // a persistent fault.
     assert!(
-        restored.version("crypto-1", 1).await.is_err(),
-        "a pre-erasure backup remained decryptable after key destruction"
+        matches!(restored.version("crypto-1", 1).await, Ok(None)),
+        "a pre-erasure backup remained decryptable (or read as a fault) after \
+         key destruction"
     );
 }
 
@@ -273,6 +534,9 @@ impl MemoryStore for Counted {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.recall(query).await
     }
+    async fn subject_ids(&self, subject: &str) -> Result<Vec<String>, agentplane::core::StoreError> {
+        self.inner.subject_ids(subject).await
+    }
     async fn version(
         &self,
         id: &str,
@@ -335,6 +599,10 @@ impl MemoryStore for RejectsComposedCascade {
         query: &Recall,
     ) -> Result<Vec<MemoryItem>, agentplane::core::StoreError> {
         self.inner.recall(query).await
+    }
+
+    async fn subject_ids(&self, subject: &str) -> Result<Vec<String>, agentplane::core::StoreError> {
+        self.inner.subject_ids(subject).await
     }
 
     async fn version(

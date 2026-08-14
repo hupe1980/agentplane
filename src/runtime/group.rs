@@ -657,11 +657,21 @@ impl<'a> StepCtx<'a> {
                     .to_owned(),
             });
         }
-        self.append(RecordKind::GroupOpened {
-            group: name.clone(),
-            resources: resources.clone(),
-        })
-        .await?;
+        // Exactly one `GroupOpened` per open and pass: like the settlement
+        // below, the record is not an effect, so a resumed step re-opening
+        // its group at the frontier would otherwise announce the same group
+        // twice.
+        if let Some(recorded) = self.recorded_groups.get_mut(&name)
+            && recorded.opened > 0
+        {
+            recorded.opened -= 1;
+        } else {
+            self.append(RecordKind::GroupOpened {
+                group: name.clone(),
+                resources: resources.clone(),
+            })
+            .await?;
+        }
         self.set_open_group(OpenGroup {
             name,
             resources,
@@ -738,6 +748,15 @@ impl<'a> StepCtx<'a> {
     }
 
     /// Write the group's ending and close it.
+    ///
+    /// Exactly once per group and pass: a settlement is not an effect, so the
+    /// cursor cannot dedup it, and a resumed step re-reaching its group's end
+    /// at the frontier — cursor exhausted, writes enabled — would otherwise
+    /// record the same settlement twice. The recorded counts are read back
+    /// from the journal when the step starts, and they are counts because two
+    /// *distinct* groups may legitimately share a name within one step —
+    /// opened, settled, opened again — so each recorded settlement excuses
+    /// exactly one re-settlement.
     pub(crate) async fn settle_open_group(
         &mut self,
         outcome: GroupOutcome,
@@ -746,6 +765,12 @@ impl<'a> StepCtx<'a> {
         let Some(open) = self.take_open_group() else {
             return Err(no_group());
         };
+        if let Some(recorded) = self.recorded_groups.get_mut(&open.name)
+            && recorded.settled > 0
+        {
+            recorded.settled -= 1;
+            return Ok(());
+        }
         self.append(RecordKind::GroupSettled {
             group: open.name,
             outcome,

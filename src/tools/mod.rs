@@ -600,6 +600,22 @@ impl ToolCatalog {
     #[must_use]
     pub fn observed(mut self, id: &ToolId, advertised: Advertised) -> Self {
         if let Some(entry) = self.entries.get_mut(id) {
+            // Recorded and compared, never obeyed — and the "compared" half
+            // must reach somebody: an advertisement that outgrows its grant
+            // is the first observable move of a server going bad, and a
+            // discrepancy only visible to code that calls `overclaiming()` by
+            // hand is detection without delivery. A warning, not an error,
+            // because the grant is the ceiling either way; what the operator
+            // is being told is that the server now *wants* more than they
+            // gave it.
+            if advertised.overclaims(&entry.0) {
+                tracing::warn!(
+                    tool = %id,
+                    "this tool's server now advertises more safety than the \
+                     operator granted; the grant still rules, but the \
+                     advertisement changed"
+                );
+            }
             entry.1 = advertised;
         }
         self

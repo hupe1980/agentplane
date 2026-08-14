@@ -255,7 +255,24 @@ impl MemoryItem {
 ///
 /// Deliberately not a free-text similarity query alone. `subject` and `purpose`
 /// are the axes an operator can reason about and a policy can be written
-/// against; a store may rank within them however it likes.
+/// against.
+///
+/// # The selection rule is part of the contract, not a backend choice
+///
+/// Recall truncates, so the order decides what an agent sees. Every backend
+/// must select the same way: **most trusted first, then newest, then id** —
+/// and when `purpose` is `None`, that ordering is **global across purposes**,
+/// not per-purpose. Two backends ranking differently is an agent that recalls
+/// different facts depending on which store a deployment happened to wire,
+/// which no test above the store can see.
+///
+/// Trust leads recency because truncating by recency alone is an eviction an
+/// attacker steers: anything able to write an untrusted memory writes `limit`
+/// of them and the trusted ones silently lose their place. What this rule does
+/// **not** cover: relevance. Within one trust rank the order is recency, so a
+/// subject with more memories than `limit` can still push an older, more
+/// pertinent memory out of the window — semantic retrieval, not recall, is the
+/// tool for that.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Recall {
     pub subject: String,
@@ -672,7 +689,9 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// If the store cannot be reached.
     async fn remember(&self, item: &MemoryItem) -> Result<u64, StoreError>;
 
-    /// The current versions matching a query, newest first.
+    /// The current versions matching a query — most trusted first, then
+    /// newest, then id, globally across purposes (see [`Recall`] for why the
+    /// ordering is contractual).
     ///
     /// Superseded and forgotten versions are not returned.
     ///
@@ -680,6 +699,25 @@ pub trait MemoryStore: Send + Sync + Debug {
     ///
     /// If the store cannot be reached.
     async fn recall(&self, query: &Recall) -> Result<Vec<MemoryItem>, StoreError>;
+
+    /// Every id currently belonging to a subject — the erasure path's
+    /// enumeration.
+    ///
+    /// A separate operation rather than a `recall` with a huge limit, because
+    /// erasure must not ride a bounded, content-returning query: a backend is
+    /// free to cap or refuse extreme recall limits (the `PostgreSQL` store
+    /// refuses limits beyond `BIGINT`), and a cryptographic erasure that
+    /// enumerated through one silently missed whatever the cap cut off — while
+    /// reporting success. This returns ids only, unbounded, in stable order.
+    ///
+    /// What it does **not** cover: forgotten and swept ids. They have no
+    /// current version, no content, and their tombstones are not subject-keyed
+    /// — an erasure that needs them already erased them.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn subject_ids(&self, subject: &str) -> Result<Vec<String>, StoreError>;
 
     /// One exact version, superseded or not.
     ///
@@ -742,8 +780,21 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// individually keeps its derivation edges in both directions, so a later
     /// cascade from further upstream still reaches everything transitively
     /// derived — A → B → C with B corrected away must not shelter C from A's
-    /// erasure. Returns the number of ids whose state this call actually
-    /// removed; a tombstone passed through is routed, not counted.
+    /// erasure.
+    ///
+    /// It is also **version-granular**, because supersession does not
+    /// un-absorb anything. A derivative whose *current* version read a doomed
+    /// node is erased as a whole id. A derivative that has since been honestly
+    /// re-derived from clean sources keeps its current version — but the
+    /// **superseded versions that named the doomed source are erased**, along
+    /// with anything transitively derived from exactly those versions.
+    /// Otherwise a rolling summary's v1, which absorbed the poisoned memory
+    /// and remained readable through [`version`](Self::version), would outlive
+    /// the erasure that claimed to reach everything derived.
+    ///
+    /// Returns the number of ids whose state this call actually removed — an
+    /// id that lost only superseded versions counts once; a tombstone passed
+    /// through is routed, not counted.
     ///
     /// # Errors
     ///
@@ -772,6 +823,15 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// Slides each touched id's window to `at + window`. It cannot extend a
     /// life past an `expires_at` — that ceiling is immutable, and both recall
     /// and the sweep take the earlier of the two.
+    ///
+    /// A touch on an id whose window has **lapsed but not yet been swept**
+    /// deliberately *resurrects* it: expiry becomes fact at the sweep, not at
+    /// the instant the window closes, and stores take `max(existing, at +
+    /// window)` so a late touch simply opens a new window. The alternative —
+    /// refusing the touch — would make the answer depend on how recently the
+    /// sweeper ran, which is an ambient race no journal records. What this
+    /// choice does not cover: the `expires_at` ceiling, which no touch moves,
+    /// and a swept id, which is a tombstone no touch revives.
     async fn touch(&self, ids: &[String], at: Timestamp) -> Result<(), StoreError>;
 }
 

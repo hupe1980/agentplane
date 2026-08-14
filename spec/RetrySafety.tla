@@ -357,7 +357,14 @@ Safety ==
 (*                          TEMPORAL PROPERTIES                              *)
 -----------------------------------------------------------------------------
 
-JournalIsAppendOnly == [][Len(journal') >= Len(journal)]_vars
+(* Prefix equality, not merely length: a journal that swapped one record for  *)
+(* another at the same length would still be a rewritten history, and a       *)
+(* length check would wave it through.                                        *)
+IsPrefixOf(p, s) ==
+    /\ Len(p) <= Len(s)
+    /\ \A k \in 1 .. Len(p) : s[k] = p[k]
+
+JournalIsAppendOnly == [][IsPrefixOf(journal, journal')]_vars
 
 (* The run always reaches a decision. `quarantined` counts: refusing to guess  *)
 (* is an answer, and the one an auditor can act on.                            *)

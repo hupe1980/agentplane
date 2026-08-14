@@ -610,6 +610,299 @@ async fn an_orphaned_mutating_effect_is_quarantined_not_retried() {
     );
 }
 
+// ── An orphan whose re-performance fails ────────────────────────────────────
+//
+// `resolve_orphan` re-performs an interrupted `Recovery::Retry` effect under
+// its original key. When that re-performance *fails*, the failure must travel
+// through the same disposition machinery a live failure does — an in-doubt
+// failure on a mutating effect is an operator's question, not a plain `Failed`
+// that unwinds. An earlier version collapsed it to a step failure inside
+// `resolve_orphan`, which skipped the classifier entirely.
+
+/// A ledger posting: mutating, declared safe to re-perform, and switchable to
+/// time out — so the re-performance of a crash orphan can be made to fail with
+/// the outcome unknown.
+#[derive(Debug)]
+struct FlakyPost {
+    attempts: Arc<AtomicUsize>,
+    times_out: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl agentplane::core::Effect for FlakyPost {
+    type Output = Value;
+    fn descriptor(&self) -> agentplane::core::EffectDescriptor {
+        agentplane::core::EffectDescriptor::new("ledger.post", json!(null))
+    }
+    fn mutates(&self) -> bool {
+        true
+    }
+    fn recovery(&self) -> agentplane::core::Recovery {
+        agentplane::core::Recovery::Retry
+    }
+    /// One attempt: the test is about what a *final* in-doubt failure means,
+    /// and further attempts would only defer that question.
+    fn retry(&self) -> agentplane::core::RetryPolicy {
+        agentplane::core::RetryPolicy::never()
+    }
+    async fn perform(&self) -> Result<Value, agentplane::core::EffectError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        if self.times_out.load(Ordering::SeqCst) {
+            return Err(agentplane::core::EffectError::Timeout {
+                driver: "ledger".into(),
+                waited_ms: 5,
+            });
+        }
+        Ok(json!({ "posted": true }))
+    }
+}
+
+/// A step that mutates and knows how to take it back, so the tests below can
+/// tell "did not compensate" from "had nothing to compensate".
+#[derive(Debug)]
+struct Prepares {
+    undone: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Skill for Prepares {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("prepare").provides("demo.prepare")
+    }
+    fn compensation(&self) -> agentplane::core::Compensation {
+        agentplane::core::Compensation::Compensatable
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, agentplane::core::SkillError> {
+        let arguments = Tainted::trusted(Value::Null);
+        cx.sink(Recorded::new("prepare"), &arguments).await?;
+        Ok(Outcome::done(input))
+    }
+    async fn compensate(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        _output: &Tainted<Value>,
+    ) -> Result<(), agentplane::core::SkillError> {
+        self.undone.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// The posting step, holding the switchable effect.
+#[derive(Debug)]
+struct Posts {
+    attempts: Arc<AtomicUsize>,
+    times_out: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Skill for Posts {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("post").provides("demo.post")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, agentplane::core::SkillError> {
+        cx.effect(FlakyPost {
+            attempts: Arc::clone(&self.attempts),
+            times_out: Arc::clone(&self.times_out),
+        })
+        .await?;
+        Ok(Outcome::done(input))
+    }
+}
+
+fn prepare_then_post() -> agentplane::core::PlanIR {
+    use agentplane::core::{ArgSource, PlanIR, PlanNode, StepId};
+    PlanIR::new(vec![
+        PlanNode::new(0, "demo.prepare").arg("input", ArgSource::run_input()),
+        PlanNode::new(1, "demo.post")
+            .arg("x", ArgSource::node(StepId(0)))
+            .terminal(),
+    ])
+}
+
+/// Run the two-step plan to completion, then rebuild its journal truncated
+/// right after the posting effect's announcement — the exact shape a `kill -9`
+/// between "sent the request" and "recorded the answer" leaves behind.
+///
+/// Returns the rebuilt store and the run id. The truncation approach comes
+/// from `tests/engine/simulation.rs`: every prefix of an append-only journal
+/// is a crash that could have happened.
+async fn crashed_mid_post() -> (Arc<RedbStore>, agentplane::core::RunId) {
+    use agentplane::journal::{Append, RecordKind};
+
+    let origin = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(origin.clone())
+        .owner("origin")
+        .skill(Prepares {
+            undone: Arc::new(AtomicUsize::new(0)),
+        })
+        .skill(Posts {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            times_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+        .build();
+    let done = rt
+        .run_plan(prepare_then_post(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(done.status, RunStatus::Succeeded, "the fixture run works");
+
+    let records = origin.read(done.run_id, 1).await.unwrap();
+    let cut = records
+        .iter()
+        .position(|r| {
+            matches!(
+                r.kind(),
+                RecordKind::EffectStarted { descriptor, .. } if descriptor.kind == "ledger.post"
+            )
+        })
+        .expect("the posting effect was announced")
+        + 1;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let lease = store
+        .acquire(done.run_id, "rebuild", std::time::Duration::from_mins(5))
+        .await
+        .unwrap();
+    for r in &records[..cut] {
+        let mut a = Append::new(done.run_id, r.kind().clone()).phase(r.body.phase);
+        if let Some(s) = r.body.step {
+            a = a.step(s);
+        }
+        if let Some(c) = r.body.case {
+            a = a.case(c);
+        }
+        if let Some(k) = r.effect_key() {
+            a = a.effect(k);
+        }
+        store.append(lease.epoch, vec![a]).await.unwrap();
+    }
+    store.release_lease(done.run_id, lease.epoch).await.unwrap();
+    (store, done.run_id)
+}
+
+/// An orphan whose re-performance fails in doubt is classified, not flattened.
+///
+/// The resume finds the posting effect announced with no terminal record and —
+/// `Recovery::Retry` — re-performs it. The re-performance times out, which is
+/// `InDoubt`, and the effect mutates: the disposition classifier's verdict for
+/// a final unknown on a mutating call is an operator's question. The run must
+/// therefore quarantine *with that diagnosis*. The message assertion is
+/// load-bearing: flattening the failure inside `resolve_orphan` would nowadays
+/// still quarantine — the failure unwind refuses to compensate around the
+/// in-doubt record — but with the unwind's message, after taking the wrong
+/// path; and with both regressions in place the run reads `Failed` and the
+/// unwind compensates the prepared step around a posting that may have landed.
+#[tokio::test]
+async fn an_orphan_whose_reperformance_fails_in_doubt_is_classified_not_flattened() {
+    let (store, run) = crashed_mid_post().await;
+
+    let undone = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let rt = Runtime::builder(store.clone())
+        .owner("resumer")
+        .skill(Prepares {
+            undone: Arc::clone(&undone),
+        })
+        .skill(Posts {
+            attempts: Arc::clone(&attempts),
+            times_out: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        })
+        .build();
+
+    let out = rt.replay(run, Mode::Resume).await.unwrap();
+
+    match &out.status {
+        RunStatus::Quarantined(msg) => assert!(
+            msg.contains("attempts exhausted"),
+            "quarantined, but not by the disposition classifier — the failed \
+             re-performance took a different path than a live failure: {msg}"
+        ),
+        other => panic!(
+            "a mutating orphan whose re-performance ended in doubt must be an \
+             operator's question, got {other:?}"
+        ),
+    }
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "the orphan is re-performed exactly once — a retry after doubt would \
+         be a second real performance"
+    );
+    assert_eq!(
+        undone.load(Ordering::SeqCst),
+        0,
+        "no compensation may run around a call whose outcome is unknown"
+    );
+    let compensated = store
+        .read(run, 1)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.kind().kind_str() == "StepCompensated")
+        .count();
+    assert_eq!(compensated, 0, "the journal must record no unwind either");
+}
+
+/// The positive half: the same crash shape, and the re-performance succeeds.
+///
+/// The orphan is re-performed under its original announcement — exactly one
+/// `EffectStarted` for the posting effect, ever — and the run completes. This
+/// is what proves the fixture above models a recoverable crash rather than a
+/// broken journal; `resuming_is_idempotent` covers the wider property that
+/// repeated resumes stay safe.
+#[tokio::test]
+async fn an_orphan_whose_reperformance_succeeds_resumes_to_success() {
+    let (store, run) = crashed_mid_post().await;
+
+    let undone = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let rt = Runtime::builder(store.clone())
+        .owner("resumer")
+        .skill(Prepares {
+            undone: Arc::clone(&undone),
+        })
+        .skill(Posts {
+            attempts: Arc::clone(&attempts),
+            times_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+        .build();
+
+    let out = rt.replay(run, Mode::Resume).await.unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "the interrupted attempt is resumed as one performance"
+    );
+    assert_eq!(undone.load(Ordering::SeqCst), 0, "nothing unwinds on success");
+
+    let records = store.read(run, 1).await.unwrap();
+    let announcements = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.kind(),
+                agentplane::journal::RecordKind::EffectStarted { descriptor, .. }
+                    if descriptor.kind == "ledger.post"
+            )
+        })
+        .count();
+    assert_eq!(
+        announcements, 1,
+        "the resumed attempt reuses the announcement already in the journal — \
+         a second one would report one interrupted call as two"
+    );
+    store.verify(run).await.unwrap();
+}
+
 /// Resuming a run that already finished is a no-op that returns the recorded
 /// outcome.
 ///
@@ -820,15 +1113,40 @@ async fn a_long_run_keeps_its_lease() {
 /// a one-second lease is expired for part of every second it exists — no
 /// renewal frequency saves it. Accepting one would produce a plane whose runs
 /// can be taken over while working, and it would only show up under load.
+///
+/// The refusal is a `BuildError` rather than a setter panic so a plane
+/// assembled from runtime input (`try_build`) reports it as a diagnostic
+/// instead of aborting the process. The positive half: the same builder with a
+/// TTL at the minimum assembles.
 #[test]
-#[should_panic(expected = "cannot be renewed")]
 fn a_lease_too_short_to_renew_is_refused() {
     use std::time::Duration;
 
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
-    let _ = Runtime::builder(store as Arc<dyn JournalStore>)
+    let refused = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .lease_ttl(Duration::from_secs(1))
-        .build();
+        .try_build();
+    let err = refused.expect_err("a one-second lease was accepted");
+    assert!(
+        matches!(
+            err,
+            agentplane::runtime::BuildError::LeaseUnrenewable { .. }
+        ),
+        "refused, but not as the lease refusal: {err}"
+    );
+    assert!(
+        err.to_string().contains("cannot be renewed"),
+        "the diagnostic no longer says why the lease is unusable: {err}"
+    );
+
+    let accepted = Runtime::builder(store as Arc<dyn JournalStore>)
+        .lease_ttl(Duration::from_secs(2))
+        .try_build();
+    assert!(
+        accepted.is_ok(),
+        "a lease at the minimum was refused — the check refuses everything, \
+         so the negative half above proves nothing"
+    );
 }
 
 /// The harness establishing "now" for a sweep tick — a test driving the

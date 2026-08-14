@@ -226,12 +226,19 @@ Safety ==
 (*                          TEMPORAL PROPERTIES                              *)
 -----------------------------------------------------------------------------
 
+(* Prefix equality, not merely length: a history that swapped one record for  *)
+(* another at the same length would still be a rewritten history, and a       *)
+(* length check would wave it through.                                        *)
+IsPrefixOf(p, s) ==
+    /\ Len(p) <= Len(s)
+    /\ \A k \in 1 .. Len(p) : s[k] = p[k]
+
 (* The journal only grows. Nothing rewrites history. *)
-JournalIsAppendOnly == [][Len(journal') >= Len(journal)]_vars
+JournalIsAppendOnly == [][IsPrefixOf(journal, journal')]_vars
 
 (* Once performed, an effect stays performed — `world` is a record of what
    happened, not a mutable set. *)
-WorldIsAppendOnly == [][Len(world') >= Len(world)]_vars
+WorldIsAppendOnly == [][IsPrefixOf(world, world')]_vars
 
 (* With crashes bounded, the run reaches a terminal state. It may legitimately *)
 (* be `quarantined` — refusing to guess is a correct outcome, not a hang.      *)

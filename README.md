@@ -55,12 +55,15 @@ cargo run --example hello_skill        # one skill, one run, one replay — star
 cargo run --example durable_pipeline   # crash, resume, divergence
 cargo run --example clearing_case      # correlation, obligations, human tasks
 cargo run --example plan_graph         # multi-step plans, contract, provenance
-cargo run --example governed_transfer  # field provenance, protected arguments
+cargo run --example governed_transfer --features manifest
+                                        # field provenance, protected arguments
 cargo run --example saga_checkout      # reverse compensation, replay-safe unwind
 cargo run --example effect_group       # calls that take together, or not at all
 cargo run --example memory_run         # private/team memory, provenance, recall
 cargo run --example bedrock_live --features bedrock
                                         # env-gated Amazon Bedrock Converse call
+cargo run --example openai_live --features providers
+                                        # env-gated OpenAI Responses call
 cargo run --example tool_loop --features redb,testkit,manifest
                                         # a model choosing tools, and four refusals
 cargo run --example planned_run --features redb,testkit,manifest
@@ -302,8 +305,8 @@ not types.
 
 `MUTANTS_SHARD=k/n` takes a round-robin slice — round-robin because the table
 groups mutations by subject, so a contiguous split would hand one shard every
-expensive target. Each line carries `[142/379]`, and each shard needs its own
-checkout: the sweep rewrites source in place.
+expensive target. Each line carries a `[current/total]` progress counter, and
+each shard needs its own checkout: the sweep rewrites source in place.
 
 ## 🚫 Non-goals
 

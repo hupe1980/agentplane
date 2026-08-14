@@ -68,6 +68,16 @@ pub trait TaskStore: Send + Sync + Debug {
     /// hides it. It also keeps queue state — who is reviewing what — from
     /// anybody not eligible for that queue.
     ///
+    /// **A same-holder re-claim is idempotent success.** A claim by the actor
+    /// who already holds the task returns the task, not
+    /// `AlreadyClaimed { holder: yourself }`. A claim's acknowledgement can be
+    /// lost — a dropped response, a crashed client that retries on restart —
+    /// and the retry must converge on "you hold it" rather than bounce off its
+    /// own success; an error naming the caller as the obstacle is one every
+    /// client would have to special-case back into an `Ok`. The exclusivity
+    /// the verb exists for is untouched: a task held by anybody *else* is
+    /// still refused with [`ClaimError::AlreadyClaimed`].
+    ///
     /// # Errors
     ///
     /// [`ClaimError`], per the order above.

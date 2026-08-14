@@ -250,7 +250,7 @@ async fn an_untrusted_input_may_not_choose_the_subject() {
     let p = plane(&manifest, json!({ "deadline_status": "OK" }));
 
     let untrusted = Tainted::object([(
-        "malo".to_owned(),
+        "malo",
         Tainted::from_source(
             json!("DE-9999"),
             agentplane::core::SourceId::new("inbound:edifact"),

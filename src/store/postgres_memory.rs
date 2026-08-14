@@ -43,15 +43,28 @@ CREATE INDEX IF NOT EXISTS memory_by_subject
     ON memory_items (tenant, subject, purpose, trust_rank, created_at DESC, id)
     WHERE current;
 
+-- Derivation edges, **per version on both ends**. Supersession does not
+-- un-absorb anything: a summary re-derived from other sources still contains
+-- what its superseded version read, and that version stays readable through
+-- version(). Id-level edges were replaced on every revision, so a cascade from
+-- the original source no longer found the superseded summary that had absorbed
+-- it. Per-version edges make the traversal see the union of what was ever
+-- derived, and let it erase exactly the superseded versions that named a
+-- doomed source while sparing a current version that did not.
 CREATE TABLE IF NOT EXISTS memory_derived (
-    tenant     TEXT NOT NULL,
-    source_id  TEXT NOT NULL,
-    derived_id TEXT NOT NULL,
-    PRIMARY KEY (tenant, source_id, derived_id)
+    tenant          TEXT   NOT NULL,
+    source_id       TEXT   NOT NULL,
+    source_version  BIGINT NOT NULL,
+    derived_id      TEXT   NOT NULL,
+    derived_version BIGINT NOT NULL,
+    PRIMARY KEY (tenant, source_id, source_version, derived_id, derived_version)
 );
 
+-- The reverse lookup erasure needs: finding the edges pointing at a memory
+-- without scanning the tenant's whole edge table inside the erasure
+-- transaction.
 CREATE INDEX IF NOT EXISTS memory_derived_by_target
-    ON memory_derived (tenant, derived_id, source_id);
+    ON memory_derived (tenant, derived_id, derived_version);
 
 CREATE TABLE IF NOT EXISTS memory_forgotten (
     tenant TEXT NOT NULL,
@@ -308,17 +321,24 @@ impl MemoryStore for PostgresStore {
             }
         }
 
-        tx.execute(
-            "DELETE FROM memory_derived WHERE tenant = $1 AND derived_id = $2",
-            &[&tenant, &stored.id],
-        )
-        .await
-        .map_err(|error| be(&error))?;
+        // One edge per source, keyed by this version on the derived end and
+        // the exact version read on the source end. Earlier versions' edges
+        // deliberately stay: a superseded summary still contains what it
+        // absorbed and remains readable through version(), so its lineage must
+        // stay traversable for as long as the version itself exists. Erasure —
+        // not supersession — is what removes edges.
         for source in &stored.derived_from {
             tx.execute(
-                "INSERT INTO memory_derived (tenant, source_id, derived_id)
-                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                &[&tenant, &source.id, &stored.id],
+                "INSERT INTO memory_derived
+                    (tenant, source_id, source_version, derived_id, derived_version)
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+                &[
+                    &tenant,
+                    &source.id,
+                    &version_i64(source.version)?,
+                    &stored.id,
+                    &version_i64(version)?,
+                ],
             )
             .await
             .map_err(|error| be(&error))?;
@@ -383,6 +403,27 @@ impl MemoryStore for PostgresStore {
             .transpose()
     }
 
+    async fn subject_ids(&self, subject: &str) -> Result<Vec<String>, StoreError> {
+        let client = self.pool_ref().get().await.map_err(|error| {
+            StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
+        })?;
+        let tenant = self.tenant_name();
+        // No LIMIT, deliberately: this is the erasure path's enumeration, and
+        // a page size here would be a page size on how much of a subject an
+        // erasure reaches. The recall limit's BIGINT ceiling does not apply
+        // because there is no limit to convert.
+        let rows = client
+            .query(
+                "SELECT DISTINCT id FROM memory_items
+                 WHERE tenant = $1 AND subject = $2 AND current
+                 ORDER BY id",
+                &[&tenant, &subject],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        Ok(rows.iter().map(|row| row.get("id")).collect())
+    }
+
     async fn forget(&self, id: &str) -> Result<(), StoreError> {
         let mut client = self.pool_ref().get().await.map_err(|error| {
             StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
@@ -429,6 +470,15 @@ impl MemoryStore for PostgresStore {
             )
             .await
             .map_err(|error| be(&error))?;
+        // The sliding-retention row goes with the memory it describes. Left
+        // behind it is residue about an erased id; every erasure path removes
+        // it, where this backend used to leave it to the expiry sweep alone.
+        tx.execute(
+            "DELETE FROM memory_access_expiry WHERE tenant = $1 AND id = $2",
+            &[&tenant, &id],
+        )
+        .await
+        .map_err(|error| be(&error))?;
         if removed > 0 {
             tx.execute(
                 "INSERT INTO memory_forgotten (tenant, id) VALUES ($1, $2)
@@ -441,6 +491,7 @@ impl MemoryStore for PostgresStore {
         tx.commit().await.map_err(|error| be(&error))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn forget_cascading(&self, id: &str) -> Result<usize, StoreError> {
         let mut client = self.pool_ref().get().await.map_err(|error| {
             StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
@@ -464,34 +515,92 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|error| be(&error))?;
 
-        // Every edge target is enqueued, **including tombstoned ones**.
-        // `forget` deliberately keeps a forgotten memory's outgoing edges so
-        // that a correction which later becomes an erasure request can still
-        // find what was derived — and a traversal that joined on a current
-        // item row skipped exactly the node it needed to pass through: A → B →
-        // C with B individually erased left C standing after a cascade from A.
-        // Both backends had the identical filter, which is what a contract
-        // written from one misreading looks like; the battery now walks a
-        // cascade through a tombstone. A tombstoned node has nothing to
-        // remove, but its descendants do.
-        let mut queue = vec![id.to_owned()];
+        // The traversal is **version-granular**. Edges are kept per derivative
+        // version, and a doomed source propagates to exactly the derivative
+        // versions that read it:
+        //
+        //   * a derivative whose *current* version absorbed a doomed node is
+        //     doomed as a whole id — its content is believed now, so the id,
+        //     every version, and everything derived onward all go;
+        //   * a derivative whose only absorbing versions are **superseded**
+        //     loses those versions and keeps its current one — a summary
+        //     honestly re-derived from clean sources is not destroyed by its
+        //     own history, but the history that named the doomed source stops
+        //     being readable through version().
+        //
+        // Every edge target is enqueued, **including tombstoned ones**:
+        // `forget` deliberately keeps a forgotten memory's edges so a cascade
+        // from further upstream can route through the tombstone. A tombstoned
+        // node has nothing to remove, but its descendants do.
+        let mut id_queue = vec![id.to_owned()];
+        let mut version_queue: Vec<(String, i64)> = Vec::new();
         let mut doomed = std::collections::BTreeSet::new();
-        while let Some(source) = queue.pop() {
-            if !doomed.insert(source.clone()) {
-                continue;
+        let mut doomed_versions: std::collections::BTreeSet<(String, i64)> =
+            std::collections::BTreeSet::new();
+        loop {
+            if let Some(source) = id_queue.pop() {
+                if !doomed.insert(source.clone()) {
+                    continue;
+                }
+                // Every outgoing edge, from every version of a fully doomed
+                // id.
+                let rows = tx
+                    .query(
+                        "SELECT derived_id, derived_version FROM memory_derived
+                         WHERE tenant = $1 AND source_id = $2",
+                        &[&tenant, &source],
+                    )
+                    .await
+                    .map_err(|error| be(&error))?;
+                version_queue.extend(
+                    rows.iter()
+                        .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1))),
+                );
+            } else if let Some((derived_id, derived_version)) = version_queue.pop() {
+                if doomed.contains(&derived_id) {
+                    continue;
+                }
+                let current_version: Option<i64> = tx
+                    .query_opt(
+                        "SELECT version FROM memory_items
+                         WHERE tenant = $1 AND id = $2 AND current",
+                        &[&tenant, &derived_id],
+                    )
+                    .await
+                    .map_err(|error| be(&error))?
+                    .map(|row| row.get(0));
+                if current_version == Some(derived_version) {
+                    id_queue.push(derived_id);
+                } else {
+                    if !doomed_versions.insert((derived_id.clone(), derived_version)) {
+                        continue;
+                    }
+                    // Only this version's own onward lineage: what a
+                    // superseded summary was itself read into.
+                    let rows = tx
+                        .query(
+                            "SELECT derived_id, derived_version FROM memory_derived
+                             WHERE tenant = $1 AND source_id = $2 AND source_version = $3",
+                            &[&tenant, &derived_id, &derived_version],
+                        )
+                        .await
+                        .map_err(|error| be(&error))?;
+                    version_queue.extend(
+                        rows.iter()
+                            .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1))),
+                    );
+                }
+            } else {
+                break;
             }
-            let rows = tx
-                .query(
-                    "SELECT derived_id FROM memory_derived
-                     WHERE tenant = $1 AND source_id = $2",
-                    &[&tenant, &source],
-                )
-                .await
-                .map_err(|error| be(&error))?;
-            queue.extend(rows.iter().map(|row| row.get::<_, String>("derived_id")));
         }
 
-        for memory_id in &doomed {
+        // A hold blocks every erasure path, version-level included: an id
+        // under hold must not lose even a superseded version.
+        let held_candidates = doomed
+            .iter()
+            .chain(doomed_versions.iter().map(|(memory_id, _)| memory_id));
+        for memory_id in held_candidates {
             if tx
                 .query_opt(
                     "SELECT 1 FROM memory_legal_holds WHERE tenant = $1 AND id = $2",
@@ -529,6 +638,14 @@ impl MemoryStore for PostgresStore {
             if rows > 0 {
                 erased += 1;
             }
+            // Sliding-retention residue goes with the id — every erasure path
+            // removes it.
+            tx.execute(
+                "DELETE FROM memory_access_expiry WHERE tenant = $1 AND id = $2",
+                &[&tenant, memory_id],
+            )
+            .await
+            .map_err(|error| be(&error))?;
             tx.execute(
                 "INSERT INTO memory_forgotten (tenant, id) VALUES ($1, $2)
                  ON CONFLICT DO NOTHING",
@@ -537,6 +654,38 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|error| be(&error))?;
         }
+
+        // Superseded versions that absorbed a doomed source, on ids that stay
+        // alive. Only the version row goes: the id keeps its current entry and
+        // — no tombstone — its future. `AND NOT current` is belt on top of the
+        // traversal's own check; the graph lock makes the two agree.
+        let mut partly: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (memory_id, version) in &doomed_versions {
+            if doomed.contains(memory_id) {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM memory_derived
+                 WHERE tenant = $1
+                   AND ((source_id = $2 AND source_version = $3)
+                     OR (derived_id = $2 AND derived_version = $3))",
+                &[&tenant, memory_id, version],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+            let rows = tx
+                .execute(
+                    "DELETE FROM memory_items
+                     WHERE tenant = $1 AND id = $2 AND version = $3 AND NOT current",
+                    &[&tenant, memory_id, version],
+                )
+                .await
+                .map_err(|error| be(&error))?;
+            if rows > 0 {
+                partly.insert(memory_id.as_str());
+            }
+        }
+        erased += partly.len();
 
         tx.commit().await.map_err(|error| be(&error))?;
         Ok(erased)
@@ -588,8 +737,20 @@ impl MemoryStore for PostgresStore {
             }
         }
         for id in &ids {
+            // Incoming edges only, through the by-target index: a derivative
+            // must stay in its source's subject, so every source of this id is
+            // in this same erasure and the edge is intra-subject cleanup, not
+            // lineage a later cascade could still need.
             tx.execute(
                 "DELETE FROM memory_derived WHERE tenant = $1 AND derived_id = $2",
+                &[&tenant, id],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+            // Sliding-retention residue goes with the id — every erasure path
+            // removes it.
+            tx.execute(
+                "DELETE FROM memory_access_expiry WHERE tenant = $1 AND id = $2",
                 &[&tenant, id],
             )
             .await
@@ -797,15 +958,24 @@ impl MemoryStore for PostgresStore {
             StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
         })?;
         let tenant = self.tenant_name();
+        // Edges are per-version, so only an edge written by the *current*
+        // version of the derivative counts here: a summary re-derived from
+        // other sources is no longer a live derivative of this one, even
+        // though its superseded versions keep their lineage for erasure.
+        // EXISTS rather than JOIN because one current version may hold several
+        // edges to different versions of the same source, and a join would
+        // return it once per edge.
         let rows = client
             .query(
                 "SELECT item.item
-                 FROM memory_derived edge
-                 JOIN memory_items item
-                   ON item.tenant = edge.tenant
-                  AND item.id = edge.derived_id
-                  AND item.current
-                 WHERE edge.tenant = $1 AND edge.source_id = $2
+                 FROM memory_items item
+                 WHERE item.tenant = $1 AND item.current
+                   AND EXISTS (
+                       SELECT 1 FROM memory_derived edge
+                       WHERE edge.tenant = item.tenant
+                         AND edge.source_id = $2
+                         AND edge.derived_id = item.id
+                         AND edge.derived_version = item.version)
                  ORDER BY item.created_at DESC, item.id ASC",
                 &[&tenant, &id],
             )

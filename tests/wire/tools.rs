@@ -585,9 +585,9 @@ impl Skill for SendsStructured {
     ) -> Result<Outcome, SkillError> {
         let recipient = Tainted::with_label(json!("treasury"), self.recipient_label.clone());
         let arguments = Tainted::object([
-            ("recipient".to_owned(), recipient),
+            ("recipient", recipient),
             (
-                "memo".to_owned(),
+                "memo",
                 Tainted::from_source(
                     json!("untrusted descriptive text is allowed here"),
                     SourceId::new("model.complete"),
@@ -816,8 +816,8 @@ impl Skill for LooksUpThenPays {
         // judges exactly that.
         let recipient = Tainted::with_label(json!("AC-1"), looked_up.label().clone());
         let arguments = Tainted::object([
-            ("recipient".to_owned(), recipient),
-            ("amount".to_owned(), Tainted::trusted(json!(10))),
+            ("recipient", recipient),
+            ("amount", Tainted::trusted(json!(10))),
         ]);
         let call = ToolCall::prepare(
             &self.catalog,

@@ -202,12 +202,37 @@ impl BlobStore for EncryptedBlobs {
         Ok(plain)
     }
 
-    async fn put_at(&self, digest: Digest, bytes: &[u8]) -> Result<(), BlobError> {
-        self.inner.put_at(digest, bytes).await
+    async fn put_at(&self, digest: Digest, _bytes: &[u8]) -> Result<(), BlobError> {
+        // Refused, not forwarded. `put_at`/`get_raw` are the envelope-layer
+        // pair the *sealing* store uses against its inner store; exposed
+        // through the decorator itself they were an unsealed side door — a
+        // skill calling `put_at` on a deployment that asked for sealing stored
+        // plaintext under a scope whose erasure could never reach it, and the
+        // mistake only surfaced when an erasure came back incomplete. The
+        // sealing write path still works: `put` above calls `put_at` on the
+        // **inner** store this decorator holds, which is a different object.
+        // What the refusal does not cover: a caller handed the inner store
+        // directly is outside this decorator's reach — sealing is only as
+        // whole as the wiring that routes every writer through it.
+        Err(BlobError::Backend(format!(
+            "put_at({}) refused: this blob store seals under scope '{}', and put_at would \
+             store the bytes unsealed — use put, which seals and preserves the plaintext \
+             address",
+            digest.to_hex(),
+            self.scope
+        )))
     }
 
     async fn get_raw(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {
-        self.inner.get_raw(digest).await
+        // Symmetric with `put_at`: raw reads through the sealed handle would
+        // hand out envelopes nobody can verify, and their only legitimate
+        // reader is this decorator's own `get`.
+        Err(BlobError::Backend(format!(
+            "get_raw({}) refused: this blob store seals under scope '{}', and raw envelope \
+             bytes are not a payload — use get, which opens and verifies",
+            digest.to_hex(),
+            self.scope
+        )))
     }
 
     async fn expire(&self, digest: Digest, at: Timestamp, reason: &str) -> Result<(), BlobError> {
@@ -216,5 +241,51 @@ impl BlobStore for EncryptedBlobs {
 
     async fn has(&self, digest: Digest) -> Result<bool, BlobError> {
         self.inner.has(digest).await
+    }
+}
+
+#[cfg(all(test, feature = "testkit"))]
+mod refusal_tests {
+    use super::*;
+    use crate::blob::MemoryBlobs;
+    use crate::testkit::MemoryKeyRing;
+    use std::sync::Arc;
+
+    /// The sealed handle refuses the raw pair; the sealing pair still works.
+    ///
+    /// `put_at`/`get_raw` forwarded straight to the inner store, so a skill
+    /// holding "the blob store" of a deployment that configured sealing could
+    /// write plaintext with one call — under a scope whose erasure would then
+    /// never reach it. The refusal is the enforcement; the `put`/`get`
+    /// round-trip beside it is the proof the door that *should* be open still
+    /// is.
+    #[tokio::test]
+    async fn the_sealed_handle_refuses_unsealed_io() {
+        let store = EncryptedBlobs::new(
+            Arc::new(MemoryBlobs::new()),
+            Arc::new(MemoryKeyRing::new()),
+            "acme/case-1",
+        );
+        let digest = store.put(b"the payload").await.expect("sealed put");
+        assert_eq!(
+            store.get(digest).await.expect("sealed get"),
+            b"the payload",
+            "the sealing pair must keep working"
+        );
+
+        let refused = store
+            .put_at(digest, b"plaintext through the side door")
+            .await
+            .expect_err("put_at on a sealed handle stored plaintext");
+        assert!(
+            refused.to_string().contains("unsealed"),
+            "the refusal must say why: {refused}"
+        );
+        assert!(
+            store.get_raw(digest).await.is_err(),
+            "get_raw on a sealed handle handed out raw envelopes"
+        );
+        // The refusal changed nothing: the sealed payload still opens.
+        assert_eq!(store.get(digest).await.expect("still sealed"), b"the payload");
     }
 }

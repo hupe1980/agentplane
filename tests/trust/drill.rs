@@ -232,3 +232,75 @@ async fn missing_stores_are_unchecked_not_passed() {
         wired.not_checked
     );
 }
+
+/// **A key ring in hand and nothing sealed is named, not silently passed.**
+///
+/// Two planes produce a drill in which zero states open and zero were
+/// erased: one that keeps case state plaintext by design, and one whose
+/// operator wired the ring and forgot to wrap the case store in
+/// `SealedCases` — the misconfiguration in which every "sealed" case is
+/// silently plaintext and erasure-by-key-destruction reaches nothing. The
+/// stores the drill holds cannot tell them apart, so the report must say the
+/// coverage was not established — as unchecked, not as a finding, because a
+/// finding would page every plaintext-by-design plane on every drill.
+#[tokio::test]
+async fn a_ring_with_nothing_sealed_is_unestablished_coverage() {
+    // A case store deliberately not wrapped in SealedCases: state lands
+    // plaintext, exactly what forgotten wiring produces.
+    let redb = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let cases = redb as Arc<dyn CaseStore>;
+    let case = cases
+        .correlate_or_open("matter", &[CorrelationKey::new("doc", "PLAIN-1")], ts(1_000))
+        .await
+        .expect("open")
+        .case_id();
+    cases
+        .put_state(case, CaseVersion::INITIAL, json!({ "about": "plaintext" }))
+        .await
+        .expect("state");
+    let keys = Arc::new(MemoryKeyRing::new()) as Arc<dyn KeyRing>;
+
+    let report = drill(&Stores {
+        cases: &cases,
+        blobs: None,
+        keys: Some(&keys),
+    })
+    .await
+    .expect("drill");
+
+    assert!(
+        report.is_sound(),
+        "ambiguous coverage is not loss, and must not page anyone: {:#?}",
+        report.findings
+    );
+    assert!(
+        report
+            .not_checked
+            .iter()
+            .any(|n| n.contains("sealed-state coverage")),
+        "a ring that opened nothing went unremarked — 'sealing was never \
+         wired' and 'nothing is sealed by design' collapsed into silence: {:#?}",
+        report.not_checked
+    );
+
+    // The positive half: a plane whose sealed state actually opened carries
+    // no such entry — coverage was established, one opened state at a time.
+    let f = fixture();
+    matter(&f, "SEALED-9", b"the artifact").await;
+    let covered = drill(&Stores {
+        cases: &f.cases,
+        blobs: Some(&f.blobs),
+        keys: Some(&f.keys),
+    })
+    .await
+    .expect("drill");
+    assert!(covered.sealed_open > 0, "the fixture sealed nothing");
+    assert!(
+        !covered
+            .not_checked
+            .iter()
+            .any(|n| n.contains("sealed-state coverage")),
+        "established coverage was reported as unestablished: {:#?}",
+        covered.not_checked
+    );
+}

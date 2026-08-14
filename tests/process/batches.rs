@@ -523,6 +523,132 @@ async fn reserving_twice_returns_the_original_run() {
     );
 }
 
+/// An exhausted item is a pause, not a failure — and not the batch's end.
+///
+/// The item's run hit its effect ceiling with its work intact. Filing that
+/// under `failed` taught operators to re-run items whose work was standing;
+/// closing the batch over it would report every meter settled while one is
+/// merely waiting for a bigger budget. So: the census counts it as
+/// `exhausted`, nothing counts it as `failed`, the cursor holds behind it,
+/// and the batch stays `Running`. The positive half re-runs the batch under a
+/// raised ceiling: the same reservation resumes the same run — no duplicate
+/// settlement — and the item completes, which proves the exhausted outcome
+/// was the resumable pause it claims to be.
+#[tokio::test]
+async fn an_exhausted_item_is_a_held_pause_not_a_failure() {
+    use agentplane::core::Budget;
+
+    /// The item's second step: one more settlement, so a one-step ceiling
+    /// pauses the item halfway with real work already landed.
+    #[derive(Debug)]
+    struct Finishes {
+        world: World,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Finishes {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("finish").provides("finish")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            cx.effect(Settle {
+                meter: "final".into(),
+                world: Arc::clone(&self.world),
+            })
+            .await?;
+            Ok(Outcome::done(Tainted::trusted(json!({ "finished": true }))))
+        }
+    }
+
+    fn two_step_plan() -> PlanIR {
+        PlanIR::new(vec![
+            PlanNode::new(0, "settle").arg("input", ArgSource::run_input()),
+            PlanNode::new(1, "finish")
+                .arg("x", ArgSource::node(agentplane::core::StepId(0)))
+                .terminal(),
+        ])
+    }
+
+    fn capped(db: &Arc<RedbStore>, world: &World, steps: usize) -> Arc<Runtime> {
+        Runtime::builder(Arc::clone(db) as Arc<dyn JournalStore>)
+            .owner("batch")
+            .batches(Arc::clone(db) as Arc<dyn BatchStore>)
+            .budget(Budget::default().steps(steps))
+            .skill(Settler {
+                world: Arc::clone(world),
+                fails: vec![],
+            })
+            .skill(Finishes {
+                world: Arc::clone(world),
+            })
+            .build()
+    }
+
+    let store = db();
+    let world: World = Arc::default();
+    let id = BatchId::generate();
+
+    // One step allowed, two needed: the item pauses at the ceiling.
+    let report = capped(&store, &world, 1)
+        .run_batch(id, &BatchSpec::new(two_step_plan(), Arc::new(Keys::upto(1))))
+        .await
+        .unwrap();
+
+    let census = store.census(id).await.unwrap();
+    assert_eq!(
+        census.exhausted, 1,
+        "the pause must be reported as what it is"
+    );
+    assert_eq!(
+        census.failed, 0,
+        "an exhausted item filed under failed sends someone to re-run work \
+         that is standing"
+    );
+    assert_eq!(census.terminal(), 0, "a pause is not a settlement");
+    assert_eq!(
+        report.status,
+        BatchStatus::Running,
+        "the batch is not finished while an item waits at a ceiling"
+    );
+    assert_eq!(
+        report.cursor, None,
+        "the cursor holds behind the paused item, or a resume steps over it"
+    );
+    assert_eq!(
+        *world.lock().unwrap(),
+        vec!["item-001"],
+        "the first settlement stands — exhaustion pauses, it does not unwind"
+    );
+
+    // The ceiling is raised: the same batch resumes the same run and the item
+    // completes without re-settling what already landed.
+    let after: World = Arc::default();
+    let done = capped(&store, &after, 10)
+        .run_batch(id, &BatchSpec::new(two_step_plan(), Arc::new(Keys::upto(1))))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        done.status,
+        BatchStatus::Completed {
+            succeeded: 1,
+            failed: 0,
+            quarantined: 0
+        },
+        "under a raised ceiling the pause resumes to completion"
+    );
+    assert_eq!(
+        *after.lock().unwrap(),
+        vec!["final"],
+        "the resume performs only the step the ceiling refused — the landed \
+         settlement is replayed, not re-settled"
+    );
+}
+
 /// Unused import guard: `StoreError` is part of the store contract surface.
 #[allow(dead_code)]
 fn _store_error_is_in_scope(_: StoreError) {}

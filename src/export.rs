@@ -110,7 +110,17 @@ pub struct ExportedRecord<'r> {
     /// The typed view, for a reader's eyes. Verification never touches it —
     /// see `raw` — and the verifier holds the two to each other so this cannot
     /// quietly say something the hashed bytes do not.
-    pub body: &'r crate::journal::RecordBody,
+    ///
+    /// **Parsed from `raw`, never taken from the store's in-memory record.**
+    /// A sealed journal hands reads back *opened* — that is its job for the
+    /// runtime, whose own steps must read what they wrote — so an export that
+    /// copied the record's `body` field would write every sealed payload's
+    /// plaintext into a file, and destroying the key would no longer reach the
+    /// copy somebody exported last month. Deriving the display copy from the
+    /// hashed bytes makes body-matches-wire true by construction and keeps
+    /// sealed payloads sealed, which is the same rule the case layer's export
+    /// read states in prose.
+    pub body: crate::journal::RecordBody,
     pub prev_hash: &'r crate::core::Digest,
     pub hash: &'r crate::core::Digest,
     /// Present only where the plane was configured to sign. `None` is an
@@ -128,16 +138,26 @@ pub struct ExportedRecord<'r> {
     pub raw: std::borrow::Cow<'r, str>,
 }
 
-impl<'r> From<&'r crate::journal::Record> for ExportedRecord<'r> {
-    fn from(r: &'r crate::journal::Record) -> Self {
-        Self {
+impl<'r> ExportedRecord<'r> {
+    /// Build an export line from a stored record, deriving the display copy
+    /// from the wire bytes.
+    ///
+    /// Fallible on purpose, with no fallback to the record's opened `body`: a
+    /// record whose hashed bytes do not parse is corrupt, and substituting the
+    /// in-memory view would export exactly the plaintext this constructor
+    /// exists to keep out of the file — a silent fallback on the one value two
+    /// mechanisms must agree about.
+    fn from_stored(r: &'r crate::journal::Record) -> Result<Self, String> {
+        let body = serde_json::from_slice::<crate::journal::RecordBody>(r.raw())
+            .map_err(|e| format!("record {}'s wire bytes do not parse: {e}", r.seq()))?;
+        Ok(Self {
             seq: r.seq(),
-            body: &r.body,
+            body,
             prev_hash: &r.prev_hash,
             hash: &r.hash,
             attestation: r.attestation.as_ref(),
             raw: String::from_utf8_lossy(r.raw()),
-        }
+        })
     }
 }
 
@@ -297,12 +317,38 @@ pub async fn to_jsonl<W: std::io::Write>(
         )?;
 
         match store.read(run, 1).await {
+            // A run the store holds nothing for is filed as unreadable, not
+            // exported as an empty block. Both backends answer an unknown run
+            // with an empty read rather than an error, so without this arm a
+            // mistyped run id produced a block with no records under it — a
+            // shape the verifier must otherwise treat as records removed after
+            // the fact. Naming it here keeps the trailer's accounting honest:
+            // an empty block in a file whose trailer does not declare the run
+            // unreadable is tampering, and only because no honest writer
+            // produces one.
+            Ok(found) if found.is_empty() => unreadable.push(Unreadable {
+                run,
+                reason: "the store holds no records for this run".to_owned(),
+            }),
             Ok(found) => {
-                for record in &found {
-                    writeln!(out, "{}", to_line(&ExportedRecord::from(record))?)?;
-                    records += 1;
+                // Every line is derived from its wire bytes before any is
+                // written, so a record that cannot be derived files the whole
+                // run as unreadable instead of leaving a half-written block
+                // shaped like a complete one.
+                match found
+                    .iter()
+                    .map(ExportedRecord::from_stored)
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(lines) => {
+                        for line in &lines {
+                            writeln!(out, "{}", to_line(line)?)?;
+                            records += 1;
+                        }
+                        exported += 1;
+                    }
+                    Err(reason) => unreadable.push(Unreadable { run, reason }),
                 }
-                exported += 1;
             }
             Err(e) => unreadable.push(Unreadable {
                 run,
@@ -360,9 +406,12 @@ pub async fn to_jsonl<W: std::io::Write>(
     Ok(trailer)
 }
 
-/// How many cases one enumeration page holds. Interior to the export: the
-/// stream out is unbounded either way, and the page only bounds memory.
-const CASE_PAGE: usize = 256;
+/// How many cases one enumeration page holds — shared with the live drill
+/// ([`crate::drill`]), which walks the same case layer with the same paging.
+/// Interior to the crate either way: the stream out is unbounded, and the
+/// page only bounds memory. One constant, because two walks that paged
+/// differently would be two subtly different definitions of "every case".
+pub(crate) const CASE_PAGE: usize = 256;
 
 /// One value as one line, refusing to write a line that is not valid JSON.
 fn to_line<T: serde::Serialize>(value: &T) -> Result<String, std::io::Error> {
@@ -437,6 +486,12 @@ impl VerifyReport {
 ///   and only the tree notices.
 /// * **The file is framed.** A missing trailer means the export was cut short,
 ///   and every line before the cut is still perfectly valid.
+/// * **The trailer's own accounting holds.** Its run and record counts are
+///   compared against what was actually read, and a run it declares unreadable
+///   is reported as *unchecked* rather than as tampering — the writer said at
+///   export time that the run's records are not here, which is the opposite of
+///   hiding it. An empty run block the trailer does **not** declare unreadable
+///   is the tamper case: no honest writer produces one.
 ///
 /// Signatures are checked when a verifier is supplied and reported as unchecked
 /// when not.
@@ -449,7 +504,7 @@ pub fn verify<R: std::io::BufRead>(
     input: R,
     verifier: Option<&dyn crate::core::Verifier>,
 ) -> Result<VerifyReport, std::io::Error> {
-    use crate::core::{Digest, merkle};
+    use crate::core::Digest;
     use serde_json::Value;
 
     let mut report = VerifyReport {
@@ -478,6 +533,17 @@ pub fn verify<R: std::io::BufRead>(
     // order rather than in the order the export happened to walk.
     let mut leaves: Vec<(u64, Digest)> = Vec::new();
     let mut pass: Option<RunPass> = None;
+    // The reader's own tally, held against the trailer's at the end: every run
+    // block seen, every block that carried at least one record, and every block
+    // that carried none. The trailer adjudicates the empty ones — an export
+    // that declared the run unreadable was honest about it, and one that did
+    // not has had records removed — which is why they are collected rather
+    // than judged on the spot: the trailer is the last line, and an
+    // intermediate block closes before it is read.
+    let mut run_blocks = 0usize;
+    let mut read_runs = 0usize;
+    let mut empty_blocks: Vec<RunId> = Vec::new();
+    let mut claims = TrailerClaims::default();
     // The two halves of the case cross-check: what the records name, and what
     // the case layer carries. Settled at the end, because either side can
     // arrive first in the file.
@@ -507,31 +573,17 @@ pub fn verify<R: std::io::BufRead>(
                 read_case_block(&value, &mut report, &mut carried, &mut blob_digests);
             }
             Some("agentplane.export.run") => {
-                finish_run(&mut report, pass.take(), verifier);
-                pass = value
-                    .get("run")
-                    .and_then(Value::as_str)
-                    .and_then(|s| RunId::parse(s).ok())
-                    .map(|run| RunPass {
-                        run,
-                        declared_seal: value
-                            .get("seal")
-                            .and_then(|s| serde_json::from_value::<Digest>(s.clone()).ok()),
-                        prev: Digest::ZERO,
-                        last_seq: 0,
-                        resealed: Vec::new(),
-                        clean: true,
-                    });
-                if let Some(pass) = &pass
-                    && let (Some(index), Some(seal)) = (
-                        value.get("index").and_then(Value::as_u64),
-                        pass.declared_seal,
-                    )
-                {
-                    leaves.push((index, merkle::leaf_hash(&seal)));
-                }
+                run_blocks += 1;
+                finish_run(
+                    &mut report,
+                    pass.take(),
+                    verifier,
+                    &mut read_runs,
+                    &mut empty_blocks,
+                );
+                pass = open_run_block(&value, &mut leaves);
             }
-            Some("agentplane.export.end") => read_trailer(&value, &mut report),
+            Some("agentplane.export.end") => read_trailer(&value, &mut report, &mut claims),
             _ => {
                 report.records += 1;
                 let Some(pass) = pass.as_mut() else {
@@ -546,20 +598,45 @@ pub fn verify<R: std::io::BufRead>(
             }
         }
     }
-    finish_run(&mut report, pass, verifier);
+    finish_run(
+        &mut report,
+        pass,
+        verifier,
+        &mut read_runs,
+        &mut empty_blocks,
+    );
 
     settle(&mut report, header_seen, leaves);
+    settle_trailer(&mut report, &claims, run_blocks, read_runs, &empty_blocks);
     settle_cases(&mut report, &stamped, &carried, blob_digests);
     Ok(report)
 }
 
-/// Read the trailer: the file is complete, and its own counts hold.
+/// What the trailer claims about the file, held for the settlement.
 ///
-/// The count comparison is what catches the case layer stripped *whole*: with
-/// every block gone the coverage cross-check has nothing to compare, and the
-/// file would read as an export of a plane that simply had no cases — while
-/// its trailer still says otherwise.
-fn read_trailer(value: &serde_json::Value, report: &mut VerifyReport) {
+/// Collected rather than compared on the spot, for two reasons that are the
+/// same reason: the trailer is the last line, so the totals it must be held
+/// against only exist once the whole file has been read — and the per-run
+/// verdicts it adjudicates (is an empty block an honestly-declared unreadable
+/// run, or records removed after the fact?) close *before* it is read, because
+/// each run block is finished when the next one starts.
+#[derive(Default)]
+struct TrailerClaims {
+    runs_requested: Option<u64>,
+    runs_exported: Option<u64>,
+    records: Option<u64>,
+    /// Runs the export itself declared unreadable, with the writer's reason.
+    unreadable: Vec<(RunId, String)>,
+}
+
+/// Read the trailer: the file is complete, and its case count holds.
+///
+/// The case-count comparison is what catches the case layer stripped *whole*:
+/// with every block gone the coverage cross-check has nothing to compare, and
+/// the file would read as an export of a plane that simply had no cases —
+/// while its trailer still says otherwise. The run and record counts are
+/// collected here and compared in [`settle_trailer`], where the totals exist.
+fn read_trailer(value: &serde_json::Value, report: &mut VerifyReport, claims: &mut TrailerClaims) {
     report.complete = true;
     if let Some(declared) = value.get("cases").and_then(serde_json::Value::as_u64)
         && declared != report.cases as u64
@@ -569,6 +646,112 @@ fn read_trailer(value: &serde_json::Value, report: &mut VerifyReport) {
              carries {} — the case layer was cut after the export was taken",
             report.cases
         ));
+    }
+    claims.runs_requested = value.get("runs_requested").and_then(serde_json::Value::as_u64);
+    claims.runs_exported = value.get("runs_exported").and_then(serde_json::Value::as_u64);
+    claims.records = value.get("records").and_then(serde_json::Value::as_u64);
+    if let Some(list) = value.get("unreadable").and_then(serde_json::Value::as_array) {
+        for entry in list {
+            let Some(run) = entry
+                .get("run")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| RunId::parse(s).ok())
+            else {
+                continue;
+            };
+            let reason = entry
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no reason recorded")
+                .to_owned();
+            claims.unreadable.push((run, reason));
+        }
+    }
+}
+
+/// Hold the trailer's own accounting to what was actually read.
+///
+/// Before this settlement existed, only the trailer's `cases` count was ever
+/// consulted — `runs_requested`, `runs_exported`, `records` and `unreadable`
+/// were fields the writer stamped and no reader read, so deleting an open
+/// run's tail records while keeping the trailer verified clean: an open run
+/// has no leaf to pin its tail, a chain prefix verifies, and the only witness
+/// left is the count.
+///
+/// The empty blocks are adjudicated here too, and the trailer is what decides
+/// which way each one goes. A run the export *declares* unreadable is
+/// unchecked, not tampering: the writer said at export time that this run's
+/// records are not in the file, which is the opposite of hiding it, and
+/// reporting it as "records removed after sealing" would teach an operator
+/// that findings are noise. An empty block the trailer does **not** declare is
+/// the tamper case — no honest writer produces one, because an unreadable or
+/// empty read files the run in the trailer instead.
+///
+/// What this does NOT cover: a trailer rewritten to match an edited file. The
+/// counts are the file's claim about itself, and holding a file to itself
+/// never catches an editor who updates both halves — that is the chain, leaf
+/// and Merkle-root checks' job, which tie the surviving bytes to history. Nor
+/// does it cover an open run's tail cut *before* the export was taken: the
+/// store served the shortened history, the writer counted what it served, and
+/// no offline file can see past its own writer.
+fn settle_trailer(
+    report: &mut VerifyReport,
+    claims: &TrailerClaims,
+    run_blocks: usize,
+    read_runs: usize,
+    empty_blocks: &[RunId],
+) {
+    for (run, reason) in &claims.unreadable {
+        report.not_checked.push(format!(
+            "run {run}: the export declares it unreadable ({reason}), so its records are \
+             not in this file and nothing about it was verified"
+        ));
+    }
+    for run in empty_blocks {
+        if claims.unreadable.iter().any(|(u, _)| u == run) {
+            continue;
+        }
+        report.findings.push(format!(
+            "run {run}: its block carries no records and the export does not declare it \
+             unreadable — either the records were removed after the export was taken, or \
+             the file was cut short before them"
+        ));
+    }
+    // The counts exist only on a framed file; a missing trailer is already the
+    // truncation finding in `settle`, and comparing against nothing would
+    // manufacture a second finding about the same cut.
+    if !report.complete {
+        return;
+    }
+    match (claims.runs_requested, claims.runs_exported, claims.records) {
+        (Some(requested), Some(exported), Some(records)) => {
+            if requested != run_blocks as u64 {
+                report.findings.push(format!(
+                    "the trailer says {requested} run(s) were requested and this file carries \
+                     {run_blocks} run block(s) — whole runs were removed or added after the \
+                     export was taken"
+                ));
+            }
+            if exported != read_runs as u64 {
+                report.findings.push(format!(
+                    "the trailer says {exported} run(s) were exported in full and this file \
+                     carries records for {read_runs} — a run's records were removed after the \
+                     export was taken"
+                ));
+            }
+            if records != report.records as u64 {
+                report.findings.push(format!(
+                    "the trailer says {records} record(s) were written and this file carries \
+                     {} — record lines were removed or added after the export was taken",
+                    report.records
+                ));
+            }
+        }
+        _ => report.findings.push(
+            "the trailer is missing counts this format always writes (runs_requested, \
+             runs_exported, records) — a reader cannot hold the file to its own accounting"
+                .to_owned(),
+        ),
     }
 }
 
@@ -659,6 +842,43 @@ fn settle_cases(
     );
 }
 
+/// Open a run block: fresh per-run state, and the block's leaf collected for
+/// the tree rebuild. Returns `None` for a block whose run id does not parse —
+/// the records under it are then flagged as belonging to no run, which is the
+/// honest reading of a block nothing can be looked up by.
+fn open_run_block(
+    value: &serde_json::Value,
+    leaves: &mut Vec<(u64, crate::core::Digest)>,
+) -> Option<RunPass> {
+    use crate::core::{Digest, merkle};
+    use serde_json::Value;
+
+    let pass = value
+        .get("run")
+        .and_then(Value::as_str)
+        .and_then(|s| RunId::parse(s).ok())
+        .map(|run| RunPass {
+            run,
+            declared_seal: value
+                .get("seal")
+                .and_then(|s| serde_json::from_value::<Digest>(s.clone()).ok()),
+            prev: Digest::ZERO,
+            last_seq: 0,
+            records: 0,
+            resealed: Vec::new(),
+            clean: true,
+        });
+    if let Some(pass) = &pass
+        && let (Some(index), Some(seal)) = (
+            value.get("index").and_then(Value::as_u64),
+            pass.declared_seal,
+        )
+    {
+        leaves.push((index, merkle::leaf_hash(&seal)));
+    }
+    pass
+}
+
 /// The verifier's working state for the run block it is inside.
 ///
 /// One struct rather than five parallel locals, because they reset together —
@@ -669,6 +889,9 @@ struct RunPass {
     declared_seal: Option<crate::core::Digest>,
     prev: crate::core::Digest,
     last_seq: u64,
+    /// How many record lines this block carried. Zero is a state the trailer
+    /// must explain: see [`settle_trailer`].
+    records: usize,
     resealed: Vec<crate::journal::Record>,
     /// Whether every record in this block checked out so far.
     ///
@@ -759,12 +982,26 @@ fn read_header(value: &serde_json::Value, report: &mut VerifyReport) {
              be all of them"
         ));
     }
+    // A foreign canonicalization rule is a statement about coverage, not a
+    // finding — nothing this pass checks depends on the rule. The chain
+    // rehash, the leaf comparison, the Merkle root and the signatures all run
+    // over the wire bytes **as written** (`Digest::chain` is plain hashing;
+    // it never re-canonicalizes), so they hold under any rule; the counts,
+    // the body-vs-wire comparison and the case coverage are byte and value
+    // comparisons with no rule in them at all. What a foreign rule *does*
+    // take off the table is re-deriving the digests inside the bodies —
+    // effect keys, manifest and plan digests — which this pass never
+    // recomputes anyway, and which a replaying build would. Filing it as a
+    // finding made an honest cross-build export read as tampered, which
+    // teaches a reader to ignore the finding that means it.
     let canon = value.get("canon").and_then(serde_json::Value::as_u64);
     if canon != Some(u64::from(crate::core::canon::VERSION)) {
-        report.findings.push(format!(
-            "the export was written under canonicalization rule {canon:?} and this build \
-             implements {} — every digest in it is unverifiable here, which is a different \
-             statement from wrong",
+        report.not_checked.push(format!(
+            "derived digests — the export was written under canonicalization rule {canon:?} \
+             and this build implements {}. The chain, leaf, root and signature checks still \
+             ran and still hold (they hash the bytes as written, never a re-serialization); \
+             what this build cannot do is re-derive the digests inside the bodies, such as \
+             effect keys, under the rule that produced them",
             crate::core::canon::VERSION
         ));
     }
@@ -798,6 +1035,7 @@ fn read_record(
     stamped: &mut std::collections::BTreeSet<crate::core::CaseId>,
 ) {
     let current = pass.run;
+    pass.records += 1;
     let (Some(raw), Some(claimed)) = (
         value.get("raw").and_then(serde_json::Value::as_str),
         value
@@ -863,6 +1101,26 @@ fn read_record(
     }
     pass.last_seq = body.seq;
 
+    // The sealing record's own claim, held to the chain it sits in — the same
+    // check the live audit makes. `RunSealed.chain_head` is the head the
+    // conclusion was drawn over, which is by construction its own record's
+    // `prev_hash`; `pass.prev` here is that head, recomputed from the wire
+    // bytes of every line before this one, so agreement is evidence about the
+    // bytes rather than the file agreeing with itself. A mismatch means the
+    // conclusion was composed against a different history than the one it was
+    // appended to, which no honest writer produces. What this does NOT cover:
+    // a run with no sealing record at all — an open run has made no claim,
+    // and its absence of one is a state, not a defect.
+    if let crate::journal::RecordKind::RunSealed { chain_head, .. } = &body.kind
+        && *chain_head != pass.prev
+    {
+        report.findings.push(format!(
+            "run {current}: the sealing record claims a chain head that is not the head it \
+             sits on — the conclusion was drawn over a different history"
+        ));
+        pass.clean = false;
+    }
+
     let attestation = value
         .get("attestation")
         .and_then(|a| serde_json::from_value::<Option<crate::core::Attestation>>(a.clone()).ok())
@@ -895,11 +1153,27 @@ fn finish_run(
     report: &mut VerifyReport,
     pass: Option<RunPass>,
     verifier: Option<&dyn crate::core::Verifier>,
+    read_runs: &mut usize,
+    empty_blocks: &mut Vec<RunId>,
 ) {
     let Some(pass) = pass else {
         return;
     };
     let run = pass.run;
+    // A block with no records is never sound, and it is never judged here:
+    // whether it is an honestly-declared unreadable run (unchecked) or a run
+    // emptied after the export was taken (a finding) is written in the
+    // trailer, which this pass has not necessarily reached — an intermediate
+    // block closes when the next one starts. Judging it now would also raise a
+    // false leaf-mismatch for a sealed unreadable run, whose declared leaf is
+    // genuine and whose records the writer honestly could not read: `prev` is
+    // still `ZERO`, and ZERO not matching the leaf is a fact about the empty
+    // walk, not about the history.
+    if pass.records == 0 {
+        empty_blocks.push(run);
+        return;
+    }
+    *read_runs += 1;
     let mut ok = pass.clean;
 
     // The one cross-check between the two halves of the export. Without it a
@@ -1036,6 +1310,25 @@ pub async fn from_jsonl<R: std::io::BufRead>(
         )));
     }
 
+    // The frame is the completeness signal, and the restore is the reader most
+    // exposed to its absence: a truncated export is a *prefix* in which every
+    // line is valid, so replaying one rebuilds a partial history shaped
+    // exactly like a whole one. The quietest cut is the worst — a file cut
+    // after the last record but before the case layer restores a journal that
+    // is byte-perfect and `is_faithful`, with every matter it names missing.
+    // Refused before any write lands, so a refused restore leaves nothing to
+    // clean up. What this does NOT cover: a file truncated *and* given a
+    // forged trailer — that is `verify`'s count settlement, and the right
+    // order is restore, then verify.
+    if !parsed.complete {
+        return Err(StoreError::Backend(
+            "the export has no trailer, so it was cut short — every line in it is a valid \
+             prefix, and restoring a prefix would rebuild a partial history shaped exactly \
+             like a whole one. Re-take the export"
+                .to_owned(),
+        ));
+    }
+
     let mut records = 0usize;
     for run in &parsed.runs {
         // Grouped by epoch, in order. Each group is one `append` carrying that
@@ -1149,6 +1442,9 @@ struct Parsed {
     version: Option<u64>,
     /// The canonicalization rule the header names, `None` when absent.
     canon: Option<u64>,
+    /// Whether the file ended with its trailer. A truncated export is a valid
+    /// prefix, and a restore must refuse it — see [`from_jsonl`].
+    complete: bool,
     runs: Vec<RestoredRun>,
     cases: Vec<RestoredCase>,
     signed: usize,
@@ -1163,11 +1459,17 @@ struct RestoredCase {
 
 /// Read an export into the shape a restore replays.
 ///
-/// Deliberately does no checking: [`verify`] answers *is this sound* and this
-/// answers *what does it say*. Folding them would make a restore refuse the very
-/// history an operator is trying to recover, at the moment they most need it —
-/// and the right order is restore, then verify the result against its own
-/// checkpoint, which [`from_jsonl`] reports.
+/// Deliberately does no *soundness* checking: [`verify`] answers *is this
+/// sound* and this answers *what does it say*. Folding them would make a
+/// restore refuse the very history an operator is trying to recover, at the
+/// moment they most need it — and the right order is restore, then verify the
+/// result against its own checkpoint, which [`from_jsonl`] reports.
+///
+/// One class of line is a hard error rather than a skip, and it is not a
+/// soundness question: a record line whose wire bytes are missing or do not
+/// parse cannot be *replayed*, only guessed at, and the one available guess —
+/// the editable display copy — is exactly the value the wire-bytes rule
+/// exists to keep out of the rebuilt history.
 fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
     use serde_json::Value;
 
@@ -1179,6 +1481,7 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
         },
         version: None,
         canon: None,
+        complete: false,
         runs: Vec::new(),
         cases: Vec::new(),
         signed: 0,
@@ -1236,7 +1539,12 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
                     blobs,
                 });
             }
-            Some("agentplane.export.end") => {}
+            Some("agentplane.export.end") => parsed.complete = true,
+            // A line carrying a `kind` this build does not recognise is not a
+            // record — record lines are the only unkinded lines in the format
+            // — so it is skipped per the no-checking rule rather than held to
+            // a record's obligations.
+            Some(_) => {}
             _ => {
                 if value.get("attestation").is_some_and(|a| !a.is_null()) {
                     parsed.signed += 1;
@@ -1244,21 +1552,27 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
                 // The wire bytes are the source of truth, exactly as they are
                 // for the verifier: the readable `body` is a courtesy copy,
                 // and a restore replaying the copy would rebuild whatever the
-                // display half said rather than what the chain covered.
-                let Some(body) = value
-                    .get("raw")
-                    .and_then(Value::as_str)
-                    .and_then(|raw| {
-                        serde_json::from_slice::<crate::journal::RecordBody>(raw.as_bytes()).ok()
-                    })
-                    .or_else(|| {
-                        value.get("body").and_then(|b| {
-                            serde_json::from_value::<crate::journal::RecordBody>(b.clone()).ok()
-                        })
-                    })
-                else {
-                    continue;
+                // display half said rather than what the chain covered. There
+                // is deliberately **no fallback to that copy**: a record line
+                // with no `raw`, or whose `raw` does not parse, is a hard
+                // error rather than a skip or a guess — silently substituting
+                // the one editable value two mechanisms must agree about would
+                // rebuild a history the chain never hashed and let the
+                // subsequent verify pass bless it.
+                let Some(raw) = value.get("raw").and_then(Value::as_str) else {
+                    return Err(std::io::Error::other(
+                        "a record line carries no wire bytes (`raw`) — restoring its display \
+                         copy instead would rebuild what the readable half says rather than \
+                         what the chain hashed, so the file is refused instead of guessed at",
+                    ));
                 };
+                let body = serde_json::from_slice::<crate::journal::RecordBody>(raw.as_bytes())
+                    .map_err(|e| {
+                        std::io::Error::other(format!(
+                            "a record line's wire bytes do not parse ({e}) — the record cannot \
+                             be replayed as written, and its display copy is not a substitute"
+                        ))
+                    })?;
                 if let Some(current) = parsed.runs.last_mut() {
                     if let crate::journal::RecordKind::RunSealed { outcome, .. } = &body.kind {
                         current.outcome = Some(outcome.clone());

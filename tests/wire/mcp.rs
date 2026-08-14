@@ -28,7 +28,8 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock,
     CreateTaskResult, DetailedTask, ErrorData, GetPromptRequestParams, GetPromptResponse,
-    GetPromptResult, GetTaskParams, GetTaskResult, Implementation, ListToolsResult,
+    GetPromptResult, GetTaskParams, GetTaskResult, Implementation, InputRequiredResult,
+    ListToolsResult,
     PaginatedRequestParams, PromptMessage, ProtocolVersion, ReadResourceRequestParams,
     ReadResourceResponse, ReadResourceResult, ResourceContents, Role, ServerCapabilities,
     ServerInfo, Task, TaskPayload, TaskStatus, Tool, ToolAnnotations, UpdateTaskParams,
@@ -117,6 +118,11 @@ impl ServerHandler for LyingServer {
                 "2026-08-06T00:00:00Z",
             ))
             .into()),
+            // The server asks the client for input mid-call. The host does not
+            // advertise elicitation, so this is an exchange it must refuse —
+            // and refuse as in-doubt, because the server may have done partial
+            // work before it asked.
+            "elicit" => Ok(InputRequiredResult::from_request_state("opaque-state").into()),
             // The server errors *while running the tool*. Whether it did
             // anything first is unknowable from here.
             "flaky" => Err(ErrorData::internal_error("the ledger blew up", None)),
@@ -132,6 +138,9 @@ impl ServerHandler for LyingServer {
         request: GetPromptRequestParams,
         _cx: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, ErrorData> {
+        if request.name == "elicit" {
+            return Ok(InputRequiredResult::from_request_state("opaque-state").into());
+        }
         if request.name != "summarize" {
             return Err(ErrorData::invalid_params("no such prompt", None));
         }
@@ -153,6 +162,9 @@ impl ServerHandler for LyingServer {
         request: ReadResourceRequestParams,
         _cx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
+        if request.uri == "kb://needs/input" {
+            return Ok(InputRequiredResult::from_request_state("opaque-state").into());
+        }
         if request.uri != "kb://settlement/rules" {
             return Err(ErrorData::invalid_params("no such resource", None));
         }
@@ -231,8 +243,40 @@ async fn connect() -> McpClient {
     McpClient::new("ledger", Arc::new(service)).with_access(
         McpAccess::new()
             .prompt("summarize", McpDataSafety::public())
-            .resource("kb://settlement/rules", McpDataSafety::public()),
+            .prompt("elicit", McpDataSafety::public())
+            .resource("kb://settlement/rules", McpDataSafety::public())
+            .resource("kb://needs/input", McpDataSafety::public()),
     )
+}
+
+/// The client asks for the 2026-07-28 baseline and the handshake lands on it.
+///
+/// rmcp's `ClientInfo::default()` requests whatever its `LATEST` constant
+/// happens to be, so a dependency bump could silently retarget the negotiated
+/// dialect — and with it which response shapes (tasks, `InputRequired`) a
+/// server is even permitted to send us. The assertion is against the raw
+/// version string, not a constant from either side of the negotiation, so it
+/// fails if anything in the chain moves.
+#[tokio::test]
+async fn the_negotiated_protocol_version_is_pinned_to_2026_07_28() {
+    let (client_side, server_side) = tokio::io::duplex(8 * 1024);
+    let (sr, sw) = tokio::io::split(server_side);
+    let (cr, cw) = tokio::io::split(client_side);
+    tokio::spawn(async move {
+        if let Ok(running) = serve_server(LyingServer, (sr, sw)).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let service = McpClient::host_info()
+        .serve((cr, cw))
+        .await
+        .expect("client initialises");
+    let negotiated = service.peer_info().expect("handshake completed");
+    assert_eq!(
+        negotiated.protocol_version.as_str(),
+        "2026-07-28",
+        "the negotiated MCP protocol version drifted from the pinned baseline"
+    );
 }
 
 /// The advertised annotations arrive intact — and are still not obeyed.
@@ -395,6 +439,70 @@ async fn a_tool_that_reports_failure_is_landed_not_did_not_happen() {
     assert!(
         err.to_string().contains("insufficient funds"),
         "and the reason must survive: {err}"
+    );
+}
+
+/// A server that asks for input mid-call is refused on every surface.
+///
+/// This host does not advertise elicitation, sampling, or roots, so a server
+/// returning `InputRequired` is opening an interaction with no governed
+/// runtime path. Each surface refuses it with the disposition its own
+/// contract demands. On `tools/call` the answer is **in doubt**: the server
+/// may already have performed partial work before it asked, so treating the
+/// refusal as "nothing happened" would license a retry that repeats that
+/// work. On `prompts/get` and `resources/read` the exchange is abandoned as
+/// `Interrupted`. What these tests do NOT establish is that a server cannot
+/// *complete* an elicitation loop against this host — that is guaranteed by
+/// the capabilities `host_info()` withholds, which the server is trusted to
+/// honour; a hostile server simply gets these refusals.
+#[tokio::test]
+async fn a_tool_that_demands_input_is_in_doubt_not_a_rejection() {
+    let client = connect().await;
+    let err = client
+        .call(&ToolId::new("ledger", "elicit"), &json!({}), None)
+        .await
+        .expect_err("the host must not answer elicitation inside a tool call");
+    assert_eq!(
+        err.disposition(),
+        Disposition::InDoubt,
+        "the server may have done partial work before asking: {err}"
+    );
+    assert!(
+        err.to_string().contains("elicitation"),
+        "the refusal must say what the server tried: {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_that_demands_input_is_interrupted() {
+    let client = connect().await;
+    let prompt = client.prompt("elicit", json!({})).expect("granted prompt");
+    let err = prompt
+        .perform()
+        .await
+        .expect_err("the host must not answer elicitation inside prompts/get");
+    assert!(
+        matches!(err, agentplane::core::EffectError::Interrupted { .. }),
+        "wrong classification: {err:?}"
+    );
+    // The positive half lives in `prompts_and_resources_are_exactly_granted_
+    // untrusted_effects`: the same fixture serves a working prompt, so this
+    // failure is about the InputRequired answer and not a broken pipe.
+}
+
+#[tokio::test]
+async fn a_resource_that_demands_input_is_interrupted() {
+    let client = connect().await;
+    let resource = client
+        .resource("kb://needs/input")
+        .expect("granted resource");
+    let err = resource
+        .perform()
+        .await
+        .expect_err("the host must not answer elicitation inside resources/read");
+    assert!(
+        matches!(err, agentplane::core::EffectError::Interrupted { .. }),
+        "wrong classification: {err:?}"
     );
 }
 

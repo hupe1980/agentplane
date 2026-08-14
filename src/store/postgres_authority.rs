@@ -88,7 +88,7 @@ fn unavailable(e: &impl std::fmt::Display) -> AuthorityError {
 impl AuthorityStore for PostgresStore {
     async fn issue(&self, authority: &StandingAuthority) -> Result<(), AuthorityError> {
         authority.validate()?;
-        let client = self.pool_ref().get().await.map_err(|e| unavailable(&e))?;
+        let mut client = self.pool_ref().get().await.map_err(|e| unavailable(&e))?;
         let tenant = self.tenant_name();
         let id = authority.id.0.clone();
         let terms = String::from_utf8(
@@ -96,20 +96,32 @@ impl AuthorityStore for PostgresStore {
         )
         .map_err(|e| unavailable(&e))?;
 
-        // `DO NOTHING` then read back, rather than `DO UPDATE`: an identical
-        // re-issue must succeed and a differing one must be refused, and only
-        // reading what is actually stored can tell those apart.
-        client
-            .execute(
-                "INSERT INTO authority_terms (tenant, authority, terms)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (tenant, authority) DO NOTHING",
-                &[&tenant, &id, &terms],
-            )
+        // One transaction, not three autocommit statements. The terms row and
+        // the balance row exist as a pair — `draw` reads them with a `JOIN`-
+        // shaped pair of queries and treats a missing balance as the store
+        // being unavailable — so a crash between the two inserts used to leave
+        // an authority that could never be drawn on *and* never re-issued: the
+        // terms row made every retry of `issue` read as an identical re-issue
+        // that then skipped the balance insert it still needed. Under a
+        // transaction, either both rows land or the retry starts from nothing.
+        let tx = client
+            .transaction()
             .await
             .map_err(|e| unavailable(&be(&e)))?;
 
-        let stored: String = client
+        // `DO NOTHING` then read back, rather than `DO UPDATE`: an identical
+        // re-issue must succeed and a differing one must be refused, and only
+        // reading what is actually stored can tell those apart.
+        tx.execute(
+            "INSERT INTO authority_terms (tenant, authority, terms)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (tenant, authority) DO NOTHING",
+            &[&tenant, &id, &terms],
+        )
+        .await
+        .map_err(|e| unavailable(&be(&e)))?;
+
+        let stored: String = tx
             .query_one(
                 "SELECT terms FROM authority_terms WHERE tenant = $1 AND authority = $2",
                 &[&tenant, &id],
@@ -122,15 +134,15 @@ impl AuthorityStore for PostgresStore {
             return Err(AuthorityError::AlreadyIssued(authority.id.clone()));
         }
 
-        client
-            .execute(
-                "INSERT INTO authority_balance (tenant, authority)
-                 VALUES ($1, $2)
-                 ON CONFLICT (tenant, authority) DO NOTHING",
-                &[&tenant, &id],
-            )
-            .await
-            .map_err(|e| unavailable(&be(&e)))?;
+        tx.execute(
+            "INSERT INTO authority_balance (tenant, authority)
+             VALUES ($1, $2)
+             ON CONFLICT (tenant, authority) DO NOTHING",
+            &[&tenant, &id],
+        )
+        .await
+        .map_err(|e| unavailable(&be(&e)))?;
+        tx.commit().await.map_err(|e| unavailable(&be(&e)))?;
         Ok(())
     }
 

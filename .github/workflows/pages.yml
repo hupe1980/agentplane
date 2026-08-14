@@ -26,9 +26,9 @@ jobs:
         with:
           tool: zola@0.22.1
 
-      # Zola fails the build on a broken internal link, which is the check the
-      # prose most often gets wrong.
-      - run: cd site && zola build
+      # `check` fails on a broken internal link or anchor — the check the
+      # prose most often gets wrong — and `build` is what actually ships.
+      - run: cd site && zola check && zola build
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site/public

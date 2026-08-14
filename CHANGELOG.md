@@ -30,12 +30,220 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
-## [Unreleased]
+## [0.16.0] — 2026-08-14
 
-Three audit rounds. Recovery gained its initiator, the case layer crossed the
+Four audit rounds. Recovery gained its initiator, the case layer crossed the
 export boundary, and a full-surface audit closed the rest — most of it one
 shape repeated: a gate correct on the first pass and absent on the second, a
-crash or a resume being the pass nobody re-checked.
+crash or a resume being the pass nobody re-checked. The fourth round went
+looking for what the third had missed and found the same shape one layer
+deeper: mechanisms that only run *after* a crash — the orphan arm, the
+failure unwind, the wake re-registration — each quietly assuming the
+machinery around it had held, plus two erasure-completeness failures and one
+leak on the export path. The catalogue gained a shape for it: enforcement
+whose only caller is a crash needs its negative test to *be* a crash.
+
+### Fixed — security: what erasure must reach, and what an export may carry
+
+- **An export through a sealed journal carried plaintext.** `SealedJournal`
+  hands reads back opened — its job for the runtime, whose steps must read
+  what they wrote — and the export copied the opened `body` into the file, so
+  destroying a key no longer reached the copy somebody exported last month;
+  the verifier then flagged the honest export as tampered, because its
+  display half disagreed with its sealed wire bytes. The export now derives
+  the display copy from the wire bytes the chain hashed — body-matches-wire
+  true by construction, sealed payloads staying sealed — with no fallback to
+  the in-memory view: a record whose raw bytes will not parse files the run
+  as unreadable rather than exporting the one thing the derivation exists to
+  keep out.
+
+- **Cascading erasure missed superseded derivative versions.** Re-deriving a
+  rolling summary deleted the derivation edges its earlier version held, so
+  forgetting a poisoned source reported success while the superseded summary
+  version that absorbed it stayed readable. Derivation edges are now
+  per-version on both backends, traversal walks the union, and the cascade
+  erases superseded versions whose sources are doomed. Beside it: subject
+  erasure on Postgres no longer fails on a page-size conversion (the RTBF
+  path was dead on the exact topology the distributed coordinator exists
+  for), and the event buffer's copy of an inbound payload — previously
+  reachable by no erasure an operator could invoke — is stripped once the
+  claimed event's delivered copy is in the journal, with an erasure verb for
+  the rows that never delivered.
+
+- **Two payload fields wrote caller-reachable text into the clear.** A
+  reconciliation probe's failure detail is a provider echoing the request it
+  was asked about — the same class as `EffectFailed.error` — and a group
+  settlement's detail names a failing invariant over the caller's values.
+  Both now seal, with the routing halves (the disposition, the outcome, the
+  Option's presence) staying clear. The sealing decorators for events, tasks
+  and push registrations also bind tenant and purpose into their AAD, so two
+  attacker-chosen identifiers can no longer manufacture a cross-purpose AAD
+  collision.
+
+- **A release's destination is now a control, not a note.** The typed release
+  journaled its destination and nothing checked it: after `apply_release` the
+  improved label was indistinguishable at every gate from natively trusted
+  data, so a value released for one sink passed at every other. Releases now
+  ride the label as destination-scoped marks applied at the sink — a value
+  released for `tool://ledger/transfer` arrives at `tool://mail/send` exactly
+  as untrusted as before the release, and a released value written to memory
+  keeps its unreleased labels, because a release is for a destination, not
+  for storage. The journal's sensitivity ceiling judges the base label for
+  the same reason — a release never lowers what may be written down — and a
+  release's `destination` must now be the exact provenance-style identity of
+  the sink it is for. Beside it, strict replay of a sink-gate refusal now
+  consumes the recorded verdict instead of quarantining the run that
+  honestly recorded it. (Breaking: labels carry release marks; eager
+  improvement is gone.)
+
+### Fixed — the second pass, one layer deeper
+
+- **Two instances could both hold a run's first lease on Postgres.** The
+  first acquisition had nothing to lock — `SELECT … FOR UPDATE` over an
+  absent row — so two concurrent first-acquires both computed epoch 1 and the
+  loser's upsert overwrote the winner: split-brain under one fence, reachable
+  by two workers driving the same batch. Acquisition is now a single guarded
+  statement; the race has a live two-instance test that fails on the old
+  shape.
+
+- **A resolved orphan's failure skipped the classifier.** Re-performing a
+  crashed effect on resume returned its failure directly, bypassing the
+  disposition and stop machinery — so a mutating re-performance that timed
+  out in doubt read as a plain failure, and the unwind then compensated
+  completed steps around a call that may have landed. The re-performance now
+  hands its failure back to the ordinary attempt loop, which decides exactly
+  as it would live: in-doubt mutating outcomes quarantine, transients retry
+  under policy.
+
+- **The failure unwind now takes the same gates as cancellation — exactly
+  when it closes the run.** A failure that will compensate something closes
+  the run to resume, so it now also refuses to unwind around an unknown
+  outcome and extends its list to every step that mutated without completing:
+  the suspended sibling severity ordering stranded holding a landed mutation,
+  and the failing step itself, whose landed effects otherwise stood forever
+  in a world where everything around them was reversed. A failure that
+  compensates nothing keeps its resume and takes neither gate, because the
+  resume is what resolves its orphans and re-registers its waits.
+
+- **An orphaned wait re-registers on resume.** A crash — or a transient store
+  error — between announcing a durable sleep or event wait and registering
+  its timer or subscription left a run that suspended forever: no driver, no
+  queue naming it, indistinguishable from work in progress. A resume now
+  re-arms the timer (the instant is journaled, and arming keeps the first
+  registration) and re-walks the wait's registration idempotently, skipping
+  only the announcement that provably survived.
+
+- **The wake path hands its lease over instead of releasing it.** A timer or
+  event delivery used to record the wake, release its bookkeeping lease, and
+  let the resume acquire a fresh one — and a crash between the two left a
+  *released* lease over a run whose timer was already disarmed, invisible to
+  the abandonment queue, which lists only leases that expired still naming an
+  owner. The resume now continues under the wake's own lease, so the run is
+  owned continuously from wake to conclusion and a crash anywhere in between
+  reaches the queue.
+
+- **A strict pass is now a pure read.** Strict verification released the
+  *live owner's* lease on the way out (both stores release on epoch match
+  alone, so a regression check could stop a healthy run's heartbeat and
+  invite a fence), accrued the historical run's spend into the current
+  period on every look, and skipped the fewer-effects check on every
+  early-stop path — a build that failed or suspended earlier than the record
+  "verified" histories it had only half-read. All three are closed; the
+  unconsumed-effects check now runs on every strict conclusion.
+
+- **Tenant spend accrues once.** The run's own budget deliberately re-bills
+  replayed history so a resume exhausts where the original did — but the
+  period ledger accrued the same figure at every conclusion, so a run that
+  suspended N times billed its prefix N times. The ledger now tracks what
+  each pass actually dispatched, and settlement accrues only that.
+
+- **One open, one settlement, one conclusion.** Group records and open
+  conclusions are not effects, so the cursor could not dedup them: every
+  resume of a still-failing run appended another `GroupOpened`, another
+  `GroupSettled` and another `RunSealed{failed}`. All three are now read back
+  and deduplicated — by count, not by name, so a step that legitimately opens
+  and settles the same group name twice keeps both pairs. The unwind's own
+  evidence changed with it: announcement, not completion, is what marks a
+  step for compensation, so the failed step's landed mutation is undone
+  beside the interrupted sibling's.
+
+- **A batch item at a ceiling reads `exhausted`, not `failed`.** (Breaking:
+  `ItemOutcome::Exhausted` is a new non-terminal variant.) Exhaustion is a
+  pause everywhere else in the runtime; the batch census filed it as
+  terminal failure, teaching operators to re-run items whose work was intact.
+  An exhausted item now holds the batch cursor like a suspended one and is
+  counted in its own census column.
+
+### Fixed — the wire, the record, and the models that check them
+
+- **Anthropic dropped a reasoning turn whose only answer was a tool call.**
+  A thinking block beside a `tool_use` with no sibling text was classified
+  unusable before the continuation was assembled, so the next turn re-sent
+  without the thinking signature and the provider rejected it. Choosing a
+  tool is an answer; the turn now carries its blocks verbatim. (Bedrock's
+  ordering was already sound; both drivers now pin it with byte-for-byte
+  continuation tests.)
+
+- **The MCP client now negotiates `2026-07-28` explicitly** instead of
+  inheriting whatever its dependency defaults to (which had silently become
+  the superseded `2025-11-25`), with the version string pinned by a wire
+  test so a dependency bump cannot retarget the suite. The
+  `InputRequiredResult` refusal — a server that stopped mid-operation to ask
+  a question has done an unknown amount of it — gained the negative tests it
+  never had, on all three surfaces.
+
+- **Back-pressure on the A2A surface is no longer spelled as a permanent
+  refusal.** A tenant at its ceiling answered with the spec's
+  missing-operation code — teaching a compliant caller to abandon work that
+  would succeed in a minute — and the refusal text leaked quota arithmetic.
+  A server-defined code now carries a digit-free message, this crate's own
+  client reads it as a retryable refusal, and a test drives the quota path
+  through the wire.
+
+- **The offline verifier stopped believing its own trailer.** A run block
+  with zero records verified as sound, an honestly-declared unreadable run
+  was reported as tampering, and only one of the trailer's counts was ever
+  compared — so deleting an open run's tail records verified clean. Every
+  count is now settled against what was read, empty blocks are findings,
+  declared-unreadable runs land in `not_checked`, restore refuses a file cut
+  short or a line without wire bytes, and the audit states its sampling
+  scope and reports an empty run as unchecked rather than sound. The
+  case-layer drill gained a CLI verb (`agentplane drill`) that fails only on
+  loss — erased-by-design stays informative — and says when sealed-state
+  coverage could not be established at all.
+
+- **The formal models lost their unreachable endings and their untested
+  verb.** Authorization's "done" state was unreachable under the shipped
+  constants — a model verifying that every run is denied — and Fencing
+  accepted epoch-zero writes from two instances while carrying no `Renew`
+  action at all, leaving the settled renew-versus-acquire split unverifiable.
+  Both are fixed with TLC runs, new mutants mapped to the Rust tests that
+  kill them, prefix-equality append-only properties, and explicit liveness
+  assumptions; the spec README's state counts now come from the harness that
+  derives them.
+
+### Changed — smaller cuts with a reason
+
+- `RuntimeBuilder::lease_ttl` no longer panics in the setter: a sub-2-second
+  lease is refused at `build`/`try_build` as `BuildError::LeaseUnrenewable`,
+  so a plane assembled from runtime input reports it as a diagnostic instead
+  of aborting the process. The stores refuse sub-second TTLs themselves now
+  rather than silently clamping — boundary enforcement for embedders that
+  never pass through this builder.
+- Task re-claim by the current holder is idempotent success on both backends
+  (Postgres refused its own holder), the task queue serves priority before
+  age on both (Postgres ordered by age alone, so an urgent task behind older
+  normal ones was absent from the page), and purpose-less memory recall
+  follows one selection rule everywhere — most trusted rank first, newest
+  within a rank — where the backends previously disagreed about which facts
+  fill a bounded recall.
+- `Release::fields`/`evidence` and `Tainted::object` take `impl
+  Into<String>`, deleting the `.to_owned()` noise from the first snippets a
+  reader copies; the README quickstart's example commands are now guarded
+  against the features they require, and the feature-table guard checks both
+  directions.
+- An advertisement that outgrows its operator grant is warned about where it
+  is observed, instead of being visible only to code that asks.
 
 ### Fixed — security: the second pass is the same run as the first
 

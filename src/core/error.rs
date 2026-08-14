@@ -591,6 +591,34 @@ pub enum PolicyError {
     #[error("untrusted data may not select protected field '{path}' of sink '{sink}'")]
     ProtectedFieldTaint { sink: String, path: String },
 
+    /// A destination-scoped release covers this value — but for a different
+    /// sink. Named explicitly, because "untrusted" alone would send the
+    /// operator hunting for a missing release that in fact exists and was
+    /// simply granted somewhere else. The message names only the two
+    /// destinations — never the release's basis or evidence, which would hand
+    /// a probing model the reviewer's reasoning.
+    #[error(
+        "untrusted data may not reach mutating sink '{sink}': the value's release \
+         names destination '{granted}', and this sink is '{actual}'"
+    )]
+    ReleaseDestination {
+        sink: String,
+        granted: String,
+        actual: String,
+    },
+
+    /// The field-scoped twin of [`ReleaseDestination`](Self::ReleaseDestination).
+    #[error(
+        "untrusted data may not select protected field '{path}' of sink '{sink}': \
+         the field's release names destination '{granted}', and this sink is '{actual}'"
+    )]
+    ProtectedFieldReleaseDestination {
+        sink: String,
+        path: String,
+        granted: String,
+        actual: String,
+    },
+
     /// A protected field derives from a source outside its operator declaration.
     #[error(
         "protected field '{path}' of sink '{sink}' derives from undeclared source '{actual_source}'"

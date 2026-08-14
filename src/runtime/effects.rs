@@ -587,6 +587,12 @@ impl Effect for RememberMemory {
                 "trust": self.item.trust,
                 "created_at": crate::core::format_timestamp(self.item.created_at),
                 "expires_at": self.item.expires_at.map(crate::core::format_timestamp),
+                // In the key beside `expires_at`, because both are lifecycle
+                // the write *creates*: `selection_digest` already commits to
+                // this field, and an effect identity that omitted it let a
+                // build change silently re-derive a different retention for
+                // the same journaled write instead of diverging.
+                "access_retention_seconds": self.item.access_retention_seconds,
                 "derived_from": self.item.derived_from,
                 // The content's digest, not the content: an effect key is
                 // recorded verbatim, and a memory's content belongs in a store

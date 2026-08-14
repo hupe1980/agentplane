@@ -350,6 +350,16 @@ fn classify_rpc(peer: &PeerId, e: &RpcError) -> PeerError {
             peer: peer.clone(),
             detail: format!("{detail} — the peer did not say whether it acted"),
         },
+        // This runtime's own server-defined back-pressure code: the quota was
+        // checked before admission, so nothing was performed and the honest
+        // reading is a refusal that will pass — retry later, do not abandon.
+        // A foreign server reusing -32029 for something else loses nothing:
+        // the request was refused either way, and refusal is the conservative
+        // class for a pre-admission answer.
+        -32029 => PeerError::Refused {
+            peer: peer.clone(),
+            detail: format!("{detail} — the peer is at a ceiling; come back"),
+        },
         // `-32603 Internal error` and anything unrecognised. The request
         // arrived; whether the peer acted is exactly what it is not saying.
         // Calling this a refusal is how a half-finished transfer is sent again

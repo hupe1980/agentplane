@@ -1,7 +1,7 @@
 //! Durable timers on redb.
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::case::TimerStore;
 use crate::core::{CaseId, EffectKey, Phase, RunId, StoreError, Timer, Timestamp};
@@ -208,12 +208,24 @@ impl TimerStore for RedbStore {
     }
 
     async fn pending_count(&self) -> Result<u64, StoreError> {
-        self.with_db(|db| {
+        let tenant = self.tenant_name();
+        self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
-            r.open_table(TIMERS)
+            let t = r.open_table(TIMERS).map_err(|e| be(&e))?;
+            // Counted over this tenant's range rather than `len()` on the
+            // table, like every sibling read here: a whole-table count reports
+            // every tenant's timers as this one's — a gauge that reads
+            // plausibly and is wrong, on the store whose keys exist precisely
+            // so one tenant cannot see another's rows.
+            let mut n = 0u64;
+            for e in t
+                .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
                 .map_err(|e| be(&e))?
-                .len()
-                .map_err(|e| be(&e))
+            {
+                e.map_err(|e| be(&e))?;
+                n += 1;
+            }
+            Ok(n)
         })
         .await
     }

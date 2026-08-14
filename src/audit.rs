@@ -458,6 +458,74 @@ fn seal_claim_holds(records: &[Record]) -> bool {
         .unwrap_or(true)
 }
 
+/// The deletion check, against the checkpoint the auditor brought.
+///
+/// The proof must be paired with the checkpoint it is verified against, and
+/// the log can grow between the two store calls — the same race `placement`
+/// refreshes for, handled the same way, because two halves of one audit
+/// reporting one race differently teaches the reader that findings are
+/// weather. A proof computed over a log larger than the checkpoint in hand
+/// fails for a reason that is time, not tampering, and a false `NotAppendOnly`
+/// is the alarm this whole module exists to make believable. One refresh
+/// covers the realistic race; a plane sealing continuously lands in
+/// `not_checked` rather than in a finding.
+///
+/// What this does NOT cover: it decides nothing about tampering on the
+/// unpinned path — a store that really did rewrite history and also keeps
+/// growing is only caught by re-running against a quiesced store, which the
+/// entry says in words.
+async fn check_append_only(
+    store: &Arc<dyn JournalStore>,
+    prior: &Checkpoint,
+    current: &mut Checkpoint,
+    findings: &mut Vec<Finding>,
+    not_checked: &mut Vec<String>,
+) -> Result<(), StoreError> {
+    if prior.origin != current.origin {
+        findings.push(Finding::WrongLog {
+            theirs: prior.origin.clone(),
+            ours: current.origin.clone(),
+        });
+        return Ok(());
+    }
+    if prior.size > current.size {
+        findings.push(Finding::Shrunk {
+            old_size: prior.size,
+            now: current.size,
+        });
+        return Ok(());
+    }
+    let mut proof = store.consistency_proof(prior.size).await?;
+    let mut latest = store.checkpoint().await?;
+    if latest.size != current.size {
+        *current = latest;
+        proof = store.consistency_proof(prior.size).await?;
+        latest = store.checkpoint().await?;
+    }
+    if latest.size == current.size {
+        let ok = merkle::verify_consistency(
+            usize::try_from(prior.size).unwrap_or(0),
+            &prior.root,
+            usize::try_from(current.size).unwrap_or(0),
+            &current.root,
+            &proof,
+        );
+        if !ok {
+            findings.push(Finding::NotAppendOnly {
+                old_size: prior.size,
+            });
+        }
+    } else {
+        *current = latest;
+        not_checked.push(
+            "append-only consistency: the log grew throughout the audit, so the proof \
+             could not be pinned to one checkpoint — re-run against a quiesced store"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 /// Check a plane's history.
 ///
 /// `runs` is what to look at — an auditor sampling, or everything they were
@@ -484,6 +552,24 @@ pub async fn audit(
     // ── Per run ────────────────────────────────────────────────────────────
     for &run in runs {
         let records = store.read(run, 1).await?;
+        // A run the store returns nothing for is unchecked, never sound.
+        // Both backends answer an unknown run with an empty read rather than
+        // an error, and every check downstream holds vacuously over nothing:
+        // `verify_chain(&[])` passes, the seal claim is absent, and a missing
+        // leaf reads as an ordinary open run — so a mistyped or deleted run id
+        // audited as "chain and signatures verified" without one record ever
+        // being looked at. Not a finding either: an unknown id and a run whose
+        // records are genuinely gone cannot be told apart from an empty read,
+        // and deletion is the prior-checkpoint check's question, which answers
+        // it with evidence rather than a guess.
+        if records.is_empty() {
+            not_checked.push(format!(
+                "run {run}: the store returned no records, so nothing about it was \
+                 verified — an empty history holds every check vacuously, which is a \
+                 different statement from sound"
+            ));
+            continue;
+        }
         let chain = match evidence.verifier {
             Some(v) => {
                 Record::verify_attested(&records, Digest::ZERO, v, evidence.require_signatures)
@@ -545,33 +631,28 @@ pub async fn audit(
         ));
     }
 
+    // The audit's scope, stated rather than implied. `runs` is whatever the
+    // caller sampled, and the log commits to `current.size` sealed runs — a
+    // clean report over three runs of a three-thousand-run log is a true
+    // statement about three runs, and nothing in the findings list would ever
+    // say so. Stated as unchecked coverage, because that is what it is. What
+    // this does NOT cover: it counts the runs *named*, not the runs verified —
+    // duplicates in the sample, open runs, and runs the store returned nothing
+    // for all inflate the count, so it is an upper bound on coverage and the
+    // per-run entries above are the exact record.
+    let examined = u64::try_from(runs.len()).unwrap_or(u64::MAX);
+    if examined < current.size {
+        not_checked.push(format!(
+            "scope — this audit examined {examined} named run(s) and the log commits to \
+             {} sealed run(s); the remainder was not looked at, and a clean report speaks \
+             only for the runs it names",
+            current.size
+        ));
+    }
+
     // ── Against what the auditor brought ───────────────────────────────────
     if let Some(prior) = evidence.prior {
-        if prior.origin != current.origin {
-            findings.push(Finding::WrongLog {
-                theirs: prior.origin.clone(),
-                ours: current.origin.clone(),
-            });
-        } else if prior.size > current.size {
-            findings.push(Finding::Shrunk {
-                old_size: prior.size,
-                now: current.size,
-            });
-        } else {
-            let proof = store.consistency_proof(prior.size).await?;
-            let ok = merkle::verify_consistency(
-                usize::try_from(prior.size).unwrap_or(0),
-                &prior.root,
-                usize::try_from(current.size).unwrap_or(0),
-                &current.root,
-                &proof,
-            );
-            if !ok {
-                findings.push(Finding::NotAppendOnly {
-                    old_size: prior.size,
-                });
-            }
-        }
+        check_append_only(store, prior, &mut current, &mut findings, &mut not_checked).await?;
     }
 
     Ok(AuditReport {

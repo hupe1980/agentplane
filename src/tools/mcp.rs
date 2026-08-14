@@ -164,6 +164,18 @@ impl McpClient {
     #[must_use]
     pub fn host_info() -> ClientInfo {
         let mut info = ClientInfo::default();
+        // The protocol baseline is pinned here rather than inherited from
+        // rmcp's `ClientInfo::default()`, whose `LATEST` constant lags the
+        // 2026-07-28 spec this host is written against — the tasks extension
+        // and structured tool responses this module relies on are defined
+        // there. Pinning also means a future rmcp bump cannot silently move
+        // the negotiated dialect in either direction; the wire test asserts
+        // the negotiated string byte-for-byte. What this does NOT do is
+        // reject a server that negotiates the connection down to an older
+        // version — rmcp's handshake accepts the server's answer, and a
+        // deployment that must refuse old servers has to check
+        // `peer_info().protocol_version` itself after connecting.
+        info.protocol_version = rmcp::model::ProtocolVersion::V_2026_07_28;
         let mut extensions = ExtensionCapabilities::new();
         extensions.insert(TASKS_EXTENSION_ID.to_owned(), JsonObject::new());
         info.capabilities.extensions = Some(extensions);
@@ -256,7 +268,23 @@ impl McpClient {
         input_responses: InputResponses,
     ) -> Result<McpTaskUpdate, ToolError> {
         self.check_task_server(&task)?;
-        let arguments = serde_json::to_value(&input_responses).unwrap_or(Value::Null);
+        // The serialized responses are what `sink_arguments` exposes to the
+        // egress gate, while `perform` sends the typed value itself. Falling
+        // back to `Null` on a serialization failure would fail *open*: the
+        // gate would inspect nothing while the wire carried everything. So a
+        // value that cannot be rendered for inspection is refused before any
+        // effect exists — nothing was sent, and the refusal says why. This
+        // does NOT validate the responses against the server's declared input
+        // schema; the server still judges them on `tasks/update`.
+        let arguments = serde_json::to_value(&input_responses).map_err(|error| {
+            ToolError::Refused {
+                tool: ToolId::new(&self.server, format!("task/{}", task.id)),
+                detail: format!(
+                    "the input responses could not be serialized for policy \
+                     inspection, so they were not sent: {error}"
+                ),
+            }
+        })?;
         Ok(McpTaskUpdate {
             task,
             input_responses,

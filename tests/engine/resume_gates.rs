@@ -1074,3 +1074,250 @@ async fn a_failed_admission_leaks_no_slot_and_no_abandoned_run() {
         "a failed admission left a lease the sweeper will read as a crashed run"
     );
 }
+
+// ── A failed unwind takes the doubt gate — and only when it compensates ─────
+
+/// Times out in doubt; the skill swallows the error and reports an ordinary
+/// failure, leaving a terminal `InDoubt` mutation on the record under a run
+/// whose status is `Failed` rather than `Quarantined`.
+#[derive(Debug)]
+struct SwallowsDoubt;
+
+#[async_trait::async_trait]
+impl Skill for SwallowsDoubt {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("swallower").provides("demo.second")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        #[derive(Debug)]
+        struct TimesOut;
+        #[async_trait::async_trait]
+        impl Effect for TimesOut {
+            type Output = Value;
+            fn descriptor(&self) -> EffectDescriptor {
+                EffectDescriptor::nullary("test.times-out")
+            }
+            fn mutates(&self) -> bool {
+                true
+            }
+            fn recovery(&self) -> Recovery {
+                Recovery::Retry
+            }
+            fn retry(&self) -> RetryPolicy {
+                RetryPolicy::never()
+            }
+            async fn perform(&self) -> Result<Value, EffectError> {
+                Err(EffectError::Timeout {
+                    driver: "x".into(),
+                    waited_ms: 1,
+                })
+            }
+        }
+        // Swallowed deliberately: the fixture needs a *failed* run holding
+        // recorded doubt, and letting the error propagate would quarantine at
+        // the step instead. The same catch runs on every resume, so the run
+        // fails identically on each pass.
+        match cx.effect(TimesOut).await {
+            Ok(v) => Ok(Outcome::done(v)),
+            Err(_) => Ok(Outcome::fail("gave up after the wire went quiet")),
+        }
+    }
+}
+
+/// A failed run refuses to compensate around recorded doubt.
+///
+/// Step 0 completed and declares itself compensatable, so this failure's
+/// unwind would compensate — and compensation closes the run to resume, which
+/// is the only path on which step 1's in-doubt mutation could ever be
+/// resolved. The unwind must therefore quarantine instead of undoing step 0
+/// around the one call nobody can account for. This is the same gate
+/// cancellation takes (`cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation`);
+/// a failure that will compensate is just as final.
+#[tokio::test]
+async fn a_failed_unwind_refuses_to_compensate_around_recorded_doubt() {
+    let store = store();
+    let undone = Arc::new(AtomicUsize::new(0));
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(Compensable {
+            name: "first",
+            provides: "demo.first",
+            undone: Arc::clone(&undone),
+        })
+        .skill(SwallowsDoubt)
+        .build();
+
+    let out = rt
+        .run_plan(two_step_plan(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Quarantined(_)),
+        "a failure about to compensate around a terminal in-doubt mutation \
+         must quarantine — undoing step 0 also destroys the resume on which \
+         the doubt could be resolved: {:?}",
+        out.status
+    );
+    assert_eq!(
+        undone.load(Ordering::SeqCst),
+        0,
+        "nothing may be compensated around an outcome nobody can account for"
+    );
+    assert_eq!(
+        kind_count(&store, out.run_id, "StepCompensated", None).await,
+        0,
+        "and the journal must agree"
+    );
+}
+
+/// The counterpart asymmetry: a failed run with doubt and nothing to
+/// compensate stays `Failed` — open, findable, and resumable.
+///
+/// A single-step run holds the same recorded doubt, but there is no completed
+/// compensatable work, so its failure closes nothing: no unwind runs, and the
+/// resume — the one path on which the doubt could resolve — stays available.
+/// Quarantining here would turn every recoverable in-doubt failure into a
+/// permanent operator obligation, which is exactly the overreach this
+/// counterpart pins down. The resume itself is the positive half: it replays,
+/// fails the same way again, and appends no second conclusion.
+#[tokio::test]
+async fn a_failure_with_doubt_but_nothing_to_unwind_stays_failed_and_resumable() {
+    let store = store();
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(SwallowsDoubt)
+        .build();
+
+    let out = rt
+        .run("demo.second", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "with nothing to compensate, the failure closes nothing and must not \
+         quarantine: {:?}",
+        out.status
+    );
+    assert!(
+        (store.clone() as Arc<dyn JournalStore>)
+            .runs_by_outcome("failed", 10)
+            .await
+            .unwrap()
+            .contains(&out.run_id),
+        "the run is findable by whoever clears failures"
+    );
+
+    let resumed = rt.replay(out.run_id, Mode::Resume).await.unwrap();
+    assert!(
+        matches!(resumed.status, RunStatus::Failed(_)),
+        "the run stayed open to resume: {:?}",
+        resumed.status
+    );
+}
+
+// ── One RunSealed per distinct conclusion ───────────────────────────────────
+
+/// Fails until told otherwise; performs no effects, so a resume replays
+/// nothing and reaches the same conclusion doing nothing new.
+#[derive(Debug)]
+struct FailsUntilFixed {
+    fixed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Skill for FailsUntilFixed {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("flaky").provides("demo.flaky")
+    }
+
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        if self.fixed.load(Ordering::SeqCst) {
+            Ok(Outcome::done(input))
+        } else {
+            Ok(Outcome::fail("the dependency is still down"))
+        }
+    }
+}
+
+/// A resume that reaches the conclusion already on the record appends nothing;
+/// a resume that reaches a *different* conclusion appends it.
+///
+/// A failed run is retried by resuming, and each unsuccessful resume ends at
+/// the same open conclusion the journal already holds. Re-appending it grows
+/// the chain by one identical `RunSealed{failed}` per attempt — a journal
+/// whose length measures operator patience rather than history. The dedup
+/// must not overreach either: when the resume finally succeeds, the new
+/// conclusion is a different fact and must land, or the run would stay
+/// recorded as failed after succeeding.
+#[tokio::test]
+async fn a_repeated_conclusion_is_not_re_sealed_but_a_new_one_is() {
+    async fn sealed_count(store: &Arc<RedbStore>, run: RunId, outcome: &str) -> usize {
+        (store.clone() as Arc<dyn JournalStore>)
+            .read(run, 1)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.kind(),
+                    RecordKind::RunSealed { outcome: o, .. } if o == outcome
+                )
+            })
+            .count()
+    }
+
+    let store = store();
+    let fixed = Arc::new(AtomicBool::new(false));
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(FailsUntilFixed {
+            fixed: Arc::clone(&fixed),
+        })
+        .build();
+
+    let out = rt
+        .run("demo.flaky", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(matches!(out.status, RunStatus::Failed(_)));
+    assert_eq!(sealed_count(&store, out.run_id, "failed").await, 1);
+
+    // Two more identical failures: same conclusion, no new record.
+    for _ in 0..2 {
+        let again = rt.replay(out.run_id, Mode::Resume).await.unwrap();
+        assert!(matches!(again.status, RunStatus::Failed(_)));
+    }
+    assert_eq!(
+        sealed_count(&store, out.run_id, "failed").await,
+        1,
+        "every no-op resume re-appended the conclusion the journal already \
+         holds — the chain now grows with operator retries"
+    );
+
+    // The dependency comes back: a different conclusion is a new fact.
+    fixed.store(true, Ordering::SeqCst);
+    let done = rt.replay(out.run_id, Mode::Resume).await.unwrap();
+    assert_eq!(done.status, RunStatus::Succeeded);
+    assert_eq!(
+        sealed_count(&store, out.run_id, "failed").await,
+        1,
+        "the old conclusion stays exactly once"
+    );
+    assert_eq!(
+        sealed_count(&store, out.run_id, "succeeded").await,
+        1,
+        "the dedup swallowed a *different* conclusion — the run succeeded and \
+         history still says it failed"
+    );
+    store.verify(out.run_id).await.unwrap();
+}

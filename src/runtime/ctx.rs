@@ -68,6 +68,16 @@ impl std::fmt::Debug for CaseContext {
     }
 }
 
+/// What the journal says about a durable wait a replay just met.
+///
+/// Internal to the wait machinery: `Recorded` carries the delivered value, and
+/// `Repair` says the wait was announced but its registration may not have
+/// survived — the caller re-registers idempotently under the same key.
+enum ReplayedWait {
+    Recorded(Tainted<Value>),
+    Repair,
+}
+
 /// How a step is being executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -160,6 +170,21 @@ pub(crate) struct Frame {
     /// both the same one: the store signs *records*, this signs *outward
     /// claims*, and a plane can legitimately have one without the other.
     pub signer: Option<Arc<dyn crate::core::Signer>>,
+    /// Group records this step and phase already wrote, with how many opens
+    /// and settlements each name has. Always empty on a live run. Group
+    /// records are not effects, so the cursor cannot dedup them; without this
+    /// a resumed step re-opening or re-settling its group at the frontier
+    /// would report one group as two. Counts rather than a set, because a
+    /// step may legitimately open and settle the same name twice — a set
+    /// would swallow the second pair of a pass that recorded only the first.
+    pub recorded_groups: std::collections::BTreeMap<String, RecordedGroup>,
+}
+
+/// How often a group name already appears on one step-and-phase's record.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RecordedGroup {
+    pub(crate) opened: usize,
+    pub(crate) settled: usize,
 }
 
 /// Per-step execution context.
@@ -230,6 +255,9 @@ pub struct StepCtx<'a> {
     /// already on the record — writing a second `StepFinished` for it reports
     /// one piece of work as two and grows the chain on every resume.
     wrote: bool,
+    /// Group records this step and phase already wrote — see
+    /// [`Frame::recorded_groups`].
+    pub(crate) recorded_groups: std::collections::BTreeMap<String, RecordedGroup>,
 }
 
 impl<'a> StepCtx<'a> {
@@ -259,6 +287,7 @@ impl<'a> StepCtx<'a> {
             #[cfg(feature = "manifest")]
             manifest,
             signer,
+            recorded_groups,
         } = frame;
         Self {
             store,
@@ -289,6 +318,7 @@ impl<'a> StepCtx<'a> {
             #[cfg(feature = "manifest")]
             manifest,
             signer,
+            recorded_groups,
             reversing: false,
             open_group: None,
             member_dispatch: false,
@@ -724,6 +754,20 @@ impl<'a> StepCtx<'a> {
             .record_effect(spend);
     }
 
+    /// [`bill`](Self::bill), for an effect this pass actually dispatched.
+    ///
+    /// The distinction feeds the tenant's period ledger: replayed spend is
+    /// billed to the run's own budget so a resume exhausts where the original
+    /// did, but only live spend accrues at settlement — otherwise every
+    /// suspend/resume cycle re-accrues the prefix and every strict pass bills
+    /// history into today's period.
+    fn bill_live(&self, spend: crate::core::Spend) {
+        self.ledger
+            .lock()
+            .expect("budget mutex")
+            .record_live_effect(spend);
+    }
+
     /// A deterministic random source.
     ///
     /// Seeded from `(run_id, step)` rather than journaled per draw: the sequence
@@ -930,8 +974,18 @@ impl<'a> StepCtx<'a> {
                         )?;
                         continue;
                     }
-                    Some(EffectReplay::Orphan { recovery, .. }) => {
-                        return self.resolve_orphan(&effect, key, attempt, &recovery).await;
+                    Some(EffectReplay::Orphan {
+                        recovery: recorded,
+                        ..
+                    }) => {
+                        if let Some(output) = self
+                            .orphan_verdict(&effect, key, attempt, &recorded, &recovery, &policy)
+                            .await?
+                        {
+                            return Ok(output);
+                        }
+                        attempt += 1;
+                        continue;
                     }
                     // History exhausted: this attempt runs live, unless a
                     // strict pass is verifying — where reaching the end is
@@ -977,31 +1031,84 @@ impl<'a> StepCtx<'a> {
                 Err(e) => e,
             };
 
-            // An in-doubt failure on a reconcilable effect is a question, not a
-            // verdict. Ask before deciding.
-            let mut disposition = failure.disposition();
-            if disposition == crate::core::Disposition::InDoubt
-                && matches!(recovery, crate::core::Recovery::Reconcile)
+            if let Some(output) = self
+                .failed_attempt_verdict(&effect, key, attempt, &recovery, &policy, &failure)
+                .await?
             {
-                match self.reconcile_and_record(&effect, key).await? {
-                    crate::core::Reconciliation::Landed(output) => return Ok(output),
-                    resolved => disposition = resolved.disposition(),
-                }
-            }
-
-            if let Some(stop) = Self::stop_reason(
-                disposition,
-                &recovery,
-                key,
-                attempt,
-                &policy,
-                &failure.to_string(),
-                matches!(failure, crate::core::EffectError::Refused(_)),
-                effect.mutates(),
-            ) {
-                return Err(stop);
+                return Ok(output);
             }
             attempt += 1;
+        }
+    }
+
+    /// Decide what a failed attempt means: a reconciled answer, a stop, or a
+    /// retry.
+    ///
+    /// One implementation for the live path and the resolved-orphan path,
+    /// because they are one rule: an in-doubt failure on a reconcilable
+    /// effect is a question asked before deciding, and everything else goes
+    /// to the stop machinery. `Ok(Some(output))` is an answer reconciliation
+    /// recovered; `Ok(None)` tells the attempt loop to retry.
+    async fn failed_attempt_verdict<E: Effect>(
+        &mut self,
+        effect: &E,
+        key: EffectKey,
+        attempt: u32,
+        recovery: &crate::core::Recovery,
+        policy: &crate::core::RetryPolicy,
+        failure: &crate::core::EffectError,
+    ) -> Result<Option<E::Output>, StepError> {
+        let mut disposition = failure.disposition();
+        if disposition == crate::core::Disposition::InDoubt
+            && matches!(recovery, crate::core::Recovery::Reconcile)
+        {
+            match self.reconcile_and_record(effect, key).await? {
+                crate::core::Reconciliation::Landed(output) => return Ok(Some(output)),
+                resolved => disposition = resolved.disposition(),
+            }
+        }
+        if let Some(stop) = Self::stop_reason(
+            disposition,
+            recovery,
+            key,
+            attempt,
+            policy,
+            &failure.to_string(),
+            matches!(failure, crate::core::EffectError::Refused(_)),
+            effect.mutates(),
+        ) {
+            return Err(stop);
+        }
+        Ok(None)
+    }
+
+    /// Resolve an orphan and classify what came of it.
+    ///
+    /// A resolved orphan that *fails* is a live failure and takes the live
+    /// failure's path — disposition, reconciliation, stop machinery — rather
+    /// than a verdict of its own. The re-performance already wrote its
+    /// terminal record inside `resolve_orphan`; what is decided here is only
+    /// what the failure means, and deciding it anywhere else is how a
+    /// mutating in-doubt outcome once unwound as a plain failure.
+    ///
+    /// `Ok(Some(output))` is a landed answer; `Ok(None)` tells the attempt
+    /// loop to retry under the recomputed policy.
+    #[allow(clippy::too_many_arguments)]
+    async fn orphan_verdict<E: Effect>(
+        &mut self,
+        effect: &E,
+        key: EffectKey,
+        attempt: u32,
+        recorded: &crate::core::Recovery,
+        recovery: &crate::core::Recovery,
+        policy: &crate::core::RetryPolicy,
+    ) -> Result<Option<E::Output>, StepError> {
+        match self.resolve_orphan(effect, key, attempt, recorded).await? {
+            Ok(output) => Ok(Some(output)),
+            Err(failure) => {
+                self.failed_attempt_verdict(effect, key, attempt, recovery, policy, &failure)
+                    .await
+            }
         }
     }
 
@@ -1013,13 +1120,24 @@ impl<'a> StepCtx<'a> {
     /// [`InDoubt`](crate::core::Disposition::InDoubt) failure asks — a crash and
     /// a timeout leave the runtime knowing exactly as much — and it is answered
     /// the same way, by declaration rather than by guessing.
+    ///
+    /// The nested result is the point of the signature: the inner `Err` is a
+    /// re-performance that **failed**, handed back to the ordinary attempt
+    /// loop so the same disposition, reconciliation and stop machinery decides
+    /// what it means. An earlier version collapsed it to a step failure here,
+    /// which skipped the classifier — a resumed orphan whose re-performance
+    /// timed out `InDoubt` on a mutating effect read as a plain failure, and
+    /// the failure unwind then compensated completed steps around a call that
+    /// may have landed. The outer `Err` carries only the verdicts this
+    /// function can reach alone: strict refuses to probe, an operator-recovery
+    /// effect stays undecidable, and an inconclusive probe stays undecidable.
     async fn resolve_orphan<E: Effect>(
         &mut self,
         effect: &E,
         key: EffectKey,
         attempt: u32,
         recovery: &crate::core::Recovery,
-    ) -> Result<E::Output, StepError> {
+    ) -> Result<Result<E::Output, crate::core::EffectError>, StepError> {
         use crate::core::{Reconciliation, Recovery};
 
         // Strict replay is a pure read, and resolving an orphan is not reading —
@@ -1043,28 +1161,17 @@ impl<'a> StepCtx<'a> {
             // Re-performed under the *same* key, and without a second
             // `EffectStarted`: the announcement already in the journal covers
             // this call, and writing another would report two attempts where
-            // one interrupted attempt was resumed.
+            // one interrupted attempt was resumed. A failure is handed back to
+            // the attempt loop, not decided here.
             Recovery::Retry | Recovery::Idempotent { .. } => {
-                match self
-                    .perform_once(effect, key, attempt, 0, false, None)
-                    .await?
-                {
-                    Ok(output) => Ok(output),
-                    Err(e) => Err(StepError::Effect(e)),
-                }
+                self.perform_once(effect, key, attempt, 0, false, None).await
             }
             // Ask, rather than assume. This is the only branch that turns an
             // undecidable outcome into a decided one without betting on it.
             Recovery::Reconcile => match self.reconcile_and_record(effect, key).await? {
-                Reconciliation::Landed(output) => Ok(output),
+                Reconciliation::Landed(output) => Ok(Ok(output)),
                 Reconciliation::DidNotHappen => {
-                    match self
-                        .perform_once(effect, key, attempt, 0, false, None)
-                        .await?
-                    {
-                        Ok(output) => Ok(output),
-                        Err(e) => Err(StepError::Effect(e)),
-                    }
+                    self.perform_once(effect, key, attempt, 0, false, None).await
                 }
                 Reconciliation::Inconclusive => Err(StepError::Undecidable {
                     key,
@@ -1110,7 +1217,7 @@ impl<'a> StepCtx<'a> {
         let (output, spend) = match &outcome {
             Reconciliation::Landed(value) => {
                 let spend = effect.spend(value);
-                self.bill(spend);
+                self.bill_live(spend);
                 (Some(serde_json::to_value(value)?), spend)
             }
             _ => (None, crate::core::Spend::default()),
@@ -1141,14 +1248,17 @@ impl<'a> StepCtx<'a> {
     /// What history says about a wait, if anything.
     ///
     /// `Ok(None)` means the journal has nothing here and the wait must be
-    /// registered live. Every other arm is a decision the recorded run already
-    /// made, reproduced rather than re-derived.
+    /// registered live. `Ok(Some(ReplayedWait::Repair))` means the wait was announced and
+    /// its registration may not have survived — the caller re-registers
+    /// idempotently under the same key, without a second announcement. Every
+    /// other arm is a decision the recorded run already made, reproduced
+    /// rather than re-derived.
     async fn replayed_wait(
         &mut self,
         key: EffectKey,
         spec: &AwaitSpec,
         cx: &CaseContext,
-    ) -> Result<Option<Tainted<Value>>, StepError> {
+    ) -> Result<Option<ReplayedWait>, StepError> {
         match self.cursor.next(key)? {
             Some(EffectReplay::Done {
                 output,
@@ -1156,11 +1266,11 @@ impl<'a> StepCtx<'a> {
                 spend,
             }) => {
                 self.bill(spend);
-                Ok(Some(Self::label_inbound(
+                Ok(Some(ReplayedWait::Recorded(Self::label_inbound(
                     output,
                     &spec.kind,
                     source.as_deref(),
-                )))
+                ))))
             }
             Some(EffectReplay::Refused { limit, used }) => {
                 Err(StepError::Budget(crate::core::BudgetExceeded::Recorded {
@@ -1180,10 +1290,22 @@ impl<'a> StepCtx<'a> {
             Some(EffectReplay::Failed { error, .. }) => {
                 Err(StepError::Effect(crate::core::EffectError::Rejected(error)))
             }
-            // A subscription with no delivery: the run is still waiting.
-            // Suspend again rather than re-registering.
+            // Announced, and *possibly* registered: a crash — or a transient
+            // store error — between the announcement and the subscription
+            // leaves exactly this record, and suspending without repairing
+            // would strand the run forever: later events buffer until they
+            // dead-letter while the run sleeps with nothing in the system
+            // naming it. A resume re-walks the registration path, which is
+            // idempotent end to end (the subscription keeps its first row,
+            // the task row derives its id from this same key), skipping only
+            // the announcement that already exists. A strict pass dispatches
+            // nothing and suspends as the record reads.
             Some(EffectReplay::Orphan { .. }) => {
-                Err(StepError::Suspended(self.suspend_reason(spec, cx).await?))
+                if self.mode == Mode::Resume {
+                    Ok(Some(ReplayedWait::Repair))
+                } else {
+                    Err(StepError::Suspended(self.suspend_reason(spec, cx).await?))
+                }
             }
             None if self.mode == Mode::Strict => Err(StepError::ReplayOverrun { actual: key }),
             None => Ok(None),
@@ -1843,9 +1965,32 @@ impl<'a> StepCtx<'a> {
                 Some(EffectReplay::Failed { error, .. }) => {
                     return Err(StepError::Effect(crate::core::EffectError::Rejected(error)));
                 }
-                // Armed but not yet fired: still asleep. Suspend again rather
-                // than re-arming, which would reset the clock every replay.
+                // Announced, and *possibly* armed: whether the arm landed is
+                // unknowable from the journal, because a crash — or a
+                // transient store error — between the announcement and the
+                // registration leaves exactly this record. Suspending without
+                // repairing would strand the run forever: no timer, no
+                // subscription, a released lease — nothing in the system ever
+                // names it again, and it looks precisely like work in
+                // progress. Re-arming is safe because `until` derives from
+                // journaled reads (the same instant on every pass) and `arm`
+                // keeps the first registration (a timer somebody may have
+                // claimed is never moved). A strict pass dispatches nothing,
+                // so only a resume repairs — strict still suspends here, which
+                // is the honest reading of a journal that ends mid-wait.
                 Some(EffectReplay::Orphan { .. }) => {
+                    if self.mode == Mode::Resume {
+                        timers
+                            .arm(&crate::core::Timer {
+                                run: self.run,
+                                case: self.case.as_ref().map(CaseContext::id),
+                                effect: key,
+                                step: self.step,
+                                phase: self.phase,
+                                fire_at: until,
+                            })
+                            .await?;
+                    }
                     return Err(StepError::Suspended(
                         crate::core::SuspendReason::AwaitingTime { until },
                     ));
@@ -1925,12 +2070,34 @@ impl<'a> StepCtx<'a> {
     /// replayed prefix the live pass's own record is the verdict, and this
     /// pass re-deriving the same refusal from the same labels is the
     /// deterministic zone agreeing with itself, not news.
+    ///
+    /// On that replayed prefix the record is also **consumed**. These gates
+    /// fire from code, on every mode, so the replay re-derives the refusal
+    /// before the dispatch path ever consults the cursor — and a record
+    /// nobody reads makes strict verification end with history left over,
+    /// reported as a quarantine about a divergence that never happened.
     async fn refuse_sink(
         &mut self,
         descriptor: &EffectDescriptor,
         denial: PolicyError,
     ) -> StepError {
         let key = self.next_effect_key(descriptor);
+        if self.mode.is_replaying() {
+            match self.cursor.next(key) {
+                // The verdict this pass just re-derived, as recorded.
+                Ok(Some(EffectReplay::Denied { .. })) => return denial.into(),
+                // History holds something else at this position: the recorded
+                // run dispatched where this build refuses.
+                Ok(Some(_)) => return StepError::ReplayOverrun { actual: key },
+                // Strict cannot refuse what history never met.
+                Ok(None) if self.mode == Mode::Strict => {
+                    return StepError::ReplayOverrun { actual: key };
+                }
+                // Past the frontier of a resume: a live decision, recorded below.
+                Ok(None) => {}
+                Err(e) => return e,
+            }
+        }
         if self.writes_enabled()
             && let Err(e) = self
                 .append_effect(
@@ -2012,13 +2179,23 @@ impl<'a> StepCtx<'a> {
     /// * **Authority-bearing fields** — a mutating sink either refuses all
     ///   untrusted arguments or declares protected JSON fields with explicit
     ///   trust, source, and sensitivity constraints.
+    ///
+    /// Both are judged over the *effective label at this sink*: the base label
+    /// improved by exactly the release marks whose destination names this
+    /// sink's identity. A release for `tool://ledger/transfer` moves nothing
+    /// at `tool://mail/send`.
     pub async fn sink<E: Effect>(
         &mut self,
         effect: E,
         args: &Tainted<Value>,
     ) -> Result<Tainted<E::Output>, StepError> {
         let sink_name = effect.descriptor().kind;
-        let label = args.label();
+        // The identity a destination-scoped release must name: the sink's
+        // provenance identity — `tool://server/name`, `model:provider/model` —
+        // the same exact name a `ProtectedField::from_sources` rule grants.
+        // One chokepoint, so a release cannot be "for the ledger" at one gate
+        // and "for tools generally" at another.
+        let sink_id = effect.source().to_string();
 
         let Some(bound) = effect.sink_arguments() else {
             return Err(PolicyError::UnboundSinkArguments { sink: sink_name }.into());
@@ -2026,6 +2203,16 @@ impl<'a> StepCtx<'a> {
         if canon::value_bytes(bound) != canon::value_bytes(args.peek()) {
             return Err(PolicyError::SinkArgumentsMismatch { sink: sink_name }.into());
         }
+
+        // The label these gates judge is the **effective label at this sink**:
+        // the base label improved by exactly the release marks granted for
+        // this destination. Everywhere outside a sink gate the base label
+        // speaks — a release is for a destination, not for storage — and this
+        // effective label is also what policy is asked over and what the
+        // dispatch journals as its outbound label, because it is the label the
+        // verdict was reached over.
+        let label = args.effective_label(&sink_id);
+        let label = &label;
 
         // Manifest-derived ceilings apply to **live dispatch only** — and
         // "live dispatch" is a property of the *cursor*, not of the mode.
@@ -2100,17 +2287,25 @@ impl<'a> StepCtx<'a> {
         // Checked here, before the announcement, so the refusal costs nothing —
         // and absent by default, because every deployment before this field had
         // no ceiling and silence must not start refusing their traffic.
+        //
+        // Judged over the **base** label, not the effective one: what may be
+        // written down is a storage question, and a release is for a
+        // destination, not for storage. A sensitivity release toward this sink
+        // does not make the bytes en route to the append-only chain any more
+        // erasable.
+        #[cfg(feature = "manifest")]
+        let stored = args.label().sensitivity;
         #[cfg(feature = "manifest")]
         if let Some(journal_ceiling) = self
             .manifest
             .as_ref()
             .filter(|_| manifest_gates)
             .and_then(|m| m.spec.security.max_sensitivity_journaled)
-            && label.sensitivity > journal_ceiling
+            && stored > journal_ceiling
         {
             let denial = PolicyError::JournalCeiling {
                 sink: sink_name,
-                actual: label.sensitivity,
+                actual: stored,
                 ceiling: journal_ceiling,
             };
             return Err(self.refuse_sink(&effect.descriptor(), denial).await);
@@ -2139,7 +2334,9 @@ impl<'a> StepCtx<'a> {
         #[cfg(not(feature = "manifest"))]
         let mutates = effect.mutates();
 
-        if let Err(refusal) = Self::enforce_protected_fields(&effect, args, sink_name, mutates) {
+        if let Err(refusal) =
+            Self::enforce_protected_fields(&effect, args, sink_name, &sink_id, mutates)
+        {
             // The whole-value taint gate and the per-field rules are sink
             // gates like the ceilings above, and their refusals are recorded
             // for the same reason.
@@ -2154,16 +2351,31 @@ impl<'a> StepCtx<'a> {
         self.effect_after_sink_gate(effect, Some(label)).await
     }
 
+    /// The whole-object taint gate and the per-field rules, judged over the
+    /// **effective label at this sink**: the base label improved by exactly
+    /// the release marks whose destination is `sink_id`, field-scoped marks
+    /// applying only to their fields. A mark granted toward a different sink
+    /// changes nothing here except the refusal's wording — the operator is
+    /// told the release exists and where it points, never its basis or
+    /// evidence.
     fn enforce_protected_fields<E: Effect>(
         effect: &E,
         args: &Tainted<Value>,
         sink_name: String,
+        sink_id: &str,
         mutates: bool,
     ) -> Result<(), StepError> {
-        let label = args.label();
         let protected = effect.protected_fields();
         if protected.is_empty() {
-            if mutates && label.is_untrusted() {
+            if mutates && args.effective_label(sink_id).is_untrusted() {
+                if let Some(mark) = misdirected_release(args, sink_id, "") {
+                    return Err(PolicyError::ReleaseDestination {
+                        sink: sink_name,
+                        granted: mark.destination().to_owned(),
+                        actual: sink_id.to_owned(),
+                    }
+                    .into());
+                }
                 return Err(PolicyError::TaintGate { sink: sink_name }.into());
             }
             return Ok(());
@@ -2171,7 +2383,7 @@ impl<'a> StepCtx<'a> {
 
         for field in protected {
             let path = field.path();
-            let Some(field_label) = args.label_at(path) else {
+            let Some(field_label) = args.effective_label_at(sink_id, path) else {
                 return Err(PolicyError::ProtectedFieldMissing {
                     sink: sink_name,
                     path: path.to_owned(),
@@ -2179,6 +2391,15 @@ impl<'a> StepCtx<'a> {
                 .into());
             };
             if field.requires_trusted() && field_label.is_untrusted() {
+                if let Some(mark) = misdirected_release(args, sink_id, path) {
+                    return Err(PolicyError::ProtectedFieldReleaseDestination {
+                        sink: sink_name,
+                        path: path.to_owned(),
+                        granted: mark.destination().to_owned(),
+                        actual: sink_id.to_owned(),
+                    }
+                    .into());
+                }
                 return Err(PolicyError::ProtectedFieldTaint {
                     sink: sink_name,
                     path: path.to_owned(),
@@ -2222,10 +2443,17 @@ impl<'a> StepCtx<'a> {
         Ok(())
     }
 
-    /// Improve a whole value's label, or selected structured field labels.
+    /// Grant a destination-scoped release over a whole value or selected
+    /// structured fields.
     ///
     /// The release is policy-authorized and permanently records the releaser,
-    /// basis, field scope, destination, evidence, and prior label. A selected
+    /// basis, field scope, destination, evidence, and prior label. It does
+    /// **not** relabel the value: it attaches release marks, and only the
+    /// sink whose identity equals the release's `destination` — the
+    /// provenance-style name, `tool://server/name`, `model:provider/model` —
+    /// computes an improved effective label from them. Everywhere else the
+    /// value keeps its base label: joined into other values, written to
+    /// memory, read as `label().trust`, it is still what it was. A selected
     /// field release is accepted only when the value was assembled with
     /// [`Tainted::object`](crate::core::Tainted::object) or
     /// [`Tainted::array`](crate::core::Tainted::array), so precision can never
@@ -2538,7 +2766,7 @@ impl<'a> StepCtx<'a> {
             Ok(output) => {
                 let json = serde_json::to_value(&output)?;
                 let spend = effect.spend(&output);
-                self.bill(spend);
+                self.bill_live(spend);
                 self.append_effect(
                     key,
                     RecordKind::EffectDone {
@@ -2558,7 +2786,7 @@ impl<'a> StepCtx<'a> {
                 // also have spent real money before dying. A stream cut off
                 // after five hundred tokens is billed for five hundred tokens.
                 let spend = e.spend();
-                self.bill(spend);
+                self.bill_live(spend);
                 // The disposition is recorded alongside the message because it
                 // is what every later decision reads — the retry taken now, and
                 // an operator's judgement afterwards. Messages get reworded;
@@ -2615,6 +2843,23 @@ impl<'a> StepCtx<'a> {
         }
         a
     }
+}
+
+/// The first release mark that covers `path`, would confer trust, and names a
+/// destination other than the sink at hand — the evidence for a refusal that
+/// can say "released, but not for here".
+///
+/// Only the two destinations reach the message; the release's basis and
+/// evidence stay in the journal, where an operator reads them and a probing
+/// model cannot.
+fn misdirected_release<'a>(
+    args: &'a Tainted<Value>,
+    sink_id: &str,
+    path: &str,
+) -> Option<&'a crate::core::ReleaseMark> {
+    args.label().releases.iter().find(|mark| {
+        mark.destination() != sink_id && mark.covers(path) && mark.scope().improves_trust()
+    })
 }
 
 /// A refusal the recorded run met, as the error this one meets.
@@ -3311,8 +3556,15 @@ impl StepCtx<'_> {
             .as_array()
             .ok_or_else(|| unusable("`memories` is not an array"))?
             .clone();
-        let mut written = Vec::with_capacity(proposals.len());
-        for proposal in proposals {
+        // The declared bound, enforced by the runtime rather than by the
+        // schema alone: `maxItems` above holds only where the `jsonschema`
+        // validator is in the build, and a declared ceiling that depends on a
+        // feature flag is a control that yields where nobody is looking. The
+        // truncation is silent toward the model on purpose — an over-long
+        // answer is not worth failing a run that has already paid for it, and
+        // which proposals survive is the declaration's order, first wins.
+        let mut written = Vec::with_capacity(proposals.len().min(formation.max_items));
+        for proposal in proposals.into_iter().take(formation.max_items) {
             let key = proposal["key"]
                 .as_str()
                 .ok_or_else(|| unusable("a proposal carries no string `key`"))?;
@@ -3934,10 +4186,16 @@ impl StepCtx<'_> {
         self.ordinal += 1;
 
         // ── Replay: the event is already in history ────────────────────────
-        if self.mode.is_replaying()
-            && let Some(recorded) = self.replayed_wait(key, spec, &cx).await?
-        {
-            return Ok(recorded);
+        // `repair` re-enters the registration below with the announcement
+        // skipped: the wait was announced and its registration may not have
+        // survived the crash that followed.
+        let mut repair = false;
+        if self.mode.is_replaying() {
+            match self.replayed_wait(key, spec, &cx).await? {
+                Some(ReplayedWait::Recorded(recorded)) => return Ok(recorded),
+                Some(ReplayedWait::Repair) => repair = true,
+                None => {}
+            }
         }
 
         let subscription = Subscription {
@@ -3958,20 +4216,24 @@ impl StepCtx<'_> {
         let now = subscription_clock();
 
         // Announce the wait before releasing the frame, so an event arriving in
-        // the same instant finds a durable subscription rather than a gap.
-        self.append_effect(
-            key,
-            RecordKind::EffectStarted {
-                descriptor,
-                recovery: crate::core::Recovery::Retry,
-                mutates: false,
-                attempt: 1,
-                backoff_ms: 0,
-                // An awaited inbound event binds no outbound value.
-                outbound_label: None,
-            },
-        )
-        .await?;
+        // the same instant finds a durable subscription rather than a gap. On
+        // a repair pass the announcement is the one record that provably
+        // survived — writing it again would report one wait as two.
+        if !repair {
+            self.append_effect(
+                key,
+                RecordKind::EffectStarted {
+                    descriptor,
+                    recovery: crate::core::Recovery::Retry,
+                    mutates: false,
+                    attempt: 1,
+                    backoff_ms: 0,
+                    // An awaited inbound event binds no outbound value.
+                    outbound_label: None,
+                },
+            )
+            .await?;
+        }
         events.subscribe(&subscription, now).await?;
 
         // Whatever must exist for a decision to attach to — a task row, say —
@@ -3979,9 +4241,13 @@ impl StepCtx<'_> {
         // is consulted. An answer arriving in this window finds both.
         before_suspend(key).await?;
 
-        // Look in the buffer: the event may already be here.
+        // Look in the buffer: the event may already be here. The journal
+        // write comes **before** the unsubscribe, because unsubscribing sheds
+        // the claimed row's payload — the journal holds the delivered copy
+        // from then on — and the old order left a crash window in which the
+        // payload existed nowhere: claimed and stripped in the buffer,
+        // never journaled. The delivery worker orders these two the same way.
         if let Some(buffered) = events.claim_for(&subscription, now).await? {
-            events.unsubscribe(self.run, key).await?;
             self.append_effect(
                 key,
                 RecordKind::EffectDone {
@@ -3991,6 +4257,7 @@ impl StepCtx<'_> {
                 },
             )
             .await?;
+            events.unsubscribe(self.run, key).await?;
             return Ok(Self::label_inbound(
                 buffered.event.payload,
                 &spec.kind,

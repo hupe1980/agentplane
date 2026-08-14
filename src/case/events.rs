@@ -99,7 +99,45 @@ pub trait EventStore: Send + Sync + Debug {
     ) -> Result<TargetedDelivery, StoreError>;
 
     /// Drop a subscription once it has been satisfied.
+    ///
+    /// Also the point where the buffer's copy of the run's **delivered**
+    /// payloads is shed. Stripping earlier — at the claim — would lose the
+    /// payload for a run that crashed between claim and resume, whose
+    /// recovery re-reads it from the buffer; unsubscribe is the run's own
+    /// signal that the wait is over, so the buffer row keeps only its
+    /// `(source, id)` identity for dedup from here on.
+    ///
+    /// That places an **ordering obligation on the caller**: journal the
+    /// delivered payload *before* unsubscribing. The delivery worker does —
+    /// it appends `EffectDone` and only then retires the subscription. A
+    /// caller that unsubscribes first has a crash window in which the buffer
+    /// copy is gone and the journal copy never landed, and recovery then
+    /// resumes the wait on a stripped row. What stripping here does **not**
+    /// cover: unclaimed and dead-lettered rows, which never reach an
+    /// unsubscribe and are erased through
+    /// [`erase_payload`](Self::erase_payload) instead.
     async fn unsubscribe(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError>;
+
+    /// Remove one buffered event's payload while keeping its identity.
+    ///
+    /// The erasure verb the buffer was missing. The buffer keeps its copy of
+    /// an inbound payload indefinitely — claimed rows stay for dedup, and
+    /// dead-lettered rows stay for the operator — so a message that becomes
+    /// the object of an erasure request had no path to erasure at all: the
+    /// journal's copy is key-erasable, the buffer's was immortal.
+    ///
+    /// The **row survives**; only the payload goes. Dedup needs exactly
+    /// `(source, id)`, so a replay of the erased message is still refused
+    /// rather than accepted as new — erasure must not reopen the door it
+    /// closed. Dead-letter entries likewise keep their identity, correlation
+    /// keys and reason, because "what went unclaimed and why" is operational
+    /// truth about the deployment, not the counterparty's content.
+    ///
+    /// What this does **not** cover: the journaled copy of a *delivered*
+    /// payload, which lives under the run's case and is erased by that case's
+    /// key; and the correlation keys, which are business identifiers the row
+    /// is filed under, not content. Returns whether a row existed.
+    async fn erase_payload(&self, source: &str, id: &str) -> Result<bool, StoreError>;
 
     /// Move events nobody claimed within the window to the dead-letter list.
     ///

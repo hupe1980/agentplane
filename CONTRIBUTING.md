@@ -76,11 +76,13 @@ Two outcomes are errors rather than skips, and both mean the row is testing
 nothing: an anchor that no longer matches, and a mutation that does not compile.
 The mutation has to *remove the guarantee*, not break the file.
 
-`just anchors` also checks that the README and the design document state the
-real number of mutations — a count drifted three times in one day before that
-was guarded. And it **refuses to answer** (exit 2) while a sweep is running,
-because a sweep holds one file mutated at a time and every anchor result in that
-window is false. A checker that answers wrongly is worse than one that declines.
+`just anchors` runs the cheap half of that constantly: a text-only pass proving
+every mutation's anchor still appears exactly once in the code it names — the
+code a mutation points at moves in routine refactors, and a drifted anchor
+leaves its guarantee silently unverified. And it **refuses to answer** (exit 2)
+while a sweep is running, because a sweep holds one file mutated at a time and
+every anchor result in that window is false. A checker that answers wrongly is
+worse than one that declines.
 
 **The first example must still build.** `just doc-examples` assembles the
 getting-started skill and wiring into a fresh crate and runs it, because
@@ -137,8 +139,8 @@ page's colours through `currentColor`, so it themes for free and costs nothing
 at runtime. Every one needs `<title>` and `<desc>` — a diagram a screen reader
 cannot read is decoration.
 
-`zola check` fails on a broken internal link *or anchor*, which is the check the
-prose most often gets wrong.
+`just site` runs `zola check`, which fails on a broken internal link *or
+anchor* — the check the prose most often gets wrong.
 
 ## 🧭 Finding your way
 

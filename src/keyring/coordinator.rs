@@ -121,9 +121,15 @@ where
 /// being nothing else: [`is_distributed`](ErasureCoordinator::is_distributed)
 /// answers `false`, so a plane sharing a store can refuse it at build.
 ///
-/// Per **scope**, not one lock for everything: erasing one subject must not
-/// serialise writes to another, and a single global lock would have made this
-/// adapter's throughput a function of how many subjects a tenant has.
+/// Per **scope**, not one lock for everything: two independent scopes never
+/// contend, so the granularity is whatever the caller's scopes encode. That
+/// is a capability, not a promise about any particular caller —
+/// [`EncryptedMemoryStore`](super::EncryptedMemoryStore) deliberately passes
+/// **one scope per tenant** (its id-addressed operations cannot know their
+/// subject without a racy lookup), so for that wrapper this coordinator
+/// behaves as a per-tenant lock and the finer granularity sits unused. A
+/// caller with genuinely finer scopes — per case, per subject — gets the
+/// finer lock for free.
 #[derive(Debug, Default)]
 pub struct LocalCoordinator {
     scopes:
@@ -270,10 +276,28 @@ impl ErasureCoordinator for PostgresCoordinator {
                 &[&Self::key(lease.scope())],
             )
             .await;
-        drop(client);
-        unlocked
-            .map(|_| ())
-            .map_err(|e| StoreError::Backend(e.to_string()))
+        match unlocked {
+            Ok(_) => {
+                drop(client);
+                Ok(())
+            }
+            Err(error) => {
+                // The unlock failed but the session may still be healthy —
+                // a statement timeout, a cancelled query — and a healthy
+                // session recycled into the pool **still holds the lock**:
+                // its next user runs unrelated queries on a connection that
+                // silently serialises every erasure on this scope, until the
+                // pool happens to retire it. Taking the connection out of the
+                // pool and dropping it closes the session, and PostgreSQL
+                // frees a dead session's advisory locks — so the failure path
+                // costs one connection instead of an invisible lock leak.
+                // What this does not cover: a network partition where the
+                // server never notices the client is gone keeps the lock until
+                // the server-side timeout reaps the session.
+                drop(deadpool_postgres::Object::take(client));
+                Err(StoreError::Backend(error.to_string()))
+            }
+        }
     }
 
     fn is_distributed(&self) -> bool {

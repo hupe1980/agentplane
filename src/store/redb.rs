@@ -594,6 +594,39 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// A lease expiry instant from a TTL, refusing what whole seconds cannot hold.
+///
+/// Lease timing here has whole-second granularity, so a TTL below one second is
+/// **refused rather than clamped**. The clamp this replaces turned "expire
+/// immediately" into "hold for a second" without telling anyone — a contract
+/// the runtime relies on, enforced only upstream. Nothing legitimate reaches
+/// this refusal: the runtime builder already refuses any TTL below its own
+/// two-second minimum at `build()` time. This is the *store's* boundary
+/// enforcement, for every other embedder of the trait — they get the same
+/// refusal instead of a silently longer lease. A TTL of 1.5s still truncates
+/// to one second; the granularity is the contract, and only the value that
+/// truncates to *zero* is a lie worth refusing.
+///
+/// The addition is checked, not assumed: `now + Duration::MAX` would wrap into
+/// the past and produce a lease that is born expired — free for anyone to
+/// claim while its owner believes it holds forever.
+fn lease_expiry(now: u64, ttl: Duration) -> Result<u64, StoreError> {
+    let secs = ttl.as_secs();
+    if secs == 0 {
+        return Err(StoreError::Backend(format!(
+            "a lease TTL of {ttl:?} is below this store's whole-second \
+             granularity and would round to zero — pass at least one second, \
+             or use the runtime's lease_ttl which enforces its own minimum"
+        )));
+    }
+    now.checked_add(secs).ok_or_else(|| {
+        StoreError::Backend(format!(
+            "a lease TTL of {ttl:?} overflows the expiry instant — the lease \
+             would wrap into the past and read as already expired"
+        ))
+    })
+}
+
 /// The last record of a run, or genesis.
 fn head_of(
     t: &impl ReadableTable<(&'static str, u64), &'static [u8]>,
@@ -888,7 +921,7 @@ impl JournalStore for RedbStore {
                 let epoch = {
                     let mut leases = w.open_table(RUN_LEASE).map_err(|e| be(&e))?;
                     let now = now_secs();
-                    let expires = now + ttl.as_secs().max(1);
+                    let expires = lease_expiry(now, ttl)?;
 
                     let existing = leases.get(key.as_str()).map_err(|e| be(&e))?.map(|v| {
                         let (o, e, x) = v.value();
@@ -955,6 +988,9 @@ impl JournalStore for RedbStore {
             {
                 let mut leases = w.open_table(RUN_LEASE).map_err(|e| be(&e))?;
                 let now = now_secs();
+                // Refused before the ownership check, so both backends answer
+                // a bad TTL the same way whatever state the lease is in.
+                let expires = lease_expiry(now, ttl)?;
                 let existing = leases.get(key.as_str()).map_err(|e| be(&e))?.map(|v| {
                     let (o, e, x) = v.value();
                     (o.to_owned(), e, x)
@@ -969,7 +1005,6 @@ impl JournalStore for RedbStore {
                     Some((held_by, held_epoch, expires_at))
                         if held_by == owner && held_epoch == epoch && expires_at > now =>
                     {
-                        let expires = now + ttl.as_secs().max(1);
                         leases
                             .insert(key.as_str(), (owner.as_str(), epoch, expires))
                             .map_err(|e| be(&e))?;
@@ -1054,9 +1089,16 @@ impl JournalStore for RedbStore {
                 if owner.is_empty() || expires_at > now {
                     continue;
                 }
-                if let Ok(run) = RunId::parse(&key[prefix.len()..]) {
-                    expired.push((expires_at, run));
-                }
+                // Corruption, per the contract on `JournalStore::abandoned_runs`
+                // and matching the shared-store backend: a stranded run
+                // silently dropped from this listing is never recovered, so an
+                // unparsable id is refused loudly rather than skipped.
+                let id = &key[prefix.len()..];
+                let run = RunId::parse(id).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("run_lease holds an unparsable run id '{id}': {e}"),
+                })?;
+                expired.push((expires_at, run));
             }
             // Oldest expiry first, so a bounded page cannot starve the run
             // that has been stranded longest behind fresher failures.
@@ -1162,13 +1204,26 @@ impl JournalStore for RedbStore {
                     break;
                 }
                 let (_, v) = entry.map_err(|e| be(&e))?;
-                // Keys are `tenant/run`; the caller asked for runs.
+                // Keys are `tenant/run`; the caller asked for runs. An entry
+                // that does not carry this tenant's prefix, or whose id does
+                // not parse, is corruption — reported rather than skipped,
+                // matching the shared-store backend, because a quarantined run
+                // silently thinned out of this page is the unreachable-signal
+                // failure the method exists to remove.
                 let key = v.value();
-                if let Some(id) = key.strip_prefix(prefix.as_str())
-                    && let Ok(run) = RunId::parse(id)
-                {
-                    out.push(run);
-                }
+                let id = key.strip_prefix(prefix.as_str()).ok_or_else(|| {
+                    StoreError::Corrupt {
+                        seq: 0,
+                        detail: format!(
+                            "run_by_outcome points at '{key}', which is outside tenant '{tenant}'"
+                        ),
+                    }
+                })?;
+                let run = RunId::parse(id).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("run_by_outcome holds an unparsable run id '{id}': {e}"),
+                })?;
+                out.push(run);
             }
             Ok(out)
         })
@@ -1340,5 +1395,94 @@ mod tests {
         assert_eq!(a.origin, "plane-1/acme");
         assert_eq!(b.origin, a.origin, "builder order changed the log's name");
         assert_eq!(c.origin, a.origin, "for_tenant is not idempotent");
+    }
+
+    /// A stored run id that does not parse is reported as corruption, not
+    /// silently thinned out of the listing.
+    ///
+    /// In here rather than in the integration suite because planting the
+    /// corrupt row takes the private tables: no public write path produces
+    /// one, which is exactly why a skip would hide it forever. The two
+    /// listings this pins are the two whose silent thinning is worst — a
+    /// stranded run dropped from `abandoned_runs` is never recovered, and a
+    /// quarantined run dropped from `runs_by_outcome` is a detected failure
+    /// whose signal reaches nobody.
+    ///
+    /// Each has a positive half first, so the error genuinely comes from the
+    /// garbage row rather than from a scan that refuses everything.
+    #[tokio::test]
+    async fn an_unparsable_run_id_is_reported_as_corruption_not_skipped() {
+        let store = RedbStore::open_in_memory().expect("store");
+        let stranded = RunId::generate();
+        let good_key = store.run_key(stranded);
+
+        // A legitimate expired lease and a legitimate outcome row: the
+        // positive halves.
+        store
+            .with_db({
+                let good_key = good_key.clone();
+                move |db| {
+                    let w = begin_write(db)?;
+                    {
+                        w.open_table(RUN_LEASE)
+                            .map_err(|e| be(&e))?
+                            .insert(good_key.as_str(), ("worker", 1u64, 0u64))
+                            .map_err(|e| be(&e))?;
+                        w.open_table(RUN_BY_OUTCOME)
+                            .map_err(|e| be(&e))?
+                            .insert(("default", "failed", 0u64), good_key.as_str())
+                            .map_err(|e| be(&e))?;
+                    }
+                    w.commit().map_err(|e| be(&e))?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("plant the healthy rows");
+        assert_eq!(
+            store.abandoned_runs(10).await.expect("a clean scan"),
+            vec![stranded]
+        );
+        assert_eq!(
+            store.runs_by_outcome("failed", 10).await.expect("a clean scan"),
+            vec![stranded]
+        );
+
+        // The garbage no correct writer produces.
+        store
+            .with_db(|db| {
+                let w = begin_write(db)?;
+                {
+                    w.open_table(RUN_LEASE)
+                        .map_err(|e| be(&e))?
+                        .insert("default/not-a-run-id", ("worker", 1u64, 0u64))
+                        .map_err(|e| be(&e))?;
+                    w.open_table(RUN_BY_OUTCOME)
+                        .map_err(|e| be(&e))?
+                        .insert(("default", "failed", 1u64), "default/not-a-run-id")
+                        .map_err(|e| be(&e))?;
+                }
+                w.commit().map_err(|e| be(&e))?;
+                Ok(())
+            })
+            .await
+            .expect("plant the corrupt rows");
+
+        let err = store
+            .abandoned_runs(10)
+            .await
+            .expect_err("an unparsable lease row must refuse the sweep, not vanish from it");
+        assert!(
+            matches!(err, StoreError::Corrupt { .. }),
+            "the refusal must be Corrupt, so it is promoted past retry logic: {err}"
+        );
+        let err = store
+            .runs_by_outcome("failed", 10)
+            .await
+            .expect_err("an unparsable outcome row must refuse the listing, not vanish from it");
+        assert!(
+            matches!(err, StoreError::Corrupt { .. }),
+            "the refusal must be Corrupt, so it is promoted past retry logic: {err}"
+        );
     }
 }

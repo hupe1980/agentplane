@@ -971,7 +971,7 @@ async fn an_untrusted_instruction_is_refused_before_the_model_sees_it() {
             // `Tainted::object` is what preserves the distinction.
             let prompt = Tainted::object([
                 (
-                    "system".to_owned(),
+                    "system",
                     if self.poisoned {
                         hostile.clone()
                     } else {
@@ -979,7 +979,7 @@ async fn an_untrusted_instruction_is_refused_before_the_model_sees_it() {
                     },
                 ),
                 (
-                    "messages".to_owned(),
+                    "messages",
                     Tainted::array([hostile.map(|h| json!({ "role": "user", "content": h }))]),
                 ),
             ]);

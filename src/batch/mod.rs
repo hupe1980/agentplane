@@ -141,6 +141,12 @@ pub enum ItemOutcome {
     /// suspension as a failure would send someone to investigate a run that is
     /// working exactly as designed.
     Suspended(String),
+    /// Paused at a ceiling. Not terminal, and deliberately not `Failed`: the
+    /// item's run is intact and stays open — an operator's two honest moves
+    /// are raise the ceiling and resume, or cancel — and a pause reported as
+    /// a fault teaches the reader to re-run work that is standing. The string
+    /// names the ceiling that was hit.
+    Exhausted(String),
 }
 
 impl ItemOutcome {
@@ -151,12 +157,13 @@ impl ItemOutcome {
             Self::Failed(_) => "failed",
             Self::Quarantined(_) => "quarantined",
             Self::Suspended(_) => "suspended",
+            Self::Exhausted(_) => "exhausted",
         }
     }
 
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
-        !matches!(self, Self::Suspended(_))
+        !matches!(self, Self::Suspended(_) | Self::Exhausted(_))
     }
 }
 
@@ -303,6 +310,8 @@ pub struct BatchCensus {
     pub failed: u64,
     pub quarantined: u64,
     pub suspended: u64,
+    /// Paused at a ceiling — resumable once somebody raises it.
+    pub exhausted: u64,
     /// Reserved with no outcome recorded — an item interrupted mid-flight.
     pub in_flight: u64,
     pub spend: Spend,

@@ -62,7 +62,8 @@ pub use identity::{
     Delegation, DelegationError, DelegationScheme, MAX_DELEGATION_DEPTH, Principal, Scope,
 };
 pub use label::{
-    Label, ProtectedField, Release, ReleaseScope, Sensitivity, SourceId, Tainted, Trust,
+    Label, ProtectedField, Release, ReleaseMark, ReleaseScope, Sensitivity, SourceId, Tainted,
+    Trust,
 };
 pub use plan::{ArgSource, Collaboration, PlanError, PlanIR, PlanNode, Topology};
 pub use policy::{

@@ -122,24 +122,29 @@ async fn this_crates_client_round_trips_against_the_reference_server() {
         .expect("the reference server refused a message this crate composed");
 
     // Their echo executor completes the task, so a successful round trip is a
-    // terminal state and not merely a 200.
+    // terminal state and not merely a 200. The completed state alone is the
+    // assertion: an earlier `|| body.get("task").is_some()` escape hatch
+    // passed for a task in *any* state, which is to say for any reply shaped
+    // like a task at all.
     let body = serde_json::to_value(&reply).expect("serialisable");
     assert!(
-        body.to_string().contains("TASK_STATE_COMPLETED") || body.get("task").is_some(),
-        "the reply did not carry the task the reference server produced: {body:#}"
+        body.to_string().contains("TASK_STATE_COMPLETED"),
+        "the reply did not carry the completed task the reference server \
+         produced: {body:#}"
     );
 }
 
-/// An unknown method is a *refusal*, not an unknown outcome.
+/// An unserved HTTP path is a *refusal*, not an unknown outcome.
 ///
-/// The disposition mapping is the half of a client with consequences, and it is
-/// the half a canned fixture cannot check honestly: a stub returns whatever the
-/// test author believed the peer would say. Here the error is the reference
-/// server's own, for a method it genuinely does not implement — and this crate
-/// must read it as *did not happen*, or a caller retries work that was never
-/// started, or abandons work that was.
+/// This is transport-level: the request never reached a JSON-RPC dispatcher at
+/// all, so the reference server answers with a bare 404 and no envelope. The
+/// client must read that as *did not happen* — nothing was routed, so nothing
+/// ran — or a mis-deployed endpoint URL turns every call into an abandoned
+/// outcome. This test was previously documented as "a method the reference
+/// server rejects", which it never was; the in-band method-not-found case is
+/// the test below.
 #[tokio::test]
-async fn a_method_the_reference_server_rejects_maps_to_a_disposition() {
+async fn an_unserved_http_path_is_did_not_happen() {
     let url = independent_server().await;
     let client = A2aClient::new(Endpoint::new(format!("{url}/nope"))).expect("client");
 
@@ -159,5 +164,41 @@ async fn a_method_the_reference_server_rejects_maps_to_a_disposition() {
         err.disposition(),
         Disposition::DidNotHappen,
         "a request the reference server never routed must be safe to retry: {err}"
+    );
+}
+
+/// The reference server answers an unknown method in-band, as JSON-RPC.
+///
+/// This crate's client can only *emit* the methods it implements, so a genuine
+/// method-not-found cannot be provoked through its public API — the request
+/// here goes over raw HTTP instead. What it pins is the reference server's
+/// half of the exchange: an unknown method comes back as a 200 carrying
+/// `error.code: -32601` (the raw numeral, spelled here rather than through any
+/// constant either side exports), not as a transport failure. That is the
+/// exact envelope this crate's `classify_rpc` maps to a clean refusal; the
+/// mapping itself is pinned by the client's own error-classification tests,
+/// not here.
+#[tokio::test]
+async fn the_reference_server_answers_an_unknown_method_in_band() {
+    let url = independent_server().await;
+    let response = reqwest::Client::new()
+        .post(&url)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "Frobnicate", "params": {},
+        }))
+        .send()
+        .await
+        .expect("the server is reachable");
+    assert!(
+        response.status().is_success(),
+        "an unknown method must be an in-band JSON-RPC error, not an HTTP \
+         failure: {}",
+        response.status()
+    );
+    let body: serde_json::Value = response.json().await.expect("a JSON-RPC envelope");
+    assert_eq!(
+        body["error"]["code"], -32601,
+        "the reference server did not answer method-not-found: {body:#}"
     );
 }

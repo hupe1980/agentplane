@@ -105,6 +105,17 @@ impl EncryptedMemoryStore {
     /// decide which lock to take is a read that races the very thing the lock
     /// protects — so the scope is the widest operation's scope, which is what
     /// the process-local mutex this replaced was already doing.
+    ///
+    /// The cost is stated rather than implied: `remember` takes this lock on
+    /// **every write**, so all of a tenant's memory writes serialise through
+    /// it, and the coordinator's per-scope granularity buys this wrapper
+    /// nothing — one tenant is one scope. That is a throughput ceiling, not a
+    /// safety gap. What the single scope does *not* protect: nothing — it is
+    /// strictly coarser than any finer scheme; what it forgoes is concurrency
+    /// between one tenant's unrelated subjects. A deployment for which that
+    /// ceiling matters needs id-addressed operations to learn their subject
+    /// transactionally before a finer scope is sound; until then, wider and
+    /// correct beats finer and racy.
     fn lifecycle_scope(&self) -> String {
         super::scope(&self.tenant, "memory-lifecycle")
     }
@@ -149,7 +160,12 @@ impl EncryptedMemoryStore {
         .map_err(|error| StoreError::Backend(error.to_string()))
     }
 
-    async fn open_item(&self, mut item: MemoryItem) -> Result<MemoryItem, StoreError> {
+    /// `Ok(None)` when the row's wrapping key was destroyed — a completed
+    /// erasure reporting itself, not a fault. Every other failure stays loud:
+    /// a row that is not an envelope, a wrong-length nonce, a ciphertext that
+    /// does not authenticate are all corruption someone must be paged about,
+    /// and folding them into the skip would make tampering read as erasure.
+    async fn open_item(&self, mut item: MemoryItem) -> Result<Option<MemoryItem>, StoreError> {
         let envelope: Envelope = serde_json::from_value(item.content).map_err(|_| {
             StoreError::Backend("encrypted memory row does not contain a valid envelope".to_owned())
         })?;
@@ -158,7 +174,11 @@ impl EncryptedMemoryStore {
                 "encrypted memory nonce has the wrong length".to_owned(),
             ));
         }
-        let key = self.keys.open(&envelope.wrapped).await.map_err(key_error)?;
+        let key = match self.keys.open(&envelope.wrapped).await {
+            Ok(key) => key,
+            Err(KeyError::Destroyed { .. }) => return Ok(None),
+            Err(error) => return Err(key_error(error)),
+        };
         let plain = Self::cipher(&key)
             .decrypt(
                 envelope.nonce.as_slice().into(),
@@ -177,7 +197,7 @@ impl EncryptedMemoryStore {
             .map_err(|error| StoreError::Backend(error.to_string()))?;
         item.content = plain.content;
         item.derived_from = plain.derived_from;
-        Ok(item)
+        Ok(Some(item))
     }
 
     async fn backing_selection(&self, source: &Selected) -> Result<Selected, StoreError> {
@@ -191,7 +211,14 @@ impl EncryptedMemoryStore {
                     source.id, source.version
                 ))
             })?;
-        let opened = self.open_item(stored.clone()).await?;
+        // An erased source cannot anchor new lineage: deriving from a version
+        // whose key is destroyed would commit to content nobody can verify.
+        let opened = self.open_item(stored.clone()).await?.ok_or_else(|| {
+            StoreError::Backend(format!(
+                "derived memory source '{}' version {} was erased",
+                source.id, source.version
+            ))
+        })?;
         if opened.selection_digest() != source.digest {
             return Err(StoreError::Backend(format!(
                 "derived memory source '{}' version {} changed",
@@ -216,15 +243,17 @@ impl EncryptedMemoryStore {
         reason: &str,
     ) -> Result<usize, StoreError> {
         super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
-            let current = self
-                .inner
-                .recall(&Recall::about(subject).limit(usize::MAX))
-                .await?;
-            for item in &current {
-                if self.inner.legal_hold(&item.id).await? {
+            // The subject's ids, enumerated by the dedicated erasure-path
+            // operation rather than by a recall with an enormous limit. A
+            // recall is a bounded content query, and a backend may cap or
+            // refuse extreme limits — the PostgreSQL store refuses anything
+            // past BIGINT — so an erasure riding one either failed outright or
+            // silently checked holds for a truncated page of the subject.
+            let ids = self.inner.subject_ids(subject).await?;
+            for id in &ids {
+                if self.inner.legal_hold(id).await? {
                     return Err(StoreError::Backend(format!(
-                        "memory '{}' is under legal hold",
-                        item.id
+                        "memory '{id}' is under legal hold"
                     )));
                 }
             }
@@ -236,7 +265,7 @@ impl EncryptedMemoryStore {
                 Ok(count) => Ok(count),
                 Err(error) => {
                     tracing::warn!(%subject, %error, "memory key was destroyed but ciphertext cleanup failed");
-                    Ok(current.len())
+                    Ok(ids.len())
                 }
             }
         })
@@ -272,18 +301,37 @@ impl MemoryStore for EncryptedMemoryStore {
         .await
     }
 
+    // The read paths follow the skip-sealed convention SealedJournal and
+    // SealedCases set: a row whose wrapping key was **destroyed** is a
+    // completed erasure, and a completed erasure must not turn every later
+    // query about the subject into a persistent error — which is exactly what
+    // happens when `erase_subject` destroys the key and the ciphertext
+    // cleanup then fails. Destroyed rows are silently absent from `recall`
+    // and `derivatives`, and `version` answers `None` as it does for any
+    // erased version. What the skip does **not** cover: rows that are not
+    // valid envelopes, wrong-length nonces, ciphertext that fails to
+    // authenticate, and an unreachable key ring all stay loud, because those
+    // are faults to page about rather than erasures reporting themselves.
     async fn recall(&self, query: &Recall) -> Result<Vec<MemoryItem>, StoreError> {
         let items = self.inner.recall(query).await?;
         let mut opened = Vec::with_capacity(items.len());
         for item in items {
-            opened.push(self.open_item(item).await?);
+            if let Some(item) = self.open_item(item).await? {
+                opened.push(item);
+            }
         }
         Ok(opened)
     }
 
+    async fn subject_ids(&self, subject: &str) -> Result<Vec<String>, StoreError> {
+        // Ids are metadata and never sealed, so there is nothing to open —
+        // and erasure needs this to work *after* the subject's key is gone.
+        self.inner.subject_ids(subject).await
+    }
+
     async fn version(&self, id: &str, version: u64) -> Result<Option<MemoryItem>, StoreError> {
         match self.inner.version(id, version).await? {
-            Some(item) => self.open_item(item).await.map(Some),
+            Some(item) => self.open_item(item).await,
             None => Ok(None),
         }
     }
@@ -306,7 +354,9 @@ impl MemoryStore for EncryptedMemoryStore {
         let items = self.inner.derivatives(id).await?;
         let mut opened = Vec::with_capacity(items.len());
         for item in items {
-            opened.push(self.open_item(item).await?);
+            if let Some(item) = self.open_item(item).await? {
+                opened.push(item);
+            }
         }
         Ok(opened)
     }

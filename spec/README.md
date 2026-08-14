@@ -26,13 +26,17 @@ them is checked too:
 
 | Spec | Result | State space |
 |---|---|---|
-| `EffectProtocol` | verified | 113 distinct states, depth 16 |
+| `EffectProtocol` | verified | 113 distinct states |
 | `RetrySafety` | verified | 493 distinct states |
 | `Saga` | verified | 63 distinct states |
-| `EffectGroup` | verified | 39 distinct states |
-| `Fencing` | verified | 1171 distinct states |
-| `Authorization` | verified | 13 distinct states |
+| `EffectGroup` | verified | 110 distinct states |
+| `Fencing` | verified | 231 distinct states |
+| `Authorization` | verified | 32 distinct states |
 | `Delegation` | verified | 9510 distinct states |
+
+The counts are TLC's `distinct states found`, and the command below is what
+derives them — if a number here disagrees with what it prints, the number
+here is the one that is wrong:
 
 ```sh
 spec/verify.sh          # Docker; no local Java needed
@@ -71,9 +75,12 @@ specific invariant written for it (see [`mutations.py`](mutations.py)):
 | Gated members released before the frontier is reached at all | `EffectGroup` | `DeferredOnlyPastTheFrontier` |
 | The gate opens while the atomic members are still uncommitted | `EffectGroup` | `TransactionPrecedesTheGate` |
 | A group unwinds after a gated member has already externalised | `EffectGroup` | `NoUnwindPastAnExternalisedDeferred` |
+| A deferred failure after the atomic members committed aborts anyway | `EffectGroup` | `AbortIsComplete` |
+| A deferred member that externalised itself before failing aborts anyway | `EffectGroup` | `NoUnwindPastAnExternalisedDeferred` |
 | A group left open is committed rather than taken back | `EffectGroup` | `NoSilentCommit` |
 | A group reports aborted with a landed member never taken back | `EffectGroup` | `AbortIsComplete` |
 | Store accepts a write without checking the epoch | `Fencing` | `EpochsNeverRegress` |
+| A renewal bumps the epoch as if it had taken the lease over | `Fencing` | `RenewalPreservesOwnership` |
 | A delegate is granted authority its delegator does not hold | `Delegation` | `ScopeNeverWidens` |
 | A chain loaded from storage is trusted rather than re-checked | `Delegation` | `RehydratedChainsAreWellFormed` |
 | Policy is re-evaluated while replaying a recorded run | `Authorization` | `ReplayNeverConsultsPolicy` |
@@ -199,9 +206,13 @@ which is why this spec can talk about completeness at all.
   precedes the first. An earlier version said "only for a committed group" and
   TLC rejected it in five states.
 - `AbortIsComplete` — an aborted group has nothing standing: every member that
-  landed was taken back, and no gated member ever ran. This is the half that
-  makes deferral worth having, and the one that catches a group reporting
-  *discharged* while a hold is still in place.
+  landed was taken back, no gated member ever ran, and the atomic members never
+  committed. The third conjunct is the atomic form of the same lie — a
+  transaction's writes are permanent and have no registered reversal, so
+  "aborted" over a committed transaction is the journal saying *taken back
+  whole* over a ledger row that stands. This is the half that makes deferral
+  worth having, and the one that catches a group reporting *discharged* while a
+  hold is still in place.
 - `NoSilentCommit` — a group nobody settled does not commit. The safe reading of
   a forgotten group is that it was never meant to take; the alternative makes
   the most consequential outcome the one an author gets by writing nothing.
@@ -249,6 +260,14 @@ something quietly stopped, and nothing but running it would have said so.
   `EffectStarted` is already the evidence that it was allowed, and journaling
   "yes" beside every call doubles the log to say nothing.
 
+Denial is an initial-state *choice* (`banned \in SUBSET Forbidden`), not a
+constant fate: the run that permits everything reaches `done` and replays to
+`ReplayFinish`, the run with a refusal stops at `LiveDeny` and replays to
+`ReplayDenied`. With an unconditional `Forbidden = {3}` every live run was
+forced into the denial, `done` was unreachable, and `LiveFinish` /
+`ReplayFinish` were dead transitions TLC never exercised — see
+[`Authorization.cfg`](Authorization.cfg).
+
 **`Delegation`**
 
 - `ScopeNeverWidens` — authority only narrows as it is passed on. A delegate that
@@ -258,24 +277,46 @@ something quietly stopped, and nothing but running it would have said so.
   rather than trusted. Storage is not an authority: a chain that was valid when
   written and a chain that was edited afterwards look identical on the way in.
 - `NoLinkExceedsTheOwner` — no link anywhere in a chain holds more than the
-  original owner did, not merely more than the link before it. Checking only
-  adjacent pairs would let authority be laundered across several hops that each
-  look like a narrowing.
+  original owner did. Mathematically this adds nothing: subset containment is
+  transitive, so it is implied by `ScopeNeverWidens` — authority *cannot* be
+  laundered across hops that each genuinely narrow. It is stated separately
+  because it is the question an auditor actually asks ("could this agent have
+  done something the person who authorized it could not?"), asked directly
+  against the owner rather than reconstructed hop by hop — and because it must
+  keep holding for any chain that reaches the model by a path the adjacent-pair
+  check did not walk.
 - `DepthIsBounded` — the chain cannot grow without limit.
 
 **`Fencing`**
 
 - `EpochsNeverRegress` — a superseded owner never appends after a takeover.
-- `SingleCurrentOwner` — at most one instance believes it holds the current
-  epoch.
+- `SingleCurrentOwner` — at most one instance holds the current epoch, stated
+  over the *same predicate the store's fence enforces on writes* — so it reads
+  "at most one instance can append", not "a value pattern holds". (It used to
+  be guarded with `leaseEpoch > 0` while `Write` accepted `held[i] >=
+  leaseEpoch`, which let two instances interleave epoch-0 appends the invariant
+  was worded to ignore.)
 - `NoWriteAboveCurrentEpoch` — nothing in the journal was written under an epoch
-  the store had already moved past.
+  the store had already moved past, or never issued.
+- `RenewalPreservesOwnership` — a renewal never moves the epoch or the owner:
+  the epoch counts takeovers, exactly, and a live lease is held by the instance
+  whose remembered epoch is current. Acquire and renew are different verbs with
+  different failure modes (`src/journal/store.rs`): `acquire` is a pure claim
+  that always bumps the epoch and refuses even the holder's own live lease;
+  `renew` extends a lease still verifiably held — same owner, same epoch,
+  unexpired, unreleased — and never bumps, because a bump would fence the owner
+  against its own in-flight writes. The `RenewAsAcquire` mutant is the spec-side
+  twin of the Rust test `a_live_lease_blocks_takeover_and_says_so_precisely`
+  (`tests/engine/recovery.rs`), which pins the same split in the implementation.
 
 The interesting state is not a clean handover. It is the instance that was
-paused by GC or a partition, was declared dead, had its run taken over, and then
-wakes up still believing it owns the run — and tries to keep writing. `Write`'s
-epoch guard *is* the store's in-transaction check: there is no window between
-"am I still the owner?" and the write, because there is no gap to slip into.
+paused by GC or a partition, had its lease lapse, had its run taken over, and
+then wakes up still believing it owns the run — and tries to keep writing.
+`Write`'s epoch guard *is* the store's in-transaction check
+(`src/store/redb.rs`: `if epoch != current`), and it is exact equality: a stale
+epoch is fenced, and an epoch above the store's is a writer inventing authority.
+There is no window between "am I still the owner?" and the write, because there
+is no gap to slip into.
 
 ## Running them
 
@@ -302,7 +343,31 @@ java -cp tla2tools.jar tlc2.TLC -config spec/EffectProtocol.cfg spec/EffectProto
 | `MaxAttempts` | 3 | Reaches retry-after-retry, where an off-by-one in the attempt bound shows up |
 | `StepCount` (saga) | 6 | Three compensatable steps *above* both stoppers, so a run can compensate more than one and the ordering invariants have something to constrain |
 | `Instances` | `{1, 2}` | Split-brain is a property of "more than one writer" |
-| `MaxSteps` | 6 | Enough for acquire → write → takeover → zombie write |
+| `MaxSteps` | 6 | Enough for acquire → renew → write → lapse → takeover → write, and for the fenced zombie attempt after a takeover |
+
+## Liveness
+
+Safety is what these models exist for, but each one also states its liveness
+assumptions explicitly rather than leaving them implied:
+
+- `EffectProtocol`, `RetrySafety`, `Saga`, `EffectGroup` assume weak fairness
+  over `Next` and check termination (`Terminates` / `AlwaysSettles`): every
+  run reaches a recorded outcome, with `quarantined` counting as one.
+- `Authorization` assumes weak fairness over `Next` and checks `Settles`: a
+  run — and its replay, if one starts — comes to rest at `stopped` or `done`.
+- `Fencing` assumes weak fairness over `Next` and checks `RunsItsCourse`: no
+  interleaving of acquire/renew/expire/write livelocks short of the step bound.
+- `Delegation` assumes weak fairness on `Store` and on the load verdict
+  (`Rehydrate \/ RejectRehydrate` — one of the two is enabled in every stored
+  state) and checks `EveryChainIsJudged`: a chain that is built is eventually
+  stored and then accepted or refused, however storage is tampered with.
+
+The fairness conjuncts are scheduling assumptions about the runtime, not
+correctness claims; the comments beside each `Spec` say exactly what is being
+assumed. The append-only temporal properties (`JournalIsAppendOnly`,
+`WorldIsAppendOnly`, `UndoIsAppendOnly`, `ReversalIsAppendOnly`) check *prefix
+equality*, not merely length — a history that swapped one record for another
+at the same length would still be a rewritten history.
 
 These are small models. They rule out design errors in the interleavings, not
 implementation errors in the Rust — that is what the tests are for.

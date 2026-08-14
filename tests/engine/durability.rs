@@ -352,6 +352,98 @@ async fn strict_replay_rejects_a_build_that_does_something_different() {
     );
 }
 
+/// Performs a knob-controlled number of read-only effects and then reports
+/// failure — `VariableEffects` for the early-stop path, where the run never
+/// reaches the ready loop's end-of-run consumption check.
+#[derive(Debug)]
+struct FailsAfterEffects {
+    count: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Skill for FailsAfterEffects {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("fails-after").provides("demo.fails-after")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, agentplane::core::SkillError> {
+        let n = self.count.load(Ordering::SeqCst);
+        for i in 0..n {
+            let arguments = Tainted::trusted(Value::Null);
+            cx.sink(
+                Recorded::new(format!("prep-{i}"))
+                    .read_only()
+                    .counter(Arc::clone(&self.calls)),
+                &arguments,
+            )
+            .await
+            .map_err(agentplane::core::SkillError::Step)?;
+        }
+        Ok(Outcome::fail("the objective was not met"))
+    }
+}
+
+/// A strict pass that stops early still checks what it never consumed.
+///
+/// The end-of-run unconsumed check lives in the ready loop's normal drain, and
+/// a run that *failed* never drains normally — it leaves through the early
+/// stop. A build performing fewer effects than the record therefore sailed
+/// through strict verification of any failed run: the pass re-ran the step,
+/// requested nothing, met the recorded failure, and returned `Failed` as
+/// "verified" over two journaled effects it had never even asked about. The
+/// positive half is the same replay with the knob honest: a genuinely
+/// unchanged build verifies the failed run quietly, so the check is proven to
+/// fire on divergence rather than on failure itself.
+#[tokio::test]
+async fn a_strict_pass_that_stops_early_still_checks_unconsumed_effects() {
+    let count = Arc::new(AtomicUsize::new(2));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let rt = Runtime::builder(store())
+        .skill(FailsAfterEffects {
+            count: Arc::clone(&count),
+            calls: Arc::clone(&calls),
+        })
+        .build();
+
+    let first = rt
+        .run("fails-after", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(matches!(first.status, RunStatus::Failed(_)));
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "both effects ran live");
+
+    // The honest build first: strict verification reproduces the recorded
+    // failure without performing anything, and without complaint.
+    let verified = rt.replay(first.run_id, Mode::Strict).await.unwrap();
+    assert!(
+        matches!(verified.status, RunStatus::Failed(_)),
+        "an unchanged build must verify the failed run quietly: {:?}",
+        verified.status
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "verification performs nothing");
+
+    // Shipped change: the step now fails immediately, requesting neither of
+    // the two effects the journal holds.
+    count.store(0, Ordering::SeqCst);
+    let replayed = rt.replay(first.run_id, Mode::Strict).await.unwrap();
+    match replayed.status {
+        RunStatus::Quarantined(msg) => assert!(
+            msg.contains("never requested"),
+            "the finding must name the first unconsumed effect: {msg}"
+        ),
+        other => panic!(
+            "a build performing fewer effects than the record passed strict \
+             verification of a failed run — the early stop skipped the \
+             consumption check: {other:?}"
+        ),
+    }
+}
+
 /// **Exactly-once is a database invariant.**
 ///
 /// Not a code path someone might forget to call: the unique index rejects a
@@ -406,9 +498,10 @@ async fn a_fenced_writer_cannot_append() {
     let s = RedbStore::open_in_memory().unwrap();
     let run = RunId::generate();
 
-    // Instance A takes a lease that expires immediately.
+    // Instance A takes the shortest lease the store serves — a zero TTL is
+    // refused outright now, not clamped up to a second — and lets it lapse.
     let a = s
-        .acquire(run, "instance-a", std::time::Duration::from_secs(0))
+        .acquire(run, "instance-a", std::time::Duration::from_secs(1))
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
@@ -579,7 +672,7 @@ async fn release_is_journaled_with_its_evidence() {
                         ReleaseScope::trust(),
                         "operator approved for settlement export",
                         "run.output",
-                        ["approval:SET-42".to_owned()],
+                        ["approval:SET-42"],
                     ),
                 )
                 .await
@@ -605,7 +698,10 @@ async fn release_is_journaled_with_its_evidence() {
         } => {
             release.basis().contains("operator approved")
                 && label.is_untrusted()
-                && !result_label.is_untrusted()
+                // A release attaches a destination-scoped mark; the base
+                // label stays untrusted everywhere but the named sink.
+                && result_label.is_untrusted()
+                && !result_label.releases.is_empty()
                 && *value
                     == agentplane::core::Digest::of(
                         &serde_json::to_vec(&json!("s")).expect("serialize fixture"),
@@ -715,7 +811,7 @@ async fn strict_replay_writes_nothing() {
                         ReleaseScope::trust(),
                         "approved",
                         "run.output",
-                        ["approval:test".to_owned()],
+                        ["approval:test"],
                     ),
                 )
                 .await?;

@@ -81,21 +81,15 @@ Delegate(s) ==
     /\ chain' = Append(chain, s)
     /\ UNCHANGED <<stored, rehydrated, phase>>
 
-(* Attempt to delegate to a WIDER scope. Refused: the chain does not change.  *)
-(*                                                                           *)
-(* Modelled explicitly rather than merely omitted, so the escalation attempt  *)
-(* is reachable in the state graph and the invariant has something to be      *)
-(* true about.                                                                *)
-AttemptWiden(s) ==
-    /\ phase = "building"
-    /\ ~(s \subseteq chain[Len(chain)])
-    /\ UNCHANGED vars
-
-(* Attempt to delegate past the depth cap. Also refused.                     *)
-AttemptTooDeep(s) ==
-    /\ phase = "building"
-    /\ Depth(chain) >= MaxDepth
-    /\ UNCHANGED vars
+(* There are deliberately NO `AttemptWiden` / `AttemptTooDeep` actions. Both  *)
+(* existed once, as `UNCHANGED vars` no-ops "so the refused attempt is        *)
+(* reachable in the state graph" — but a transition that changes nothing is   *)
+(* indistinguishable from the stuttering `[][Next]_vars` already permits: it  *)
+(* added zero states and the invariants were never asked anything by it. The  *)
+(* escalation attempt is made real by the `DelegateCanWiden` mutant, which    *)
+(* strips the subset guard from `Delegate` so the widening actually lands —   *)
+(* and `ScopeNeverWidens` must kill it. A decorative twin inside the spec     *)
+(* would only look like coverage.                                             *)
 
 -----------------------------------------------------------------------------
 (*                      STORAGE, TAMPERING, REHYDRATION                      *)
@@ -140,15 +134,27 @@ RejectRehydrate ==
 
 Next ==
     \/ \E s \in SUBSET Grants : Delegate(s)
-    \/ \E s \in SUBSET Grants : AttemptWiden(s)
-    \/ \E s \in SUBSET Grants : AttemptTooDeep(s)
     \/ Store
     \/ \E i \in 1 .. 4, s \in SUBSET Grants : Tamper(i, s)
     \/ Rehydrate
     \/ RejectRehydrate
     \/ (phase \in {"loaded", "rejected"} /\ UNCHANGED vars)
 
+(* The liveness ASSUMPTIONS, stated explicitly rather than implied:           *)
+(*                                                                           *)
+(*   * WF on `Store` — a chain being built is eventually stored; the runtime  *)
+(*     does not delegate forever without ever using the chain.                *)
+(*   * WF on the load verdict — a stored chain is eventually judged. One of   *)
+(*     `Rehydrate` / `RejectRehydrate` is enabled in every stored state       *)
+(*     (`WellFormed` either holds or it does not), so fairness over their     *)
+(*     disjunction says the load path eventually answers even while storage   *)
+(*     keeps being tampered with.                                             *)
+(*                                                                           *)
+(* Both are scheduling assumptions about the runtime, not correctness claims; *)
+(* `EveryChainIsJudged` below is what they buy.                               *)
 Spec == Init /\ [][Next]_vars
+             /\ WF_vars(Store)
+             /\ WF_vars(Rehydrate \/ RejectRehydrate)
 
 -----------------------------------------------------------------------------
 (*                              INVARIANTS                                   *)
@@ -184,5 +190,15 @@ Safety ==
     /\ NoLinkExceedsTheOwner
     /\ DepthIsBounded
     /\ RehydratedChainsAreWellFormed
+
+-----------------------------------------------------------------------------
+(*                          TEMPORAL PROPERTIES                              *)
+-----------------------------------------------------------------------------
+
+(* Every chain that is built is eventually stored and judged — accepted or    *)
+(* refused — however storage is tampered with in between. Rules out the load  *)
+(* path that never answers, and makes "rejected" an ending the model must     *)
+(* actually reach rather than merely name.                                    *)
+EveryChainIsJudged == <>(phase \in {"loaded", "rejected"})
 
 =============================================================================

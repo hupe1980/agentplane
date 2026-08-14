@@ -275,8 +275,11 @@ Until something runs on a clock, a deadline is a number in a table and an
 unclaimed event is a row nobody reads. That is the failure this runtime is built
 against — not a crash, but a silence.
 
-One tick, six findings — four of them loud, and the first two routine healing
-that still means something died:
+One tick, eight findings — not all of them alarms, and the first two routine
+healing that still means something died. Recovery runs first, because an
+abandoned run may be one step from meeting a deadline the passes below would
+otherwise breach; then deadlines, task windows, event redelivery and
+dead-lettering, and finally timers:
 
 | Finding | What happens |
 |---|---|
@@ -286,14 +289,34 @@ that still means something died:
 | An obligation passed unmet | `DeadlineTransition` → `Breached`; the **case** is escalated |
 | A task's window closed | The declared `on_expiry` is applied |
 | An event nobody claimed aged out | Dead-lettered with a reason |
+| A sleeping run's instant arrived | The run is woken; reported as `timers_fired` |
+| A wake was recorded but the resume died | Reported as `wake_failures`; the lease lapses and the recovery pass picks the run up on a later tick |
 
 `now` is passed in rather than read, so the caller controls the clock. That keeps
 the sweeper testable at all, and lets a simulation drive a year of obligations
 through in milliseconds.
 
-Every field of `SweepReport` is a number worth alerting on. `is_quiet()` is the
-useful predicate: a healthy plane sweeps silently, so a non-silent sweep means
-something happened.
+Not every field of `SweepReport` is an alarm, and not all of them are numbers.
+`timers_fired` is the system working — its own documentation says not to alert
+on it — and `runs_recovered` is routine healing whose real message is that an
+instance died. `saturated` is a set of flags saying which passes came back full
+and so may not have seen everything that was waiting; `record` names the sealed
+run holding the tick's own evidence, when the tick did anything. Two fields sit
+apart from the counters. `evidence_lost` is the most serious thing the report
+can carry: the tick decided something — obligations breached, cases escalated —
+and the durable, tamper-evident account of who decided that and when could not
+be written. `census_unavailable` means the gauges could not be read this tick,
+so the census in the report is a default rather than a reading — a blind spot
+wearing a zero.
+
+`needs_attention()` is the alerting predicate, and it enumerates exactly what a
+human should see: `breached`, `tasks_expired` or `dead_lettered` above zero, any
+saturated pass, `recovery_failures` or `wake_failures` above zero,
+`evidence_lost`, and `census_unavailable`. Recoveries that *succeeded* stay off
+that list — they are the plane healing, findable in the report and in the
+sweep's own run. `is_quiet()` is the broader predicate: a healthy plane sweeps
+silently, so a non-silent sweep means something happened, even when it was only
+the system working.
 
 ### The recovery pass: who resumes a crashed run
 
@@ -399,8 +422,12 @@ backlog to everybody. The test that should have caught it compared the
 vocabulary against the routes its own walk exercised, and that walk did not call
 `/runs` either: two omissions that cancelled, agreeing forever. Enumerate the
 vocabulary when writing rules, and grant `api:run.list` and `api:case.list`
-explicitly — they are the two read verbs an on-call person needs and the two an
-allowlist built from route names alone will miss.
+explicitly — they are the two read verbs an on-call person needs and two that an
+allowlist built from route names alone will miss. `api:task.takeover` is a third
+to place deliberately: displacing an absent colleague's claim is its own verb
+rather than a widened `api:task.claim`, precisely so a policy set can hand it to
+a queue lead without handing displacement to every reviewer — and a rule set
+that never mentions it has quietly made takeover impossible for everybody.
 
 The general rule is worth stating because it is easy to satisfy accidentally and
 easy to lose: a control that notices and does not deliver is closer to none than
@@ -446,6 +473,13 @@ three-way, and the middle answer is the one worth trusting the tooling for:
 reporting itself, counted and never a finding — and **lost**, which is the only
 one that pages. A drill that alarmed on erasure would teach you its findings
 are noise, and that is how a real loss gets ignored six months later.
+
+The same rehearsal has a CLI verb for deployments that never write Rust:
+`agentplane drill` opens the store the flags name, prints the report as JSON,
+and exits non-zero **only on loss** — erased-by-design counts stay informative.
+A store file holds no blob backend and no key ring, so those halves land in
+the report's unchecked list rather than being silently passed; the library
+call on the running plane remains the complete form.
 
 `audit` prints the report as JSON and exits non-zero on findings — but **not** on
 `not_checked`, which is a separate list and the one worth reading. An audit given
@@ -735,7 +769,7 @@ JSON logs, a test recorder — without the crate choosing an exporter.
 
 ```
 agentplane.run                     gen_ai.operation.name = invoke_agent
-└── agentplane.step                agentplane.step.id, .capability, .phase
+└── agentplane.step                agentplane.step.id, .capability; agentplane.phase
     └── agentplane.effect          .kind, .attempt, .mutates, .replayed
                                    gen_ai.operation.name = execute_tool | chat
 ```
@@ -796,6 +830,28 @@ author's intent, not the runtime's behaviour.
 
 Feature `http`, off by default. A library embedded in someone else's process
 should not open a port unless asked.
+
+### Serving it
+
+Embedders wire `Api` into their own process; the `agentplane` binary's `serve`
+verb does the same wiring from flags, hosting exactly one manifest per process
+with its journal on disk (`--store`). The peer surface binds to `--addr`
+(default `127.0.0.1:8080` — loopback until you say otherwise), and the operator
+surface this section documents is opt-in beside it: `--operator-addr` puts the
+worklist, task decisions and `GET /runs?outcome=quarantined` on its **own**
+listener, so a network policy can treat the two audiences differently.
+`--policy` names the Cedar policy set and has no default, because a permissive
+engine and no engine are the same behaviour and only one of them looks
+governed; `--tokens` names the bearer tokens of the callers this plane accepts.
+`--sweep-every` sets how often deadlines, task expiry, dead letters and due
+timers are swept, and `0` runs the sweep from your own scheduler instead.
+`--push-host` permits A2A push notifications to that exact host and is
+repeatable — without one, push is not wired and the Agent Card advertises it as
+absent rather than claiming a capability nothing serves. Every flag but
+`--push-host` is also an environment variable (`AGENTPLANE_ADDR`,
+`AGENTPLANE_OPERATOR_ADDR`, `AGENTPLANE_POLICY`, `AGENTPLANE_TOKENS`,
+`AGENTPLANE_SWEEP_EVERY`, `AGENTPLANE_STORE`), which is how a container image
+is configured without editing its command line.
 
 ### Identity comes from the request, never from its body
 
@@ -965,6 +1021,7 @@ whether a run id exists by comparing a `400` against a `404`.
 | `GET /tasks/{task}` | What is this proposal, and may I decide it? |
 | `POST /tasks/{task}/claim` | This one is mine — don't let a colleague duplicate it |
 | `POST /tasks/{task}/release` | It isn't mine after all; give it back |
+| `POST /tasks/{task}/takeover` | The colleague holding it is out — displace their claim, naming whose it was |
 | `POST /tasks/{task}/decide` | Approve or reject, as myself |
 | `GET /cases?status=…` | What is escalated and has not been cleared? Newest first; defaults to `escalated` |
 | `GET /cases/{case}` | What has happened on this matter, and by when must it end? |
@@ -1133,9 +1190,16 @@ find its case), and answer a request with one call:
 
 ```rust
 let n = agentplane::blob::erase_case(
-    blobs.as_ref(), cases.as_ref(), case, now, "art-17 request",
+    blobs.as_ref(), cases.as_ref(), Some(keys.as_ref()), &tenant,
+    case, now, "art-17 request",
 ).await?;
 ```
+
+The key-ring and tenant arguments exist with the `keyring` feature. On a
+sealed plane, passing the ring destroys the case's wrapping key after every
+tombstone is written, so each sealed copy becomes unreadable at once; pass
+`None` on a plane that stores blobs unsealed, and the call is plain
+tombstoning.
 
 Every blob that case produced is tombstoned with the same reason. Other cases
 are untouched — including ones that stored *identical bytes*, which land on the

@@ -333,6 +333,16 @@ impl BudgetExceeded {
 pub struct Ledger {
     budget: Budget,
     consumed: Consumed,
+    /// What *this pass* dispatched, as opposed to what it read back.
+    ///
+    /// The budget verdict runs on `consumed`, which bills replayed history
+    /// exactly as it was billed live so a resumed run reaches the same
+    /// exhaustion at the same point. The tenant's quota ledger must not: a run
+    /// that suspends and resumes N times would accrue its prefix N times, and
+    /// a strict verification would bill a historical run's whole spend into
+    /// the current period on every look. This figure carries only the effects
+    /// the current pass actually performed, and it is what settlement accrues.
+    live: Spend,
 }
 
 impl Ledger {
@@ -350,12 +360,25 @@ impl Ledger {
                 elapsed_secs: 0,
                 denials: 0,
             },
+            live: Spend {
+                tokens: 0,
+                minor_units: 0,
+            },
         }
     }
 
     #[must_use]
     pub const fn budget(&self) -> Budget {
         self.budget
+    }
+
+    /// What the current pass dispatched, excluding everything read from
+    /// history. This is the figure a tenant's period ledger accrues; the run's
+    /// own budget verdict uses [`consumed`](Self::consumed), which includes
+    /// the replayed prefix.
+    #[must_use]
+    pub const fn live_spend(&self) -> Spend {
+        self.live
     }
 
     #[must_use]
@@ -434,9 +457,26 @@ impl Ledger {
 
     /// Add what an effect consumed. The figure comes from the journal, so this
     /// is identical on replay.
+    ///
+    /// For an effect the current pass actually dispatched, use
+    /// [`record_live_effect`](Self::record_live_effect) — this method is the
+    /// replay arm, and what it records is deliberately absent from
+    /// [`live_spend`](Self::live_spend).
     pub fn record_effect(&mut self, spend: Spend) {
         self.consumed.effects += 1;
         self.consumed.spend += spend;
+    }
+
+    /// Add what a **freshly dispatched** effect consumed.
+    ///
+    /// Identical to [`record_effect`](Self::record_effect) for the budget
+    /// verdict, and additionally counted toward [`live_spend`](Self::live_spend)
+    /// — the figure the tenant's period ledger accrues at settlement. Calling
+    /// this from a replay path would resurrect the double-billing it exists to
+    /// remove.
+    pub fn record_live_effect(&mut self, spend: Spend) {
+        self.record_effect(spend);
+        self.live += spend;
     }
 
     /// Count a policy refusal, and report if that was one too many.

@@ -2245,3 +2245,257 @@ async fn a_read_beside_an_open_group_is_allowed() {
         "the run failed for an unexpected reason: {why}"
     );
 }
+
+// ── One settlement per settlement, across resumes ───────────────────────────
+//
+// A settlement is not an effect, so the replay cursor cannot dedup it. A
+// resumed step re-walks its group from history and reaches the settle call at
+// the frontier — cursor exhausted, writes enabled — where an unguarded settle
+// would append the same `GroupSettled` again on every resume. The guard reads
+// the settlements already on the record and consumes them, counted rather than
+// set-keyed, because one step may legitimately open and settle the same name
+// twice.
+
+/// Commits a group, then fails until told otherwise — the shape of a run whose
+/// failing tail is retried by resuming over a settled group.
+#[derive(Debug)]
+struct CommitsThenFails {
+    world: Arc<World>,
+    fixed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Skill for CommitsThenFails {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("commits-then-fails").provides("commits-then-fails")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let w = &self.world;
+        let mut g = cx
+            .group("hold", ["inventory"])
+            .await
+            .map_err(SkillError::Step)?;
+        g.reversible("inventory", Call::new("stock.hold", "held", w), |_| {
+            Call::new("stock.release", "released", w)
+        })
+        .await
+        .map_err(SkillError::Step)?;
+        g.commit(&[]).await.map_err(SkillError::Step)?;
+
+        if self.fixed.load(Ordering::SeqCst) {
+            Ok(Outcome::done(Tainted::trusted(json!("shipped"))))
+        } else {
+            Err(SkillError::Other("failed past the frontier".into()))
+        }
+    }
+}
+
+/// Counts records of one kind, optionally per group name.
+async fn group_kind_count(
+    store: &Arc<RedbStore>,
+    run: agentplane::core::RunId,
+    kind: &str,
+) -> usize {
+    (store.clone() as Arc<dyn JournalStore>)
+        .read(run, 1)
+        .await
+        .expect("read")
+        .iter()
+        .filter(|r| r.kind().kind_str() == kind)
+        .count()
+}
+
+/// A resume over a settled group appends no second settlement, and a resume
+/// that reaches a different run conclusion appends exactly that.
+///
+/// The run commits its group and then fails past the frontier, so every retry
+/// is a resume that replays the members from history, re-reaches the commit,
+/// and must find its settlement already recorded. The failing resume also
+/// re-reaches the same failed conclusion, which must not grow the chain
+/// either. The positive half: the group genuinely settled (once), the member
+/// landed exactly once ever, and when the failure is fixed the succeeding
+/// conclusion *is* appended — dedup must never swallow a new fact.
+#[tokio::test]
+async fn a_resume_does_not_settle_a_settled_group_again() {
+    let world = World::new();
+    let fixed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(CommitsThenFails {
+            world: Arc::clone(&world),
+            fixed: Arc::clone(&fixed),
+        })
+        .build();
+
+    let out = rt
+        .run("commits-then-fails", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "got {:?}",
+        out.status
+    );
+    assert_eq!(
+        group_kind_count(&store, out.run_id, "GroupSettled").await,
+        1,
+        "the live pass settles once"
+    );
+
+    // Retry the still-failing run twice: replays, fails again, appends
+    // neither a settlement nor a conclusion.
+    for _ in 0..2 {
+        let again = rt
+            .replay(out.run_id, agentplane::runtime::Mode::Resume)
+            .await
+            .expect("resume");
+        assert!(matches!(again.status, RunStatus::Failed(_)));
+    }
+    assert_eq!(
+        group_kind_count(&store, out.run_id, "GroupSettled").await,
+        1,
+        "a resumed step re-reaching its group's end recorded the same \
+         settlement again — one commit now reads as several"
+    );
+    assert_eq!(
+        group_kind_count(&store, out.run_id, "GroupOpened").await,
+        1,
+        "a resumed step re-opening its group announced the same group again — \
+         opened/settled pairing queries now count phantom groups"
+    );
+    assert_eq!(
+        group_kind_count(&store, out.run_id, "RunSealed").await,
+        1,
+        "a no-op resume re-appended the conclusion the record already holds"
+    );
+    assert_eq!(
+        world.entries(),
+        vec!["held"],
+        "the member performed exactly once across every pass"
+    );
+
+    // Fixed: the succeeding resume appends its new conclusion — and still no
+    // second settlement.
+    fixed.store(true, Ordering::SeqCst);
+    let done = rt
+        .replay(out.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .expect("resume");
+    assert_eq!(done.status, RunStatus::Succeeded);
+    assert_eq!(
+        group_kind_count(&store, out.run_id, "GroupSettled").await,
+        1,
+        "success must not re-settle either"
+    );
+    assert_eq!(
+        group_kind_count(&store, out.run_id, "RunSealed").await,
+        2,
+        "the new conclusion is a different fact and must land"
+    );
+}
+
+/// Two settlements of one name are two facts: both recorded live, neither
+/// re-recorded on resume.
+///
+/// A step may open and settle the same group name twice — two checkout
+/// attempts, say. The dedup therefore counts recorded settlements per name
+/// rather than keying a set on it: a set would swallow the second settlement,
+/// leaving a journal that claims one of the two groups never closed. The
+/// resume half is the enforcement under test; the live half is the fixture
+/// proof.
+#[tokio::test]
+async fn two_settlements_of_one_name_both_record_and_neither_repeats() {
+    /// Opens and settles `pair` twice, then fails until told otherwise.
+    #[derive(Debug)]
+    struct SettlesTwice {
+        world: Arc<World>,
+        fixed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for SettlesTwice {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("settles-twice").provides("settles-twice")
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let w = &self.world;
+            for what in ["first", "second"] {
+                let mut g = cx
+                    .group("pair", ["inventory"])
+                    .await
+                    .map_err(SkillError::Step)?;
+                g.reversible("inventory", Call::new("stock.hold", what, w), |_| {
+                    Call::new("stock.release", "released", w)
+                })
+                .await
+                .map_err(SkillError::Step)?;
+                g.commit(&[]).await.map_err(SkillError::Step)?;
+            }
+            if self.fixed.load(Ordering::SeqCst) {
+                Ok(Outcome::done(Tainted::trusted(json!("done"))))
+            } else {
+                Err(SkillError::Other("failed past both frontiers".into()))
+            }
+        }
+    }
+
+    let world = World::new();
+    let fixed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(SettlesTwice {
+            world: Arc::clone(&world),
+            fixed: Arc::clone(&fixed),
+        })
+        .build();
+
+    let out = rt
+        .run("settles-twice", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(matches!(out.status, RunStatus::Failed(_)));
+    assert_eq!(
+        group_kind_count(&store, out.run_id, "GroupSettled").await,
+        2,
+        "two distinct groups under one name are two settlements — a set-keyed \
+         dedup would have swallowed the second"
+    );
+
+    let again = rt
+        .replay(out.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .expect("resume");
+    assert!(matches!(again.status, RunStatus::Failed(_)));
+    assert_eq!(
+        group_kind_count(&store, out.run_id, "GroupSettled").await,
+        2,
+        "the resume must consume both recorded settlements, appending none"
+    );
+    assert_eq!(
+        world.entries(),
+        vec!["first", "second"],
+        "the members performed exactly once each"
+    );
+
+    // And the positive close: fixed, the run completes over both settled
+    // groups without disturbing their record.
+    fixed.store(true, Ordering::SeqCst);
+    let done = rt
+        .replay(out.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .expect("resume");
+    assert_eq!(done.status, RunStatus::Succeeded);
+    assert_eq!(group_kind_count(&store, out.run_id, "GroupSettled").await, 2);
+}

@@ -166,6 +166,25 @@ pub enum BuildError {
     )]
     AgentToolSelfReference { agent: String, capability: String },
 
+    /// A lease TTL shorter than the store's expiry granularity.
+    ///
+    /// Both stores keep lease expiry in whole seconds and treat
+    /// `expires_at <= now` as lapsed, so anything under the minimum is expired
+    /// for part of every second it exists — no renewal frequency saves it.
+    /// A plane built with one would have every run takeable by another
+    /// instance while still working, and only under load.
+    #[error(
+        "a lease of {ttl:?} cannot be renewed: the store keeps expiry in whole \
+         seconds and treats `expires_at <= now` as lapsed, so anything under \
+         {minimum:?} expires between renewals however often they run — and a \
+         run that cannot hold its lease can be taken over while it is still \
+         working"
+    )]
+    LeaseUnrenewable {
+        ttl: std::time::Duration,
+        minimum: std::time::Duration,
+    },
+
     /// One tool server name was registered twice.
     #[error(
         "tool server '{server}' is registered twice — registration order would \

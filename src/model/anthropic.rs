@@ -515,6 +515,16 @@ fn interpret(
     // It generated and then declined. Metered, because generation happened —
     // and `Unusable` rather than `Refused` for exactly that reason: a refusal
     // costs nothing, this costs whatever it took to decide.
+    //
+    // What this error does NOT carry is the provider turn itself.
+    // `ModelError::Unusable` has no continuation field, so any thinking blocks
+    // and their signatures emitted before the model declined are dropped here:
+    // a caller that retries after this error re-sends the conversation without
+    // the declined turn, which Anthropic accepts because no tool_use from that
+    // turn is being answered. What is lost is only the (billed) reasoning the
+    // model produced on its way to declining — not a continuation obligation.
+    // If a declined turn ever needs to be carried forward, the error type
+    // itself must grow a continuation slot; this driver cannot smuggle one.
     if stop_reason.as_deref() == Some("refusal") {
         return Err(ModelError::Unusable {
             model: model.clone(),
@@ -546,7 +556,18 @@ fn interpret(
         }
         (value.to_string(), Some(value))
     } else {
-        if text.is_empty() {
+        // **A tool call is not an empty answer.** With extended thinking on,
+        // Anthropic routinely answers a tool-calling turn with `thinking` +
+        // `tool_use` blocks and no sibling text at all — choosing the tool IS
+        // the answer. Rejecting that shape as `Unusable` did worse than waste
+        // the turn: the error path carries no continuation, so the signed
+        // thinking blocks were dropped and the retry re-sent the conversation
+        // without them, which the provider rejects on the next tool turn. So
+        // emptiness is only fatal when there is also no tool call to act on.
+        // This guard does NOT cover the genuine-refusal case above, which
+        // still discards the turn, nor does it validate that the tool calls
+        // are for declared tools — the caller's tool loop owns that.
+        if text.is_empty() && tool_calls.is_empty() {
             return Err(ModelError::Unusable {
                 model: model.clone(),
                 usage,
@@ -1141,6 +1162,81 @@ mod tests {
         assert_eq!(
             body["messages"], parts,
             "content blocks must survive untouched: {body}"
+        );
+    }
+
+    /// Thinking + `tool_use` + no sibling text is a working tool turn.
+    ///
+    /// With extended thinking on, choosing a tool IS the answer: Anthropic
+    /// emits `thinking` and `tool_use` blocks with no text beside them. This
+    /// shape used to be classified `Unusable` for emptiness — and because the
+    /// error path carries no continuation, the signed thinking blocks were
+    /// dropped and the next turn was rejected by the provider. The assertion
+    /// on byte-for-byte equality is the load-bearing half: a driver that
+    /// reconstructs the turn from the fields it understands cannot return the
+    /// signature it never kept.
+    #[test]
+    fn a_thinking_tool_turn_with_no_text_is_an_answer_not_an_empty_one() {
+        let content = json!([
+            { "type": "thinking", "thinking": "private reasoning", "signature": "sig-bytes" },
+            { "type": "tool_use", "id": "c1", "name": "ledger.read", "input": { "id": "AC-1" } },
+        ]);
+        let completion = interpret(
+            &ModelId::new("anthropic", "claude-x"),
+            None,
+            false,
+            Assembled {
+                text: String::new(),
+                forced: None,
+                tool_calls: vec![crate::model::ToolCall {
+                    id: "c1".to_owned(),
+                    name: "ledger.read".to_owned(),
+                    arguments: json!({ "id": "AC-1" }),
+                }],
+                usage: Usage::default(),
+                stop_reason: Some("tool_use".to_owned()),
+                continuation: content.clone(),
+            },
+        )
+        .expect("a tool call with empty sibling text is a normal tool turn");
+        assert_eq!(completion.tool_calls.len(), 1);
+        let state = completion
+            .continuation
+            .expect("a tool turn must carry its provider continuation")
+            .state;
+        assert_eq!(
+            state,
+            json!([{ "role": "assistant", "content": content }]),
+            "the continuation must carry the provider turn verbatim, thinking \
+             blocks and signature included"
+        );
+    }
+
+    /// The emptiness guard still holds where there is genuinely nothing.
+    ///
+    /// The twin of the test above: no text AND no tool call is an answer with
+    /// nothing in it, and it stays a metered `Unusable`. Together the pair
+    /// pins the guard to exactly `text.is_empty() && tool_calls.is_empty()` —
+    /// remove either conjunct and one of them fails.
+    #[test]
+    fn an_answer_with_neither_text_nor_tool_calls_is_unusable() {
+        let error = interpret(
+            &ModelId::new("anthropic", "claude-x"),
+            None,
+            false,
+            Assembled {
+                text: String::new(),
+                forced: None,
+                tool_calls: Vec::new(),
+                usage: Usage::default(),
+                stop_reason: Some("end_turn".to_owned()),
+                continuation: json!([]),
+            },
+        )
+        .expect_err("an empty answer with no tool calls is not usable");
+        assert!(
+            matches!(error, ModelError::Unusable { .. }),
+            "wrong classification: {error}"
         );
     }
 

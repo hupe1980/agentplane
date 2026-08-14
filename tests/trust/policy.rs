@@ -235,7 +235,7 @@ impl Skill for Releases {
                     ReleaseScope::trust(),
                     "reviewed against the settlement record",
                     "run.output",
-                    ["review:SET-42".to_owned()],
+                    ["review:SET-42"],
                 ),
             )
             .await?;
@@ -310,7 +310,7 @@ impl Skill for ReleasesWithBasis {
                     ReleaseScope::trust(),
                     self.0,
                     "run.output",
-                    ["review:SET-42".to_owned()],
+                    ["review:SET-42"],
                 ),
             )
             .await?,

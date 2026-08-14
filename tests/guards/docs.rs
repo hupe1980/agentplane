@@ -153,6 +153,113 @@ fn the_documented_feature_table_matches_cargo_toml() {
         "these Cargo features are not in the feature table on \
          site/content/docs/getting-started.md: {undocumented:?}"
     );
+
+    // The reverse direction, which this guard's own doc comment always
+    // promised and the test did not check: a table row for a feature that no
+    // longer exists reads as a capability, and the reader who enables it gets
+    // a build error they blame on themselves. Rows are `| `name` |` lines in
+    // the feature table.
+    let phantom: Vec<&str> = doc
+        .lines()
+        .filter_map(|l| {
+            let row = l.strip_prefix("| `")?;
+            let (name, _) = row.split_once('`')?;
+            Some(name)
+        })
+        .filter(|row| !row.contains(' ') && !names.contains(row))
+        .collect();
+    assert!(
+        phantom.is_empty(),
+        "the feature table on site/content/docs/getting-started.md documents \
+         features Cargo.toml does not define: {phantom:?}"
+    );
+}
+
+/// Every `cargo run --example …` command in the README actually runs.
+///
+/// The examples' `required-features` live in Cargo.toml, and a README line
+/// that omits one fails with an error the reader blames on themselves — which
+/// happened: a quickstart command drifted when an example gained a feature.
+///
+/// The default feature set counts as present, because `--features` adds to it.
+///
+/// What this does not check: that the example does what the comment beside it
+/// says, or commands on the site (the site embeds and runs its own snippets).
+#[test]
+fn every_readme_example_command_names_the_features_it_needs() {
+    let manifest = read("Cargo.toml");
+    let readme = read("README.md");
+
+    // `[[example]]` blocks: name plus required-features.
+    let mut required: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for block in manifest.split("[[example]]").skip(1) {
+        let name = block
+            .lines()
+            .find_map(|l| l.split_once('=').filter(|(k, _)| k.trim() == "name"))
+            .map(|(_, v)| v.trim().trim_matches('"').to_owned());
+        let features = block
+            .lines()
+            .find_map(|l| {
+                l.split_once('=')
+                    .filter(|(k, _)| k.trim() == "required-features")
+            })
+            .map(|(_, v)| {
+                v.trim()
+                    .trim_matches(['[', ']'])
+                    .split(',')
+                    .map(|f| f.trim().trim_matches('"').to_owned())
+                    .filter(|f| !f.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(name) = name {
+            required.insert(name, features);
+        }
+    }
+    assert!(
+        required.len() > 10,
+        "the [[example]] scan found only {required:?} — Cargo.toml moved and \
+         this guard is now inert"
+    );
+
+    let default_features = ["redb"];
+    let mut commands = 0usize;
+    let mut broken = Vec::new();
+    for line in readme.lines() {
+        let Some(rest) = line.trim().strip_prefix("cargo run --example ") else {
+            continue;
+        };
+        commands += 1;
+        let mut words = rest.split_whitespace();
+        let example = words.next().unwrap_or_default();
+        let listed: Vec<&str> = match words.next() {
+            Some("--features") => words
+                .next()
+                .unwrap_or_default()
+                .split(',')
+                .collect(),
+            _ => Vec::new(),
+        };
+        let Some(needs) = required.get(example) else {
+            broken.push(format!("`{example}` is not an example Cargo.toml declares"));
+            continue;
+        };
+        for need in needs {
+            if !default_features.contains(&need.as_str()) && !listed.contains(&need.as_str()) {
+                broken.push(format!(
+                    "`cargo run --example {example}` needs feature `{need}` \
+                     and the README command does not pass it"
+                ));
+            }
+        }
+    }
+    assert!(
+        commands > 5,
+        "the README scan found only {commands} `cargo run --example` commands \
+         — the quickstart moved and this guard is now inert"
+    );
+    assert!(broken.is_empty(), "{}", broken.join("\n"));
 }
 
 /// Every file an example or module embeds is actually in the published tarball.

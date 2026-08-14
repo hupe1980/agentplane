@@ -34,6 +34,7 @@ fn outcome_to_row(o: &ItemOutcome) -> (&'static str, String) {
         ItemOutcome::Failed(d) => ("failed", d.clone()),
         ItemOutcome::Quarantined(d) => ("quarantined", d.clone()),
         ItemOutcome::Suspended(d) => ("suspended", d.clone()),
+        ItemOutcome::Exhausted(d) => ("exhausted", d.clone()),
     }
 }
 
@@ -47,6 +48,7 @@ fn outcome_from_row(has: u8, s: &str, detail: &str) -> Option<ItemOutcome> {
         "failed" => Some(ItemOutcome::Failed(d)),
         "quarantined" => Some(ItemOutcome::Quarantined(d)),
         "suspended" => Some(ItemOutcome::Suspended(d)),
+        "exhausted" => Some(ItemOutcome::Exhausted(d)),
         _ => None,
     }
 }
@@ -55,7 +57,7 @@ fn outcome_from_row(has: u8, s: &str, detail: &str) -> Option<ItemOutcome> {
 /// waiting, and a resume that steps over it reports the batch complete while it
 /// is not.
 fn is_open(has_outcome: u8, outcome: &str) -> bool {
-    has_outcome != 1 || outcome == "suspended"
+    has_outcome != 1 || outcome == "suspended" || outcome == "exhausted"
 }
 
 #[async_trait]
@@ -269,6 +271,7 @@ impl BatchStore for RedbStore {
                         "failed" => c.failed += 1,
                         "quarantined" => c.quarantined += 1,
                         "suspended" => c.suspended += 1,
+                        "exhausted" => c.exhausted += 1,
                         _ => c.in_flight += 1,
                     }
                 } else {

@@ -403,6 +403,30 @@ fn err_code(body: &Value) -> i64 {
         .unwrap_or_else(|| panic!("expected a JSON-RPC error, got: {body:#}"))
 }
 
+/// The named constants are the raw numerals the A2A 1.0 error table assigns.
+///
+/// Every response assertion in this file compares `err_code(&body)` against
+/// the same `code` module the server emits from, so both sides of those
+/// comparisons would move together if a constant were mistyped or renumbered.
+/// This is the one place the constants meet the spec's literal values instead
+/// of themselves; with it, each `code::`-based response assertion becomes a
+/// transitive raw pin. What this does NOT check is that the server *uses* the
+/// right constant at each site — the response tests own that half.
+#[test]
+fn the_error_constants_carry_the_spec_tables_raw_values() {
+    assert_eq!(code::TASK_NOT_FOUND, -32001);
+    assert_eq!(code::TASK_NOT_CANCELABLE, -32002);
+    assert_eq!(code::PUSH_NOT_SUPPORTED, -32003);
+    assert_eq!(code::UNSUPPORTED_OPERATION, -32004);
+    assert_eq!(code::CONTENT_TYPE_NOT_SUPPORTED, -32005);
+    assert_eq!(code::EXTENDED_CARD_NOT_CONFIGURED, -32007);
+    assert_eq!(code::VERSION_NOT_SUPPORTED, -32009);
+    // Not spec-assigned: the server-defined back-pressure code. Pinned so it
+    // cannot drift onto a value the spec's table does define, which would turn
+    // "not right now" into whatever that code means to a compliant client.
+    assert_eq!(code::QUOTA_EXHAUSTED, -32029);
+}
+
 // ── Discovery ───────────────────────────────────────────────────────────────
 
 /// The card is served without credentials, and it is the derived one.
@@ -822,6 +846,129 @@ async fn push_worker_cleans_up_after_advance_won_the_race_with_a_crash() {
             .unwrap()
             .is_none(),
         "a terminal registration survived forever after advance-before-delete"
+    );
+}
+
+/// A receiver that answers 500 is `Rejected`, and the cursor stays put.
+///
+/// This is the one test that drives the real `PushSender` at a real HTTP
+/// receiver — every other push test doubles the transport, so the
+/// status-to-outcome mapping at the bottom of `deliver` (2xx is `Accepted`,
+/// anything else answered is `Rejected`) had no coverage and
+/// `Delivered::Rejected` was constructed nowhere in the suite. Two halves:
+/// the sender itself must report `Rejected(500)` as an *outcome* rather than
+/// an error, and the durable worker consuming that outcome must not advance
+/// the delivery cursor — proven by the retry re-sending the identical
+/// payload once the receiver recovers. What this does NOT cover is the
+/// abandonment ceiling for a receiver that never recovers; the worker's own
+/// tests own that.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_receiver_answering_500_is_rejected_and_the_cursor_does_not_advance() {
+    use agentplane::push::{PushPolicy, PushSender};
+
+    #[derive(Clone, Default)]
+    struct Receiver {
+        bodies: Arc<Mutex<Vec<Value>>>,
+        failures: Arc<Mutex<usize>>,
+    }
+    let receiver = Receiver::default();
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post({
+            let state = receiver.clone();
+            move |axum::Json(body): axum::Json<Value>| {
+                let state = state.clone();
+                async move {
+                    state.bodies.lock().unwrap().push(body);
+                    let mut failures = state.failures.lock().unwrap();
+                    if *failures > 0 {
+                        *failures -= 1;
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}/hook", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // The loopback exception is `testkit`-only and lifts HTTPS and the
+    // public-address check for this literal host; the host grant still runs.
+    let sender =
+        PushSender::new(PushPolicy::new().allow_host("127.0.0.1")).allow_plaintext_loopback();
+
+    // First half: a 500 is an outcome, not an error, and it is `Rejected`
+    // carrying the status the receiver answered with.
+    *receiver.failures.lock().unwrap() = 1;
+    let probe = PushConfig {
+        id: "probe".to_owned(),
+        task: RunId::generate(),
+        url: url.clone(),
+        token: None,
+        authentication: None,
+    };
+    let outcome = sender
+        .deliver(&probe, &json!({"probe": true}))
+        .await
+        .expect("an answered request is an outcome, never a PushError");
+    assert_eq!(outcome, Delivered::Rejected(500), "the status must survive");
+
+    // Second half: the worker consuming that outcome leaves the cursor where
+    // it was. Same registration flow as production, real sender throughout.
+    let f = fixture();
+    let server = A2aServer::new(
+        f.rt.clone(),
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &f.manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("the fixture wires a policy engine")
+    .with_push(
+        Arc::clone(&f.store) as Arc<dyn PushStore>,
+        Arc::new(sender) as Arc<dyn PushTransport>,
+    )
+    .expect("push before signing");
+    let worker = server.push_worker().expect("worker");
+    let router = server.router();
+
+    *receiver.failures.lock().unwrap() = 1;
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({
+                "message": text("go"),
+                "configuration": {
+                    "taskPushNotificationConfig": { "url": url }
+                }
+            }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert!(sent["result"]["task"]["id"].is_string(), "{sent:#}");
+
+    let before = receiver.bodies.lock().unwrap().len();
+    let rejected = worker.run_once(10, 10).await.expect("failed sweep");
+    assert_eq!(rejected.deliveries, 0, "a 500 was counted as delivered");
+    assert_eq!(rejected.retries, 1, "a rejected delivery must be rescheduled");
+
+    // The receiver has recovered; the retry must carry the exact payload the
+    // 500 answered, which is only possible if the cursor did not move.
+    let delivered = worker.run_once(13, 10).await.expect("retry sweep");
+    assert!(delivered.deliveries > 0, "the retry never happened");
+    let bodies = receiver.bodies.lock().unwrap();
+    assert_eq!(
+        bodies[before],
+        bodies[before + 1],
+        "the cursor advanced past the rejected record, skipping its payload"
     );
 }
 
@@ -1599,6 +1746,38 @@ async fn a_blocking_call_returns_the_agents_answer() {
     );
 }
 
+/// The trailing-slash spelling of the endpoint answers like the bare one.
+///
+/// Production registers `/a2a` and `/a2a/` as two axum routes, because a
+/// reverse proxy that appends a slash is common and axum treats the two as
+/// distinct paths. Until now only the network-gated TCK ever requested the
+/// slash form, so a refactor that dropped the second `.route(...)` would pass
+/// every CI test and break behind exactly the proxies the route exists for.
+/// This does NOT test any proxy behaviour itself — only that both spellings
+/// reach the same dispatcher.
+#[tokio::test]
+async fn the_trailing_slash_route_answers_like_the_bare_one() {
+    let f = fixture();
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "SendMessage",
+        "params": {"message": text("go")},
+    });
+    let req = Request::builder()
+        .uri("/a2a/")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("x-actor", "peer-a")
+        .header("A2A-Version", "1.0")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let (status, body) = send(&f.router(), req).await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(
+        body["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "the slash spelling did not reach the dispatcher: {body:#}"
+    );
+}
+
 #[tokio::test]
 async fn get_task_honors_history_length_and_reconstructs_artifacts() {
     let f = fixture();
@@ -1716,6 +1895,11 @@ async fn unwired_push_and_unknown_methods_are_told_apart() {
             i64::from(code::PUSH_NOT_SUPPORTED),
             "{method} must be refused with the push-specific code: {body:#}"
         );
+        // The raw numeral, so the pin does not share the constant it checks:
+        // -32003 is PushNotificationNotSupportedError in the A2A 1.0
+        // error-code table, and that number is what a spec-written client
+        // matches on.
+        assert_eq!(err_code(&body), -32003, "{method}: {body:#}");
     }
 
     // And a genuinely unknown method still says so, or the two are
@@ -1779,6 +1963,12 @@ async fn cancelling_a_finished_task_is_not_cancelable() {
         "cancelling a completed run reported something other than \
          not-cancelable: {body:#}"
     );
+    // The raw numeral, beside the named constant. Every other assertion in
+    // this file compares against the same `code` module the server emits from,
+    // so a typo in the constant would agree with itself on both sides of the
+    // comparison. -32002 is TaskNotCancelableError in the A2A 1.0 error-code
+    // table, and a client written against the spec matches on the number.
+    assert_eq!(err_code(&body), -32002, "{body:#}");
 }
 
 /// One counterparty, one provenance spelling: `peer:{actor}`, on every door.
@@ -2132,6 +2322,91 @@ async fn a_policy_denial_is_a_decline_not_a_server_fault() {
          which names the action and resource the gate keyed on — enough to map \
          this plane's authorization vocabulary by probing it: {body:#}"
     );
+}
+
+/// A full quota answers with the server-defined back-pressure code, and the
+/// quota arithmetic stays inside.
+///
+/// Two enforcements meet here. First the code: this used to be `-32004
+/// UnsupportedOperationError`, a permanent missing-capability code that
+/// teaches a compliant caller to abandon rather than back off; the raw
+/// numeral `-32029` is asserted so reverting the mapping fails loudly.
+/// Second the message: `QuotaError`'s own rendering names the running count
+/// and the ceiling, numbers an unauthenticated prober has no business
+/// learning, so the wire message must carry no digits at all. What this test
+/// does NOT cover is the peer-side classification of the new code — that
+/// lives with the A2A client driver.
+#[tokio::test]
+async fn a_full_quota_is_back_pressure_with_no_arithmetic_in_the_answer() {
+    use agentplane::quota::{QuotaStore, TenantQuota};
+
+    let manifest = Manifest::parse(ONE_SKILL).expect("parse");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let policy = Arc::new(Recording::default());
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let scoped = Arc::new(store.as_ref().clone().for_tenant(TenantId::default()));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .policy(policy.clone() as Arc<dyn PolicyEngine>)
+        // A ceiling of zero: every admission is refused as back-pressure.
+        .quota(
+            scoped as Arc<dyn QuotaStore>,
+            TenantQuota {
+                max_concurrent_runs: Some(0),
+                ..TenantQuota::default()
+            },
+        )
+        .skill(Echoes {
+            capability: "settlement.check",
+            seen: seen.clone(),
+        })
+        .build();
+    let f = Fixture {
+        rt,
+        store,
+        policy,
+        seen,
+        manifest,
+    };
+
+    let (status, body) = send(
+        &f.router(),
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    // The raw numeral, not `code::QUOTA_EXHAUSTED`: the pin must not share
+    // the constant it exists to check.
+    assert_eq!(
+        err_code(&body),
+        -32029,
+        "a full quota must be the server-defined back-pressure code, not a \
+         spec-defined permanent one: {body:#}"
+    );
+    let message = body["error"]["message"].as_str().expect("an error message");
+    assert!(
+        !message.contains(|c: char| c.is_ascii_digit()),
+        "the quota's counters leaked to an external caller: {message}"
+    );
+
+    // The positive half: the identical request against the identical fixture
+    // shape minus the quota completes, so the refusal above is the ceiling
+    // and not a broken fixture.
+    let unlimited = fixture();
+    let (_, ok) = send(
+        &unlimited.router(),
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(ok["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED");
 }
 
 /// This crate's own A2A client, calling this crate's own A2A server.

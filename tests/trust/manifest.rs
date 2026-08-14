@@ -3303,6 +3303,61 @@ fn a_card_with_an_integer_beyond_double_precision_is_refused_at_signing() {
     }
 }
 
+/// The same integer bound is enforced when *verifying* a foreign card.
+///
+/// The signing-side test above proves this crate will not produce such a
+/// card; it proves nothing about accepting one, and the two paths share the
+/// bound only because both route through `signing_input`. A refactor that
+/// checked representability in `sign` alone would keep the signing test green
+/// while this verifier started accepting cards whose canonical bytes a
+/// conforming JCS implementation reads differently than were signed — each
+/// side correct under its own arithmetic. The card here is signed first and
+/// damaged afterwards, so the refusal can only come from the verify path.
+/// What this does NOT pin is which of several signatures is checked first;
+/// the refusal fires while computing the input, before any of them.
+#[cfg(feature = "signing")]
+#[test]
+fn a_card_with_an_integer_beyond_double_precision_is_refused_at_verification() {
+    use agentplane::peers::{AgentCard, AgentExtension, CardSignatureError, CardSigner, CardVerifier};
+    use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
+
+    let signer = Ed25519Signer::new("did:example:publisher", &[7u8; 32]);
+    let verifier = Ed25519Verifier::new()
+        .trust("did:example:publisher", &signer.verifying_key())
+        .expect("a valid key");
+
+    let m = Manifest::parse(GOOD).expect("parse");
+    let mut card = AgentCard::derive(&m, "https://plane.internal/a2a").expect("derive");
+    card.sign(&signer as &dyn CardSigner).expect("sign");
+    // The positive half: the signed card verifies as-is, so the refusal below
+    // is about the number and not about a broken signature fixture.
+    card.verify(&verifier as &dyn CardVerifier)
+        .expect("the untouched card must verify");
+
+    // Now the shape a hostile or buggy publisher would send: a signature is
+    // present, and beside it an integer past 2^53.
+    card.capabilities.extensions.push(AgentExtension {
+        uri: "https://example.com/ext/limits".to_owned(),
+        description: None,
+        required: false,
+        params: Some(serde_json::json!({ "sequence": 9_007_199_254_740_993_u64 })),
+    });
+
+    match card.verify(&verifier as &dyn CardVerifier) {
+        Err(CardSignatureError::UnrepresentableNumber { value, path }) => {
+            assert_eq!(value, "9007199254740993");
+            assert!(
+                path.contains("sequence"),
+                "the refusal must name where the value is: {path}"
+            );
+        }
+        other => panic!(
+            "a card carrying an integer beyond double precision was accepted \
+             or misclassified on verification: {other:?}"
+        ),
+    }
+}
+
 /// An interface is selected by binding **and** version, in card order.
 ///
 /// An agent may publish the same binding at several protocol versions, so
@@ -3838,7 +3893,7 @@ async fn a_coded_skill_completes_on_the_manifests_own_model() {
             cx: &mut StepCtx<'_>,
             input: Tainted<serde_json::Value>,
         ) -> Result<Outcome, SkillError> {
-            let prompt = Tainted::object([("document".to_owned(), input)]);
+            let prompt = Tainted::object([("document", input)]);
             let completion = cx.complete(&prompt).await?;
             Ok(Outcome::done(completion.map(|c| json!({ "text": c.text }))))
         }

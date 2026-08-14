@@ -153,13 +153,20 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "tool_output_cannot_reach_a_mutating_sink",
         "untrusted data may reach a mutating sink",
         """        if protected.is_empty() {
-            if mutates && label.is_untrusted() {
+            if mutates && args.effective_label(sink_id).is_untrusted() {
+                if let Some(mark) = misdirected_release(args, sink_id, "") {
+                    return Err(PolicyError::ReleaseDestination {
+                        sink: sink_name,
+                        granted: mark.destination().to_owned(),
+                        actual: sink_id.to_owned(),
+                    }
+                    .into());
+                }
                 return Err(PolicyError::TaintGate { sink: sink_name }.into());
             }
             return Ok(());
         }""",
         """        if protected.is_empty() {
-            let _ = label;
             return Ok(());
         }""",
     ),
@@ -469,8 +476,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/ctx.rs",
         "a_failed_completion_spends_the_budget_that_stops_the_next_one",
         "a failed effect is billed as costing nothing",
-        "                let spend = e.spend();\n                self.bill(spend);",
-        "                let spend = crate::core::Spend::default();\n                self.bill(spend);",
+        "                let spend = e.spend();\n                self.bill_live(spend);",
+        "                let spend = crate::core::Spend::default();\n                self.bill_live(spend);",
     ),
     # A stream that died reported as never having happened. It reached the
     # provider — we watched it generate — so repeating buys a second bill for the
@@ -1377,20 +1384,40 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         """                // Edges deliberately stay — **both directions**. Outgoing,""",
         """                {
                     let mut edges = w.open_table(DERIVED).map_err(|e| be(&e))?;
-                    let stale: Vec<String> = edges
-                        .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                    let mut edges_rev = w.open_table(DERIVED_BY_TARGET).map_err(|e| be(&e))?;
+                    let stale: Vec<(String, u64, u64)> = edges_rev
+                        .range(
+                            (tenant.as_str(), id.as_str(), 0, "", 0)
+                                ..=(tenant.as_str(), id.as_str(), u64::MAX, MAX_STR, u64::MAX),
+                        )
                         .map_err(|e| be(&e))?
-                        .filter_map(|entry| match entry {
-                            Ok((key, _)) if key.value().2 == id => {
-                                Some(Ok(key.value().1.to_owned()))
-                            }
-                            Ok(_) => None,
-                            Err(error) => Some(Err(be(&error))),
+                        .map(|entry| {
+                            entry
+                                .map(|(key, _)| {
+                                    let (_, _, dv, sid, sv) = key.value();
+                                    (sid.to_owned(), sv, dv)
+                                })
+                                .map_err(|error| be(&error))
                         })
                         .collect::<Result<_, StoreError>>()?;
-                    for source_id in stale {
+                    for (source_id, source_version, derived_version) in stale {
                         edges
-                            .remove((tenant.as_str(), source_id.as_str(), id.as_str()))
+                            .remove((
+                                tenant.as_str(),
+                                source_id.as_str(),
+                                source_version,
+                                id.as_str(),
+                                derived_version,
+                            ))
+                            .map_err(|e| be(&e))?;
+                        edges_rev
+                            .remove((
+                                tenant.as_str(),
+                                id.as_str(),
+                                derived_version,
+                                source_id.as_str(),
+                                source_version,
+                            ))
                             .map_err(|e| be(&e))?;
                     }
                 }
@@ -2593,7 +2620,28 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "outliving its own remedy",
         "                for source in &item.derived_from {\n"
         "                    derived\n"
-        "                        .insert((tenant.as_str(), source.id.as_str(), id.as_str()), ())\n"
+        "                        .insert(\n"
+        "                            (\n"
+        "                                tenant.as_str(),\n"
+        "                                source.id.as_str(),\n"
+        "                                source.version,\n"
+        "                                id.as_str(),\n"
+        "                                version,\n"
+        "                            ),\n"
+        "                            (),\n"
+        "                        )\n"
+        "                        .map_err(|e| be(&e))?;\n"
+        "                    derived_rev\n"
+        "                        .insert(\n"
+        "                            (\n"
+        "                                tenant.as_str(),\n"
+        "                                id.as_str(),\n"
+        "                                version,\n"
+        "                                source.id.as_str(),\n"
+        "                                source.version,\n"
+        "                            ),\n"
+        "                            (),\n"
+        "                        )\n"
         "                        .map_err(|e| be(&e))?;\n"
         "                }",
         "",
@@ -3102,8 +3150,12 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "untrusted memory writes `limit` of them and evicts every trusted one "
         "from the window — silently, because each item is honestly labelled and "
         "the caller gets exactly the number it asked for",
-        "                if rank == 0 {\n                    trusted.push(item);\n                } else {\n                    untrusted.push(item);\n                }",
-        "                trusted.push(item);",
+        "            keys.sort_unstable_by(|a, b| {\n"
+        "                (a.0, a.1, a.2.as_str()).cmp(&(b.0, b.1, b.2.as_str()))\n"
+        "            });",
+        "            keys.sort_unstable_by(|a, b| {\n"
+        "                (a.1, a.2.as_str()).cmp(&(b.1, b.2.as_str()))\n"
+        "            });",
     ),
     "AHaltDoesNotStopAnUnlimitedTenant": (
         "src/runtime/executor.rs",
@@ -3144,6 +3196,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "as trusted, toward what destination, on what evidence",
         "        releases.extend(releases_in(run, &records));",
         "",
+    ),
+    "AReleaseCoversEverySink": (
+        "src/core/label.rs",
+        "a_release_for_one_destination_is_refused_at_another_sink",
+        "the effective label ignores the destination a release named, so a "
+        "value released for one sink arrives improved at every sink — the "
+        "declared control the marks exist to enforce",
+        "            if mark.destination() == destination && mark.covers(path) {",
+        "            if mark.covers(path) {",
     ),
     "AReleaseValidatorThatAcceptsAnything": (
         "src/core/label.rs",
@@ -3518,8 +3579,10 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "subject erasure runs without the lifecycle lock, so a write on another "
         "instance lands under a scope this one is destroying and the erasure "
         "reports success over a row sealed to a key that no longer exists",
-        "        super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {\n            let current = self",
-        "        (async {\n            let current = self",
+        "        super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {\n"
+        "            // The subject's ids, enumerated by the dedicated erasure-path",
+        "        (async {\n"
+        "            // The subject's ids, enumerated by the dedicated erasure-path",
     ),
     "AnUnknownA2aParameterIsIgnored": (
         "src/api/a2a.rs",
@@ -3696,7 +3759,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_finished_run_frees_its_slot",
         "a run never gives its concurrency slot back, so a ceiling of N permits "
         "N runs per process lifetime rather than N at a time",
-        "        self.settle_quota(run, spend).await;",
+        "            self.settle_quota(run, live_spend).await;",
         "",
     ),
     "ReplayReChecksTheQuota": (
@@ -3784,8 +3847,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a lease shorter than the store's whole-second expiry granularity is "
         "accepted, so a live run cannot hold it and any instance may take the "
         "run away while it is still working",
-        "            ttl >= MIN_LEASE_TTL,",
-        "            ttl >= Duration::ZERO,",
+        "        if self.lease_ttl < MIN_LEASE_TTL {",
+        "        if self.lease_ttl < Duration::ZERO {",
     ),
     "TheServerSpeaksTheOldProtocolVersion": (
         "src/api/a2a.rs",
@@ -4153,9 +4216,9 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a declared journal ceiling does not refuse, so data the deployment "
         "said must stay erasable is written into an append-only chain that "
         "cannot forget it",
-        """            && label.sensitivity > journal_ceiling
+        """            && stored > journal_ceiling
         {""",
-        """            && label.sensitivity > journal_ceiling
+        """            && stored > journal_ceiling
             && false
         {""",
     ),

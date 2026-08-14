@@ -206,6 +206,60 @@ async fn rotation_rewraps_without_touching_the_payload() {
         "rewrapping did not move the key to the current generation"
     );
     assert_eq!(fresh.scope, old.scope, "rewrapping moved the erasure unit");
+    // The half that makes this test non-vacuous: the ring once rotated only
+    // the *label*, so `sealed` came back byte-identical and everything above
+    // passed with no rotation having happened. The new generation must be a
+    // different key, so the re-sealed bytes must differ while the material
+    // inside stays the same.
+    assert_ne!(
+        old.sealed, fresh.sealed,
+        "rewrapping produced identical sealed bytes, so the generations share \
+         one KEK and nothing rotated"
+    );
+    assert_eq!(
+        ring.open(&fresh).await.expect("open rewrapped").expose(),
+        ring.open(&old).await.expect("open old").expose(),
+        "the rewrapped key opens to different material than the original"
+    );
+}
+
+/// A wrap naming a generation this ring never issued is refused, not opened.
+///
+/// `open` used to ignore `wrapped_by` entirely and decrypt with whatever key
+/// the scope currently had — so a wrap fabricated with any label at all
+/// "opened", to garbage, and the mistake surfaced later as corrupt payloads
+/// rather than here as a refusal. A KMS resolves the key version from the
+/// ciphertext's own metadata and refuses versions it does not hold; the fake
+/// now does the same. What this does NOT give the fake is integrity on the
+/// sealed bytes themselves — XOR authenticates nothing, deliberately, so only
+/// the resolution semantics are being pinned here.
+#[tokio::test]
+async fn a_wrap_from_a_generation_the_ring_never_issued_is_refused() {
+    let ring = MemoryKeyRing::new();
+    let (_dek, wrapped) = ring.data_key("case-7").await.expect("mint");
+
+    // Same scope, same sealed bytes, a generation that never existed.
+    let forged = agentplane::keyring::WrappedKey {
+        scope: wrapped.scope.clone(),
+        wrapped_by: "memory-kek-999".to_owned(),
+        sealed: wrapped.sealed.clone(),
+    };
+    assert!(
+        matches!(ring.open(&forged).await, Err(KeyError::Refused(_))),
+        "a generation this ring never wrapped under must refuse, not decrypt \
+         with whichever key is current"
+    );
+
+    // And an id another ring entirely would have stamped.
+    let alien = agentplane::keyring::WrappedKey {
+        scope: wrapped.scope,
+        wrapped_by: "vault:v3".to_owned(),
+        sealed: wrapped.sealed,
+    };
+    assert!(
+        matches!(ring.open(&alien).await, Err(KeyError::Refused(_))),
+        "a foreign wrapping-key id must be refused"
+    );
 }
 
 /// Moving ciphertext to another address does not decrypt it there.

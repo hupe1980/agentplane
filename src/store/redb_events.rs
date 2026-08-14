@@ -90,6 +90,15 @@ const EVENTS_LIVE: TableDefinition<(&str, i64, &str), ()> = TableDefinition::new
 /// `(received_at, event_id) -> ()`, retired events, for the dead-letter view.
 const EVENTS_DEAD: TableDefinition<(&str, i64, &str), ()> = TableDefinition::new("inbound_dead");
 
+/// `(tenant, run_id, event_id) -> ()`, events a run currently holds claimed.
+///
+/// The index `unsubscribe` strips delivered payloads through. Written in the
+/// same transaction as every claim, removed when the run's unsubscribe sheds
+/// the payload — without it, finding "the events this run claimed" is a scan
+/// of every event the tenant ever received, on the hot path of every wait.
+const EVENTS_CLAIMED: TableDefinition<(&str, &str, &str), ()> =
+    TableDefinition::new("inbound_claimed");
+
 /// `(created_at, run_id, effect_key, namespace, value) -> ()`, waits in
 /// registration order.
 const SUBS_BY_TIME: TableDefinition<(&str, i64, &str, &str, &str, &str), ()> =
@@ -103,6 +112,7 @@ pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError
     w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
     w.open_table(EVENTS_LIVE).map_err(|e| be(&e))?;
     w.open_table(EVENTS_DEAD).map_err(|e| be(&e))?;
+    w.open_table(EVENTS_CLAIMED).map_err(|e| be(&e))?;
     w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
     Ok(())
 }
@@ -178,6 +188,55 @@ fn claim_row(
         )
         .map_err(|e| be(&e))?;
     Ok(())
+}
+
+/// Replace an event row's payload with JSON `null`, keeping everything else.
+///
+/// The erasure primitive shared by `unsubscribe` (delivered rows) and
+/// `erase_payload` (unclaimed and dead-lettered rows). The row's identity,
+/// claim state and dead-letter accounting all survive: dedup needs the
+/// `(source, id)` key so a replay of the erased message is still refused, and
+/// the dead-letter list stays countable and attributable — only the
+/// counterparty's content goes.
+fn strip_payload(
+    events: &mut redb::Table<'_, (&'static str, &'static str), EventRow<'static>>,
+    tenant: &str,
+    key: &str,
+) -> Result<bool, StoreError> {
+    let Some(row) = events.get((tenant, key)).map_err(|e| be(&e))?.map(|v| {
+        let (src, bid, kd, _, ra, cb, ca, hc, dead, reason) = v.value();
+        (
+            src.to_owned(),
+            bid.to_owned(),
+            kd.to_owned(),
+            ra,
+            cb.to_owned(),
+            ca,
+            hc,
+            dead,
+            reason.to_owned(),
+        )
+    }) else {
+        return Ok(false);
+    };
+    events
+        .insert(
+            (tenant, key),
+            (
+                row.0.as_str(),
+                row.1.as_str(),
+                row.2.as_str(),
+                "null",
+                row.3,
+                row.4.as_str(),
+                row.5,
+                row.6,
+                row.7,
+                row.8.as_str(),
+            ),
+        )
+        .map_err(|e| be(&e))?;
+    Ok(true)
 }
 
 /// Write an event's correlation rows and its match-path index.
@@ -500,6 +559,12 @@ impl EventStore for RedbStore {
                             .map_err(|e| be(&e))?
                             .remove((tenant.as_str(), received, id.as_str()))
                             .map_err(|e| be(&e))?;
+                        // Findable by the claiming run, so its unsubscribe can
+                        // shed the delivered payload without a scan.
+                        w.open_table(EVENTS_CLAIMED)
+                            .map_err(|e| be(&e))?
+                            .insert((tenant.as_str(), run.as_str(), id.as_str()), ())
+                            .map_err(|e| be(&e))?;
                         let corr_t = w.open_table(EVENT_CORR).map_err(|e| be(&e))?;
                         let correlation = load_correlation(&corr_t, &tenant, &id)?;
                         Some(BufferedEvent {
@@ -582,6 +647,12 @@ impl EventStore for RedbStore {
                             w.open_table(EVENTS_LIVE)
                                 .map_err(|e| be(&e))?
                                 .remove((tenant.as_str(), ra, id.as_str()))
+                                .map_err(|e| be(&e))?;
+                            // Findable by the claiming run, so its unsubscribe
+                            // can shed the delivered payload without a scan.
+                            w.open_table(EVENTS_CLAIMED)
+                                .map_err(|e| be(&e))?
+                                .insert((tenant.as_str(), run.as_str(), id.as_str()), ())
                                 .map_err(|e| be(&e))?;
 
                             let mut correlation = Vec::new();
@@ -823,6 +894,12 @@ impl EventStore for RedbStore {
                         .map_err(|e| be(&e))?;
                     drop(events);
                     index_correlation(&w, &tenant, &id, &keys, ts(at))?;
+                    // Findable by the claiming run, so its unsubscribe can
+                    // shed the delivered payload without a scan.
+                    w.open_table(EVENTS_CLAIMED)
+                        .map_err(|e| be(&e))?
+                        .insert((tenant.as_str(), run.as_str(), id.as_str()), ())
+                        .map_err(|e| be(&e))?;
                     // The subscription is deliberately **not** retired here,
                     // unlike `match_waiter` — the asymmetry is the two paths'
                     // retry semantics. A retried targeted delivery rebuilds
@@ -905,8 +982,59 @@ impl EventStore for RedbStore {
                         .map_err(|e| be(&e))?;
                 }
             }
+            {
+                // The run's unsubscribe is the store's signal that delivery
+                // was journaled, so the buffer's copy of every payload this
+                // run claimed is shed here — the row keeps its `(source, id)`
+                // identity, claim and dead-letter fields, because dedup and
+                // accounting need those and only the content was ever the
+                // erasure concern. Stripping at the *claim* instead would lose
+                // the payload for a run that crashed between claim and
+                // resume, whose recovery re-reads it from the buffer.
+                let mut claimed = w.open_table(EVENTS_CLAIMED).map_err(|e| be(&e))?;
+                let held: Vec<String> = claimed
+                    .range((tenant.as_str(), run.as_str(), "")..=(tenant.as_str(), run.as_str(), MAX_STR))
+                    .map_err(|e| be(&e))?
+                    .map(|entry| {
+                        entry
+                            .map(|(key, _)| key.value().2.to_owned())
+                            .map_err(|error| be(&error))
+                    })
+                    .collect::<Result<_, _>>()?;
+                let mut events = w.open_table(EVENTS).map_err(|e| be(&e))?;
+                for id in held {
+                    strip_payload(&mut events, &tenant, &id)?;
+                    claimed
+                        .remove((tenant.as_str(), run.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?;
+                }
+            }
             w.commit().map_err(|e| be(&e))?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn erase_payload(&self, source: &str, id: &str) -> Result<bool, StoreError> {
+        let tenant = self.tenant_name();
+        // Through the one implementation of the dedup identity, not a second
+        // spelling of its separator.
+        let key = InboundEvent {
+            source: source.to_owned(),
+            id: id.to_owned(),
+            kind: String::new(),
+            correlation: Vec::new(),
+            payload: serde_json::Value::Null,
+        }
+        .dedup_key();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let existed = {
+                let mut events = w.open_table(EVENTS).map_err(|e| be(&e))?;
+                strip_payload(&mut events, &tenant, &key)?
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(existed)
         })
         .await
     }

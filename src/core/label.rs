@@ -66,6 +66,117 @@ pub struct Label {
     pub provenance: BTreeSet<SourceId>,
     pub trust: Trust,
     pub sensitivity: Sensitivity,
+    /// Destination-scoped release marks. A typed release no longer improves
+    /// `trust` or `sensitivity` in place — it attaches a mark here, and the
+    /// mark is honoured only at the exact sink the release named. Everywhere
+    /// else — joins, memory writes, a plain `label.trust` read — the base
+    /// label speaks: a release is for a destination, not for storage.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub releases: BTreeSet<ReleaseMark>,
+}
+
+/// One destination-scoped improvement a [`Release`] granted, carried on the
+/// label of the value it covers.
+///
+/// The mark records what a *gate* needs to compute the effective label at a
+/// concrete sink: the destination the release named, which part of the value
+/// it covers, and which dimensions it may improve. The full [`Release`] —
+/// evidence, releaser, prior label — is already journaled; the basis rides
+/// along so an operator reading a label knows which decision to look up,
+/// but refusal messages never quote it.
+///
+/// Marks live on the **whole-value** label of a [`Tainted`], with `field`
+/// pointers relative to that value's root. Projection rebases them; a value
+/// reshaped by [`Tainted::map`] or [`Tainted::zip`] drops the marks whose
+/// pointer scope the reshaping invalidated — losing a mark refuses more,
+/// never less.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseMark {
+    destination: String,
+    /// The covered part as an absolute RFC 6901 JSON Pointer; empty covers
+    /// the whole value.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    field: String,
+    scope: ReleaseScope,
+    basis: String,
+}
+
+impl ReleaseMark {
+    fn of(release: &Release, field: String) -> Self {
+        Self {
+            destination: release.destination.clone(),
+            field,
+            scope: release.scope,
+            basis: release.basis.clone(),
+        }
+    }
+
+    /// The exact sink identity the release named — the same provenance-style
+    /// name a [`ProtectedField::from_sources`] rule grants: `tool://server/name`,
+    /// `model:provider/model`.
+    #[must_use]
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+
+    /// The covered field pointer; empty means the whole value.
+    #[must_use]
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> ReleaseScope {
+        self.scope
+    }
+
+    #[must_use]
+    pub fn basis(&self) -> &str {
+        &self.basis
+    }
+
+    /// Whether this mark's scope covers the value at `path`.
+    ///
+    /// A whole-value mark covers everything; a field mark covers its field and
+    /// that field's descendants — the same inheritance rule
+    /// [`Tainted::label_at`] applies to field labels. It never covers an
+    /// ancestor: releasing `/account` says nothing about the object around it.
+    #[must_use]
+    pub fn covers(&self, path: &str) -> bool {
+        self.field.is_empty()
+            || path == self.field
+            || path
+                .strip_prefix(self.field.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+    }
+
+    /// Rebase under a new parent pointer, for [`Tainted::object`]/[`Tainted::array`]
+    /// assembly: a mark on the child's whole value becomes a field mark on the
+    /// parent.
+    fn rebased(mut self, prefix: &str) -> Self {
+        self.field = format!("{prefix}{}", self.field);
+        self
+    }
+
+    /// The mark as seen from the value at `pointer`, or `None` when the
+    /// projection leaves its scope behind. A mark covering `pointer` or an
+    /// ancestor covers the projection whole; one on a descendant is carried
+    /// down rebased.
+    fn projected(&self, pointer: &str) -> Option<Self> {
+        if self.covers(pointer) {
+            let mut mark = self.clone();
+            mark.field = String::new();
+            return Some(mark);
+        }
+        self.field
+            .strip_prefix(pointer)
+            .filter(|rest| rest.starts_with('/'))
+            .map(|rest| Self {
+                field: rest.to_owned(),
+                ..self.clone()
+            })
+    }
 }
 
 /// A stricter information-flow rule for one JSON field sent to a sink.
@@ -104,7 +215,7 @@ pub struct Release {
 }
 
 /// Which label dimensions an authorized release may improve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseScope {
     trust: bool,
@@ -139,6 +250,19 @@ impl ReleaseScope {
             sensitivity: Some(target),
         }
     }
+
+    /// Whether this scope confers trust — what the taint gates ask when they
+    /// explain a destination mismatch.
+    #[must_use]
+    pub const fn improves_trust(self) -> bool {
+        self.trust
+    }
+
+    /// The sensitivity ceiling this scope grants, if any.
+    #[must_use]
+    pub const fn sensitivity_target(self) -> Option<Sensitivity> {
+        self.sensitivity
+    }
 }
 
 impl Release {
@@ -152,7 +276,7 @@ impl Release {
         scope: ReleaseScope,
         basis: impl Into<String>,
         destination: impl Into<String>,
-        evidence: impl IntoIterator<Item = String>,
+        evidence: impl IntoIterator<Item: Into<String>>,
     ) -> Self {
         Self::new(scope, [String::new()], basis, destination, evidence)
     }
@@ -167,10 +291,10 @@ impl Release {
     #[must_use]
     pub fn fields(
         scope: ReleaseScope,
-        fields: impl IntoIterator<Item = String>,
+        fields: impl IntoIterator<Item: Into<String>>,
         basis: impl Into<String>,
         destination: impl Into<String>,
-        evidence: impl IntoIterator<Item = String>,
+        evidence: impl IntoIterator<Item: Into<String>>,
     ) -> Self {
         Self::new(scope, fields, basis, destination, evidence)
     }
@@ -186,17 +310,20 @@ impl Release {
     /// input, and neither can start disagreeing about which releases are legal.
     fn new(
         scope: ReleaseScope,
-        fields: impl IntoIterator<Item = String>,
+        fields: impl IntoIterator<Item: Into<String>>,
         basis: impl Into<String>,
         destination: impl Into<String>,
-        evidence: impl IntoIterator<Item = String>,
+        evidence: impl IntoIterator<Item: Into<String>>,
     ) -> Self {
         let release = Self {
             scope,
             basis: basis.into(),
             destination: destination.into(),
-            fields: fields.into_iter().collect::<BTreeSet<_>>(),
-            evidence: evidence.into_iter().collect::<BTreeSet<_>>(),
+            fields: fields.into_iter().map(Into::into).collect::<BTreeSet<_>>(),
+            evidence: evidence
+                .into_iter()
+                .map(Into::into)
+                .collect::<BTreeSet<_>>(),
         };
         assert!(
             release.validate().is_ok(),
@@ -389,6 +516,7 @@ impl Label {
             provenance: BTreeSet::new(),
             trust: Trust::Trusted,
             sensitivity: Sensitivity::Public,
+            releases: BTreeSet::new(),
         }
     }
 
@@ -401,6 +529,7 @@ impl Label {
             provenance: BTreeSet::from([source]),
             trust: Trust::Untrusted,
             sensitivity: Sensitivity::Internal,
+            releases: BTreeSet::new(),
         }
     }
 
@@ -411,13 +540,20 @@ impl Label {
     }
 
     /// Bounded join-semilattice: trust degrades, sensitivity escalates,
-    /// provenance accumulates.
+    /// provenance accumulates, release marks union.
+    ///
+    /// The union is a *record*, not a promotion: a mark only ever improves the
+    /// label at the one sink it names, and callers that join labels across
+    /// values with different pointer shapes ([`Tainted::zip`],
+    /// [`Tainted::object`]) rebase or drop the marks whose pointers the new
+    /// shape invalidated.
     #[must_use]
     pub fn join(&self, other: &Self) -> Self {
         Self {
             provenance: self.provenance.union(&other.provenance).cloned().collect(),
             trust: self.trust.max(other.trust),
             sensitivity: self.sensitivity.max(other.sensitivity),
+            releases: self.releases.union(&other.releases).cloned().collect(),
         }
     }
 
@@ -530,9 +666,16 @@ impl<T> Tainted<T> {
     /// [`Tainted::array`] when assembling structured values whose field-level
     /// provenance must survive to a sink.
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Tainted<U> {
+        let mut label = self.label;
+        // Field-scoped release marks die with the field labels: the transform
+        // invalidated their pointers, and a mark surviving onto whatever now
+        // sits at its path would extend a grant to data it never covered. A
+        // whole-value mark still covers the derived value, exactly as the
+        // whole-value label does.
+        label.releases.retain(|mark| mark.field().is_empty());
         Tainted {
             value: f(self.value),
-            label: self.label,
+            label,
             fields: BTreeMap::new(),
         }
     }
@@ -542,7 +685,12 @@ impl<T> Tainted<T> {
     /// Arbitrary tuple construction invalidates structured JSON paths, so any
     /// field maps are deliberately discarded.
     pub fn zip<U>(self, other: Tainted<U>) -> Tainted<(T, U)> {
-        let label = self.label.join(&other.label);
+        let mut label = self.label.join(&other.label);
+        // No release survives the mix: the tuple is a value neither release
+        // was granted over, and a whole-value mark carried across would treat
+        // the *other* half as released too. Losing a mark refuses more,
+        // never less.
+        label.releases.clear();
         Tainted {
             value: (self.value, other.value),
             label,
@@ -553,15 +701,25 @@ impl<T> Tainted<T> {
 
 impl Tainted<serde_json::Value> {
     /// Build a JSON object without flattening the labels of its fields.
-    pub fn object(fields: impl IntoIterator<Item = (String, Self)>) -> Self {
+    pub fn object<K: Into<String>>(fields: impl IntoIterator<Item = (K, Self)>) -> Self {
         let mut value = serde_json::Map::new();
         let mut label = Label::trusted();
         let mut field_labels = BTreeMap::new();
 
         for (name, field) in fields {
+            let name = name.into();
             let base = format!("/{}", escape_pointer_token(&name));
-            label = label.join(&field.label);
-            field_labels.insert(base.clone(), field.label);
+            // Release marks are carried root-relative on the whole-value
+            // label, so the child's marks are rebased under its new pointer
+            // rather than unioned as-is — an unrebased union would cover the
+            // wrong fields of the assembled object.
+            let mut child_label = field.label;
+            let marks = std::mem::take(&mut child_label.releases);
+            label = label.join(&child_label);
+            label
+                .releases
+                .extend(marks.into_iter().map(|mark| mark.rebased(&base)));
+            field_labels.insert(base.clone(), child_label);
             for (path, nested) in field.fields {
                 field_labels.insert(format!("{base}{path}"), nested);
             }
@@ -583,8 +741,14 @@ impl Tainted<serde_json::Value> {
 
         for (index, element) in elements.into_iter().enumerate() {
             let base = format!("/{index}");
-            label = label.join(&element.label);
-            field_labels.insert(base.clone(), element.label);
+            // The same rebase rule as `object`, for the same reason.
+            let mut element_label = element.label;
+            let marks = std::mem::take(&mut element_label.releases);
+            label = label.join(&element_label);
+            label
+                .releases
+                .extend(marks.into_iter().map(|mark| mark.rebased(&base)));
+            field_labels.insert(base.clone(), element_label);
             for (path, nested) in element.fields {
                 field_labels.insert(format!("{base}{path}"), nested);
             }
@@ -650,7 +814,17 @@ impl Tainted<serde_json::Value> {
             return Some(self.clone());
         }
         let value = self.value.pointer(pointer)?.clone();
-        let label = self.label_at(pointer)?.clone();
+        let mut label = self.label_at(pointer)?.clone();
+        // Keep exactly the marks whose scope covers the projection, rebased to
+        // the projected value's root — the same rebase rule the field labels
+        // below follow. A mark that covers neither the pointer nor one of its
+        // descendants is dropped, which refuses more, never less.
+        label.releases = self
+            .label
+            .releases
+            .iter()
+            .filter_map(|mark| mark.projected(pointer))
+            .collect();
         let prefix = format!("{pointer}/");
         let fields = self
             .fields
@@ -668,12 +842,18 @@ impl Tainted<serde_json::Value> {
     }
 
     /// Apply an authorized release. The runtime owns the only call site.
+    ///
+    /// The release does not improve trust or sensitivity in place — it
+    /// attaches [`ReleaseMark`]s to the whole-value label, and only the gates
+    /// judging the exact sink the release named honour them (via
+    /// [`effective_label_at`](Self::effective_label_at)). Every other
+    /// consumer keeps seeing the base label: a value released "for
+    /// `tool://ledger/transfer`" is still untrusted data everywhere else.
     pub(crate) fn apply_release(mut self, release: &Release) -> Option<Self> {
         if release.is_whole_value() {
-            self.label = apply_release_scope(&self.label, release.scope);
-            for label in self.fields.values_mut() {
-                *label = apply_release_scope(label, release.scope);
-            }
+            self.label
+                .releases
+                .insert(ReleaseMark::of(release, String::new()));
             return Some(self);
         }
 
@@ -689,18 +869,50 @@ impl Tainted<serde_json::Value> {
         }
 
         for released in &release.fields {
-            let descendants = format!("{released}/");
-            for (path, label) in &mut self.fields {
-                if path == released || path.starts_with(&descendants) {
-                    *label = apply_release_scope(label, release.scope);
-                }
+            self.label
+                .releases
+                .insert(ReleaseMark::of(release, released.clone()));
+        }
+        Some(self)
+    }
+
+    /// The label a concrete sink sees for the whole value: the base label
+    /// improved by exactly the whole-value release marks granted for
+    /// `destination`. Field-scoped marks improve only their fields, so a
+    /// value whose `/account` was released stays tainted as a whole.
+    ///
+    /// The result carries no marks of its own — it *is* the judgement at that
+    /// sink, and is what the sink gates enforce, what policy is asked over,
+    /// and what the dispatch journals as its outbound label.
+    #[must_use]
+    pub fn effective_label(&self, destination: &str) -> Label {
+        Self::improved(&self.label, &self.label.releases, destination, "")
+    }
+
+    /// The label a concrete sink sees at a JSON Pointer: the base
+    /// [`label_at`](Self::label_at) improved by exactly the marks granted for
+    /// `destination` whose scope covers `path`. `None` when the path is not
+    /// in the value, exactly as `label_at`.
+    #[must_use]
+    pub fn effective_label_at(&self, destination: &str, path: &str) -> Option<Label> {
+        let base = self.label_at(path)?;
+        Some(Self::improved(base, &self.label.releases, destination, path))
+    }
+
+    fn improved(
+        base: &Label,
+        marks: &BTreeSet<ReleaseMark>,
+        destination: &str,
+        path: &str,
+    ) -> Label {
+        let mut effective = base.clone();
+        effective.releases.clear();
+        for mark in marks {
+            if mark.destination() == destination && mark.covers(path) {
+                effective = apply_release_scope(&effective, mark.scope());
             }
         }
-        self.label = self
-            .fields
-            .values()
-            .fold(Label::trusted(), |joined, label| joined.join(label));
-        Some(self)
+        effective
     }
 }
 
@@ -780,16 +992,16 @@ mod tests {
     #[test]
     fn field_projection_preserves_only_the_selected_lineage() {
         let nested = Tainted::object([
-            ("safe".to_owned(), Tainted::trusted(serde_json::json!("ok"))),
+            ("safe", Tainted::trusted(serde_json::json!("ok"))),
             (
-                "body".to_owned(),
+                "body",
                 Tainted::from_source(serde_json::json!("outside"), src("model")),
             ),
         ]);
         let value = Tainted::object([
-            ("selected".to_owned(), nested),
+            ("selected", nested),
             (
-                "other".to_owned(),
+                "other",
                 Tainted::from_source(serde_json::json!("noise"), src("tool")),
             ),
         ]);
@@ -803,35 +1015,167 @@ mod tests {
         assert!(selected.label_at("/other").is_none());
     }
 
+    /// A release improves nothing in place: it is honoured only at the sink
+    /// it named, only for the fields it named.
     #[test]
-    fn field_release_improves_only_its_declared_scope() {
+    fn field_release_improves_only_its_declared_scope_at_its_destination() {
         let value = Tainted::object([
             (
-                "recipient".to_owned(),
+                "recipient",
                 Tainted::from_source(serde_json::json!("treasury"), src("model")),
             ),
             (
-                "memo".to_owned(),
+                "memo",
                 Tainted::from_source(serde_json::json!("outside"), src("model")),
             ),
         ]);
         let release = Release::fields(
             ReleaseScope::trust(),
-            ["/recipient".to_owned()],
+            ["/recipient"],
             "operator verified account",
-            "ledger.transfer",
-            ["approval:42".to_owned()],
+            "tool://ledger/transfer",
+            ["approval:42"],
         );
 
         let released = value.apply_release(&release).unwrap();
-        let recipient = released.label_at("/recipient").unwrap();
-        assert_eq!(recipient.trust, Trust::Trusted);
-        assert_eq!(recipient.sensitivity, Sensitivity::Internal);
-        assert_eq!(recipient.provenance, BTreeSet::from([src("model")]));
-        assert!(released.label_at("/memo").unwrap().is_untrusted());
+
+        // The base labels are untouched: a release is a destination-scoped
+        // grant, not a relabelling. A consumer that reads `label_at` — a
+        // memory write, a join — still sees untrusted data.
+        assert!(released.label_at("/recipient").unwrap().is_untrusted());
+        assert!(released.label().is_untrusted());
+
+        // At the granted destination the effective label is improved — trust
+        // only, retaining sensitivity and provenance.
+        let at_dest = released
+            .effective_label_at("tool://ledger/transfer", "/recipient")
+            .unwrap();
+        assert_eq!(at_dest.trust, Trust::Trusted);
+        assert_eq!(at_dest.sensitivity, Sensitivity::Internal);
+        assert_eq!(at_dest.provenance, BTreeSet::from([src("model")]));
+
+        // A different sink sees the base label: the release does not follow
+        // the value to destinations nobody authorized.
         assert!(
-            released.label().is_untrusted(),
-            "unreleased content still taints"
+            released
+                .effective_label_at("tool://mail/send", "/recipient")
+                .unwrap()
+                .is_untrusted(),
+            "a release for one destination improved the label at another"
+        );
+
+        // The unreleased sibling and the whole value stay tainted even at the
+        // granted destination.
+        assert!(
+            released
+                .effective_label_at("tool://ledger/transfer", "/memo")
+                .unwrap()
+                .is_untrusted()
+        );
+        assert!(
+            released
+                .effective_label("tool://ledger/transfer")
+                .is_untrusted(),
+            "a field-scoped release must not clear the whole-value taint"
+        );
+    }
+
+    /// Projection and assembly carry a mark exactly as they carry field
+    /// labels: rebased, and only where its scope still covers something.
+    #[test]
+    fn a_release_mark_survives_projection_and_assembly_rebased() {
+        let value = Tainted::object([
+            (
+                "account",
+                Tainted::from_source(serde_json::json!("DE00"), src("crm")),
+            ),
+            (
+                "note",
+                Tainted::from_source(serde_json::json!("text"), src("model")),
+            ),
+        ]);
+        let release = Release::fields(
+            ReleaseScope::trust(),
+            ["/account"],
+            "operator verified account",
+            "tool://ledger/transfer",
+            ["approval:42"],
+        );
+        let released = value.apply_release(&release).unwrap();
+
+        // Projecting the released field keeps the mark, rebased to the
+        // projection's root; projecting the sibling does not acquire it.
+        let account = released.project_field("account").unwrap();
+        assert_eq!(
+            account.effective_label("tool://ledger/transfer").trust,
+            Trust::Trusted,
+            "the mark did not survive projection of the field it covers"
+        );
+        assert!(
+            account.effective_label("tool://mail/send").is_untrusted(),
+            "projection widened the mark to a destination it never named"
+        );
+        let note = released.project_field("note").unwrap();
+        assert!(
+            note.effective_label("tool://ledger/transfer").is_untrusted(),
+            "projecting a sibling acquired a mark that never covered it"
+        );
+
+        // Reassembly rebases the mark under the new pointer.
+        let assembled = Tainted::object([("payment", account)]);
+        assert_eq!(
+            assembled
+                .effective_label_at("tool://ledger/transfer", "/payment")
+                .map(|l| l.trust),
+            Some(Trust::Trusted),
+            "assembly lost or failed to rebase the projected mark"
+        );
+        assert!(
+            assembled
+                .effective_label("tool://ledger/transfer")
+                .is_untrusted(),
+            "assembly promoted a field mark to the whole value"
+        );
+    }
+
+    /// A reshaped value keeps no more authority than its shape can carry.
+    #[test]
+    fn reshaping_a_value_drops_the_marks_its_shape_invalidated() {
+        let released_whole = Tainted::from_source(serde_json::json!("x"), src("crm"))
+            .apply_release(&Release::whole(
+                ReleaseScope::trust(),
+                "reviewed",
+                "tool://ledger/transfer",
+                ["ticket:1"],
+            ))
+            .unwrap();
+
+        // `zip` mixes in a value the release never covered, so nothing
+        // survives — not even the whole-value mark.
+        let zipped = released_whole.clone().zip(Tainted::trusted(1));
+        assert!(zipped.label().releases.is_empty());
+
+        // `map` keeps the whole-value mark (the label rides the transform as
+        // it always has) but a field mark dies with the field labels.
+        let mapped_whole = released_whole.map(|v| v);
+        assert_eq!(mapped_whole.label().releases.len(), 1);
+
+        let field_released = Tainted::object([(
+            "account",
+            Tainted::from_source(serde_json::json!("DE00"), src("crm")),
+        )])
+        .apply_release(&Release::fields(
+            ReleaseScope::trust(),
+            ["/account"],
+            "reviewed",
+            "tool://ledger/transfer",
+            ["ticket:1"],
+        ))
+        .unwrap();
+        let mapped_fields = field_released.map(|v| v);
+        assert!(
+            mapped_fields.label().releases.is_empty(),
+            "a field mark outlived the pointer paths the transform invalidated"
         );
     }
 
@@ -920,14 +1264,14 @@ mod tests {
     fn an_untracked_descendant_inherits_its_nearest_labelled_ancestor() {
         let nested = Tainted::object([
             (
-                "recipient".to_owned(),
+                "recipient",
                 Tainted::with_label(
                     serde_json::json!({ "addr": "ops@example.com" }),
                     Label::trusted(),
                 ),
             ),
             (
-                "note".to_owned(),
+                "note",
                 Tainted::with_label(
                     serde_json::json!("n"),
                     Label::untrusted(src("tool://mail")).with_sensitivity(Sensitivity::Secret),
@@ -963,14 +1307,14 @@ mod tests {
     fn field_provenance_is_reported_rebased_and_required() {
         let value = Tainted::object([
             (
-                "recipient".to_owned(),
+                "recipient",
                 Tainted::with_label(
                     serde_json::json!("ops@example.com"),
                     Label::untrusted(src("tool://mail")),
                 ),
             ),
             (
-                "amount".to_owned(),
+                "amount",
                 Tainted::with_label(serde_json::json!(10), Label::trusted()),
             ),
         ]);
@@ -1057,9 +1401,15 @@ mod tests {
             .apply_release(&ok)
             .expect("a release over a field with real lineage was refused");
         assert_eq!(
-            good.label_at("/recipient").map(|l| l.trust),
+            good.effective_label_at("tool://ledger/post", "/recipient")
+                .map(|l| l.trust),
             Some(Trust::Trusted),
-            "the released field was not promoted"
+            "the released field was not promoted at its granted destination"
+        );
+        assert_eq!(
+            good.label_at("/recipient").map(|l| l.trust),
+            Some(Trust::Untrusted),
+            "the release relabelled the base value instead of marking it"
         );
     }
 }
@@ -1085,10 +1435,10 @@ mod release_validation_tests {
     fn sound() -> Release {
         Release::fields(
             ReleaseScope::trust(),
-            ["/recipient".to_owned()],
+            ["/recipient"],
             "operator matched the account to settlement SET-42",
             "tool://ledger/transfer",
-            ["approval:SET-42".to_owned()],
+            ["approval:SET-42"],
         )
     }
 
@@ -1336,10 +1686,10 @@ mod release_validation_tests {
     fn a_release_reports_the_decision_it_was_given() {
         let release = Release::fields(
             ReleaseScope::trust(),
-            ["/recipient".to_owned()],
+            ["/recipient"],
             "four-eyes approval AC-1",
             "tool://ledger/post_entry",
-            ["ticket:AC-1".to_owned(), "reviewer:sam".to_owned()],
+            ["ticket:AC-1", "reviewer:sam"],
         );
 
         assert_eq!(
@@ -1375,7 +1725,7 @@ mod release_validation_tests {
             ReleaseScope::trust(),
             "operator override",
             "tool://ledger/post_entry",
-            ["ticket:AC-2".to_owned()],
+            ["ticket:AC-2"],
         );
         assert!(
             whole.is_whole_value(),

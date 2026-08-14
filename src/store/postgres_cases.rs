@@ -161,6 +161,12 @@ CREATE INDEX IF NOT EXISTS inbound_events_dead
     ON inbound_events (tenant, received_at DESC)
     WHERE dead;
 
+-- The unsubscribe strip's read: the rows a run holds claimed, whose delivered
+-- payloads are shed once the run's wait is satisfied and journaled.
+CREATE INDEX IF NOT EXISTS inbound_events_claimed
+    ON inbound_events (tenant, claimed_by)
+    WHERE claimed_by IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS inbound_correlation (
     tenant    TEXT NOT NULL,
     event_id  TEXT NOT NULL,
@@ -229,9 +235,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     PRIMARY KEY (tenant, task_id)
 );
 
--- The queue's read: pending work in arrival order.
-CREATE INDEX IF NOT EXISTS tasks_queue
-    ON tasks (tenant, state, created_at);
+-- The queue's read: pending work, most urgent first and oldest within a rank.
+-- The rank expression is verbatim the ORDER BY in `queue` — an expression
+-- index serves a query only when the expressions match exactly.
+CREATE INDEX IF NOT EXISTS tasks_queue_rank
+    ON tasks (tenant, state,
+              (CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
+                             WHEN 'normal' THEN 2 ELSE 3 END),
+              created_at);
 
 -- The overdue sweep's read. Partial: most tasks have no window to close.
 CREATE INDEX IF NOT EXISTS tasks_due
@@ -1119,10 +1130,16 @@ impl EventStore for PostgresStore {
     }
 
     async fn subscribe(&self, sub: &Subscription, at: Timestamp) -> Result<(), StoreError> {
-        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // One transaction for the whole wait. A subscription with several
+        // correlation keys is one wait, and the per-statement autocommit this
+        // replaces could fail halfway — a wait reachable by some of its keys
+        // and not others, which matches or misses depending on which key the
+        // event happens to carry. The redb backend writes them in one
+        // transaction; so does this.
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
         for k in &sub.correlation {
-            client
-                .execute(
+            tx.execute(
                     "INSERT INTO subscriptions
                        (run_id, effect_key, case_id, step, phase, event_kind,
                         namespace, value, created_at, tenant)
@@ -1144,6 +1161,7 @@ impl EventStore for PostgresStore {
                 .await
                 .map_err(|e| be(&e))?;
         }
+        tx.commit().await.map_err(|e| be(&e))?;
         Ok(())
     }
 
@@ -1321,12 +1339,21 @@ impl EventStore for PostgresStore {
 
         // Lock this run's candidate subscription rows. Two continuations for
         // one task then serialize before either can insert its event.
+        //
+        // Ordered by effect key, because that is the order the embedded
+        // backend walks its subscription table in — its key is
+        // `(tenant, run, effect, …)` — and when one run has several waits that
+        // all match one event, *which* wait the delivery satisfies is
+        // observable: the resumed step, the effect key on the wake record. Two
+        // backends electing different waiters is a run that behaves
+        // differently depending on which store it journals to. Lowest effect
+        // key wins on both.
         let rows = tx
             .query(
                 "SELECT effect_key, case_id, step, phase, namespace, value
                    FROM subscriptions
                   WHERE tenant = $1 AND run_id = $2 AND event_kind = $3
-                  ORDER BY created_at ASC
+                  ORDER BY effect_key ASC
                   FOR UPDATE",
                 &[&tenant, &target.to_string(), &event.kind],
             )
@@ -1439,7 +1466,48 @@ impl EventStore for PostgresStore {
             )
             .await
             .map_err(|e| be(&e))?;
+        // The run's unsubscribe is the store's signal that delivery was
+        // journaled, so the buffer's copy of every payload this run claimed is
+        // shed here. The row keeps its `(source, id)` identity, claim and
+        // dead-letter fields: dedup and accounting need those, and only the
+        // content was ever the erasure concern. Stripping at the *claim*
+        // instead would lose the payload for a run that crashed between claim
+        // and resume, whose recovery re-reads it from the buffer.
+        client
+            .execute(
+                "UPDATE inbound_events SET payload = 'null'
+                  WHERE tenant = $1 AND claimed_by = $2",
+                &[&self.tenant_name(), &run.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
         Ok(())
+    }
+
+    async fn erase_payload(&self, source: &str, id: &str) -> Result<bool, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // Through the one implementation of the dedup identity, not a second
+        // spelling of its separator.
+        let key = InboundEvent {
+            source: source.to_owned(),
+            id: id.to_owned(),
+            kind: String::new(),
+            correlation: Vec::new(),
+            payload: serde_json::Value::Null,
+        }
+        .dedup_key();
+        // The row survives with its identity, claim state and dead-letter
+        // reason — dedup still refuses a replay of the erased message, the
+        // dead-letter list stays countable, and only the payload goes.
+        let n = client
+            .execute(
+                "UPDATE inbound_events SET payload = 'null'
+                  WHERE tenant = $1 AND event_id = $2",
+                &[&self.tenant_name(), &key],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(n > 0)
     }
 
     async fn sweep_unclaimed(
@@ -1512,7 +1580,15 @@ impl EventStore for PostgresStore {
                 },
                 received_at: Timestamp::from_unix_timestamp(row.get::<_, i64>(3))
                     .map_err(|e| corrupt("unrepresentable received_at", e))?,
-                reason: row.get::<_, Option<String>>(4).unwrap_or_default(),
+                // One wording across backends: a retirement that recorded no
+                // reason reads "unclaimed", exactly as the redb backend
+                // answers, rather than an empty string here and a word there —
+                // an operator scripting on the reason field must not have to
+                // know which store the plane journals to.
+                reason: row
+                    .get::<_, Option<String>>(4)
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or_else(|| "unclaimed".to_owned()),
             });
         }
         Ok(out)
@@ -1829,12 +1905,22 @@ impl TaskStore for PostgresStore {
         // `claimed`, un-deciding the expiry policy that already fired on it.
         // `take_over` and `release` carry the same predicate for the same
         // reason.
+        //
+        // The second arm is the **same-holder re-claim**, which is idempotent
+        // success — the contract on `TaskStore::claim`, and the one the redb
+        // backend already honoured while this one refused with
+        // `AlreadyClaimed { holder: yourself }`. A claim whose acknowledgement
+        // was lost is retried by an honest client, and the retry must converge
+        // on "you hold it" rather than bounce off its own success. It does not
+        // widen the race: a task claimed by anybody *else* still fails every
+        // arm, and an expired task matches neither state predicate.
         let updated = client
             .execute(
                 "UPDATE tasks SET assignee = $2, state = 'claimed'
                   WHERE task_id = $1 AND tenant = $3
-                    AND (assignee IS NULL OR assignee = $2)
-                    AND state IN ('open', 'escalated')",
+                    AND ((state IN ('open', 'escalated')
+                          AND (assignee IS NULL OR assignee = $2))
+                         OR (state = 'claimed' AND assignee = $2))",
                 &[&id.to_hex(), &actor.to_owned(), &self.tenant_name()],
             )
             .await
@@ -1985,12 +2071,23 @@ impl TaskStore for PostgresStore {
 
     async fn queue(&self, roles: &[String], limit: usize) -> Result<Vec<Task>, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // Most urgent first, oldest within a rank — the trait's contract, which
+        // the redb backend serves from a rank-keyed index. Ordering by age
+        // alone made the limit a filter on the wrong axis: an urgent task
+        // behind a page of older normal ones was simply absent from the page,
+        // which for a worklist means the most important decision is the one
+        // nobody is shown. The CASE expression must stay identical to the one
+        // in the `tasks_queue_rank` index, or the index stops serving this
+        // read.
         let rows = client
             .query(
                 &format!(
                     "SELECT {TASK_COLS} FROM tasks
                       WHERE tenant = $2 AND state IN ('open', 'escalated')
-                      ORDER BY created_at ASC LIMIT $1"
+                      ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
+                                             WHEN 'normal' THEN 2 ELSE 3 END,
+                               created_at ASC
+                      LIMIT $1"
                 ),
                 &[
                     &i64::try_from(limit).unwrap_or(i64::MAX),
@@ -2196,6 +2293,7 @@ impl BatchStore for PostgresStore {
             ItemOutcome::Failed(d) => ("failed", Some(d.clone())),
             ItemOutcome::Quarantined(d) => ("quarantined", Some(d.clone())),
             ItemOutcome::Suspended(d) => ("suspended", Some(d.clone())),
+            ItemOutcome::Exhausted(d) => ("exhausted", Some(d.clone())),
         };
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let updated = client
@@ -2231,7 +2329,8 @@ impl BatchStore for PostgresStore {
             .query_one(
                 "SELECT MIN(item_key) FROM batch_items
                   WHERE batch_id = $1 AND tenant = $2
-                    AND (outcome IS NULL OR outcome = 'suspended')",
+                    AND (outcome IS NULL OR outcome = 'suspended'
+                         OR outcome = 'exhausted')",
                 &[&batch.to_string(), &self.tenant_name()],
             )
             .await
@@ -2283,6 +2382,7 @@ impl BatchStore for PostgresStore {
                 Some("failed") => c.failed = n,
                 Some("quarantined") => c.quarantined = n,
                 Some("suspended") => c.suspended = n,
+                Some("exhausted") => c.exhausted = n,
                 _ => c.in_flight = n,
             }
             c.spend.tokens += amount_of(tokens);
@@ -2330,6 +2430,7 @@ fn outcome_from(state: Option<String>, detail: Option<String>) -> Option<ItemOut
         "failed" => Some(ItemOutcome::Failed(d)),
         "quarantined" => Some(ItemOutcome::Quarantined(d)),
         "suspended" => Some(ItemOutcome::Suspended(d)),
+        "exhausted" => Some(ItemOutcome::Exhausted(d)),
         _ => None,
     }
 }

@@ -747,16 +747,19 @@ impl Runtime {
         );
         self.meter().count(metrics::TIMERS_FIRED, "");
 
-        // The wake is recorded and the timer disarmed; the bookkeeping lease
-        // has nothing left to write. `replay` claims its own lease before it
-        // reads, so this one is handed back first rather than deadlocking the
-        // resume against its own wake — and a `LeaseHeld` from the replay
-        // means somebody claimed the run in the gap, who will read the
-        // recorded wake like any other completed effect.
-        if let Err(e) = self.store().release_lease(timer.run, lease.epoch).await {
-            tracing::debug!(run = %timer.run, error = %e, "could not hand back the wake lease");
-        }
-        match self.replay(timer.run, Mode::Resume).await {
+        // The wake is recorded and the timer disarmed; the resume continues
+        // under the *same* lease rather than releasing and re-acquiring. The
+        // old release-then-acquire choreography opened a window this pass
+        // could not see again: a crash between the release and the resume's
+        // acquire left a released lease over a run whose timer was already
+        // disarmed — no driver, and absent from the abandonment queue, which
+        // lists only leases that expired while still naming an owner. Handing
+        // the lease over keeps the run owned continuously from wake to
+        // conclusion, so a crash anywhere in the resume leaves an owned lease
+        // the sweep drains. A `LeaseHeld` can still surface if this lease
+        // lapses mid-resume and somebody else claims the run — they will read
+        // the recorded wake like any other completed effect.
+        match self.resume_holding(timer.run, lease).await {
             Ok(_) | Err(RuntimeError::LeaseHeld { .. }) => Ok(()),
             Err(e) => Err(e),
         }

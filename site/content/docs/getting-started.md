@@ -466,8 +466,8 @@ let catalog = ToolCatalog::new()
   );
 
 let args = Tainted::object([
-  ("account".to_owned(), Tainted::trusted(json!("receivables"))),
-  ("memo".to_owned(), model_written_memo), // may remain untrusted
+  ("account", Tainted::trusted(json!("receivables"))),
+  ("memo", model_written_memo), // may remain untrusted
 ]);
 let result = cx
   .sink_with(&args, |value| {
@@ -494,10 +494,10 @@ let args = cx.release(
   args,
   Release::fields(
     ReleaseScope::trust(),
-    ["/account".to_owned()],
+    ["/account"],
     "operator matched the account to settlement SET-42",
     "tool://ledger/post_entry",
-    ["approval:SET-42".to_owned()],
+    ["approval:SET-42"],
   ),
 ).await?;
 ```

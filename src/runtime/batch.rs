@@ -207,9 +207,15 @@ impl Runtime {
 
 /// A batch is complete only when nothing is reserved and nothing is waiting.
 ///
+/// An exhausted item is waiting too — paused at a ceiling, resumable the
+/// moment somebody raises it — and it holds the cursor for exactly that
+/// reason. Reporting `Completed` over one would let `everything_settled()`
+/// answer yes while an item's meters are unsettled, which is the "mostly
+/// worked read as worked" this type exists to prevent.
+///
 /// Note there is no path to a status that says "succeeded": see `crate::batch`.
 fn status_of(c: &BatchCensus, source_exhausted: bool) -> BatchStatus {
-    if !source_exhausted || c.in_flight > 0 || c.suspended > 0 {
+    if !source_exhausted || c.in_flight > 0 || c.suspended > 0 || c.exhausted > 0 {
         return BatchStatus::Running;
     }
     BatchStatus::Completed {
@@ -238,7 +244,10 @@ fn classify_item(outcome: Result<RunOutcome, RuntimeError>) -> (ItemOutcome, Spe
         // it internally — but if one ever escaped it is an item that did not
         // settle, which is what `Failed` means here.
         RunStatus::Failed(why) | RunStatus::Replanning(why) => ItemOutcome::Failed(why),
-        RunStatus::Exhausted(limit) => ItemOutcome::Failed(limit.to_string()),
+        // A pause, not a fault — mirrored from the run's own semantics: the
+        // work stands, and raising the ceiling resumes it. Filing it under
+        // `Failed` taught operators to re-run items whose work was intact.
+        RunStatus::Exhausted(limit) => ItemOutcome::Exhausted(limit.to_string()),
         // An item somebody stopped did not settle, and the batch must not
         // report otherwise — but the reason names the person, so a partial
         // batch can be told apart from one that hit a wall.

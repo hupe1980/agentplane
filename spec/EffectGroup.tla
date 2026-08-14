@@ -233,6 +233,12 @@ DeferredFailsFirst ==
     /\ unwindPos = 0
     /\ pos = Reversibles + 1
     /\ invariantsHold
+    \* A deferred member only runs once the transaction has resolved — the
+    \* same guard `ReleaseDeferred` and `DeferredFailsLanded` carry. A failure
+    \* AT the gate cannot precede the gate being reachable; without this
+    \* conjunct the model aborted groups whose atomic members were still
+    \* pending, a state the implementation cannot produce.
+    /\ txState # "pending"
     /\ gatePos <= Deferreds
     /\ gatePos \in BadDeferreds
     /\ Len(sent) = 0
@@ -446,8 +452,15 @@ Safety ==
 (*                          TEMPORAL PROPERTIES                              *)
 -----------------------------------------------------------------------------
 
-(* A reversal is recorded history, not a scratch pad. *)
-ReversalIsAppendOnly == [][Len(reversed') >= Len(reversed)]_vars
+(* A reversal is recorded history, not a scratch pad. Prefix equality, not    *)
+(* merely length — a record that swapped one reversal for another at the same *)
+(* length would still be rewritten history, and a length check would wave it  *)
+(* through.                                                                   *)
+IsPrefixOf(p, s) ==
+    /\ Len(p) <= Len(s)
+    /\ \A k \in 1 .. Len(p) : s[k] = p[k]
+
+ReversalIsAppendOnly == [][IsPrefixOf(reversed, reversed')]_vars
 
 (* Every group reaches a recorded outcome. `quarantined` counts — refusing to  *)
 (* decide is a decision, and the one an operator can act on. An `open` group    *)

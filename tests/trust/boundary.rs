@@ -154,6 +154,10 @@ impl Effect for Transfer {
     fn sink_arguments(&self) -> Option<&Value> {
         Some(&self.arguments)
     }
+    /// The identity a destination-scoped release must name to cover this sink.
+    fn source(&self) -> SourceId {
+        SourceId::new("tool://ledger/transfer")
+    }
     fn recovery(&self) -> Recovery {
         Recovery::Retry
     }
@@ -162,6 +166,63 @@ impl Effect for Transfer {
     }
     async fn perform(&self) -> Result<Value, EffectError> {
         self.world.lock().unwrap().push("transferred".into());
+        Ok(json!({}))
+    }
+}
+
+/// A mutating sink with a protected recipient, standing at a named address —
+/// the fixture for destination-scoped releases: two of these differ only in
+/// the identity a release must name.
+#[derive(Debug)]
+struct ProtectedSink {
+    world: World,
+    arguments: Value,
+    identity: &'static str,
+    kind: &'static str,
+    protected: Vec<agentplane::core::ProtectedField>,
+}
+
+impl ProtectedSink {
+    fn new(world: World, arguments: Value, identity: &'static str, kind: &'static str) -> Self {
+        Self {
+            world,
+            arguments,
+            identity,
+            kind,
+            protected: vec![agentplane::core::ProtectedField::trusted("/recipient")],
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Effect for ProtectedSink {
+    type Output = Value;
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(self.kind, json!({}))
+    }
+    fn mutates(&self) -> bool {
+        true
+    }
+    fn max_sensitivity(&self) -> Sensitivity {
+        Sensitivity::Secret
+    }
+    fn sink_arguments(&self) -> Option<&Value> {
+        Some(&self.arguments)
+    }
+    fn protected_fields(&self) -> &[agentplane::core::ProtectedField] {
+        &self.protected
+    }
+    fn source(&self) -> SourceId {
+        SourceId::new(self.identity)
+    }
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+    fn retry(&self) -> RetryPolicy {
+        RetryPolicy::never()
+    }
+    async fn perform(&self) -> Result<Value, EffectError> {
+        self.world.lock().unwrap().push(self.kind.into());
         Ok(json!({}))
     }
 }
@@ -267,9 +328,9 @@ async fn plan_argument_assembly_preserves_field_level_provenance() {
             _input: Tainted<Value>,
         ) -> Result<Outcome, SkillError> {
             Ok(Outcome::done(Tainted::object([
-                ("recipient".to_owned(), Tainted::trusted(json!("treasury"))),
+                ("recipient", Tainted::trusted(json!("treasury"))),
                 (
-                    "memo".to_owned(),
+                    "memo",
                     Tainted::from_source(json!("model text"), SourceId::new("model.complete")),
                 ),
             ])))
@@ -524,8 +585,10 @@ async fn releasing_is_the_only_label_improvement_and_it_is_journaled() {
                     Release::whole(
                         ReleaseScope::trust(),
                         "validated against the settlement schema",
-                        "ledger.transfer",
-                        ["settlement-schema:v1".to_owned()],
+                        // The sink's provenance identity, exactly — a release
+                        // is granted toward one concrete destination.
+                        "tool://ledger/transfer",
+                        ["settlement-schema:v1"],
                     ),
                 )
                 .await?;
@@ -701,6 +764,226 @@ async fn a_replayed_effect_carries_the_same_label() {
     assert!(after.iter().any(|(n, untrusted, _)| n == "b" && *untrusted));
 }
 
+// ── Destination-scoped release ──────────────────────────────────────────────
+
+/// Routes one released value to the sink named in the run input.
+///
+/// The release names `tool://ledger/transfer`, and only that: the value's
+/// `/recipient` came from a model, the release covers exactly that field, and
+/// both sinks protect the field with `require_trusted`. Which sink the value
+/// then reaches is the run input's choice — which is precisely the situation
+/// a destination on a release exists for, because before destinations were
+/// enforced, a released value was indistinguishable from natively trusted
+/// data at *every* gate.
+#[derive(Debug)]
+struct Routed {
+    world: World,
+}
+
+#[async_trait::async_trait]
+impl Skill for Routed {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("routed").provides("routed")
+    }
+    async fn invoke(&self, cx: &mut StepCtx<'_>, i: Tainted<Value>) -> Result<Outcome, SkillError> {
+        let to_mail = i.peek().get("to").and_then(Value::as_str) == Some("mail");
+        let arguments = Tainted::object([
+            (
+                "recipient",
+                Tainted::from_source(json!("treasury"), SourceId::new("model.complete")),
+            ),
+            ("memo", Tainted::trusted(json!("settlement"))),
+        ]);
+        let arguments = cx
+            .release(
+                arguments,
+                Release::fields(
+                    ReleaseScope::trust(),
+                    ["/recipient"],
+                    "operator matched the account to settlement SET-42",
+                    "tool://ledger/transfer",
+                    ["approval:SET-42"],
+                ),
+            )
+            .await?;
+        let (identity, kind) = if to_mail {
+            ("tool://mail/send", "mail.send")
+        } else {
+            ("tool://ledger/transfer", "ledger.transfer")
+        };
+        let out = cx
+            .sink(
+                ProtectedSink::new(
+                    Arc::clone(&self.world),
+                    arguments.peek().clone(),
+                    identity,
+                    kind,
+                ),
+                &arguments,
+            )
+            .await?;
+        Ok(Outcome::done(out))
+    }
+}
+
+/// A release is for its destination, not for every sink the value can reach.
+///
+/// This is the enforcement of the journaled `destination` field: a skill that
+/// releases a recipient "for `tool://ledger/transfer`" and then routes the
+/// value into `tool://mail/send` is refused there — and passes at the sink the
+/// release actually named. Before this, the destination was recorded and never
+/// compared against anything.
+#[tokio::test]
+async fn a_release_for_one_destination_is_refused_at_another_sink() {
+    let world: World = Arc::default();
+    let store = db();
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Routed {
+            world: Arc::clone(&world),
+        })
+        .build();
+
+    let refused = rt
+        .run("routed", Tainted::trusted(json!({ "to": "mail" })))
+        .await
+        .unwrap();
+    let RunStatus::Failed(why) = &refused.status else {
+        panic!(
+            "a value released for the ledger reached the mail sink: {:?}",
+            refused.status
+        )
+    };
+    assert!(
+        why.contains("tool://ledger/transfer") && why.contains("tool://mail/send"),
+        "the refusal must name both the granted destination and the sink it \
+         refused at, or the operator hunts for a release that exists: {why}"
+    );
+    assert!(
+        !why.contains("SET-42") && !why.contains("operator matched"),
+        "the refusal leaked the release's basis or evidence to the caller: {why}"
+    );
+    assert!(
+        world.lock().unwrap().is_empty(),
+        "the mail send must not have happened"
+    );
+
+    // The positive half: the exact destination the release named accepts the
+    // same value. Without this, a refuse-everything change reads as enforcement.
+    let allowed = rt
+        .run("routed", Tainted::trusted(json!({ "to": "ledger" })))
+        .await
+        .unwrap();
+    assert!(
+        matches!(allowed.status, RunStatus::Succeeded),
+        "{:?}",
+        allowed.status
+    );
+    assert_eq!(*world.lock().unwrap(), vec!["ledger.transfer".to_owned()]);
+}
+
+/// A destination-scoped release replays to the same verdicts.
+///
+/// Labels — marks included — are journaled with the run, so a strict replay
+/// reaches the same accept at the granted sink and the same refusal at the
+/// wrong one, without re-deciding either.
+#[tokio::test]
+async fn a_destination_scoped_release_replays_to_the_same_verdicts() {
+    let store = db();
+    let build = || {
+        Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .skill(Routed {
+                world: Arc::default(),
+            })
+            .build()
+    };
+
+    let allowed = build()
+        .run("routed", Tainted::trusted(json!({ "to": "ledger" })))
+        .await
+        .unwrap();
+    assert!(matches!(allowed.status, RunStatus::Succeeded));
+    let refused = build()
+        .run("routed", Tainted::trusted(json!({ "to": "mail" })))
+        .await
+        .unwrap();
+    assert!(matches!(refused.status, RunStatus::Failed(_)));
+
+    for original in [&allowed, &refused] {
+        let replay = build()
+            .replay(original.run_id, Mode::Strict)
+            .await
+            .expect("a destination-scoped release must replay strictly");
+        assert_eq!(
+            replay.status, original.status,
+            "replay re-judged a destination-scoped release"
+        );
+    }
+}
+
+/// A release is for a destination, not for storage.
+///
+/// A released value written to memory keeps its base label: recalled tomorrow
+/// — possibly toward a different sink — it is still the untrusted data it was,
+/// and only the journaled release covers the one destination it named.
+#[tokio::test]
+async fn a_released_value_written_to_memory_keeps_its_base_trust() {
+    use agentplane::memory::{MemoryStore, MemoryWrite, Recall};
+
+    #[derive(Debug)]
+    struct Remembers;
+
+    #[async_trait::async_trait]
+    impl Skill for Remembers {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("remembers").provides("remembers")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let external = Tainted::from_source(json!("DE00"), SourceId::new("crm"));
+            let released = cx
+                .release(
+                    external,
+                    Release::whole(
+                        ReleaseScope::trust(),
+                        "operator matched the account",
+                        "tool://ledger/transfer",
+                        ["approval:SET-42"],
+                    ),
+                )
+                .await?;
+            cx.remember(MemoryWrite::new("acct-1", "acct", "settlement"), released)
+                .await?;
+            Ok(Outcome::done(Tainted::trusted(json!({}))))
+        }
+    }
+
+    let store = db();
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+        .skill(Remembers)
+        .build()
+        .run("remembers", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(matches!(out.status, RunStatus::Succeeded), "{:?}", out.status);
+
+    let items = (Arc::clone(&store) as Arc<dyn MemoryStore>)
+        .recall(&Recall::about("acct"))
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].trust,
+        Trust::Untrusted,
+        "a destination-scoped release followed the value into storage — memory \
+         would replay it as trusted toward every future sink"
+    );
+    assert!(items[0].label().is_untrusted());
+}
+
 /// Does taint survive a hand-off to another agent?
 ///
 /// The requirement is that risk context survives delegation and is checked
@@ -758,5 +1041,61 @@ async fn taint_survives_a_handoff_between_agents() {
         "a specialist's untrusted answer arrived at the next agent as {seen}: taint \
          does not survive the hand-off, so 'risk context must survive \
          delegation' has no mechanism behind it"
+    );
+}
+
+/// A code-gate sink refusal strict-replays as the refusal it was.
+///
+/// These gates fire from code on every mode, so a replay re-derives the
+/// refusal before the dispatch path consults the cursor — and the journaled
+/// `PolicyDenied` record must be consumed on the way, or strict verification
+/// ends with history left over and reports a quarantine about a divergence
+/// that never happened.
+#[tokio::test]
+async fn a_refused_sink_strict_replays_to_the_same_refusal() {
+    #[derive(Debug)]
+    struct Naive {
+        world: World,
+    }
+    #[async_trait::async_trait]
+    impl Skill for Naive {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("naive2").provides("naive2")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let answer = cx.effect(ToolCall).await?;
+            let out = cx
+                .sink(
+                    Transfer {
+                        world: Arc::clone(&self.world),
+                        arguments: answer.peek().clone(),
+                    },
+                    &answer,
+                )
+                .await?;
+            Ok(Outcome::done(out))
+        }
+    }
+    let store = db();
+    let build = || {
+        Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .skill(Naive {
+                world: Arc::default(),
+            })
+            .build()
+    };
+    let out = build()
+        .run("naive2", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(matches!(out.status, RunStatus::Failed(_)));
+    let replay = build().replay(out.run_id, Mode::Strict).await.unwrap();
+    assert_eq!(
+        replay.status, out.status,
+        "a taint-gate refusal did not replay to the verdict the run recorded"
     );
 }

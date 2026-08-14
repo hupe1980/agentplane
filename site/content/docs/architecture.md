@@ -65,7 +65,7 @@ harder to find — it only manifests on old records.
   <text class="lbl" x="320" y="82"  text-anchor="middle">2 · Act</text>
   <text class="sub" x="320" y="99"  text-anchor="middle">the outward call</text>
   <text class="lbl" x="557" y="82"  text-anchor="middle">3 · Record</text>
-  <text class="sub" x="557" y="99"  text-anchor="middle">EffectEnded</text>
+  <text class="sub" x="557" y="99"  text-anchor="middle">EffectDone</text>
 
   <path class="arrow" d="M158 86 H239" marker-end="url(#ah)"/>
   <path class="arrow" d="M395 86 H476" marker-end="url(#ah)"/>
@@ -324,9 +324,14 @@ later siblings' completions — effects performed and never undone.
 **Severity beats ready order.** A suspension is the run working; a failure is the
 run over. If one sibling suspends on an approval and another fails after
 mutating, reporting the suspension would defer the unwind until an event that may
-never arrive. So `Quarantined` > `Failed` > `Exhausted` > `Suspended`, and ready
-order decides only within a severity — keeping the choice a property of the plan
-rather than of the schedule.
+never arrive. So `Quarantined` > `Failed` > `Exhausted` > `Suspended`, with two
+peers folded into the ranks: `Cancelled` sits with `Failed`, because a stop
+ranks with a failure rather than above it — both end the run and both unwind —
+and `Replanning` sits with `Suspended`, the weakest signal in a batch, since a
+sibling that failed outright has already decided the run and re-planning around
+a failure is not what the requesting step was asking for. Ready order decides
+only within a severity — keeping the choice a property of the plan rather than
+of the schedule.
 
 `Quarantined` sits highest because it is the only one that must *not* unwind.
 
@@ -336,7 +341,8 @@ rather than of the schedule.
   <desc id="st-d">When concurrently dispatched siblings disagree about how a run
     ended, severity decides, not the order they happened to be scheduled in.
     Quarantined outranks Failed, which outranks Exhausted, which outranks
-    Suspended. Only Quarantined refuses to unwind.</desc>
+    Suspended. Cancelled ranks with Failed; Replanning ranks with Suspended.
+    Only Quarantined refuses to unwind.</desc>
 
   <rect class="box" x="14"  y="58" width="132" height="52" rx="9"/>
   <rect class="box" x="176" y="58" width="132" height="52" rx="9"/>
@@ -358,7 +364,9 @@ rather than of the schedule.
 
   <text class="sub" x="14"  y="34">outranks →</text>
   <text class="danger-lbl" x="80" y="140" text-anchor="middle">an outcome nobody can account for</text>
-  <text class="sub" x="563" y="140" text-anchor="middle">a wait, not an ending</text>
+  <text class="sub" x="242" y="140" text-anchor="middle">Cancelled ranks here</text>
+  <text class="sub" x="563" y="130" text-anchor="middle">Replanning ranks here</text>
+  <text class="sub" x="563" y="146" text-anchor="middle">a wait, not an ending</text>
 
   <defs>
     <marker id="sh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
@@ -493,7 +501,7 @@ forward member has already landed and there is now no way to undo it, so
 settling as aborted would put "discharged" in the journal while the hold still
 stands.
 
-### Four endings, because two would lie
+### Three endings, because two would lie
 
 | Outcome | What is standing |
 |---|---|
@@ -692,7 +700,7 @@ help either. What is left pointing at it is a case row: ordinary mutable data
 that goes in the same delete.
 
 So sealed runs enter a **per-plane Merkle log** (RFC 6962 shape), and the store
-answers two questions:
+answers three questions:
 
 * `checkpoint()` — origin, size, and root over every sealed run, in the C2SP
   `tlog-checkpoint` shape so existing verifiers work.
@@ -951,7 +959,7 @@ refused" without saying what made it unsafe sends an operator through the whole
 run. A run that wants a different plan after reading untrusted input is
 describing exactly the attack.
 
-**Bounded.** `Budget::replans` caps it. A run that replans without bound has
+**Bounded.** `Budget::max_replans` caps it. A run that replans without bound has
 stopped making progress and started thrashing.
 
 **A completed step's id may not be reused for other work.** Effect keys are
@@ -1222,7 +1230,18 @@ limit**, because the stopping point is recorded rather than recomputed.
 | `max_effects` | Yes — counted in advance |
 | `max_tokens` | No — see below |
 | `max_minor_units` | No — see below |
+| `max_replans` | Yes — each plan change is counted |
+| `max_denials` | Yes — each policy refusal is counted |
 | `max_wallclock_secs` | Opt-in; costs one journaled clock read per step |
+
+The last two counters bound faults rather than work. A run that replans without
+bound has stopped making progress and started thrashing, and the ceiling turns
+that from an unbounded spend into a reported fault. A run that keeps hitting
+the policy is probing it: refusals carry a uniform message precisely so a model
+cannot tell one from another, but the refused/allowed bit itself still leaks
+one bit per attempt, and nothing short of fabricating success removes that —
+what bounds the channel is bounding the attempts. It is an operational ceiling
+as much as a security one, because a denial loop is thrashing by another name.
 
 ### A metered budget overshoots by one operation
 
@@ -1393,8 +1412,10 @@ src/
   manifest/  the declaration an agent is built from, and the registry it is
              pinned in (feature `manifest`, off by default)
   api/       the HTTP surface for operators (feature `http`, off by default)
-  model/     the ModelProvider seam, the metering rules, and two streaming
-             drivers (feature `providers`, off by default)
+  model/     the ModelProvider seam and the metering rules, always present;
+             the provider drivers, each with a streaming twin, sit behind
+             features (`providers` for Anthropic, OpenAI, Gemini and
+             Chat Completions; `bedrock` for Bedrock — both off by default)
   testkit/   fault injection, a fake model provider, and shared assertions
              (feature `testkit`, off by default) — for this crate's assurance
              layers and for embedders testing their own stores and skills
@@ -2575,9 +2596,10 @@ code rather than a tightening of the rules.
 
 There are no review-only security fields, and no architectural injection-pattern
 label: arbitrary native skill code cannot be proven to follow one, and such a
-label would manufacture confidence. `spec.output.schema` is carried
-to the provider and into the effect key, but is not validated a second time
-against a result.
+label would manufacture confidence. `spec.output.schema` is carried to the
+provider, into the effect key, and is checked against the value that comes back
+— a parseable but non-conforming answer is a metered unusable result, not data
+that reaches downstream code.
 
 ### The prompt is part of the declaration
 
@@ -2677,14 +2699,18 @@ Refuse the silence that costs money, not the silence that costs nothing.
 back. Narrowing a field is a breaking change to every consumer, so it belongs in
 the digest rather than in a deploy.
 
-The crate does **not** validate results against it — the same decision
-`Completion::structured` documents, because a second JSON Schema implementation
-here could disagree with the one that did the enforcing, and the disagreement
-would surface as a run refusing an answer that is in fact conformant.
-Enforcement belongs at the provider, during generation, where a constraint
-prevents a malformed answer rather than rejecting one already paid for.
+Enforcement starts at the provider, during generation, where constrained
+decoding prevents a malformed answer before tokens are emitted rather than
+rejecting one already paid for. The crate then validates the parsed value
+locally against the same schema as defense in depth — the decision
+`Completion::structured` documents — so a provider bug or a forced-tool
+best-effort answer surfaces as a loud, metered unusable result instead of
+malformed data reaching downstream code, and the declarative runtime checks the
+final answer once more before it settles, because what settles is that exact
+value. External schema references are never resolved: validation performs no
+hidden file or network I/O.
 
-That does not make it inert. Handed to `ModelCall::expecting`, the schema goes
+The schema also shapes replay. Handed to `ModelCall::expecting`, it goes
 into the **effect key** — so editing it makes a replay report divergence instead
 of quietly reinterpreting last year's stored answer under today's rules.
 

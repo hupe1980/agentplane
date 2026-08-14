@@ -100,8 +100,8 @@ impl Skill for Triage {
         };
 
         let first_prompt = Tainted::object([
-            ("system".to_owned(), Tainted::trusted(json!(system.clone()))),
-            ("ticket".to_owned(), input),
+            ("system", Tainted::trusted(json!(system.clone()))),
+            ("ticket", input),
         ]);
         // Asked twice on purpose — a verifier pass is a second question. Even
         // byte-identical calls would be fine: an effect's identity includes
@@ -122,8 +122,8 @@ impl Skill for Triage {
         // is *once consumption has reached the limit, nothing further starts*,
         // so a one-call skill completes whatever the token ceiling says.
         let checked_prompt = Tainted::object([
-            ("system".to_owned(), Tainted::trusted(json!(system))),
-            ("verify".to_owned(), draft),
+            ("system", Tainted::trusted(json!(system))),
+            ("verify", draft),
         ]);
         let checked = cx
             .complete_with(&checked_prompt, expecting(&schema))

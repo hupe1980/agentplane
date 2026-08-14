@@ -55,17 +55,27 @@ impl SealedTasks {
         )
     }
 
-    /// Bound to the task, so a proposal lifted onto another task fails to
-    /// authenticate rather than opening as somebody else's decision.
-    fn aad(id: TaskId) -> String {
-        id.to_string()
+    /// Bound to tenant, purpose label and task, so a proposal lifted onto
+    /// another task fails to authenticate rather than opening as somebody
+    /// else's decision. The `task:{tenant}:` prefix follows the journal and
+    /// case decorators: a bare task id as AAD was a string another decorator's
+    /// identifier could collide with, and while task ids are generated rather
+    /// than attacker-chosen, the AAD's job is to make cross-purpose confusion
+    /// inexpressible rather than merely unlikely. What the AAD does not do
+    /// alone: the sealing scope also separates envelopes, and the two are
+    /// deliberately redundant.
+    /// `pub(super)` so the keyring's own tests can hold the three decorators'
+    /// derivations side by side and prove colliding identifiers never share
+    /// an AAD.
+    pub(super) fn aad(tenant: &TenantId, id: TaskId) -> String {
+        format!("task:{tenant}:{id}")
     }
 
     async fn opened(&self, mut task: Task) -> Task {
         let Some(envelope) = payload::unwrap(&task.justification.proposed_action) else {
             return task;
         };
-        let aad = Self::aad(task.id);
+        let aad = Self::aad(&self.tenant, task.id);
         // Left sealed when it will not open: an erased proposal must not make
         // the queue unreadable, and a reviewer seeing a sealed row knows the
         // matter was erased rather than that the plane is broken.
@@ -95,7 +105,7 @@ impl TaskStore for SealedTasks {
         let envelope = super::envelope::seal(
             self.keys.as_ref(),
             &self.scope_for(task),
-            Self::aad(task.id).as_bytes(),
+            Self::aad(&self.tenant, task.id).as_bytes(),
             &plain,
         )
         .await

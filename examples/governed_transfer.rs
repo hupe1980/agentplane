@@ -109,15 +109,15 @@ impl Skill for Transfer {
             _ => Tainted::from_source(json!("treasury"), SourceId::new("model.complete")),
         };
         let arguments = Tainted::object([
-            ("recipient".to_owned(), recipient),
+            ("recipient", recipient),
             (
-                "memo".to_owned(),
+                "memo",
                 Tainted::from_source(
                     json!("model-written description may remain untrusted"),
                     SourceId::new("model.complete"),
                 ),
             ),
-            ("amount".to_owned(), Tainted::trusted(json!(1250))),
+            ("amount", Tainted::trusted(json!(1250))),
         ]);
 
         let arguments = if scenario == "released" {
@@ -125,10 +125,10 @@ impl Skill for Transfer {
                 arguments,
                 Release::fields(
                     ReleaseScope::trust(),
-                    ["/recipient".to_owned()],
+                    ["/recipient"],
                     "operator matched the account to settlement SET-42",
                     "tool://ledger/transfer",
-                    ["approval:SET-42".to_owned()],
+                    ["approval:SET-42"],
                 ),
             )
             .await?

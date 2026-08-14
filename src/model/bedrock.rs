@@ -1764,6 +1764,106 @@ mod tests {
         );
     }
 
+    /// Reasoning + `toolUse` + no sibling text is a working tool turn.
+    ///
+    /// With extended thinking on, choosing a tool IS the answer: Converse
+    /// returns `reasoningContent` and `toolUse` blocks with no text beside
+    /// them. This test pins two things at once. First, that the emptiness
+    /// guard in `interpret` requires *both* no text and no tool call before
+    /// declaring the answer unusable — weaken it to text alone and this fails.
+    /// Second, that the continuation carries the reasoning block byte-for-byte
+    /// beside the tool call, signature included, because Bedrock rejects a
+    /// follow-up turn whose reasoning does not return its signature and a
+    /// driver that rebuilt the turn from the fields it understands cannot
+    /// return what it never kept. What this does NOT cover is the streaming
+    /// accumulator's reassembly of those blocks — that has its own tests in
+    /// `bedrock_stream.rs`; both paths funnel into this same `interpret`.
+    #[test]
+    fn a_reasoning_tool_turn_with_no_text_is_an_answer_not_an_empty_one() {
+        let model = ModelId::new("bedrock", "test");
+        let message = Message::builder()
+            .role(ConversationRole::Assistant)
+            .content(ContentBlock::ReasoningContent(
+                ReasoningContentBlock::ReasoningText(
+                    ReasoningTextBlock::builder()
+                        .text("private reasoning")
+                        .signature("sig-bytes")
+                        .build()
+                        .expect("reasoning block"),
+                ),
+            ))
+            .content(ContentBlock::ToolUse(
+                ToolUseBlock::builder()
+                    .tool_use_id("tool_1")
+                    .name("lookup")
+                    .input(document_from_json(&json!({ "id": "AC-1" })))
+                    .build()
+                    .expect("tool block"),
+            ))
+            .build()
+            .expect("assistant message");
+        let output = aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
+            .output(aws_sdk_bedrockruntime::types::ConverseOutput::Message(
+                message,
+            ))
+            .stop_reason(aws_sdk_bedrockruntime::types::StopReason::ToolUse)
+            .build()
+            .expect("converse output");
+
+        let completion = Bedrock::interpret(&model, None, SchemaMode::Native, &output)
+            .expect("a tool call with empty sibling text is a normal tool turn");
+        assert_eq!(completion.tool_calls.len(), 1);
+        assert_eq!(completion.tool_calls[0].name, "lookup");
+        let state = completion
+            .continuation
+            .expect("a tool turn must carry its provider continuation")
+            .state;
+        assert_eq!(
+            state,
+            json!([{ "role": "assistant", "content": [
+                { "type": "reasoning", "text": "private reasoning", "signature": "sig-bytes" },
+                { "type": "tool_use", "id": "tool_1", "name": "lookup", "input": { "id": "AC-1" } },
+            ]}]),
+            "the continuation must carry the provider turn verbatim, reasoning \
+             block and signature included"
+        );
+    }
+
+    /// The twin of the test above: no text AND no tool call stays unusable.
+    ///
+    /// Together the pair pins the guard to exactly `text.is_empty() &&
+    /// calls.is_empty()` (with no structured answer either) — remove either
+    /// conjunct and one of the two fails.
+    #[test]
+    fn an_answer_with_neither_text_nor_tool_calls_is_unusable() {
+        let model = ModelId::new("bedrock", "test");
+        let message = Message::builder()
+            .role(ConversationRole::Assistant)
+            .content(ContentBlock::ReasoningContent(
+                ReasoningContentBlock::ReasoningText(
+                    ReasoningTextBlock::builder()
+                        .text("reasoned and then said nothing")
+                        .build()
+                        .expect("reasoning block"),
+                ),
+            ))
+            .build()
+            .expect("assistant message");
+        let output = aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
+            .output(aws_sdk_bedrockruntime::types::ConverseOutput::Message(
+                message,
+            ))
+            .stop_reason(aws_sdk_bedrockruntime::types::StopReason::EndTurn)
+            .build()
+            .expect("converse output");
+        let error = Bedrock::interpret(&model, None, SchemaMode::Native, &output)
+            .expect_err("reasoning with neither text nor a tool call is not usable");
+        assert!(
+            matches!(error, ModelError::Unusable { .. }),
+            "wrong classification: {error}"
+        );
+    }
+
     #[test]
     fn cumulative_bedrock_transcript_decodes_every_prior_turn() {
         let model = ModelId::new("bedrock", "test");

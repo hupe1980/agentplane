@@ -285,9 +285,9 @@ og:
 doc-examples:
     tools/check-doc-examples.sh
 
-# build the docs site into site/public
+# build the docs site into site/public, refusing broken internal links/anchors
 site:
-    cd site && zola build
+    cd site && zola check && zola build
 
 # serve the docs site locally with live reload
 site-serve:

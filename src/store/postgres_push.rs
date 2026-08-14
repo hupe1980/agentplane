@@ -8,7 +8,7 @@ use crate::push::{
     PushStore,
 };
 
-use super::postgres::PostgresStore;
+use super::postgres::{PostgresStore, amount_of};
 
 fn be(error: &tokio_postgres::Error) -> StoreError {
     StoreError::Backend(error.to_string())
@@ -32,9 +32,13 @@ fn registration_from(row: &tokio_postgres::Row) -> Result<PushRegistration, Stor
                     credentials: Secret::new(credentials),
                 }),
         },
-        next_seq: row.get::<_, i64>(6).cast_unsigned(),
-        attempts: row.get::<_, i32>(7).cast_unsigned(),
-        next_attempt_at: row.get::<_, i64>(8).cast_unsigned(),
+        // Clamped, not bit-cast, for the reason `amount_of` gives: the columns
+        // carry CHECKs, but a row edited around them must read as *nothing*
+        // rather than as billions — `cast_unsigned` on a negative cursor would
+        // fast-forward the delivery past every unacknowledged event.
+        next_seq: amount_of(row.get::<_, i64>(6)),
+        attempts: u32::try_from(row.get::<_, i32>(7)).unwrap_or(0),
+        next_attempt_at: amount_of(row.get::<_, i64>(8)),
         last_error: row.get(9),
     })
 }

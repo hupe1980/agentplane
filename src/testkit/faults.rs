@@ -283,6 +283,30 @@ impl JournalStore for Faulty {
         self.inner.is_shared()
     }
 
+    /// The wrapped store's atomic capability, passed through undamaged.
+    ///
+    /// The trait's default answers `None`, so leaving this to the default
+    /// silently *removed* a capability: a plane whose backend offers atomic
+    /// effect enrolment lost it the moment a test wrapped the store in faults,
+    /// and the fault suite exercised a differently-wired plane than the one
+    /// production runs. Note what this does NOT do: the atomic handle returned
+    /// here is the inner store's own, so faults are never injected on the
+    /// atomic path — the schedule covers `append` only.
+    fn atomic(&self) -> Option<&dyn crate::journal::AtomicJournal> {
+        self.inner.atomic()
+    }
+
+    /// The wrapped store's tenant, passed through undamaged.
+    ///
+    /// The default is the default tenant, so a faulty wrapper around a
+    /// tenant-scoped store previously *misreported* who it serves — and the
+    /// runtime builder's startup check, which exists to refuse exactly that
+    /// mismatch, would have refused a correctly-scoped store or admitted a
+    /// wrongly-scoped one depending on which side wore the wrapper.
+    fn tenant(&self) -> &str {
+        self.inner.tenant()
+    }
+
     async fn append(&self, epoch: Epoch, batch: Vec<Append>) -> Result<Vec<Record>, StoreError> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let kinds: Vec<&str> = batch.iter().map(|a| a.kind.kind_str()).collect();
@@ -390,9 +414,6 @@ impl JournalStore for Faulty {
         self.inner.seal(run, epoch, outcome).await
     }
 
-    // Stop requests pass through unfaulted. The schedule injects faults on
-    // *appends*, because that is where a lost commit changes what the runtime
-    // may conclude; a dropped stop request is an operator retrying a click.
     async fn checkpoint(&self) -> Result<crate::journal::Checkpoint, StoreError> {
         self.inner.checkpoint().await
     }
@@ -411,6 +432,9 @@ impl JournalStore for Faulty {
         self.inner.inclusion_proof(run).await
     }
 
+    // Stop requests pass through unfaulted. The schedule injects faults on
+    // *appends*, because that is where a lost commit changes what the runtime
+    // may conclude; a dropped stop request is an operator retrying a click.
     async fn request_cancel(
         &self,
         run: RunId,
@@ -425,5 +449,140 @@ impl JournalStore for Faulty {
         run: RunId,
     ) -> Result<Option<crate::journal::Cancellation>, StoreError> {
         self.inner.cancellation(run).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store that offers the atomic capability and a scoped tenant.
+    ///
+    /// Only `atomic()` and `tenant()` matter here; every data method is
+    /// unreachable in this test and says so. The stub exists because neither
+    /// capability can be observed through a backend the test suite can build
+    /// in-process — redb offers no atomic journal — and the trait's *defaults*
+    /// are exactly the wrong answers a forgetful wrapper would give.
+    #[derive(Debug)]
+    struct Capable;
+
+    #[async_trait]
+    impl crate::journal::AtomicJournal for Capable {
+        async fn append_atomic(
+            &self,
+            _run: RunId,
+            _epoch: Epoch,
+            _work: &dyn crate::journal::AtomicWork,
+        ) -> Result<Vec<Record>, StoreError> {
+            Err(StoreError::Backend("the test never commits".into()))
+        }
+    }
+
+    #[async_trait]
+    impl JournalStore for Capable {
+        fn is_shared(&self) -> bool {
+            true
+        }
+        fn atomic(&self) -> Option<&dyn crate::journal::AtomicJournal> {
+            Some(self)
+        }
+        // The literal is the point: the stub must answer something other
+        // than the trait default, and the trait's signature fixes the
+        // lifetime whether or not the value here is 'static.
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn tenant(&self) -> &str {
+            "acme"
+        }
+        async fn append(&self, _: Epoch, _: Vec<Append>) -> Result<Vec<Record>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn read(&self, _: RunId, _: Seq) -> Result<Vec<Record>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn runs_by_outcome(&self, _: &str, _: usize) -> Result<Vec<RunId>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn recent_runs(
+            &self,
+            _: Option<(u64, RunId)>,
+            _: usize,
+        ) -> Result<Vec<(RunId, u64)>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn case_history(
+            &self,
+            _: crate::core::CaseId,
+            _: usize,
+        ) -> Result<Vec<Record>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn head(&self, _: RunId) -> Result<Head, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn acquire(&self, _: RunId, _: &str, _: Duration) -> Result<Lease, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn renew(
+            &self,
+            _: RunId,
+            _: &str,
+            _: Epoch,
+            _: Duration,
+        ) -> Result<Lease, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn abandoned_runs(&self, _: usize) -> Result<Vec<RunId>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn release_lease(&self, _: RunId, _: Epoch) -> Result<(), StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn seal(&self, _: RunId, _: Epoch, _: &str) -> Result<Digest, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn checkpoint(&self) -> Result<crate::journal::Checkpoint, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn consistency_proof(&self, _: u64) -> Result<Vec<Digest>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn inclusion_proof(
+            &self,
+            _: RunId,
+        ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn request_cancel(&self, _: RunId, _: &str, _: &str) -> Result<bool, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn cancellation(
+            &self,
+            _: RunId,
+        ) -> Result<Option<crate::journal::Cancellation>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+    }
+
+    /// The wrapper forwards capabilities instead of shadowing them with the
+    /// trait defaults.
+    ///
+    /// Delete either override in `Faulty` and one half of this fails: the
+    /// default `atomic()` answers `None`, silently dropping the capability
+    /// from every fault test, and the default `tenant()` answers the default
+    /// tenant, misreporting a scoped store to the runtime builder's startup
+    /// check.
+    #[test]
+    fn capabilities_pass_through_the_fault_wrapper() {
+        let faulty = Faulty::new(Arc::new(Capable), Schedule::healthy());
+        assert!(
+            faulty.atomic().is_some(),
+            "wrapping in faults dropped the atomic capability"
+        );
+        assert_eq!(
+            faulty.tenant(),
+            "acme",
+            "wrapping in faults misreported the tenant"
+        );
+        assert!(faulty.is_shared(), "topology must pass through too");
     }
 }

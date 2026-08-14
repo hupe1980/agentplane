@@ -1320,3 +1320,507 @@ async fn a_dropped_case_layer_is_a_finding_not_a_quiet_file() {
     );
     assert!(!report.is_sound(), "a stripped export still reported sound");
 }
+
+/// An export taken through a sealed journal carries ciphertext, not plaintext.
+///
+/// `SealedJournal::read` hands records back *opened* — the runtime's own steps
+/// must read what they wrote — so an export that copied the opened `body` into
+/// the file would quietly undo erasure: destroying the wrapping key no longer
+/// reaches the copy somebody exported last month. The export therefore derives
+/// its display copy from the wire bytes the chain hashed. Three assertions,
+/// each a distinct failure mode: the caller's payload is absent from the file,
+/// the verifier raises no false tamper finding over the honest sealed export,
+/// and the sealed body still matches its own wire bytes by construction.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn a_sealed_journals_export_carries_no_plaintext() {
+    use agentplane::keyring::KeyRing;
+    use agentplane::testkit::MemoryKeyRing;
+
+    let secret = "SECRET-PAYLOAD-73";
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let ring = Arc::new(MemoryKeyRing::new());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .keyring(Arc::clone(&ring) as Arc<dyn KeyRing>)
+        .skill(Trivial)
+        .build();
+    let out = rt
+        .run("demo.trivial", Tainted::trusted(json!({ "n": secret })))
+        .await
+        .expect("run");
+
+    // Through the runtime's own handle — the sealed decorator, which is the
+    // natural wiring an embedder reaches for and the one that used to leak.
+    let mut file = Vec::new();
+    agentplane::export::to_jsonl(rt.journal(), None, &[out.run_id], &mut file)
+        .await
+        .expect("export");
+    let text = String::from_utf8(file).expect("utf8");
+
+    assert!(
+        !text.contains(secret),
+        "the export of a sealed journal carries the caller's plaintext — \
+         erasure no longer reaches the exported copy"
+    );
+    // The positive half: the payload genuinely crossed the run, so its absence
+    // above is sealing, not the fixture never writing it.
+    let opened = rt
+        .journal()
+        .read(out.run_id, 1)
+        .await
+        .expect("read through the ring");
+    let opened_text = serde_json::to_string(&opened.iter().map(|r| &r.body).collect::<Vec<_>>())
+        .expect("serialize");
+    assert!(
+        opened_text.contains(secret),
+        "the payload never reached the journal — the absence assertion above \
+         is measuring the fixture"
+    );
+
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None).expect("verify");
+    assert!(
+        report.is_sound(),
+        "an honest sealed export raised findings — the display copy and the \
+         wire bytes disagree: {:#?}",
+        report.findings
+    );
+}
+
+// ── The trailer's accounting, held to the file ──────────────────────────────
+//
+// Only the trailer's `cases` count used to be read back; `runs_requested`,
+// `runs_exported`, `records` and `unreadable` were written by the exporter
+// and consulted by nobody, so a file edited under an intact trailer verified
+// clean wherever no chain link or leaf happened to notice. These tests pin
+// the settlement that closed that: counts compared, honest unreadability
+// routed to `not_checked`, and an empty run block never sound.
+
+/// Build an **open** run by appending records and never sealing — the shape
+/// whose tail no Merkle leaf pins, so the trailer's counts are the only
+/// witness left when lines go missing.
+async fn open_run_export() -> (agentplane::core::RunId, String) {
+    use agentplane::journal::RecordKind;
+
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let run = agentplane::core::RunId::generate();
+    for skill in ["first", "second", "third"] {
+        store
+            .append(
+                1,
+                vec![Append::new(
+                    run,
+                    RecordKind::StepStarted {
+                        skill: skill.to_owned(),
+                    },
+                )],
+            )
+            .await
+            .expect("append");
+    }
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        .await
+        .expect("export");
+    (run, String::from_utf8(out).expect("utf8"))
+}
+
+/// **Deleting an open run's tail record is caught by the trailer's count.**
+///
+/// The quiet edit this settlement exists for: an open run has no leaf, a
+/// chain prefix verifies, and the sequence stays contiguous when only the
+/// tail is gone — so before the counts were compared, this file verified
+/// clean with a record missing. The trailer is the writer's own tally, and
+/// the only line left that knows how long the run was.
+#[tokio::test]
+async fn a_deleted_tail_record_fails_the_trailer_accounting() {
+    let (_, text) = open_run_export().await;
+
+    // The positive half first: the untouched file verifies.
+    let clean =
+        agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None).expect("verify");
+    assert!(clean.is_sound(), "{:#?}", clean.findings);
+
+    // Remove the last record line — the tail cut, on a line boundary.
+    let lines: Vec<&str> = text.lines().collect();
+    let is_record =
+        |l: &str| serde_json::from_str::<Value>(l).is_ok_and(|v| v.get("kind").is_none());
+    let last_record = lines
+        .iter()
+        .rposition(|l| is_record(l))
+        .expect("the fixture exported records");
+    let cut: String = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != last_record)
+        .map(|(_, l)| *l)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_ne!(cut, text, "the fixture removed nothing");
+
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(cut.as_bytes()), None).expect("verify");
+    assert!(
+        !report.is_sound(),
+        "an open run's tail record was deleted and the export verified clean — \
+         no leaf pins an open run, so only the trailer's count can notice"
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.contains("record lines were removed")),
+        "the deletion was noticed for the wrong reason: {:#?}",
+        report.findings
+    );
+}
+
+/// **A run block with no records is never sound.**
+///
+/// Empty every record out of a run and, before this, the block sailed
+/// through: an open run has no leaf to disagree with, `clean` stayed true
+/// over zero checks, and the run landed in `sound` — an export vouching for
+/// a history it does not contain. An empty block the trailer does not
+/// declare unreadable has no honest producer, because the exporter files an
+/// empty or failed read in the trailer instead.
+#[tokio::test]
+async fn a_run_block_with_no_records_is_never_sound() {
+    let (run, text) = open_run_export().await;
+
+    let stripped: String = text
+        .lines()
+        .filter(|l| serde_json::from_str::<Value>(l).is_ok_and(|v| v.get("kind").is_some()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_ne!(stripped, text, "the fixture removed nothing");
+
+    let report = agentplane::export::verify(std::io::Cursor::new(stripped.as_bytes()), None)
+        .expect("verify");
+    assert!(
+        !report.sound.contains(&run),
+        "a run block with zero records under it was reported sound — the \
+         verifier vouched for records it never saw"
+    );
+    assert!(!report.is_sound(), "{report:#?}");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.contains("carries no records")),
+        "the emptied block was not named: {:#?}",
+        report.findings
+    );
+}
+
+/// **A run the export declares unreadable is unchecked, not tampering.**
+///
+/// The exporter's honesty must not read as an incident: a run it could not
+/// read is named in the trailer, its block carries the log position and
+/// nothing else, and the verifier used to meet that shape with "the log's
+/// leaf is not this run's terminal hash" — a tamper finding over a run the
+/// file explicitly says it does not contain. Honest omission routes to
+/// `not_checked`; the tamper finding is reserved for an empty block the
+/// trailer does *not* declare, which no honest writer produces.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_declared_unreadable_run_is_unchecked_not_a_tamper_finding() {
+    use agentplane::testkit::faults::{Faulty, Schedule};
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Trivial)
+        .build();
+    let healthy = rt
+        .run("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .await
+        .expect("run")
+        .run_id;
+    let damaged = rt
+        .run("demo.trivial", Tainted::trusted(json!({ "n": 2 })))
+        .await
+        .expect("run")
+        .run_id;
+
+    let faulty: Arc<dyn JournalStore> = Arc::new(Faulty::new(
+        Arc::clone(&store) as Arc<dyn JournalStore>,
+        Schedule::healthy().unreadable(damaged),
+    ));
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&faulty, None, &[healthy, damaged], &mut out)
+        .await
+        .expect("export");
+
+    let report = agentplane::export::verify(std::io::Cursor::new(&out), None).expect("verify");
+    assert!(
+        report.is_sound(),
+        "an honestly-declared unreadable run was reported as tampering — an \
+         auditor paged over the exporter's own honesty: {:#?}",
+        report.findings
+    );
+    assert!(
+        report.sound.contains(&healthy),
+        "the healthy run stopped verifying: {report:#?}"
+    );
+    assert!(
+        !report.sound.contains(&damaged),
+        "a run whose records are not in the file was vouched for"
+    );
+    assert!(
+        report
+            .not_checked
+            .iter()
+            .any(|n| n.contains(&damaged.to_string()) && n.contains("unreadable")),
+        "the unreadable run is not reported as unchecked, so its absence from \
+         `sound` is silence rather than a statement: {:#?}",
+        report.not_checked
+    );
+}
+
+/// **A foreign canonicalization rule narrows coverage; it is not a finding.**
+///
+/// Nothing the offline pass checks depends on the rule: the chain rehash,
+/// leaf, root and signature checks hash the wire bytes as written and never
+/// re-canonicalize, and the counts and body-vs-wire comparisons have no rule
+/// in them at all. What a foreign rule removes is re-deriving digests inside
+/// the bodies — which this pass never does. Filing the mismatch as a finding
+/// made an honest cross-build export read as tampered; and worse, the old
+/// gate implied the *other* checks stopped meaning anything, which they do
+/// not — proven here by catching a real edit under the foreign rule.
+#[tokio::test]
+async fn a_foreign_canon_rule_is_narrowed_coverage_not_a_finding() {
+    let (store, run) = one_run().await;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        .await
+        .expect("export");
+
+    // Rewrite only the header's canon field. Record bodies journal the canon
+    // version too, so a blanket replace would edit hashed bytes and this test
+    // would measure its own corruption.
+    let text = String::from_utf8(out).expect("utf8");
+    let foreign: String = text
+        .lines()
+        .map(|line| {
+            if serde_json::from_str::<Value>(line)
+                .is_ok_and(|v| v.get("kind") == Some(&json!("agentplane.export")))
+            {
+                line.replace(
+                    &format!("\"canon\":{}", agentplane::core::canon::VERSION),
+                    "\"canon\":999",
+                )
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_ne!(foreign, text, "the fixture edited nothing");
+
+    let report = agentplane::export::verify(std::io::Cursor::new(foreign.as_bytes()), None)
+        .expect("verify");
+    assert!(
+        report.is_sound(),
+        "an honest export written under another canonicalization rule was \
+         reported as tampered — unverifiable and wrong are different \
+         sentences: {:#?}",
+        report.findings
+    );
+    assert!(
+        report
+            .not_checked
+            .iter()
+            .any(|n| n.contains("canonicalization rule")),
+        "the narrowed coverage is not stated: {:#?}",
+        report.not_checked
+    );
+
+    // The checks that do run under a foreign rule still catch a real edit —
+    // the half that proves the gate was scoped rather than moved.
+    let edited = foreign
+        .replace("\\\"n\\\":1", "\\\"n\\\":9")
+        .replace("\"n\":1", "\"n\":9");
+    assert_ne!(edited, foreign, "the fixture edited nothing");
+    let caught = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None)
+        .expect("verify");
+    assert!(
+        caught
+            .findings
+            .iter()
+            .any(|f| f.contains("does not recompute")),
+        "under a foreign canon rule the rehash stopped running — the rule \
+         gates digest re-derivation, not hashing bytes as written: {:#?}",
+        caught.findings
+    );
+}
+
+/// **A sealing record claiming a foreign head is caught offline.**
+///
+/// The live audit holds `RunSealed.chain_head` to the chain it sits in; an
+/// auditor working from the file alone deserves the same check, because the
+/// forgery it catches — a conclusion composed against a different history
+/// and appended to this one — leaves every hash, leaf and root verifying:
+/// the chain is honest about the bytes, and only the claim inside them lies.
+#[tokio::test]
+async fn a_sealing_record_claiming_a_foreign_head_is_caught_offline() {
+    use agentplane::core::Label;
+    use agentplane::journal::RecordKind;
+
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let run = agentplane::core::RunId::generate();
+    let lease = store
+        .acquire(run, "test", Duration::from_secs(60))
+        .await
+        .expect("lease");
+    store
+        .append(
+            lease.epoch,
+            vec![
+                Append::new(
+                    run,
+                    RecordKind::RunAdmitted {
+                        capability: "demo".into(),
+                        governed_by: None,
+                        input_label: Label::trusted(),
+                        input: json!({}),
+                        policy_bundle: None,
+                        canon: agentplane::core::canon::VERSION,
+                    },
+                ),
+                Append::new(
+                    run,
+                    RecordKind::RunSealed {
+                        outcome: "succeeded".into(),
+                        // Not the head this conclusion sits on.
+                        chain_head: Digest::of(b"some other history"),
+                    },
+                ),
+            ],
+        )
+        .await
+        .expect("append");
+    store.seal(run, lease.epoch, "succeeded").await.expect("seal");
+
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        .await
+        .expect("export");
+    let report = agentplane::export::verify(std::io::Cursor::new(&out), None).expect("verify");
+    assert!(
+        report.findings.iter().any(|f| f.contains("chain head")),
+        "a conclusion drawn over a different history verified offline — the \
+         live audit catches this and the file reader waved it through: {:#?}",
+        report.findings
+    );
+    assert!(
+        !report.sound.contains(&run),
+        "the run carrying the lying conclusion was reported sound"
+    );
+
+    // The positive half: an honest run raises no such finding.
+    let (honest_store, honest_run) = one_run().await;
+    let mut honest = Vec::new();
+    agentplane::export::to_jsonl(&honest_store, None, &[honest_run], &mut honest)
+        .await
+        .expect("export");
+    let clean = agentplane::export::verify(std::io::Cursor::new(&honest), None).expect("verify");
+    assert!(
+        !clean.findings.iter().any(|f| f.contains("chain head")),
+        "an honest sealing record was flagged: {:#?}",
+        clean.findings
+    );
+}
+
+// ── The restore refuses what it cannot faithfully replay ────────────────────
+
+/// **A truncated export does not restore.**
+///
+/// A cut file is a valid prefix — every line parses, every chain joins — and
+/// a restore that replayed it would rebuild a partial history shaped exactly
+/// like a whole one. The quietest cut is the worst: everything after the last
+/// record but before the trailer is the case layer, so the journal restores
+/// byte-perfect and every matter it names is silently gone. The frame is the
+/// completeness signal, and the restore must demand it.
+#[tokio::test]
+async fn a_truncated_export_refuses_to_restore() {
+    let (store, run) = one_run().await;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        .await
+        .expect("export");
+    let text = String::from_utf8(out).expect("utf8");
+
+    let lines: Vec<&str> = text.lines().collect();
+    let cut = lines[..lines.len() - 1].join("\n");
+    assert!(
+        lines.last().expect("lines").contains("agentplane.export.end"),
+        "the fixture did not cut the trailer, so this test would measure itself"
+    );
+
+    let fresh: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let refused =
+        agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(cut.as_bytes())).await;
+    let Err(e) = refused else {
+        panic!("a truncated export restored as a whole history");
+    };
+    assert!(
+        e.to_string().contains("cut short"),
+        "the refusal does not name the truncation: {e}"
+    );
+
+    // The positive half: the whole file restores.
+    let ok = agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(text.as_bytes()))
+        .await
+        .expect("restore");
+    assert!(ok.is_faithful(), "the untouched export did not restore");
+}
+
+/// **A record line without wire bytes does not restore from its display copy.**
+///
+/// `raw` is the bytes the chain hashed; `body` is a courtesy copy anyone can
+/// edit. A restore that quietly fell back to the copy when `raw` was missing
+/// rebuilt whatever the readable half said — the exact value the wire-bytes
+/// rule exists to keep out of a rebuilt history, substituted silently on the
+/// one field two mechanisms must agree about — and the verify pass after the
+/// restore would then bless the result, because the rebuilt store re-hashes
+/// what it was fed.
+#[tokio::test]
+async fn a_record_line_without_wire_bytes_refuses_to_restore() {
+    let (store, run) = one_run().await;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        .await
+        .expect("export");
+    let text = String::from_utf8(out).expect("utf8");
+
+    // Strip `raw` from every record line, leaving the display copies intact —
+    // the file a fallback-shaped restore would happily rebuild from.
+    let mut stripped_any = false;
+    let stripped: String = text
+        .lines()
+        .map(|line| {
+            let mut v: Value = serde_json::from_str(line).expect("line json");
+            if v.get("kind").is_none()
+                && let Some(obj) = v.as_object_mut()
+                && obj.remove("raw").is_some()
+            {
+                stripped_any = true;
+                return serde_json::to_string(&v).expect("line json");
+            }
+            line.to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(stripped_any, "the fixture stripped nothing");
+
+    let fresh: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let refused =
+        agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(stripped.as_bytes()))
+            .await;
+    let Err(e) = refused else {
+        panic!("a record with no wire bytes restored from its editable display copy");
+    };
+    assert!(
+        e.to_string().contains("wire bytes"),
+        "the refusal does not name the missing wire bytes: {e}"
+    );
+}

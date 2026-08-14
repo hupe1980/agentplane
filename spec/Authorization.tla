@@ -26,7 +26,8 @@ EXTENDS Naturals, Sequences
 
 CONSTANTS
     EffectCount,   (* Effects the run would perform if permitted.             *)
-    Forbidden      (* Positions the policy refuses. A subset of 1..EffectCount *)
+    Forbidden      (* Positions the policy MAY refuse. A subset of            *)
+                   (* 1..EffectCount.                                          *)
 
 ASSUME EffectCount \in Nat
 ASSUME Forbidden \subseteq 1 .. EffectCount
@@ -38,14 +39,22 @@ VARIABLES
     world,     (* Seq of effect positions that actually reached the outside.   *)
     asked,     (* Positions at which the policy engine was consulted.          *)
     ruleset,   (* Which policy set is in force: "original" | "relaxed".        *)
+    banned,    (* Positions the ORIGINAL ruleset refuses in this run. An       *)
+               (* initial-state choice from SUBSET Forbidden — denial must be  *)
+               (* a choice rather than fate. A constant set would force every  *)
+               (* live run into LiveDeny and leave "done" (and the whole       *)
+               (* replay-of-a-completed-run path) unreachable, which is how    *)
+               (* LiveFinish and ReplayFinish were dead transitions for a      *)
+               (* while. Same idiom as EffectGroup's txState.                  *)
     status     (* "running" | "stopped" | "done"                               *)
 
-vars == <<mode, pos, journal, world, asked, ruleset, status>>
+vars == <<mode, pos, journal, world, asked, ruleset, banned, status>>
 
 TypeOK ==
     /\ mode \in {"live", "replay"}
     /\ pos \in 1 .. (EffectCount + 1)
     /\ ruleset \in {"original", "relaxed"}
+    /\ banned \subseteq Forbidden
     /\ status \in {"running", "stopped", "done"}
 
 Init ==
@@ -55,6 +64,7 @@ Init ==
     /\ world = << >>
     /\ asked = {}
     /\ ruleset = "original"
+    /\ banned \in SUBSET Forbidden   (* Either way; the model explores both.  *)
     /\ status = "running"
 
 -----------------------------------------------------------------------------
@@ -64,7 +74,7 @@ Init ==
 (* The relaxed set permits everything — it is the "somebody edited the rules  *)
 (* between the run and the audit" case, which is the whole reason this model  *)
 (* exists.                                                                    *)
-Permits(n) == (ruleset = "relaxed") \/ (n \notin Forbidden)
+Permits(n) == (ruleset = "relaxed") \/ (n \notin banned)
 
 (* Does the journal hold a record at position n?                             *)
 RecordedAt(n) == \E k \in 1 .. Len(journal) : journal[k].at = n
@@ -90,7 +100,7 @@ LivePermit ==
     /\ world' = Append(world, pos)
     /\ journal' = Append(journal, [at |-> pos, kind |-> "done"])
     /\ pos' = pos + 1
-    /\ UNCHANGED <<mode, ruleset, status>>
+    /\ UNCHANGED <<mode, ruleset, banned, status>>
 
 (* Denied: the engine is consulted, NOTHING reaches the world, and the denial *)
 (* is journaled. The record is what makes the stop replayable.                *)
@@ -102,14 +112,14 @@ LiveDeny ==
     /\ asked' = asked \cup {pos}
     /\ journal' = Append(journal, [at |-> pos, kind |-> "denied"])
     /\ status' = "stopped"
-    /\ UNCHANGED <<mode, pos, world, ruleset>>
+    /\ UNCHANGED <<mode, pos, world, ruleset, banned>>
 
 LiveFinish ==
     /\ status = "running"
     /\ mode = "live"
     /\ pos = EffectCount + 1
     /\ status' = "done"
-    /\ UNCHANGED <<mode, pos, journal, world, asked, ruleset>>
+    /\ UNCHANGED <<mode, pos, journal, world, asked, ruleset, banned>>
 
 -----------------------------------------------------------------------------
 (*                     THE RULES CHANGE, THEN WE REPLAY                      *)
@@ -121,7 +131,7 @@ EditPolicy ==
     /\ status \in {"stopped", "done"}
     /\ mode = "live"
     /\ ruleset' = "relaxed"
-    /\ UNCHANGED <<mode, pos, journal, world, asked, status>>
+    /\ UNCHANGED <<mode, pos, journal, world, asked, banned, status>>
 
 (* Begin replaying the recorded run. `asked` is reset so the invariant about  *)
 (* consultation is about the replay pass specifically.                        *)
@@ -133,7 +143,7 @@ StartReplay ==
     /\ world' = << >>
     /\ asked' = {}
     /\ status' = "running"
-    /\ UNCHANGED <<journal, ruleset>>
+    /\ UNCHANGED <<journal, ruleset, banned>>
 
 (* A recorded effect is read back. Note what is absent: no call to Permits,   *)
 (* and `asked` is unchanged. The effect never reaches the world, so it never  *)
@@ -144,7 +154,7 @@ ReplayDone ==
     /\ pos <= EffectCount
     /\ RecordKindAt(pos) = "done"
     /\ pos' = pos + 1
-    /\ UNCHANGED <<mode, journal, world, asked, ruleset, status>>
+    /\ UNCHANGED <<mode, journal, world, asked, ruleset, banned, status>>
 
 (* A recorded denial stops the replay in the same place, with the same        *)
 (* reason, whatever the rules say now.                                        *)
@@ -154,7 +164,7 @@ ReplayDenied ==
     /\ pos <= EffectCount
     /\ RecordKindAt(pos) = "denied"
     /\ status' = "stopped"
-    /\ UNCHANGED <<mode, pos, journal, world, asked, ruleset>>
+    /\ UNCHANGED <<mode, pos, journal, world, asked, ruleset, banned>>
 
 (* History ran out with the run still going: the recorded run stopped here    *)
 (* and left no record saying why. Reachable only if a denial was NOT          *)
@@ -165,14 +175,14 @@ ReplayOverrun ==
     /\ pos <= EffectCount
     /\ RecordKindAt(pos) = "none"
     /\ status' = "stopped"
-    /\ UNCHANGED <<mode, pos, journal, world, asked, ruleset>>
+    /\ UNCHANGED <<mode, pos, journal, world, asked, ruleset, banned>>
 
 ReplayFinish ==
     /\ status = "running"
     /\ mode = "replay"
     /\ pos = EffectCount + 1
     /\ status' = "done"
-    /\ UNCHANGED <<mode, pos, journal, world, asked, ruleset>>
+    /\ UNCHANGED <<mode, pos, journal, world, asked, ruleset, banned>>
 
 Next ==
     \/ LivePermit
@@ -186,7 +196,12 @@ Next ==
     \/ ReplayFinish
     \/ (status \in {"stopped", "done"} /\ mode = "replay" /\ UNCHANGED vars)
 
-Spec == Init /\ [][Next]_vars
+(* Weak fairness is the model's one liveness ASSUMPTION, stated rather than   *)
+(* implied: the scheduler does not stall forever with a step enabled. It      *)
+(* forces nothing about WHICH step runs — a live run may still permit, deny,  *)
+(* or finish — it only rules out the run that sits in "running" doing         *)
+(* nothing. `Settles` below is what that assumption buys.                     *)
+Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 -----------------------------------------------------------------------------
 (*                              INVARIANTS                                   *)
@@ -194,11 +209,12 @@ Spec == Init /\ [][Next]_vars
 
 (* THE invariant. Nothing forbidden ever reached the world.                  *)
 (*                                                                           *)
-(* Stated against `Forbidden` rather than against `Permits`, deliberately:    *)
-(* the question is whether the rules IN FORCE AT THE TIME were honoured, and  *)
-(* relaxing them afterwards must not retroactively make a refused call legal. *)
+(* Stated against `banned` — the rules in force when the run executed —       *)
+(* rather than against `Permits`, deliberately: relaxing the rules afterwards *)
+(* must not retroactively make a refused call legal. (`banned` is immutable   *)
+(* for the life of a behaviour; only `ruleset` models the edit.)              *)
 NothingForbiddenIsPerformed ==
-    \A k \in 1 .. Len(world) : world[k] \notin Forbidden
+    \A k \in 1 .. Len(world) : world[k] \notin banned
 
 (* The engine is never consulted during replay.                              *)
 (*                                                                           *)
@@ -230,5 +246,24 @@ Safety ==
     /\ DenialIsDurable
     /\ ReplayPerformsNothing
     /\ NoRedundantPermitRecords
+
+-----------------------------------------------------------------------------
+(*                          TEMPORAL PROPERTIES                              *)
+-----------------------------------------------------------------------------
+
+(* The journal is recorded history: nothing rewrites or shortens it — not     *)
+(* even `StartReplay`, which resets everything else. Prefix equality, not     *)
+(* merely length: a journal that swapped a "denied" for a "done" at the same  *)
+(* length would still be a rewritten history.                                 *)
+IsPrefixOf(p, s) ==
+    /\ Len(p) <= Len(s)
+    /\ \A k \in 1 .. Len(p) : s[k] = p[k]
+
+JournalIsAppendOnly == [][IsPrefixOf(journal, journal')]_vars
+
+(* Under weak fairness, every run — and the replay of it, if one starts —     *)
+(* eventually comes to rest at a recorded outcome and stays there. A stop on  *)
+(* a denial counts: "stopped" is a decision, not a hang.                      *)
+Settles == <>[](status \in {"stopped", "done"})
 
 =============================================================================

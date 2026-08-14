@@ -270,6 +270,12 @@ pub trait JournalStore: Send + Sync + Debug {
     /// page that never drains, which is worse than no page, because a wrong
     /// answer reads exactly like a right one.
     ///
+    /// A stored run id that does not parse is **corruption**, reported as
+    /// [`StoreError::Corrupt`] rather than silently thinned out of the page.
+    /// Both shipped backends hold this; one used to skip and the other used to
+    /// refuse, and a listing that quietly loses the quarantined run is the
+    /// unreachable-signal failure this method exists to remove.
+    ///
     /// Bounded, and the bound is visible: `limit` results means *at least*
     /// that many, not exactly.
     ///
@@ -369,6 +375,15 @@ pub trait JournalStore: Send + Sync + Debug {
     /// **same epoch**, which fencing exists to make impossible and cannot see.
     /// Renewal is a different operation with a different failure mode, so it
     /// is a different method: [`renew`](Self::renew).
+    ///
+    /// Lease timing has **whole-second granularity**, and a TTL that truncates
+    /// to zero seconds is refused rather than clamped up — a store that
+    /// rounded "expire immediately" to "hold for a second" would be enforcing
+    /// a contract nobody stated. The expiry addition is checked too: a TTL
+    /// near `Duration::MAX` is refused instead of wrapping into the past. The
+    /// runtime never sends either (its builder refuses TTLs below its own
+    /// two-second minimum); the store-level refusal is the boundary for every
+    /// other embedder of this trait.
     async fn acquire(&self, run: RunId, owner: &str, ttl: Duration) -> Result<Lease, StoreError>;
 
     /// Extend a lease this caller still holds, without ever claiming one.
@@ -392,6 +407,9 @@ pub trait JournalStore: Send + Sync + Debug {
     /// lease operation: a read-then-write renewal has a window in which the
     /// lease can lapse and be claimed, and renewing over the new owner is the
     /// split-brain the epoch exists to prevent.
+    ///
+    /// The TTL contract is [`acquire`](Self::acquire)'s: whole-second
+    /// granularity, sub-second values refused, overflow refused.
     async fn renew(
         &self,
         run: RunId,
@@ -431,6 +449,11 @@ pub trait JournalStore: Send + Sync + Debug {
     /// under its own heartbeat. A recovered run that was in fact still owned is
     /// not corrupted either way: the recovering instance bumps the epoch, and
     /// the store fences the previous owner's next append.
+    ///
+    /// A stored run id that does not parse is **corruption**, reported as
+    /// [`StoreError::Corrupt`] rather than skipped: a stranded run silently
+    /// dropped from this listing is a run nothing will ever recover, and this
+    /// is the one page it can appear on.
     ///
     /// # Errors
     ///

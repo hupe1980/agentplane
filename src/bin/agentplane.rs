@@ -120,6 +120,29 @@ enum Verb {
     Verify(VerifyArgs),
     /// Rebuild a store from an export, and prove it by its own checkpoint.
     Restore(RestoreArgs),
+    /// Walk the case layer and tell erasure from loss, against the live stores.
+    Drill(DrillArgs),
+}
+
+/// The live half of the case-layer drill, as a verb.
+///
+/// `Runtime::drill` existed and could only be reached by writing Rust, which
+/// is the dependency the declarative tier exists to remove — a deployment
+/// that is only a YAML file had no way to rehearse its own recovery. The verb
+/// opens the same store file the other journal verbs do; the case layer lives
+/// in it, so `--store` is the whole wiring.
+///
+/// What this verb does NOT check: blob bytes and sealed-state keys. A redb
+/// file holds no blob store, and this binary has no key-ring wiring — both
+/// are named as unchecked in the report rather than silently passed, which is
+/// the same honesty the library's own report shape enforces. An embedder
+/// whose plane has those stores runs `Runtime::drill` with them wired.
+#[derive(clap::Args, Debug)]
+struct DrillArgs {
+    /// The store holding the case layer to drill. Required — the drill walks
+    /// cases, and a memory store this process did not write holds none.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: String,
 }
 
 /// Rebuild a journal from an export.
@@ -502,6 +525,48 @@ fn journal_verb(opts: &StoreArgs, audit: Option<&AuditArgs>) -> Result<ExitCode,
     })
 }
 
+/// The recovery rehearsal, from the command line.
+///
+/// The exit code carries the drill's load-bearing property: **only a loss
+/// finding fails the command.** Erasure — tombstoned blobs, destroyed keys —
+/// is retention working and lands in the report's counters, never in
+/// `findings`, so a plane that erased everything it was asked to exits zero.
+/// A drill whose exit code could not tell the two apart would teach whoever
+/// scripts it to ignore the nonzero that means bytes are missing with no
+/// tombstone to explain them.
+fn drill_verb(opts: &DrillArgs) -> Result<ExitCode, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    rt.block_on(async {
+        let redb = Arc::new(RedbStore::open(&opts.store).map_err(|e| e.to_string())?);
+        // The same file the other journal verbs open holds the case layer —
+        // that is the wiring, whole. Blobs and keys are not in it, and the
+        // report says so instead of this verb pretending otherwise.
+        let cases: Arc<dyn agentplane::case::CaseStore> = redb;
+        let stores = agentplane::drill::Stores {
+            cases: &cases,
+            blobs: None,
+            #[cfg(feature = "keyring")]
+            keys: None,
+        };
+        let report = agentplane::drill::drill(&stores)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+        Ok(if report.is_sound() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        })
+    })
+}
+
 /// Read and validate the manifests, for every verb.
 ///
 /// A manifest that does not validate is not a thing to run, digest, or reason
@@ -542,6 +607,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         }
         Verb::Audit(a) => journal_verb(&a.store, Some(&a)),
         Verb::Export(a) => journal_verb(&a, None),
+        Verb::Drill(a) => drill_verb(&a),
         Verb::Restore(a) => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

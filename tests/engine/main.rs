@@ -24,3 +24,4 @@ mod recovery;
 mod resume_gates;
 mod retries;
 mod simulation;
+mod waits;

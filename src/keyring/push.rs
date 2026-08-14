@@ -77,11 +77,19 @@ impl SealedPush {
         super::scope(&self.tenant, "push")
     }
 
-    /// Bound to the registration, so a sealed credential lifted onto another
-    /// row fails to authenticate rather than opening as authority to a
-    /// destination it was never given for.
-    fn aad(task: RunId, id: &str) -> String {
-        format!("{task}/{id}")
+    /// Bound to tenant, purpose label and registration, so a sealed credential
+    /// lifted onto another row fails to authenticate rather than opening as
+    /// authority to a destination it was never given for. The `push:{tenant}:`
+    /// prefix follows the journal and case decorators: the registration id is
+    /// caller-supplied, so a bare `"{task}/{id}"` was a string a caller could
+    /// shape to collide with another decorator's AAD. What the AAD does not do
+    /// alone: the sealing scope also separates envelopes, and the two are
+    /// deliberately redundant.
+    /// `pub(super)` so the keyring's own tests can hold the three decorators'
+    /// derivations side by side and prove colliding identifiers never share
+    /// an AAD.
+    pub(super) fn aad(tenant: &TenantId, task: RunId, id: &str) -> String {
+        format!("push:{tenant}:{task}/{id}")
     }
 
     async fn sealed_secret(&self, aad: &str, secret: &Secret) -> Result<Secret, StoreError> {
@@ -98,7 +106,7 @@ impl SealedPush {
 
     /// The stored shape: credentials sealed, routing untouched.
     async fn sealed(&self, config: &PushConfig) -> Result<PushConfig, StoreError> {
-        let aad = Self::aad(config.task, &config.id);
+        let aad = Self::aad(&self.tenant, config.task, &config.id);
         let mut sealed = config.clone();
         if let Some(token) = &config.token {
             sealed.token = Some(self.sealed_secret(&aad, token).await?);
@@ -127,7 +135,7 @@ impl SealedPush {
     }
 
     async fn opened(&self, mut config: PushConfig) -> PushConfig {
-        let aad = Self::aad(config.task, &config.id);
+        let aad = Self::aad(&self.tenant, config.task, &config.id);
         if let Some(token) = config.token.take() {
             config.token = self.opened_secret(&aad, token).await;
         }

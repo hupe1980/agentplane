@@ -283,8 +283,14 @@ Safety ==
 -----------------------------------------------------------------------------
 
 (* Compensation only ever grows: an unwind is recorded history, not a scratch  *)
-(* pad that gets rewritten.                                                    *)
-UndoIsAppendOnly == [][Len(undone') >= Len(undone)]_vars
+(* pad that gets rewritten. Prefix equality, not merely length — a record of   *)
+(* compensations that swapped one entry for another at the same length would   *)
+(* still be rewritten history, and a length check would wave it through.       *)
+IsPrefixOf(p, s) ==
+    /\ Len(p) <= Len(s)
+    /\ \A k \in 1 .. Len(p) : s[k] = p[k]
+
+UndoIsAppendOnly == [][IsPrefixOf(undone, undone')]_vars
 
 (* Every run reaches a decision. `quarantined` counts — refusing to unwind is  *)
 (* an answer, and the one an auditor can act on.                               *)

@@ -331,6 +331,32 @@ fn be(e: &tokio_postgres::Error) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
+/// Classify a failed `COMMIT`, for every journal write that commits one.
+///
+/// The one in-doubt window a native transaction keeps: the server *answering*
+/// is what distinguishes "refused, rolled back" from "may have landed". A
+/// database error is an answer — a serialization or constraint failure is a
+/// clean rollback and stays an ordinary backend error. Anything else — the
+/// connection dropping between sending `COMMIT` and receiving its
+/// acknowledgement — means the commit may be standing, and the caller must not
+/// treat it as taken back.
+///
+/// One function rather than a closure per call site, because the
+/// classification used to exist only on the atomic path: a plain `append` or
+/// `seal` whose commit acknowledgement was lost read as a retryable backend
+/// error, and the retry double-appended every record that is not effect-keyed
+/// — exactly-once guards only `EffectStarted` rows, so a retried
+/// `StepPlanned` or `RunSealed` lands twice with nothing to refuse it.
+fn commit_refused_or_in_doubt(e: &tokio_postgres::Error) -> StoreError {
+    if e.as_db_error().is_some() {
+        be(e)
+    } else {
+        StoreError::CommitUnknown {
+            detail: e.to_string(),
+        }
+    }
+}
+
 fn pool_err(e: &impl std::fmt::Display) -> StoreError {
     StoreError::Backend(e.to_string())
 }
@@ -378,6 +404,40 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// A lease expiry instant from a TTL, refusing what whole seconds cannot hold.
+///
+/// Lease timing here has whole-second granularity, so a TTL below one second is
+/// **refused rather than clamped**. The clamp this replaces turned "expire
+/// immediately" into "hold for a second" without telling anyone — a contract
+/// the runtime relies on (its epoch arithmetic assumes a TTL means what it
+/// says), enforced only upstream. Nothing legitimate reaches this refusal: the
+/// runtime builder already refuses any TTL below its own two-second minimum at
+/// `build()` time. This is the *store's* boundary enforcement, for every other
+/// embedder of the trait — they get the same refusal instead of a silently
+/// longer lease. A TTL of 1.5s still truncates to one second; the granularity
+/// is the contract, and only the value that truncates to *zero* is a lie worth
+/// refusing.
+///
+/// The addition is checked, not assumed: `now + Duration::MAX` would wrap into
+/// the past and produce a lease that is born expired — free for anyone to
+/// claim while its owner believes it holds forever.
+fn lease_expiry(now: u64, ttl: Duration) -> Result<u64, StoreError> {
+    let secs = ttl.as_secs();
+    if secs == 0 {
+        return Err(StoreError::Backend(format!(
+            "a lease TTL of {ttl:?} is below this store's whole-second \
+             granularity and would round to zero — pass at least one second, \
+             or use the runtime's lease_ttl which enforces its own minimum"
+        )));
+    }
+    now.checked_add(secs).ok_or_else(|| {
+        StoreError::Backend(format!(
+            "a lease TTL of {ttl:?} overflows the expiry instant — the lease \
+             would wrap into the past and read as already expired"
+        ))
+    })
 }
 
 impl PostgresStore {
@@ -763,7 +823,10 @@ impl JournalStore for PostgresStore {
         let tx = client.transaction().await.map_err(|e| be(&e))?;
         self.fence(&tx, run, epoch).await?;
         let sealed = self.append_within(&tx, run, epoch, batch).await?;
-        tx.commit().await.map_err(|e| be(&e))?;
+        // In-doubt classification, not only on the atomic path: see
+        // `commit_refused_or_in_doubt` for the double-append a retried
+        // "failure" here used to produce.
+        tx.commit().await.map_err(|e| commit_refused_or_in_doubt(&e))?;
         Ok(sealed)
     }
 
@@ -826,10 +889,20 @@ impl JournalStore for PostgresStore {
             .await
             .map_err(|e| be(&e))?;
 
-        Ok(rows
-            .iter()
-            .filter_map(|r| RunId::parse(r.get::<_, &str>(0)).ok())
-            .collect())
+        rows.iter()
+            .map(|r| {
+                let id: &str = r.get(0);
+                // A stored run id that does not parse is corruption, and the
+                // contract (see `JournalStore::runs_by_outcome`) is to say so
+                // rather than silently thin the page: a quarantined run that
+                // vanishes from the listing is the unreachable-signal failure
+                // this method exists to remove.
+                RunId::parse(id).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("run_outcome holds an unparsable run id '{id}': {e}"),
+                })
+            })
+            .collect()
     }
 
     async fn recent_runs(
@@ -947,79 +1020,96 @@ impl JournalStore for PostgresStore {
     }
 
     async fn acquire(&self, run: RunId, owner: &str, ttl: Duration) -> Result<Lease, StoreError> {
-        let mut client = self.pool.get().await.map_err(|e| pool_err(&e))?;
-        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
         let now = now_secs();
-        let expires = now + ttl.as_secs().max(1);
+        let expires = lease_expiry(now, ttl)?;
         let key = run.to_string();
 
-        // `FOR UPDATE` so two instances racing for an expired lease serialise:
-        // exactly one takes it and bumps the epoch, and the other sees the
-        // result of that rather than the state before it.
-        let existing = tx
+        // **One guarded statement**, so a run's *first* lease is arbitrated by
+        // the same constraint as every later one. The previous shape —
+        // `SELECT … FOR UPDATE`, decide in Rust, upsert — locked nothing when
+        // the row did not exist yet: `FOR UPDATE` on an absent row takes no
+        // lock, so two instances first-acquiring one run concurrently both
+        // read `None`, both computed epoch 1, and the loser's unguarded upsert
+        // overwrote the winner's row. Both returned `Lease { epoch: 1 }` and
+        // both passed the append fence — split-brain under a single fencing
+        // token, on exactly the backend that exists to prevent it, and the
+        // realistic trigger is mundane: two instances driving one batch
+        // first-acquire the same reserved run id at the same instant.
+        //
+        // The `WHERE` clause admits exactly the leases `acquire` may claim:
+        // expired ones, which includes released ones — release blanks the
+        // owner and zeroes the expiry, so a released row *is* an expired row.
+        // A live lease fails the predicate, the upsert updates zero rows, and
+        // `RETURNING` hands back nothing: that is the `LeaseHeld` refusal. A
+        // claim over a lapsed holder takes `run_lease.epoch + 1`, fencing them
+        // — including this very caller, because a lapsed lease is not yours to
+        // renew (renewal is `renew`, which proves the exact `(owner, epoch)`).
+        // A fresh insert starts at epoch 1. `ON CONFLICT DO UPDATE` serialises
+        // racing claimers on the row (or on the index entry being inserted),
+        // so exactly one of them wins whichever state the row is in.
+        let row = client
             .query_opt(
-                "SELECT owner, epoch, expires_at FROM run_lease
-                  WHERE tenant = $1 AND run_id = $2 FOR UPDATE",
-                &[&self.tenant_name(), &key],
+                "INSERT INTO run_lease (tenant, run_id, owner, epoch, expires_at)
+                 VALUES ($1, $2, $3, 1, $4)
+                 ON CONFLICT (tenant, run_id) DO UPDATE SET
+                   owner = EXCLUDED.owner,
+                   epoch = run_lease.epoch + 1,
+                   expires_at = EXCLUDED.expires_at
+                 WHERE run_lease.expires_at <= $5
+                 RETURNING epoch",
+                &[
+                    &self.tenant_name(),
+                    &key,
+                    &owner.to_owned(),
+                    &expires.cast_signed(),
+                    &now.cast_signed(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
 
-        let epoch = match existing {
-            None => 1,
-            Some(row) => {
-                let held_by: String = row.get(0);
-                let epoch: i64 = row.get(1);
-                let expires_at: i64 = row.get(2);
-                let epoch = epoch.cast_unsigned();
-                if expires_at.cast_unsigned() <= now {
-                    // Expired or released: claim and fence whoever held it,
-                    // **including this caller**. Checked before any ownership
-                    // test on purpose — a lapsed lease is not yours to renew,
-                    // because you cannot know whether somebody took over in
-                    // the gap.
-                    epoch + 1
-                } else {
-                    // Still live — held by anyone, this caller included.
-                    // `acquire` claims and never renews: handing a same-owner
-                    // caller the current epoch is two executors on one run
-                    // that fencing cannot tell apart. Renewal is `renew`,
-                    // which proves the caller still holds the exact
-                    // `(owner, epoch)` it claims to.
-                    return Err(StoreError::LeaseHeld {
-                        run: key,
-                        owner: held_by,
-                        epoch,
-                        remaining_secs: expires_at.cast_unsigned().saturating_sub(now),
-                    });
-                }
-            }
-        };
+        if let Some(row) = row {
+            let epoch: i64 = row.get(0);
+            return Ok(Lease {
+                run,
+                owner: owner.to_owned(),
+                epoch: epoch.cast_unsigned(),
+            });
+        }
 
-        tx.execute(
-            "INSERT INTO run_lease (tenant, run_id, owner, epoch, expires_at)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (tenant, run_id) DO UPDATE SET
-               owner = EXCLUDED.owner,
-               epoch = EXCLUDED.epoch,
-               expires_at = EXCLUDED.expires_at",
-            &[
-                &self.tenant_name(),
-                &key,
-                &owner.to_owned(),
-                &epoch.cast_signed(),
-                &expires.cast_signed(),
-            ],
-        )
-        .await
-        .map_err(|e| be(&e))?;
-
-        tx.commit().await.map_err(|e| be(&e))?;
-        Ok(Lease {
-            run,
-            owner: owner.to_owned(),
-            epoch,
-        })
+        // Zero rows means a live lease refused the claim. The holder is read
+        // afterwards only to *name* them in the error; the refusal itself was
+        // decided inside the guarded statement, so this read racing a
+        // concurrent release can at worst describe a holder who has just let
+        // go — the caller's next acquire will win.
+        let held = client
+            .query_opt(
+                "SELECT owner, epoch, expires_at FROM run_lease
+                  WHERE tenant = $1 AND run_id = $2",
+                &[&self.tenant_name(), &key],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        match held {
+            Some(row) => Err(StoreError::LeaseHeld {
+                run: key,
+                owner: row.get(0),
+                epoch: row.get::<_, i64>(1).cast_unsigned(),
+                remaining_secs: row
+                    .get::<_, i64>(2)
+                    .cast_unsigned()
+                    .saturating_sub(now),
+            }),
+            // Lease rows are never deleted (the epoch lives in them), so a
+            // refused claim over a missing row is a store this code does not
+            // understand.
+            None => Err(StoreError::Backend(format!(
+                "acquire for run {key} was refused but no lease row exists — \
+                 lease rows are never deleted, so this store's state is not \
+                 one this backend can have written"
+            ))),
+        }
     }
 
     async fn renew(
@@ -1031,7 +1121,7 @@ impl JournalStore for PostgresStore {
     ) -> Result<Lease, StoreError> {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
         let now = now_secs();
-        let expires = now + ttl.as_secs().max(1);
+        let expires = lease_expiry(now, ttl)?;
         // One statement, so the check and the write cannot be raced: the row
         // is extended only where it is still held, unexpired and unreleased by
         // exactly `(owner, epoch)`. A released row blanks the owner and fails
@@ -1093,7 +1183,14 @@ impl JournalStore for PostgresStore {
         rows.iter()
             .map(|row| {
                 let id: String = row.get(0);
-                RunId::parse(&id).map_err(|e| StoreError::Backend(format!("bad run id: {e}")))
+                // Corruption, per the contract on `JournalStore::abandoned_runs`:
+                // a stranded run silently dropped from this listing is never
+                // recovered, so an unparsable id is refused loudly rather than
+                // skipped.
+                RunId::parse(&id).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("run_lease holds an unparsable run id '{id}': {e}"),
+                })
             })
             .collect()
     }
@@ -1173,7 +1270,9 @@ impl JournalStore for PostgresStore {
         )
         .await
         .map_err(|e| be(&e))?;
-        tx.commit().await.map_err(|e| be(&e))?;
+        // A seal is a write like any other: a lost commit acknowledgement is
+        // in doubt, not retryable — see `commit_refused_or_in_doubt`.
+        tx.commit().await.map_err(|e| commit_refused_or_in_doubt(&e))?;
 
         Ok(head)
     }
@@ -1327,9 +1426,64 @@ fn as_refs(
     owned.iter().map(|b| &**b as _).collect()
 }
 
+/// Refuse a statement that would end or control the journal's transaction.
+///
+/// The seam hands a co-located resource the journal's *own* transaction, and
+/// the entire value of that is the shared fate: the resource's writes and the
+/// records describing them commit together or not at all. A member that issues
+/// `COMMIT` commits a half-written batch out from under `append_within`; a
+/// `ROLLBACK` dissolves it and the seam then "commits" nothing while reporting
+/// success; a `SAVEPOINT`/`RELEASE` pair lets the member carve out a region
+/// whose fate diverges from the records'. None of those is a write a resource
+/// may make, so they are refused before reaching the wire.
+///
+/// The check matches the statement's leading keyword (and, where one keyword
+/// is ambiguous, the second): `COMMIT`, `END` and their prepared-transaction
+/// forms; `ROLLBACK` and `ABORT`; `BEGIN` and `START`; `SAVEPOINT` and
+/// `RELEASE`; `PREPARE TRANSACTION` (bare `PREPARE` — statement preparation —
+/// stays allowed); `SET TRANSACTION` (other `SET`s stay allowed).
+///
+/// **What this does not cover**, stated so nobody mistakes it for a boundary:
+/// a *function* with side effects on transaction state — a PL/pgSQL procedure
+/// that `COMMIT`s, `dblink` opening its own autonomous connection, an
+/// extension that manipulates the transaction from C — arrives here as an
+/// innocent `SELECT`/`CALL` and passes. So does a control verb hidden behind a
+/// leading comment (`/* */ COMMIT`), a `DO` block, or dynamic SQL built with
+/// `EXECUTE` inside a function. This is a guard against the honest mistake —
+/// a resource ported from code that managed its own transactions — not a
+/// sandbox against a hostile one; a resource is trusted code the deployment
+/// registered, and what this refusal protects is the atomicity *invariant*,
+/// not the database from its own operators.
+fn refuse_transaction_control(sql: &str) -> Result<(), StoreError> {
+    let mut words = sql
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty());
+    let first = words.next().unwrap_or("").to_ascii_uppercase();
+    let second = words.next().unwrap_or("").to_ascii_uppercase();
+    let forbidden = match first.as_str() {
+        // `END` is an alias for COMMIT, `ABORT` for ROLLBACK.
+        "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "BEGIN" | "START" | "SAVEPOINT" | "RELEASE" => {
+            true
+        }
+        "PREPARE" | "SET" => second == "TRANSACTION",
+        _ => false,
+    };
+    if forbidden {
+        return Err(StoreError::Backend(format!(
+            "the statement '{first}' would end or control the journal's \
+             transaction — a co-located resource writes *inside* the \
+             transaction that records it; it does not own that transaction, \
+             and dissolving it from within would break the atomicity the \
+             seam exists to provide"
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl AtomicTx for PgAtomicTx<'_> {
     async fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, StoreError> {
+        refuse_transaction_control(sql)?;
         let owned = bind(params);
         self.0
             .execute(sql, &as_refs(&owned))
@@ -1338,6 +1492,9 @@ impl AtomicTx for PgAtomicTx<'_> {
     }
 
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Value>, StoreError> {
+        // Guarded on the query path too: the driver does not care which method
+        // carries a statement, so `query("ROLLBACK", …)` would run it.
+        refuse_transaction_control(sql)?;
         let owned = bind(params);
         let rows = self
             .0
@@ -1436,23 +1593,9 @@ impl AtomicJournal for PostgresStore {
             .map_err(|e| StoreError::Backend(e.to_string()))?;
 
         let sealed = self.append_within(&tx, run, epoch, batch).await?;
-        // The one in-doubt window a native transaction keeps: the server
-        // *answering* is what distinguishes "refused,
-        // rolled back" from "may have landed". A database error is an answer —
-        // a serialization or constraint failure is a clean rollback and stays
-        // an ordinary backend error. Anything else — the connection dropping
-        // between sending COMMIT and receiving its acknowledgement — means the
-        // commit may be standing, and the caller must not treat it as taken
-        // back.
-        tx.commit().await.map_err(|e| {
-            if e.as_db_error().is_some() {
-                be(&e)
-            } else {
-                StoreError::CommitUnknown {
-                    detail: e.to_string(),
-                }
-            }
-        })?;
+        // The shared classification: a refusal is a clean rollback, a lost
+        // acknowledgement is in doubt. See `commit_refused_or_in_doubt`.
+        tx.commit().await.map_err(|e| commit_refused_or_in_doubt(&e))?;
         Ok(sealed)
     }
 }

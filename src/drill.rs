@@ -43,9 +43,10 @@ use crate::blob::{BlobError, BlobStore};
 use crate::case::CaseStore;
 use crate::core::StoreError;
 
-/// How many cases one enumeration page holds. Interior: the walk is complete
-/// either way, and the page only bounds memory.
-const CASE_PAGE: usize = 256;
+/// One page size for one case layer: the export walks the same cases with the
+/// same paging, and two constants would be two subtly different definitions
+/// of "every case" waiting to drift apart.
+use crate::export::CASE_PAGE;
 
 /// What a live drill established, and what it could not look at.
 ///
@@ -156,6 +157,36 @@ pub async fn drill(stores: &Stores<'_>) -> Result<DrillReport, StoreError> {
         if !full {
             break;
         }
+    }
+
+    // A key ring in hand and nothing sealed to open is an ambiguity worth
+    // naming, because two very different planes produce it: one that
+    // deliberately keeps case state plaintext (or seals only journal
+    // payloads — this probe reads case state, not the journal), and one whose
+    // operator wired the ring and forgot to wrap the case store in
+    // `SealedCases` — the misconfiguration in which every "sealed" case is
+    // silently plaintext and erasure-by-key-destruction reaches nothing.
+    // The stores this drill holds cannot tell the two apart, so it is
+    // reported as unestablished coverage rather than as a finding: a finding
+    // would page every plaintext-by-design plane on every drill, which is how
+    // the loss findings above stop being believed. What this does NOT cover:
+    // it says nothing when even one state opened or was erased — a plane that
+    // seals *some* cases and stores others plaintext reads as covered — and
+    // nothing about journal-payload sealing at all.
+    #[cfg(feature = "keyring")]
+    if stores.keys.is_some()
+        && report.cases > 0
+        && report.sealed_open == 0
+        && report.sealed_erased == 0
+    {
+        report.not_checked.push(
+            "sealed-state coverage — a key ring was supplied and no case's state was \
+             sealed, so this pass proved nothing about sealing: either this plane keeps \
+             case state plaintext by design, or sealing was never wired to the case \
+             store. The two cannot be told apart from here, and only the second is a \
+             misconfiguration worth chasing"
+                .to_owned(),
+        );
     }
     Ok(report)
 }

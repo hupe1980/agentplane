@@ -352,11 +352,11 @@ MUTATIONS: dict[str, tuple[str, str, str, str, str]] = {
         "policy is re-evaluated while replaying a recorded run",
         """    /\\ RecordKindAt(pos) = "done"
     /\\ pos' = pos + 1
-    /\\ UNCHANGED <<mode, journal, world, asked, ruleset, status>>""",
+    /\\ UNCHANGED <<mode, journal, world, asked, ruleset, banned, status>>""",
         """    /\\ RecordKindAt(pos) = "done"
     /\\ asked' = asked \\cup {pos}
     /\\ pos' = pos + 1
-    /\\ UNCHANGED <<mode, journal, world, ruleset, status>>""",
+    /\\ UNCHANGED <<mode, journal, world, ruleset, banned, status>>""",
     ),
     # Stopping on a denial without journaling it. Nothing is performed twice;
     # the damage is a replay that reports divergence for a code change nobody
@@ -373,16 +373,48 @@ MUTATIONS: dict[str, tuple[str, str, str, str, str]] = {
     /\\ status' = "stopped\"""",
     ),
     # Dropping the store's in-transaction epoch check, so a fenced zombie lands
-    # a write after its run was taken over.
+    # a write after its run was taken over. `held[i] >= 1` stays: the writer
+    # still only writes under a lease it once acquired — the bug is the store
+    # not comparing that lease's epoch against its own.
     "NoFence": (
         "Fencing",
         "EpochsNeverRegress",
         "store accepts a write without checking the epoch",
-        """    /\\ steps < MaxSteps
-    /\\ held[i] >= leaseEpoch
+        """Write(i) ==
+    /\\ steps < MaxSteps
+    /\\ HoldsCurrent(i)
 """,
-        """    /\\ steps < MaxSteps
+        """Write(i) ==
+    /\\ steps < MaxSteps
+    /\\ held[i] >= 1
 """,
+    ),
+    # Treating a renewal as a re-acquisition: the heartbeat bumps the epoch it
+    # was only supposed to extend. Every heartbeat then mints a fresh epoch
+    # without a takeover, so an epoch in the journal no longer names the
+    # ownership change that produced it — and in the variant where the store
+    # bumps without telling the caller, the owner is fenced by its own
+    # heartbeat. The renew/acquire split is settled, load-bearing semantics;
+    # the Rust side of this same bug is pinned by
+    # `a_live_lease_blocks_takeover_and_says_so_precisely`
+    # (tests/engine/recovery.rs), which asserts a renewal returns the SAME
+    # epoch and that `acquire` refuses even the holder's own live lease.
+    "RenewAsAcquire": (
+        "Fencing",
+        "RenewalPreservesOwnership",
+        "a renewal bumps the epoch as if it had taken the lease over",
+        """    /\\ leaseLive
+    /\\ leaseOwner = i
+    /\\ held[i] = leaseEpoch
+    /\\ steps' = steps + 1
+    /\\ UNCHANGED <<leaseEpoch, leaseOwner, leaseLive, takeovers, held, journal>>""",
+        """    /\\ leaseLive
+    /\\ leaseOwner = i
+    /\\ held[i] = leaseEpoch
+    /\\ leaseEpoch' = leaseEpoch + 1
+    /\\ held' = [held EXCEPT ![i] = leaseEpoch + 1]
+    /\\ steps' = steps + 1
+    /\\ UNCHANGED <<leaseOwner, leaseLive, takeovers, journal>>""",
     ),
 }
 

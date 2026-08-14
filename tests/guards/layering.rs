@@ -347,6 +347,11 @@ const CLAIMS: &[(&str, &str, &str)] = &[
         "NoWriteAboveCurrentEpoch",
         "a_fenced_writer_cannot_append",
     ),
+    (
+        "Fencing",
+        "RenewalPreservesOwnership",
+        "a_live_lease_blocks_takeover_and_says_so_precisely",
+    ),
 ];
 
 /// `TypeOK` is a well-formedness check on the model itself, not a claim about
