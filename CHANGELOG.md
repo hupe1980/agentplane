@@ -244,6 +244,15 @@ whose only caller is a crash needs its negative test to *be* a crash.
   directions.
 - An advertisement that outgrows its operator grant is warned about where it
   is observed, instead of being visible only to code that asks.
+- **`StepCtx::sink_with` accepts the fallible builder it was written for.**
+  `StepError` gained `Tool`, the conversion the trait behind `sink_with`
+  needs to take a `Result` — so the guides' own shape, handing back the
+  `Result` that `ToolCall::prepare` already produces, compiles. It had never
+  compiled: the trait's fallible arm was a capability with no conversion
+  behind it, every caller in the crate passed an infallible builder, and the
+  published snippet that teaches the shape was the only thing exercising it.
+  A refusal there fails the step, because the catalogue is consulted before
+  anything leaves.
 
 ### Fixed — security: the second pass is the same run as the first
 

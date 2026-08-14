@@ -449,6 +449,26 @@ pub enum StepError {
     #[error("{0}")]
     Encoding(#[from] serde_json::Error),
 
+    /// A tool call could not be prepared: the tool is not in the operator's
+    /// catalogue, or the arguments do not match what it declared.
+    ///
+    /// The same conversion [`SkillError::Tool`] provides, one level down,
+    /// and it is load-bearing for the same reason. `sink_with` is how a
+    /// governed tool call is written — the closure hands back whatever
+    /// building the effect produced — and [`BuildsEffect`] accepts a
+    /// `Result` only when its error converts to *this* type. Without this
+    /// variant the trait's stated purpose ("`ToolCall::prepare`, which
+    /// refuses a tool the catalogue does not hold, returns the `Result` it
+    /// already produces") was a capability nothing could use, and the
+    /// published snippet that exercises it did not compile.
+    ///
+    /// A refusal here dispatched nothing, so it fails the step rather than
+    /// leaving doubt: the catalogue was consulted before any call left.
+    ///
+    /// [`BuildsEffect`]: crate::runtime::BuildsEffect
+    #[error(transparent)]
+    Tool(#[from] crate::tools::ToolError),
+
     /// The outcome of an effect cannot be determined, and its declared
     /// [`Recovery`](crate::core::Recovery) forbids guessing.
     ///

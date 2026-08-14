@@ -2316,3 +2316,102 @@ spec:
         "the refusal did not name the unwired server: {message}"
     );
 }
+
+// ── The fallible builder, which is what `sink_with` exists to accept ────────
+
+/// A tool call written the way the guides teach it: `sink_with`, handing back
+/// the `Result` that `ToolCall::prepare` already produces.
+#[derive(Debug)]
+struct SendsVia {
+    catalog: ToolCatalog,
+    client: Arc<Fake>,
+    tool: ToolId,
+}
+
+#[async_trait::async_trait]
+impl Skill for SendsVia {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("sends-via").provides("sends-via")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let args = Tainted::trusted(json!({ "recipient": "acme" }));
+        let out = cx
+            .sink_with(&args, |value| {
+                ToolCall::prepare(
+                    &self.catalog,
+                    Arc::clone(&self.client) as Arc<dyn ToolClient>,
+                    self.tool.clone(),
+                    value,
+                )
+            })
+            .await?;
+        Ok(Outcome::done(out))
+    }
+}
+
+/// **A refusal to build the effect stops the step, with its type intact.**
+///
+/// `sink_with` takes the `Result` a fallible builder already produces — that
+/// is the whole reason the trait behind it has a fallible arm — and this is
+/// the arm nothing else exercises: every other caller in this crate hands it
+/// an infallible builder. The consequence of leaving it uncovered was a
+/// capability that could not be used at all: the conversion the trait needs
+/// did not exist, so the published snippet teaching this shape did not
+/// compile, and no test noticed because none was written this way.
+///
+/// Both halves, because either alone proves little: the catalogued tool must
+/// dispatch (or the refusal below is just a broken fixture), and the
+/// uncatalogued one must fail the step naming the tool rather than reaching a
+/// server.
+#[tokio::test]
+async fn a_builder_that_refuses_stops_the_step_and_calls_nothing() {
+    let client = Fake::ok();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsVia {
+            catalog: ToolCatalog::new().allow(transfer(), ToolSafety::default()),
+            client: Arc::clone(&client),
+            tool: transfer(),
+        })
+        .build()
+        .run("sends-via", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "a catalogued tool must dispatch through `sink_with`: {:?}",
+        out.status
+    );
+    assert_eq!(client.calls.lock().unwrap().as_slice(), ["ledger/transfer"]);
+
+    // The same skill against an empty catalogue: `prepare` refuses, and the
+    // refusal has to survive as an error the step fails on rather than as a
+    // value the gates then inspect.
+    let refused_client = Fake::ok();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsVia {
+            catalog: ToolCatalog::new(),
+            client: Arc::clone(&refused_client),
+            tool: transfer(),
+        })
+        .build()
+        .run("sends-via", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    match out.status {
+        RunStatus::Failed(why) => assert!(
+            why.contains("ledger/transfer"),
+            "the refusal must name the tool it would not build: {why}"
+        ),
+        other => panic!("an uncatalogued tool must fail the step, got {other:?}"),
+    }
+    assert!(
+        refused_client.calls.lock().unwrap().is_empty(),
+        "the catalogue was consulted before anything reached a server"
+    );
+}
