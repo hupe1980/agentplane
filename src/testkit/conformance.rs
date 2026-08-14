@@ -311,6 +311,25 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
          still readable"
     );
 
+    // The count answers an erasure *request*, so it may only report what this
+    // call removed. Cascading from an id that is already a tombstone removes
+    // nothing: the traversal has a root to start from and no state to destroy,
+    // and answering `1` would tell a caller — a regulator, an erasure ledger —
+    // that a memory was destroyed by a call that found nothing there. The
+    // tombstone case above cannot see this: an already-erased *intermediate*
+    // is reached version-wise and never counted either way, so the guard that
+    // keeps the count honest is only exercised when the stateless node is the
+    // one the request names.
+    assert_eq!(
+        store
+            .forget_cascading("chain-a")
+            .await
+            .expect("cascading a second time is not an error"),
+        0,
+        "a cascade over an already-erased id reported an erasure it did not \
+         perform — the count is what an erasure request is answered with"
+    );
+
     // The same routing obligation for the *other* way a memory dies: expiry.
     // `sweep_expired` erases state, and it must leave the derivation edges in
     // both directions exactly as `forget` does — with U → E → D and E expired,

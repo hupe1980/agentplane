@@ -991,6 +991,53 @@ async fn two_runtimes_do_not_share_a_lease_owner() {
              both would now write to this run under one epoch"
         ),
     }
+
+    // The refusal above cannot tell two owners apart on its own: `acquire` is
+    // a pure claim, so it refuses a live lease *whoever* asks, and it would
+    // refuse identically if both instances answered to one name. `renew` is
+    // where a shared identity does its damage — it extends a lease for the
+    // owner that holds it, so a second instance wearing the same name renews
+    // a run it does not own and both write under one epoch, which is the
+    // split-brain the fence exists to prevent.
+    let held = store
+        .acquire(
+            RunId::generate(),
+            a.owner_id(),
+            std::time::Duration::from_mins(1),
+        )
+        .await
+        .expect("a fresh run is free");
+    match store
+        .renew(
+            held.run,
+            b.owner_id(),
+            held.epoch,
+            std::time::Duration::from_mins(1),
+        )
+        .await
+    {
+        // `LeaseNotHeld` rather than `LeaseHeld`: the question renewal asks is
+        // whether *this* caller holds the lease, and a stranger does not.
+        Err(StoreError::LeaseNotHeld { .. }) => {}
+        Err(other) => panic!("expected a refusal to renew: {other:?}"),
+        Ok(_) => panic!(
+            "a second runtime renewed a lease it does not hold — the two \
+             instances answer to one owner name, so the fence cannot tell them \
+             apart and both write to this run under one epoch"
+        ),
+    }
+
+    // The positive half: the holder's own renewal still works, so the refusal
+    // above is about identity and not about renewal being broken outright.
+    store
+        .renew(
+            held.run,
+            a.owner_id(),
+            held.epoch,
+            std::time::Duration::from_mins(1),
+        )
+        .await
+        .expect("the holder must be able to renew its own lease");
 }
 
 /// Wiring a manifest does not make replicas of one agent share an owner.
