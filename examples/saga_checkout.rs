@@ -141,9 +141,9 @@ fn checkout() -> PlanIR {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(RedbStore::open_in_memory()?);
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
     let events: EventLog = Arc::default();
-    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+    let runtime = Runtime::builder(Arc::clone(&store))
         .owner("checkout")
         .skill(SagaStep::new(
             "checkout.reserve",

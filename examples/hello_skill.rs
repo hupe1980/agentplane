@@ -2,8 +2,7 @@
 //!
 //! Every other example layers a real concern on top — crash recovery, cases,
 //! plans, sagas, memory. This one is deliberately none of that. It exists so a
-//! newcomer has a runnable file, not a doc snippet, that shows the whole shape
-//! in under fifty lines:
+//! newcomer has a runnable file, not a doc snippet, that shows the whole shape:
 //!
 //! * a skill is one `invoke`, handed a `StepCtx` and a labelled input;
 //! * the clock is an effect (`cx.now()`), so replay reads the recorded instant
@@ -16,17 +15,20 @@
 use std::sync::Arc;
 
 // The getting-started page calls this "this exact skill", so it imports the way
-// that page does: one prelude line, which is the whole point of having one.
+// that page does: one prelude line, which is the whole point of having one —
+// `async_trait` included, so writing a skill starts here rather than in
+// `Cargo.toml`.
 use agentplane::prelude::*;
 use serde_json::{Value, json};
 
 #[derive(Debug)]
 struct Greet;
 
-#[async_trait::async_trait]
+#[async_trait]
 impl Skill for Greet {
+    // No `.provides(..)`: a skill that declares nothing answers its own name.
     fn descriptor(&self) -> SkillDescriptor {
-        SkillDescriptor::new("greet").provides("demo.greet")
+        SkillDescriptor::new("greet")
     }
 
     async fn invoke(
@@ -46,21 +48,22 @@ impl Skill for Greet {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
-    let runtime = Runtime::builder(Arc::clone(&store))
-        .owner("hello-service")
-        .skill(Greet)
-        .build();
+    let runtime = Runtime::builder(Arc::clone(&store)).skill(Greet).build();
 
     let outcome = runtime
-        .run("demo.greet", Tainted::trusted(json!({ "name": "world" })))
+        .run("greet", Tainted::trusted(json!({ "name": "world" })))
         .await?;
-    println!("live:    {:?} → {:?}", outcome.status, outcome.output);
 
     // Re-executes the logic and reads every effect back from the journal.
     // Nothing is performed again — no clock is read, no answer is invented.
     let replayed = runtime.replay(outcome.run_id, Mode::Strict).await?;
-    println!("replay:  {:?} → {:?}", replayed.status, replayed.output);
     assert_eq!(outcome.output, replayed.output, "replay reproduced the run");
+
+    // `.success()` turns "did it work, and what did it say" into one `?`:
+    // the labelled answer, or a typed error naming the run and its status.
+    let answer = outcome.success()?;
+    println!("live:    {}", answer.peek());
+    println!("replay:  {}", replayed.success()?.peek());
 
     println!("\nSame answer, and the second time nothing happened.");
     Ok(())

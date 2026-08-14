@@ -812,6 +812,23 @@ pub enum StoreError {
         remaining_secs: u64,
     },
 
+    /// A renewal presented an `(owner, epoch)` the lease is not currently held
+    /// under.
+    ///
+    /// The one honest reading is *this caller no longer owns the run*: the
+    /// lease was released by a clean exit, lapsed and was reclaimed, or was
+    /// taken over. Distinct from [`LeaseHeld`](Self::LeaseHeld) — that refuses
+    /// a newcomer, this refuses a former owner — and the responses are
+    /// opposite: a newcomer waits, a former owner stops. What a renewal must
+    /// never do with this state is *claim*: a heartbeat that re-acquires a
+    /// released lease holds a run its owner already handed back, and the sweep
+    /// then "recovers" a run that concluded cleanly.
+    #[error(
+        "run {run}: the lease is not held at epoch {epoch} by this owner — it was \
+         released, lapsed, or taken over, and a renewal never claims"
+    )]
+    LeaseNotHeld { run: String, epoch: u64 },
+
     #[error("corrupt record at seq {seq}: {detail}")]
     Corrupt { seq: Seq, detail: String },
 

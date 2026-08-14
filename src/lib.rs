@@ -244,6 +244,16 @@ pub mod prelude {
     pub use crate::journal::JournalStore;
     pub use crate::runtime::{Mode, RunStatus, Runtime, StepCtx};
 
+    /// The attribute every `impl Skill` needs, so writing one does not begin
+    /// with adding a dependency.
+    ///
+    /// The one non-crate name here, and it earns the exception by the same
+    /// rule as everything else: no program that implements [`Skill`] can do
+    /// without it, and this crate already depends on it unconditionally — so
+    /// re-exporting costs nothing and deletes a setup step from every
+    /// getting-started path.
+    pub use async_trait::async_trait;
+
     /// The default embedded backend, present whenever `redb` is.
     ///
     /// The one feature-gated name here, because it is on by default and a

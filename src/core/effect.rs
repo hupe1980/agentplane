@@ -15,14 +15,37 @@
 //! So an effect declares *what it does* — [`EffectDescriptor`] — and the runtime
 //! derives the key from `(step, ordinal, kind, canonical(args))`. Skills cannot
 //! forge or collide keys.
+//!
+//! # Effect identity
+//!
+//! An effect's identity is **what it does *and* where it stands**: the key
+//! hashes the step, the phase, the ordinal (which dispatch within the step),
+//! the attempt (which try of that dispatch), the kind, and the canonical
+//! arguments. Two consequences fall out, and both are worth stating because
+//! each is the opposite of a reasonable guess:
+//!
+//! * **Two byte-identical calls in one step are two effects.** The ordinal
+//!   separates them, so a verifier pass that asks the model the same question
+//!   twice dispatches twice, and replay hands each call back its own recorded
+//!   answer in order. No disambiguating salt in the arguments is needed — a
+//!   position is already a name.
+//! * **The same call from changed code is a different effect.** Replay
+//!   recomputes keys as it walks; code that reorders, inserts, or reshapes a
+//!   dispatch changes some position-or-content pair, the recomputed key stops
+//!   matching history, and the run is quarantined rather than continued under
+//!   a journal another program wrote.
+//!
+//! What identity deliberately excludes: anything provider-invisible. A stream
+//! observer, a label, a retry policy — none of these change what was asked, so
+//! none may change which recorded answer a replay reads back.
 
 use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::core::{
-    EffectError, EffectKey, Phase, ProtectedField, Provenance, RetryPolicy, Sensitivity, Spend,
-    StepId, Trust, canon,
+    EffectError, EffectKey, Phase, ProtectedField, Provenance, RetryPolicy, Sensitivity, SourceId,
+    Spend, StepId, Trust, canon,
 };
 
 impl EffectKey {
@@ -272,6 +295,30 @@ pub trait Effect: Send + Sync {
         None
     }
 
+    /// The provenance identity an untrusted result of this effect carries.
+    ///
+    /// This is the name a [`ProtectedField::from_sources`] rule matches, so its
+    /// precision decides what a source rule can *say*. The default —
+    /// `effect:{kind}` — names only the effect family, and a family is too
+    /// coarse for the rule that matters: "the recipient must come from the CRM
+    /// lookup" is unsatisfiable when every granted tool answers as
+    /// `effect:tool.call`, because the rule then admits whichever tool an
+    /// injected prompt reached first.
+    ///
+    /// So the effects whose outputs feed authority-bearing fields override
+    /// this with the identity an operator actually grants:
+    ///
+    /// * a tool call → its reference, `tool://server/name`;
+    /// * a commission → `agent/{capability}`;
+    /// * a model completion → `model:{provider}/{model}`.
+    ///
+    /// The default stays for effects nobody writes source rules about — the
+    /// clock, a case read — where a finer name would be precision without a
+    /// consumer.
+    fn source(&self) -> SourceId {
+        SourceId::new(format!("effect:{}", self.descriptor().kind))
+    }
+
     /// How much this effect's *output* may be trusted.
     ///
     /// **Defaults to [`Trust::Untrusted`]**, and the direction of that default is
@@ -414,6 +461,7 @@ pub trait AnyEffect: Send + Sync {
     fn sink_arguments(&self) -> Option<&Value>;
     fn protected_fields(&self) -> &[ProtectedField];
     fn delegation_depth(&self) -> Option<usize>;
+    fn source(&self) -> SourceId;
     fn trust(&self) -> Trust;
     fn output_sensitivity(&self) -> Sensitivity;
     fn spend_erased(&self, output: &Value) -> Spend;
@@ -455,6 +503,9 @@ where
     }
     fn delegation_depth(&self) -> Option<usize> {
         Effect::delegation_depth(self)
+    }
+    fn source(&self) -> SourceId {
+        Effect::source(self)
     }
     fn trust(&self) -> Trust {
         Effect::trust(self)
@@ -528,6 +579,9 @@ impl Effect for Box<dyn AnyEffect + '_> {
     }
     fn delegation_depth(&self) -> Option<usize> {
         (**self).delegation_depth()
+    }
+    fn source(&self) -> SourceId {
+        (**self).source()
     }
     fn trust(&self) -> Trust {
         (**self).trust()

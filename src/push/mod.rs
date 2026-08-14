@@ -45,6 +45,53 @@ mod outbox;
 pub use delivery::{DeliveryWorker, Projection, PushSweepReport};
 pub use outbox::{Destination, OPERATOR_PREFIX, Outbox, RunCompleted, is_operator_id};
 
+/// Which of the two id namespaces a worker serves.
+///
+/// Two workers share one [`PushStore`]: the A2A worker serves caller-registered
+/// webhooks, the outbox worker serves operator destinations, and the two are
+/// told apart by the [`OPERATOR_PREFIX`] on the registration id. This enum is
+/// that split as a value, so the **store** can filter a due query on it —
+/// filtering after a bounded read cannot work, because rows of the other
+/// namespace occupy the head of the stable order and starve everything behind
+/// them while the report reads as a quiet plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushNamespace {
+    /// Destinations the deployment configured for itself — ids carrying
+    /// [`OPERATOR_PREFIX`], served by [`Outbox`]'s worker.
+    Operator,
+    /// Webhooks callers registered over A2A — every id without the prefix.
+    Caller,
+}
+
+impl PushNamespace {
+    /// Whether a registration id belongs to this namespace.
+    #[must_use]
+    pub fn owns_id(self, id: &str) -> bool {
+        match self {
+            Self::Operator => is_operator_id(id),
+            Self::Caller => !is_operator_id(id),
+        }
+    }
+}
+
+/// One namespace's due registrations, with the other namespace's backlog
+/// counted rather than silently skipped.
+#[derive(Debug, Clone, Default)]
+pub struct DueBatch {
+    /// Due registrations of the requested namespace, in the store's stable
+    /// order.
+    pub rows: Vec<PushRegistration>,
+    /// Due rows of the **other** namespace that were visible to this query.
+    ///
+    /// Counted so a deployment running only one worker can see the backlog no
+    /// worker of this kind will ever serve, instead of a report shaped like a
+    /// quiet plane. A lower bound: both backends' native overrides count the
+    /// whole foreign due backlog, and the paging default reports what its
+    /// final window happened to scan past — never more than the truth, and
+    /// exact once a read exhausts the store.
+    pub unserved: usize,
+}
+
 use std::fmt::Debug;
 
 use async_trait::async_trait;
@@ -235,6 +282,52 @@ pub trait PushStore: Send + Sync + Debug {
 
     /// Registrations whose retry instant has arrived, in stable order.
     async fn due(&self, at: u64, limit: usize) -> Result<Vec<PushRegistration>, StoreError>;
+
+    /// The due registrations of **one namespace**, however deep in the stable
+    /// order they sit — plus a count of the other namespace's due rows.
+    ///
+    /// The filter belongs in the query because it cannot live after it: a
+    /// worker that reads a bounded window and then drops the rows it does not
+    /// own is starved the moment the other namespace fills the window, and its
+    /// own rows beyond it are never read at all. The id prefix is already the
+    /// discriminator — see [`PushNamespace`].
+    ///
+    /// The default implementation pages over [`due`](Self::due) with a growing
+    /// window until it holds `limit` rows of the namespace or the store is
+    /// exhausted. Correct against any backend, and linear in the other
+    /// namespace's backlog — a backend with an index should override it with an
+    /// in-query filter on the id prefix.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn due_in(
+        &self,
+        at: u64,
+        limit: usize,
+        namespace: PushNamespace,
+    ) -> Result<DueBatch, StoreError> {
+        let mut window = limit.max(1);
+        loop {
+            let all = self.due(at, window).await?;
+            // Fewer rows than asked for means the store has no more to show;
+            // a full window may merely be the head of a longer order.
+            let exhausted = all.len() < window;
+            let mut batch = DueBatch::default();
+            for registration in all {
+                if namespace.owns_id(&registration.config.id) {
+                    batch.rows.push(registration);
+                } else {
+                    batch.unserved = batch.unserved.saturating_add(1);
+                }
+            }
+            if batch.rows.len() >= limit || exhausted {
+                batch.rows.truncate(limit);
+                return Ok(batch);
+            }
+            window = window.saturating_mul(2);
+        }
+    }
 
     /// Acknowledge every record before `next_seq`.
     async fn advance(&self, task: RunId, id: &str, next_seq: Seq) -> Result<(), StoreError>;
@@ -486,12 +579,17 @@ impl PushSender {
     /// was still granted, and a check performed only at write time cannot do
     /// that.
     ///
+    /// Private on purpose: [`PushTransport::deliver`] is the one entry point.
+    /// A second, public spelling of the same delivery was a door past the
+    /// trait — callable without anything guaranteeing the validation the trait
+    /// documents, and one rename away from the two drifting apart.
+    ///
     /// # Errors
     ///
     /// [`PushError`] when the URL is not permitted or does not resolve to a
     /// public address. Transport failures are **not** errors here — see the
     /// return type.
-    pub async fn deliver(
+    async fn deliver_validated(
         &self,
         config: &PushConfig,
         payload: &serde_json::Value,
@@ -506,11 +604,22 @@ impl PushSender {
             .to_owned();
         let port = url.port_or_known_default().unwrap_or(443);
 
+        // `Url::host_str` keeps the brackets on an IPv6 literal and the
+        // resolver refuses them — so without stripping, every v6 literal fell
+        // through to a DNS lookup that cannot succeed, and one whole address
+        // family was dead and misreported as retryable. Only the resolution
+        // uses the bare form; the granted-host comparison and the netguard
+        // messages keep the spelling the URL carries.
+        let lookup = host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(&host)
+            .to_owned();
         // Resolved once, every answer checked, and the connection pinned to
         // exactly those addresses. Without the pin the client resolves again and
         // may be handed a different answer than the one that passed — which is
         // the rebinding attack this check would otherwise only appear to stop.
-        let resolved = tokio::net::lookup_host((host.as_str(), port))
+        let resolved = tokio::net::lookup_host((lookup.as_str(), port))
             .await
             .map_err(|e| PushError::Unroutable(format!("DNS for '{host}': {e}")))?;
         let addrs = if self.operator {
@@ -609,7 +718,7 @@ impl PushTransport for PushSender {
         config: &PushConfig,
         payload: &serde_json::Value,
     ) -> Result<Delivered, PushError> {
-        PushSender::deliver(self, config, payload).await
+        self.deliver_validated(config, payload).await
     }
 }
 

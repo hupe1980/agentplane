@@ -133,8 +133,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/executor.rs",
         "a_quarantined_run_is_never_unwound",
         "a run holding an unknown outcome is unwound anyway",
-        "            RunStatus::Failed(_) | RunStatus::Exhausted(_) | RunStatus::Cancelled { .. } => {}",
-        "            RunStatus::Failed(_)\n            | RunStatus::Exhausted(_)\n            | RunStatus::Cancelled { .. }\n            | RunStatus::Quarantined(_) => {}",
+        "            RunStatus::Failed(_) | RunStatus::Cancelled { .. } => {}",
+        "            RunStatus::Failed(_)\n            | RunStatus::Cancelled { .. }\n            | RunStatus::Quarantined(_) => {}",
     ),
     # ── Information flow ────────────────────────────────────────────────────
     "TrustToolOutput": (
@@ -644,8 +644,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "any document containing a JSON null — not the field, the whole record "
         "— so every request carrying an unset optional is reported as malformed "
         "and denied, while an operator reading 'denied' hunts for the rule",
-        "            without_nulls(r.context.clone()),",
-        "            r.context.clone(),",
+        "        let stripped = without_nulls(r.context.clone(), &mut removed);",
+        "        let stripped = r.context.clone();",
     ),
     "AnAbsentPublisherIsNull": (
         "src/runtime/executor.rs",
@@ -1010,7 +1010,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                     detail: error.to_string(),
                 })?;
         }
-        let digest =
+        let stored =
             self.blobs
                 .put(&fetched.bytes)
                 .await
@@ -1018,7 +1018,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                     driver: "blob.store".to_owned(),
                     detail: error.to_string(),
                 })?;""",
-        """        let digest =
+        """        let stored =
             self.blobs
                 .put(&fetched.bytes)
                 .await
@@ -1652,7 +1652,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/executor.rs",
         "stopping_a_suspended_run_undoes_what_it_did",
         "a stopped run seals without undoing what it already did",
-        "            RunStatus::Failed(_) | RunStatus::Exhausted(_) | RunStatus::Cancelled { .. } => {}",
+        "            RunStatus::Failed(_) | RunStatus::Cancelled { .. } => {}",
         "            RunStatus::Failed(_) | RunStatus::Exhausted(_) => {}\n            RunStatus::Cancelled { .. } => return Ok(status),",
     ),
     "StopUnwindsAroundDoubt": (
@@ -2496,8 +2496,13 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_delivered_events_source_is_the_authenticated_caller",
         "a caller names the source of the event it delivers, so it controls both "
         "halves of the dedup identity and can deduplicate against another party",
-        "    let mut event = InboundEvent::new(s.caller.actor.clone(), body.id, body.kind, body.payload);",
-        "    let mut event = InboundEvent::new(\"urn:anonymous\", body.id, body.kind, body.payload);\n    let _ = &s;",
+        "    let mut event = InboundEvent::new(\n"
+        "        peer_source(&s.caller.actor),\n"
+        "        body.id,\n"
+        "        body.kind,\n"
+        "        body.payload,\n"
+        "    );",
+        "    let mut event = InboundEvent::new(\"urn:anonymous\", body.id, body.kind, body.payload);",
     ),
     "AnAwaitedEventsSenderIsNotJournaled": (
         "src/runtime/executor.rs",
@@ -2577,8 +2582,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "compaction does not bound what the summarising model may be shown, so "
         "summarising becomes the route by which confidential memories reach a "
         "model that may not see them — while looking like housekeeping",
-        "        let call = crate::model::ModelCall::new(provider, model, prompt.peek().clone())\n            .with_max_sensitivity(into.max_sensitivity);",
-        "        let call = crate::model::ModelCall::new(provider, model, prompt.peek().clone())\n            .with_max_sensitivity(crate::core::Sensitivity::Secret);",
+        "                crate::model::ModelCall::new(provider, model, value)\n                    .with_max_sensitivity(max_sensitivity)",
+        "                crate::model::ModelCall::new(provider, model, value)\n                    .with_max_sensitivity(crate::core::Sensitivity::Secret)",
     ),
     "ASummaryForgetsWhatItWasMadeFrom": (
         "src/store/redb_memory.rs",
@@ -2934,8 +2939,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a tick that decided nothing still opens and seals a run, so the Merkle "
         "log fills with evidence of inactivity — and a log of nothings is where "
         "the somethings hide",
-        "    const fn new() -> Self {\n        Self {\n            run: None,\n            entries: Vec::new(),\n        }\n    }",
-        "    fn new() -> Self {\n        Self {\n            run: Some(RunId::generate()),\n            entries: Vec::new(),\n        }\n    }",
+        "    const fn new() -> Self {\n        Self {\n            run: None,\n            wrote: false,\n        }\n    }",
+        "    fn new() -> Self {\n        Self {\n            run: Some(RunId::generate()),\n            wrote: false,\n        }\n    }",
     ),
     "ASweepRecordIsNotReachableFromItsCase": (
         "src/runtime/sweeper.rs",
@@ -2983,7 +2988,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "takes, so it governs the A2A peer call and not the function call — a "
         "specialist hands work off inside one process, and A->B->C->A is "
         "reachable with no peer boundary to cross and no allowlist to notice",
-        "        self.check_delegation_depth(&effect)?;",
+        "        self.refuse_excess_delegation(&effect, &descriptor).await?;",
         "",
     ),
     "ADerivedCatalogueRelaxesAGrant": (
@@ -3034,11 +3039,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "protocol, so a replay asks again and gets different floats — and since "
         "the query vector is in the semantic-retrieval effect key, the run "
         "quarantines itself with nothing on the record explaining why",
-        "        self.sink(\n            crate::runtime::effects::Embed {",
+        "        self.sink_with(&arguments, |value| crate::runtime::effects::Embed {",
         "        if true {\n            let v = embedder.embed(&plain).await"
         ".map_err(StepError::Store)?;\n            return Ok(crate::core::Tainted"
         "::trusted(v));\n        }\n"
-        "        self.sink(\n            crate::runtime::effects::Embed {",
+        "        self.sink_with(&arguments, |value| crate::runtime::effects::Embed {",
     ),
     "MemoryFormsBeforeTheHumanDecides": (
         "src/runtime/declarative.rs",
@@ -3047,7 +3052,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a reviewer's refusal fails the run while the refused answer stays a "
         "standing fact the next run reads as established",
         "        if let Some(spec) = oversight.as_ref().filter(|s| s.gates_the_answer()) {",
-        "        self.form_answer(cx, formation, formed_source.clone(), input, model)\n"
+        "        self.form_answer(cx, formation, formed_source.clone(), input, model_role)\n"
         "            .await?;\n"
         "        if let Some(spec) = oversight.as_ref().filter(|s| s.gates_the_answer()) {",
     ),
@@ -3158,7 +3163,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "satisfies the check while being governed by no manifest — it runs "
         "under the plane's default budget and no manifest gate, and the plane "
         "builds cleanly",
-        "                mine.extend(s.descriptor().provides);",
+        "                mine.extend(s.descriptor().capabilities());",
         "",
     ),
     "ACaseWriteReachesPolicyAsARead": (
@@ -3421,13 +3426,32 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                Ok::<(), String>(()).map_err(|detail| {",
     ),
     "AnOperatorWorkerServesACallersWebhook": (
-        "src/push/outbox.rs",
+        # The trait *default*: since both backends grew native overrides, the
+        # runtime path no longer runs this code over a real store, and the
+        # test that kills it is the conformance pin that forces the default
+        # over redb and compares — a worker-level test would pass with this
+        # mutation applied, because the worker reads the (unmutated) override.
+        "src/push/mod.rs",
+        "redb_due_in_matches_the_paging_default",
+        "the paging default stops filtering by namespace, so any backend "
+        "without a native override hands every worker every registration and "
+        "the deployment's own event is POSTed to a peer's A2A webhook — a "
+        "disclosure to a party that registered for something else",
+        "                if namespace.owns_id(&registration.config.id) {",
+        "                if true {",
+    ),
+    "RedbDueInServesEveryNamespace": (
+        # The native override the workers actually run over the embedded
+        # store. Killed by the worker-level test, because the disclosure it
+        # names — an operator event on a caller's webhook — is the one this
+        # filter exists to prevent.
+        "src/store/redb_push.rs",
         "an_operator_worker_leaves_a_callers_webhook_alone",
-        "the outbox worker claims every registration in the store rather than "
-        "only its own, so the deployment's own event is POSTed to a peer's A2A "
-        "webhook — a disclosure to a party that registered for something else",
-        "    fn owns(&self, registration: &PushRegistration) -> bool {\n        is_operator_id(&registration.config.id)",
-        "    fn owns(&self, registration: &PushRegistration) -> bool {\n        let _ = registration;\n        true",
+        "the embedded store's native due filter serves every namespace, so "
+        "every worker claims every registration and the deployment's own "
+        "event is POSTed to a peer's A2A webhook",
+        "                if !namespace.owns_id(id) {",
+        "                if false {",
     ),
     "AnUnfireableMutatingGrantParses": (
         "src/manifest/mod.rs",
@@ -3682,10 +3706,10 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "genuinely happened can refuse — history says something different on "
         "the second reading",
         "        // Strict verification never writes, so it holds no lease to renew.\n"
-        "        let _heartbeat = (mode != Mode::Strict).then(|| self.heartbeat(run, epoch));",
+        "        let _heartbeat = lease.map(|l| self.heartbeat(run, l.epoch));",
         "        self.check_quota(run).await?;\n"
         "        // Strict verification never writes, so it holds no lease to renew.\n"
-        "        let _heartbeat = (mode != Mode::Strict).then(|| self.heartbeat(run, epoch));",
+        "        let _heartbeat = lease.map(|l| self.heartbeat(run, l.epoch));",
     ),
     "APeerCanNameAnyTenant": (
         "src/api/a2a.rs",
@@ -3803,7 +3827,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "every protected sink field downstream checks nothing",
         "    let input = Tainted::from_source(\n"
         "        message.to_input(),\n"
-        "        SourceId::new(format!(\"peer:{}\", caller.actor)),\n"
+        "        SourceId::new(super::peer_source(&caller.actor)),\n"
         "    );",
         "    let input = Tainted::trusted(message.to_input());",
     ),
@@ -4109,8 +4133,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_sealed_journal_hides_payloads_and_still_verifies_without_keys",
         "a sealed journal writes its payloads in the clear, so the prompts and "
         "arguments a deployment sealed reach the store readable",
-        "                *field = payload::wrap(&envelope);",
-        "                let _ = &envelope;",
+        "                        *field = payload::wrap(&envelope);",
+        "                        let _ = &envelope;",
     ),
     "ADestroyedKeyStillOpens": (
         "src/journal/payload.rs",
@@ -4296,8 +4320,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "verification trusts the hash a record carries instead of recomputing "
         "it, so an export edited after it was written verifies clean — the "
         "chain becomes a claim the file makes about itself",
-        """            if record.hash != claimed {""",
-        """            if false && record.hash != claimed {""",
+        """        raw_bytes.to_vec(),
+        pass.prev,
+        claimed,
+        attestation,""",
+        """        raw_bytes.to_vec(),
+        pass.prev,
+        crate::core::Digest::chain(pass.prev, raw_bytes),
+        attestation,""",
     ),
     "AnExportDropsAnUnreadableRun": (
         "src/export.rs",
@@ -4512,13 +4542,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "untrusted contact runs on the privileged model even when a quarantined "
         "one is declared, so the role designated for it governs nothing in the "
         "declarative tier",
-        """    m.spec
-        .models
-        .as_ref()
-        .and_then(|models| models.quarantined.as_ref())
-        .map_or_else(|| fallback.clone(), |r| ModelId::new(&r.provider, &r.model))""",
-        """    let _ = m;
-    fallback.clone()""",
+        "    m.quarantined_role().unwrap_or_else(|| fallback.clone())",
+        "    let _ = m;\n    fallback.clone()",
     ),
     "PlannedAcceptsUntrustedInput": (
         "src/runtime/declarative.rs",

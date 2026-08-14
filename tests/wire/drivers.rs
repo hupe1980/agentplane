@@ -329,12 +329,22 @@ async fn an_internal_error_is_in_doubt_not_a_refusal() {
         "an internal error was read as a clean refusal, which is how a partial \
          transfer gets repeated: {err}"
     );
+    assert!(
+        matches!(err, PeerError::InDoubt { .. }),
+        "a JSON-RPC internal error is an answered fault, not a timeout: {err}"
+    );
 }
 
-/// A 5xx reached them, so it is in doubt too.
+/// A 5xx reached them, so it is in doubt too — and it is diagnosed as an
+/// answered fault, not as a timeout.
+///
+/// The variant matters beyond the disposition: `TimedOut` prints "did not
+/// answer in time", which is false for a peer that answered HTTP 500 promptly,
+/// and a false diagnosis is what an operator debugs first. The in-doubt bucket
+/// has its own variant whose text says what is actually known.
 #[tokio::test]
 async fn a_server_error_is_in_doubt() {
-    let (c, _) = canned(503, json!({ "error": "unavailable" }));
+    let (c, _) = canned(500, json!({ "error": "boom" }));
     let url = serve(c).await;
     let client = A2aClient::new(Endpoint::new(url)).unwrap();
     let err = client
@@ -349,6 +359,19 @@ async fn a_server_error_is_in_doubt() {
         .await
         .unwrap_err();
     assert_eq!(err.disposition(), Disposition::InDoubt, "{err}");
+    assert!(
+        matches!(err, PeerError::InDoubt { .. }),
+        "an HTTP 500 is an answered fault, not a timeout: {err}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("answered HTTP 500"),
+        "the diagnosis does not say the peer answered with a fault: {text}"
+    );
+    assert!(
+        !text.contains("did not answer in time"),
+        "an answered fault is described as slowness: {text}"
+    );
 }
 
 /// A 401 is a refusal: read, declined, nothing done.

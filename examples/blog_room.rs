@@ -137,8 +137,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // are registered on it. Each keeps its own manifest, its own ceilings and
     // its own answerability; what they share is infrastructure.
     let editor_m = parse(EDITOR);
+    let driver: Arc<dyn ModelProvider> = provider.clone();
     let plane = Runtime::builder(Arc::clone(&store))
-        .provider("fake", Arc::clone(&provider) as Arc<dyn ModelProvider>)
+        .provider("fake", driver)
         .agent(Agent::new(&research_m))
         .agent(Agent::new(&write_m))
         .agent(Agent::new(&editor_m).skill(Editor))
@@ -260,7 +261,7 @@ async fn yaml_room(
     // the order below is one a real model would plausibly choose.
     provider.will_call_tool(
         "call_research",
-        "agent__blog_dresearch",
+        "agent__blog-research",
         json!({ "topic": "why durable execution beats a retry loop" }),
     );
     // Schema-shaped, because `room.yaml`'s researcher declares `output.schema`.
@@ -270,7 +271,7 @@ async fn yaml_room(
     provider.will_say(r#"{"claims": ["Retries repeat work; journals replay it."]}"#);
     provider.will_call_tool(
         "call_draft",
-        "agent__blog_ddraft",
+        "agent__blog-draft",
         json!({
             "brief": "why durable execution beats a retry loop",
             "claims": "Retries repeat work; journals replay it.",

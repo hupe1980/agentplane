@@ -223,6 +223,13 @@ pub struct StepCtx<'a> {
     /// an ambient one, because members reach the world through the same two
     /// methods everything else does.
     member_dispatch: bool,
+    /// Whether this step has appended anything to the journal.
+    ///
+    /// The executor's "did this step do new work" bit: a resumed step that
+    /// merely re-read its own history appends nothing here, and its ending is
+    /// already on the record — writing a second `StepFinished` for it reports
+    /// one piece of work as two and grows the chain on every resume.
+    wrote: bool,
 }
 
 impl<'a> StepCtx<'a> {
@@ -285,7 +292,13 @@ impl<'a> StepCtx<'a> {
             reversing: false,
             open_group: None,
             member_dispatch: false,
+            wrote: false,
         }
+    }
+
+    /// Whether this step appended anything — the executor's "did new work" bit.
+    pub(crate) const fn wrote_records(&self) -> bool {
+        self.wrote
     }
 
     /// Run something with the gate exempted, because it is taking work back.
@@ -462,6 +475,111 @@ impl<'a> StepCtx<'a> {
         self.manifest.as_deref()
     }
 
+    /// Complete a prompt on the **manifest's own** model, through the
+    /// **plane's own** driver.
+    ///
+    /// The model-call counterpart to [`call_tool`](Self::call_tool), and it
+    /// closes the same gap. A declarative agent resolves its model from the
+    /// declaration and its driver from the plane's registry; a hand-written
+    /// skill had to carry an `Arc<dyn ModelProvider>` field and name a model
+    /// in code — so the skill held wiring its manifest never described, and
+    /// the file's `models.privileged` governed the declarative tier while the
+    /// coded tier read it or did not. This is the path where it cannot be
+    /// ignored: the privileged role supplies the model and its reviewed
+    /// ceilings, the plane supplies the driver registered under the role's
+    /// provider name, and the manifest's egress ceiling rides the call.
+    ///
+    /// ```ignore
+    /// let completion = cx.complete(&prompt).await?;
+    /// ```
+    ///
+    /// An explicit `(provider, model)` remains one construction away —
+    /// `cx.sink_with(&prompt, |value| ModelCall::new(provider, model, value))`
+    /// — which is the honest spelling for a call the manifest does not govern.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError`] when this skill runs under no manifest, when the manifest
+    /// declares no privileged model, when no driver is registered under the
+    /// role's provider name, or whatever the dispatch itself refuses.
+    #[cfg(feature = "manifest")]
+    pub async fn complete(
+        &mut self,
+        prompt: &Tainted<Value>,
+    ) -> Result<Tainted<crate::model::Completion>, StepError> {
+        self.complete_with(prompt, |call| call).await
+    }
+
+    /// [`complete`](Self::complete), with the call adjusted before dispatch.
+    ///
+    /// The closure receives the fully-resolved call — model, role ceilings and
+    /// egress ceiling already applied — and may add what only the skill knows:
+    ///
+    /// ```ignore
+    /// let completion = cx
+    ///     .complete_with(&prompt, |call| call.expecting(schema.clone()))
+    ///     .await?;
+    /// ```
+    ///
+    /// It runs *after* the manifest's declarations are applied, so a skill can
+    /// tighten or reshape the call; what it cannot do is dodge the `declared`
+    /// gate, which still refuses a model the manifest never named.
+    ///
+    /// # Errors
+    ///
+    /// As [`complete`](Self::complete).
+    #[cfg(feature = "manifest")]
+    pub async fn complete_with<F>(
+        &mut self,
+        prompt: &Tainted<Value>,
+        tune: F,
+    ) -> Result<Tainted<crate::model::Completion>, StepError>
+    where
+        F: FnOnce(crate::model::ModelCall) -> crate::model::ModelCall,
+    {
+        let refuse = |detail: String| StepError::Effect(crate::core::EffectError::Other(detail));
+        let manifest = self.manifest.clone().ok_or_else(|| {
+            refuse(
+                "this skill runs under no manifest, so `cx.complete` has no declared \
+                 model to call — register it with `Agent::new(&manifest).skill(..)`, or \
+                 construct a `ModelCall` and dispatch it with `cx.sink_with`"
+                    .into(),
+            )
+        })?;
+        let role = manifest.privileged_role().ok_or_else(|| {
+            refuse(format!(
+                "manifest '{}' declares no privileged model — `spec.models.privileged` \
+                 is what `cx.complete` calls",
+                manifest.metadata.name
+            ))
+        })?;
+        let provider = self
+            .plane
+            .upgrade()
+            .and_then(|plane| plane.model_provider(&role.model.provider))
+            .ok_or_else(|| {
+                refuse(format!(
+                    "no driver is registered for provider '{}' — \
+                     `RuntimeBuilder::provider(\"{}\", ..)` is what maps the manifest's \
+                     name to one",
+                    role.model.provider, role.model.provider
+                ))
+            })?;
+        let egress = manifest.spec.security.max_sensitivity_egress;
+        self.sink_with(prompt, |value| {
+            let mut call = role.applied_to(crate::model::ModelCall::new(
+                provider,
+                role.model.clone(),
+                value,
+            ));
+            if let Some(ceiling) = egress {
+                call = call.with_max_sensitivity(ceiling);
+            }
+            tune(call)
+        })
+        .await
+    }
+
     /// Call a tool through the **plane's own** catalogue.
     ///
     /// # Why this exists, and why the obvious alternative is a hole
@@ -527,12 +645,11 @@ impl<'a> StepCtx<'a> {
                     .into(),
             ))
         })?;
-        let prepared =
-            crate::tools::ToolCall::prepare(&catalog, client, tool, arguments.peek().clone())
-                .map_err(|e| {
-                    StepError::Effect(crate::core::EffectError::Rejected(e.to_string()))
-                })?;
-        self.sink(prepared, &arguments).await
+        self.sink_with(&arguments, |value| {
+            crate::tools::ToolCall::prepare(&catalog, client, tool, value)
+                .map_err(|e| StepError::Effect(crate::core::EffectError::Rejected(e.to_string())))
+        })
+        .await
     }
 
     /// What this run tells a callee about itself, sealed for one call.
@@ -690,6 +807,12 @@ impl<'a> StepCtx<'a> {
     ) -> Result<Tainted<E::Output>, StepError> {
         let trust = effect.trust();
         let declared = effect.output_sensitivity();
+        // Captured before dispatch consumes the effect. This is the name a
+        // `ProtectedField::from_sources` rule matches, so it is per *effect* —
+        // `tool://crm/lookup`, `model:openai/gpt-4o` — not per family: a rule
+        // that can only say `effect:tool.call` admits whichever granted tool an
+        // injected prompt reached first, which is no rule at all.
+        let source = effect.source();
         let kind = effect.descriptor().kind;
         // A mutation beside an open group, rather than inside it. Refused:
         // the group's `Aborted` outcome says *taken back whole*, and this
@@ -714,9 +837,7 @@ impl<'a> StepCtx<'a> {
 
         let labelled = match trust {
             crate::core::Trust::Trusted => Tainted::trusted(output),
-            crate::core::Trust::Untrusted => {
-                Tainted::from_source(output, crate::core::SourceId::new(format!("effect:{kind}")))
-            }
+            crate::core::Trust::Untrusted => Tainted::from_source(output, source),
         };
         // Raised, never lowered: an untrusted result is already `Internal`, and
         // an effect that could declare its output *less* sensitive than its
@@ -745,9 +866,12 @@ impl<'a> StepCtx<'a> {
         // round. The loop a `specialist` role exists to prevent is the in-plane
         // one: A commissions B commissions C commissions A, inside one process,
         // with no peer boundary to cross and no allowlist to notice.
-        self.check_delegation_depth(&effect)?;
-
+        //
+        // A refusal is journaled like the sink gates': it fires before any key
+        // exists, so the record takes the dispatch's position, and replay
+        // consumes the verdict instead of re-deciding it.
         let descriptor = effect.descriptor();
+        self.refuse_excess_delegation(&effect, &descriptor).await?;
         let policy = effect.retry();
         let recovery = effect.recovery();
         let ordinal = self.ordinal;
@@ -798,6 +922,11 @@ impl<'a> StepCtx<'a> {
                             disposition,
                             spend,
                             permanent,
+                            // Recomputed from the code, like the recovery and
+                            // the policy: replay assumes the same program, and
+                            // the record's own `mutates` lives on the start
+                            // record the cursor has already collapsed.
+                            effect.mutates(),
                         )?;
                         continue;
                     }
@@ -868,6 +997,7 @@ impl<'a> StepCtx<'a> {
                 &policy,
                 &failure.to_string(),
                 matches!(failure, crate::core::EffectError::Refused(_)),
+                effect.mutates(),
             ) {
                 return Err(stop);
             }
@@ -1491,6 +1621,7 @@ impl<'a> StepCtx<'a> {
         error: &str,
         disposition: crate::core::Disposition,
         permanent: bool,
+        mutates: bool,
     ) -> Result<u32, StepError> {
         // Billed on replay exactly as it was live, or a run that exhausted its
         // budget on failures would replay as healthy under the same limit.
@@ -1522,6 +1653,7 @@ impl<'a> StepCtx<'a> {
             policy,
             error,
             permanent,
+            mutates,
         ) {
             return Err(stop);
         }
@@ -1558,6 +1690,7 @@ impl<'a> StepCtx<'a> {
         policy: &crate::core::RetryPolicy,
         message: &str,
         permanent: bool,
+        mutates: bool,
     ) -> Option<StepError> {
         use crate::core::{Disposition, Recovery};
 
@@ -1573,8 +1706,26 @@ impl<'a> StepCtx<'a> {
             }
             Disposition::InDoubt => match recovery {
                 // Safe to repeat by declaration: either genuinely idempotent,
-                // or carrying an idempotency key the provider honours.
-                Recovery::Retry | Recovery::Idempotent { .. } => {}
+                // or carrying an idempotency key the provider honours — while
+                // attempts remain. Once they run out the doubt is *final*,
+                // and for a mutating effect a final unknown is an operator's
+                // question, not a `Failed` (I5): a failure unwinds, and the
+                // unwind would compensate every step around a call that may
+                // have landed — the refund for money nobody took, issued by
+                // the retry policy having merely given up.
+                Recovery::Retry | Recovery::Idempotent { .. } => {
+                    if mutates && !policy.permits(attempt) {
+                        return Some(StepError::Undecidable {
+                            key,
+                            recovery: recovery.clone(),
+                            detail: format!(
+                                "{message} — attempts exhausted with the outcome still \
+                                 unknown, and the effect mutates; whether the last call \
+                                 landed is a question for an operator, not for an unwind"
+                            ),
+                        });
+                    }
+                }
                 Recovery::Reconcile => {
                     // Reached only once the probe has already run and come back
                     // inconclusive — the caller resolves what it can before
@@ -1759,7 +1910,98 @@ impl<'a> StepCtx<'a> {
         self.sleep_until(until).await
     }
 
+    /// Record a sink-gate refusal under the key the refused dispatch would
+    /// have carried, then hand it back as the error to raise.
+    ///
+    /// The refusal occupies the dispatch's position: the ordinal is consumed
+    /// and the record keyed exactly as the effect would have been (attempt 1 —
+    /// nothing was attempted), for the same reason a budget refusal and a
+    /// policy denial are keyed. A sink refusal used to leave *no* record —
+    /// these gates fire before `effect_unlabelled` derives a key, so there was
+    /// nothing convenient to file it under — and the consequence surfaced one
+    /// mode later: a strict pass over the refused run reached the same gate,
+    /// found nothing to consume, and a resumed pass re-decided a verdict that
+    /// was already history. Journaled only where writes are enabled: on a
+    /// replayed prefix the live pass's own record is the verdict, and this
+    /// pass re-deriving the same refusal from the same labels is the
+    /// deterministic zone agreeing with itself, not news.
+    async fn refuse_sink(
+        &mut self,
+        descriptor: &EffectDescriptor,
+        denial: PolicyError,
+    ) -> StepError {
+        let key = self.next_effect_key(descriptor);
+        if self.writes_enabled()
+            && let Err(e) = self
+                .append_effect(
+                    key,
+                    RecordKind::PolicyDenied {
+                        reason: denial.to_string(),
+                        action: crate::core::ACTION_EGRESS.to_owned(),
+                        resource: descriptor.kind.clone(),
+                    },
+                )
+                .await
+        {
+            // A runtime that cannot record what it refused must not report
+            // the tidier error instead.
+            return e;
+        }
+        denial.into()
+    }
+
+    /// Send a labeled value into a sink, handing the value to the effect and
+    /// the gate in one motion.
+    ///
+    /// The closure receives the inner value and builds the effect from it, so
+    /// the bytes the gates check and the bytes the effect sends are one
+    /// argument rather than two the caller must keep in agreement:
+    ///
+    /// ```ignore
+    /// let completion = cx
+    ///     .sink_with(&prompt, |value| ModelCall::new(provider, model, value))
+    ///     .await?;
+    /// ```
+    ///
+    /// This replaces the two-pass spelling — `ModelCall::new(..,
+    /// prompt.peek().clone())` beside `cx.sink(call, &prompt)` — where the
+    /// same data was written twice and a runtime check caught the versions
+    /// drifting apart. Passing it once removes the drift at the API instead of
+    /// detecting it afterwards; the byte-for-byte binding check still runs
+    /// underneath, because a custom effect could bind something other than
+    /// what its constructor was handed, and that is a driver bug worth a loud
+    /// refusal.
+    ///
+    /// Fallible construction composes: the closure may return
+    /// `Result<E, impl Into<StepError>>` — see [`BuildsEffect`] — which is
+    /// what `ToolCall::prepare` needs.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the closure refuses with, and everything [`sink`](Self::sink)
+    /// refuses: the egress ceiling, the journal ceiling, the whole-value taint
+    /// gate, and the per-field provenance rules.
+    pub async fn sink_with<E, B, F>(
+        &mut self,
+        args: &Tainted<Value>,
+        build: F,
+    ) -> Result<Tainted<E::Output>, StepError>
+    where
+        E: Effect,
+        B: BuildsEffect<E>,
+        F: FnOnce(Value) -> B,
+    {
+        let effect = build(args.peek().clone()).into_effect()?;
+        self.sink(effect, args).await
+    }
+
     /// Send a labeled value into a sink, enforcing the information-flow gates.
+    ///
+    /// Prefer [`sink_with`](Self::sink_with), which hands the value to the
+    /// effect and the gate in one motion. This form remains for effects that
+    /// bind their outbound value internally — a governed media fetch derives
+    /// its bound arguments from the URL it was constructed over — and for
+    /// callers holding an effect built elsewhere.
     ///
     /// Two checks, both of which are the reason labels exist at all:
     ///
@@ -1785,22 +2027,34 @@ impl<'a> StepCtx<'a> {
             return Err(PolicyError::SinkArgumentsMismatch { sink: sink_name }.into());
         }
 
-        // Manifest-derived ceilings apply to **live dispatch only**.
+        // Manifest-derived ceilings apply to **live dispatch only** — and
+        // "live dispatch" is a property of the *cursor*, not of the mode.
         //
-        // A replay re-executes the deterministic zone and reads every effect
-        // back from the journal; if today's manifest were consulted here, a
-        // tightened ceiling would refuse an effect that already happened and a
-        // loosened one would bless an effect that was refused. Either way the
-        // replay stops reproducing the run and starts re-judging it under rules
-        // that did not exist at the time — which this design rejects for policy
-        // and must reject for declarations too, since a manifest is policy a
+        // A replayed effect reads its result back from the journal; if
+        // today's manifest were consulted for it, a tightened ceiling would
+        // refuse an effect that already happened and a loosened one would
+        // bless an effect that was refused. Either way the replay stops
+        // reproducing the run and starts re-judging it under rules that did
+        // not exist at the time — which this design rejects for policy and
+        // must reject for declarations too, since a manifest is policy a
         // reviewer wrote.
         //
-        // The sink's *own* ceiling still applies: that is code, and a code
-        // change that alters an outcome is divergence, which quarantine exists
-        // to catch.
+        // But `Resume` is only *replaying* until its history runs out, and
+        // then it dispatches **live** — new calls, against the real world,
+        // for the rest of the run. Keying these gates on the mode instead of
+        // on cursor exhaustion switched them off for that entire live tail:
+        // a run refused by the egress ceiling, resumed, sailed the same value
+        // past the same ceiling — an enforcement whose second attempt is a
+        // bypass is not an enforcement. `writes_enabled` is precisely "will
+        // this effect dispatch live": always in `Live`, past the frontier in
+        // `Resume`, never in `Strict` (which cannot dispatch at all — an
+        // exhausted cursor there is `ReplayOverrun`, not permission).
+        //
+        // The sink's *own* ceiling still applies everywhere: that is code, and
+        // a code change that alters an outcome is divergence, which quarantine
+        // exists to catch.
         #[cfg(feature = "manifest")]
-        let manifest_gates = !self.mode.is_replaying();
+        let manifest_gates = self.writes_enabled();
 
         let ceiling = {
             let effect_ceiling = effect.max_sensitivity();
@@ -1828,12 +2082,12 @@ impl<'a> StepCtx<'a> {
             effect_ceiling
         };
         if label.sensitivity > ceiling {
-            return Err(PolicyError::EgressCeiling {
+            let denial = PolicyError::EgressCeiling {
                 sink: sink_name,
                 actual: label.sensitivity,
                 ceiling,
-            }
-            .into());
+            };
+            return Err(self.refuse_sink(&effect.descriptor(), denial).await);
         }
 
         // What may be *written down* is a different question from what may
@@ -1854,12 +2108,12 @@ impl<'a> StepCtx<'a> {
             .and_then(|m| m.spec.security.max_sensitivity_journaled)
             && label.sensitivity > journal_ceiling
         {
-            return Err(PolicyError::JournalCeiling {
+            let denial = PolicyError::JournalCeiling {
                 sink: sink_name,
                 actual: label.sensitivity,
                 ceiling: journal_ceiling,
-            }
-            .into());
+            };
+            return Err(self.refuse_sink(&effect.descriptor(), denial).await);
         }
 
         // The reviewed grant may only tighten — here as at the authorization
@@ -1885,7 +2139,15 @@ impl<'a> StepCtx<'a> {
         #[cfg(not(feature = "manifest"))]
         let mutates = effect.mutates();
 
-        Self::enforce_protected_fields(&effect, args, sink_name, mutates)?;
+        if let Err(refusal) = Self::enforce_protected_fields(&effect, args, sink_name, mutates) {
+            // The whole-value taint gate and the per-field rules are sink
+            // gates like the ceilings above, and their refusals are recorded
+            // for the same reason.
+            return Err(match refusal {
+                StepError::Policy(denial) => self.refuse_sink(&effect.descriptor(), denial).await,
+                other => other,
+            });
+        }
 
         // The same label the gates above enforced, handed to the deployment's
         // own rules. See `authorize` for why it belongs there too.
@@ -2154,6 +2416,7 @@ impl<'a> StepCtx<'a> {
         disposition: crate::core::Disposition,
         spend: crate::core::Spend,
         permanent: bool,
+        mutates: bool,
     ) -> Result<u32, StepError> {
         self.bill(spend);
         self.recorded_failure(
@@ -2166,14 +2429,33 @@ impl<'a> StepCtx<'a> {
             error,
             disposition,
             permanent,
+            mutates,
         )
+    }
+
+    /// The delegation-depth gate, with its refusal journaled.
+    async fn refuse_excess_delegation<E: Effect>(
+        &mut self,
+        effect: &E,
+        descriptor: &EffectDescriptor,
+    ) -> Result<(), StepError> {
+        if let Err(refusal) = self.check_delegation_depth(effect) {
+            return Err(match refusal {
+                StepError::Policy(denial) => self.refuse_sink(descriptor, denial).await,
+                other => other,
+            });
+        }
+        Ok(())
     }
 
     /// Refuse an effect that would delegate deeper than the declaration allows.
     ///
-    /// Live dispatch only, like every other manifest gate: a replay reads its
-    /// effects back, so a tightened ceiling must not retroactively refuse an
-    /// effect that already happened.
+    /// Live dispatch only, like every other manifest gate — where "live" is
+    /// cursor exhaustion, not mode: a replayed effect reads its result back,
+    /// so a tightened ceiling must not retroactively refuse it, but a resumed
+    /// run past its frontier is dispatching *new* delegations against the
+    /// real world, and the loop a `specialist` role exists to prevent does
+    /// not pause because the run once crashed.
     // `self` and `effect` are both unused without `manifest`, and the ceiling
     // lives on the manifest — so a build with no manifest support has nothing to
     // check rather than a different rule.
@@ -2188,7 +2470,7 @@ impl<'a> StepCtx<'a> {
         let ceiling = self
             .manifest
             .as_ref()
-            .filter(|_| !self.mode.is_replaying())
+            .filter(|_| self.writes_enabled())
             .and_then(|manifest| {
                 // Role is authority, not prose. A specialist means zero
                 // delegation even when the duplicate numeric ceiling is
@@ -2298,20 +2580,22 @@ impl<'a> StepCtx<'a> {
         }
     }
 
-    async fn append_effect(&self, key: EffectKey, kind: RecordKind) -> Result<(), StepError> {
+    async fn append_effect(&mut self, key: EffectKey, kind: RecordKind) -> Result<(), StepError> {
         self.store
             .append(self.epoch, vec![self.stamp(kind).effect(key)])
             .await?;
+        self.wrote = true;
         Ok(())
     }
 
-    pub(crate) async fn append(&self, kind: RecordKind) -> Result<(), StepError> {
+    pub(crate) async fn append(&mut self, kind: RecordKind) -> Result<(), StepError> {
         if !self.writes_enabled() {
             return Ok(());
         }
         self.store
             .append(self.epoch, vec![self.stamp(kind)])
             .await?;
+        self.wrote = true;
         Ok(())
     }
 
@@ -2656,14 +2940,11 @@ impl StepCtx<'_> {
     ) -> Result<Tainted<Vec<f32>>, StepError> {
         let plain = text.peek().clone();
         let arguments = text.map(serde_json::Value::String);
-        self.sink(
-            crate::runtime::effects::Embed {
-                embedder,
-                text: plain,
-                arguments: arguments.peek().clone(),
-            },
-            &arguments,
-        )
+        self.sink_with(&arguments, |value| crate::runtime::effects::Embed {
+            embedder,
+            text: plain,
+            arguments: value,
+        })
         .await
     }
 
@@ -2685,18 +2966,18 @@ impl StepCtx<'_> {
             ))
         })?;
         let plain = query.peek().clone();
+        let searched = plain.clone();
         let arguments = query.map(|query| {
             serde_json::to_value(query).expect("SemanticQuery serialization is infallible")
         });
         let hits = self
-            .sink(
+            .sink_with(&arguments, |value| {
                 crate::runtime::effects::SemanticRecall {
                     retriever,
-                    query: plain.clone(),
-                    arguments: arguments.peek().clone(),
-                },
-                &arguments,
-            )
+                    query: searched,
+                    arguments: value,
+                }
+            })
             .await?
             .into_unlabelled();
         let mut out = Vec::with_capacity(hits.len());
@@ -2866,10 +3147,10 @@ impl StepCtx<'_> {
         model: crate::model::ModelId,
     ) -> Result<u64, StepError> {
         // The prompt is **built here**, from the sources, rather than accepted
-        // from the caller. `cx.sink` refuses an effect whose outbound arguments
-        // differ from the labelled value it checked, and a caller passing a
-        // pre-built call would have to reproduce this assembly exactly to get
-        // past that gate — an obligation nobody would meet twice.
+        // from the caller. The sink binds an effect's outbound arguments to the
+        // labelled value it checks, and a caller passing a pre-built call would
+        // have to reproduce this assembly exactly to satisfy that binding — an
+        // obligation nobody would meet twice.
         //
         // Labelled by the join of the sources, so the model call is checked like
         // any other outbound value rather than around it.
@@ -2887,9 +3168,13 @@ impl StepCtx<'_> {
             ),
         ]);
 
-        let call = crate::model::ModelCall::new(provider, model, prompt.peek().clone())
-            .with_max_sensitivity(into.max_sensitivity);
-        let completion = self.sink(call, &prompt).await?;
+        let max_sensitivity = into.max_sensitivity;
+        let completion = self
+            .sink_with(&prompt, |value| {
+                crate::model::ModelCall::new(provider, model, value)
+                    .with_max_sensitivity(max_sensitivity)
+            })
+            .await?;
         let label = completion.label().clone();
         let summary = completion.map(|c| c.structured.unwrap_or(serde_json::Value::String(c.text)));
 
@@ -2946,12 +3231,22 @@ impl StepCtx<'_> {
     /// destination and instruction; the model proposes only stable keys and
     /// content. Every proposal remains labelled from the model and source and
     /// is written through [`remember`](Self::remember).
+    ///
+    /// # It takes the whole role, not a model id
+    ///
+    /// Formation is untrusted contact — the source material derives from
+    /// whatever the run handled — so a manifest that declares a quarantined
+    /// role declares `max_tokens` and `reasoning_effort` beside the model for
+    /// exactly this call. Taking the id alone was how those two ceilings got
+    /// parsed into the digest and then dropped at this seam: a declared
+    /// control the runtime silently did not apply. The role's ceilings now
+    /// ride the formation call itself.
     pub async fn form_memories(
         &mut self,
         formation: crate::memory::Formation,
         source: Tainted<Value>,
         provider: Arc<dyn crate::model::ModelProvider>,
-        model: crate::model::ModelId,
+        role: crate::model::ModelRole,
     ) -> Result<Vec<(String, u64)>, StepError> {
         let source_label = source.label().clone();
         let prompt = Tainted::object([
@@ -2981,11 +3276,16 @@ impl StepCtx<'_> {
             "required": ["memories"],
             "additionalProperties": false
         });
-        let call = crate::model::ModelCall::new(provider, model, prompt.peek().clone())
-            .with_max_sensitivity(formation.max_sensitivity)
-            .with_output_sensitivity(source_label.sensitivity)
-            .expecting(schema);
-        let completion = self.sink(call, &prompt).await?;
+        let completion = self
+            .sink_with(&prompt, |value| {
+                role.applied_to(
+                    crate::model::ModelCall::new(provider, role.model.clone(), value)
+                        .with_max_sensitivity(formation.max_sensitivity)
+                        .with_output_sensitivity(source_label.sensitivity)
+                        .expecting(schema),
+                )
+            })
+            .await?;
         let label = completion.label().join(&source_label);
 
         // The schema above is enforced at the effect boundary, so a well-formed
@@ -3322,8 +3622,17 @@ impl StepCtx<'_> {
         };
 
         // Idempotent by primary key, so a resumed run re-registering the same
-        // obligation is a no-op rather than a duplicate.
-        cx.cases.register_deadline(&deadline).await?;
+        // obligation is a no-op rather than a duplicate — and on Resume that
+        // re-registration is deliberate even for a replayed effect, because it
+        // is what heals a crash between the resolution record and the case
+        // store's row. Strict never writes it, matching `store_blob`: a
+        // verification pass is a pure read, and one that re-registered
+        // obligations would mutate the case layer every time someone ran a
+        // regression check — including re-arming a deadline an operator had
+        // since cancelled.
+        if self.mode != Mode::Strict {
+            cx.cases.register_deadline(&deadline).await?;
+        }
 
         self.append(RecordKind::DeadlineRegistered {
             name,
@@ -3768,6 +4077,35 @@ impl StepCtx<'_> {
     }
 }
 
+/// What a [`StepCtx::sink_with`] closure may hand back: the effect itself, or
+/// a refusal to build one.
+///
+/// Two implementations and no third: an effect whose construction cannot fail
+/// is returned bare, and one whose construction can — `ToolCall::prepare`,
+/// which refuses a tool the catalogue does not hold — returns the `Result` it
+/// already produces. Without this the infallible majority would write `Ok(..)`
+/// at every call site to satisfy the fallible minority.
+pub trait BuildsEffect<E: Effect> {
+    /// The effect, or the error that stops the step instead.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the construction refused with, converted to a [`StepError`].
+    fn into_effect(self) -> Result<E, StepError>;
+}
+
+impl<E: Effect> BuildsEffect<E> for E {
+    fn into_effect(self) -> Result<E, StepError> {
+        Ok(self)
+    }
+}
+
+impl<T: Effect, Er: Into<StepError>> BuildsEffect<T> for Result<T, Er> {
+    fn into_effect(self) -> Result<T, StepError> {
+        self.map_err(Into::into)
+    }
+}
+
 /// Fold a delegation chain into a policy context object.
 ///
 /// Merged rather than nested under a key so a rule reads `context.owner` and
@@ -3888,6 +4226,12 @@ impl Effect for Commission {
     /// Another agent's answer is somebody else's data.
     fn trust(&self) -> crate::core::Trust {
         crate::core::Trust::Untrusted
+    }
+
+    /// Which agent answered, so a source rule can name the specialist rather
+    /// than the act of delegating.
+    fn source(&self) -> crate::core::SourceId {
+        crate::core::SourceId::new(format!("agent/{}", self.capability))
     }
 
     /// Handing work to another agent **is** delegation, and the depth ceiling

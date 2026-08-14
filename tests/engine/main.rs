@@ -21,5 +21,6 @@ mod durability;
 mod faults;
 mod reconciliation;
 mod recovery;
+mod resume_gates;
 mod retries;
 mod simulation;

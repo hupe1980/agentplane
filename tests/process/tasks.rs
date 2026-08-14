@@ -1029,11 +1029,14 @@ spec:
       mutates: true
       description: Move funds between accounts.
       requires_approval: true
-      # The model may choose these, within a ceiling. Declaring them is what
-      # lifts the blanket refusal a mutating tool otherwise applies to untrusted
-      # arguments — and the human gate below is a second, independent control.
+      # The model may author these, and the file says so out loud: the source
+      # rule names the privileged model as the one place the recipient may
+      # come from, which is the reviewed decision that lifts the blanket
+      # refusal a mutating tool otherwise applies to untrusted arguments —
+      # and the human gate above is a second, independent control.
       protected_fields:
         - path: /recipient
+          allowed_sources: [model:fake/m-1]
           max_sensitivity: internal
         - path: /amount
           max_sensitivity: internal
@@ -1241,6 +1244,7 @@ spec:
       mutates: true
       protected_fields:
         - path: /amount
+          allowed_sources: [model:fake/m-1]
           max_sensitivity: internal
   budgets: {}
 "#,

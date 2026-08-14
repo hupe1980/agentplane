@@ -1205,11 +1205,12 @@ async fn a_sweep_whose_evidence_fails_to_write_is_flagged_not_silent() {
         .await
         .unwrap();
 
-    // The case store still works — the breach happens — but the sweep's own
-    // `Swept` evidence append fails.
+    // The notes land and the breach is applied — but the sweep's own record
+    // cannot be *closed*: the `RunSealed` append fails, so the decisions sit
+    // in an open run no checkpoint will ever commit to.
     let journal: Arc<dyn JournalStore> = Arc::new(Faulty::new(
         Arc::clone(&inner) as Arc<dyn JournalStore>,
-        Schedule::healthy().on_kind("Swept", Fault::FailedClean),
+        Schedule::healthy().on_kind("RunSealed", Fault::FailedClean),
     ));
     let rt = Runtime::builder(journal).cases(Arc::clone(&cases)).build();
 
@@ -1220,7 +1221,7 @@ async fn a_sweep_whose_evidence_fails_to_write_is_flagged_not_silent() {
     assert_eq!(report.breached, 1, "the breach must still have happened");
     assert!(
         report.record.is_none(),
-        "no sealed run exists when its append failed"
+        "no sealed run exists when its closure failed"
     );
     assert!(
         report.evidence_lost,
@@ -1230,6 +1231,80 @@ async fn a_sweep_whose_evidence_fails_to_write_is_flagged_not_silent() {
         report.needs_attention(),
         "a lost sweep record must demand attention"
     );
+}
+
+/// **A decision that cannot be recorded is not applied.**
+///
+/// I2, aimed at the sweeper itself: the note announcing a breach is durable
+/// *before* the deadline state moves. The old order — apply, then buffer the
+/// note for the tick's end — orphaned the decision permanently on a crash in
+/// between, because the transition is idempotent and the next tick found it
+/// already applied and re-decided nothing. Written first, the failure mode
+/// inverts: the obligation stays `Pending`, and the next tick breaches it
+/// *with* its record.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_sweep_decision_that_cannot_be_recorded_is_not_applied() {
+    use agentplane::core::{Deadline, DeadlineState};
+    use agentplane::testkit::{Fault, Faulty, Schedule};
+
+    let inner = Arc::new(RedbStore::open_in_memory().unwrap());
+    let cases = Arc::clone(&inner) as Arc<dyn CaseStore>;
+    let now = Timestamp::from_unix_timestamp(1_800_000_000).unwrap();
+
+    let case = cases
+        .correlate_or_open("matter", &[key("matter", "M-89")], now)
+        .await
+        .unwrap()
+        .case_id();
+    cases
+        .register_deadline(&Deadline {
+            case,
+            name: "respond-by".to_owned(),
+            resolved_at: now - std::time::Duration::from_secs(3600),
+            calendar_digest: Digest::of(b"test-calendar"),
+            warn_at: None,
+            state: DeadlineState::Pending,
+        })
+        .await
+        .unwrap();
+
+    // The sweep's `Swept` note cannot be written, so the breach must not be.
+    let journal: Arc<dyn JournalStore> = Arc::new(Faulty::new(
+        Arc::clone(&inner) as Arc<dyn JournalStore>,
+        Schedule::healthy().on_kind("Swept", Fault::FailedClean),
+    ));
+    let rt = Runtime::builder(journal).cases(Arc::clone(&cases)).build();
+
+    rt.sweep(now, std::time::Duration::from_mins(5))
+        .await
+        .expect_err("a decision whose record cannot be written fails the tick loudly");
+
+    let standing = cases
+        .deadlines(case)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.name == "respond-by")
+        .expect("the obligation still exists");
+    assert_eq!(
+        standing.state,
+        DeadlineState::Pending,
+        "the breach was applied without its record — announce-before-act \
+         inverted, and a crash here orphans the decision forever"
+    );
+
+    // The store heals — modelled as a plane over the un-faulted backend — and
+    // the next tick breaches the obligation *with* its record.
+    let healed = Runtime::builder(Arc::clone(&inner) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&cases))
+        .build();
+    let report = healed
+        .sweep(now, std::time::Duration::from_mins(5))
+        .await
+        .unwrap();
+    assert_eq!(report.breached, 1);
+    assert!(report.record.is_some(), "the breach carries its evidence");
 }
 
 /// Evidence already earned survives a later phase's error.
@@ -1584,4 +1659,183 @@ async fn case_of_reads_the_binding_off_the_run() {
         .await
         .unwrap();
     assert_eq!(rt.case_of(lone.run_id).await.expect("readable"), None);
+}
+
+// ── Strict verification writes nothing to the case layer ────────────────────
+
+/// A case store that counts obligation registrations and delegates the rest.
+#[derive(Debug)]
+struct CountsRegistrations {
+    inner: Arc<dyn CaseStore>,
+    registered: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl CaseStore for CountsRegistrations {
+    async fn correlate(
+        &self,
+        keys: &[CorrelationKey],
+    ) -> Result<Option<agentplane::core::CaseId>, agentplane::core::StoreError> {
+        self.inner.correlate(keys).await
+    }
+    async fn correlate_or_open(
+        &self,
+        kind: &str,
+        keys: &[CorrelationKey],
+        at: Timestamp,
+    ) -> Result<Correlation, agentplane::core::StoreError> {
+        self.inner.correlate_or_open(kind, keys, at).await
+    }
+    async fn case(
+        &self,
+        id: agentplane::core::CaseId,
+    ) -> Result<Option<agentplane::core::Case>, agentplane::core::StoreError> {
+        self.inner.case(id).await
+    }
+    async fn cases(
+        &self,
+        after: Option<agentplane::core::CaseId>,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Case>, agentplane::core::StoreError> {
+        self.inner.cases(after, limit).await
+    }
+    async fn import_case(
+        &self,
+        case: &agentplane::core::Case,
+        deadlines: &[agentplane::core::Deadline],
+        blobs: &[Digest],
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.import_case(case, deadlines, blobs).await
+    }
+    async fn attach_run(
+        &self,
+        case: agentplane::core::CaseId,
+        run: agentplane::core::RunId,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.attach_run(case, run).await
+    }
+    async fn link_blob(
+        &self,
+        case: agentplane::core::CaseId,
+        digest: Digest,
+        at: Timestamp,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.link_blob(case, digest, at).await
+    }
+    async fn blobs_of(
+        &self,
+        case: agentplane::core::CaseId,
+    ) -> Result<Vec<Digest>, agentplane::core::StoreError> {
+        self.inner.blobs_of(case).await
+    }
+    async fn put_state(
+        &self,
+        case: agentplane::core::CaseId,
+        expected: agentplane::core::CaseVersion,
+        state: Value,
+    ) -> Result<agentplane::core::CaseVersion, agentplane::core::StoreError> {
+        self.inner.put_state(case, expected, state).await
+    }
+    async fn set_status(
+        &self,
+        case: agentplane::core::CaseId,
+        status: agentplane::core::CaseStatus,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.set_status(case, status).await
+    }
+    async fn close(
+        &self,
+        case: agentplane::core::CaseId,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.close(case).await
+    }
+    async fn register_deadline(
+        &self,
+        deadline: &agentplane::core::Deadline,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.registered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.register_deadline(deadline).await
+    }
+    async fn deadlines(
+        &self,
+        case: agentplane::core::CaseId,
+    ) -> Result<Vec<agentplane::core::Deadline>, agentplane::core::StoreError> {
+        self.inner.deadlines(case).await
+    }
+    async fn set_deadline_state(
+        &self,
+        case: agentplane::core::CaseId,
+        name: &str,
+        state: agentplane::core::DeadlineState,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.set_deadline_state(case, name, state).await
+    }
+    async fn due(
+        &self,
+        now: Timestamp,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Deadline>, agentplane::core::StoreError> {
+        self.inner.due(now, limit).await
+    }
+    async fn by_status(
+        &self,
+        status: agentplane::core::CaseStatus,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Case>, agentplane::core::StoreError> {
+        self.inner.by_status(status, limit).await
+    }
+    async fn census(
+        &self,
+        now: Timestamp,
+    ) -> Result<agentplane::case::CaseCensus, agentplane::core::StoreError> {
+        self.inner.census(now).await
+    }
+}
+
+/// Strict replay does not re-register a run's obligations.
+///
+/// Verification is a pure read — `store_blob` and the memory paths already
+/// honour that — but `deadline` re-registered unconditionally, so every
+/// regression check of a recorded run wrote to the case layer it was supposed
+/// to be observing. Idempotence hid most of it; what it could not hide is the
+/// principle, and the day the registration is *not* idempotent against the
+/// case's current state (a cancelled obligation, a migrated row), a
+/// verification pass becomes the thing that re-arms it.
+#[tokio::test]
+async fn strict_replay_does_not_re_register_an_obligation() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cases: Arc<dyn CaseStore> = Arc::new(CountsRegistrations {
+        inner: store.clone() as Arc<dyn CaseStore>,
+        registered: Arc::clone(&registered),
+    });
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(cases)
+        .skill(Obliges {
+            name: "respond-by",
+            spec: DeadlineSpec::days(5),
+            meet: true,
+        })
+        .build();
+
+    let out = rt
+        .run_correlated(
+            "obliges",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("document", "D-strict")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded);
+    assert_eq!(registered.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let replayed = rt.replay(out.run_id, Mode::Strict).await.unwrap();
+    assert_eq!(replayed.status, RunStatus::Succeeded);
+    assert_eq!(
+        registered.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "strict verification wrote to the case layer it was observing"
+    );
 }

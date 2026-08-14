@@ -49,6 +49,13 @@ pub struct AgentRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillDescriptor {
     pub name: String,
+    /// The capabilities declared with [`provides`](Self::provides).
+    ///
+    /// Empty means **the skill's name is the capability** — see
+    /// [`capabilities`](Self::capabilities), which is what the runtime reads.
+    /// The name/capability split earns its keep in a plan graph, where one
+    /// skill answers an abstract capability another agent names; a hello-world
+    /// program should not have to invent two names for one thing.
     pub provides: Vec<Capability>,
 }
 
@@ -64,6 +71,20 @@ impl SkillDescriptor {
     pub fn provides(mut self, cap: impl Into<Capability>) -> Self {
         self.provides.push(cap.into());
         self
+    }
+
+    /// The capabilities this skill answers: what it declared, or its own name.
+    ///
+    /// Never empty. Declaring a capability **replaces** the name default
+    /// rather than adding to it, so a skill that provides `demo.greet` is not
+    /// also silently reachable as `greet` — one declared surface, not two.
+    #[must_use]
+    pub fn capabilities(&self) -> Vec<Capability> {
+        if self.provides.is_empty() {
+            vec![Capability::new(&self.name)]
+        } else {
+            self.provides.clone()
+        }
     }
 }
 

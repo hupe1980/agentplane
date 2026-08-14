@@ -777,6 +777,145 @@ async fn untrusted_data_from_an_allowed_source_may_select_a_protected_argument()
     assert_eq!(client.calls.lock().unwrap().as_slice(), ["ledger/transfer"]);
 }
 
+/// Reads a value through one tool, then pays through another, carrying the
+/// lookup's own label onto the transfer's `/recipient`.
+///
+/// The harness for the per-tool provenance tests below: which tool is read is
+/// the parameter, because the property under test is that the *rule* can tell
+/// two granted tools apart.
+#[derive(Debug)]
+struct LooksUpThenPays {
+    catalog: ToolCatalog,
+    client: Arc<Fake>,
+    lookup: ToolId,
+}
+
+#[async_trait::async_trait]
+impl Skill for LooksUpThenPays {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("pays")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let query = Tainted::trusted(json!({ "customer": "C-1" }));
+        let read = ToolCall::prepare(
+            &self.catalog,
+            Arc::clone(&self.client) as Arc<dyn ToolClient>,
+            self.lookup.clone(),
+            query.peek().clone(),
+        )
+        .map_err(|error| SkillError::Other(error.to_string()))?;
+        let looked_up = cx.sink(read, &query).await?;
+
+        // The recipient carries the lookup result's label — which tool
+        // answered is now in its provenance, and the transfer's source rule
+        // judges exactly that.
+        let recipient = Tainted::with_label(json!("AC-1"), looked_up.label().clone());
+        let arguments = Tainted::object([
+            ("recipient".to_owned(), recipient),
+            ("amount".to_owned(), Tainted::trusted(json!(10))),
+        ]);
+        let call = ToolCall::prepare(
+            &self.catalog,
+            Arc::clone(&self.client) as Arc<dyn ToolClient>,
+            transfer(),
+            arguments.peek().clone(),
+        )
+        .map_err(|error| SkillError::Other(error.to_string()))?;
+        Ok(Outcome::done(cx.sink(call, &arguments).await?))
+    }
+}
+
+/// The catalogue the per-tool provenance tests share: two read-only lookups,
+/// and a transfer whose `/recipient` must come from the source `rule` names.
+fn per_tool_catalog(rule: ProtectedField) -> ToolCatalog {
+    ToolCatalog::new()
+        .allow(ToolId::new("crm", "lookup"), ToolSafety::read_only())
+        .allow(ToolId::new("tickets", "search"), ToolSafety::read_only())
+        .allow(
+            transfer(),
+            ToolSafety::default()
+                .max_sensitivity(Sensitivity::Secret)
+                .protect(rule),
+        )
+}
+
+async fn pay_via(lookup: ToolId, rule: ProtectedField) -> (RunStatus, Vec<String>) {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::new(vec![
+        Ok(json!({ "result": "fine" })),
+        Ok(json!({ "account": "AC-1" })),
+    ]);
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(LooksUpThenPays {
+            catalog: per_tool_catalog(rule),
+            client: Arc::clone(&client),
+            lookup,
+        })
+        .build()
+        .run("pays", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    let calls = client.calls.lock().unwrap().clone();
+    (out.status, calls)
+}
+
+/// A source rule can name **which tool**, not merely "a tool".
+///
+/// Every effect result used to be labelled by its family — `effect:tool.call`
+/// — so a rule saying "the recipient must come from the CRM lookup" was
+/// unsatisfiable strictly and satisfiable loosely by whichever granted tool an
+/// injected prompt reached first. The label now carries the tool's own
+/// reference, so the rule admits exactly the tool it names.
+#[tokio::test]
+async fn a_source_rule_names_the_tool_and_admits_exactly_it() {
+    let rule = || ProtectedField::from_sources("/recipient", [SourceId::new("tool://crm/lookup")]);
+
+    // Data from the named tool passes.
+    let (status, calls) = pay_via(ToolId::new("crm", "lookup"), rule()).await;
+    assert!(
+        matches!(status, RunStatus::Succeeded),
+        "data from the tool the rule names was refused: {status:?}"
+    );
+    assert_eq!(calls, ["crm/lookup", "ledger/transfer"]);
+
+    // Data from another *granted* tool is refused: the grant is authority to
+    // call it, not authority for its answers to steer a protected field.
+    let (status, calls) = pay_via(ToolId::new("tickets", "search"), rule()).await;
+    assert!(
+        matches!(status, RunStatus::Failed(_)),
+        "another granted tool's data reached a field whose rule names the CRM: {status:?}"
+    );
+    assert_eq!(
+        calls,
+        ["tickets/search"],
+        "the transfer must never have dispatched"
+    );
+}
+
+/// The family-level spelling is dead, and loudly so.
+///
+/// A deployment still writing `effect:tool.call` has a rule that matches no
+/// label this runtime produces — which must refuse, not quietly admit, because
+/// a rule that means nothing and permits everything is the worse failure.
+#[tokio::test]
+async fn the_kind_level_source_spelling_no_longer_matches() {
+    let (status, calls) = pay_via(
+        ToolId::new("crm", "lookup"),
+        ProtectedField::from_sources("/recipient", [SourceId::new("effect:tool.call")]),
+    )
+    .await;
+    assert!(
+        matches!(status, RunStatus::Failed(_)),
+        "the retired family-level source string still matched: {status:?}"
+    );
+    assert_eq!(calls, ["crm/lookup"]);
+}
+
 #[tokio::test]
 async fn a_protected_tool_argument_honours_its_own_sensitivity_ceiling() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
@@ -961,14 +1100,29 @@ fn a_typed_tool_cannot_silently_replace_itself() {
     let _ = ToolBox::new().with::<ReadBalance>().with::<ReadBalance>();
 }
 
-/// `server__tool` stays readable and injective even when either component
-/// contains the separator.
+/// `server__tool` stays readable and injective: underscores pass through,
+/// dots render as hyphens, and no two ids share a wire name.
 #[test]
 fn two_tools_cannot_collapse_to_one_model_name() {
     use agentplane::tools::{ToolCatalog, ToolId, ToolSafety};
 
-    let first = ToolId::new("ledger__archive", "read");
-    let second = ToolId::new("ledger", "archive__read");
+    // The motivating spellings: an underscored tool keeps its underscores,
+    // and a dotted capability reads as itself with hyphens.
+    assert_eq!(
+        ToolId::new("svc", "get_gas").wire_name(),
+        "svc__get_gas",
+        "an ordinary underscored name must survive unescaped"
+    );
+    assert_eq!(
+        ToolId::new("agent", "blog.research").wire_name(),
+        "agent__blog-research",
+        "a dotted capability must read as itself, dot rendered as hyphen"
+    );
+
+    // Injective across the dot rendering: the `__` separator is the only
+    // place a wire name holds two underscores, so the boundary is unambiguous.
+    let first = ToolId::new("a.b", "c");
+    let second = ToolId::new("a", "b.c");
     assert_ne!(first.wire_name(), second.wire_name());
 
     let catalog = ToolCatalog::new()
@@ -976,6 +1130,26 @@ fn two_tools_cannot_collapse_to_one_model_name() {
         .allow(second.clone(), ToolSafety::default());
     assert_eq!(catalog.resolve(&first.wire_name()), Some(first));
     assert_eq!(catalog.resolve(&second.wire_name()), Some(second));
+}
+
+/// A component the wire rendering cannot carry unambiguously is refused where
+/// the tool is declared — not resolved by luck at dispatch.
+#[test]
+#[should_panic(expected = "cannot be rendered as a wire name")]
+fn a_component_containing_the_separator_is_refused_at_declaration() {
+    use agentplane::tools::{ToolCatalog, ToolId, ToolSafety};
+    let _ = ToolCatalog::new().allow(
+        ToolId::new("ledger", "archive__read"),
+        ToolSafety::default(),
+    );
+}
+
+/// A literal hyphen would collide with the rendered dot, so it is refused too.
+#[test]
+#[should_panic(expected = "cannot be rendered as a wire name")]
+fn a_component_containing_a_hyphen_is_refused_at_declaration() {
+    use agentplane::tools::{ToolCatalog, ToolId, ToolSafety};
+    let _ = ToolCatalog::new().allow(ToolId::new("ledger", "archive-read"), ToolSafety::default());
 }
 
 /// Code and the reviewed declaration must agree, in both directions.
@@ -1916,6 +2090,127 @@ async fn an_in_doubt_tool_call_does_not_become_a_chat_message() {
         1,
         "the model was asked again after an in-doubt outcome"
     );
+}
+
+// ── The declared output shape binds the loop ────────────────────────────────
+//
+// `spec.output.schema` was applied to `completion` and `planned` and never to
+// `tool-calling`: the loop's model calls carried no schema, so the provider
+// was never constrained, the boundary never validated, and the settled answer
+// was whatever the model felt like — while triage rules were being typed
+// against the schema at parse. A declared control the runtime did not apply,
+// on the execution kind that most needs it (I12).
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+const SHAPED_TELLER: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities: { provides: [ledger.ask] }
+  identity: { role: A teller. }
+  security: { max_sensitivity_egress: internal }
+  models:
+    privileged: { provider: fake, model: teller-1 }
+  tools:
+    - ref: tool://ledger/read
+      mutates: false
+      max_sensitivity: internal
+      description: Read a balance.
+  output:
+    schema:
+      type: object
+      properties:
+        balance: { type: number }
+      required: [balance]
+      additionalProperties: false
+  execution: { kind: tool-calling, max_turns: 3 }
+  budgets: {}
+"#;
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+async fn run_shaped_teller(
+    provider: &Arc<agentplane::testkit::FakeProvider>,
+) -> agentplane::runtime::RunOutcome {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::tools::ToolBox;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let manifest = Manifest::parse(SHAPED_TELLER).expect("parse");
+    Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .provider(
+            "fake",
+            Arc::clone(provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .toolbox(ToolBox::new().with::<ReadBalance>())
+        .build()
+        .run("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .await
+        .expect("the run completes")
+}
+
+/// An answer that defies the declared shape fails the run rather than settling.
+///
+/// The schema is in the digest, triage rules are typed against it at parse,
+/// and a consumer pins a version to get exactly this shape — so an answer
+/// outside it settling as `Succeeded` is the contract everyone reviewed being
+/// the one thing nobody enforced.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_tool_calling_answer_outside_the_declared_shape_fails_the_run() {
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_structure(json!({ "verdict": "fine" }));
+
+    let out = run_shaped_teller(&provider).await;
+    assert!(
+        matches!(&out.status, RunStatus::Failed(m) if m.contains("does not satisfy")),
+        "a non-conforming answer settled instead of failing: {:?}",
+        out.status
+    );
+}
+
+/// A conforming answer settles, and the schema rides on **every** turn —
+/// including the one that asks for a tool, which it must not break.
+///
+/// The positive half, without which the test above would pass for a loop that
+/// refused everything. Which turn answers is the model's choice, so the schema
+/// is attached to each call and asserted on each recorded ask; the tool-call
+/// turn is exempted from validation by the boundary (choosing a tool is a
+/// legitimate answer to a schema-bearing request), which is what lets the
+/// mid-loop turn carry it unharmed.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_conforming_tool_calling_answer_settles_and_every_turn_carries_the_schema() {
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_call_tool("call_1", "ledger__read", json!({ "account": "AC-1" }));
+    provider.will_structure(json!({ "balance": 42 }));
+
+    let out = run_shaped_teller(&provider).await;
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "a conforming answer must settle: {:?}",
+        out.status
+    );
+    assert_eq!(
+        out.output.as_ref().expect("an answer").peek(),
+        &json!({ "balance": 42 })
+    );
+
+    let asked = provider.asked();
+    assert_eq!(asked.len(), 2, "one tool turn, one answering turn");
+    for (turn, ask) in asked.iter().enumerate() {
+        let schema = ask
+            .schema
+            .as_ref()
+            .unwrap_or_else(|| panic!("turn {turn} was not constrained to the declared shape"));
+        assert!(
+            schema["properties"]["balance"].is_object(),
+            "turn {turn} carries a different schema: {schema}"
+        );
+    }
+    assert!(provider.script_exhausted());
 }
 
 /// A plane may grant typed tools and a remote server's tools to one agent.

@@ -317,9 +317,23 @@ pub enum PeerError {
     #[error("'{peer}' refused the request: {detail}")]
     Refused { peer: PeerId, detail: String },
 
-    /// Sent, and the outcome is unknown.
+    /// Sent, and no answer came within the deadline.
+    ///
+    /// Only for actual timeouts. Everything else that leaves the outcome
+    /// unknown — an answered fault, an unreadable response, a connection that
+    /// died mid-flight — is [`InDoubt`](Self::InDoubt), because "did not
+    /// answer in time" is a false diagnosis of a peer that answered HTTP 500
+    /// promptly, and a false diagnosis is what an operator debugs first.
     #[error("'{peer}' did not answer in time: {detail}")]
     TimedOut { peer: PeerId, detail: String },
+
+    /// The request may have reached the peer, and the outcome is unknown.
+    ///
+    /// The in-doubt bucket stated honestly: an HTTP 5xx, a JSON-RPC internal
+    /// error, a response that could not be read, a request that failed
+    /// mid-flight. Each says the peer may have acted; none says it was slow.
+    #[error("the outcome at '{peer}' is unknown: {detail}")]
+    InDoubt { peer: PeerId, detail: String },
 
     /// Sent, but the peer's response did not conform to the negotiated protocol.
     ///
@@ -345,7 +359,9 @@ impl PeerError {
             | Self::WrongAudience { .. }
             | Self::Unreachable { .. }
             | Self::Refused { .. } => Disposition::DidNotHappen,
-            Self::TimedOut { .. } | Self::InvalidResponse { .. } => Disposition::InDoubt,
+            Self::TimedOut { .. } | Self::InDoubt { .. } | Self::InvalidResponse { .. } => {
+                Disposition::InDoubt
+            }
             Self::Failed { .. } => Disposition::Landed,
         }
     }

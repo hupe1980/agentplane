@@ -587,6 +587,52 @@ impl ModelError {
     }
 }
 
+/// One model role, as a declaration resolves it: which model, and the
+/// ceilings the reviewer put beside it.
+///
+/// A manifest declares `max_tokens` and `reasoning_effort` **per role**
+/// because the model is only half the decision — the role that reads hostile
+/// content is the one whose output most needs a ceiling somebody reviewed.
+/// Passing the id alone is how those two fields get parsed into the digest and
+/// then dropped, so the runtime's seams carry the whole role and
+/// [`applied_to`](Self::applied_to) puts it on a call in one motion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRole {
+    pub model: ModelId,
+    /// Cap on generated tokens, when the declaration set one.
+    pub max_output_tokens: Option<u32>,
+    /// Requested reasoning depth, when the declaration set one.
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl ModelRole {
+    /// A role with no declared ceilings — the driver defaults apply.
+    #[must_use]
+    pub fn new(model: ModelId) -> Self {
+        Self {
+            model,
+            max_output_tokens: None,
+            reasoning_effort: None,
+        }
+    }
+
+    /// Put this role's declared ceilings on a call.
+    ///
+    /// The model itself is *not* applied here — a [`ModelCall`] is constructed
+    /// with its model, so applying it afterwards would be a second place the
+    /// choice is made.
+    #[must_use]
+    pub fn applied_to(&self, mut call: ModelCall) -> ModelCall {
+        if let Some(max_output_tokens) = self.max_output_tokens {
+            call = call.with_max_output_tokens(max_output_tokens);
+        }
+        if let Some(effort) = self.reasoning_effort {
+            call = call.with_reasoning_effort(effort);
+        }
+        call
+    }
+}
+
 /// One request to a provider.
 ///
 /// A struct rather than a widening argument list, because what a model call
@@ -999,16 +1045,42 @@ impl ModelCall {
     ///
     /// The control that matters for a hosted model: a prompt assembled from a
     /// secret is an exfiltration whether or not anyone meant it.
+    ///
+    /// It is also the **floor of the completion's own label** — see
+    /// [`with_output_sensitivity`](Self::with_output_sensitivity) for why the
+    /// two are one decision.
     #[must_use]
     pub const fn with_max_sensitivity(mut self, s: Sensitivity) -> Self {
         self.max_sensitivity = s;
         self
     }
 
+    /// Declare the completion's sensitivity floor, above the derived one.
+    ///
+    /// The derived floor is [`max_sensitivity`](Self::with_max_sensitivity),
+    /// always: a caller who raised the egress ceiling to show the model a
+    /// confidential prompt has told the runtime what class of data the answer
+    /// was derived from, and a completion labelled below its own prompt is a
+    /// laundering primitive — ask the model to restate the secret and read it
+    /// back a level down. So this setter can only *raise* the floor; a value
+    /// below the ceiling is kept and simply loses to it at
+    /// [`Effect::output_sensitivity`], where the two are joined in one place
+    /// rather than at every call site that used to compensate by hand.
     #[must_use]
     pub const fn with_output_sensitivity(mut self, s: Sensitivity) -> Self {
         self.output_sensitivity = s;
         self
+    }
+
+    /// The one floor both the terminal completion and the live stream carry:
+    /// the declared output sensitivity, never below the egress ceiling the
+    /// prompt was shown under.
+    ///
+    /// One function on purpose — the stream label computed its own copy once,
+    /// and a second implementation of a floor is the pair that drifts at the
+    /// boundary nobody probed.
+    fn declared_output_floor(&self) -> Sensitivity {
+        self.output_sensitivity.max(self.max_sensitivity)
     }
 
     #[must_use]
@@ -1145,8 +1217,16 @@ impl Effect for ModelCall {
         self.max_sensitivity
     }
 
+    /// Never below [`max_sensitivity`](Effect::max_sensitivity).
+    ///
+    /// A sink's result inherits the class of what was sent into it: a caller
+    /// who raised the egress ceiling to get a confidential prompt out has
+    /// declared what the answer derives from, and returning that answer at a
+    /// lower label would make one round trip through a model a release nobody
+    /// authorized. `with_output_sensitivity` still raises the floor further;
+    /// nothing lowers it below the ceiling.
     fn output_sensitivity(&self) -> Sensitivity {
-        self.output_sensitivity
+        self.declared_output_floor()
     }
 
     fn sink_arguments(&self) -> Option<&Value> {
@@ -1160,6 +1240,13 @@ impl Effect for ModelCall {
     /// the canonical prompt-injection carrier.
     fn trust(&self) -> Trust {
         Trust::Untrusted
+    }
+
+    /// Which model answered — `model:{provider}/{model}` — the same spelling
+    /// the live stream label has always carried, now derived in one place so
+    /// the terminal completion and the stream cannot name one answer two ways.
+    fn source(&self) -> crate::core::SourceId {
+        crate::core::SourceId::new(format!("model:{}", self.model))
     }
 
     fn spend(&self, output: &Completion) -> Spend {
@@ -1180,11 +1267,17 @@ impl Effect for ModelCall {
         refuse_provider_side_media(&prompt, &self.model)
             .map_err(|error| EffectError::Rejected(error.to_string()))?;
 
-        let mut stream_label = crate::core::Label::untrusted(crate::core::SourceId::new(format!(
-            "model:{}",
-            self.model
-        )));
-        stream_label.sensitivity = self.output_sensitivity;
+        // The same identity the terminal completion is labelled with, from the
+        // same derivation — `Effect::source` — so the two spellings cannot
+        // drift apart.
+        let mut stream_label = crate::core::Label::untrusted(Effect::source(self));
+        // Raised, never assigned: the untrusted label already carries the
+        // `Internal` floor every model answer has, and the terminal completion
+        // is floored the same way at the effect boundary. A plain `=` here
+        // once *lowered* the stream below that — the same bytes left the
+        // plane twice, once labelled and once laundered, differing only in
+        // whether the caller read them live.
+        stream_label.sensitivity = stream_label.sensitivity.max(self.declared_output_floor());
         let answered = self
             .provider
             .complete(Request {
@@ -1456,6 +1549,118 @@ mod tests {
         assert_eq!(
             Effect::retry(&insistent).max_attempts,
             RetryPolicy::default().max_attempts
+        );
+    }
+
+    /// A completion's floor derives from its egress ceiling.
+    ///
+    /// A caller who raised `max_sensitivity` to show the model a confidential
+    /// prompt has said what the answer derives from; a completion labelled
+    /// below that is a laundering primitive — ask the model to restate the
+    /// secret and read it back a level down. Every direction is asserted:
+    /// the derived default, an explicit value below the ceiling losing to it,
+    /// and an explicit value above it still raising the floor.
+    #[test]
+    fn a_completions_floor_derives_from_its_egress_ceiling() {
+        let provider = || -> Arc<dyn ModelProvider> {
+            Arc::new(RecordingProvider(Arc::new(AtomicUsize::new(0))))
+        };
+        let call = |p| ModelCall::new(p, ModelId::new("custom", "m"), json!({"q": "hi"}));
+
+        let derived = call(provider()).with_max_sensitivity(Sensitivity::Confidential);
+        assert_eq!(
+            Effect::output_sensitivity(&derived),
+            Sensitivity::Confidential,
+            "raising the egress ceiling without setting an output sensitivity \
+             must floor the completion at the ceiling"
+        );
+
+        let lowered = call(provider())
+            .with_max_sensitivity(Sensitivity::Confidential)
+            .with_output_sensitivity(Sensitivity::Public);
+        assert_eq!(
+            Effect::output_sensitivity(&lowered),
+            Sensitivity::Confidential,
+            "an explicit output sensitivity below the ceiling must lose to it"
+        );
+
+        let raised = call(provider())
+            .with_max_sensitivity(Sensitivity::Internal)
+            .with_output_sensitivity(Sensitivity::Secret);
+        assert_eq!(
+            Effect::output_sensitivity(&raised),
+            Sensitivity::Secret,
+            "an explicit output sensitivity above the ceiling still raises the floor"
+        );
+    }
+
+    /// Captures the label the runtime hands a driver for live stream delivery.
+    #[derive(Debug, Default)]
+    struct StreamLabelProbe(std::sync::Mutex<Option<crate::core::Label>>);
+
+    #[async_trait]
+    impl ModelProvider for StreamLabelProbe {
+        async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
+            *self.0.lock().unwrap() = request.stream.map(|(_, label)| label.clone());
+            Ok(Completion {
+                text: "ok".to_owned(),
+                tool_calls: Vec::new(),
+                usage: Usage::default(),
+                stop_reason: Some("end_turn".to_owned()),
+                truncated: false,
+                structured: None,
+                continuation: None,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropsEvents;
+    impl ModelStreamObserver for DropsEvents {
+        fn event(&self, _event: crate::core::Tainted<ModelStreamEvent>) {}
+    }
+
+    /// Stream delivery never carries less than the terminal completion's floor.
+    ///
+    /// The terminal answer is floored at the effect boundary — untrusted, so
+    /// `Internal` at least, raised to the declared output sensitivity. The
+    /// stream label used to be *assigned* from the declared value instead,
+    /// so the same bytes left the plane twice: once labelled, once lowered to
+    /// the `Public` default, differing only in whether the caller read them
+    /// live.
+    #[tokio::test]
+    async fn a_stream_label_never_dips_below_the_terminal_floor() {
+        let probe = Arc::new(StreamLabelProbe::default());
+        let call = ModelCall::new(
+            Arc::clone(&probe) as Arc<dyn ModelProvider>,
+            ModelId::new("custom", "m"),
+            json!({"q": "hi"}),
+        )
+        .streaming_to(Arc::new(DropsEvents));
+        call.perform().await.expect("completes");
+        let label = probe.0.lock().unwrap().clone().expect("a stream label");
+        assert_eq!(
+            label.sensitivity,
+            Sensitivity::Internal,
+            "with nothing declared, stream delivery dipped below the Internal \
+             floor every untrusted completion carries"
+        );
+
+        let probe = Arc::new(StreamLabelProbe::default());
+        let call = ModelCall::new(
+            Arc::clone(&probe) as Arc<dyn ModelProvider>,
+            ModelId::new("custom", "m"),
+            json!({"q": "hi"}),
+        )
+        .with_max_sensitivity(Sensitivity::Confidential)
+        .streaming_to(Arc::new(DropsEvents));
+        call.perform().await.expect("completes");
+        let label = probe.0.lock().unwrap().clone().expect("a stream label");
+        assert_eq!(
+            label.sensitivity,
+            Sensitivity::Confidential,
+            "stream delivery must carry the ceiling-derived floor the terminal \
+             completion carries"
         );
     }
 

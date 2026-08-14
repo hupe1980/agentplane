@@ -253,6 +253,17 @@ impl StepCursor {
         self.pos >= self.effects.len()
     }
 
+    /// The first journaled effect nothing has consumed, if any.
+    ///
+    /// The strict verifier's witness: a build that performs *fewer* effects
+    /// than the record leaves this non-empty at the end, and the finding must
+    /// name the key rather than merely count — an operator hunting a missing
+    /// effect needs to know which one went missing.
+    #[must_use]
+    pub fn first_unconsumed(&self) -> Option<EffectKey> {
+        self.effects.get(self.pos).map(|(k, _, _)| *k)
+    }
+
     /// Whether the next journaled effect is `key`, without consuming it.
     ///
     /// Used to ask history a question it is the only authority on: after a
@@ -328,17 +339,6 @@ impl ReplayCursor {
         Self { by_step }
     }
 
-    /// Total journaled effects across all steps.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.by_step.values().map(|c| c.effects.len()).sum()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Detach a step's history so the step can own it.
     ///
     /// Returns an empty cursor for a step with no recorded effects, which is
@@ -364,49 +364,25 @@ impl ReplayCursor {
     /// Whether *any* step still has unread history.
     #[must_use]
     pub fn fully_exhausted(&self) -> bool {
-        self.by_step.values().all(|c| c.pos >= c.effects.len())
+        self.by_step.values().all(StepCursor::exhausted)
     }
 
-    /// Whether this step's next journaled effect is `key`, without consuming it.
-    ///
-    /// Used to ask history a question it is the only authority on: after a
-    /// recorded failure, did the run go on to retry? The answer is "the next
-    /// effect is that attempt", and inferring it from the current retry policy
-    /// instead would let a policy edit rewrite what happened.
+    /// The first journaled effect nothing has consumed, with the step and
+    /// phase it belongs to — the strict verifier's witness that this build
+    /// performs fewer effects than the record.
     #[must_use]
-    pub fn peek_is(&self, step: StepId, phase: Phase, key: EffectKey) -> bool {
+    pub fn first_unconsumed(&self) -> Option<(StepId, Phase, EffectKey)> {
+        self.by_step.iter().find_map(|((step, phase), cursor)| {
+            cursor.first_unconsumed().map(|k| (*step, *phase, k))
+        })
+    }
+
+    /// The first unconsumed effect in one `(step, phase)` slice, if any.
+    #[must_use]
+    pub fn unconsumed_in(&self, step: StepId, phase: Phase) -> Option<EffectKey> {
         self.by_step
             .get(&(step, phase))
-            .and_then(|c| c.effects.get(c.pos))
-            .is_some_and(|(k, _, _)| *k == key)
-    }
-
-    /// Consume this step's next journaled effect, verifying it is the one being
-    /// asked for.
-    ///
-    /// Returns `None` once the step's history is exhausted, meaning "perform
-    /// this one live".
-    pub fn next(
-        &mut self,
-        step: StepId,
-        phase: Phase,
-        recomputed: EffectKey,
-    ) -> Result<Option<EffectReplay>, StepError> {
-        let Some(cursor) = self.by_step.get_mut(&(step, phase)) else {
-            return Ok(None);
-        };
-        let Some((expected, seq, replay)) = cursor.effects.get(cursor.pos) else {
-            return Ok(None);
-        };
-        if *expected != recomputed {
-            return Err(StepError::NonDeterminism {
-                seq: *seq,
-                expected: *expected,
-                actual: recomputed,
-            });
-        }
-        cursor.pos += 1;
-        Ok(Some(replay.clone()))
+            .and_then(StepCursor::first_unconsumed)
     }
 }
 
@@ -452,6 +428,19 @@ mod tests {
     const S0: StepId = StepId(0);
     const S1: StepId = StepId(1);
 
+    /// Consume one step's next effect the way the runtime does: detach the
+    /// step's slice, ask it, hand it back.
+    fn next(
+        cur: &mut ReplayCursor,
+        step: StepId,
+        key: EffectKey,
+    ) -> Result<Option<EffectReplay>, StepError> {
+        let mut slice = cur.take(step, Phase::Forward);
+        let out = slice.next(key);
+        cur.restore(step, Phase::Forward, slice);
+        out
+    }
+
     #[test]
     fn replays_a_completed_effect_without_performing_it() {
         let recs = records(vec![
@@ -468,7 +457,7 @@ mod tests {
         ]);
         let mut cur = ReplayCursor::from_records(&recs);
         assert_eq!(
-            cur.next(S0, Phase::Forward, key(1)).unwrap(),
+            next(&mut cur, S0, key(1)).unwrap(),
             Some(EffectReplay::Done {
                 output: json!("recorded"),
                 source: None,
@@ -496,7 +485,7 @@ mod tests {
         ]);
         let mut cur = ReplayCursor::from_records(&recs);
         assert!(matches!(
-            cur.next(S0, Phase::Forward, key(99)).unwrap_err(),
+            next(&mut cur, S0, key(99)).unwrap_err(),
             StepError::NonDeterminism { .. }
         ));
     }
@@ -528,7 +517,7 @@ mod tests {
         ]);
         let mut cur = ReplayCursor::from_records(&recs);
         assert!(
-            cur.next(S0, Phase::Forward, key(2)).is_err(),
+            next(&mut cur, S0, key(2)).is_err(),
             "order within a step is verified"
         );
     }
@@ -566,7 +555,7 @@ mod tests {
 
         // Step 0 asks first even though step 1 finished first in the journal.
         assert_eq!(
-            cur.next(S0, Phase::Forward, key(1)).unwrap(),
+            next(&mut cur, S0, key(1)).unwrap(),
             Some(EffectReplay::Done {
                 output: json!("a"),
                 source: None,
@@ -574,7 +563,7 @@ mod tests {
             })
         );
         assert_eq!(
-            cur.next(S1, Phase::Forward, key(10)).unwrap(),
+            next(&mut cur, S1, key(10)).unwrap(),
             Some(EffectReplay::Done {
                 output: json!("b"),
                 source: None,
@@ -611,7 +600,7 @@ mod tests {
             ),
         ]);
         let mut cur = ReplayCursor::from_records(&recs);
-        cur.next(S0, Phase::Forward, key(1)).unwrap();
+        next(&mut cur, S0, key(1)).unwrap();
 
         assert!(cur.exhausted(S0, Phase::Forward));
         assert!(
@@ -625,7 +614,8 @@ mod tests {
     fn an_unknown_step_has_no_history() {
         let cur = ReplayCursor::from_records(&[]);
         assert!(cur.exhausted(StepId(7), Phase::Forward));
-        assert!(cur.is_empty());
+        assert!(cur.fully_exhausted());
+        assert!(cur.first_unconsumed().is_none());
     }
 
     #[test]
@@ -643,9 +633,9 @@ mod tests {
             ),
         ]);
         let mut cur = ReplayCursor::from_records(&recs);
-        cur.next(S0, Phase::Forward, key(1)).unwrap();
+        next(&mut cur, S0, key(1)).unwrap();
         assert_eq!(
-            cur.next(S0, Phase::Forward, key(2)).unwrap(),
+            next(&mut cur, S0, key(2)).unwrap(),
             None,
             "resume runs the rest live"
         );
@@ -657,7 +647,7 @@ mod tests {
     fn orphaned_start_is_surfaced_with_its_recovery_mode() {
         let recs = records(vec![(S0, key(1), started())]);
         let mut cur = ReplayCursor::from_records(&recs);
-        match cur.next(S0, Phase::Forward, key(1)).unwrap() {
+        match next(&mut cur, S0, key(1)).unwrap() {
             Some(EffectReplay::Orphan { recovery, .. }) => {
                 assert!(matches!(recovery, Recovery::Retry));
             }
@@ -682,7 +672,7 @@ mod tests {
         ]);
         let mut cur = ReplayCursor::from_records(&recs);
         assert_eq!(
-            cur.next(S0, Phase::Forward, key(1)).unwrap(),
+            next(&mut cur, S0, key(1)).unwrap(),
             Some(EffectReplay::Failed {
                 error: "boom".into(),
                 disposition: Disposition::DidNotHappen,

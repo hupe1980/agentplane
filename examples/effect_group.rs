@@ -165,9 +165,9 @@ impl Skill for Checkout {
 async fn checkout(
     notify_fails: bool,
 ) -> Result<(Ledger, agentplane::runtime::RunOutcome), Box<dyn std::error::Error>> {
-    let store = Arc::new(RedbStore::open_in_memory()?);
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
     let ledger: Ledger = Arc::default();
-    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+    let runtime = Runtime::builder(Arc::clone(&store))
         .skill(Checkout {
             ledger: Arc::clone(&ledger),
             notify_fails,

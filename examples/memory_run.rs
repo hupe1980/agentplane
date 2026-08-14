@@ -106,8 +106,10 @@ impl Skill for SemanticMemory {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(RedbStore::open_in_memory()?);
-    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+    let journal: Arc<dyn JournalStore> = store.clone();
+    let memories: Arc<dyn MemoryStore> = store.clone();
+    let runtime = Runtime::builder(journal)
+        .memory(memories)
         .skill(TeamMemory)
         .build();
 
@@ -162,8 +164,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             embedding: vec![1.0, 0.0],
         }],
     )) as Arc<dyn SemanticRetriever>;
-    let semantic = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+    let journal: Arc<dyn JournalStore> = store.clone();
+    let memories: Arc<dyn MemoryStore> = store.clone();
+    let semantic = Runtime::builder(journal)
+        .memory(memories)
         .skill(SemanticMemory(retriever))
         .build();
     let ranked = semantic

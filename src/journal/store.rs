@@ -350,11 +350,55 @@ pub trait JournalStore: Send + Sync + Debug {
     /// The run's current chain head.
     async fn head(&self, run: RunId) -> Result<Head, StoreError>;
 
-    /// Take or renew ownership, returning the fencing epoch to write under.
+    /// Take ownership of a run, returning the fencing epoch to write under.
     ///
-    /// Claiming an expired lease bumps the epoch, which fences the previous
-    /// owner. Renewing an owned lease keeps it.
+    /// A **pure claim**: it succeeds only on a lease that is free — never
+    /// granted, released, or expired — and it always bumps the epoch past the
+    /// previous holder's, which fences them. A lease that is currently held
+    /// and unexpired is refused with [`StoreError::LeaseHeld`], **including
+    /// when the caller itself is the holder**.
+    ///
+    /// That last refusal is deliberate, and it used to be the opposite:
+    /// `acquire` renewed for the same owner. Two failures hid in that
+    /// convenience. A heartbeat racing its own run's conclusion could
+    /// re-acquire the lease the conclusion had just *released*, leaving a
+    /// live, never-released lease over a concluded run — which the recovery
+    /// sweep then "recovers" forever. And a second entry point on the same
+    /// instance (a cancel, a delivery) could "acquire" the lease of a run the
+    /// instance was actively executing and drive a second execution under the
+    /// **same epoch**, which fencing exists to make impossible and cannot see.
+    /// Renewal is a different operation with a different failure mode, so it
+    /// is a different method: [`renew`](Self::renew).
     async fn acquire(&self, run: RunId, owner: &str, ttl: Duration) -> Result<Lease, StoreError>;
+
+    /// Extend a lease this caller still holds, without ever claiming one.
+    ///
+    /// Succeeds only when the lease is currently held, unexpired, unreleased,
+    /// by exactly `(owner, epoch)` — and keeps the epoch, because bumping it
+    /// would fence the owner against its own in-flight writes. Anything else
+    /// fails with [`StoreError::LeaseNotHeld`]: the lease was released (the
+    /// run concluded), lapsed (anyone may have taken it), or is held by
+    /// somebody else (somebody did). A failed renewal means *stop* — the
+    /// caller no longer owns the run, and the store will fence its next
+    /// append anyway.
+    ///
+    /// The refusal to claim is the entire contract. A renewal that "helpfully"
+    /// re-took an expired or released lease would fence the run with its own
+    /// heartbeat, or resurrect a lease over a run that already handed it back
+    /// — and a concluded run with a live lease is a run the recovery sweep
+    /// re-executes when the lease lapses.
+    ///
+    /// Checked and written inside one store transaction, like every other
+    /// lease operation: a read-then-write renewal has a window in which the
+    /// lease can lapse and be claimed, and renewing over the new owner is the
+    /// split-brain the epoch exists to prevent.
+    async fn renew(
+        &self,
+        run: RunId,
+        owner: &str,
+        epoch: Epoch,
+        ttl: Duration,
+    ) -> Result<Lease, StoreError>;
 
     /// Runs whose lease **expired without being released** — the runs an
     /// instance died holding.

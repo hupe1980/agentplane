@@ -32,7 +32,7 @@ use serde_json::Value;
 use crate::core::StoreError;
 use crate::journal::{JournalStore, Record, RecordKind};
 
-use super::{Delivered, PushRegistration, PushStore, PushTransport};
+use super::{Delivered, PushNamespace, PushRegistration, PushStore, PushTransport};
 
 /// What one journal record should be delivered as.
 ///
@@ -66,14 +66,21 @@ pub trait Projection: Send + Sync + Debug {
         matches!(record.kind(), RecordKind::RunSealed { .. })
     }
 
-    /// Whether this worker owns a registration.
+    /// Which id namespace this worker serves.
     ///
     /// Two workers share one store: the A2A worker serves caller-registered
     /// webhooks, the outbox worker serves operator destinations. Without this
     /// each would deliver the other's rows with its own projection — an
     /// operator's `CloudEvents` message to a peer's A2A webhook, and a `StreamResponse` to
     /// the deployment's bus.
-    fn owns(&self, registration: &PushRegistration) -> bool;
+    ///
+    /// A declaration rather than a per-row predicate, because the split is the
+    /// **store's** discriminator: the worker hands it to
+    /// [`PushStore::due_in`](super::PushStore::due_in) so the query itself
+    /// filters, instead of reading a bounded window and dropping the rows it
+    /// does not own — which starves this worker's rows the moment the other
+    /// namespace fills the window.
+    fn namespace(&self) -> PushNamespace;
 }
 
 /// Outcome of one bounded delivery sweep.
@@ -91,6 +98,18 @@ pub struct PushSweepReport {
     /// wearing one shape — both remove the registration, and only one of them
     /// delivered anything.
     pub abandoned: usize,
+    /// Due rows in the **other** id namespace — work this worker must not
+    /// touch, surfaced so it cannot be invisible.
+    ///
+    /// A deployment that scheduled only one of the two workers has a backlog
+    /// no sweep will ever serve, and before this field its report was
+    /// byte-identical to a quiet plane's. Deliberately **not** part of
+    /// [`needs_attention`](Self::needs_attention): whenever both workers run,
+    /// the other's rows are legitimately due in the instants between its
+    /// sweeps, and one tick cannot tell that ordinary overlap from an
+    /// unserved namespace — so this is visibility, judged by the operator who
+    /// knows which workers exist.
+    pub unserved: usize,
     pub saturated: bool,
 }
 
@@ -193,23 +212,22 @@ impl DeliveryWorker {
         limit: usize,
     ) -> Result<PushSweepReport, crate::core::StoreError> {
         // One over the limit, so a saturated sweep is distinguishable from one
-        // that happened to fill the page exactly. Registrations this worker does
-        // not own are skipped **after** the read, because the store's ordering is
-        // the cursor's and filtering in it would need a second index.
-        let due: Vec<PushRegistration> = self
+        // that happened to fill the page exactly. The namespace filter rides
+        // in the query itself: filtering a bounded read afterwards let rows of
+        // the other namespace occupy the whole window, starving this worker's
+        // own rows while its report read as a quiet plane.
+        let batch = self
             .store
-            .due(at, limit.saturating_add(1))
-            .await?
-            .into_iter()
-            .filter(|registration| self.projection.owns(registration))
-            .collect();
-        let saturated = due.len() > limit;
+            .due_in(at, limit.saturating_add(1), self.projection.namespace())
+            .await?;
+        let saturated = batch.rows.len() > limit;
         let mut report = PushSweepReport {
-            registrations: due.len().min(limit),
+            registrations: batch.rows.len().min(limit),
+            unserved: batch.unserved,
             saturated,
             ..PushSweepReport::default()
         };
-        for registration in due.into_iter().take(limit) {
+        for registration in batch.rows.into_iter().take(limit) {
             let mut attempts = registration.attempts;
             let records = self
                 .journal

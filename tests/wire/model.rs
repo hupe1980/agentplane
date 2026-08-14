@@ -1177,3 +1177,76 @@ async fn a_conforming_answer_still_reaches_the_skill() {
         "the structured answer did not reach the skill"
     );
 }
+
+/// Asks the same question twice, byte for byte, in one step.
+#[derive(Debug)]
+struct AsksTwice(Arc<FakeProvider>);
+
+#[async_trait::async_trait]
+impl Skill for AsksTwice {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("asks-twice")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let provider = Arc::clone(&self.0) as Arc<dyn ModelProvider>;
+        let first = cx
+            .sink_with(&input, |v| {
+                ModelCall::new(Arc::clone(&provider), model(), v)
+            })
+            .await?;
+        let second = cx
+            .sink_with(&input, |v| {
+                ModelCall::new(Arc::clone(&provider), model(), v)
+            })
+            .await?;
+        Ok(Outcome::done(Tainted::trusted(
+            json!({ "first": first.peek().text, "second": second.peek().text }),
+        )))
+    }
+}
+
+/// Two byte-identical calls in one step are two effects, and replay keeps
+/// them apart.
+///
+/// Pinned because it is easy to believe otherwise — an effect's identity reads
+/// as `(kind, args)`, and two calls with the same descriptor look like one
+/// effect asked twice. They are not: the **ordinal** is hashed into the key,
+/// so the second call is a distinct effect by position, dispatches live, and
+/// replay hands each call back its own recorded answer in order. A verifier
+/// pass over an answer, or a retry loop rewording nothing, needs no
+/// disambiguating salt in the prompt. See `core::effect` on effect identity.
+#[tokio::test]
+async fn two_identical_calls_in_one_step_are_two_effects() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let provider = FakeProvider::new();
+    provider.will_say("one");
+    provider.will_say("two");
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(AsksTwice(Arc::clone(&provider)))
+        .build();
+
+    let out = rt
+        .run("asks-twice", Tainted::trusted(json!("q")))
+        .await
+        .unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);
+    assert_eq!(provider.calls(), 2, "both identical calls must dispatch");
+    let answer = out.output.expect("an answer");
+    assert_eq!(
+        answer.peek(),
+        &json!({ "first": "one", "second": "two" }),
+        "each call gets its own answer, in dispatch order"
+    );
+
+    // Strict replay reads both back — same order, no provider contact — which
+    // is what distinct-by-position keys buy: the journal cannot hand the first
+    // call the second's answer.
+    let replayed = rt.replay(out.run_id, Mode::Strict).await.unwrap();
+    assert_eq!(replayed.status, RunStatus::Succeeded);
+    assert_eq!(provider.calls(), 2, "replay must not ask the model again");
+    assert_eq!(replayed.output.expect("an answer").peek(), answer.peek());
+}

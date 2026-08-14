@@ -53,9 +53,123 @@ pub async fn check_cases(store: &Arc<dyn CaseStore>, r: &mut Report) {
     two_concurrent_messages_open_one_case(store, r).await;
     a_stale_state_write_is_refused(store, r).await;
     a_state_write_to_a_missing_case_is_not_found(store, r).await;
+    a_write_to_a_missing_matter_is_not_found(store, r).await;
     only_one_of_several_racing_writers_wins(store, r).await;
     enumeration_pages_without_gap_or_overlap(store, r).await;
     an_imported_case_is_reachable_by_every_read_path(store, r).await;
+    concurrent_attaches_all_land_and_land_once(store, r).await;
+}
+
+/// Every mutation of a matter that does not exist says so.
+///
+/// `put_state` already has this pinned; `close` and `set_deadline_state` are
+/// the other verbs a sweep or an operator drives blind, and a backend that
+/// discards their row counts reports success for a decision that landed
+/// nowhere — a closed case nobody closed, a breached obligation nobody
+/// registered.
+async fn a_write_to_a_missing_matter_is_not_found(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let ghost = CaseId::generate();
+    match store.close(ghost).await {
+        Err(StoreError::NotFound(_)) => {}
+        Ok(()) => r.record(
+            "missing rows",
+            "closing a case that does not exist reported success — the caller \
+             now believes an audited matter was settled",
+        ),
+        Err(e) => r.record(
+            "missing rows",
+            format!("closing a missing case was answered with {e}"),
+        ),
+    }
+    match store
+        .set_deadline_state(ghost, "response-due", crate::core::DeadlineState::Breached)
+        .await
+    {
+        Err(StoreError::NotFound(_)) => {}
+        Ok(()) => r.record(
+            "missing rows",
+            "a deadline transition on an obligation nobody registered reported \
+             success — the sweep's decision was written into nothing",
+        ),
+        Err(e) => r.record(
+            "missing rows",
+            format!("a missing deadline transition was answered with {e}"),
+        ),
+    }
+}
+
+/// **Concurrent attaches all land, and each run lands once.**
+///
+/// `attach_run` allocates the next position in the case's run order, and two
+/// instances attaching different runs at the same moment must not both take
+/// one position — nor may the collision surface as an error, because the
+/// runs already executed and their attachment is a fact being recorded, not
+/// requested. The store retries or serialises; the caller sees every run
+/// attached exactly once.
+async fn concurrent_attaches_all_land_and_land_once(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let opened = store
+        .correlate_or_open("attach-race", &keys("C-ATTACH-RACE"), ts(1_000))
+        .await;
+    let Ok(crate::case::Correlation::Opened(case)) = opened else {
+        r.record(
+            "attach",
+            format!("the fixture case did not open: {opened:?}"),
+        );
+        return;
+    };
+
+    let runs: Vec<RunId> = (0..4).map(|_| RunId::generate()).collect();
+    let mut handles = Vec::new();
+    for run in &runs {
+        let store = Arc::clone(store);
+        let run = *run;
+        handles.push(tokio::spawn(
+            async move { store.attach_run(case, run).await },
+        ));
+    }
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            other => {
+                r.record(
+                    "attach",
+                    format!(
+                        "a concurrent attach failed instead of serialising: {other:?} — \
+                         the run executed, and the record of it joining its matter is \
+                         a fact the store refused to hold"
+                    ),
+                );
+                return;
+            }
+        }
+    }
+    // Idempotence under the same contention rules.
+    let _ = store.attach_run(case, runs[0]).await;
+
+    match store.case(case).await {
+        Ok(Some(read)) => {
+            let mut attached: Vec<String> = read.runs.iter().map(ToString::to_string).collect();
+            attached.sort_unstable();
+            let mut expected: Vec<String> = runs.iter().map(ToString::to_string).collect();
+            expected.sort_unstable();
+            if attached != expected {
+                r.record(
+                    "attach",
+                    format!(
+                        "after four concurrent attaches the case holds {:?} — every \
+                         run must appear exactly once, in a stable order",
+                        read.runs
+                    ),
+                );
+            }
+        }
+        other => r.record(
+            "attach",
+            format!("the case could not be read back: {other:?}"),
+        ),
+    }
 }
 
 /// `cases` pages exhaustively: every case exactly once, whatever the limit.
@@ -641,10 +755,206 @@ pub async fn check_events(store: &Arc<dyn EventStore>, r: &mut Report) {
     a_repeated_event_id_is_not_buffered_twice(store, r).await;
     an_event_is_claimed_by_one_waiter_only(store, r).await;
     a_waiter_is_matched_by_one_event_only(store, r).await;
+    a_waiter_is_consumed_by_one_of_two_distinct_events(store, r).await;
     a_targeted_event_resumes_only_its_named_run(store, r).await;
     a_claimed_event_is_never_retired(store, r).await;
     a_claimed_event_is_recoverable_by_its_own_run(store, r).await;
     a_satisfied_waiter_does_not_claim_a_second_event(store, r).await;
+    a_zero_grace_sweep_retires_an_event_received_this_second(store, r).await;
+    a_dead_letter_carries_the_keys_it_was_routed_on(store, r).await;
+}
+
+/// **Two distinct events racing one wait: exactly one is consumed, and the
+/// other stays live.**
+///
+/// `a_waiter_is_matched_by_one_event_only` replays the *same* event twice, so
+/// the event-row claim alone passes it. This is the race that claim cannot
+/// settle: two *different* messages both carry the wait's correlation key, and
+/// both `match_waiter` calls select the same subscription. Each then claims
+/// its own — unclaimed — event row, and the loser's message ends up claimed
+/// for a run whose wait the winner already satisfied: parked under a claim
+/// nobody will consume, and a claimed event never dead-letters, so it vanishes
+/// from every listing an operator reads. The subscription row itself has to be
+/// the thing the two matches serialise on.
+///
+/// The pin is the aftermath rather than the interleaving: exactly one match
+/// reports a resume, and a zero-grace sweep must still be able to retire the
+/// other event — a message nobody consumed must age out with a reason, not
+/// disappear.
+async fn a_waiter_is_consumed_by_one_of_two_distinct_events(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let run = RunId::generate();
+    let sub = Subscription {
+        run,
+        case: None,
+        effect: effect(23),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "ack".into(),
+        correlation: keys("E-TWO-EVENTS"),
+    };
+    let _ = store.subscribe(&sub, ts(1_000)).await;
+
+    let event = |id: &str| InboundEvent {
+        source: "urn:conformance".to_owned(),
+        id: id.into(),
+        kind: "ack".into(),
+        correlation: keys("E-TWO-EVENTS"),
+        payload: serde_json::json!({}),
+    };
+    let first = event("evt-two-1");
+    let second = event("evt-two-2");
+    let _ = store.buffer(&first, ts(1_001)).await;
+    let _ = store.buffer(&second, ts(1_001)).await;
+
+    // Concurrently, because the defect is a missing lock: two transactions
+    // that both read the subscription before either retires it.
+    let (a, b) = {
+        let (s1, s2) = (Arc::clone(store), Arc::clone(store));
+        let (e1, e2) = (first.clone(), second.clone());
+        let one = tokio::spawn(async move { s1.match_waiter(&e1, ts(1_002)).await });
+        let two = tokio::spawn(async move { s2.match_waiter(&e2, ts(1_002)).await });
+        (one.await, two.await)
+    };
+    let (Ok(Ok(a)), Ok(Ok(b))) = (a, b) else {
+        r.record("single-consumption", "match_waiter failed under contention");
+        return;
+    };
+    match (&a, &b) {
+        (Some(_), None) | (None, Some(_)) => {}
+        (Some(_), Some(_)) => r.record(
+            "single-consumption",
+            "two distinct events both matched one wait — one run is resumed \
+             twice, and the second message is consumed by a wait it never \
+             satisfied",
+        ),
+        (None, None) => {
+            r.record(
+                "single-consumption",
+                "neither of two matching events found the waiting run",
+            );
+            return;
+        }
+    }
+
+    // The unconsumed event must still be sweepable. With the race unlocked it
+    // sits claimed for the resumed run and the sweep — which only retires
+    // unclaimed rows — never touches it.
+    if let Err(e) = store.sweep_unclaimed(ts(9_999), "expired").await {
+        r.record("single-consumption", format!("sweep_unclaimed failed: {e}"));
+        return;
+    }
+    let consumed = if a.is_some() { &first } else { &second };
+    let loser = if a.is_some() { &second } else { &first };
+    match store.dead_letters(100).await {
+        Ok(dead) => {
+            if !dead.iter().any(|d| d.event.id == loser.id) {
+                r.record(
+                    "single-consumption",
+                    format!(
+                        "event {} was neither consumed nor dead-lettered — it is \
+                         parked under a claim nobody will ever consume, invisible \
+                         to every listing",
+                        loser.id
+                    ),
+                );
+            }
+            if dead.iter().any(|d| d.event.id == consumed.id) {
+                r.record(
+                    "single-consumption",
+                    "the consumed event was retired as unclaimed",
+                );
+            }
+        }
+        Err(e) => r.record("single-consumption", format!("dead_letters failed: {e}")),
+    }
+}
+
+/// **A zero grace window retires an event received this second.**
+///
+/// The sweep's cutoff is *the oldest instant still worth keeping*, and both
+/// backends stamp at second granularity — so `received_at < cutoff` silently
+/// spares everything received in the cutoff's own second. An operator who
+/// configures "retire immediately" then watches unclaimed messages survive
+/// exactly one sweep, which on a quiet store is forever.
+async fn a_zero_grace_sweep_retires_an_event_received_this_second(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let event = InboundEvent {
+        source: "urn:conformance".to_owned(),
+        id: "evt-boundary".into(),
+        kind: "ack".into(),
+        correlation: keys("E-BOUNDARY"),
+        payload: serde_json::json!({}),
+    };
+    let _ = store.buffer(&event, ts(5_000)).await;
+    match store.sweep_unclaimed(ts(5_000), "zero grace").await {
+        Ok(_) => {}
+        Err(e) => {
+            r.record("sweep boundary", format!("sweep_unclaimed failed: {e}"));
+            return;
+        }
+    }
+    match store.dead_letters(100).await {
+        Ok(dead) => {
+            if !dead.iter().any(|d| d.event.id == "evt-boundary") {
+                r.record(
+                    "sweep boundary",
+                    "an event received at the cutoff instant survived a zero-grace \
+                     sweep — `<` where the contract is `<=`, and on a quiet store \
+                     the message it spares is never retired",
+                );
+            }
+        }
+        Err(e) => r.record("sweep boundary", format!("dead_letters failed: {e}")),
+    }
+}
+
+/// **A dead letter still carries the correlation keys it was routed on.**
+///
+/// The dead-letter view exists for an operator deciding what went wrong, and
+/// the first question about an unclaimed message is *what was it correlated
+/// by* — a wrong key is the most common reason nobody was waiting. A backend
+/// that reconstructs the event without re-reading its keys hands back a
+/// valid-looking message silently stripped of the one field that explains it.
+async fn a_dead_letter_carries_the_keys_it_was_routed_on(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let event = InboundEvent {
+        source: "urn:conformance".to_owned(),
+        id: "evt-keyed-letter".into(),
+        kind: "ack".into(),
+        correlation: keys("E-DEAD-KEYS"),
+        payload: serde_json::json!({}),
+    };
+    let _ = store.buffer(&event, ts(6_000)).await;
+    let _ = store.sweep_unclaimed(ts(9_999), "nobody was waiting").await;
+    match store.dead_letters(100).await {
+        Ok(dead) => match dead.iter().find(|d| d.event.id == "evt-keyed-letter") {
+            Some(letter) => {
+                if letter.event.correlation != keys("E-DEAD-KEYS") {
+                    r.record(
+                        "dead letters",
+                        format!(
+                            "a dead letter came back with correlation {:?} instead of \
+                             the keys it was buffered with — the operator reading it \
+                             cannot see what it failed to match on",
+                            letter.event.correlation
+                        ),
+                    );
+                }
+            }
+            None => r.record("dead letters", "the unclaimed event was not retired"),
+        },
+        Err(e) => r.record("dead letters", format!("dead_letters failed: {e}")),
+    }
 }
 
 /// **One subscription consumes one event — the match retires the waiter.**
@@ -1049,6 +1359,82 @@ async fn a_waiter_is_matched_by_one_event_only(store: &Arc<dyn EventStore>, r: &
     }
 }
 
+/// **Two tenants' waiting lists are two lists, even under colliding names.**
+///
+/// `mine` and `other` must be handles onto **one** shared backend, scoped to
+/// two different tenants — that is the whole point, and a caller passing two
+/// separate databases proves nothing.
+///
+/// The adversarial half hands the attacker every identifier the row is keyed
+/// by: the *same* run id, effect key, kind and correlation key registered in
+/// the other tenant — all attacker-suppliable strings, since a run id is not a
+/// secret and a correlation key is a business value. `waiting` must count the
+/// row once for its owner and zero times for anyone else; a listing that
+/// leaned on a tenant-keyed row lookup while walking every tenant's index
+/// found its own row *through the other tenant's index entry too*, listing one
+/// wait twice — phantom backlog whose size another tenant controls. The
+/// positive halves pin that each owner still sees exactly its own row, so a
+/// scoping that broke the listing for everybody cannot pass.
+pub async fn check_waiting_tenancy(
+    mine: &Arc<dyn EventStore>,
+    other: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let run = RunId::generate();
+    let sub = Subscription {
+        run,
+        case: None,
+        effect: effect(77),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "ack".into(),
+        correlation: keys("E-TENANCY-WAIT"),
+    };
+    let _ = mine.subscribe(&sub, ts(1_000)).await;
+    // The attacker registers an identical wait — same run id, same effect,
+    // same key — in *their* tenant.
+    let _ = other.subscribe(&sub, ts(1_000)).await;
+
+    match mine.waiting(100).await {
+        Ok(waits) => {
+            let matching = waits
+                .iter()
+                .filter(|w| w.run == run && w.effect == sub.effect)
+                .count();
+            if matching != 1 {
+                r.record(
+                    "tenancy",
+                    format!(
+                        "one registered wait was listed {matching} time(s) after another \
+                         tenant registered a colliding row — the listing walked past its \
+                         own tenant's range"
+                    ),
+                );
+            }
+        }
+        Err(e) => r.record("tenancy", format!("waiting failed: {e}")),
+    }
+    match other.waiting(100).await {
+        Ok(waits) => {
+            let matching = waits
+                .iter()
+                .filter(|w| w.run == run && w.effect == sub.effect)
+                .count();
+            if matching != 1 {
+                r.record(
+                    "tenancy",
+                    format!(
+                        "the other tenant's own wait was listed {matching} time(s) — \
+                         the scoping removed the feature rather than isolating it"
+                    ),
+                );
+            }
+        }
+        Err(e) => r.record("tenancy", format!("waiting failed: {e}")),
+    }
+}
+
 // ── Timers ──────────────────────────────────────────────────────────────────
 
 /// Check a [`TimerStore`].
@@ -1107,6 +1493,101 @@ pub async fn check_tasks(store: &Arc<dyn TaskStore>, r: &mut Report) {
     only_the_holder_releases(store, r).await;
     the_backlog_counts_work_somebody_is_holding(store, r).await;
     a_take_over_names_its_holder_and_keeps_the_exclusions(store, r).await;
+    an_expired_task_is_not_resurrected_by_a_claim(store, r).await;
+    a_state_write_to_a_missing_task_is_not_found(store, r).await;
+}
+
+/// **A claim racing an expiry cannot resurrect the task.**
+///
+/// The sweep expires a task; a reviewer's claim is in flight at the same
+/// moment. A claim whose reservation is keyed on the assignee alone passes its
+/// eligibility read while the task is still open, loses the race, and then
+/// writes `claimed` over `expired` — un-deciding an expiry policy that
+/// already fired, on the on-expiry disposition an operator relied on.
+///
+/// The sequential half pins the visible contract; the concurrent rounds are
+/// what reach the reservation statement itself, because the eligibility
+/// read refuses a *settled* expiry before the write is ever attempted.
+/// Whatever the interleaving, the invariant is the same: once both calls have
+/// returned, the task is `expired` — either the claim lost and erred, or it
+/// won first and the expiry overwrote it.
+async fn an_expired_task_is_not_resurrected_by_a_claim(store: &Arc<dyn TaskStore>, r: &mut Report) {
+    r.checked += 1;
+    let roles = vec!["ops".to_owned()];
+
+    // Sequential: a settled expiry refuses the claim outright.
+    let settled = task(36, None);
+    if store.open(&settled).await.is_err() {
+        r.record("expiry", "open failed");
+        return;
+    }
+    if store
+        .set_state(settled.id, TaskState::Expired)
+        .await
+        .is_err()
+    {
+        r.record("expiry", "the fixture could not expire its task");
+        return;
+    }
+    if store.claim(settled.id, "alice", &roles).await.is_ok() {
+        r.record(
+            "expiry",
+            "a claim on an expired task succeeded — the expiry the sweep \
+             already acted on is silently un-decided",
+        );
+    }
+
+    // Concurrent: the race the reservation predicate exists for.
+    for round in 0u8..8 {
+        let t = task(40 + round, None);
+        if store.open(&t).await.is_err() {
+            r.record("expiry", "open failed");
+            return;
+        }
+        let (s1, s2) = (Arc::clone(store), Arc::clone(store));
+        let claim = tokio::spawn(async move { s1.claim(t.id, "alice", &["ops".to_owned()]).await });
+        let expire = tokio::spawn(async move { s2.set_state(t.id, TaskState::Expired).await });
+        let _ = claim.await;
+        let _ = expire.await;
+        let Ok(Some(after)) = store.task(t.id).await else {
+            r.record("expiry", "the raced task could not be read back");
+            return;
+        };
+        if after.state != TaskState::Expired {
+            r.record(
+                "expiry",
+                format!(
+                    "after a claim raced an expiry the task ended {:?} — an \
+                     expired task was resurrected into a reviewer's hands",
+                    after.state
+                ),
+            );
+            return;
+        }
+    }
+}
+
+/// A state write to a task that does not exist is `NotFound`, not silence.
+///
+/// The sweep and the decision path both drive tasks through `set_state`, and a
+/// backend that discards the row count reports success for a write that landed
+/// nowhere — the same lie a release that freed nothing tells, on the verb the
+/// expiry sweep trusts.
+async fn a_state_write_to_a_missing_task_is_not_found(store: &Arc<dyn TaskStore>, r: &mut Report) {
+    r.checked += 1;
+    let ghost = task(63, None);
+    match store.set_state(ghost.id, TaskState::Completed).await {
+        Err(StoreError::NotFound(_)) => {}
+        Ok(()) => r.record(
+            "missing rows",
+            "set_state on a task that does not exist reported success — the \
+             caller now believes a decision was recorded that no store holds",
+        ),
+        Err(e) => r.record(
+            "missing rows",
+            format!("set_state on a missing task was answered with {e}"),
+        ),
+    }
 }
 
 /// **The absent-holder case: a take-over displaces exactly the holder it

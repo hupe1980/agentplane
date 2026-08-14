@@ -530,13 +530,17 @@ async fn a_quarantined_run_is_never_unwound() {
 
 // ── Budget ──────────────────────────────────────────────────────────────────
 
-/// **Compensation is not admission-gated.**
+/// **Exhaustion is a pause, and its mutations stand.**
 ///
-/// Refusing to undo because the ceiling was reached is how a run ends with a
-/// charged card and no order. The ceiling exists to bound work, not to strand it
-/// half-done — and the spend is still journaled, so the overshoot is visible.
+/// The run did exactly what it was told, and what it was told included a
+/// ceiling. Both of the operator's honest options need the completed work
+/// standing: raise the ceiling and resume — which continues *over* that work —
+/// or cancel, which unwinds through the ordinary evidence-based protocol.
+/// Unwinding on exhaustion made the three ends of an exhausted run contradict
+/// each other: the work was reversed, the run stayed resumable, and a resume
+/// then reported success over a world where the work no longer stood.
 #[tokio::test]
-async fn an_exhausted_run_still_unwinds() {
+async fn an_exhausted_run_pauses_with_its_work_standing() {
     let l = log();
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
@@ -558,8 +562,22 @@ async fn an_exhausted_run_still_unwinds() {
     );
     assert_eq!(
         entries(&l),
+        vec!["do:a", "do:b"],
+        "exhaustion pauses the run; nothing is undone behind the operator \
+         deciding whether to raise the ceiling"
+    );
+
+    // Cancelling is the option that unwinds — the operator deciding the work
+    // is not worth finishing, through the same protocol every stop uses.
+    let fresh = rt
+        .request_cancel(out.run_id, "ops", "not worth finishing")
+        .await
+        .unwrap();
+    assert!(fresh, "the first stop request records");
+    assert_eq!(
+        entries(&l),
         vec!["do:a", "do:b", "undo:b", "undo:a"],
-        "the budget stops the work, not the cleanup"
+        "cancel unwinds what exhaustion left standing, in reverse"
     );
 }
 

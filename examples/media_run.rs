@@ -115,17 +115,15 @@ impl Skill for DescribeImage {
                 })
             },
         );
-        let call = ModelCall::new(
-            Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
-            ModelId::new("fake", "vision-1"),
-            prompt.peek().clone(),
-        )
-        .with_max_sensitivity(Sensitivity::Internal)
-        .with_media(
-            Arc::clone(&self.blobs) as Arc<dyn BlobStore>,
-            [&self.artifact],
-        );
-        let completion = cx.sink(call, &prompt).await?;
+        let provider: Arc<dyn ModelProvider> = self.provider.clone();
+        let blobs: Arc<dyn BlobStore> = self.blobs.clone();
+        let completion = cx
+            .sink_with(&prompt, |value| {
+                ModelCall::new(provider, ModelId::new("fake", "vision-1"), value)
+                    .with_max_sensitivity(Sensitivity::Internal)
+                    .with_media(blobs, [&self.artifact])
+            })
+            .await?;
         assert_eq!(completion.label().trust, Trust::Untrusted);
         Ok(Outcome::done(
             completion.map(|answer| json!({ "description": answer.text })),
@@ -138,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Provider-side URL dereferencing is an architectural egress bypass.
     let refused_provider = FakeProvider::new();
     let remote = ModelCall::new(
-        Arc::clone(&refused_provider) as Arc<dyn ModelProvider>,
+        refused_provider.clone(),
         ModelId::new("fake", "vision-1"),
         json!({
             "input": [{

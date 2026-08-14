@@ -29,7 +29,8 @@ one builder call:
 | Run input | journal — `RunAdmitted.input` | **no**, verbatim | sealed, per-case scope |
 | **Model prompts** | journal — inside `EffectStarted.descriptor.args`, because the prompt is part of effect identity | **no**, verbatim | sealed, per-case scope |
 | **Tool call arguments** | journal — same field, same reason | **no**, verbatim | sealed, per-case scope |
-| Effect outputs — completions, tool results | journal — `EffectDone.output` | **no**, verbatim | sealed, per-case scope |
+| Effect outputs — completions, tool results | journal — `EffectDone.output`, and a reconciliation probe's `EffectReconciled.output`, which is the same data | **no**, verbatim | sealed, per-case scope |
+| Failure messages, notes, frozen plans | journal — `EffectFailed.error` (the message only), `Note.text`, `PlanFrozen.plan`, which embeds the trusted input the plan was compiled from | **no**, verbatim | sealed, per-case scope |
 | Case state writes, status changes, deadline transitions | journal (the effect) **and** the case store | **no** in the journal; the case store's copy is overwritten, not erased | sealed in both, one scope |
 | Inbound event payloads — a counterparty's message body | journal (the awaited effect's output) **and** the event store | **no** | sealed in both; the buffer's copy is its own unit, keyed `(source, id)` |
 | Human task proposals — `Justification.proposed_action`, the exact thing a reviewer is shown | journal (the task effect) **and** the task store | **no** | sealed in both; the task's `summary` stays readable so a queue stays usable |
@@ -84,12 +85,16 @@ Absent means unbounded, which is what every deployment had before the field
 existed.
 
 **Or seal the journal itself.** `SealedJournal::wrap(store, keys, tenant)` seals the
-payload fields — run input, effect arguments (prompts, tool calls) and effect
-outputs — under the same per-case scope `erase_case` already destroys, so a
-single erasure reaches blobs and journal alike:
+payload fields — run input, effect arguments (prompts, tool calls), effect and
+reconciliation outputs, failure messages, notes and frozen plans; the caller's
+data, never the runtime's routing — under the same per-case scope `erase_case`
+already destroys, so a single erasure reaches blobs and journal alike. The
+envelope's associated data binds the tenant and the record's identity, so
+ciphertext moved to another record fails to authenticate rather than opening
+as somebody else's payload:
 
 ```rust
-Runtime::builder(store).cases(cases).events(events).tasks(tasks)
+Runtime::builder_on(store)
     .keyring(keys)   // seals all of them, and blob payloads
     .build()
 ```
@@ -100,11 +105,13 @@ and verifies the chain afterwards.
 
 One call, one guarantee. The wrapping happens at `build()`, so the order you
 write the builder in cannot lose it — registering a store *after* the key ring
-seals it just the same. The decorators (`SealedJournal`, `SealedCases`,
-`SealedTasks`, `SealedEvents`) are public for embedders wiring stores by hand,
-but a plane should not need four correct decisions where one will do: a
-control that can be forgotten four times is one where forgetting looks exactly
-like remembering.
+seals it just the same. An operator `Outbox`'s store is swept up too: it keeps
+the destinations' webhook bearer tokens — credentials like any caller's — so
+`SealedPush` wraps it in the same pass. The decorators (`SealedJournal`,
+`SealedCases`, `SealedTasks`, `SealedEvents`, `SealedPush`) are public for
+embedders wiring stores by hand, but a plane should not need five correct
+decisions where one will do: a control that can be forgotten five times is one
+where forgetting looks exactly like remembering.
 
 **Governed memory is the one store this call leaves alone, and the exclusion
 is forced rather than an oversight.** `EncryptedMemoryStore` serialises subject
@@ -272,8 +279,12 @@ retention unit — bytes are linked to their case when they are written, and a
 second differently-shaped unit for keys would let the two disagree about what an
 erasure covered. `cx.blobs()` is where a skill gets a store already sealed to its
 case; a store held from the builder writes in the clear, and the two would
-disagree about what erasing the case erased. A run under a key ring that belongs
-to no case is refused rather than quietly unsealed.
+disagree about what erasing the case erased. A **blob** write on a run under a
+key ring that belongs to no case is refused rather than quietly unsealed. The
+run's *journal* payloads are a different matter: a record bound to no case seals
+under `tenant/<run>` — still an erasure unit somebody can name — and
+`blob::erase_run` is the verb that destroys it, the counterpart of `erase_case`
+for the unit that call can never reach.
 
 Governed media is payload too, and takes the same route — scoped to its case, or to a named external retention policy when another lifecycle controller owns those bytes. A guard holds the raw store to **exactly one reader**, because a second write path reaching it directly is the shape of hole worth naming: everything works, the bytes are written, the run succeeds, and the erasure is quietly partial.
 

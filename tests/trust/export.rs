@@ -95,14 +95,16 @@ async fn an_export_carries_what_a_reader_needs_to_check_it_without_us() {
     let header = &lines[0];
     assert_eq!(header["kind"], "agentplane.export");
     assert_eq!(
-        header["version"], 2,
+        header["version"],
+        agentplane::export::FORMAT_VERSION,
         "the format version is what a reader pins; it must not be absent"
     );
     assert_eq!(
         header["canon"],
         agentplane::core::canon::VERSION,
-        "a digest without the rule that computed it is unverifiable, and the \
-         rule has already changed once"
+        "a digest without the rule that computed it is unverifiable — a \
+         version-less digest would be re-derived under whatever rule the \
+         reading build implements"
     );
     assert_eq!(
         header["checkpoint"]["size"], 1,
@@ -417,12 +419,17 @@ async fn an_edited_record_fails_to_recompute() {
         .expect("export");
 
     // Change a journaled payload without touching any hash — the edit an
-    // operator with write access to the file would make. The run's *input* is
-    // in the record; the skill's output is not, which is why this greps for a
-    // value the export demonstrably contains rather than one it seemed like it
-    // should.
+    // operator with write access to the file would make, applied to **both**
+    // copies the line carries: the readable body (`"n":1`) and the wire bytes,
+    // where the same characters travel escaped inside the `raw` string
+    // (`\"n\":1`). Editing both is the consistent forgery, so the only thing
+    // left to catch it is the hash. The run's *input* is in the record; the
+    // skill's output is not, which is why this greps for a value the export
+    // demonstrably contains rather than one it seemed like it should.
     let original = String::from_utf8(out).expect("utf8");
-    let text = original.replace("\"n\":1", "\"n\":9");
+    let text = original
+        .replace("\\\"n\\\":1", "\\\"n\\\":9")
+        .replace("\"n\":1", "\"n\":9");
     assert_ne!(
         original, text,
         "the fixture edited nothing, so this test would pass against a verifier \
@@ -442,6 +449,84 @@ async fn an_edited_record_fails_to_recompute() {
             .any(|f| f.contains("does not recompute")),
         "the edit was noticed for the wrong reason: {:#?}",
         report.findings
+    );
+}
+
+/// **Verification runs over the wire bytes, not over a re-serialization.**
+///
+/// The chain is over history *as written* — the journal's own wire-bytes rule
+/// — and the export carries those bytes in `raw` so an offline verifier can
+/// hold the file to them. A verifier that instead re-serialized the parsed
+/// `body` would pass this file: the pretty copy still matches the hash once
+/// put back through this build's canonicalization, while the bytes actually
+/// carried — the ones a restore replays — say something else. Only rehashing
+/// `raw` itself catches it.
+#[tokio::test]
+async fn tampered_wire_bytes_are_caught_even_when_the_readable_body_is_pristine() {
+    let (store, run) = one_run().await;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        .await
+        .expect("export");
+
+    // Edit only the escaped copy inside `raw`, leaving `body` and every hash
+    // exactly as written.
+    let original = String::from_utf8(out).expect("utf8");
+    let text = original.replace("\\\"n\\\":1", "\\\"n\\\":9");
+    assert_ne!(
+        original, text,
+        "the fixture edited nothing, so this test would pass against any verifier"
+    );
+
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None).expect("verify");
+    assert!(
+        !report.is_sound(),
+        "the wire bytes were edited and the export still verified — the \
+         verifier is rehashing a re-serialization of the display copy instead \
+         of the bytes the chain covers"
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.contains("does not recompute") || f.contains("wire bytes")),
+        "the edit was noticed for the wrong reason: {:#?}",
+        report.findings
+    );
+}
+
+/// **The display copy is held to the wire bytes.**
+///
+/// `body` exists for a reader's eyes; the hash covers `raw`. An edit to the
+/// display copy alone leaves every hash verifying — which is exactly why it
+/// must be its own finding, or an export could show an auditor a history the
+/// chain never committed to, one field over from the bytes that prove
+/// otherwise.
+#[tokio::test]
+async fn an_edited_display_body_is_a_finding_though_every_hash_verifies() {
+    let (store, run) = one_run().await;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        .await
+        .expect("export");
+
+    // Edit only the readable copy, leaving `raw` and every hash as written.
+    let original = String::from_utf8(out).expect("utf8");
+    let text = original.replace("\"n\":1", "\"n\":9");
+    assert_ne!(original, text, "the fixture edited nothing");
+
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None).expect("verify");
+    assert!(
+        report.findings.iter().any(|f| f.contains("wire bytes")),
+        "a display body disagreeing with its wire bytes went unnoticed: {:#?}",
+        report.findings
+    );
+    assert!(
+        !report.sound.contains(&run),
+        "a run whose readable history disagrees with its hashed history was \
+         reported sound"
     );
 }
 
@@ -694,7 +779,10 @@ async fn an_export_of_a_foreign_format_version_is_named_not_guessed_at() {
         .expect("export");
 
     let original = String::from_utf8(out).expect("utf8");
-    let foreign = original.replace("\"version\":2", "\"version\":3");
+    let foreign = original.replace(
+        &format!("\"version\":{}", agentplane::export::FORMAT_VERSION),
+        "\"version\":999",
+    );
     assert_ne!(
         original, foreign,
         "the fixture edited nothing, so this test would pass against a reader \
@@ -889,6 +977,9 @@ impl JournalStore for StaleCheckpoint {
     async fn release_lease(&self, run: RunId, e: Epoch) -> Result<(), StoreError> {
         self.inner.release_lease(run, e).await
     }
+    async fn renew(&self, run: RunId, o: &str, e: Epoch, t: Duration) -> Result<Lease, StoreError> {
+        self.inner.renew(run, o, e, t).await
+    }
     async fn seal(&self, run: RunId, e: Epoch, o: &str) -> Result<Digest, StoreError> {
         self.inner.seal(run, e, o).await
     }
@@ -1037,7 +1128,11 @@ async fn an_edited_record_in_an_open_run_is_not_sound() {
     );
 
     let original = String::from_utf8(bytes).expect("utf8");
-    let edited = original.replace("\"n\":1", "\"n\":9");
+    // Both copies — the readable body and the escaped wire bytes — so the
+    // hash is the only witness left. See `an_edited_record_fails_to_recompute`.
+    let edited = original
+        .replace("\\\"n\\\":1", "\\\"n\\\":9")
+        .replace("\"n\":1", "\"n\":9");
     assert_ne!(original, edited, "the fixture edited nothing");
 
     let report =

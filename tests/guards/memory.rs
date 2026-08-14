@@ -827,7 +827,11 @@ async fn a_replayed_recall_does_not_refresh_access_retention_again() {
         json!({"value": true}),
         Trust::Untrusted,
     );
-    sliding.access_retention_seconds = Some(60);
+    // Wide enough that the item is still inside its window at the real
+    // wall-clock instant the run recalls it: the window opens at the write —
+    // an untouched item is not immortal — and the fixture's created_at is a
+    // fixed past instant.
+    sliding.access_retention_seconds = Some(60 * 60 * 24 * 365 * 20);
     store.remember(&sliding).await.expect("remember sliding");
     let touches = Arc::new(AtomicUsize::new(0));
     let memories = Arc::new(Counted {

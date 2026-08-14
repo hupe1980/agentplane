@@ -3,6 +3,9 @@
 //! ```sh
 //! agentplane run agent.yaml --input '{"ticket": "printer on fire"}'
 //! agentplane run room.yaml  --input '{"topic": "durable execution"}'
+//! echo '{"ticket": "…"}' | agentplane run agent.yaml --input -
+//! agentplane replay 01J… --store runs.redb --manifest agent.yaml --strict
+//! agentplane card agent.yaml --url https://agents.example.com
 //! agentplane validate room.yaml
 //! agentplane digest room.yaml
 //! ```
@@ -41,9 +44,9 @@
 //! I12 says a declared control must be enforced or rejected by the parser. What
 //! a derive buys is that the bad state stops being representable: a flag lives on
 //! its subcommand's struct, and `run --push-host` fails to parse by
-//! construction. `--strict` `requires` `--replay` in the same way, and `--help`
-//! is generated from the structs that enforce the flags rather than being prose
-//! that can describe an option nobody implemented.
+//! construction — `--strict` belongs to `replay` and fails to parse on `run`
+//! the same way. `--help` is generated from the structs that enforce the flags
+//! rather than being prose that can describe an option nobody implemented.
 //!
 //! It costs 9 crates on `cli` and **nothing on the library**, which is what
 //! settled it: `cli` produces a binary and already carries three hundred.
@@ -99,6 +102,10 @@ struct Cli {
 enum Verb {
     /// Execute an agent once and print its answer.
     Run(RunArgs),
+    /// Re-execute a recorded run: resume it, or verify it with --strict.
+    Replay(ReplayArgs),
+    /// Print the Agent Card a served manifest would advertise.
+    Card(CardArgs),
     /// Host an agent as an A2A 1.0 peer.
     Serve(Box<ServeArgs>),
     /// Check every document in a file, and say what is in it.
@@ -238,7 +245,7 @@ struct RunArgs {
     /// The manifest, or a `---`-separated file of them.
     manifest: String,
 
-    /// The run's input, as JSON. Defaults to `{}`.
+    /// The run's input, as JSON. `-` reads standard input. Defaults to `{}`.
     #[arg(long, conflicts_with = "input_file")]
     input: Option<String>,
 
@@ -254,14 +261,6 @@ struct RunArgs {
     #[arg(long, env = "AGENTPLANE_STORE")]
     store: Option<String>,
 
-    /// Re-execute a recorded run instead of starting one.
-    #[arg(long)]
-    replay: Option<String>,
-
-    /// With --replay: verify rather than resume.
-    #[arg(long, requires = "replay")]
-    strict: bool,
-
     /// Run an MCP server as a child process and reach it as `tool://NAME/...`.
     ///
     /// Repeatable, one per server. The manifest grants the tools; this says only
@@ -270,6 +269,56 @@ struct RunArgs {
     /// Needs the `mcp-stdio` feature.
     #[arg(long, value_name = "NAME=COMMAND")]
     mcp: Vec<String>,
+}
+
+/// Re-execute a recorded run.
+///
+/// Its own verb rather than a `run --replay` flag, because the two share
+/// almost nothing: a replay has no input, no capability choice and no default
+/// store — the journal *is* the subject — and a flag table where half the
+/// flags are meaningless under another flag is the silently-accepted-option
+/// defect this parser was adopted to remove.
+#[derive(clap::Args, Debug)]
+struct ReplayArgs {
+    /// The run to re-execute.
+    run_id: String,
+
+    /// The journal holding it. Required: there is nothing to replay in a
+    /// memory store this process did not itself write.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: String,
+
+    /// The manifest (or `---`-separated room) the run executed under.
+    ///
+    /// Required, because a replay re-executes the deterministic zone and a
+    /// declarative agent's manifest *is* that code. Hand it the same document;
+    /// a journal written by a different declaration is divergence, and the
+    /// run is quarantined rather than continued — which is the desired
+    /// outcome, not a limitation.
+    #[arg(long)]
+    manifest: String,
+
+    /// Verify rather than resume: read every effect back and fail if this
+    /// build would do more, less, or different work than the record.
+    #[arg(long)]
+    strict: bool,
+
+    /// Run an MCP server as a child process, as `run` takes it. A resume that
+    /// continues past its recorded history dispatches live and may need one.
+    #[arg(long, value_name = "NAME=COMMAND")]
+    mcp: Vec<String>,
+}
+
+/// Print the Agent Card a served manifest would advertise.
+#[derive(clap::Args, Debug)]
+struct CardArgs {
+    /// The manifest. A card names one agent, exactly as `serve` hosts one.
+    manifest: String,
+
+    /// The public base URL the card advertises — what `serve --url` would be
+    /// handed, without serving anything.
+    #[arg(long, env = "AGENTPLANE_URL")]
+    url: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -558,11 +607,38 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let manifests = manifests_at(&a.manifest)?;
             execute(&manifests, &a)
         }
+        Verb::Replay(a) => {
+            let manifests = manifests_at(&a.manifest)?;
+            replay(&manifests, &a)
+        }
+        Verb::Card(a) => card(&a),
         Verb::Serve(a) => {
             let manifests = manifests_at(&a.manifest)?;
             serve(&manifests, &a)
         }
     }
+}
+
+/// Print the Agent Card a served manifest would advertise.
+fn card(opts: &CardArgs) -> Result<ExitCode, String> {
+    // One card, one agent — the same rule `serve` applies, because this verb
+    // prints exactly what `serve` would advertise.
+    let manifests = manifests_at(&opts.manifest)?;
+    let [manifest] = manifests.as_slice() else {
+        return Err(format!(
+            "`card` describes one agent and this file holds {}. A2A's card \
+             path is well-known and singular — split the file, or point this \
+             at the document you would serve",
+            manifests.len()
+        ));
+    };
+    let card =
+        agentplane::peers::AgentCard::derive(manifest, &opts.url).map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&card).map_err(|e| e.to_string())?
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn main() -> ExitCode {
@@ -582,6 +658,18 @@ fn main() -> ExitCode {
 impl RunArgs {
     fn read_input(&self) -> Result<serde_json::Value, String> {
         let text = match (&self.input, &self.input_file) {
+            // `-` is stdin, the convention every pipe-shaped tool honours and
+            // `verify` here already does. It belongs to `--input`, not
+            // `--input-file`: a file literally named `-` is reachable as
+            // `./-`, and a pipe is not reachable any other way.
+            (Some(s), _) if s == "-" => {
+                use std::io::Read as _;
+                let mut text = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut text)
+                    .map_err(|e| format!("reading standard input: {e}"))?;
+                text
+            }
             (Some(s), _) => s.clone(),
             (_, Some(p)) => std::fs::read_to_string(p).map_err(|e| format!("reading {p}: {e}"))?,
             _ => "{}".into(),
@@ -692,25 +780,21 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
         )?;
         let store = Arc::new(RedbStore::open(path).map_err(|e| e.to_string())?);
 
-        let mut builder = with_providers(
-            Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>),
-            std::slice::from_ref(manifest),
-        )
-        .await?;
         // **The whole plane, not a corner of it.** One redb file backs every
         // store this runtime has, and a server that wired only the journal and
         // the case layer would accept an agent that waits, sleeps or opens a
         // human task and then never make progress on any of them — a suspended
-        // run is a row, and something has to come back for it.
+        // run is a row, and something has to come back for it. `builder_on`
+        // wires all six stores to the file in one call.
+        let mut builder = with_providers(
+            Runtime::builder_on(Arc::clone(&store)),
+            std::slice::from_ref(manifest),
+        )
+        .await?;
         for (name, client) in connect_mcp_servers(&opts.mcp).await? {
             builder = builder.tool_server(name, client);
         }
         builder = builder
-            .cases(Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>)
-            .tasks(Arc::clone(&store) as Arc<dyn agentplane::case::TaskStore>)
-            .events(Arc::clone(&store) as Arc<dyn agentplane::case::EventStore>)
-            .timers(Arc::clone(&store) as Arc<dyn agentplane::case::TimerStore>)
-            .memory(Arc::clone(&store) as Arc<dyn agentplane::memory::MemoryStore>)
             .policy(Arc::new(policy) as Arc<dyn agentplane::core::PolicyEngine>)
             .agent(agentplane::runtime::Agent::new(manifest));
         let runtime = builder.try_build().map_err(|e| e.to_string())?;
@@ -1024,7 +1108,8 @@ fn serve(_manifests: &[Manifest], _opts: &ServeArgs) -> Result<ExitCode, String>
     )
 }
 
-fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
+/// Refuse a file whose behaviour is not in the file.
+fn require_declarative(manifests: &[Manifest]) -> Result<(), String> {
     for manifest in manifests {
         if manifest.spec.execution.is_none() {
             return Err(format!(
@@ -1035,6 +1120,28 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
             ));
         }
     }
+    Ok(())
+}
+
+/// The verbs' shared tail: report the run, print the answer, exit honestly.
+fn conclude(outcome: &agentplane::runtime::RunOutcome) -> ExitCode {
+    eprintln!("run {} — {:?}", outcome.run_id, outcome.status);
+    if let Some(output) = &outcome.output {
+        // The answer on stdout and everything else on stderr, so this
+        // composes with a pipe instead of needing a flag to be quiet.
+        println!("{}", output.peek());
+    }
+    // A refused, exhausted or failed run must not exit zero: whoever scripts
+    // this needs the shell's own answer to "did it work".
+    if matches!(outcome.status, RunStatus::Succeeded) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
+    require_declarative(manifests)?;
 
     // Current-thread on purpose. A CLI runs one agent and exits, so a work
     // stealing pool buys nothing and would mean pulling `rt-multi-thread` into
@@ -1066,37 +1173,53 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
         // sentence, not a programmer error worth a crash.
         let agent = builder.try_build().map_err(|e| e.to_string())?;
 
-        let outcome = if let Some(id) = &opts.replay {
-            let run = agentplane::core::RunId::parse(id)
-                .map_err(|e| format!("`{id}` is not a run id: {e}"))?;
-            let mode = if opts.strict {
-                Mode::Strict
-            } else {
-                Mode::Resume
-            };
-            agent.replay(run, mode).await
-        } else {
-            let capability = entry_capability(manifests, opts.capability.as_deref())?;
-            agent
-                .run(&capability, Tainted::trusted(opts.read_input()?))
-                .await
-        }
-        .map_err(|e| e.to_string())?;
+        let capability = entry_capability(manifests, opts.capability.as_deref())?;
+        let outcome = agent
+            .run(&capability, Tainted::trusted(opts.read_input()?))
+            .await
+            .map_err(|e| e.to_string())?;
 
-        eprintln!("run {} — {:?}", outcome.run_id, outcome.status);
-        if let Some(output) = &outcome.output {
-            // The answer on stdout and everything else on stderr, so this
-            // composes with a pipe instead of needing a flag to be quiet.
-            println!("{}", output.peek());
-        }
+        Ok(conclude(&outcome))
+    })
+}
 
-        // A refused, exhausted or failed run must not exit zero: whoever scripts
-        // this needs the shell's own answer to "did it work".
-        Ok(if matches!(outcome.status, RunStatus::Succeeded) {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        })
+/// Re-execute a recorded run against the same declaration.
+///
+/// The plane is rebuilt exactly as `run` builds it — same providers, same MCP
+/// wiring, same agents — plus the whole case layer, because a **resume** may
+/// continue past its recorded history and dispatch live: a run that suspended
+/// on a task or a timer needs the stores those live in. `--strict` never
+/// dispatches; it reads the history back and fails if this build diverges.
+fn replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, String> {
+    require_declarative(manifests)?;
+
+    let run = agentplane::core::RunId::parse(&opts.run_id)
+        .map_err(|e| format!("`{}` is not a run id: {e}", opts.run_id))?;
+    let mode = if opts.strict {
+        Mode::Strict
+    } else {
+        Mode::Resume
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    rt.block_on(async {
+        let store = Arc::new(RedbStore::open(&opts.store).map_err(|e| e.to_string())?);
+        let mut builder =
+            with_providers(Runtime::builder_on(Arc::clone(&store)), manifests).await?;
+        for (name, client) in connect_mcp_servers(&opts.mcp).await? {
+            builder = builder.tool_server(name, client);
+        }
+        for manifest in manifests {
+            builder = builder.agent(agentplane::runtime::Agent::new(manifest));
+        }
+        let agent = builder.try_build().map_err(|e| e.to_string())?;
+
+        let outcome = agent.replay(run, mode).await.map_err(|e| e.to_string())?;
+        Ok(conclude(&outcome))
     })
 }
 

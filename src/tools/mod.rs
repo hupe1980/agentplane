@@ -125,30 +125,47 @@ impl ToolId {
 
     /// The inverse of [`reference`](Self::reference).
     ///
-    /// `None` for anything that is not `tool://server/name`. Refusing rather
-    /// than guessing: a reference this cannot parse is one no router can dial,
-    /// and inventing an id from it would grant a tool nobody wrote down.
+    /// `None` for anything that is not `tool://server/name`, and for
+    /// components no wire name could carry — see [`wire_name`](Self::wire_name)
+    /// for the charset. Refusing rather than guessing: a reference this cannot
+    /// parse is one no router can dial, and inventing an id from it would
+    /// grant a tool nobody wrote down.
     #[must_use]
     pub fn parse(reference: &str) -> Option<Self> {
         let rest = reference.strip_prefix(TOOL_SCHEME)?;
         let (server, tool) = rest.split_once('/')?;
-        (!server.is_empty() && !tool.is_empty() && !tool.contains('/'))
+        (valid_component(server) && valid_component(tool) && !tool.contains('/'))
             .then(|| Self::new(server, tool))
     }
 
-    /// How a **model** names this tool: `server__tool`.
+    /// How a **model** names this tool: `server__tool`, dots rendered as `-`.
     ///
-    /// Neither `tool://server/tool` nor `server/tool` is a legal function name —
-    /// providers restrict them to letters, digits, underscore and hyphen, so a
-    /// `:` or `/` is rejected before the model ever sees the tool. The double
-    /// underscore is the separator because a single one appears inside ordinary
-    /// tool names and would make `a_b/c` and `a/b_c` collide. Underscores in
-    /// either component are escaped as `_u`, so the separator can never occur
-    /// inside an encoded component: `a__b/c` and `a/b__c` remain distinct
-    /// rather than being refused or resolved by map order.
+    /// Neither `tool://server/tool` nor `server/tool` is a legal function name
+    /// — providers restrict them to letters, digits, underscore and hyphen
+    /// (Gemini also permits dots, but a name must be legal everywhere) — so a
+    /// `:` or `/` is rejected before the model ever sees the tool. Two rules
+    /// make the rendering readable *and* injective:
     ///
-    /// This is the name [`ToolCatalog::resolve`] matches, because it is the only
-    /// one a model can actually emit.
+    /// * **`.` becomes `-`.** Capabilities are conventionally dotted
+    ///   (`blog.research`), and `-` is legal in every shipped provider's
+    ///   charset — so `tool://agent/blog.research` reads as
+    ///   `agent__blog-research` rather than an escape soup.
+    /// * **The separator is `__`, and it cannot occur elsewhere.** Components
+    ///   are refused at declaration if they contain `-` (which would collide
+    ///   with a rendered dot), contain `__`, or start or end with `_` (either
+    ///   of which would let ordinary underscores run into the separator). The
+    ///   one `__` in a wire name is therefore the boundary, and the mapping
+    ///   back is exact.
+    ///
+    /// An earlier scheme escaped `_`→`_u` and `.`→`_d`, which was injective
+    /// and unreadable — `agent__blog_dresearch` — and its readability cost was
+    /// paid at exactly the wrong moment: by someone diffing a model's chosen
+    /// tool against an operator's grant. Refusing a few pathological names at
+    /// declaration ([`ToolCatalog::allow`] panics; [`ToolId::parse`] returns
+    /// `None`) is the better trade.
+    ///
+    /// This is the name [`ToolCatalog::resolve`] matches, because it is the
+    /// only one a model can actually emit.
     #[must_use]
     pub fn wire_name(&self) -> String {
         format!(
@@ -159,18 +176,29 @@ impl ToolId {
     }
 }
 
-/// Escape the separator byte, and the one byte providers refuse.
+/// Render one component for the wire: dots become hyphens.
 ///
-/// Every input underscore becomes `_u`, so encoded components contain no `__`
-/// and concatenating two of them with `__` is injective. Dots become `_d` for
-/// a different reason: providers restrict function names to letters, digits,
-/// underscore and hyphen, and **capabilities are conventionally dotted**
-/// (`research.summarise`) — so an agent offered as a tool would otherwise be
-/// declared under a name the provider rejects before the model ever sees it.
-/// The escapes stay injective together because both rewrite into `_`-prefixed
-/// pairs after every original `_` has been escaped.
+/// Injective because [`valid_component`] refuses a literal `-` on the way in —
+/// every hyphen a model sees denotes a dot, and every other byte is itself.
 fn wire_component(value: &str) -> String {
-    value.replace('_', "_u").replace('.', "_d")
+    value.replace('.', "-")
+}
+
+/// Whether a server or tool name may appear in a wire name.
+///
+/// Letters, digits, `_` and `.` only; no `__`; no leading or trailing `_`; no
+/// `-`. Each refusal protects the wire rendering's injectivity or the
+/// providers' charsets — see [`ToolId::wire_name`] — and each is enforced
+/// where a tool is *declared*, never against a name a model emitted: a model's
+/// near-miss is a failed resolve, not a panic.
+fn valid_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && !value.contains("__")
+        && !value.starts_with('_')
+        && !value.ends_with('_')
 }
 
 impl std::fmt::Display for ToolId {
@@ -460,8 +488,23 @@ impl ToolCatalog {
     }
 
     /// Permit a tool, with the operator's declaration of what it does.
+    ///
+    /// # Panics
+    ///
+    /// If either component of the id could not appear in a wire name — a
+    /// literal `-`, a `__`, a leading or trailing `_`, or a byte outside
+    /// letters, digits, `_` and `.` — because a granted tool the model cannot
+    /// be offered under an unambiguous name is a wiring mistake, and this is
+    /// the one place every declaration passes. See [`ToolId::wire_name`].
     #[must_use]
     pub fn allow(mut self, id: ToolId, safety: ToolSafety) -> Self {
+        assert!(
+            valid_component(&id.server) && valid_component(&id.tool),
+            "tool id '{id}' cannot be rendered as a wire name: server and tool may \
+             hold letters, digits, `_` and `.`, with no `-`, no `__`, and no leading \
+             or trailing `_` — a name outside that set would collide with, or split \
+             on, the `__` separator and the `.`→`-` rendering"
+        );
         self.entries.insert(id, (safety, Advertised::default()));
         self
     }
@@ -823,6 +866,18 @@ impl Effect for ToolCall {
     /// cannot: the catalogue governs authority, not provenance.
     fn trust(&self) -> Trust {
         Trust::Untrusted
+    }
+
+    /// The tool's own reference, so a source rule can name *this* tool.
+    ///
+    /// `tool://server/name` — the spelling a manifest grants and a reviewer
+    /// reads. Under the family-level default every granted tool answered as
+    /// `effect:tool.call`, so a `ProtectedField::from_sources` rule could not
+    /// distinguish the CRM lookup from the ticket search: "the recipient must
+    /// come from the CRM" was unsatisfiable strictly, and satisfiable loosely
+    /// by whichever tool an injected prompt reached first.
+    fn source(&self) -> crate::core::SourceId {
+        crate::core::SourceId::new(self.id.reference())
     }
 
     fn attach(&mut self, provenance: &crate::core::Provenance) {

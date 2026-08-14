@@ -76,11 +76,40 @@ impl SealedJournal {
         )
     }
 
-    /// Bound to the run, so an envelope lifted into another run's history
-    /// fails to authenticate rather than opening as somebody else's data.
+    /// The associated data a record's payloads authenticate under.
+    ///
+    /// The ciphertext binds **tenant, record identity and purpose** as
+    /// authenticated associated data, and each component here closes one move:
+    ///
+    /// * the purpose label separates this from every other envelope the same
+    ///   ring seals, so a case-state envelope cannot be replayed as a journal
+    ///   payload;
+    /// * the tenant stops an envelope crossing tenants that happen to share a
+    ///   ring (scopes already differ, but the AAD must not be the only thing
+    ///   left agreeing);
+    /// * the run stops an envelope lifted into another run's history from
+    ///   opening as somebody else's data;
+    /// * the record kind stops a payload moving between fields *within* a run
+    ///   — an `EffectDone` output replayed as a `RunAdmitted` input;
+    /// * the effect key (`-` when the record has none) pins an effect payload
+    ///   to its effect, so one attempt's output cannot be presented as
+    ///   another's.
+    ///
     /// Position within a run needs no binding: the chain already covers it.
-    fn aad(run: RunId) -> String {
-        run.to_string()
+    /// The kind string is the serde tag, stable across upcasts, so a record
+    /// written today still opens after a schema bump.
+    fn aad(
+        &self,
+        run: RunId,
+        kind: &crate::journal::RecordKind,
+        effect: Option<crate::core::EffectKey>,
+    ) -> String {
+        format!(
+            "journal:{}:{run}:{}:{}",
+            self.tenant,
+            kind.kind_str(),
+            effect.map_or_else(|| "-".to_owned(), crate::core::EffectKey::to_hex),
+        )
     }
 }
 
@@ -104,19 +133,43 @@ impl JournalStore for SealedJournal {
         let mut sealed = Vec::with_capacity(batch.len());
         for mut entry in batch {
             let scope = self.scope_for(entry.run, entry.case);
-            let aad = Self::aad(entry.run);
+            let aad = self.aad(entry.run, &entry.kind, entry.effect_key);
             for field in payload::payloads(&mut entry.kind) {
-                // Canonical bytes: the same reason every other digest input in
-                // this crate is canonical, and here it also means a payload
-                // seals identically however the map was built.
-                let plain = crate::core::canon::to_bytes(&*field).map_err(|e| {
-                    StoreError::Backend(format!("a payload would not serialise: {e}"))
-                })?;
-                let envelope =
-                    super::envelope::seal(self.keys.as_ref(), &scope, aad.as_bytes(), &plain)
+                match field {
+                    payload::SealedField::Value(field) => {
+                        // Canonical bytes: the same reason every other digest
+                        // input in this crate is canonical, and here it also
+                        // means a payload seals identically however the map
+                        // was built.
+                        let plain = crate::core::canon::to_bytes(&*field).map_err(|e| {
+                            StoreError::Backend(format!("a payload would not serialise: {e}"))
+                        })?;
+                        let envelope = super::envelope::seal(
+                            self.keys.as_ref(),
+                            &scope,
+                            aad.as_bytes(),
+                            &plain,
+                        )
                         .await
                         .map_err(|e| sealing(&e))?;
-                *field = payload::wrap(&envelope);
+                        *field = payload::wrap(&envelope);
+                    }
+                    // A text field seals over its UTF-8 bytes and is replaced
+                    // by a marked string rather than an object, because the
+                    // field's wire type is a string and the record must
+                    // serialise with the same shape sealed or clear.
+                    payload::SealedField::Text(field) => {
+                        let envelope = super::envelope::seal(
+                            self.keys.as_ref(),
+                            &scope,
+                            aad.as_bytes(),
+                            field.as_bytes(),
+                        )
+                        .await
+                        .map_err(|e| sealing(&e))?;
+                        *field = payload::wrap_text(&envelope);
+                    }
+                }
             }
             sealed.push(entry);
         }
@@ -151,6 +204,16 @@ impl JournalStore for SealedJournal {
         ttl: std::time::Duration,
     ) -> Result<Lease, StoreError> {
         self.inner.acquire(run, owner, ttl).await
+    }
+
+    async fn renew(
+        &self,
+        run: RunId,
+        owner: &str,
+        epoch: Epoch,
+        ttl: std::time::Duration,
+    ) -> Result<Lease, StoreError> {
+        self.inner.renew(run, owner, epoch, ttl).await
     }
 
     async fn release_lease(&self, run: RunId, epoch: Epoch) -> Result<(), StoreError> {
@@ -220,22 +283,40 @@ impl SealedJournal {
         let mut out = Vec::with_capacity(records.len());
         for record in records {
             let run = record.body.run;
-            let aad = Self::aad(run);
+            let aad = self.aad(run, record.kind(), record.effect_key());
             let mut kind = record.kind().clone();
             let mut changed = false;
             for field in payload::payloads(&mut kind) {
-                let Some(envelope) = payload::unwrap(field) else {
-                    continue;
-                };
                 // A payload that will not open is left sealed on purpose: the
                 // alternative — failing the read — would make a
                 // cryptographically erased run unreadable *and* unauditable,
                 // turning a discharged obligation into an outage.
-                if let Ok(plain) =
-                    super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope).await
-                {
-                    *field = serde_json::from_slice(&plain)?;
-                    changed = true;
+                match field {
+                    payload::SealedField::Value(field) => {
+                        let Some(envelope) = payload::unwrap(field) else {
+                            continue;
+                        };
+                        if let Ok(plain) =
+                            super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope)
+                                .await
+                        {
+                            *field = serde_json::from_slice(&plain)?;
+                            changed = true;
+                        }
+                    }
+                    payload::SealedField::Text(field) => {
+                        let Some(envelope) = payload::unwrap_text(field) else {
+                            continue;
+                        };
+                        if let Ok(plain) =
+                            super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope)
+                                .await
+                            && let Ok(text) = String::from_utf8(plain)
+                        {
+                            *field = text;
+                            changed = true;
+                        }
+                    }
                 }
             }
             out.push(if changed {

@@ -39,9 +39,12 @@ struct Triage {
 #[async_trait::async_trait]
 impl Skill for Triage {
     fn descriptor(&self) -> SkillDescriptor {
-        // What it *provides* is a capability, not its own name. Plans bind
-        // capabilities to skills, so what a step needs is decoupled from who
-        // provides it — and swapping the implementation is a binding change.
+        // A skill that declares nothing answers its own name — the right
+        // default for a first program. `.provides(..)` is declared here because
+        // the plan below binds the *capability* `ticket.triage`, decoupling
+        // what a step needs from who provides it — and swapping the
+        // implementation is then a binding change. Declaring a capability
+        // replaces the name default rather than adding to it.
         SkillDescriptor::new("triage").provides("ticket.triage")
     }
 
@@ -74,21 +77,25 @@ impl Skill for Triage {
                 Tainted::array([input.map(|i| json!({ "role": "user", "content": i }))]),
             ),
         ]);
-        let call = ModelCall::new(
-            Arc::clone(&self.provider),
-            ModelId::new("anthropic", "claude-sonnet-4-5"),
-            prompt.peek().clone(),
-        )
-        // The ceiling that matters for a hosted model: a prompt assembled from a
-        // secret is an exfiltration whether or not anyone meant it.
-        .with_max_sensitivity(Sensitivity::Internal)
-        .expecting(json!({
-            "type": "object",
-            "properties": { "severity": { "type": "string" } },
-            "required": ["severity"],
-        }));
-
-        let completion = cx.sink(call, &prompt).await?;
+        // `sink_with` hands the labelled value to the effect and the gates in
+        // one motion: the closure receives the inner value, so the bytes the
+        // egress ceiling checks and the bytes the provider is sent cannot be
+        // two versions of one prompt.
+        let provider = Arc::clone(&self.provider);
+        let completion = cx
+            .sink_with(&prompt, |value| {
+                ModelCall::new(provider, ModelId::new("anthropic", "claude-sonnet-4-5"), value)
+                    // The ceiling that matters for a hosted model: a prompt
+                    // assembled from a secret is an exfiltration whether or
+                    // not anyone meant it.
+                    .with_max_sensitivity(Sensitivity::Internal)
+                    .expecting(json!({
+                        "type": "object",
+                        "properties": { "severity": { "type": "string" } },
+                        "required": ["severity"],
+                    }))
+            })
+            .await?;
         Ok(Outcome::done(completion.map(|c| {
             c.structured.unwrap_or(Value::Null)
         })))
@@ -249,10 +256,13 @@ let media_grant = fetched.peek().clone();
 let prompt = fetched.map(|artifact| json!({
     "input": [{ "role": "user", "content": [artifact.openai_image()] }]
 }));
-let call = ModelCall::new(provider, model, prompt.peek().clone())
-    .with_max_sensitivity(Sensitivity::Internal)
-    .with_media(blobs.clone(), [&media_grant]);
-let answer = cx.sink(call, &prompt).await?;
+let answer = cx
+    .sink_with(&prompt, |value| {
+        ModelCall::new(provider, model, value)
+            .with_max_sensitivity(Sensitivity::Internal)
+            .with_media(blobs.clone(), [&media_grant])
+    })
+    .await?;
 ```
 
 Use `artifact.anthropic_image()` for Anthropic,
@@ -452,8 +462,17 @@ or `RequiresOperator`. A mutating effect that declares nothing gets
 
 Declare `trust()` only if the output is *not* somebody else's data — the
 default is untrusted, and it is the right default. If the effect carries an
-outbound value, dispatch it with `cx.sink(effect, &args)` rather than
-`cx.effect`, which refuses it.
+outbound value, dispatch it through the sink gate — `cx.sink_with(&args, |v|
+...)` builds the effect from the labelled value in one motion, and the two-arg
+`cx.sink(effect, &args)` remains for an effect that binds its outbound value
+internally — rather than `cx.effect`, which refuses it. Provenance names the
+concrete source: `source()` defaults to `effect:{kind}`, and the effects whose
+outputs feed authority-bearing fields override it with the identity an operator
+actually grants — a tool call answers as `tool://server/name`, a model
+completion as `model:{provider}/{model}`, a commission as `agent/{capability}`.
+A family name would be too coarse for the rule that matters: "the recipient
+must come from the CRM lookup" is unsatisfiable when every granted tool answers
+under one family.
 
 You do not need an effect for the ordinary nondeterminism: `cx.now()` is the
 journaled clock, `cx.rng()` is seeded per step and reproduces on replay, and
@@ -467,8 +486,9 @@ that recomputed them would disagree with the history it claims to reproduce.
 use agentplane::model::{ModelCall, ModelProvider};
 
 let prompt = input.map(|ticket| json!({ "task": "triage", "ticket": ticket }));
-let call = ModelCall::new(provider, model_id, prompt.peek().clone());
-let completion = cx.sink(call, &prompt).await?;   // Tainted<Completion>
+let completion = cx
+    .sink_with(&prompt, |value| ModelCall::new(provider, model_id, value))
+    .await?;   // Tainted<Completion>
 ```
 
 **The trap:** treating a failed call as free. A model call has a third state
@@ -484,8 +504,9 @@ burned. You do not have to do anything to get that.
 
 ```rust
 let prompt = Tainted::trusted(prompt);
-let call = ModelCall::new(provider, model, prompt.peek().clone()).expecting(schema);
-let completion = cx.sink(call, &prompt).await?;
+let completion = cx
+    .sink_with(&prompt, |value| ModelCall::new(provider, model, value).expecting(schema))
+    .await?;
 let value = completion.peek().structured.as_ref().expect("a schema was declared");
 ```
 
@@ -635,11 +656,19 @@ spec:
         - path: /target
           require_trusted: true
         - path: /correction
-          allowed_sources: [effect:model.complete]
+          allowed_sources: [model:anthropic/claude-sonnet-5]
   budgets:
     max_tokens: 120000
     max_minor_units: 250      # cents, never a float
 ```
+
+A source rule names the **concrete** source, because that is what an effect's
+output carries as provenance: a tool call answers as `tool://server/name`, a
+model completion as `model:{provider}/{model}`, a commission as
+`agent/{capability}`. A family spelling like `effect:model.complete` matches
+nothing — a family is too coarse for the rule that matters, since "the
+correction must come from the privileged model" is unsatisfiable when every
+completion answers under one name.
 
 ```rust
 use agentplane::manifest::Manifest;
@@ -733,14 +762,17 @@ let args = Tainted::object([
 ]);
 let safety = ToolSafety::default()
     .protect(ProtectedField::trusted("/recipient"));
-let call = ToolCall::prepare(&catalog, client, tool, args.peek().clone())?;
-let result = cx.sink(call, &args).await?;
+let result = cx
+    .sink_with(&args, |value| ToolCall::prepare(&catalog, client, tool, value))
+    .await?;
 ```
 
-The recipient must remain trusted; the memo may remain untrusted. `sink` also
-compares canonical JSON, so a call cannot validate `args` and dispatch a
-different recipient. Effects carrying outbound values are rejected by
-`cx.effect`, making this gate mandatory rather than conventional.
+The recipient must remain trusted; the memo may remain untrusted. `sink_with`
+hands the labelled value to the call and the gates in one motion, and the
+byte-for-byte binding check still runs underneath — canonical JSON is compared,
+so a call cannot validate `args` and dispatch a different recipient. Effects
+carrying outbound values are rejected by `cx.effect`, making this gate
+mandatory rather than conventional.
 
 When a trusted process authorizes a change, release the smallest possible
 field and name the decision:
@@ -2165,7 +2197,7 @@ let (history, _version) = cx.case_state().await?;
 //    The history is untrusted, so it goes in `messages`; the instruction that
 //    says *rewrite this as a standalone question* is the manifest's, and
 //    trusted, which is why `/system` is a protected field.
-let standalone = cx.sink(ModelCall::new(provider, model, prompt), &prompt).await?;
+let standalone = cx.sink_with(&prompt, |value| ModelCall::new(provider, model, value)).await?;
 
 // 3. Embed the rewritten question — never the raw turn.
 let vector = cx.embed(embedder, standalone.map(|c| c.text.clone())).await?;
@@ -2375,8 +2407,8 @@ let plane = |name: &str| {
     let tenant = TenantId::new(name)?;
     let store = Arc::new(base.clone().for_tenant(tenant.clone()));
     Ok::<_, Box<dyn std::error::Error>>(
-        Runtime::builder(store.clone() as Arc<dyn JournalStore>)
-            .cases(store as Arc<dyn CaseStore>)
+        // `builder_on` wires every store to this tenant's scoped handle.
+        Runtime::builder_on(store)
             .tenant(tenant)
             .policy(rules_for(name))
             .skill(Triage)
@@ -2427,8 +2459,10 @@ the builder seals the journal, the case store, the worklist, the event buffer
 and blob payloads.
 
 ```rust
-let rt = Runtime::builder(store)
-    .cases(cases).events(events).tasks(tasks)
+// `builder_on` wires all six stores — journal, cases, tasks, events, timers,
+// memory — to one backend in one call, which is what a deployment on a single
+// `RedbStore` or `PostgresStore` means anyway.
+let rt = Runtime::builder_on(store)
     .keyring(keys)          // seals all of them
     .build();
 ```

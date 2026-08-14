@@ -403,6 +403,8 @@ async fn a_crash_orphan_is_resolved_by_the_probe_rather_than_escalated() {
         )
         .await
         .unwrap();
+    // The process died: its lease is claimable, not renewable.
+    f.store.release_lease(run, lease.epoch).await.unwrap();
 
     let out = f.rt.replay(run, Mode::Resume).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);

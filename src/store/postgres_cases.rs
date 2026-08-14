@@ -51,10 +51,14 @@ CREATE TABLE IF NOT EXISTS cases (
     -- backend is the one that exists for several plane instances sharing a
     -- store, so the overlapping read-modify-write is not a corner case here —
     -- it is the normal operating condition.
-    version   BIGINT NOT NULL DEFAULT 0,
+    version   BIGINT NOT NULL DEFAULT 0 CHECK (version >= 0),
     opened_at BIGINT NOT NULL,
     PRIMARY KEY (tenant, case_id)
 );
+
+-- The worklist read: cases by status, newest first.
+CREATE INDEX IF NOT EXISTS cases_by_status
+    ON cases (tenant, status, opened_at DESC);
 
 CREATE TABLE IF NOT EXISTS case_correlation (
     tenant    TEXT    NOT NULL,
@@ -81,10 +85,17 @@ CREATE TABLE IF NOT EXISTS case_runs (
     tenant  TEXT   NOT NULL,
     case_id TEXT   NOT NULL,
     run_id  TEXT   NOT NULL,
-    seq     BIGINT NOT NULL,
+    seq     BIGINT NOT NULL CHECK (seq >= 0),
     PRIMARY KEY (tenant, case_id, run_id),
     FOREIGN KEY (tenant, case_id) REFERENCES cases (tenant, case_id) ON DELETE CASCADE
 );
+
+-- One run per position. `attach_run` allocates seq as MAX+1, and two instances
+-- attaching different runs concurrently would both compute the same next
+-- position; the constraint makes the collision an error the store retries
+-- rather than two runs silently sharing a place in the case's order.
+CREATE UNIQUE INDEX IF NOT EXISTS case_runs_order
+    ON case_runs (tenant, case_id, seq);
 
 -- The blobs a case produced. The case is what an erasure request names, and a
 -- digest cannot be reversed to find its case, so the link has to be recorded
@@ -113,6 +124,10 @@ CREATE TABLE IF NOT EXISTS case_deadlines (
     FOREIGN KEY (tenant, case_id) REFERENCES cases (tenant, case_id) ON DELETE CASCADE
 );
 
+-- The sweep's read: outstanding obligations by due instant.
+CREATE INDEX IF NOT EXISTS case_deadlines_due
+    ON case_deadlines (tenant, state, resolved_at);
+
 CREATE TABLE IF NOT EXISTS inbound_events (
     -- The dedup identity is (source, id), CloudEvents' uniqueness pair. Keying
     -- on id alone deduplicates two producers into each other: id is unique
@@ -135,6 +150,17 @@ CREATE TABLE IF NOT EXISTS inbound_events (
     PRIMARY KEY (tenant, event_id)
 );
 
+-- The sweep's read: live unclaimed events by age. Partial, so the index is
+-- exactly the sweep's candidate set rather than the whole buffer.
+CREATE INDEX IF NOT EXISTS inbound_events_live
+    ON inbound_events (tenant, received_at)
+    WHERE claimed_by IS NULL AND NOT dead;
+
+-- The dead-letter view: retired events, newest first.
+CREATE INDEX IF NOT EXISTS inbound_events_dead
+    ON inbound_events (tenant, received_at DESC)
+    WHERE dead;
+
 CREATE TABLE IF NOT EXISTS inbound_correlation (
     tenant    TEXT NOT NULL,
     event_id  TEXT NOT NULL,
@@ -144,6 +170,10 @@ CREATE TABLE IF NOT EXISTS inbound_correlation (
     FOREIGN KEY (tenant, event_id)
         REFERENCES inbound_events (tenant, event_id) ON DELETE CASCADE
 );
+
+-- The claim path's join: which buffered events carry this business key.
+CREATE INDEX IF NOT EXISTS inbound_correlation_by_key
+    ON inbound_correlation (tenant, namespace, value);
 
 -- The match path: an arriving event finds the runs waiting for it here. The
 -- tenant leads for the same reason it leads `case_correlation_open`, and this
@@ -162,6 +192,12 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     created_at BIGINT NOT NULL,
     PRIMARY KEY (tenant, run_id, effect_key, namespace, value)
 );
+
+-- The match path's read: who is waiting on this kind and key. The primary key
+-- leads with the run for targeted delivery; this serves the arriving event,
+-- which knows only what it carries.
+CREATE INDEX IF NOT EXISTS subscriptions_by_key
+    ON subscriptions (tenant, event_kind, namespace, value);
 
 CREATE TABLE IF NOT EXISTS timers (
     tenant     TEXT   NOT NULL,
@@ -193,6 +229,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     PRIMARY KEY (tenant, task_id)
 );
 
+-- The queue's read: pending work in arrival order.
+CREATE INDEX IF NOT EXISTS tasks_queue
+    ON tasks (tenant, state, created_at);
+
+-- The overdue sweep's read. Partial: most tasks have no window to close.
+CREATE INDEX IF NOT EXISTS tasks_due
+    ON tasks (tenant, due_at)
+    WHERE due_at IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS batches (
     tenant      TEXT    NOT NULL,
     batch_id    TEXT    NOT NULL,
@@ -208,8 +253,10 @@ CREATE TABLE IF NOT EXISTS batch_items (
     run_id   TEXT   NOT NULL,
     outcome  TEXT,
     detail   TEXT,
-    tokens   BIGINT NOT NULL DEFAULT 0,
-    minor    BIGINT NOT NULL DEFAULT 0,
+    -- Spend cannot be negative; the docs say so, and a constraint is the only
+    -- form of cannot a shared store honours.
+    tokens   BIGINT NOT NULL DEFAULT 0 CHECK (tokens >= 0),
+    minor    BIGINT NOT NULL DEFAULT 0 CHECK (minor >= 0),
     PRIMARY KEY (tenant, batch_id, item_key),
     FOREIGN KEY (tenant, batch_id) REFERENCES batches (tenant, batch_id) ON DELETE CASCADE
 );
@@ -242,8 +289,8 @@ CREATE TABLE IF NOT EXISTS quota_halted (
 CREATE TABLE IF NOT EXISTS quota_spent (
     tenant      TEXT   NOT NULL,
     period      TEXT   NOT NULL,
-    tokens      BIGINT NOT NULL DEFAULT 0,
-    minor_units BIGINT NOT NULL DEFAULT 0,
+    tokens      BIGINT NOT NULL DEFAULT 0 CHECK (tokens >= 0),
+    minor_units BIGINT NOT NULL DEFAULT 0 CHECK (minor_units >= 0),
     PRIMARY KEY (tenant, period)
 );
 ";
@@ -647,19 +694,41 @@ impl CaseStore for PostgresStore {
 
     async fn attach_run(&self, case: CaseId, run: RunId) -> Result<(), StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        client
-            .execute(
-                "INSERT INTO case_runs (case_id, run_id, seq, tenant)
-                 VALUES ($1, $2,
-                         (SELECT COALESCE(MAX(seq), 0) + 1 FROM case_runs
-                           WHERE case_id = $1 AND tenant = $3),
-                         $3)
-                 ON CONFLICT (tenant, case_id, run_id) DO NOTHING",
-                &[&case.to_string(), &run.to_string(), &self.tenant_name()],
-            )
-            .await
-            .map_err(|e| be(&e))?;
-        Ok(())
+        // Zero-based, matching `import_case`'s enumeration — one rule for what
+        // position the first run holds, whichever door it came through.
+        //
+        // The MAX+1 subquery is not atomic with the insert: two instances
+        // attaching different runs both compute the same next position, and
+        // the `case_runs_order` unique index turns that from two runs silently
+        // sharing a place in the case's history into a violation this loop
+        // retries. The `ON CONFLICT` arm still absorbs only the *idempotence*
+        // conflict — the same run attached twice — because it names the
+        // primary key's columns; a seq collision surfaces as the error the
+        // retry exists for. Bounded, because unbounded politeness under a
+        // pathological writer is a hang: past the bound the collision is
+        // reported rather than spun on.
+        for _ in 0..8 {
+            let result = client
+                .execute(
+                    "INSERT INTO case_runs (case_id, run_id, seq, tenant)
+                     VALUES ($1, $2,
+                             (SELECT COALESCE(MAX(seq) + 1, 0) FROM case_runs
+                               WHERE case_id = $1 AND tenant = $3),
+                             $3)
+                     ON CONFLICT (tenant, case_id, run_id) DO NOTHING",
+                    &[&case.to_string(), &run.to_string(), &self.tenant_name()],
+                )
+                .await;
+            match result {
+                Ok(_) => return Ok(()),
+                Err(e) if e.code() == Some(&SqlState::UNIQUE_VIOLATION) => {}
+                Err(e) => return Err(be(&e)),
+            }
+        }
+        Err(StoreError::Backend(format!(
+            "could not attach run {run} to case {case}: the run-order position was \
+             claimed concurrently on every attempt"
+        )))
     }
 
     async fn link_blob(
@@ -803,16 +872,23 @@ impl CaseStore for PostgresStore {
             )));
         }
 
-        tx.execute(
-            "UPDATE cases SET status = $2 WHERE case_id = $1 AND tenant = $3",
-            &[
-                &case.to_string(),
-                &CaseStatus::Closed.as_str(),
-                &self.tenant_name(),
-            ],
-        )
-        .await
-        .map_err(|e| be(&e))?;
+        // The row count is read: closing a case that does not exist reported
+        // success, while the redb backend answers `NotFound` — and the caller
+        // of a silent close believes an audited matter was settled.
+        let n = tx
+            .execute(
+                "UPDATE cases SET status = $2 WHERE case_id = $1 AND tenant = $3",
+                &[
+                    &case.to_string(),
+                    &CaseStatus::Closed.as_str(),
+                    &self.tenant_name(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if n == 0 {
+            return Err(StoreError::NotFound(case.to_string()));
+        }
         // Releasing the keys is what lets a later message open a *new* matter
         // rather than reanimating an audited one.
         tx.execute(
@@ -869,7 +945,11 @@ impl CaseStore for PostgresStore {
         state: DeadlineState,
     ) -> Result<(), StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        client
+        // The row count is read: a transition for an obligation that does not
+        // exist reported success, while the redb backend answers `NotFound` —
+        // and the sweep that believes it breached a deadline nobody registered
+        // has written its decision into nothing.
+        let n = client
             .execute(
                 "UPDATE case_deadlines SET state = $3
                   WHERE case_id = $1 AND name = $2 AND tenant = $4",
@@ -882,6 +962,9 @@ impl CaseStore for PostgresStore {
             )
             .await
             .map_err(|e| be(&e))?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("{case}/{name}")));
+        }
         Ok(())
     }
 
@@ -1128,12 +1211,23 @@ impl EventStore for PostgresStore {
         let tx = client.transaction().await.map_err(|e| be(&e))?;
 
         for k in &event.correlation {
+            // `FOR UPDATE` on the subscription row, for the race `deliver_to`
+            // already locks against: two *different* events for one wait. The
+            // claim below guards the event row, so one event never resumed two
+            // runs — but nothing serialised two events electing one waiter.
+            // Both selected it, both claimed their own (unclaimed) event, and
+            // the loser's event was left claimed for a run whose wait the
+            // winner had already satisfied: parked forever, because the sweep
+            // only retires rows with no claim. Locking the row makes the loser
+            // wait; the winner's retirement then deletes it, and the loser's
+            // re-evaluation finds no waiter and leaves its event live.
             let Some(row) = tx
                 .query_opt(
                     "SELECT run_id, effect_key, case_id, step, phase FROM subscriptions
                       WHERE tenant = $4 AND event_kind = $1
                         AND namespace = $2 AND value = $3
-                      ORDER BY created_at ASC LIMIT 1",
+                      ORDER BY created_at ASC LIMIT 1
+                      FOR UPDATE",
                     &[&event.kind, &k.namespace, &k.value, &self.tenant_name()],
                 )
                 .await
@@ -1354,11 +1448,15 @@ impl EventStore for PostgresStore {
         reason: &str,
     ) -> Result<usize, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // `<=`, not `<`: a zero grace window must retire everything already
+        // buffered, and with second-granularity stamps `<` silently spares
+        // anything received this second — the same boundary the redb sweep
+        // states, pinned for both by the conformance battery.
         let n = client
             .execute(
                 "UPDATE inbound_events SET dead = TRUE, dead_reason = $2
                   WHERE tenant = $3 AND claimed_by IS NULL AND NOT dead
-                    AND received_at < $1",
+                    AND received_at <= $1",
                 &[
                     &older_than.unix_timestamp(),
                     &reason.to_owned(),
@@ -1374,7 +1472,7 @@ impl EventStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
-                "SELECT bare_id, kind, payload, received_at, dead_reason, source
+                "SELECT bare_id, kind, payload, received_at, dead_reason, source, event_id
                    FROM inbound_events WHERE tenant = $2 AND dead
                   ORDER BY received_at DESC LIMIT $1",
                 &[
@@ -1387,12 +1485,29 @@ impl EventStore for PostgresStore {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let payload: String = row.get(2);
+            // The correlation keys are read back, as the redb backend reads
+            // them: the first question about an unclaimed message is *what was
+            // it correlated by*, and a reconstructed event with no keys is a
+            // valid-looking message silently stripped of the field that
+            // explains it.
+            let event_id: String = row.get(6);
+            let corr = client
+                .query(
+                    "SELECT namespace, value FROM inbound_correlation
+                      WHERE tenant = $2 AND event_id = $1",
+                    &[&event_id, &self.tenant_name()],
+                )
+                .await
+                .map_err(|e| be(&e))?;
             out.push(DeadLetter {
                 event: InboundEvent {
                     source: row.get(5),
                     id: row.get(0),
                     kind: row.get(1),
-                    correlation: Vec::new(),
+                    correlation: corr
+                        .iter()
+                        .map(|r| CorrelationKey::new(r.get::<_, String>(0), r.get::<_, String>(1)))
+                        .collect(),
                     payload: serde_json::from_str(&payload)?,
                 },
                 received_at: Timestamp::from_unix_timestamp(row.get::<_, i64>(3))
@@ -1706,24 +1821,42 @@ impl TaskStore for PostgresStore {
         }
 
         // The reservation itself is one statement, guarded on the row still
-        // being unheld. Checking above and writing here would leave a window two
-        // reviewers both pass through.
+        // being unheld **and still pending**. Checking above and writing here
+        // would leave a window two reviewers both pass through — and the state
+        // predicate is not redundant with the eligibility read: a sweep can
+        // expire the task between that read and this write, and an UPDATE
+        // keyed on the assignee alone would resurrect an expired task into
+        // `claimed`, un-deciding the expiry policy that already fired on it.
+        // `take_over` and `release` carry the same predicate for the same
+        // reason.
         let updated = client
             .execute(
                 "UPDATE tasks SET assignee = $2, state = 'claimed'
                   WHERE task_id = $1 AND tenant = $3
-                    AND (assignee IS NULL OR assignee = $2)",
+                    AND (assignee IS NULL OR assignee = $2)
+                    AND state IN ('open', 'escalated')",
                 &[&id.to_hex(), &actor.to_owned(), &self.tenant_name()],
             )
             .await
             .map_err(|e| ClaimError::Store(be(&e)))?;
         if updated == 0 {
-            let holder = task_on(&client, &tenant, id)
+            // Which guard refused: state, or holder. Re-read and say so — a
+            // barred claim reported as "held by nobody" sends the reviewer
+            // back to a queue that will refuse them again.
+            let current = task_on(&client, &tenant, id)
                 .await
-                .map_err(ClaimError::Store)?
-                .and_then(|t| t.assignee)
-                .unwrap_or_default();
-            return Err(ClaimError::AlreadyClaimed { task: id, holder });
+                .map_err(ClaimError::Store)?;
+            return Err(match current {
+                None => ClaimError::NotFound(id),
+                Some(t) if !t.state.is_pending() => ClaimError::NotPending {
+                    task: id,
+                    state: t.state,
+                },
+                Some(t) => ClaimError::AlreadyClaimed {
+                    task: id,
+                    holder: t.assignee.unwrap_or_default(),
+                },
+            });
         }
         task_on(&client, &tenant, id)
             .await
@@ -1833,13 +1966,20 @@ impl TaskStore for PostgresStore {
 
     async fn set_state(&self, id: TaskId, state: TaskState) -> Result<(), StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        client
+        // The row count is read, for the reason `release` and `record` read
+        // theirs: a state write that matched nothing reported success, and the
+        // expiry sweep believed it had settled a task no store holds. The
+        // redb backend answers `NotFound`; the conformance battery pins both.
+        let n = client
             .execute(
                 "UPDATE tasks SET state = $2 WHERE task_id = $1 AND tenant = $3",
                 &[&id.to_hex(), &state.as_str(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
+        if n == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
         Ok(())
     }
 

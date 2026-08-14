@@ -152,6 +152,15 @@ impl JournalStore for NoExactlyOnce {
     ) -> Result<(), agentplane::core::StoreError> {
         self.inner.release_lease(run, epoch).await
     }
+    async fn renew(
+        &self,
+        run: agentplane::core::RunId,
+        owner: &str,
+        epoch: agentplane::core::Epoch,
+        ttl: std::time::Duration,
+    ) -> Result<agentplane::journal::Lease, agentplane::core::StoreError> {
+        self.inner.renew(run, owner, epoch, ttl).await
+    }
     async fn seal(
         &self,
         run: agentplane::core::RunId,
@@ -213,6 +222,23 @@ async fn redb_satisfies_the_case_layer_contracts() {
     cc::check_timers(&(Arc::clone(&store) as Arc<dyn TimerStore>), &mut report).await;
     cc::check_tasks(&(Arc::clone(&store) as Arc<dyn TaskStore>), &mut report).await;
     cc::check_batches(&(Arc::clone(&store) as Arc<dyn BatchStore>), &mut report).await;
+
+    // Two tenant handles onto the *same* database, because the tenancy check
+    // is about one backend keeping two tenants apart — two databases would
+    // pass vacuously.
+    let mine = Arc::new(
+        store
+            .as_ref()
+            .clone()
+            .for_tenant(agentplane::core::TenantId::new("acme").expect("valid")),
+    ) as Arc<dyn EventStore>;
+    let other = Arc::new(
+        store
+            .as_ref()
+            .clone()
+            .for_tenant(agentplane::core::TenantId::new("globex").expect("valid")),
+    ) as Arc<dyn EventStore>;
+    cc::check_waiting_tenancy(&mine, &other, &mut report).await;
 
     report.assert_conforms("RedbStore (case layer)");
 }

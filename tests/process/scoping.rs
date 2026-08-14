@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use agentplane::case::{CaseStore, EventStore, TaskStore};
+use agentplane::case::{CaseStore, TaskStore};
 use agentplane::core::{CorrelationKey, Tainted, Trust};
 use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
@@ -74,11 +74,9 @@ fn plane(manifest: &Manifest, answer: serde_json::Value) -> Plane {
         "memories": [{ "key": "language", "content": "prefers German" }]
     }));
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
-    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
-        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
-        .events(Arc::clone(&store) as Arc<dyn EventStore>)
-        .tasks(Arc::clone(&store) as Arc<dyn TaskStore>)
+    // One backend, all six stores: the `builder_on` path a real deployment on
+    // a single file takes, exercised by every test through this helper.
+    let rt = Runtime::builder_on(Arc::clone(&store))
         .provider("fake", Arc::clone(&provider) as Arc<dyn ModelProvider>)
         .agent(Agent::new(manifest))
         .try_build()
@@ -143,6 +141,70 @@ async fn a_correlation_binding_files_each_party_under_its_own_subject() {
             .expect("recall")
             .is_empty(),
         "the binding was filed literally, which would pool every party again"
+    );
+}
+
+/// The quarantined role's own ceilings ride the formation call.
+///
+/// A manifest that designates a quarantined model for untrusted contact
+/// declares `max_tokens` beside it, and formation is untrusted contact. The
+/// ceiling used to stop at the `form_memories` seam — the role's model id
+/// travelled and its ceilings were dropped, a declared control the runtime
+/// silently did not apply. The proof is the journal: the formation effect's
+/// descriptor must carry the quarantined model *and* its declared ceiling.
+#[tokio::test]
+async fn a_quarantined_roles_ceilings_govern_the_formation_call() {
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: watcher, version: "1.0.0" }
+spec:
+  capabilities: { provides: [watch.deadline] }
+  models:
+    privileged: { provider: fake, model: m-1 }
+    quarantined: { provider: fake, model: q-1, max_tokens: 77 }
+  execution: { kind: completion }
+  security: { max_sensitivity_egress: internal }
+  memory_formation:
+    subject: "clearing-desk"
+    purpose: clearing
+    instruction: Extract stable facts only.
+    max_items: 2
+    max_sensitivity: internal
+  budgets: {}
+"#,
+    )
+    .expect("manifest");
+    let p = plane(&manifest, json!({ "deadline_status": "OK" }));
+
+    let out =
+        p.rt.run("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+            .await
+            .expect("the run completes");
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    let records = (Arc::clone(&p.store) as Arc<dyn JournalStore>)
+        .read(out.run_id, 1)
+        .await
+        .expect("read");
+    let formation = records
+        .iter()
+        .find_map(|record| match record.kind() {
+            agentplane::journal::RecordKind::EffectStarted { descriptor, .. }
+                if descriptor.kind == "model.complete"
+                    && descriptor.args["model"] == json!("q-1") =>
+            {
+                Some(descriptor.args.clone())
+            }
+            _ => None,
+        })
+        .expect("the formation call runs on the quarantined model");
+    assert_eq!(
+        formation["max_output_tokens"],
+        json!(77),
+        "the quarantined role's declared max_tokens must reach the journaled \
+         formation call, or the digest covers a ceiling nothing applies"
     );
 }
 

@@ -95,6 +95,18 @@ pub const EVALUATOR_SEMANTICS: &str =
 const ADAPTER_CONFIGURATION: &[u8] =
     b"principal=Agent;action=Action;resource=Resource;context=action-schema";
 
+/// Target of the `tracing` event emitted when null stripping changed the
+/// context a rule evaluated — see [`without_nulls`] for why stripping exists
+/// and what it can and cannot change.
+///
+/// Emitted at `debug`, deliberately: a model call's request profile carries a
+/// `null` for every optional knob nobody set, so the common case would make a
+/// louder level a firehose. What the event buys an audit is the divergence
+/// itself: the effect key canonicalized the arguments *with* their nulls,
+/// while policy evaluated them without — two views of one call, and the only
+/// record that they differed is this event and the `removed` count on it.
+pub const CONTEXT_NULLS_STRIPPED: &str = "agentplane.policy.context_nulls_stripped";
+
 /// A Cedar policy set, compiled once.
 ///
 /// Compiled at construction rather than per request: parsing on every effect
@@ -207,8 +219,26 @@ impl CedarEngine {
         let principal = uid("Agent", r.principal)?;
         let action = uid("Action", r.action)?;
         let resource = uid("Resource", r.resource)?;
+        let mut removed = 0usize;
+        let stripped = without_nulls(r.context.clone(), &mut removed);
+        if removed > 0 {
+            // The one record that the two views diverged: the effect key
+            // canonicalized these arguments with their nulls, the rules are
+            // about to see them without. Cheap — the count fell out of the
+            // pass that stripped them — and per request, so an audit walking
+            // a decision back to its arguments knows to compare the two.
+            tracing::debug!(
+                target: CONTEXT_NULLS_STRIPPED,
+                action = %r.action,
+                resource = %r.resource,
+                removed,
+                "null values were stripped from the authorization context \
+                 before evaluation; policy saw fewer attributes or array \
+                 elements than the effect key canonicalized"
+            );
+        }
         let context = Context::from_json_value(
-            without_nulls(r.context.clone()),
+            stripped,
             self.schema.as_ref().map(|schema| (schema, &action)),
         )
         .map_err(|e| format!("context is not a Cedar record: {e}"))?;
@@ -261,19 +291,40 @@ impl CedarEngine {
 /// what follows it. A policy indexing a fixed position in caller-supplied data
 /// is fragile regardless, and the alternative is refusing the request, which
 /// would reinstate the outage for data the runtime does not control.
-fn without_nulls(value: Value) -> Value {
+///
+/// # The divergence is recorded
+///
+/// Stripping means policy evaluates a context that is not byte-for-byte the
+/// arguments the effect key canonicalized. That is safe by the argument above
+/// — nothing removed was matchable — but it is still two views of one call,
+/// and an audit reconciling a decision against journaled arguments deserves to
+/// know they differ. `removed` counts every dropped value, and the caller
+/// emits a [`CONTEXT_NULLS_STRIPPED`] event whenever it is non-zero.
+fn without_nulls(value: Value, removed: &mut usize) -> Value {
     match value {
         Value::Object(map) => Value::Object(
             map.into_iter()
-                .filter(|(_, v)| !v.is_null())
-                .map(|(k, v)| (k, without_nulls(v)))
+                .filter_map(|(k, v)| {
+                    if v.is_null() {
+                        *removed += 1;
+                        None
+                    } else {
+                        Some((k, without_nulls(v, removed)))
+                    }
+                })
                 .collect(),
         ),
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .filter(|v| !v.is_null())
-                .map(without_nulls)
+                .filter_map(|v| {
+                    if v.is_null() {
+                        *removed += 1;
+                        None
+                    } else {
+                        Some(without_nulls(v, removed))
+                    }
+                })
                 .collect(),
         ),
         other => other,
@@ -337,11 +388,28 @@ impl PolicyEngine for CedarEngine {
 
         match answer.decision() {
             cedar_policy::Decision::Allow if errors.is_empty() => PolicyDecision::Permit,
-            // Permitted *and* something failed to evaluate. The permit stands —
-            // a policy that did evaluate said yes — but the broken rule is
-            // reported, because the next thing it fails to evaluate may be a
-            // `forbid`.
-            cedar_policy::Decision::Allow => PolicyDecision::Permit,
+            // Permitted *and* something failed to evaluate. The permit does
+            // **not** stand. Cedar is total: an erroring policy contributes
+            // nothing, so the rule that failed may be exactly the `forbid`
+            // that would have overridden this permit — the `Allow` can exist
+            // *because* the veto broke. Letting it through makes every
+            // evaluation error a switch that turns a forbid off, and a gate
+            // an attacker disarms by making a rule error (a context attribute
+            // an unusual request shape omits, say) is a control that yields
+            // exactly under the pressure it exists to hold — a ceiling fails
+            // open because its accounting was made unreachable, wearing a
+            // permit. So this fails closed, exactly as `Deny` + errors stays
+            // a deny — and says it is a defect, because the operator's fix is
+            // the policy set, not the request. The error text itself goes to
+            // the trace above and to the deny reason the journal keeps; a
+            // model probing the gate sees only the uniform refusal, as it
+            // does for every policy denial.
+            cedar_policy::Decision::Allow => PolicyDecision::deny(format!(
+                "policy evaluation error — refusing because a rule that might \
+                 have forbidden this call failed to evaluate: {} — this is a \
+                 defect in the policy set, not a rule firing",
+                errors.join("; ")
+            )),
             cedar_policy::Decision::Deny if !errors.is_empty() => PolicyDecision::deny(format!(
                 "denied while {} policy error(s) went unevaluated: {} — fix the \
                  policy set; this denial may not mean what it appears to",

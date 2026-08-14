@@ -224,6 +224,11 @@ pub use tasks::SealedTasks;
 mod journal;
 pub use journal::SealedJournal;
 
+#[cfg(feature = "push")]
+mod push;
+#[cfg(feature = "push")]
+pub use push::SealedPush;
+
 mod sealed;
 pub use sealed::EncryptedBlobs;
 

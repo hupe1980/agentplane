@@ -311,6 +311,76 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
          still readable"
     );
 
+    // The same routing obligation for the *other* way a memory dies: expiry.
+    // `sweep_expired` erases state, and it must leave the derivation edges in
+    // both directions exactly as `forget` does — with U → E → D and E expired,
+    // a later cascade from poisoned U still has to route through E's tombstone
+    // to reach D. The sweep once deleted E's incoming edges, which severed
+    // exactly that path; the cascade then stopped at the tombstone and the
+    // summary-of-a-summary outlived the erasure.
+    store
+        .remember(&make(
+            "exp-u",
+            "team-expiry-chain",
+            "support",
+            json!({"n": 1}),
+        ))
+        .await
+        .expect("expiry-chain root");
+    let exp_u = store
+        .version("exp-u", 1)
+        .await
+        .expect("read root")
+        .expect("root exists");
+    let mut exp_e = make("exp-e", "team-expiry-chain", "support", json!({"n": 2}));
+    exp_e.expires_at = Some(at(1_760_000_150));
+    exp_e.derived_from = vec![Selected {
+        id: exp_u.id.clone(),
+        version: exp_u.version,
+        digest: exp_u.selection_digest(),
+    }];
+    store.remember(&exp_e).await.expect("expiring middle");
+    let exp_e = store
+        .version("exp-e", 1)
+        .await
+        .expect("read middle")
+        .expect("middle exists");
+    let mut exp_d = make("exp-d", "team-expiry-chain", "support", json!({"n": 3}));
+    exp_d.derived_from = vec![Selected {
+        id: exp_e.id.clone(),
+        version: exp_e.version,
+        digest: exp_e.selection_digest(),
+    }];
+    store.remember(&exp_d).await.expect("expiry-chain leaf");
+
+    assert_eq!(
+        store
+            .sweep_expired(at(1_760_000_150))
+            .await
+            .expect("expire the middle"),
+        1,
+        "exactly the middle link expires"
+    );
+    assert_eq!(
+        store
+            .forget_cascading("exp-u")
+            .await
+            .expect("cascade through the expired tombstone"),
+        2,
+        "the cascade must erase the root and the leaf, counting only what it \
+         erased — not the expired tombstone it passed through"
+    );
+    assert!(
+        store
+            .version("exp-d", 1)
+            .await
+            .expect("leaf lookup")
+            .is_none(),
+        "a derivative reached only through an *expired* intermediate survived \
+         the cascade — the expiry sweep severed the lineage that a later \
+         erasure of the poisoned source needed to route through"
+    );
+
     assert_eq!(
         store
             .forget_subject("team-a")
@@ -400,6 +470,47 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
             .is_none()
     );
 
+    // Sliding retention, alone: the window opens at the write. Initialized
+    // lazily instead, an item with a window and no fixed expiry was immortal
+    // until its first touch — opt-in garbage that never collects.
+    let mut fading = make(
+        "memory-fading",
+        "team-fading",
+        "support",
+        json!({"fading": true}),
+    );
+    fading.access_retention_seconds = Some(60);
+    store.remember(&fading).await.expect("fading memory");
+    assert_eq!(
+        store
+            .recall(&Recall::about("team-fading").at(at(1_760_000_059)))
+            .await
+            .expect("inside the untouched window")
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .recall(&Recall::about("team-fading").at(at(1_760_000_060)))
+            .await
+            .expect("after the untouched window")
+            .is_empty(),
+        "an untouched sliding-retention memory outlived its own window — the \
+         window must open at the write, or an item nobody ever touches is \
+         immortal"
+    );
+    assert_eq!(
+        store
+            .sweep_expired(at(1_760_000_060))
+            .await
+            .expect("sweep the untouched window"),
+        1,
+        "the sweep must collect an untouched sliding-retention memory"
+    );
+
+    // Sliding retention under a hard ceiling: the touch slides the window,
+    // and the ceiling is immutable — the effective expiry is whichever comes
+    // first, never a touched-up instant past `expires_at`.
     let mut sliding = make(
         "memory-sliding",
         "team-retention",
@@ -410,24 +521,55 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
     sliding.access_retention_seconds = Some(60);
     store.remember(&sliding).await.expect("sliding memory");
     store
-        .touch(&["memory-sliding".to_owned()], at(1_760_000_190))
+        .touch(&["memory-sliding".to_owned()], at(1_760_000_040))
         .await
         .expect("touch sliding retention");
     assert_eq!(
         store
-            .recall(&Recall::about("team-retention").at(at(1_760_000_240)))
+            .recall(&Recall::about("team-retention").at(at(1_760_000_099)))
             .await
-            .expect("extended recall")
+            .expect("inside the touched window")
             .len(),
         1,
-        "journaled access did not extend retention past the fixed expiry"
+        "a journaled touch did not slide the window"
+    );
+    store
+        .touch(&["memory-sliding".to_owned()], at(1_760_000_190))
+        .await
+        .expect("touch near the ceiling");
+    assert_eq!(
+        store
+            .recall(&Recall::about("team-retention").at(at(1_760_000_199)))
+            .await
+            .expect("just under the ceiling")
+            .len(),
+        1
     );
     assert!(
         store
-            .recall(&Recall::about("team-retention").at(at(1_760_000_250)))
+            .recall(&Recall::about("team-retention").at(at(1_760_000_200)))
             .await
-            .expect("after sliding expiry")
-            .is_empty()
+            .expect("at the ceiling")
+            .is_empty(),
+        "a touch extended a memory past its immutable `expires_at` — the \
+         ceiling is the disposal date an operator can state, and sliding \
+         retention may only shorten a life, never lengthen it"
+    );
+    assert_eq!(
+        store
+            .sweep_expired(at(1_760_000_200))
+            .await
+            .expect("sweep at the ceiling"),
+        1,
+        "the sweep must erase at the ceiling even though the touched window \
+         reaches past it"
+    );
+    assert!(
+        store
+            .version("memory-sliding", 1)
+            .await
+            .expect("swept sliding version")
+            .is_none()
     );
 }
 
@@ -502,6 +644,10 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     a_fabricated_future_epoch_is_fenced(fresh, &mut r).await;
     a_live_lease_is_not_stolen(fresh, &mut r).await;
     a_takeover_advances_the_epoch(fresh, &mut r).await;
+    acquire_claims_and_never_renews(fresh, &mut r).await;
+    a_renewal_extends_only_what_is_still_held(fresh, &mut r).await;
+    a_batch_spans_one_run(fresh, &mut r).await;
+    a_stale_epoch_cannot_seal(fresh, &mut r).await;
     a_rejected_batch_writes_nothing(fresh, &mut r).await;
     read_starts_where_it_is_told(fresh, &mut r).await;
     a_case_scan_selects_one_matter(fresh, &mut r).await;
@@ -1396,20 +1542,211 @@ async fn a_takeover_advances_the_epoch(fresh: Factory<'_>, r: &mut Report) {
     r.checked += 1;
     let store = fresh().await;
     let run = RunId::generate();
-    let Ok(a) = store.acquire(run, "instance-a", LEASE).await else {
+    let Ok(a) = store.acquire(run, "instance-a", SHORT).await else {
         return;
     };
-    let Ok(again) = store.acquire(run, "instance-a", LEASE).await else {
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let Ok(again) = store.acquire(run, "instance-b", LEASE).await else {
+        r.record("fencing", "an expired lease could not be claimed");
         return;
     };
-    if again.epoch != a.epoch {
+    if again.epoch <= a.epoch {
         r.record(
             "fencing",
             format!(
-                "renewing an owned lease must keep the epoch ({} became {}) — bumping it \
-                 fences the owner against itself, and its in-flight writes start failing",
-                a.epoch, again.epoch
+                "claiming an expired lease must advance the epoch ({} did not move past \
+                 {}) — without the bump the dead owner's writes are never fenced",
+                again.epoch, a.epoch
             ),
+        );
+    }
+}
+
+/// `acquire` is a pure claim: a live lease is refused, **the caller's own
+/// included**.
+///
+/// The same-owner case is the one a backend author "helpfully" allows, and it
+/// re-opens two closed defects at once: a heartbeat racing its run's
+/// conclusion re-takes the lease the conclusion just released, and a second
+/// entry point on one instance drives a second execution of a run the
+/// instance is already executing — under the *same epoch*, which fencing
+/// cannot see. Renewal is `renew`, checked below.
+async fn acquire_claims_and_never_renews(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let run = RunId::generate();
+    let Ok(_) = store.acquire(run, "instance-a", LEASE).await else {
+        return;
+    };
+    match store.acquire(run, "instance-a", LEASE).await {
+        Err(crate::core::StoreError::LeaseHeld { .. }) => {}
+        Err(e) => r.record(
+            "fencing",
+            format!("a same-owner acquire of a held lease must fail as LeaseHeld, not {e}"),
+        ),
+        Ok(lease) => r.record(
+            "fencing",
+            format!(
+                "a same-owner acquire of a held lease succeeded at epoch {} — acquire \
+                 renewed instead of claiming, so two executors on one instance share \
+                 one epoch and fencing cannot tell them apart",
+                lease.epoch
+            ),
+        ),
+    }
+}
+
+/// `renew` extends exactly what is still held, and never claims.
+///
+/// Four refusals and one success, and the refusals carry the weight: a renewal
+/// that re-takes a released lease resurrects ownership over a run that
+/// concluded — which the recovery sweep then "recovers" when the lease lapses
+/// — and one that accepts a stale epoch renews the fenced past over the
+/// current owner.
+async fn a_renewal_extends_only_what_is_still_held(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let run = RunId::generate();
+    let Ok(lease) = store.acquire(run, "instance-a", LEASE).await else {
+        return;
+    };
+
+    // Held, unexpired, right owner and epoch: the one case that succeeds, and
+    // the epoch must not move — bumping it fences the owner against itself.
+    match store.renew(run, "instance-a", lease.epoch, LEASE).await {
+        Ok(renewed) if renewed.epoch == lease.epoch => {}
+        Ok(renewed) => r.record(
+            "fencing",
+            format!(
+                "a renewal moved the epoch ({} became {}) — the owner is fenced \
+                 against its own in-flight writes",
+                lease.epoch, renewed.epoch
+            ),
+        ),
+        Err(e) => r.record("fencing", format!("renewing a held lease failed: {e}")),
+    }
+
+    // The wrong owner and the wrong epoch are both refusals, not claims.
+    if store
+        .renew(run, "instance-b", lease.epoch, LEASE)
+        .await
+        .is_ok()
+    {
+        r.record(
+            "fencing",
+            "another owner renewed a lease it does not hold — renewal became theft",
+        );
+    }
+    if store
+        .renew(run, "instance-a", lease.epoch + 1, LEASE)
+        .await
+        .is_ok()
+    {
+        r.record(
+            "fencing",
+            "a renewal with a fabricated epoch succeeded — a caller invented \
+             authority it never acquired",
+        );
+    }
+
+    // Released is gone. This is the heartbeat-races-conclusion shape: the run
+    // concluded and handed its lease back, and a late renewal must fail
+    // rather than resurrect it — a live lease over a concluded run is a run
+    // the recovery sweep re-executes forever once it lapses.
+    if store.release_lease(run, lease.epoch).await.is_err() {
+        r.record("fencing", "release_lease of a held lease failed");
+        return;
+    }
+    match store.renew(run, "instance-a", lease.epoch, LEASE).await {
+        Err(_) => {}
+        Ok(_) => r.record(
+            "fencing",
+            "a renewal re-took a lease the owner had already released — the \
+             heartbeat racing its own run's conclusion leaves a live lease over \
+             a concluded run, and the sweep recovers a clean exit forever",
+        ),
+    }
+    // And the failed renewal left nothing behind: the run must not surface as
+    // abandoned, now or after any TTL, because it exited cleanly.
+    match store.abandoned_runs(10).await {
+        Ok(listed) if listed.contains(&run) => r.record(
+            "recovery",
+            "a released run appears abandoned after a refused renewal — the \
+             renewal wrote something it had no claim to",
+        ),
+        _ => {}
+    }
+}
+
+/// A batch is one run's atomic unit, on every backend.
+///
+/// Everything an append does — the fence, the seal check, the head read, the
+/// chain each record links into — is scoped to one run, so a record naming
+/// another run would be sealed into the wrong chain under the wrong fence.
+/// The embedded store refused this loudly; the shared one keyed the whole
+/// batch under its first record's run and wrote the rest into it silently,
+/// which is worse than either accepting or refusing on purpose.
+async fn a_batch_spans_one_run(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let a = RunId::generate();
+    let b = RunId::generate();
+    let Ok(lease) = store.acquire(a, "conformance", LEASE).await else {
+        return;
+    };
+    if store
+        .append(lease.epoch, vec![admitted(a), admitted(b)])
+        .await
+        .is_ok()
+    {
+        r.record(
+            "atomicity",
+            "a batch spanning two runs was accepted — the second run's record was \
+             sealed into the first run's chain under the first run's fence",
+        );
+        return;
+    }
+    for run in [a, b] {
+        if store.read(run, 1).await.map_or(0, |v| v.len()) != 0 {
+            r.record(
+                "atomicity",
+                "a refused cross-run batch still left records behind",
+            );
+        }
+    }
+}
+
+/// A seal is fenced like any other write.
+///
+/// A seal freezes a chain forever and publishes its head as a Merkle leaf. A
+/// backend that seals without checking the epoch lets a fenced zombie freeze a
+/// run its replacement is still extending — every later checkpoint then
+/// attests a head the true history has moved past.
+async fn a_stale_epoch_cannot_seal(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let run = RunId::generate();
+    let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+        return;
+    };
+    if store
+        .append(lease.epoch, vec![admitted(run)])
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if store.seal(run, lease.epoch + 7, "succeeded").await.is_ok() {
+        r.record(
+            "fencing",
+            "a seal under a fabricated epoch was accepted — a fenced writer froze \
+             a chain it does not own",
+        );
+    }
+    if let Err(e) = store.seal(run, lease.epoch, "succeeded").await {
+        r.record(
+            "fencing",
+            format!("a seal under the current epoch was refused: {e}"),
         );
     }
 }

@@ -157,8 +157,8 @@ impl Tool for PostEntry {
     }
 }
 
-fn plane(provider: &Arc<FakeProvider>) -> (Arc<Runtime>, Arc<RedbStore>) {
-    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+fn plane(provider: &Arc<FakeProvider>) -> (Arc<Runtime>, Arc<dyn JournalStore>) {
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
     let manifest = Manifest::parse(TELLER).expect("the agent parses");
 
     // The implementations. One call: the catalogue is derived from the agent's
@@ -170,8 +170,9 @@ fn plane(provider: &Arc<FakeProvider>) -> (Arc<Runtime>, Arc<RedbStore>) {
     // reads like a control.
     let tools = ToolBox::new().with::<ReadBalance>().with::<PostEntry>();
 
-    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .provider("fake", Arc::clone(provider) as Arc<dyn ModelProvider>)
+    let driver: Arc<dyn ModelProvider> = provider.clone();
+    let rt = Runtime::builder(Arc::clone(&store))
+        .provider("fake", driver)
         .agent(Agent::new(&manifest))
         .toolbox(tools)
         .build();

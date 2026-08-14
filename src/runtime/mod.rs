@@ -14,7 +14,7 @@ pub mod telemetry;
 
 pub use batch::BatchSpec;
 pub use build_error::BuildError;
-pub use ctx::{Mode, StepCtx};
+pub use ctx::{BuildsEffect, Mode, StepCtx};
 #[cfg(feature = "manifest")]
 pub use executor::Agent;
 /// The one `RunStatus` list, shared by every test that owes a per-variant
@@ -22,7 +22,8 @@ pub use executor::Agent;
 #[cfg(test)]
 pub(crate) use executor::every_status;
 pub use executor::{
-    LEASE_TTL, MIN_LEASE_TTL, RunOutcome, RunStatus, Runtime, RuntimeBuilder, SEALED_OUTCOMES,
+    FullBackend, LEASE_TTL, MIN_LEASE_TTL, RunFailure, RunOutcome, RunStatus, Runtime,
+    RuntimeBuilder, SEALED_OUTCOMES,
 };
 pub use group::{EffectGroup, Invariant};
 pub use sweeper::{Saturation, SweepReport, WokenRuns};

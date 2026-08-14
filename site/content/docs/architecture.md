@@ -271,9 +271,18 @@ A quarantined run holds an effect whose outcome is unknown. Compensating a
 payment that may never have gone out creates a refund for money nobody took, and
 undoing everything *except* the one thing nobody can account for leaves a worse
 mess than stopping. So a quarantined run compensates nothing. A suspended run
-does not unwind either — it is healthy and waiting.
+does not unwind either — it is healthy and waiting. Cancellation obeys the same
+rule from the other direction: a cancel refuses to unwind through recorded
+doubt, because "stop" must not manufacture a reversal for work nobody can
+account for.
 
-Failures that *do* unwind: `Failed`, and `Exhausted`.
+What *does* unwind: `Failed`, and `Cancelled`. **Exhaustion does not** — it is
+a pause, not a fault. The run did what it was told, and what it was told
+included a ceiling; its mutations stand, because the operator's two honest
+options both need them standing. Raise the ceiling and resume — the resume
+re-evaluates the recorded budget refusal against the current ledger and
+journals a `BudgetReadmitted` record — or cancel, which unwinds through the
+ordinary path.
 
 ### Compensation is exempt from the budget
 
@@ -1233,7 +1242,13 @@ two machines is money that produces two different budget verdicts.
 
 `RunStatus::Exhausted` is distinct from `Failed`. The run did what it was told,
 and what it was told included a ceiling. Conflating the two has operators
-debugging a system that behaved exactly as instructed.
+debugging a system that behaved exactly as instructed. It is also a **pause**
+rather than an end: completed work stands, and resuming after the ceiling was
+raised re-evaluates the recorded refusal against the current ledger, journaled
+as `BudgetReadmitted` so the chain says who raised what to let it continue. The
+one exception is a run that has already compensated — that one is closed to
+resume, because continuing over reversed work would report success about a
+world where it no longer stands.
 
 ## Human tasks
 
@@ -1714,7 +1729,7 @@ the invariant for the one route nobody would think to check.
 | `CancelTask` | a durable stop request; the task stays `WORKING` |
 | `GetExtendedAgentCard` | the authenticated card |
 | `SendStreamingMessage`, `SubscribeToTask` | SSE status and artifact updates, read from the journal; terminal subscription is refused |
-| `ListTasks` | newest-first, cursor-paginated and per-task-authorized tasks with context/status/time filters, bounded history, and optional artifacts. A content filter's cost is bounded (`filter_scan_budget`, default 1024 candidate reads): the spec's `totalSize` is the exact pre-pagination count, so an unbounded filter would let one field buy a scan of every run the tenant ever wrote — over budget is a refusal naming `statusTimestampAfter` as the lever that narrows from the index, never a quietly truncated total |
+| `ListTasks` | newest-first, cursor-paginated and per-task-authorized tasks with context/status/time filters, bounded history, and optional artifacts. A content filter's cost is bounded (`filter_scan_budget`, default 1024 candidate reads): the spec's `totalSize` is the exact pre-pagination count, so an unbounded filter would let one field buy a scan of every run the tenant ever wrote — over budget is a refusal naming `statusTimestampAfter` as the lever that narrows from the index, never a quietly truncated total. Artifact inclusion is budgeted too — reassembling artifacts replays each task's run, so a page past the budget returns the remaining tasks without artifacts and marks each with `io.agentplane.a2a/artifactsOmitted` in `Task.metadata`, because a bounded result must not be shaped like a complete one; `GetTask` on the marked id recovers them, and a sealed-run cache keeps the reassembly from being paid twice |
 | the push-notification configs | durable create/get/list/delete when wired; the protocol-specific refusal otherwise |
 | anything else | `-32601`, method not found |
 

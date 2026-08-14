@@ -106,16 +106,16 @@ impl Skill for Answers {
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
-        let call = ModelCall::new(
-            Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
-            ModelId::new("fake", "scribe-1"),
-            input.peek().clone(),
-        )
-        // Not provider-visible, so not part of the effect key: the same run
-        // with and without a watcher has one history.
-        .streaming_to(Arc::clone(&self.printer) as Arc<dyn ModelStreamObserver>);
-
-        let answer = cx.sink(call, &input).await?;
+        let provider: Arc<dyn ModelProvider> = self.provider.clone();
+        let printer: Arc<dyn ModelStreamObserver> = self.printer.clone();
+        let answer = cx
+            .sink_with(&input, |value| {
+                ModelCall::new(provider, ModelId::new("fake", "scribe-1"), value)
+                    // Not provider-visible, so not part of the effect key: the
+                    // same run with and without a watcher has one history.
+                    .streaming_to(printer)
+            })
+            .await?;
         Ok(Outcome::done(answer.map(|c| json!({ "answer": c.text }))))
     }
 }

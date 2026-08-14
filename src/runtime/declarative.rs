@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 
 use crate::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted};
 use crate::manifest::{ExecutionKind, Identity, Manifest};
-use crate::model::{ModelCall, ModelId, ModelProvider};
+use crate::model::{ModelCall, ModelProvider, ModelRole};
 
 use super::StepCtx;
 
@@ -85,13 +85,13 @@ impl Declarative {
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
         system: String,
-        model_role: (ModelId, Option<u32>, Option<crate::model::ReasoningEffort>),
+        role: ModelRole,
         egress: Option<crate::core::Sensitivity>,
         granted: Vec<crate::manifest::ToolGrant>,
         oversight: Option<Proposal>,
         formation: Option<crate::manifest::MemoryFormation>,
+        output_schema: Option<Value>,
     ) -> Result<Outcome, SkillError> {
-        let (model, max_output_tokens, reasoning_effort) = model_role;
         let (catalog, client) = self.tools.clone().ok_or_else(|| {
             SkillError::Other(
                 "this agent declares `tool-calling` but the plane has no tool \
@@ -126,28 +126,47 @@ impl Declarative {
         let mut conversation_label = prompt.label().clone();
 
         for _turn in 0..self.max_turns {
-            let mut call = ModelCall::new(
-                Arc::clone(&self.provider),
-                model.clone(),
-                prompt.peek().clone(),
-            )
-            .with_tools(declared.clone())
-            .continuing(exchanges.clone())
-            .with_output_sensitivity(conversation_label.sensitivity);
-            if let Some(state) = continuation.take() {
-                call = call.with_continuation(state);
-            }
-            if let Some(max_output_tokens) = max_output_tokens {
-                call = call.with_max_output_tokens(max_output_tokens);
-            }
-            if let Some(effort) = reasoning_effort {
-                call = call.with_reasoning_effort(effort);
-            }
-            if let Some(ceiling) = egress {
-                call = call.with_max_sensitivity(ceiling);
-            }
+            // No `with_output_sensitivity`: the completion's floor derives
+            // from the call's own egress ceiling, which is exactly the level
+            // this loop used to restate by hand from the conversation label —
+            // dispatch refuses a conversation above the ceiling, so the two
+            // spellings could only ever agree, and the derived one cannot be
+            // forgotten at the next call site.
             let outbound = prompt.with_joined_label(&conversation_label);
-            let completion = cx.sink(call, &outbound).await?;
+            let completion = cx
+                .sink_with(&outbound, |value| {
+                    let mut call =
+                        ModelCall::new(Arc::clone(&self.provider), role.model.clone(), value)
+                            .with_tools(declared.clone())
+                            .continuing(exchanges.clone());
+                    // The declared output shape rides on **every** turn, not
+                    // only the last. Which turn answers is the model's choice,
+                    // so there is no moment before dispatch at which "this is
+                    // the final turn" is known — and a schema attached only
+                    // where the runtime guessed the answer would land is a
+                    // contract the model can step around by answering a turn
+                    // early. `honour_declared_schema` exempts a completion
+                    // that asks for tools, so mid-loop turns are untouched;
+                    // the turn that answers is provider-constrained during
+                    // generation and validated at the effect boundary, exactly
+                    // as `completion` and `planned` already are. Parsed for
+                    // intent is not a release state (I12): triage rules are
+                    // typed against this schema, so an answer the schema never
+                    // bound would put rows in a worklist that the reviewed
+                    // predicate provably cannot describe.
+                    if let Some(schema) = output_schema.clone() {
+                        call = call.expecting(schema);
+                    }
+                    if let Some(state) = continuation.take() {
+                        call = call.with_continuation(state);
+                    }
+                    call = role.applied_to(call);
+                    if let Some(ceiling) = egress {
+                        call = call.with_max_sensitivity(ceiling);
+                    }
+                    call
+                })
+                .await?;
             let label = completion.label().join(&conversation_label);
             let completion = Tainted::with_label(completion.into_unlabelled(), label);
 
@@ -164,6 +183,19 @@ impl Declarative {
                 );
                 let answer =
                     completion.map(|c| c.structured.unwrap_or_else(|| json!({ "text": c.text })));
+                // Belt and braces beside the boundary check, the same pair
+                // `planned` keeps: the provider constrained generation and the
+                // effect boundary validated the completion, and the answer is
+                // still checked here because what settles is *this* value —
+                // an extraction step between the two would otherwise be a gap
+                // the declared shape never crossed.
+                if let Some(schema) = output_schema.as_ref()
+                    && let Err(detail) = crate::model::validate_schema(schema, answer.peek())
+                {
+                    return Ok(Outcome::fail(format!(
+                        "the answer does not satisfy the declared output shape: {detail}"
+                    )));
+                }
                 // A tool-calling agent reaches oversight by the same path a
                 // completion does. It did not, and the manifest said nothing
                 // about that: `oversight` parsed, built and ran while no human
@@ -179,7 +211,7 @@ impl Declarative {
                         &bindable_input,
                         oversight,
                         formation.as_ref(),
-                        &model,
+                        &role,
                     )
                     .await;
             }
@@ -314,14 +346,17 @@ impl Declarative {
                     continue;
                 }
 
-                let prepared = crate::tools::ToolCall::prepare(
-                    &catalog,
-                    Arc::clone(&client),
-                    id,
-                    asked.arguments.clone(),
-                )?;
-
-                match cx.sink(prepared, &args).await {
+                let dispatched = cx
+                    .sink_with(&args, |value| {
+                        crate::tools::ToolCall::prepare(&catalog, Arc::clone(&client), id, value)
+                            .map_err(|e| {
+                                crate::core::StepError::Effect(crate::core::EffectError::Rejected(
+                                    e.to_string(),
+                                ))
+                            })
+                    })
+                    .await;
+                match dispatched {
                     Ok(result) => {
                         conversation_label = conversation_label.join(result.label());
                         exchanges
@@ -376,7 +411,7 @@ impl Declarative {
         input: &Tainted<Value>,
         oversight: Option<Proposal>,
         formation: Option<&crate::manifest::MemoryFormation>,
-        model: &ModelId,
+        role: &ModelRole,
     ) -> Result<Outcome, SkillError> {
         if let Some(spec) = oversight.as_ref().filter(|s| s.gates_the_answer()) {
             // Register the obligation the wait is bounded by. A declarative
@@ -399,7 +434,7 @@ impl Declarative {
                 )));
             }
         }
-        self.form_answer(cx, formation, formed_source, input, model)
+        self.form_answer(cx, formation, formed_source, input, role)
             .await?;
         // **After** the approval gate and after formation, for the same reason
         // formation is after the gate: a triage row raised from an answer a
@@ -464,7 +499,7 @@ impl Declarative {
         declaration: Option<&crate::manifest::MemoryFormation>,
         answer: Tainted<Value>,
         input: &Tainted<Value>,
-        model: &ModelId,
+        role: &ModelRole,
     ) -> Result<(), SkillError> {
         let Some(declaration) = declaration else {
             return Ok(());
@@ -478,9 +513,14 @@ impl Declarative {
         // be writing durable memory from it, not the one holding the agent's
         // authority. Falling back to the answer's model when no quarantined
         // role is declared keeps the single-model manifest exactly as it was.
-        let model = match cx.manifest() {
-            Some(m) => untrusted_contact_model(m, model),
-            None => model.clone(),
+        //
+        // The **whole** role travels: `StepCtx::form_memories` applies its
+        // `max_tokens` and `reasoning_effort` to the formation call, so the
+        // ceilings the reviewer put beside the quarantined model govern the
+        // one call the declarative tier makes on it here.
+        let formation_role = match cx.manifest() {
+            Some(m) => untrusted_contact_model(m, role),
+            None => role.clone(),
         };
         let expires_at = if let Some(seconds) = declaration.retention_seconds {
             let now = cx.now().await?;
@@ -500,7 +540,7 @@ impl Declarative {
             },
             answer,
             Arc::clone(&self.provider),
-            model,
+            formation_role,
         )
         .await?;
         Ok(())
@@ -529,15 +569,13 @@ impl Declarative {
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
         system: String,
-        model_role: (ModelId, Option<u32>, Option<crate::model::ReasoningEffort>),
+        role: ModelRole,
         egress: Option<crate::core::Sensitivity>,
         granted: Vec<crate::manifest::ToolGrant>,
         oversight: Option<Proposal>,
         formation: Option<crate::manifest::MemoryFormation>,
         output_schema: Option<Value>,
     ) -> Result<Outcome, SkillError> {
-        let (model, max_output_tokens, reasoning_effort) = model_role;
-
         // The plan is this run's authorization order, and the planner reads
         // the input to write it. Untrusted input authoring a plan is the
         // attacker choosing the control flow — the thing I8 refuses for
@@ -591,23 +629,20 @@ impl Declarative {
             ("input".to_owned(), input.clone()),
             ("tools".to_owned(), Tainted::trusted(json!(surface))),
         ]);
-        let mut call = ModelCall::new(
-            Arc::clone(&self.provider),
-            model.clone(),
-            prompt.peek().clone(),
-        )
-        .with_output_sensitivity(prompt.label().sensitivity)
-        .expecting(plan_schema(self.max_turns));
-        if let Some(max_output_tokens) = max_output_tokens {
-            call = call.with_max_output_tokens(max_output_tokens);
-        }
-        if let Some(effort) = reasoning_effort {
-            call = call.with_reasoning_effort(effort);
-        }
-        if let Some(ceiling) = egress {
-            call = call.with_max_sensitivity(ceiling);
-        }
-        let completion = cx.sink(call, &prompt).await?;
+        // The completion's floor derives from the egress ceiling below; see
+        // the loop's model call for why nothing restates it here.
+        let completion = cx
+            .sink_with(&prompt, |value| {
+                let mut call =
+                    ModelCall::new(Arc::clone(&self.provider), role.model.clone(), value)
+                        .expecting(plan_schema(self.max_turns));
+                call = role.applied_to(call);
+                if let Some(ceiling) = egress {
+                    call = call.with_max_sensitivity(ceiling);
+                }
+                call
+            })
+            .await?;
         // Everything the planner wrote is a model completion: plan literals
         // carry this label, so a constant the planner invented arrives at
         // every gate as untrusted model output — while a *reference* carries
@@ -658,13 +693,14 @@ impl Declarative {
                         // "Not granted" reads as a *policy* finding, and for a
                         // hand-written plan it is usually a *spelling* one: the
                         // grant is right there in the manifest, under the other
-                        // of this tool's two names. `wire_name` escapes `_` to
-                        // `_u`, so `tool://svc/get_gas` is `svc__get_ugas` on
-                        // the wire, and an author who writes the obvious
-                        // `svc__get_gas` goes looking in the policy for a
-                        // mistake that is in the escaping. A planner is offered
-                        // the wire names and will not hit this; a person
-                        // writing a plan in a test will.
+                        // of this tool's two names. `wire_name` renders `.` as
+                        // `-`, so `tool://agent/blog.research` is
+                        // `agent__blog-research` on the wire, and an author who
+                        // writes the manifest reference — or the dotted
+                        // `agent__blog.research` — goes looking in the policy
+                        // for a mistake that is in the rendering. A planner is
+                        // offered the wire names and will not hit this; a
+                        // person writing a plan in a test will.
                         //
                         // Both spellings are already derived here, so the hint
                         // costs a lookup rather than a second source of truth.
@@ -740,13 +776,15 @@ impl Declarative {
                     let out = if id.server == crate::tools::AGENT_SERVER {
                         cx.commission(&id.tool, assembled).await?
                     } else {
-                        let prepared = crate::tools::ToolCall::prepare(
-                            catalog,
-                            Arc::clone(client),
-                            id,
-                            assembled.peek().clone(),
-                        )?;
-                        cx.sink(prepared, &assembled).await?
+                        cx.sink_with(&assembled, |value| {
+                            crate::tools::ToolCall::prepare(catalog, Arc::clone(client), id, value)
+                                .map_err(|e| {
+                                    crate::core::StepError::Effect(
+                                        crate::core::EffectError::Rejected(e.to_string()),
+                                    )
+                                })
+                        })
+                        .await?
                     };
                     outputs.push(out);
                 }
@@ -777,9 +815,15 @@ impl Declarative {
                             "plan step {index}: a parse schema must be an object schema"
                         )));
                     };
-                    let parse_model = match cx.manifest() {
-                        Some(m) => untrusted_contact_model(m, &model),
-                        None => model.clone(),
+                    // The whole role, ceilings included. A parse is the one
+                    // call in a plan that reads hostile content, so the token
+                    // ceiling and reasoning depth its declaration carries are
+                    // the ones that apply here — and when no quarantined role
+                    // is declared, the privileged role's own declaration
+                    // governs its fallback rather than the driver default.
+                    let parse_role = match cx.manifest() {
+                        Some(m) => untrusted_contact_model(m, &role),
+                        None => role.clone(),
                     };
                     let prompt = Tainted::object([
                         (
@@ -788,17 +832,23 @@ impl Declarative {
                         ),
                         ("source".to_owned(), source.clone()),
                     ]);
-                    let mut call = ModelCall::new(
-                        Arc::clone(&self.provider),
-                        parse_model,
-                        prompt.peek().clone(),
-                    )
-                    .with_output_sensitivity(prompt.label().sensitivity)
-                    .expecting(schema);
-                    if let Some(ceiling) = egress {
-                        call = call.with_max_sensitivity(ceiling);
-                    }
-                    let completion = cx.sink(call, &prompt).await?;
+                    // As at the planning call: the floor derives from the
+                    // egress ceiling, so nothing restates it per site.
+                    let completion = cx
+                        .sink_with(&prompt, |value| {
+                            let mut call = ModelCall::new(
+                                Arc::clone(&self.provider),
+                                parse_role.model.clone(),
+                                value,
+                            )
+                            .expecting(schema);
+                            call = parse_role.applied_to(call);
+                            if let Some(ceiling) = egress {
+                                call = call.with_max_sensitivity(ceiling);
+                            }
+                            call
+                        })
+                        .await?;
                     let label = completion.label().join(prompt.label()).clone();
                     let Some(mut value) = completion.peek().structured.clone() else {
                         return Ok(Outcome::fail(format!(
@@ -865,7 +915,7 @@ impl Declarative {
             &input,
             oversight,
             formation.as_ref(),
-            &model,
+            &role,
         )
         .await
     }
@@ -886,17 +936,7 @@ impl Skill for Declarative {
     ) -> Result<Outcome, SkillError> {
         // Read into owned values before any effect runs, so nothing borrows the
         // agent across an await.
-        let (
-            system,
-            model,
-            max_output_tokens,
-            reasoning_effort,
-            schema,
-            egress,
-            oversight,
-            granted,
-            formation,
-        ) = {
+        let (system, role, schema, egress, oversight, granted, formation) = {
             let m = cx.manifest().ok_or_else(|| {
                 // Unreachable through the builder, which only registers this
                 // skill when a manifest declared it. Stated rather than
@@ -906,7 +946,7 @@ impl Skill for Declarative {
                     "a declarative agent ran without a manifest — it has nothing to be".into(),
                 )
             })?;
-            let (model, max_output_tokens, reasoning_effort) = privileged(m).ok_or_else(|| {
+            let role = privileged(m).ok_or_else(|| {
                 SkillError::Other(format!(
                     "manifest '{}' declares execution but no privileged model — a \
                      declarative agent has nothing to call",
@@ -919,9 +959,7 @@ impl Skill for Declarative {
                     .as_ref()
                     .map(Identity::system_prompt)
                     .unwrap_or_default(),
-                model,
-                max_output_tokens,
-                reasoning_effort,
+                role,
                 m.output_schema().cloned(),
                 m.spec.security.max_sensitivity_egress,
                 m.spec.oversight.as_ref().map(Proposal::from_manifest),
@@ -946,36 +984,35 @@ impl Skill for Declarative {
                     ("system".to_owned(), Tainted::trusted(json!(system))),
                     ("input".to_owned(), input),
                 ]);
-                let mut call = ModelCall::new(
-                    Arc::clone(&self.provider),
-                    model.clone(),
-                    prompt.peek().clone(),
-                )
-                .with_output_sensitivity(prompt.label().sensitivity);
-                if let Some(max_output_tokens) = max_output_tokens {
-                    call = call.with_max_output_tokens(max_output_tokens);
-                }
-                if let Some(effort) = reasoning_effort {
-                    call = call.with_reasoning_effort(effort);
-                }
-                if let Some(schema) = schema {
-                    call = call.expecting(schema);
-                }
-                // The declared egress ceiling, applied to the one sink a
-                // declarative agent has. Without it the call keeps `ModelCall`'s
-                // conservative default of `Public`, so a declarative agent could
-                // only ever handle public data — and an agent commissioned with
-                // a *specialist's* answer is handling untrusted data by
-                // definition, which is `Internal` at least.
-                //
-                // A manifest that declares no ceiling keeps the default: a
-                // deployment that never said what may leave does not get to send
-                // internal data because it was convenient.
-                if let Some(ceiling) = egress {
-                    call = call.with_max_sensitivity(ceiling);
-                }
-
-                let completion = cx.sink(call, &prompt).await?;
+                // The completion's floor derives from the egress ceiling
+                // applied below; see the tool loop's model call for why
+                // nothing restates it here.
+                let completion = cx
+                    .sink_with(&prompt, |value| {
+                        let mut call =
+                            ModelCall::new(Arc::clone(&self.provider), role.model.clone(), value);
+                        call = role.applied_to(call);
+                        if let Some(schema) = schema {
+                            call = call.expecting(schema);
+                        }
+                        // The declared egress ceiling, applied to the one sink
+                        // a declarative agent has. Without it the call keeps
+                        // `ModelCall`'s conservative default of `Public`, so a
+                        // declarative agent could only ever handle public data
+                        // — and an agent commissioned with a *specialist's*
+                        // answer is handling untrusted data by definition,
+                        // which is `Internal` at least.
+                        //
+                        // A manifest that declares no ceiling keeps the
+                        // default: a deployment that never said what may leave
+                        // does not get to send internal data because it was
+                        // convenient.
+                        if let Some(ceiling) = egress {
+                            call = call.with_max_sensitivity(ceiling);
+                        }
+                        call
+                    })
+                    .await?;
                 let label = completion.label().join(prompt.label());
                 let completion = Tainted::with_label(completion.into_unlabelled(), label);
                 let formed_source = Tainted::with_label(
@@ -997,36 +1034,21 @@ impl Skill for Declarative {
                     &bindable_input,
                     oversight,
                     formation.as_ref(),
-                    &model,
+                    &role,
                 )
                 .await
             }
 
             ExecutionKind::ToolCalling => {
                 self.tool_loop(
-                    cx,
-                    input,
-                    system,
-                    (model, max_output_tokens, reasoning_effort),
-                    egress,
-                    granted,
-                    oversight,
-                    formation,
+                    cx, input, system, role, egress, granted, oversight, formation, schema,
                 )
                 .await
             }
 
             ExecutionKind::Planned => {
                 self.planned(
-                    cx,
-                    input,
-                    system,
-                    (model, max_output_tokens, reasoning_effort),
-                    egress,
-                    granted,
-                    oversight,
-                    formation,
-                    schema,
+                    cx, input, system, role, egress, granted, oversight, formation, schema,
                 )
                 .await
             }
@@ -1418,18 +1440,24 @@ fn resolve_subject(
     }
 }
 
-/// The model for untrusted contact: the quarantined role when one is
-/// declared, the given fallback otherwise.
+/// The role for untrusted contact: the quarantined role when one is declared,
+/// the given fallback otherwise.
 ///
 /// One implementation, consulted by memory formation and by a plan's `parse`
 /// steps — the two places the declarative tier itself points a model at
 /// untrusted-derived content.
-fn untrusted_contact_model(m: &Manifest, fallback: &ModelId) -> ModelId {
-    m.spec
-        .models
-        .as_ref()
-        .and_then(|models| models.quarantined.as_ref())
-        .map_or_else(|| fallback.clone(), |r| ModelId::new(&r.provider, &r.model))
+///
+/// The **whole** role, not only its model id. `max_tokens` and
+/// `reasoning_effort` are declared per role for a reason a quarantined model
+/// makes concrete: the role that reads hostile content is the one whose output
+/// most needs a ceiling somebody reviewed. Returning the id alone parsed those
+/// two fields into the digest and then dropped them — a declared control the
+/// runtime silently did not apply (I12), found the way that shape always is,
+/// by following the value rather than the field. The fallback is a role too,
+/// so a manifest with no quarantined model keeps the privileged declaration's
+/// own ceilings instead of quietly reverting to the driver default.
+fn untrusted_contact_model(m: &Manifest, fallback: &ModelRole) -> ModelRole {
+    m.quarantined_role().unwrap_or_else(|| fallback.clone())
 }
 
 /// The tool surface a declarative agent offers a model: exactly the manifest's
@@ -1476,15 +1504,8 @@ fn offered_tools<'g>(
     (offered, declared)
 }
 
-fn privileged(
-    m: &Manifest,
-) -> Option<(ModelId, Option<u32>, Option<crate::model::ReasoningEffort>)> {
-    let r = m.spec.models.as_ref()?.privileged.as_ref()?;
-    Some((
-        ModelId::new(&r.provider, &r.model),
-        r.max_tokens,
-        r.reasoning_effort,
-    ))
+fn privileged(m: &Manifest) -> Option<ModelRole> {
+    m.privileged_role()
 }
 
 /// What a failed tool call may tell the model, if anything.

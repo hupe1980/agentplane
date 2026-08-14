@@ -406,6 +406,15 @@ pub enum Approval {
     /// ago, and a reviewer refusing now is refusing a summary of something that
     /// already happened. Gating the **call** is the control the answer gate
     /// reads like.
+    ///
+    /// Declaring it obliges the grants: every **mutating** grant must set
+    /// `requires_approval: true`, or the manifest is refused at parse. The
+    /// mode's claim is that a person sees the calls that change the world;
+    /// enforced only where somebody remembered to also write
+    /// `requires_approval`, it would be runtime-identical to
+    /// [`None`](Self::None) — a mode in the reviewed file that the runtime
+    /// cannot tell from its absence. Read-only grants stay ungated, because
+    /// the mode never claimed a person reviews reads.
     ToolsOnly,
     /// Nothing waits. The run completes and
     /// [`Oversight::triage`] decides what a person is shown afterwards.
@@ -694,6 +703,15 @@ pub struct ModelRef {
     pub reasoning_effort: Option<crate::model::ReasoningEffort>,
 }
 
+/// A declared [`ModelRef`] in the model layer's vocabulary.
+fn role(r: &ModelRef) -> crate::model::ModelRole {
+    crate::model::ModelRole {
+        model: crate::model::ModelId::new(&r.provider, &r.model),
+        max_output_tokens: r.max_tokens,
+        reasoning_effort: r.reasoning_effort,
+    }
+}
+
 /// The shape an agent promises its callers.
 ///
 /// `capabilities.provides` names a capability; this says what comes back. A
@@ -903,6 +921,27 @@ fn tool_references_in(text: &str) -> Vec<String> {
 }
 
 impl Manifest {
+    /// The privileged role, resolved to the model layer's vocabulary.
+    ///
+    /// The **whole** role — id plus the `max_tokens` and `reasoning_effort`
+    /// declared beside it — because a role's ceilings are half the
+    /// declaration, and every seam that carried the id alone has ended up
+    /// silently dropping the other half.
+    #[must_use]
+    pub fn privileged_role(&self) -> Option<crate::model::ModelRole> {
+        self.spec.models.as_ref()?.privileged.as_ref().map(role)
+    }
+
+    /// The quarantined role for untrusted contact, when one is declared.
+    ///
+    /// `None` means the manifest designates no separate model for hostile
+    /// content; callers fall back to the privileged role's own declaration,
+    /// never to a driver default.
+    #[must_use]
+    pub fn quarantined_role(&self) -> Option<crate::model::ModelRole> {
+        self.spec.models.as_ref()?.quarantined.as_ref().map(role)
+    }
+
     /// Begin a programmatic declaration with the required identity fields.
     ///
     /// YAML and Rust construction converge on [`Manifest::build`]; neither gets
@@ -1294,6 +1333,38 @@ impl Manifest {
                     grant.reference
                 )));
             }
+            // The inverse trap: fields declared, none of them about authority.
+            // Declaring `protected_fields` is what lifts the whole-object
+            // taint gate on a mutating sink — the runtime then trusts the
+            // per-field rules to be the decision about who may author what.
+            // A sensitivity ceiling is not that decision: it bounds how
+            // *secret* an argument may be, and the model's own untrusted
+            // completion is happily below any ceiling — so a grant whose only
+            // rules are ceilings lifts the gate while constraining nobody,
+            // and the recipient, amount and command fields dispatch exactly
+            // as the model wrote them. Authority needs a provenance rule.
+            if grant.mutates
+                && !grant.protected_fields.is_empty()
+                && grant
+                    .protected_fields
+                    .iter()
+                    .all(|f| !f.requires_trusted() && f.allowed_sources().is_empty())
+            {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.tools: '{}' declares `mutates: true` and every \
+                     `protected_fields` entry carries only a sensitivity \
+                     ceiling. Declaring protected fields is what lifts the \
+                     whole-object taint gate on a mutating sink, and a ceiling \
+                     bounds how secret an argument may be — not who authored \
+                     it — so the model's own untrusted completion would fill \
+                     every authority-bearing field unconstrained. At least one \
+                     protected field must carry a trust or source rule: \
+                     `require_trusted: true`, or `allowed_sources` naming \
+                     where the value must come from (a ceiling may sit beside \
+                     either)",
+                    grant.reference
+                )));
+            }
         }
         Ok(())
     }
@@ -1458,6 +1529,31 @@ impl Manifest {
                          set `requires_approval: true` on the calls a person must see, or \
                          use 'required' to gate the answer",
             });
+        }
+        // And the mode's claim is about the calls that change the world, so a
+        // mutating grant it does not gate is the claim broken where it counts.
+        // Before this check, `tools-only` was runtime-identical to `none` the
+        // moment one grant asked: the file read as "a person sees this agent's
+        // actions" while the transfer beside the gated call ran unattended —
+        // a declared control enforced only where somebody remembered to also
+        // write `requires_approval`, which is no mode at all. Read-only grants
+        // stay ungated: the mode never claimed a person reviews reads.
+        if o.approval == Approval::ToolsOnly
+            && let Some(silent) = self
+                .spec
+                .tools
+                .iter()
+                .find(|grant| grant.mutates && !grant.requires_approval)
+        {
+            return Err(ManifestError::Syntax(format!(
+                "spec.oversight.approval: 'tools-only' names per-call approval as this \
+                 agent's human control, and '{}' is a mutating grant with no \
+                 `requires_approval` — a mode that gates tool calls while a call that \
+                 changes the world needs nobody is a declared control nothing enforces. \
+                 Set `requires_approval: true` on every mutating grant, or use \
+                 'required' to gate the answer instead",
+                silent.reference
+            )));
         }
         // `none` is the advisory mode, not an off switch: something in the
         // block still has to perform. Without this, `approval: none` with an

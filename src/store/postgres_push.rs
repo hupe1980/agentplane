@@ -3,12 +3,40 @@
 use async_trait::async_trait;
 
 use crate::core::{RunId, Secret, Seq, StoreError};
-use crate::push::{PushAuthentication, PushConfig, PushRegistration, PushStore};
+use crate::push::{
+    DueBatch, OPERATOR_PREFIX, PushAuthentication, PushConfig, PushNamespace, PushRegistration,
+    PushStore,
+};
 
 use super::postgres::PostgresStore;
 
 fn be(error: &tokio_postgres::Error) -> StoreError {
     StoreError::Backend(error.to_string())
+}
+
+/// One due row into a registration, shared by [`PushStore::due`] and
+/// [`PushStore::due_in`] so the two reads cannot decode one schema two ways.
+fn registration_from(row: &tokio_postgres::Row) -> Result<PushRegistration, StoreError> {
+    let task_id: String = row.get(0);
+    Ok(PushRegistration {
+        config: PushConfig {
+            id: row.get(1),
+            task: RunId::parse(&task_id).map_err(|error| StoreError::Backend(error.to_string()))?,
+            url: row.get(2),
+            token: row.get::<_, Option<String>>(3).map(Secret::new),
+            authentication: row
+                .get::<_, Option<String>>(4)
+                .zip(row.get::<_, Option<String>>(5))
+                .map(|(scheme, credentials)| PushAuthentication {
+                    scheme,
+                    credentials: Secret::new(credentials),
+                }),
+        },
+        next_seq: row.get::<_, i64>(6).cast_unsigned(),
+        attempts: row.get::<_, i32>(7).cast_unsigned(),
+        next_attempt_at: row.get::<_, i64>(8).cast_unsigned(),
+        last_error: row.get(9),
+    })
 }
 
 #[async_trait]
@@ -139,31 +167,75 @@ impl PushStore for PostgresStore {
             )
             .await
             .map_err(|error| be(&error))?;
-        rows.into_iter()
-            .map(|row| {
-                let task_id: String = row.get(0);
-                Ok(PushRegistration {
-                    config: PushConfig {
-                        id: row.get(1),
-                        task: RunId::parse(&task_id)
-                            .map_err(|error| StoreError::Backend(error.to_string()))?,
-                        url: row.get(2),
-                        token: row.get::<_, Option<String>>(3).map(Secret::new),
-                        authentication: row
-                            .get::<_, Option<String>>(4)
-                            .zip(row.get::<_, Option<String>>(5))
-                            .map(|(scheme, credentials)| PushAuthentication {
-                                scheme,
-                                credentials: Secret::new(credentials),
-                            }),
-                    },
-                    next_seq: row.get::<_, i64>(6).cast_unsigned(),
-                    attempts: row.get::<_, i32>(7).cast_unsigned(),
-                    next_attempt_at: row.get::<_, i64>(8).cast_unsigned(),
-                    last_error: row.get(9),
-                })
-            })
-            .collect()
+        rows.iter().map(registration_from).collect()
+    }
+
+    async fn due_in(
+        &self,
+        at: u64,
+        limit: usize,
+        namespace: PushNamespace,
+    ) -> Result<DueBatch, StoreError> {
+        let client = self
+            .pool_ref()
+            .get()
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        // The namespace filter rides in the query, which is the reason this
+        // override exists: the paging default is correct and linear in the
+        // other namespace's backlog, and this backend has an index. The prefix
+        // test is a LIKE pattern *derived from* [`OPERATOR_PREFIX`] so the
+        // query and [`is_operator_id`](crate::push::is_operator_id) cannot
+        // drift — safe because the prefix contains no `%` or `_`, the two
+        // bytes LIKE would read as instructions.
+        let wants_operator = namespace == PushNamespace::Operator;
+        let pattern = format!("{OPERATOR_PREFIX}%");
+        let rows = client
+            .query(
+                "SELECT task_id, config_id, url, token, auth_scheme, auth_credentials,
+                    next_seq, attempts, next_attempt_at, last_error
+                 FROM push_delivery
+                 WHERE tenant = $1 AND next_attempt_at <= $2
+                   AND (config_id LIKE $4) = $5
+                 ORDER BY next_attempt_at, task_id, config_id
+                 LIMIT $3",
+                &[
+                    &self.tenant_name(),
+                    &at.cast_signed(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &pattern,
+                    &wants_operator,
+                ],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        // The whole foreign due backlog, not the slice a scan happened to walk
+        // past: `unserved` documents itself as a lower bound, and the exact
+        // count is the most honest lower bound a backend with a filter can
+        // give — it is what the paging default converges to once it has read
+        // the store to the end.
+        let unserved_row = client
+            .query_one(
+                "SELECT COUNT(*) FROM push_delivery
+                 WHERE tenant = $1 AND next_attempt_at <= $2
+                   AND (config_id LIKE $3) <> $4",
+                &[
+                    &self.tenant_name(),
+                    &at.cast_signed(),
+                    &pattern,
+                    &wants_operator,
+                ],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        let unserved = usize::try_from(unserved_row.get::<_, i64>(0)).unwrap_or(usize::MAX);
+        Ok(DueBatch {
+            rows: rows
+                .iter()
+                .map(registration_from)
+                .collect::<Result<_, _>>()?,
+            unserved,
+        })
     }
 
     async fn advance(&self, task: RunId, id: &str, next_seq: Seq) -> Result<(), StoreError> {

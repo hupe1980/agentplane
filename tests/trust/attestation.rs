@@ -513,6 +513,217 @@ async fn an_audit_reports_what_it_could_not_look_at() {
     assert!(report.not_checked.iter().any(|s| s.contains("signatures")));
 }
 
+/// **A truncated-but-internally-consistent history is a finding, not sound.**
+///
+/// A prefix of a hash chain verifies on its own — chaining catches edits and
+/// holes, never a missing tail. For a *sealed* run the tail is pinned by the
+/// Merkle leaf: the log committed to the run's terminal hash, so an audit must
+/// hold the head it recomputed from the served bytes against the leaf the
+/// store claims. An audit that verified each half separately — chain sound,
+/// store-supplied leaf in the tree — waved through a store serving a shortened
+/// history of a run whose seal proves it was longer.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
+    use agentplane::core::{Epoch, RunId, Seq, StoreError};
+    use agentplane::journal::{Append, Cancellation, Checkpoint, Head, Inclusion, Lease};
+
+    /// A store that lies by omission: every read loses the last record.
+    #[derive(Debug)]
+    struct Truncating(Arc<dyn JournalStore>);
+
+    #[async_trait::async_trait]
+    impl JournalStore for Truncating {
+        fn is_shared(&self) -> bool {
+            self.0.is_shared()
+        }
+        fn tenant(&self) -> &str {
+            self.0.tenant()
+        }
+        async fn append(
+            &self,
+            epoch: Epoch,
+            batch: Vec<Append>,
+        ) -> Result<Vec<Record>, StoreError> {
+            self.0.append(epoch, batch).await
+        }
+        async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
+            let mut records = self.0.read(run, from).await?;
+            records.pop();
+            Ok(records)
+        }
+        async fn case_history(
+            &self,
+            case: agentplane::core::CaseId,
+            limit: usize,
+        ) -> Result<Vec<Record>, StoreError> {
+            self.0.case_history(case, limit).await
+        }
+        async fn acquire(
+            &self,
+            run: RunId,
+            owner: &str,
+            ttl: std::time::Duration,
+        ) -> Result<Lease, StoreError> {
+            self.0.acquire(run, owner, ttl).await
+        }
+        async fn release_lease(&self, run: RunId, epoch: Epoch) -> Result<(), StoreError> {
+            self.0.release_lease(run, epoch).await
+        }
+        async fn renew(
+            &self,
+            run: RunId,
+            owner: &str,
+            epoch: Epoch,
+            ttl: std::time::Duration,
+        ) -> Result<Lease, StoreError> {
+            self.0.renew(run, owner, epoch, ttl).await
+        }
+        async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
+            self.0.abandoned_runs(limit).await
+        }
+        async fn runs_by_outcome(
+            &self,
+            outcome: &str,
+            limit: usize,
+        ) -> Result<Vec<RunId>, StoreError> {
+            self.0.runs_by_outcome(outcome, limit).await
+        }
+        async fn recent_runs(
+            &self,
+            after: Option<(u64, RunId)>,
+            limit: usize,
+        ) -> Result<Vec<(RunId, u64)>, StoreError> {
+            self.0.recent_runs(after, limit).await
+        }
+        async fn head(&self, run: RunId) -> Result<Head, StoreError> {
+            self.0.head(run).await
+        }
+        async fn seal(
+            &self,
+            run: RunId,
+            epoch: Epoch,
+            outcome: &str,
+        ) -> Result<Digest, StoreError> {
+            self.0.seal(run, epoch, outcome).await
+        }
+        async fn checkpoint(&self) -> Result<Checkpoint, StoreError> {
+            self.0.checkpoint().await
+        }
+        async fn consistency_proof(&self, old_size: u64) -> Result<Vec<Digest>, StoreError> {
+            self.0.consistency_proof(old_size).await
+        }
+        async fn inclusion_proof(&self, run: RunId) -> Result<Option<Inclusion>, StoreError> {
+            self.0.inclusion_proof(run).await
+        }
+        async fn request_cancel(
+            &self,
+            run: RunId,
+            actor: &str,
+            reason: &str,
+        ) -> Result<bool, StoreError> {
+            self.0.request_cancel(run, actor, reason).await
+        }
+        async fn cancellation(&self, run: RunId) -> Result<Option<Cancellation>, StoreError> {
+            self.0.cancellation(run).await
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let runs = sealed_runs(&store, 1).await;
+
+    // The honest store audits sound — so the finding below is the truncation,
+    // not the fixture.
+    let honest = store.clone() as Arc<dyn JournalStore>;
+    let clean = agentplane::audit::audit(&honest, &runs, &agentplane::audit::Evidence::default())
+        .await
+        .unwrap();
+    assert!(clean.is_sound(), "{:?}", clean.findings);
+
+    // The same log, served one record short. The prefix's chain verifies —
+    // that is what a chain is — and the leaf the log holds is genuine, so
+    // only holding the two to each other can catch it.
+    let lying =
+        Arc::new(Truncating(store.clone() as Arc<dyn JournalStore>)) as Arc<dyn JournalStore>;
+    let report = agentplane::audit::audit(&lying, &runs, &agentplane::audit::Evidence::default())
+        .await
+        .unwrap();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, agentplane::audit::Finding::LeafMismatch { .. })),
+        "a sealed run served as a truncated-but-consistent prefix audited as: \
+         sound={:?} findings={:?}",
+        report.sound,
+        report.findings
+    );
+    assert!(
+        !report.sound.contains(&runs[0]),
+        "the truncated run was reported sound"
+    );
+}
+
+/// **The sealing record's own claim is held to the chain it sits in.**
+///
+/// `RunSealed.chain_head` is the head the conclusion was drawn over — by
+/// construction its own record's `prev_hash`. A writer that seals a
+/// conclusion composed against some other history produces a mismatch no
+/// honest path can, and an audit that never read the field left it
+/// unfalsifiable.
+#[tokio::test]
+async fn a_sealing_record_claiming_a_foreign_head_is_a_finding() {
+    use agentplane::core::Label;
+    use agentplane::journal::{Append, RecordKind};
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let s = store.clone() as Arc<dyn JournalStore>;
+    let run = agentplane::core::RunId::generate();
+    let lease = s
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .unwrap();
+    s.append(
+        lease.epoch,
+        vec![
+            Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "demo".into(),
+                    governed_by: None,
+                    input_label: Label::trusted(),
+                    input: json!({}),
+                    policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
+                },
+            ),
+            Append::new(
+                run,
+                RecordKind::RunSealed {
+                    outcome: "succeeded".into(),
+                    // Not the head this conclusion sits on.
+                    chain_head: Digest::of(b"some other history"),
+                },
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+    s.seal(run, lease.epoch, "succeeded").await.unwrap();
+
+    let report = agentplane::audit::audit(&s, &[run], &agentplane::audit::Evidence::default())
+        .await
+        .unwrap();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, agentplane::audit::Finding::SealClaim { .. })),
+        "a conclusion drawn over a different history audited as: {:?}",
+        report.findings
+    );
+}
+
 /// **The point of the whole mechanism, from the auditor's side.**
 ///
 /// Without a checkpoint from outside, an audit of a store somebody deleted a run

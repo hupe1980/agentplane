@@ -58,12 +58,10 @@ use std::sync::Arc;
 
 use agentplane::api::a2a::{A2aReply, A2aServer, Part};
 use agentplane::api::{AuthError, Authenticator, Caller};
-use agentplane::case::{CaseStore, EventStore};
 use agentplane::core::{
     AwaitSpec, CorrelationKey, DeadlineSpec, Outcome, PolicyBundleIdentity, PolicyDecision,
     PolicyEngine, PolicyRequest, Skill, SkillDescriptor, SkillError, Tainted,
 };
-use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
 use agentplane::peers::CardSecurity;
 use agentplane::runtime::{Agent, Runtime, StepCtx};
@@ -205,9 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let manifest = Manifest::parse(ECHO)?;
     let store = Arc::new(RedbStore::open_in_memory()?);
-    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
-        .events(Arc::clone(&store) as Arc<dyn EventStore>)
+    let runtime = Runtime::builder_on(Arc::clone(&store))
         .policy(Arc::new(PermitEverything))
         .agent(Agent::new(&manifest).skill(TckAgent))
         .build();

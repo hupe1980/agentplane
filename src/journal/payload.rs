@@ -11,13 +11,12 @@
 //! enforcing exactly-once — the guarantee whose failure is a payment taken
 //! twice.
 //!
-//! So the variant stays exactly what it was and only the *payload* is sealed:
-//! `RunAdmitted.input`, `EffectStarted.descriptor.args` — which is where model
-//! prompts and tool arguments live — and `EffectDone.output`. Everything the
-//! runtime routes on (`seq`, `run`, `case`, `step`, `phase`, `epoch`,
-//! `effect_key`, and the variant itself) stays in the clear, so exactly-once,
-//! the case scan, the outcome index and the chain all keep working with no key
-//! at all.
+//! So the variant stays exactly what it was and only the *payload* is sealed —
+//! every field that carries the caller's data, enumerated in [`payloads`].
+//! Everything the runtime routes on (`seq`, `run`, `case`, `step`, `phase`,
+//! `epoch`, `effect_key`, and the variant itself) stays in the clear, so
+//! exactly-once, the case scan, the outcome index and the chain all keep
+//! working with no key at all.
 //!
 //! # The chain commits to ciphertext
 //!
@@ -49,6 +48,25 @@ pub fn is_sealed(value: &Value) -> bool {
         .is_some_and(|o| o.len() == 1 && o.get(SEALED).is_some_and(serde_json::Value::is_string))
 }
 
+/// Whether this string field is a sealed payload rather than readable text.
+///
+/// The string counterpart of [`is_sealed`], for the fields whose schema is a
+/// string rather than a value — a note's text, a failure's message. The same
+/// caveat applies in the same shape: text that legitimately began with the
+/// marker and decoded as base64 to its end would be indistinguishable, so the
+/// marker is deliberately not something prose would open with.
+#[must_use]
+pub fn is_sealed_text(text: &str) -> bool {
+    use base64::Engine;
+    text.strip_prefix(SEALED)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .is_some_and(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .is_ok()
+        })
+}
+
 /// Wrap an envelope as the JSON a record carries in place of its payload.
 pub(crate) fn wrap(envelope: &[u8]) -> Value {
     use base64::Engine;
@@ -67,17 +85,82 @@ pub(crate) fn unwrap(value: &Value) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// Wrap an envelope as the string a record carries in place of a text field.
+pub(crate) fn wrap_text(envelope: &[u8]) -> String {
+    use base64::Engine;
+    format!(
+        "{SEALED}:{}",
+        base64::engine::general_purpose::STANDARD.encode(envelope)
+    )
+}
+
+/// The envelope inside a sealed text field, if this is one.
+pub(crate) fn unwrap_text(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let encoded = text.strip_prefix(SEALED)?.strip_prefix(':')?;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()
+}
+
+/// One sealable field of a record, by the shape its schema gives it.
+///
+/// Two arms rather than coercing text into a JSON value, because the record's
+/// wire format is the field's declared type: a `Note`'s `text` is a string on
+/// the wire, and sealing must replace it with a string or every reader of the
+/// serialized record changes shape with the key configuration.
+pub(crate) enum SealedField<'a> {
+    /// A JSON payload — input, output, arguments, a frozen plan.
+    Value(&'a mut Value),
+    /// A free-text payload — a note, a failure message.
+    Text(&'a mut String),
+}
+
 /// The payload fields of a record kind, for sealing and opening in place.
 ///
 /// One list, consulted by both directions, because a field sealed on the way
 /// in and forgotten on the way out is a record nobody can read — and the
 /// reverse is a payload that was never sealed at all.
-pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<&mut Value> {
+///
+/// The dividing rule: *what a store is asked questions about stays readable;
+/// what it merely holds is sealed.* Neither backend matches or
+/// indexes on any field below — routing lives in `seq`, `run`, `case`,
+/// `effect_key`, the variant, and `RunSealed.outcome`, all of which stay
+/// clear.
+pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
     use super::RecordKind as K;
     match kind {
-        K::RunAdmitted { input, .. } => vec![input],
-        K::EffectStarted { descriptor, .. } => vec![&mut descriptor.args],
-        K::EffectDone { output, .. } => vec![output],
+        K::RunAdmitted { input, .. } => vec![SealedField::Value(input)],
+        // The frozen plan is sealed because it can *embed* the caller's data,
+        // not merely reference it: a `planned` agent's planner reads the
+        // (trusted) input to write the plan, and any constant it binds —
+        // `ArgSource::Const` — is a value derived from that input, frozen into
+        // the graph. Trusted is not non-sensitive. Everything that routes on
+        // the plan (the step list, the digest) is recomputed from the opened
+        // value by a runtime that holds the key; with the key erased the run's
+        // data is gone and its replay legitimately goes with it, exactly as it
+        // does for `RunAdmitted.input`.
+        K::PlanFrozen { plan, .. } => vec![SealedField::Value(plan)],
+        K::EffectStarted { descriptor, .. } => vec![SealedField::Value(&mut descriptor.args)],
+        K::EffectDone { output, .. } => vec![SealedField::Value(output)],
+        // A reconciled effect's recovered result is the same object an
+        // `EffectDone.output` is — caller data a probe happened to fetch —
+        // while `disposition` and `detail`'s *absence or presence* drive
+        // recovery and stay clear.
+        K::EffectReconciled { output, .. } => output
+            .as_mut()
+            .map(SealedField::Value)
+            .into_iter()
+            .collect(),
+        // The message is free text a provider or tool wrote — it quotes the
+        // request it refused, which is the caller's data. `disposition` and
+        // `permanent` MUST stay clear: retry and reconciliation route on them,
+        // and a recovery that needed a key to decide whether a call reached
+        // the world would fail closed into an outage.
+        K::EffectFailed { error, .. } => vec![SealedField::Text(error)],
+        // Reasoning recorded beside the effects it explains — model output
+        // over the caller's data, and nothing routes on it.
+        K::Note { text } => vec![SealedField::Text(text)],
         // Everything else is control-plane: names, states, digests, counts.
         // Sealing them would cost the readability that makes an unopenable
         // journal still useful, and buy nothing — none of them carries the

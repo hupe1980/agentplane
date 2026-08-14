@@ -21,12 +21,15 @@ all, because the journal then holds an intention with no outcome.
 
 ```rust
 let prompt = Tainted::trusted(prompt);
-let call = ModelCall::new(provider, model, prompt.peek().clone());
-let answer = cx.sink(call, &prompt).await?;
+let answer = cx
+    .sink_with(&prompt, |value| ModelCall::new(provider, model, value))
+    .await?;
 ```
 
-Model prompts are outbound data, so `sink` binds the exact labelled value to
-the call before dispatch. Live, that performs the call and journals the result. On replay, it performs
+Model prompts are outbound data, so they go through the sink gate: `sink_with`
+hands the labelled value to the effect and the gate in one motion — the closure
+receives the inner value, so the bytes the gates check and the bytes the
+provider is sent cannot drift apart. Live, that performs the call and journals the result. On replay, it performs
 nothing and returns the recorded answer. The skill code is identical either way,
 which is the point: replay is not a special mode a skill has to know about.
 
@@ -235,11 +238,21 @@ The label is applied **by the effect, at the source** — not by the caller. A
 label the caller applies is a label the caller forgets, and this crate's own test
 fixtures forgot it once, which made an existing guarantee untestable for months.
 
-Every outbound effect must use `cx.sink`, which binds the exact dispatched JSON
-to the labels being checked. An **egress ceiling** limits sensitivity. A mutating
-sink either refuses any untrusted argument, or declares protected JSON fields
-whose trust, provenance sources and sensitivity are checked independently — so
-an untrusted memo may accompany a trusted recipient without acquiring authority.
+Every outbound effect must go through the sink gate — `cx.sink_with`, or the
+two-arg `cx.sink` for an effect that binds its outbound value internally —
+which holds the exact dispatched JSON to the labels being checked. An **egress
+ceiling** limits sensitivity. A mutating sink either refuses any untrusted
+argument, or declares protected JSON fields whose trust, provenance sources and
+sensitivity are checked independently — so an untrusted memo may accompany a
+trusted recipient without acquiring authority.
+
+A provenance source names the **concrete** origin, not a family of effects: a
+tool call's output carries `tool://server/name`, a model completion
+`model:{provider}/{model}`, a commission `agent/{capability}`. That precision
+is what a source rule can *say* — "the recipient must come from the CRM
+lookup" is unsatisfiable when every granted tool answers under one family
+name, because the rule then admits whichever tool an injected prompt reached
+first.
 
 `cx.release` is the only way to improve a label. Its typed request names the
 trust and/or sensitivity dimension, exact fields, destination, basis and
@@ -375,7 +388,9 @@ discovering one call at a time.
 |---|---|
 | `now()`, `rng()`, `note(text)` | the clock, the per-step RNG, and a line in the chain — all reproduced on replay |
 | `effect(e)` | any effect with no labelled value to bind |
-| `sink(e, &value)` | an outbound effect **with** its labelled arguments — the only path that can carry protected fields |
+| `sink_with(&value, build)` | an outbound effect **with** its labelled arguments, built from them in one motion — the primary dispatch shape, and the only path that can carry protected fields |
+| `sink(e, &value)` | the same gate, for an effect built elsewhere or one that binds its outbound value internally |
+| `complete(&prompt)`, `complete_with(&prompt, tune)` | a completion on the governing manifest's own model, through the plane's registered driver — no provider `Arc` in the skill |
 | `release(request)` | typed, policy-authorized improvement of a label |
 | `deadline`, `meet_deadline`, `cancel_deadline` | obligations |
 | `sleep(d)`, `await_event(&spec)`, `task(&spec)` | durable suspension — a waiting run is a row, not a thread |

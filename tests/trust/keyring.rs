@@ -722,6 +722,7 @@ async fn case_state_is_sealed_and_erasing_the_case_takes_it() {
 /// breaks — three mechanisms sharing a scope only work if they really do share
 /// it, and nothing but this test says they do.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
     use agentplane::blob::{BlobStore, MemoryBlobs};
     use agentplane::case::CaseStore;
@@ -779,6 +780,47 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
                     },
                 )
                 .case(case),
+                // Every other payload field the sealing list names, so this
+                // test is the one that notices a field added to a record and
+                // forgotten by the list: a plan can embed input-derived
+                // constants, a note is model output over the caller's data, a
+                // failure message quotes the request that was refused, and a
+                // reconciled output is caller data a probe recovered.
+                Append::new(
+                    run,
+                    RecordKind::PlanFrozen {
+                        steps: vec!["claim.assess".into()],
+                        plan: serde_json::json!({ "constant": "Ada Lovelace" }),
+                    },
+                )
+                .case(case),
+                Append::new(
+                    run,
+                    RecordKind::Note {
+                        text: "the claimant Ada Lovelace looks legitimate".into(),
+                    },
+                )
+                .case(case),
+                Append::new(
+                    run,
+                    RecordKind::EffectFailed {
+                        error: "payee Ada Lovelace was refused by the bank".into(),
+                        spend: agentplane::core::Spend::default(),
+                        disposition: agentplane::core::Disposition::DidNotHappen,
+                        permanent: false,
+                    },
+                )
+                .case(case),
+                Append::new(
+                    run,
+                    RecordKind::EffectReconciled {
+                        disposition: agentplane::core::Disposition::Landed,
+                        output: Some(serde_json::json!({ "claimant": "Ada Lovelace" })),
+                        spend: agentplane::core::Spend::default(),
+                        detail: None,
+                    },
+                )
+                .case(case),
             ],
         )
         .await
@@ -828,17 +870,146 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
         "case state survived the erasure: {}",
         after.state
     );
-    // Journal payload: sealed shut, through the store that holds the ring.
+    // Journal payloads: sealed shut, through the store that holds the ring —
+    // every field on the sealing list, because a field the erasure misses is
+    // an erasure reporting success over readable data.
     let records = journal.read(run, 1).await.expect("read");
-    match records[0].kind() {
-        RecordKind::RunAdmitted { input, .. } => assert!(
-            payload::is_sealed(input),
-            "the journal payload survived the erasure: {input}"
-        ),
+    for record in &records {
+        match record.kind() {
+            RecordKind::RunAdmitted { input, .. } => assert!(
+                payload::is_sealed(input),
+                "the admitted input survived the erasure: {input}"
+            ),
+            RecordKind::PlanFrozen { plan, .. } => assert!(
+                payload::is_sealed(plan),
+                "the frozen plan survived the erasure — its constants are \
+                 compiled from the caller's input: {plan}"
+            ),
+            RecordKind::Note { text } => assert!(
+                payload::is_sealed_text(text),
+                "a note survived the erasure: {text}"
+            ),
+            RecordKind::EffectFailed {
+                error,
+                disposition,
+                permanent,
+                ..
+            } => {
+                assert!(
+                    payload::is_sealed_text(error),
+                    "a failure message survived the erasure: {error}"
+                );
+                // The routing half must NOT be sealed: recovery reads the
+                // disposition with no key at all.
+                assert_eq!(*disposition, agentplane::core::Disposition::DidNotHappen);
+                assert!(!*permanent);
+            }
+            RecordKind::EffectReconciled { output, .. } => assert!(
+                output.as_ref().is_some_and(payload::is_sealed),
+                "a reconciled output survived the erasure: {output:?}"
+            ),
+            other => panic!("unexpected record: {other:?}"),
+        }
+    }
+    assert!(
+        !serde_json::to_string(
+            &records
+                .iter()
+                .map(agentplane::Record::kind)
+                .collect::<Vec<_>>()
+        )
+        .expect("serialise")
+        .contains("Lovelace"),
+        "the caller's data is readable somewhere in the erased run's records"
+    );
+
+    // ── And the history still proves itself ─────────────────────────────────
+    let stored = raw.read(run, 1).await.expect("raw");
+    Record::verify_chain(&stored, Digest::ZERO)
+        .expect("the erasure destroyed the tamper evidence along with the data");
+}
+
+/// **A run with no case still has an erasure path.**
+///
+/// `SealedJournal` seals a case-less record's payloads under `tenant/<run>` —
+/// an erasure unit somebody can name — but `erase_case` was the only erasure
+/// verb, and it destroys a *case* scope. A run that never bound to a case
+/// therefore had sealed data nobody could erase: a scope with a name and no
+/// verb. `erase_run` is that verb, and this holds it to the same composed
+/// claim `erase_case` is held to — the payloads become unreadable, and the
+/// chain still verifies over the ciphertext it always committed to.
+#[tokio::test]
+async fn a_case_less_runs_payloads_are_erasable_by_run() {
+    use agentplane::core::{Digest, Label, RunId, TenantId, Timestamp};
+    use agentplane::journal::{Append, JournalStore, Record, RecordKind, payload};
+    use agentplane::keyring::SealedJournal;
+
+    let tenant = TenantId::default();
+    let keys = Arc::new(MemoryKeyRing::default());
+    let ring = Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>;
+    let raw = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let journal = SealedJournal::wrap(
+        Arc::clone(&raw) as Arc<dyn JournalStore>,
+        Arc::clone(&ring),
+        tenant.clone(),
+    );
+
+    let at = Timestamp::from_unix_timestamp(1_760_000_000).expect("time");
+    let run = RunId::generate();
+    let lease = journal
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    journal
+        .append(
+            lease.epoch,
+            // Deliberately no `.case(..)`: the run is its own erasure unit.
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "one-shot.report".into(),
+                    governed_by: None,
+                    input_label: Label::trusted(),
+                    input: serde_json::json!({ "claimant": "Ada Lovelace" }),
+                    policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+
+    // Readable before, through the ring.
+    match journal.read(run, 1).await.expect("read")[0].kind() {
+        RecordKind::RunAdmitted { input, .. } => {
+            assert_eq!(input["claimant"], "Ada Lovelace");
+        }
         other => panic!("unexpected record: {other:?}"),
     }
 
-    // ── And the history still proves itself ─────────────────────────────────
+    agentplane::blob::erase_run(
+        ring.as_ref(),
+        &tenant,
+        run,
+        at,
+        "subject exercised the right to erasure",
+    )
+    .await
+    .expect("erase");
+
+    // Sealed shut after — through the store that still holds the ring.
+    match journal.read(run, 1).await.expect("read")[0].kind() {
+        RecordKind::RunAdmitted { input, .. } => assert!(
+            payload::is_sealed(input),
+            "a case-less run's payload survived its erasure: {input}"
+        ),
+        other => panic!("unexpected record: {other:?}"),
+    }
+    // Idempotent: a retry cannot rewrite when or why the data went.
+    agentplane::blob::erase_run(ring.as_ref(), &tenant, run, at, "retry")
+        .await
+        .expect("second erasure");
+    // And the history still proves itself with no key at all.
     let stored = raw.read(run, 1).await.expect("raw");
     Record::verify_chain(&stored, Digest::ZERO)
         .expect("the erasure destroyed the tamper evidence along with the data");
@@ -1011,5 +1182,226 @@ async fn configuring_a_key_ring_seals_every_store() {
             "the journal was not sealed by the plane's key ring: {input}"
         ),
         other => panic!("unexpected record: {other:?}"),
+    }
+}
+
+// ── Webhook credentials at rest ─────────────────────────────────────────────
+
+/// The push table stores destinations and the credentials to reach them, and
+/// the concept spec calls a leaked registration what it is: a destination and
+/// a bearer token for it. [`SealedPush`](agentplane::keyring::SealedPush)
+/// seals the credentials and leaves the routing readable — the due query
+/// orders and filters on task, id and retry instant, and a delivery table
+/// whose routing is sealed cannot deliver.
+#[cfg(all(feature = "push", feature = "redb"))]
+mod sealed_push {
+    use std::sync::Arc;
+
+    use agentplane::core::{RunId, Secret, TenantId};
+    use agentplane::journal::payload;
+    use agentplane::keyring::{KeyRing, SealedPush};
+    use agentplane::push::{PushAuthentication, PushConfig, PushStore};
+    use agentplane::store::RedbStore;
+    use agentplane::testkit::MemoryKeyRing;
+
+    fn now() -> agentplane::core::Timestamp {
+        agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("a valid instant")
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn fixture() -> (
+        Arc<dyn PushStore>,
+        Arc<MemoryKeyRing>,
+        Arc<SealedPush>,
+        TenantId,
+    ) {
+        let raw = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn PushStore>;
+        let keys = Arc::new(MemoryKeyRing::default());
+        let tenant = TenantId::default();
+        let sealed = SealedPush::wrap(
+            Arc::clone(&raw),
+            Arc::clone(&keys) as Arc<dyn KeyRing>,
+            tenant.clone(),
+        );
+        (raw, keys, sealed, tenant)
+    }
+
+    fn registration(task: RunId) -> PushConfig {
+        PushConfig {
+            id: "cfg-1".to_owned(),
+            task,
+            url: "https://hooks.acme.example/a2a".to_owned(),
+            token: Some(Secret::new("opaque-a2a-token")),
+            authentication: Some(PushAuthentication {
+                scheme: "Bearer".to_owned(),
+                credentials: Secret::new("the-receivers-bearer"),
+            }),
+        }
+    }
+
+    /// Both secrets round-trip through the wrapper and neither reaches the
+    /// store readable — while everything the store is asked questions about
+    /// stays in the clear.
+    #[tokio::test]
+    async fn a_webhook_credential_is_sealed_at_rest_and_round_trips() {
+        let (raw, _keys, sealed, _tenant) = fixture();
+        let task = RunId::generate();
+        sealed.put(&registration(task), 1).await.expect("put");
+
+        // Through the wrapper: the delivery worker's view, which must hold
+        // the credentials it will put on the POST.
+        let back = sealed
+            .get(task, "cfg-1")
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            back.token.as_ref().map(Secret::expose),
+            Some("opaque-a2a-token")
+        );
+        assert_eq!(
+            back.authentication
+                .as_ref()
+                .map(|auth| auth.credentials.expose()),
+            Some("the-receivers-bearer")
+        );
+        let due = sealed.due(0, 10).await.expect("due");
+        assert_eq!(
+            due[0].config.token.as_ref().map(Secret::expose),
+            Some("opaque-a2a-token"),
+            "the due read is the one the worker delivers from, and it came \
+             back sealed"
+        );
+
+        // In the store: both credentials sealed, and the secrets are not in
+        // the bytes.
+        let stored = raw
+            .get(task, "cfg-1")
+            .await
+            .expect("raw get")
+            .expect("present");
+        let stored_token = stored.token.as_ref().map(Secret::expose).expect("a token");
+        assert!(
+            payload::is_sealed_text(stored_token),
+            "the A2A token reached the store readable"
+        );
+        assert!(!stored_token.contains("opaque-a2a-token"));
+        let stored_bearer = stored
+            .authentication
+            .as_ref()
+            .map(|auth| auth.credentials.expose())
+            .expect("credentials");
+        assert!(
+            payload::is_sealed_text(stored_bearer),
+            "the receiver's bearer reached the store readable"
+        );
+        assert!(!stored_bearer.contains("the-receivers-bearer"));
+
+        // The routing half stays readable, or the due scan and the worker
+        // would have nothing to route on.
+        assert_eq!(stored.url, "https://hooks.acme.example/a2a");
+        assert_eq!(
+            stored
+                .authentication
+                .as_ref()
+                .map(|auth| auth.scheme.as_str()),
+            Some("Bearer"),
+            "the scheme is a label, not a secret, and validation reads it"
+        );
+        assert_eq!(raw.due(0, 10).await.expect("raw due").len(), 1);
+    }
+
+    /// Destroying the tenant's push scope makes every stored credential
+    /// unreadable — in the live store and in every backup of it — while the
+    /// registrations themselves stay routable, so the sweep serving other
+    /// tenants never trips over the erased one.
+    #[tokio::test]
+    async fn erasing_the_tenant_reaches_every_webhook_credential() {
+        let (_raw, keys, sealed, tenant) = fixture();
+        let task = RunId::generate();
+        sealed.put(&registration(task), 1).await.expect("put");
+
+        keys.destroy(
+            &agentplane::keyring::scope(&tenant, "push"),
+            now(),
+            "the tenant was erased",
+        )
+        .await
+        .expect("destroy");
+
+        let after = sealed
+            .get(task, "cfg-1")
+            .await
+            .expect("get")
+            .expect("still registered");
+        assert!(
+            after.token.is_none(),
+            "a token opened after its tenant's key was destroyed"
+        );
+        assert!(
+            after.authentication.is_none(),
+            "a bearer opened after its tenant's key was destroyed — or came \
+             back as a header full of ciphertext"
+        );
+        // Routing survives: the row is still found and still due, so it ages
+        // out through the ordinary retry ceiling instead of wedging the sweep.
+        assert_eq!(after.url, "https://hooks.acme.example/a2a");
+        assert_eq!(sealed.due(0, 10).await.expect("due").len(), 1);
+    }
+
+    /// A sealed credential copied onto another registration does not open.
+    ///
+    /// The associated data binds the envelope to `(task, id)`: a row edited to
+    /// carry another row's ciphertext — a column copied in the database, not a
+    /// key compromise — fails to authenticate rather than opening as authority
+    /// the other registration was never given.
+    #[tokio::test]
+    async fn a_credential_lifted_onto_another_registration_does_not_open() {
+        let (raw, _keys, sealed, _tenant) = fixture();
+        let task = RunId::generate();
+        sealed.put(&registration(task), 1).await.expect("put");
+        let stolen = raw
+            .get(task, "cfg-1")
+            .await
+            .expect("raw get")
+            .expect("present")
+            .token
+            .expect("a sealed token");
+
+        // The copy: a second registration wearing the first one's ciphertext,
+        // written past the wrapper the way a database edit would be.
+        raw.put(
+            &PushConfig {
+                id: "cfg-2".to_owned(),
+                task,
+                url: "https://hooks.acme.example/other".to_owned(),
+                token: Some(stolen),
+                authentication: None,
+            },
+            1,
+        )
+        .await
+        .expect("raw put");
+
+        let moved = sealed
+            .get(task, "cfg-2")
+            .await
+            .expect("get")
+            .expect("present");
+        assert!(
+            moved.token.is_none(),
+            "a credential sealed for one registration opened on another"
+        );
+        // And the original still opens, so the refusal above is the binding
+        // working rather than the ring being broken.
+        let original = sealed
+            .get(task, "cfg-1")
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            original.token.as_ref().map(Secret::expose),
+            Some("opaque-a2a-token")
+        );
     }
 }

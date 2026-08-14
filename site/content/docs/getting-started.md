@@ -108,6 +108,13 @@ agentplane digest   summariser.yaml     # what a registry pins
 agentplane run      summariser.yaml --input '{"ticket": "printer on fire"}'
 ```
 
+`--input -` reads stdin, the convention every pipe-shaped tool honours. A
+recorded run is re-executed with its own verb — `agentplane replay <run-id>
+--store runs.redb --manifest summariser.yaml`, plus `--strict` to verify rather
+than resume — and `agentplane card <manifest> --url <base>` prints the Agent
+Card a served manifest would advertise, so what a peer will see is reviewable
+before anything listens on a socket.
+
 Or with no Rust toolchain at all, which is rather the point of a tier whose
 premise is *a file and a key are the whole agent*:
 
@@ -295,10 +302,9 @@ your build. Everything else is opt-in:
 ```sh
 cargo add agentplane
 cargo add serde_json
-# A `Skill` is an async trait, and the runtime is async. Both are yours to
-# choose, so neither is re-exported — but the snippets below will not compile
-# without them.
-cargo add async-trait
+# The runtime is async, and which executor runs it is yours to choose — so
+# tokio is not re-exported. `async_trait` is: writing a skill starts at the
+# prelude, not in Cargo.toml.
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -350,10 +356,11 @@ use serde_json::{Value, json};
 #[derive(Debug)]
 struct Greet;
 
-#[async_trait::async_trait]
+#[async_trait]
 impl Skill for Greet {
+    // No `.provides(..)`: a skill that declares nothing answers its own name.
     fn descriptor(&self) -> SkillDescriptor {
-        SkillDescriptor::new("greet").provides("demo.greet")
+        SkillDescriptor::new("greet")
     }
 
     async fn invoke(
@@ -398,7 +405,7 @@ let runtime = Runtime::builder(Arc::clone(&store))
     .skill(Greet)
     .build();
 
-let outcome = runtime.run("demo.greet", Tainted::trusted(json!({ "name": "world" }))).await?;
+let outcome = runtime.run("greet", Tainted::trusted(json!({ "name": "world" }))).await?;
 println!("{:?} → {:?}", outcome.status, outcome.output);
 
 // Re-executes the logic, reads every effect back. Nothing is performed again.
@@ -415,12 +422,17 @@ an *input*, and a panic there reports one tenant's typo by killing every other
 tenant's in-flight run. Same checks underneath, so the two cannot drift about
 what is refused.
 
-Note `run("demo.greet", …)` takes the **capability**, not the skill name. Plans
-bind capabilities to skills, so what a step needs is decoupled from who provides
-it.
+Note `run("greet", …)` takes a **capability**. Here the capability *is* the
+skill's name, because a skill that declares nothing answers its own name — a
+hello-world program should not have to invent two names for one thing.
+`.provides(..)` exists for the case where the two genuinely differ: in a plan,
+one skill answers an abstract capability another step names, so what a step
+needs is decoupled from who provides it. Declaring a capability **replaces**
+the name default rather than adding to it — one declared surface, not two.
 
 Get it wrong and the plane tells you what it *does* have, because it is the only
-party that knows:
+party that knows. Here, from a plane whose skill declared
+`.provides("demo.greet")`:
 
 ```text
 Error: no skill provides capability 'demo.greeet' — this plane provides:
@@ -457,21 +469,22 @@ let args = Tainted::object([
   ("account".to_owned(), Tainted::trusted(json!("receivables"))),
   ("memo".to_owned(), model_written_memo), // may remain untrusted
 ]);
-let call = ToolCall::prepare(
-  &catalog,
-  client,
-  ToolId::new("ledger", "post_entry"),
-  args.peek().clone(),
-)?;
-let result = cx.sink(call, &args).await?; // exact bytes, protected account
+let result = cx
+  .sink_with(&args, |value| {
+    ToolCall::prepare(&catalog, client, ToolId::new("ledger", "post_entry"), value)
+  })
+  .await?; // exact bytes, protected account
 ```
 
 `ToolSafety::default()` says **mutates**, and that default is the whole posture: a
 tool nobody has thought about gets the treatment that makes the runtime cautious,
 not the one that makes it fast. A mutating call whose outcome is unknown escalates
 to an operator rather than being retried. Any effect that exposes outbound
-arguments must use `sink`; `effect` refuses it, so the check cannot be skipped.
-The protected account must be trusted, while an ordinary memo can retain model
+arguments must go through the sink gate; `effect` refuses it, so the check cannot
+be skipped. `sink_with` hands the labelled value to the effect and the gate in
+one motion — the closure receives the inner value, so the bytes the gates check
+and the bytes the tool is sent cannot be two versions of one argument. The
+protected account must be trusted, while an ordinary memo can retain model
 provenance.
 
 If a person or trusted process authorizes a label change, use a typed release:
@@ -577,19 +590,17 @@ what the *model* is told is one uniform sentence on purpose, because a precise
 refusal is an oracle an injected prompt can probe. See
 [security](@/docs/security.md).
 
-**`sink ... requires cx.sink` / argument mismatch** — an outbound effect was
-sent through `cx.effect`, or the effect carries different JSON from the labeled
-value checked. Build the call from `args.peek().clone()` and dispatch it with
-`cx.sink(call, &args)`.
-
 **`protected field ...`** — an authority-bearing path is absent, untrusted,
 derived from a source outside the allowlist, or above its own sensitivity
 ceiling. Fix the dataflow or use a narrowly scoped, policy-authorized `Release`;
 do not mark the whole object trusted.
 
 **`Exhausted(...)`** — a declared step/effect/token/cost/time/denial budget
-bound the run. This is a terminal, journaled outcome, not a transient provider
-failure. Raise the reviewed ceiling or reduce the plan.
+bound the run. This is a journaled **pause**, not a transient provider failure
+and not a fault: the run did what it was told, and what it was told included a
+ceiling, so its completed work stands. Raise the reviewed ceiling and resume —
+the recorded refusal is re-evaluated against the current ledger — or cancel,
+which unwinds.
 
 **A run that never finishes** — it is probably suspended waiting for an event,
 a timer, or a human. `GET /runs/{id}` reports *why* it is not finishing rather

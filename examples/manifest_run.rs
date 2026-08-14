@@ -28,10 +28,10 @@
 
 use std::sync::Arc;
 
-use agentplane::core::{Outcome, Sensitivity, Skill, SkillDescriptor, SkillError, Tainted};
+use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted};
 use agentplane::journal::JournalStore;
 use agentplane::manifest::{Manifest, ManifestError, MemoryRegistry, Registry, RegistryError};
-use agentplane::model::{ModelCall, ModelId, ModelProvider};
+use agentplane::model::{ModelId, ModelProvider};
 use agentplane::runtime::{Agent, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use agentplane::testkit::FakeProvider;
@@ -42,18 +42,17 @@ const AGENT: &str = include_str!("triage.yaml");
 
 /// One of the agent's skills.
 ///
-/// It holds **no manifest**. An agent has skills, not the other way round — the
-/// runtime is the agent, it owns the declaration, and a skill asks its execution
-/// context which agent it is part of. A skill separately configured with its own
-/// copy could disagree with the agent about what the agent is, which is exactly
-/// the drift a single reviewable file is supposed to remove.
+/// It holds **nothing** — no manifest, no provider, no model id. An agent has
+/// skills, not the other way round: the runtime is the agent, it owns the
+/// declaration and the drivers, and a skill asks its execution context which
+/// agent it is part of. A skill separately configured with its own copy of any
+/// of that could disagree with the agent about what the agent is, which is
+/// exactly the drift a single reviewable file is supposed to remove.
 ///
 /// So nothing in this struct decides what the agent is told, which model
 /// answers, or what shape the answer takes.
 #[derive(Debug)]
-struct Triage {
-    provider: Arc<FakeProvider>,
-}
+struct Triage;
 
 #[async_trait::async_trait]
 impl Skill for Triage {
@@ -68,60 +67,47 @@ impl Skill for Triage {
     ) -> Result<Outcome, SkillError> {
         // Asked of the context, not held by this skill. Read into owned
         // values up front, so nothing borrows the agent while the effects run.
-        let (system, model, schema) = {
+        let (system, schema) = {
             let manifest = cx.manifest().expect("this agent runs under a manifest");
-            let spec = &manifest.spec;
-
             // The words the agent is given. agentplane does not own them; it
             // owns their hash, and the layout this renders to is pinned by a
             // test.
-            let system = spec
+            let system = manifest
+                .spec
                 .identity
                 .as_ref()
                 .map(agentplane::manifest::Identity::system_prompt)
                 .unwrap_or_default();
-
-            // The model the file names, not one chosen here.
-            let m = spec
-                .models
-                .as_ref()
-                .and_then(|m| m.privileged.as_ref())
-                .expect("triage.yaml declares a privileged model");
-
-            (
-                system,
-                ModelId::new(&m.provider, &m.model),
-                manifest.output_schema().cloned(),
-            )
+            (system, manifest.output_schema().cloned())
         };
 
-        // Built twice, because a verifier pass is a second question rather than
-        // the same one asked again — and an effect key derived from an identical
-        // prompt would collide with the first call's.
-        let build = |prompt: Value| {
-            let mut call = ModelCall::new(
-                Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
-                model.clone(),
-                prompt,
-            )
-            .with_max_sensitivity(Sensitivity::Internal);
-            // The declared result contract. Handed to `expecting`, it goes into
-            // the **effect key** — so editing the schema makes a replay report
-            // divergence rather than quietly reinterpreting a stored answer
-            // under today's rules.
-            if let Some(schema) = &schema {
-                call = call.expecting(schema.clone());
+        // `cx.complete_with` resolves the rest from the declaration: the
+        // privileged model, its declared ceilings, the driver registered under
+        // the provider's name, and the egress ceiling. The closure adds the
+        // one thing the skill decides — that *this* call answers in the
+        // declared result contract. Handed to `expecting`, the schema goes
+        // into the **effect key**, so editing it makes a replay report
+        // divergence rather than quietly reinterpreting a stored answer under
+        // today's rules.
+        let expecting = |schema: &Option<Value>| {
+            let schema = schema.clone();
+            move |mut call: agentplane::model::ModelCall| {
+                if let Some(schema) = schema {
+                    call = call.expecting(schema);
+                }
+                call
             }
-            call
         };
 
         let first_prompt = Tainted::object([
             ("system".to_owned(), Tainted::trusted(json!(system.clone()))),
             ("ticket".to_owned(), input),
         ]);
-        let first = cx
-            .sink(build(first_prompt.peek().clone()), &first_prompt)
-            .await?;
+        // Asked twice on purpose — a verifier pass is a second question. Even
+        // byte-identical calls would be fine: an effect's identity includes
+        // its position in the step, so two identical dispatches are two
+        // effects, each replayed from its own record.
+        let first = cx.complete_with(&first_prompt, expecting(&schema)).await?;
 
         let draft = first.map(|completion| {
             completion
@@ -140,7 +126,7 @@ impl Skill for Triage {
             ("verify".to_owned(), draft),
         ]);
         let checked = cx
-            .sink(build(checked_prompt.peek().clone()), &checked_prompt)
+            .complete_with(&checked_prompt, expecting(&schema))
             .await?;
 
         Ok(Outcome::done(checked.map(|c| {
@@ -154,13 +140,15 @@ fn runtime_for(
     manifest: &Arc<Manifest>,
     provider: &Arc<FakeProvider>,
 ) -> Arc<Runtime> {
+    let driver: Arc<dyn ModelProvider> = provider.clone();
     Runtime::builder(Arc::clone(store))
+        // The driver under the name the manifest calls it — deployment wiring,
+        // beside the journal, exactly where an API key would live.
+        .provider("fake", driver)
         // The declaration and the skills that serve it arrive together: the
         // manifest governs *this agent's* steps — its budget, its grants, its
         // ceilings — while the runtime keeps the journal and the drivers.
-        .agent(Agent::new(manifest).skill(Triage {
-            provider: Arc::clone(provider),
-        }))
+        .agent(Agent::new(manifest).skill(Triage))
         .build()
 }
 

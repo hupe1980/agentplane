@@ -587,6 +587,10 @@ async fn an_open_run_refuses_to_resume_under_a_different_policy_bundle() {
         .await
         .unwrap();
 
+    // The fixture's own lease is handed back: a resume claims the lease
+    // before it reads, and a held one would refuse for the wrong reason.
+    store.release_lease(run, lease.epoch).await.unwrap();
+
     let world: World = Arc::default();
     let err = runtime(&store, &world, Some(Arc::new(Refuses("nothing"))))
         .replay(run, Mode::Resume)

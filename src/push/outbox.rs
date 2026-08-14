@@ -55,7 +55,7 @@ use crate::core::{RunId, Seq, StoreError};
 use crate::journal::{Record, RecordKind};
 
 use super::delivery::Projection;
-use super::{PushAuthentication, PushConfig, PushRegistration, PushStore};
+use super::{PushAuthentication, PushConfig, PushStore};
 
 /// The marker that tells an operator destination from a caller's webhook.
 ///
@@ -68,8 +68,9 @@ use super::{PushAuthentication, PushConfig, PushRegistration, PushStore};
 ///
 /// So the id namespace is split by a prefix that a caller cannot use — the A2A
 /// server refuses a `pushNotificationConfig.id` beginning with it — and each
-/// worker claims only its own rows through
-/// [`Projection::owns`](super::Projection::owns).
+/// worker declares its half through
+/// [`Projection::namespace`](super::Projection::namespace), which the store's
+/// due query filters on.
 pub const OPERATOR_PREFIX: &str = "operator:";
 
 /// Whether a registration id names an operator destination.
@@ -173,6 +174,31 @@ impl Outbox {
     #[must_use]
     pub fn destinations(&self) -> &[Destination] {
         &self.destinations
+    }
+
+    /// The same outbox, with its store's credentials sealed under `keys`.
+    ///
+    /// An operator destination's bearer — written by [`open`](Self::open) into
+    /// every run's registration — is a credential like any caller's, and the
+    /// store keeps it. This wraps the store in
+    /// [`SealedPush`](crate::keyring::SealedPush), so what lands at rest is
+    /// sealed and what [`Outbox`]'s worker reads back is not.
+    ///
+    /// One method rather than "construct with a wrapped store" because the
+    /// runtime seals stores at **build** — after the embedder handed the outbox
+    /// over — and a decorator only the constructor could apply is a guarantee
+    /// the argument order decides. `tenant` must be the tenant the store
+    /// serves, for the reason
+    /// [`SealedCases::wrap`](crate::keyring::SealedCases::wrap) gives.
+    #[cfg(feature = "keyring")]
+    #[must_use]
+    pub fn sealed(
+        mut self,
+        keys: Arc<dyn crate::keyring::KeyRing>,
+        tenant: crate::core::TenantId,
+    ) -> Self {
+        self.store = crate::keyring::SealedPush::wrap(Arc::clone(&self.store), keys, tenant);
+        self
     }
 
     /// Register every destination against a run, from its first record on.
@@ -279,7 +305,7 @@ impl Projection for RunCompleted {
         })])
     }
 
-    fn owns(&self, registration: &PushRegistration) -> bool {
-        is_operator_id(&registration.config.id)
+    fn namespace(&self) -> super::PushNamespace {
+        super::PushNamespace::Operator
     }
 }

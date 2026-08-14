@@ -117,10 +117,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ToolSafety::read_only().max_sensitivity(agentplane::core::Sensitivity::Internal),
             ),
     );
-    let store = Arc::new(RedbStore::open_in_memory()?);
-    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .provider("fake", Arc::clone(&provider) as Arc<dyn ModelProvider>)
-        .tools(catalog, Arc::clone(&desk) as Arc<dyn ToolClient>)
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
+    let driver: Arc<dyn ModelProvider> = provider.clone();
+    let transport: Arc<dyn ToolClient> = desk.clone();
+    let rt = Runtime::builder(Arc::clone(&store))
+        .provider("fake", driver)
+        .tools(catalog, transport)
         .agent(Agent::new(&manifest))
         .build();
 

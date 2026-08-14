@@ -237,6 +237,37 @@ impl MemoryStore for RedbStore {
                         .insert((tenant.as_str(), source.id.as_str(), id.as_str()), ())
                         .map_err(|e| be(&e))?;
                 }
+
+                // Sliding retention starts at the write, not at the first
+                // touch. Initialized lazily, an item with a window and no
+                // fixed expiry was *immortal* until somebody touched it —
+                // opt-in garbage that never collects. The write is itself an
+                // access, so the window opens here and each journaled touch
+                // slides it; a version written without the window drops the
+                // row, because retention is a property of what is currently
+                // believed.
+                drop(derived);
+                let mut access = w.open_table(ACCESS_EXPIRY).map_err(|e| be(&e))?;
+                match item.access_retention_seconds {
+                    Some(window) => {
+                        let expiry =
+                            created.saturating_add(i64::try_from(window).unwrap_or(i64::MAX));
+                        let prior = access
+                            .get((tenant.as_str(), id.as_str()))
+                            .map_err(|e| be(&e))?
+                            .map_or(i64::MIN, |value| value.value());
+                        if expiry > prior {
+                            access
+                                .insert((tenant.as_str(), id.as_str()), expiry)
+                                .map_err(|e| be(&e))?;
+                        }
+                    }
+                    None => {
+                        access
+                            .remove((tenant.as_str(), id.as_str()))
+                            .map_err(|e| be(&e))?;
+                    }
+                }
                 version
             };
             w.commit().map_err(|e| be(&e))?;
@@ -323,8 +354,11 @@ impl MemoryStore for RedbStore {
                     .and_then(|value| {
                         crate::core::Timestamp::from_unix_timestamp(value.value()).ok()
                     });
+                // `expires_at` is a hard ceiling: sliding access retention may
+                // shorten a life below it, never extend one past it — so the
+                // effective expiry is the *earlier* of the two, not the later.
                 let effective = match (item.expires_at, access_expiry) {
-                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (Some(left), Some(right)) => Some(left.min(right)),
                     (left, right) => left.or(right),
                 };
                 if as_of.is_some_and(|at| effective.is_some_and(|expires| expires <= at)) {
@@ -814,7 +848,6 @@ impl MemoryStore for RedbStore {
                 let mut current = w.open_table(CURRENT).map_err(|e| be(&e))?;
                 let mut by_subject = w.open_table(BY_SUBJECT).map_err(|e| be(&e))?;
                 let mut forgotten = w.open_table(FORGOTTEN).map_err(|e| be(&e))?;
-                let mut edges = w.open_table(DERIVED).map_err(|e| be(&e))?;
                 let holds = w.open_table(HOLDS).map_err(|e| be(&e))?;
                 let access = w.open_table(ACCESS_EXPIRY).map_err(|e| be(&e))?;
                 let entries: Vec<(String, String, String, i64, u64)> = current
@@ -859,8 +892,11 @@ impl MemoryStore for RedbStore {
                         .and_then(|value| {
                             crate::core::Timestamp::from_unix_timestamp(value.value()).ok()
                         });
+                    // The recall rule, applied to erasure: the ceiling wins,
+                    // so a touched-up window never carries an item past its
+                    // immutable `expires_at`.
                     let effective = match (item.expires_at, access_expiry) {
-                        (Some(left), Some(right)) => Some(left.max(right)),
+                        (Some(left), Some(right)) => Some(left.min(right)),
                         (left, right) => left.or(right),
                     };
                     if effective.is_some_and(|expires| expires <= at) {
@@ -883,22 +919,17 @@ impl MemoryStore for RedbStore {
                     forgotten
                         .insert((tenant.as_str(), id.as_str()), ())
                         .map_err(|e| be(&e))?;
-                    let incoming: Vec<String> = edges
-                        .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
-                        .map_err(|e| be(&e))?
-                        .filter_map(|entry| match entry {
-                            Ok((key, _)) if key.value().2 == id => {
-                                Some(Ok(key.value().1.to_owned()))
-                            }
-                            Ok(_) => None,
-                            Err(error) => Some(Err(be(&error))),
-                        })
-                        .collect::<Result<_, StoreError>>()?;
-                    for source in incoming {
-                        edges
-                            .remove((tenant.as_str(), source.as_str(), id.as_str()))
-                            .map_err(|e| be(&e))?;
-                    }
+                    // Edges deliberately stay — both directions, exactly as
+                    // `forget` keeps them. An expired memory becomes a
+                    // tombstone, not a hole in the graph: with U → E → D and E
+                    // expired here, a later `forget_cascading(U)` must still
+                    // route *through* E to reach D, and this sweep once
+                    // deleted E's incoming edges — severing exactly that path,
+                    // so the poisoned source's summary-of-a-summary outlived
+                    // the erasure. The read path keeps a kept edge harmless
+                    // (`derivatives` joins on a current item), and the
+                    // tombstone prevents id reuse from attaching this lineage
+                    // to unrelated future content.
                     let versions: Vec<u64> = items
                         .range(
                             (tenant.as_str(), id.as_str(), 0)

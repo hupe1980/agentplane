@@ -238,14 +238,30 @@ impl RedbStore {
     /// belongs to another tenant finds nothing, because the key it looks under
     /// was never written.
     ///
-    /// The origin moves with it. Two tenants sharing a database would otherwise
-    /// publish checkpoints under one origin name, and a witness could not tell
-    /// whose history it was cosigning.
+    /// The checkpoint origin carries the tenant too — two tenants sharing a
+    /// database would otherwise publish checkpoints under one origin name, and
+    /// a witness could not tell whose history it was cosigning. Composed at
+    /// read time from the base name and the tenant rather than baked into a
+    /// field: baking it in made the builder order-sensitive, so `for_tenant`
+    /// called twice double-qualified the origin and `origin()` after
+    /// `for_tenant` silently dropped the tenant — either way a checkpoint
+    /// under a name no verifier ever saw again.
     #[must_use]
     pub fn for_tenant(mut self, tenant: crate::core::TenantId) -> Self {
-        self.origin = format!("{}/{}", self.origin, tenant);
         self.tenant = tenant;
         self
+    }
+
+    /// The name this tenant's Merkle log publishes under.
+    ///
+    /// The default tenant keeps the bare base name, so a single-tenant plane's
+    /// checkpoints read as they always have.
+    fn log_origin(&self) -> String {
+        if self.tenant.as_str() == crate::core::TenantId::DEFAULT {
+            self.origin.clone()
+        } else {
+            format!("{}/{}", self.origin, self.tenant)
+        }
     }
 
     /// The storage key for a run, and the only place one is derived.
@@ -882,18 +898,21 @@ impl JournalStore for RedbStore {
                     let epoch = match existing {
                         // Fresh run.
                         None => 1,
-                        // Expired or released: take over and fence whoever held
-                        // it, **including this caller**. Checked before the
-                        // ownership test on purpose — a lease that has lapsed is
-                        // not yours to renew, because you cannot know whether
-                        // somebody took over in the gap. Assuming you were
-                        // fenced is the only safe reading.
+                        // Expired or released: claim and fence whoever held
+                        // it, **including this caller**. Checked before any
+                        // ownership test on purpose — a lease that has lapsed
+                        // is not yours to renew, because you cannot know
+                        // whether somebody took over in the gap. Assuming you
+                        // were fenced is the only safe reading.
                         Some((_, epoch, expires_at)) if expires_at <= now => epoch + 1,
-                        // Ours and still live: renew without bumping, or the
-                        // owner fences its own in-flight writes.
-                        Some((held_by, epoch, _)) if held_by == owner => epoch,
-                        // Someone else's, still live. Not a fencing situation:
-                        // this caller is not stale, it is simply not the owner.
+                        // Still live — held by anyone, this caller included.
+                        // `acquire` claims and never renews: a same-owner
+                        // "renewal" here is a second entry point on one
+                        // instance asking to drive a run the instance is
+                        // already executing, and handing it the same epoch is
+                        // two executors fencing cannot tell apart. Renewal is
+                        // `renew`, which proves the caller still holds the
+                        // exact `(owner, epoch)` it claims to.
                         Some((held_by, epoch, expires_at)) => {
                             return Err(StoreError::LeaseHeld {
                                 run: key.clone(),
@@ -913,6 +932,60 @@ impl JournalStore for RedbStore {
                 Ok(epoch)
             })
             .await?;
+
+        Ok(Lease {
+            run,
+            owner: owner_out,
+            epoch,
+        })
+    }
+
+    async fn renew(
+        &self,
+        run: RunId,
+        owner: &str,
+        epoch: Epoch,
+        ttl: Duration,
+    ) -> Result<Lease, StoreError> {
+        let key = self.run_key(run);
+        let owner = owner.to_owned();
+        let owner_out = owner.clone();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            {
+                let mut leases = w.open_table(RUN_LEASE).map_err(|e| be(&e))?;
+                let now = now_secs();
+                let existing = leases.get(key.as_str()).map_err(|e| be(&e))?.map(|v| {
+                    let (o, e, x) = v.value();
+                    (o.to_owned(), e, x)
+                });
+                // Held, unexpired, unreleased, by exactly `(owner, epoch)` —
+                // anything else is a lease this caller has lost, and a renewal
+                // never claims. A released row blanks the owner, so it fails
+                // the ownership comparison; an expired row fails the expiry
+                // one, because whoever claims it next takes epoch + 1 and a
+                // renewal that got in first would resurrect the fenced past.
+                match existing {
+                    Some((held_by, held_epoch, expires_at))
+                        if held_by == owner && held_epoch == epoch && expires_at > now =>
+                    {
+                        let expires = now + ttl.as_secs().max(1);
+                        leases
+                            .insert(key.as_str(), (owner.as_str(), epoch, expires))
+                            .map_err(|e| be(&e))?;
+                    }
+                    _ => {
+                        return Err(StoreError::LeaseNotHeld {
+                            run: key.clone(),
+                            epoch,
+                        });
+                    }
+                }
+            }
+            w.commit().map_err(|e| be(&e))?;
+            Ok(())
+        })
+        .await?;
 
         Ok(Lease {
             run,
@@ -1148,7 +1221,7 @@ impl JournalStore for RedbStore {
     async fn checkpoint(&self) -> Result<crate::journal::Checkpoint, StoreError> {
         let leaves = self.log_leaves().await?;
         Ok(crate::journal::Checkpoint {
-            origin: self.origin.clone(),
+            origin: self.log_origin(),
             size: leaves.len() as u64,
             root: crate::core::merkle::root(&leaves),
         })
@@ -1229,5 +1302,43 @@ impl JournalStore for RedbStore {
             }))
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `origin` and `for_tenant` compose the same name whatever order they are
+    /// called in, and calling either twice changes nothing.
+    ///
+    /// The origin used to be baked into a field at `for_tenant` time, so
+    /// `for_tenant` twice double-qualified it and `origin` afterwards silently
+    /// dropped the tenant — either way a checkpoint published under a name no
+    /// verifier would ever see again.
+    #[tokio::test]
+    async fn checkpoint_origin_is_order_insensitive_and_idempotent() {
+        let tenant = crate::core::TenantId::new("acme").expect("tenant");
+
+        let tenant_then_origin = RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant.clone())
+            .origin("plane-1");
+        let origin_then_tenant = RedbStore::open_in_memory()
+            .expect("store")
+            .origin("plane-1")
+            .for_tenant(tenant.clone());
+        let twice = RedbStore::open_in_memory()
+            .expect("store")
+            .origin("plane-1")
+            .for_tenant(tenant.clone())
+            .for_tenant(tenant);
+
+        let a = tenant_then_origin.checkpoint().await.expect("checkpoint");
+        let b = origin_then_tenant.checkpoint().await.expect("checkpoint");
+        let c = twice.checkpoint().await.expect("checkpoint");
+        assert_eq!(a.origin, "plane-1/acme");
+        assert_eq!(b.origin, a.origin, "builder order changed the log's name");
+        assert_eq!(c.origin, a.origin, "for_tenant is not idempotent");
     }
 }

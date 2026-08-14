@@ -171,6 +171,24 @@ impl Caller {
     }
 }
 
+/// The provenance source under which a counterparty's data enters this plane:
+/// `peer:{actor}`, one spelling for every transport.
+///
+/// The `{actor}` is the **authenticated** caller, never a name the body
+/// claimed. Three spellings of one counterparty used to exist — bare
+/// `{actor}` on operator-API events, `a2a:peer:{actor}` on A2A task
+/// continuations, `peer:{actor}` on A2A message inputs — and nothing
+/// downstream distinguishes transports: the event `source` becomes the
+/// delivered value's provenance exactly as a message input's `SourceId` does.
+/// So a protected sink field naming the one counterparty it accepts a value
+/// from would match or miss depending on which door the value came through,
+/// which is a hole shaped like a spelling. One helper, so the spellings
+/// cannot drift again; a transport-qualified variant may return only when
+/// something depends on telling transports apart, and today nothing does.
+pub(crate) fn peer_source(actor: &str) -> String {
+    format!("peer:{actor}")
+}
+
 /// Establishes who is calling.
 ///
 /// Given the whole header map rather than a parsed token on purpose: a
@@ -1242,8 +1260,14 @@ async fn deliver(
     // The source is who the transport says they are, never who the body claims.
     // A self-asserted source would make `(source, id)` a pair a caller controls
     // both halves of — so one counterparty could deduplicate against another's
-    // messages by naming them.
-    let mut event = InboundEvent::new(s.caller.actor.clone(), body.id, body.kind, body.payload);
+    // messages by naming them. Spelled `peer:{actor}` like every other door a
+    // counterparty's data enters through — see [`peer_source`].
+    let mut event = InboundEvent::new(
+        peer_source(&s.caller.actor),
+        body.id,
+        body.kind,
+        body.payload,
+    );
     event.correlation = body.correlation;
 
     let delivery = s

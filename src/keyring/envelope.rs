@@ -67,6 +67,25 @@ pub(super) async fn seal(
     Ok(envelope)
 }
 
+/// The scope the envelope's wrapped key claims, without opening anything.
+///
+/// For callers that must *reconstruct* the associated data an envelope was
+/// sealed under — the drill's probe holds a case id but not the tenant — and
+/// the claim is safe to read before verification because it is not taken on
+/// trust: the ring will only unwrap the data key if the named scope's wrapping
+/// key actually seals it, so a relabelled scope fails at `open` rather than
+/// opening under the wrong identity.
+pub(super) fn wrapped_scope(envelope: &[u8]) -> Option<String> {
+    if envelope.len() < 4 {
+        return None;
+    }
+    let (len_bytes, rest) = envelope.split_at(4);
+    let len = u32::from_be_bytes(len_bytes.try_into().unwrap_or([0; 4])) as usize;
+    let bytes = rest.get(..len)?;
+    let wrapped: WrappedKey = serde_json::from_slice(bytes).ok()?;
+    Some(wrapped.scope)
+}
+
 /// Open an envelope sealed by [`seal`], under the same `aad`.
 ///
 /// # Errors

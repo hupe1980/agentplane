@@ -231,16 +231,18 @@ fn a_forbid_beats_a_permit_and_reads_the_context() {
     );
 }
 
-/// A missing attribute denies nothing, which is why the key has to be right.
+/// A forbid that cannot evaluate takes its permit down with it.
 ///
-/// The positive half of the correction above. Cedar's totality means a rule
-/// reading an attribute the runtime does not send is *unsatisfied*, not
-/// erroring — so a `forbid` written against a misspelled key disappears and
-/// whatever `permit` accompanies it decides. Pinning that here means the next
-/// person to invent a context key finds out from a test rather than from an
-/// incident.
+/// Cedar is total: a rule that errors — here a `forbid` reading
+/// `context.args_trust`, a key the runtime never sends — contributes nothing,
+/// so the `permit` beside it produces a clean-looking `Allow`. That `Allow`
+/// may exist only *because* the veto broke, which makes every evaluation
+/// error a switch that turns a forbid off — a gate an unusual request shape
+/// can disarm. So the adapter refuses it, and the refusal reads as a
+/// **defect** rather than a rule firing, because the operator's fix is the
+/// policy set and not the request.
 #[test]
-fn a_forbid_on_an_attribute_the_runtime_never_sends_fails_open() {
+fn a_forbid_on_an_attribute_the_request_lacks_fails_closed() {
     let engine = CedarEngine::new(
         r#"
         permit(principal, action == Action::"effect:perform", resource);
@@ -251,9 +253,51 @@ fn a_forbid_on_an_attribute_the_runtime_never_sends_fails_open() {
     .unwrap();
 
     let tainted = sink_context("untrusted", "internal", &["tool:ledger"]);
+    let d = ask(&engine, "agent:a", ACTION_PERFORM, TOOL_CALL, &tainted);
+    let PolicyDecision::Deny { reason } = d else {
+        panic!("an Allow reached beside an evaluation error must not stand: {d:?}");
+    };
     assert!(
-        ask(&engine, "agent:a", ACTION_PERFORM, TOOL_CALL, &tainted).is_permit(),
-        "a forbid keyed on a nonexistent attribute must be shown to permit — if          this ever denies, Cedar's totality changed and the warning above is stale"
+        reason.contains("policy evaluation error"),
+        "the reason must say the policy set is broken: {reason}"
+    );
+    assert!(
+        reason.contains("defect in the policy set, not a rule"),
+        "the reason must distinguish a defect from a rule firing: {reason}"
+    );
+    assert!(
+        !reason.contains("no policy permits"),
+        "and it must not read as an ordinary default-deny: {reason}"
+    );
+}
+
+/// The same pair, evaluable, decides both ways — proving the refusal above is
+/// about the *error*, not the forbid: a clean `Allow` still permits, and the
+/// forbid still vetoes when its attribute is present and matches.
+#[test]
+fn the_same_forbid_decides_once_its_attribute_is_present() {
+    let engine = CedarEngine::new(
+        r#"
+        permit(principal, action == Action::"effect:perform", resource);
+        forbid(principal, action == Action::"effect:perform", resource)
+        when { context.mutates && context.args_trust == "untrusted" };
+        "#,
+    )
+    .unwrap();
+
+    let mut clean = sink_context("untrusted", "internal", &["tool:ledger"]);
+    clean["args_trust"] = json!("trusted");
+    assert!(
+        ask(&engine, "agent:a", ACTION_PERFORM, TOOL_CALL, &clean).is_permit(),
+        "a clean Allow must still permit, or the fail-closed rule above is a \
+         deny-everything change passing its own test"
+    );
+
+    let mut vetoed = sink_context("untrusted", "internal", &["tool:ledger"]);
+    vetoed["args_trust"] = json!("untrusted");
+    assert!(
+        !ask(&engine, "agent:a", ACTION_PERFORM, TOOL_CALL, &vetoed).is_permit(),
+        "the forbid must still fire when it can evaluate"
     );
 }
 
@@ -866,6 +910,90 @@ fn a_null_inside_caller_arguments_does_not_deny_everything() {
             PolicyDecision::Permit
         ),
         "a null in caller arguments denied a request the rule permits"
+    );
+}
+
+/// Stripping a null leaves a record an audit can find.
+///
+/// The stripping above is safe — Cedar has no null literal, so nothing removed
+/// was matchable — but it still means the rules evaluated a context that is
+/// not byte-for-byte the arguments the effect key canonicalized. Two views of
+/// one call, and without this event the only way to learn they differed is to
+/// re-derive the stripping by hand. Both halves are asserted: the event fires
+/// when something was removed, and stays silent when nothing was — an event on
+/// every request would bury the divergence it exists to surface.
+#[test]
+fn null_stripping_is_visible_to_an_audit() {
+    #[derive(Debug, Default, Clone)]
+    struct Sink {
+        events: Arc<Mutex<Vec<(String, String)>>>,
+    }
+    impl tracing::Subscriber for Sink {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _s: &tracing::span::Id, _v: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _s: &tracing::span::Id, _f: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .unwrap()
+                .push((event.metadata().target().to_owned(), fields.0));
+        }
+        fn enter(&self, _s: &tracing::span::Id) {}
+        fn exit(&self, _s: &tracing::span::Id) {}
+    }
+
+    let engine = CedarEngine::new("permit(principal, action, resource);").unwrap();
+    let sink = Sink::default();
+    let events = Arc::clone(&sink.events);
+
+    // Two nulls — an unset object member and an array element — so the count
+    // proves the pass saw both shapes rather than only the easy one.
+    let with_nulls = json!({
+        "args": { "amount": 50, "memo": Value::Null, "tags": ["a", Value::Null] },
+    });
+    let decision = tracing::subscriber::with_default(sink.clone(), || {
+        ask(&engine, "p", ACTION_PERFORM, TOOL_CALL, &with_nulls)
+    });
+    assert!(decision.is_permit(), "the stripped request still evaluates");
+    let recorded = events.lock().unwrap().clone();
+    assert!(
+        recorded.iter().any(|(target, fields)| {
+            target == agentplane::policy::CONTEXT_NULLS_STRIPPED && fields.contains("removed=2")
+        }),
+        "stripping left no record an audit could find: {recorded:?}"
+    );
+
+    events.lock().unwrap().clear();
+    let untouched = json!({ "args": { "amount": 50, "tags": ["a"] } });
+    let decision = tracing::subscriber::with_default(sink, || {
+        ask(&engine, "p", ACTION_PERFORM, TOOL_CALL, &untouched)
+    });
+    assert!(decision.is_permit());
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(target, _)| target != agentplane::policy::CONTEXT_NULLS_STRIPPED),
+        "an untouched context must not claim it was stripped"
     );
 }
 

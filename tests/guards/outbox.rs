@@ -274,6 +274,69 @@ async fn an_operator_worker_leaves_a_callers_webhook_alone() {
     );
 }
 
+/// A window full of the other namespace's rows starves nothing.
+///
+/// The defect this pins: ownership used to be filtered **after** a bounded
+/// `due` read, so caller webhooks at the head of the stable order occupied the
+/// whole window, the operator worker's own row beyond it was never read, and
+/// the report — zero registrations, zero of everything — was byte-identical to
+/// a quiet plane's. The filter now rides in the store query, so the worker's
+/// rows are found however deep they sit, and the foreign backlog is a number
+/// in the report instead of an invisible one.
+#[tokio::test]
+async fn foreign_rows_at_the_head_of_the_window_neither_starve_nor_hide() {
+    let f = fixture(vec![Destination::new("bus", "https://bus.internal/events")]);
+    let out =
+        f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+            .await
+            .expect("the run completes");
+
+    // Five caller registrations whose ids sort ahead of `operator:bus` for the
+    // same task, so they occupy the head of the stable due order.
+    for n in 0..5 {
+        f.store
+            .put(
+                &PushConfig {
+                    id: format!("a-hook-{n}"),
+                    task: out.run_id,
+                    url: "https://peer.example/hook".to_owned(),
+                    token: None,
+                    authentication: None,
+                },
+                1,
+            )
+            .await
+            .expect("the caller registers");
+    }
+
+    // A window of two: smaller than the caller backlog in front of the
+    // operator row. Post-read filtering can never reach the row; the in-query
+    // filter must.
+    let report = f.worker().run_once(10, 2).await.expect("a sweep");
+    assert_eq!(
+        report.deliveries, 1,
+        "the operator row behind five foreign rows was starved: {report:?}"
+    );
+    assert_eq!(report.completed, 1, "{report:?}");
+    assert_eq!(
+        report.unserved, 5,
+        "the foreign backlog is invisible, so this report reads as a quiet \
+         plane: {report:?}"
+    );
+
+    // The caller rows are untouched — visible is not served.
+    for n in 0..5 {
+        assert!(
+            f.store
+                .get(out.run_id, &format!("a-hook-{n}"))
+                .await
+                .expect("get")
+                .is_some(),
+            "the operator worker consumed a caller's registration"
+        );
+    }
+}
+
 /// The reserved prefix is what keeps the two apart.
 #[test]
 fn the_operator_namespace_is_recognisable() {

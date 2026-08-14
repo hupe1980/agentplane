@@ -60,37 +60,56 @@ const SWEEP_EPOCH: crate::core::Epoch = 1;
 /// rather than restate it — the list and the sealer must agree byte for byte.
 pub(crate) const SWEEP_OUTCOME: &str = "swept";
 
-/// What one tick did, accumulating into a run only if there is anything to say.
+/// What one tick did, opening a run only if there is anything to say.
 ///
 /// Lazy on purpose. A quiet plane sweeps constantly and should leave nothing
 /// behind: opening a run per tick would fill the Merkle log with evidence that
 /// nothing happened, and a log of nothings is where the somethings hide.
+///
+/// **Each decision is durable before it is applied** — I2's
+/// announce-before-act, applied to the sweeper itself. The ledger used to
+/// buffer its notes in memory and write them all when the tick ended, which
+/// inverted the invariant precisely where it matters most: the state changes a
+/// sweep applies (a breach, an escalation) are idempotent transitions, so a
+/// crash between applying them and sealing the buffered evidence did not
+/// merely delay the record — it orphaned it *permanently*, because the next
+/// tick found the transition already applied and re-decided nothing. So
+/// `note` appends immediately, before the caller touches state, and `seal`
+/// only closes the run the notes already live in.
 struct SweepLedger {
     run: Option<RunId>,
-    entries: Vec<crate::journal::Append>,
+    /// Whether at least one note has durably landed — the difference between
+    /// "the tick decided nothing" and "the tick's first note failed before
+    /// anything was applied", both of which leave nothing to seal.
+    wrote: bool,
 }
 
 impl SweepLedger {
     const fn new() -> Self {
         Self {
             run: None,
-            entries: Vec::new(),
+            wrote: false,
         }
     }
 
-    /// Note one action, opening the tick's run the first time.
+    /// Durably note one decision, opening the tick's run the first time.
+    ///
+    /// Called **before** the state change it describes; a note that cannot be
+    /// written fails the decision, which is then not applied — an unrecorded
+    /// breach is worse than a breach noticed one tick late.
     ///
     /// `case` stamps the record so `JournalStore::case_history` finds it. That
     /// is the whole point of writing this down: the question is *why is this
     /// case escalated*, and a sweep run belongs to no case, so a walk over the
     /// case's own runs would never reach it.
-    fn note(
+    async fn note(
         &mut self,
+        store: &Arc<dyn JournalStore>,
         case: Option<CaseId>,
         subject: String,
         action: SweptAction,
         detail: Option<String>,
-    ) {
+    ) -> Result<(), RuntimeError> {
         let run = *self.run.get_or_insert_with(RunId::generate);
         let mut entry = crate::journal::Append::new(
             run,
@@ -103,17 +122,22 @@ impl SweepLedger {
         if let Some(case) = case {
             entry = entry.case(case);
         }
-        self.entries.push(entry);
+        store
+            .append(SWEEP_EPOCH, vec![entry])
+            .await
+            .map_err(RuntimeError::from_store)?;
+        self.wrote = true;
+        Ok(())
     }
 
-    /// Write the tick down and close it.
+    /// Close the tick's record.
     ///
     /// Sealed, so it enters the Merkle log like any other run and the external
     /// audit tool checks it without being taught what a sweep is. Best-effort
-    /// in the same sense settlement is: the work is already done and the state
-    /// already changed, so failing the tick because its *record* would not
-    /// write would turn a bookkeeping problem into an operational one — but it
-    /// is loud, because a sweep whose evidence is missing is the case this
+    /// in the same sense settlement is: the notes are already durable and the
+    /// state already changed, so failing the tick because its *closure* would
+    /// not write would turn a bookkeeping problem into an operational one — but
+    /// it is loud, because a sweep whose evidence is missing is the case this
     /// whole mechanism exists to prevent.
     ///
     /// The three outcomes are distinct on purpose: a quiet tick and a tick whose
@@ -126,9 +150,11 @@ impl SweepLedger {
         let Some(run) = self.run else {
             return SweepRecord::Quiet;
         };
-        if let Err(e) = store.append(SWEEP_EPOCH, self.entries).await {
-            tracing::error!(%run, error = %e, "a sweep's own record could not be written");
-            return SweepRecord::EvidenceLost;
+        if !self.wrote {
+            // The first note failed before anything was applied: no decision
+            // stands, so there is nothing to seal — and the phase error that
+            // stopped the tick is already on its way to the caller.
+            return SweepRecord::Quiet;
         }
 
         // The conclusion goes *in* the chain before the chain closes over it,
@@ -252,6 +278,9 @@ const TASK_BATCH: usize = 512;
 /// worth of runs orphaned at once — drains over several ticks with the
 /// saturation flag up rather than holding one tick hostage for the duration.
 const RECOVERY_BATCH: usize = 32;
+/// Redelivery walks the waiting list and touches the store per subscription,
+/// so it takes the same bounded bite the timer pass does.
+const EVENT_BATCH: usize = 128;
 
 /// What one tick found and did.
 ///
@@ -265,6 +294,14 @@ pub struct SweepReport {
     pub tasks_expired: usize,
     pub tasks_escalated: usize,
     pub dead_lettered: usize,
+    /// Claimed-but-undelivered events whose delivery this tick finished.
+    ///
+    /// Each is a message that arrived in time and whose delivery died between
+    /// the claim and the resume — a crash in that window, or an owner that
+    /// outlived the delivery's bounded retry. The redelivery is the system
+    /// healing; a persistent count here means deliveries keep dying, which is
+    /// worth asking why.
+    pub events_redelivered: usize,
     /// Sleeping runs woken because their instant arrived.
     ///
     /// Not a number to alert on — a fired timer is the system working. It is
@@ -315,6 +352,14 @@ pub struct SweepReport {
     /// Carried on the report as well as emitted, so an embedder that wants the
     /// numbers does not have to stand up a metrics subscriber to see them.
     pub census: Census,
+    /// The gauges could not be read this tick.
+    ///
+    /// The counters above are still real — the tick's work happened — but the
+    /// census is a default, not a reading. Carried as a flag rather than an
+    /// error because a report that arrives degraded beats one that was thrown
+    /// away over a gauge: the breaches and recoveries it accounts for already
+    /// happened.
+    pub census_unavailable: bool,
 }
 
 impl SweepReport {
@@ -336,6 +381,10 @@ impl SweepReport {
             // plane healing, findable in the report and the sweep's own run.
             || self.recovery_failures > 0
             || self.wake_failures > 0
+            // Gauges that could not be read are a blind spot wearing a
+            // default; somebody should know the numbers are missing, not
+            // merely zero.
+            || self.census_unavailable
     }
 
     #[must_use]
@@ -355,6 +404,7 @@ impl SweepReport {
             && self.tasks_expired == 0
             && self.tasks_escalated == 0
             && self.dead_lettered == 0
+            && self.events_redelivered == 0
             && self.timers_fired == 0
             && self.wake_failures == 0
             && self.runs_recovered == 0
@@ -394,6 +444,13 @@ impl Runtime {
             self.sweep_tasks(now, &mut report, &mut ledger).await?;
 
             if self.events().is_some() {
+                // Deliveries that died between the claim and the resume — a
+                // crash in that window, or an owner that outlived the
+                // delivery's bounded retry. The claimed event blocks every
+                // dedup'd retry of itself, so this pass is the only driver
+                // left; without it the message that arrived in time is parked
+                // forever behind its own claim.
+                report.events_redelivered = self.redeliver_claimed(EVENT_BATCH).await?;
                 report.dead_lettered = self.sweep_events(event_grace).await?;
             }
             if self.timers().is_some() {
@@ -423,9 +480,26 @@ impl Runtime {
         phases?;
 
         // Observed last, so the reading reflects what this sweep just resolved
-        // rather than the backlog it was about to clear.
-        report.census = self.census(now).await?;
-        self.meter().census(&report.census);
+        // rather than the backlog it was about to clear. A failed reading
+        // **degrades** the report rather than discarding it: everything above
+        // — the breaches, the recoveries, the sealed evidence run — already
+        // happened, and a `?` here threw the whole account away because one
+        // gauge could not be read at the end. The flag keeps the absence
+        // loud; the counters keep what the tick actually did.
+        match self.census(now).await {
+            Ok(census) => {
+                report.census = census;
+                self.meter().census(&report.census);
+            }
+            Err(error) => {
+                report.census_unavailable = true;
+                tracing::error!(
+                    %error,
+                    "the census could not be read; this report carries the tick's \
+                     counters and no gauges"
+                );
+            }
+        }
 
         Ok(report)
     }
@@ -479,15 +553,18 @@ impl Runtime {
                         outcome = %status,
                     );
                     self.meter().count(metrics::RUNS_RECOVERED, &status);
-                    ledger.note(
-                        None,
-                        run.to_string(),
-                        SweptAction::RunRecovered,
-                        Some(format!(
-                            "taken over after its owner's lease lapsed without \
-                             release; resumed to '{status}'"
-                        )),
-                    );
+                    ledger
+                        .note(
+                            self.store(),
+                            None,
+                            run.to_string(),
+                            SweptAction::RunRecovered,
+                            Some(format!(
+                                "taken over after its owner's lease lapsed without \
+                                 release; resumed to '{status}'"
+                            )),
+                        )
+                        .await?;
                     report.runs_recovered += 1;
                 }
                 // Someone else holds it live: a second instance's recovery —
@@ -505,17 +582,20 @@ impl Runtime {
                     if let Ok(lease) = self.store().acquire(run, self.owner_id(), LEASE_TTL).await {
                         let _ = self.store().release_lease(run, lease.epoch).await;
                     }
-                    ledger.note(
-                        None,
-                        run.to_string(),
-                        SweptAction::RunRecovered,
-                        Some(
-                            "its owner died between acquiring the lease and the \
-                             admission append; no run exists, so clearing the \
-                             lease is the whole recovery"
-                                .to_owned(),
-                        ),
-                    );
+                    ledger
+                        .note(
+                            self.store(),
+                            None,
+                            run.to_string(),
+                            SweptAction::RunRecovered,
+                            Some(
+                                "its owner died between acquiring the lease and the \
+                                 admission append; no run exists, so clearing the \
+                                 lease is the whole recovery"
+                                    .to_owned(),
+                            ),
+                        )
+                        .await?;
                     report.runs_recovered += 1;
                 }
                 Err(error) => {
@@ -666,8 +746,20 @@ impl Runtime {
             due = %timer.fire_at,
         );
         self.meter().count(metrics::TIMERS_FIRED, "");
-        self.replay(timer.run, Mode::Resume).await?;
-        Ok(())
+
+        // The wake is recorded and the timer disarmed; the bookkeeping lease
+        // has nothing left to write. `replay` claims its own lease before it
+        // reads, so this one is handed back first rather than deadlocking the
+        // resume against its own wake — and a `LeaseHeld` from the replay
+        // means somebody claimed the run in the gap, who will read the
+        // recorded wake like any other completed effect.
+        if let Err(e) = self.store().release_lease(timer.run, lease.epoch).await {
+            tracing::debug!(run = %timer.run, error = %e, "could not hand back the wake lease");
+        }
+        match self.replay(timer.run, Mode::Resume).await {
+            Ok(_) | Err(RuntimeError::LeaseHeld { .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Warn on approaching obligations; escalate breached ones.
@@ -693,6 +785,37 @@ impl Runtime {
             if deadline.is_due(now) {
                 // Past the instant with the obligation unmet. This is the event
                 // the whole deadline machinery exists to produce.
+                //
+                // The notes land **before** the transitions — I2, applied to
+                // the sweeper. The order used to be act-then-buffer, and a
+                // crash between the two orphaned the decision permanently:
+                // the transition is idempotent, so the next tick found it
+                // already applied and wrote nothing, leaving a breached case
+                // with no durable account of who breached it or when. Written
+                // first, a crash leaves a note whose transition the next tick
+                // re-applies — a duplicate decision on the record, which is
+                // honest, rather than an applied decision off it.
+                ledger
+                    .note(
+                        self.store(),
+                        Some(deadline.case),
+                        deadline.case.to_string(),
+                        SweptAction::DeadlineBreached,
+                        Some(format!(
+                            "'{}' was due {} and was not met",
+                            deadline.name, deadline.resolved_at
+                        )),
+                    )
+                    .await?;
+                ledger
+                    .note(
+                        self.store(),
+                        Some(deadline.case),
+                        deadline.case.to_string(),
+                        SweptAction::CaseEscalated,
+                        Some(format!("obligation '{}' was breached", deadline.name)),
+                    )
+                    .await?;
                 cases
                     .set_deadline_state(deadline.case, &deadline.name, DeadlineState::Breached)
                     .await
@@ -701,21 +824,6 @@ impl Runtime {
                     .set_status(deadline.case, CaseStatus::Escalated)
                     .await
                     .map_err(RuntimeError::from_store)?;
-                ledger.note(
-                    Some(deadline.case),
-                    deadline.case.to_string(),
-                    SweptAction::DeadlineBreached,
-                    Some(format!(
-                        "'{}' was due {} and was not met",
-                        deadline.name, deadline.resolved_at
-                    )),
-                );
-                ledger.note(
-                    Some(deadline.case),
-                    deadline.case.to_string(),
-                    SweptAction::CaseEscalated,
-                    Some(format!("obligation '{}' was breached", deadline.name)),
-                );
                 tracing::error!(
                     target: super::telemetry::DEADLINE_BREACHED,
                     case = %deadline.case,
@@ -725,19 +833,22 @@ impl Runtime {
                 self.meter().count(metrics::DEADLINE_BREACHES, "");
                 report.breached += 1;
             } else if deadline.needs_warning(now) {
+                ledger
+                    .note(
+                        self.store(),
+                        Some(deadline.case),
+                        deadline.case.to_string(),
+                        SweptAction::DeadlineWarned,
+                        Some(format!(
+                            "'{}' comes due {}",
+                            deadline.name, deadline.resolved_at
+                        )),
+                    )
+                    .await?;
                 cases
                     .set_deadline_state(deadline.case, &deadline.name, DeadlineState::Warned)
                     .await
                     .map_err(RuntimeError::from_store)?;
-                ledger.note(
-                    Some(deadline.case),
-                    deadline.case.to_string(),
-                    SweptAction::DeadlineWarned,
-                    Some(format!(
-                        "'{}' comes due {}",
-                        deadline.name, deadline.resolved_at
-                    )),
-                );
                 warned += 1;
             }
         }
@@ -767,16 +878,19 @@ impl Runtime {
                 // Widen the audience and keep waiting. Escalating twice is a
                 // no-op, which is what makes the sweep safe to run on a timer.
                 OnExpiry::Escalate if task.state != TaskState::Escalated => {
+                    ledger
+                        .note(
+                            self.store(),
+                            task.case,
+                            task.id.to_hex(),
+                            SweptAction::TaskEscalated,
+                            Some("nobody answered inside the window".to_owned()),
+                        )
+                        .await?;
                     tasks
                         .set_state(task.id, TaskState::Escalated)
                         .await
                         .map_err(RuntimeError::from_store)?;
-                    ledger.note(
-                        task.case,
-                        task.id.to_hex(),
-                        SweptAction::TaskEscalated,
-                        Some("nobody answered inside the window".to_owned()),
-                    );
                     report.tasks_escalated += 1;
                 }
                 OnExpiry::Escalate => {}
@@ -786,19 +900,22 @@ impl Runtime {
                 // leaving it hanging.
                 policy => {
                     let decision = Decision::expired(policy);
+                    ledger
+                        .note(
+                            self.store(),
+                            task.case,
+                            task.id.to_hex(),
+                            SweptAction::TaskExpired,
+                            // The *declared* policy, so the record says what was
+                            // decided in advance rather than only what happened.
+                            Some(format!("window closed; applied {policy:?}")),
+                        )
+                        .await?;
                     self.answer_task(task.id, &decision).await?;
                     tasks
                         .set_state(task.id, TaskState::Expired)
                         .await
                         .map_err(RuntimeError::from_store)?;
-                    ledger.note(
-                        task.case,
-                        task.id.to_hex(),
-                        SweptAction::TaskExpired,
-                        // The *declared* policy, so the record says what was
-                        // decided in advance rather than only what happened.
-                        Some(format!("window closed; applied {policy:?}")),
-                    );
                     report.tasks_expired += 1;
                 }
             }

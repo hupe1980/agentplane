@@ -205,10 +205,9 @@ impl Skill for SendRequest {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(RedbStore::open_in_memory()?);
-    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
-        .cases(store.clone() as Arc<dyn CaseStore>)
-        .events(store.clone() as Arc<dyn EventStore>)
-        .tasks(store.clone() as Arc<dyn TaskStore>)
+    // One backend, the whole case layer: `builder_on` wires the journal,
+    // cases, tasks, events, timers and memory to the same file in one call.
+    let rt = Runtime::builder_on(Arc::clone(&store))
         .calendar(Arc::new(WorkingDays))
         .skill(SendRequest)
         .build();

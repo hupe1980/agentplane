@@ -104,7 +104,7 @@ fn a_webhook_must_be_https() {
 /// ones this feature exists for.
 #[tokio::test]
 async fn a_revoked_host_stops_receiving_notifications() {
-    use agentplane::push::PushSender;
+    use agentplane::push::{PushSender, PushTransport};
 
     // Registered under one policy...
     let permissive = PushPolicy::new().allow_host("hooks.acme.example");
@@ -130,7 +130,7 @@ async fn a_revoked_host_stops_receiving_notifications() {
 /// service reaches nothing.
 #[tokio::test]
 async fn a_webhook_resolving_to_a_private_address_is_refused() {
-    use agentplane::push::PushSender;
+    use agentplane::push::{PushSender, PushTransport};
 
     // `localhost` is granted by name and still refused, because the refusal is
     // about where it resolves.
@@ -165,7 +165,7 @@ async fn a_webhook_resolving_to_a_private_address_is_refused() {
 #[cfg(feature = "testkit")]
 #[tokio::test]
 async fn the_loopback_exception_lifts_two_refusals_and_no_others() {
-    use agentplane::push::PushSender;
+    use agentplane::push::{PushSender, PushTransport};
 
     let granted = PushPolicy::new().allow_host("localhost");
     let permissive = PushSender::new(granted.clone()).allow_plaintext_loopback();
@@ -225,6 +225,60 @@ async fn the_loopback_exception_lifts_two_refusals_and_no_others() {
     assert!(
         matches!(outcome, Err(PushError::NotHttps)),
         "plaintext loopback was permitted without asking for it: {outcome:?}"
+    );
+}
+
+/// A bracketed IPv6 literal is judged by the address rule, not lost in DNS.
+///
+/// `Url::host_str` keeps the brackets and the resolver refuses them, so before
+/// the strip every v6 webhook fell through to a DNS lookup that cannot succeed
+/// — one whole address family dead, and classified as a retryable outage. A
+/// private literal must refuse for the **right** reason: forbidden, not
+/// unresolvable.
+#[tokio::test]
+async fn a_bracketed_ipv6_webhook_is_judged_not_unresolvable() {
+    use agentplane::push::{PushSender, PushTransport};
+
+    // Documentation range: granted by the operator, still private, and never
+    // behind a DNS answer — so the only correct refusal is the address rule's.
+    let sender = PushSender::new(PushPolicy::new().allow_host("[2001:db8::1]"));
+    let outcome = sender
+        .deliver(
+            &config("https://[2001:db8::1]/hook"),
+            &serde_json::json!({"statusUpdate": {}}),
+        )
+        .await;
+    let error = match outcome {
+        Err(PushError::Unroutable(detail)) => detail,
+        other => panic!("a private v6 literal produced {other:?}"),
+    };
+    assert!(
+        error.contains("forbidden address"),
+        "the refusal is not the address rule's — the literal fell through to \
+         DNS and died as unresolvable: {error}"
+    );
+}
+
+/// And with the testkit loopback exception, `[::1]` is actually dialled.
+///
+/// The end-to-end pin for the address family: the literal parses, resolves to
+/// itself, and reaches the transport — nothing listens on port 1, so the
+/// outcome is an unreachable delivery rather than any refusal.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_bracketed_ipv6_loopback_literal_is_dialled_under_the_exception() {
+    use agentplane::push::PushSender;
+
+    let sender = PushSender::new(PushPolicy::new().allow_host("[::1]")).allow_plaintext_loopback();
+    let outcome = <PushSender as agentplane::push::PushTransport>::deliver(
+        &sender,
+        &config("http://[::1]:1/hook"),
+        &serde_json::json!({"statusUpdate": {}}),
+    )
+    .await;
+    assert!(
+        matches!(outcome, Ok(agentplane::push::Delivered::Unreachable(_))),
+        "a v6 loopback literal was refused rather than dialled: {outcome:?}"
     );
 }
 
@@ -326,6 +380,19 @@ async fn registrations_round_trip() {
     store.delete(task, "one").await.expect("deleting twice");
     assert!(store.get(task, "one").await.expect("get").is_none());
     assert_eq!(store.list(task).await.expect("list").len(), 1);
+}
+
+/// The embedded backend's native `due_in` answers exactly as the trait's
+/// paging default would.
+///
+/// The override exists to make the namespace filter one scan instead of a
+/// re-reading window; it must never make it a different *answer*. The battery
+/// and its reasoning live in [`crate::due_conformance`], shared with the
+/// `PostgreSQL` backend so the two overrides are held to one semantics.
+#[tokio::test]
+async fn redb_due_in_matches_the_paging_default() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn PushStore>;
+    crate::due_conformance::pin_due_in_against_the_default(store).await;
 }
 
 /// Replacing credentials or a URL must not acknowledge events on the receiver's

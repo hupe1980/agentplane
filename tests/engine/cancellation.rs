@@ -437,3 +437,78 @@ async fn stopping_a_finished_run_does_not_reopen_it() {
         after.status
     );
 }
+
+/// Cancelling a run that is actively executing acknowledges at once and takes
+/// effect at the next step boundary.
+///
+/// The operator's call must not race the live executor for the run: the
+/// request is durable, `Ok` comes back immediately, and the *owner* observes
+/// the stop at its next boundary. The old path resumed the run anyway, and on
+/// the owner's own instance the lease "renewal" handed that resume the same
+/// epoch the live execution was writing under — two executors on one chain
+/// that fencing, by construction, could not tell apart.
+#[tokio::test]
+async fn cancelling_a_running_run_acknowledges_and_lands_at_the_boundary() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Signals when it starts, then dawdles long enough to be cancelled.
+    #[derive(Debug)]
+    struct Slow {
+        started: Arc<std::sync::Mutex<Option<RunId>>>,
+        proceed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Slow {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("slow").provides("demo.slow")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            *self.started.lock().unwrap() = Some(cx.run_id());
+            while !self.proceed.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Ok(Outcome::done(Tainted::trusted(json!({"done": true}))))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let started = Arc::new(std::sync::Mutex::new(None));
+    let proceed = Arc::new(AtomicBool::new(false));
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .skill(Slow {
+            started: Arc::clone(&started),
+            proceed: Arc::clone(&proceed),
+        })
+        .build();
+
+    let running = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.run("demo.slow", Tainted::trusted(json!({}))).await })
+    };
+    // Wait until the step is genuinely in flight.
+    let run = loop {
+        if let Some(run) = *started.lock().unwrap() {
+            break run;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+
+    // The stop request returns promptly with an acknowledgement, while the
+    // step is still mid-flight and the owner holds the lease.
+    let fresh = rt.request_cancel(run, "ops", "stop it").await.unwrap();
+    assert!(fresh, "the first stop request records");
+
+    // The owner reaches its next boundary and observes the stop.
+    proceed.store(true, Ordering::SeqCst);
+    let out = running.await.unwrap().unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Cancelled { ref actor, .. } if actor == "ops"),
+        "the running owner did not observe the durable stop at its boundary: {:?}",
+        out.status
+    );
+}

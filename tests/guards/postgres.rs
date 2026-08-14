@@ -184,6 +184,32 @@ async fn postgres_persists_push_delivery_cursors() {
     );
 }
 
+/// The active-active backend's native `due_in` answers exactly as the trait's
+/// paging default would.
+///
+/// This is the backend whose override matters most — the `LIKE`-shaped filter
+/// and the separate count query are the two places a Postgres spelling could
+/// quietly diverge from `owns_id` — and the battery is the same one redb runs,
+/// so both overrides are held to one semantics.
+#[cfg(feature = "push")]
+#[tokio::test]
+async fn postgres_due_in_matches_the_paging_default() {
+    use agentplane::push::PushStore;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let store = PostgresStore::connect(&url)
+        .await
+        .expect("connect")
+        .for_tenant(agentplane::core::TenantId::new("push-due-in").unwrap());
+    crate::due_conformance::pin_due_in_against_the_default(Arc::new(store) as Arc<dyn PushStore>)
+        .await;
+}
+
 async fn memory_revisions_are_shared_and_serialized(
     first: Arc<PostgresStore>,
     second: Arc<PostgresStore>,
@@ -349,6 +375,22 @@ async fn postgres_satisfies_the_case_layer_contracts() {
     cc::check_timers(&(Arc::clone(&store) as Arc<dyn TimerStore>), &mut report).await;
     cc::check_tasks(&(Arc::clone(&store) as Arc<dyn TaskStore>), &mut report).await;
     cc::check_batches(&(Arc::clone(&store) as Arc<dyn BatchStore>), &mut report).await;
+
+    // Two tenant handles onto the *same* server, because the tenancy check is
+    // about one backend keeping two tenants apart.
+    let mine = Arc::new(
+        store
+            .as_ref()
+            .clone()
+            .for_tenant(agentplane::core::TenantId::new("acme").expect("valid")),
+    ) as Arc<dyn EventStore>;
+    let other = Arc::new(
+        store
+            .as_ref()
+            .clone()
+            .for_tenant(agentplane::core::TenantId::new("globex").expect("valid")),
+    ) as Arc<dyn EventStore>;
+    cc::check_waiting_tenancy(&mine, &other, &mut report).await;
 
     report.assert_conforms("PostgresStore (case layer)");
 }
@@ -1326,4 +1368,30 @@ async fn postgres_two_sweepers_partition_the_due_timers() {
         union, armed,
         "the two sweeps together must fire every due timer exactly once"
     );
+}
+
+/// A URL demanding TLS is refused rather than silently downgraded.
+///
+/// The pool is built without a TLS connector, so honouring `sslmode=require`
+/// is impossible — and connecting anyway would send the journal in plaintext
+/// under a connection string whose author explicitly asked otherwise. Needs no
+/// server: the refusal happens before any connection is attempted, which is
+/// the point.
+#[tokio::test]
+async fn a_url_demanding_tls_is_refused_not_downgraded() {
+    let err = PostgresStore::connect("postgresql://u:p@127.0.0.1:5432/db?sslmode=require")
+        .await
+        .expect_err("sslmode=require over a NoTls pool must refuse");
+    assert!(
+        err.to_string().contains("TLS"),
+        "the refusal must name the gap: {err}"
+    );
+
+    // `prefer` promises nothing, and is served as written — the error, if any,
+    // must be a connection failure rather than the TLS refusal. No server
+    // listens in this test, and the pool connects lazily, so construction
+    // succeeds.
+    PostgresStore::connect("postgresql://u:p@127.0.0.1:5432/db?sslmode=prefer")
+        .await
+        .ok();
 }

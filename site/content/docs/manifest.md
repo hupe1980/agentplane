@@ -97,7 +97,13 @@ model is offered exactly the tools `spec.tools` grants, with the descriptions an
 argument schemas declared there; the name it returns is matched **byte for byte**,
 and one matching nothing comes back as a failed call so the model can correct
 itself. Arguments carry the completion's own untrusted label, so protected fields
-and the egress ceiling decide. An agent still asking when `max_turns` runs out
+and the egress ceiling decide. `output.schema` rides **every** turn, not only
+the last — which turn answers is the model's choice, so there is no moment
+before dispatch at which "this is the final turn" is known, and a schema
+attached only where the runtime guessed the answer would land is a contract the
+model can step around by answering a turn early. A turn that asks for tools is
+untouched; the turn that answers is provider-constrained during generation, and
+the settled answer is validated against the schema before it is returned. An agent still asking when `max_turns` runs out
 **fails** rather than returning half-formed reasoning as its answer.
 
 **`planned`** — plan first, then execute without the model. One privileged
@@ -266,8 +272,12 @@ model did all the work — a control the file claims and the runtime never
 applies. A **coded** agent may declare both: its skill chooses, so the roles are
 a reviewed allowlist rather than something a tier selects from.
 
-Both are `{ provider, model }`, where `provider` is the name a driver was
-registered under. The `agentplane` binary ships `openai`, `anthropic`, `gemini`,
+Both are `{ provider, model }` plus two optional per-role ceilings —
+`max_tokens`, a per-call output ceiling, and `reasoning_effort`, an explicit
+reasoning depth. The ceilings are enforced on **every** call the role serves:
+the quarantined role's included, so a memory-formation extraction or a `parse`
+step runs under the reviewed bounds rather than the driver's defaults.
+`provider` is the name a driver was registered under. The `agentplane` binary ships `openai`, `anthropic`, `gemini`,
 `bedrock`, `chat-completions` and `fake`; an embedder registers its own with
 `RuntimeBuilder::provider`, and a name nothing was registered under is refused
 at build rather than at the first call. The pair is
@@ -341,6 +351,16 @@ a mutating tool with **no** protected fields refuses untrusted arguments
 outright, and declaring which fields a model may influence is how you permit the
 useful part without permitting the dangerous part.
 
+On a mutating grant, **at least one protected field must carry a trust or
+source rule** — `require_trusted: true`, or `allowed_sources` naming where the
+value must come from. A grant whose every entry carries only a sensitivity
+ceiling is refused at parse: declaring protected fields is what lifts the
+whole-object taint gate, and a ceiling bounds how *secret* an argument may be,
+not who authored it — so the model's own untrusted completion would fill every
+authority-bearing field unconstrained. A source rule names the **concrete**
+source an effect's output carries: `tool://server/name`, `model:{provider}/{model}`,
+`agent/{capability}`, or an operator identity of your own.
+
 ## `spec.context`
 
 Exact MCP context reads, separate from action-granting tools. They remain
@@ -382,7 +402,7 @@ human is in the loop when none is.
 
 | Field | Default | Notes |
 |---|---|---|
-| `approval` | **required** | `required` gates every answer. `tools-only` gates only the grants that set `requires_approval`, leaving the answer unattended — the shape most deployments want, since gating a tool-calling agent's *answer* is a review that arrives after the tool already ran. `none` gates nothing and leaves the deciding to `triage`. None is a predicate: *"require approval when severity is high"* changes what the agent **does**, and that is one step from an `if`. |
+| `approval` | **required** | `required` gates every answer. `tools-only` gates only the grants that set `requires_approval`, leaving the answer unattended — the shape most deployments want, since gating a tool-calling agent's *answer* is a review that arrives after the tool already ran. Under `tools-only`, **every mutating grant must declare `requires_approval`** — refused at parse otherwise, because a mode that gates tool calls while a call that changes the world needs nobody is a declared control nothing enforces; read-only grants stay ungated. `none` gates nothing and leaves the deciding to `triage`. None is a predicate: *"require approval when severity is high"* changes what the agent **does**, and that is one step from an `if`. |
 | `approvers` | anyone | Roles that may decide. Empty means anyone — worth choosing on purpose rather than by omission. |
 | `deadline` | **required** | The obligation that bounds the wait: `{ name, kind, params }`. The agent **registers** it, which is why the declaration carries more than a name — a file-only agent writes no code, so naming an obligation nothing registers made oversight fail outright. `kind` and `params` go to the deployment's `Calendar` unchanged, so "one working day" means whatever that domain says and this crate never guesses. |
 | `on_expiry` | deny | What happens when the window closes. |

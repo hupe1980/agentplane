@@ -247,7 +247,7 @@ async fn a_plan_naming_an_ungranted_tool_fails_before_any_dispatch() {
     assert!(client.calls().is_empty(), "something reached a tool");
 }
 
-const UNDERSCORED: &str = r#"
+const DOTTED: &str = r#"
 apiVersion: agentplane.hupe1980.github.io/v1alpha1
 kind: Agent
 metadata: { name: payer, version: "1.0.0" }
@@ -258,7 +258,7 @@ spec:
   models:
     privileged: { provider: fake, model: planner-1 }
   tools:
-    - ref: tool://crm/get_account
+    - ref: tool://crm/account.lookup
       mutates: false
       description: Look up a customer record.
       arguments:
@@ -270,22 +270,25 @@ spec:
   budgets: {}
 "#;
 
-/// A hand-written plan naming the *manifest* spelling gets told which one to use.
+/// A hand-written plan naming the *dotted* spelling gets told which one to use.
 ///
-/// `wire_name` escapes `_` to `_u`, so `tool://crm/get_account` is
-/// `crm__get_uaccount` on the wire. Someone writing a plan in a test writes the
-/// obvious `crm__get_account`, and "not granted" sends them to the policy for a
-/// mistake that is in the escaping — the grant is right there in the manifest.
+/// `wire_name` renders `.` as `-`, so `tool://crm/account.lookup` is
+/// `crm__account-lookup` on the wire. Someone writing a plan in a test writes
+/// the obvious dotted `crm__account.lookup`, and "not granted" sends them to
+/// the policy for a mistake that is in the rendering — the grant is right
+/// there in the manifest. (Plain underscored names need no hint any more: the
+/// wire name *is* `server__tool` for them, which is half the point of the
+/// rendering.)
 #[tokio::test]
-async fn a_plan_naming_the_manifest_spelling_is_told_the_wire_name() {
-    let manifest = Manifest::parse(UNDERSCORED).expect("parse");
+async fn a_plan_naming_the_dotted_spelling_is_told_the_wire_name() {
+    let manifest = Manifest::parse(DOTTED).expect("parse");
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(plan(json!({
-        "steps": [{ "tool": "crm__get_account", "args": {} }]
+        "steps": [{ "tool": "crm__account.lookup", "args": {} }]
     })));
     let client = Arc::new(Recorder::default());
     let catalog = Arc::new(ToolCatalog::new().allow(
-        ToolId::new("crm", "get_account"),
+        ToolId::new("crm", "account.lookup"),
         ToolSafety::read_only().max_sensitivity(agentplane::core::Sensitivity::Internal),
     ));
     let rt = wired(&manifest, &provider, catalog, &client);
@@ -300,7 +303,8 @@ async fn a_plan_naming_the_manifest_spelling_is_told_the_wire_name() {
     match out.status {
         RunStatus::Failed(reason) => {
             assert!(
-                reason.contains("tool://crm/get_account") && reason.contains("crm__get_uaccount"),
+                reason.contains("tool://crm/account.lookup")
+                    && reason.contains("crm__account-lookup"),
                 "the refusal did not name both spellings: {reason}"
             );
         }
@@ -313,14 +317,14 @@ async fn a_plan_naming_the_manifest_spelling_is_told_the_wire_name() {
 /// hint cannot degrade into "did you mean" attached to everything.
 #[tokio::test]
 async fn a_plan_naming_nothing_at_all_gets_no_spelling_hint() {
-    let manifest = Manifest::parse(UNDERSCORED).expect("parse");
+    let manifest = Manifest::parse(DOTTED).expect("parse");
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(plan(json!({
         "steps": [{ "tool": "vault__open", "args": {} }]
     })));
     let client = Arc::new(Recorder::default());
     let catalog = Arc::new(ToolCatalog::new().allow(
-        ToolId::new("crm", "get_account"),
+        ToolId::new("crm", "account.lookup"),
         ToolSafety::read_only().max_sensitivity(agentplane::core::Sensitivity::Internal),
     ));
     let rt = wired(&manifest, &provider, catalog, &client);
@@ -521,6 +525,149 @@ async fn a_parse_runs_on_the_quarantined_model() {
     assert!(
         schema["properties"]["have_enough_information"].is_object(),
         "the runtime did not inject the escape bit: {schema}"
+    );
+}
+
+/// The quarantined role's own ceilings govern its calls, not just its name.
+///
+/// `max_tokens` and `reasoning_effort` are declared per role, inside the
+/// digest — and the quarantined role's copies were parsed and then dropped,
+/// so the role that reads hostile content ran under the driver default while
+/// the reviewed file said otherwise. A declared control the runtime does not
+/// apply is the I12 shape; here it is pinned by reading what the provider was
+/// actually asked, which is the same `max_output_tokens` the journaled effect
+/// descriptor records for the call.
+#[tokio::test]
+async fn a_quarantined_roles_ceilings_reach_its_parse_calls() {
+    const CEILINGED: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: reader, version: "1.0.0" }
+spec:
+  capabilities: { provides: [read.contact] }
+  identity: { role: "Extract contacts" }
+  security: { max_sensitivity_egress: internal }
+  models:
+    privileged: { provider: fake, model: planner-1, max_tokens: 2048 }
+    quarantined: { provider: fake, model: extractor-1, max_tokens: 512, reasoning_effort: low }
+  tools:
+    - ref: tool://web/fetch
+      mutates: false
+      description: Fetch a page.
+      arguments:
+        type: object
+        properties:
+          url: { type: string }
+        required: [url]
+  execution: { kind: planned, max_turns: 3 }
+  budgets: {}
+"#;
+    let manifest = Manifest::parse(CEILINGED).expect("parse");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_answer(plan(parsing_plan()));
+    provider.will_answer(plan(json!({
+        "email": "bob@x",
+        "have_enough_information": true
+    })));
+    let client = Arc::new(Recorder::default());
+    let catalog = Arc::new(ToolCatalog::new().allow(
+        ToolId::new("web", "fetch"),
+        ToolSafety::read_only().max_sensitivity(agentplane::core::Sensitivity::Internal),
+    ));
+    let rt = wired(&manifest, &provider, catalog, &client);
+
+    let out = rt
+        .run(
+            "read.contact",
+            Tainted::trusted(json!({ "url": "https://example.com" })),
+        )
+        .await
+        .expect("run");
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "parse plan failed: {:?}",
+        out.status
+    );
+
+    let asked = provider.asked();
+    assert_eq!(asked.len(), 2, "one planning call, one parse");
+    assert_eq!(
+        asked[0].max_output_tokens, 2048,
+        "the privileged role's declared ceiling did not reach the planning call"
+    );
+    assert_eq!(asked[1].model.to_string(), "fake/extractor-1");
+    assert_eq!(
+        asked[1].max_output_tokens, 512,
+        "the quarantined role's declared `max_tokens` did not reach the parse \
+         call — parsed for intent is not applied"
+    );
+    assert_eq!(
+        asked[1].reasoning_effort,
+        Some(agentplane::model::ReasoningEffort::Low),
+        "the quarantined role's declared `reasoning_effort` did not reach the \
+         parse call"
+    );
+}
+
+/// And with no quarantined role, the parse falls back to the **whole**
+/// privileged declaration — its ceilings included, not only its model id.
+#[tokio::test]
+async fn a_parse_fallback_keeps_the_privileged_roles_ceilings() {
+    const FALLBACK: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: reader, version: "1.0.0" }
+spec:
+  capabilities: { provides: [read.contact] }
+  identity: { role: "Extract contacts" }
+  security: { max_sensitivity_egress: internal }
+  models:
+    privileged: { provider: fake, model: planner-1, max_tokens: 2048 }
+  tools:
+    - ref: tool://web/fetch
+      mutates: false
+      description: Fetch a page.
+      arguments:
+        type: object
+        properties:
+          url: { type: string }
+        required: [url]
+  execution: { kind: planned, max_turns: 3 }
+  budgets: {}
+"#;
+    let manifest = Manifest::parse(FALLBACK).expect("parse");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_answer(plan(parsing_plan()));
+    provider.will_answer(plan(json!({
+        "email": "bob@x",
+        "have_enough_information": true
+    })));
+    let client = Arc::new(Recorder::default());
+    let catalog = Arc::new(ToolCatalog::new().allow(
+        ToolId::new("web", "fetch"),
+        ToolSafety::read_only().max_sensitivity(agentplane::core::Sensitivity::Internal),
+    ));
+    let rt = wired(&manifest, &provider, catalog, &client);
+
+    let out = rt
+        .run(
+            "read.contact",
+            Tainted::trusted(json!({ "url": "https://example.com" })),
+        )
+        .await
+        .expect("run");
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "parse plan failed: {:?}",
+        out.status
+    );
+
+    let asked = provider.asked();
+    assert_eq!(asked.len(), 2, "one planning call, one parse");
+    assert_eq!(asked[1].model.to_string(), "fake/planner-1");
+    assert_eq!(
+        asked[1].max_output_tokens, 2048,
+        "the privileged fallback dropped its own declared ceiling"
     );
 }
 

@@ -352,10 +352,14 @@ fn classify_rpc(peer: &PeerId, e: &RpcError) -> PeerError {
         },
         // `-32603 Internal error` and anything unrecognised. The request
         // arrived; whether the peer acted is exactly what it is not saying.
-        // Calling this a refusal is how a half-finished transfer is sent again.
-        _ => PeerError::TimedOut {
+        // Calling this a refusal is how a half-finished transfer is sent again
+        // — and calling it a timeout is a false diagnosis of a peer that
+        // answered promptly, with a fault.
+        _ => PeerError::InDoubt {
             peer: peer.clone(),
-            detail: format!("{detail} — the peer did not say whether it acted"),
+            detail: format!(
+                "{detail} — the peer answered with a fault and did not say whether it acted"
+            ),
         },
     }
 }
@@ -389,10 +393,14 @@ fn send_message_result(peer: &PeerId, result: &Value) -> Result<Value, PeerError
 fn classify_status(peer: &PeerId, status: reqwest::StatusCode) -> PeerError {
     if status.is_server_error() {
         // It reached them. A 500 from a gateway and a 500 from the agent are
-        // indistinguishable here, and one of them may have acted.
-        return PeerError::TimedOut {
+        // indistinguishable here, and one of them may have acted. Not a
+        // timeout: the peer answered, and answered with a fault.
+        return PeerError::InDoubt {
             peer: peer.clone(),
-            detail: format!("HTTP {status} — the peer did not say whether it acted"),
+            detail: format!(
+                "the peer answered HTTP {status} — a fault, not a decline, and it did not \
+                 say whether it acted"
+            ),
         };
     }
     PeerError::Refused {
@@ -421,21 +429,22 @@ fn classify_transport(peer: &PeerId, e: &reqwest::Error) -> PeerError {
     }
     if e.is_body() || e.is_decode() {
         // The request went out and something came back that could not be read.
-        // The peer very likely acted.
-        return PeerError::TimedOut {
+        // The peer very likely acted — and it certainly answered, so calling
+        // this a timeout would misdirect whoever debugs it.
+        return PeerError::InDoubt {
             peer: peer.clone(),
-            detail: format!("the response could not be read: {e}"),
+            detail: format!("the peer answered, and the response could not be read: {e}"),
         };
     }
     if e.is_request() {
         // A request that failed while being built or written. A partial write
         // is indistinguishable from none, so this is not `Unreachable`.
-        return PeerError::TimedOut {
+        return PeerError::InDoubt {
             peer: peer.clone(),
             detail: format!("the request failed in flight: {e}"),
         };
     }
-    PeerError::TimedOut {
+    PeerError::InDoubt {
         peer: peer.clone(),
         detail: e.to_string(),
     }

@@ -62,17 +62,24 @@ impl SealedCases {
         super::scope(&self.tenant, &case.to_string())
     }
 
-    /// Bound to the case, so a sealed state lifted onto another case fails to
-    /// authenticate rather than opening as somebody else's matter.
-    fn aad(case: CaseId) -> String {
-        case.to_string()
+    /// The associated data case state authenticates under.
+    ///
+    /// The ciphertext binds tenant, record identity and purpose as
+    /// authenticated associated data. The purpose label separates this from every other envelope the
+    /// same ring seals; the tenant stops a state envelope crossing tenants
+    /// that share a ring (case ids are generated, but `import_case` accepts
+    /// them verbatim, so an id is not a tenant boundary); and the case id
+    /// stops a sealed state lifted onto another case from opening as somebody
+    /// else's matter.
+    fn aad(&self, case: CaseId) -> String {
+        format!("case-state:{}:{case}", self.tenant)
     }
 
     async fn open_state(&self, case: CaseId, state: Value) -> Value {
         let Some(envelope) = payload::unwrap(&state) else {
             return state;
         };
-        let aad = Self::aad(case);
+        let aad = self.aad(case);
         // Left sealed when it will not open. A destroyed key is a completed
         // erasure, not an outage: the case must stay listable, countable and
         // closable afterwards.
@@ -101,16 +108,25 @@ impl SealedCases {
 /// keep distinct: a destroyed key is a completed erasure reporting itself.
 ///
 /// This lives beside [`SealedCases`] rather than in the drill because the AAD
-/// rule — the state is bound to its case id — is this decorator's own, and a
-/// second spelling of it in another module is the sign/verify split that fails
-/// silently in one direction.
+/// rule — the state is bound to tenant, purpose and case id — is this
+/// decorator's own, and a second spelling of it in another module is the
+/// sign/verify split that fails silently in one direction.
+///
+/// The probe holds a case id and no tenant, so the tenant half of the AAD is
+/// recovered from the envelope's own wrapped-key scope — safe, because the
+/// scope is not taken on trust: the ring only unwraps a data key its named
+/// scope's wrapping key actually seals, so a relabelled scope fails at `open`
+/// rather than opening under a borrowed identity. The scope must also name
+/// exactly this case, or the envelope was written for a different matter.
 pub async fn probe_sealed_case_state(
     keys: &dyn KeyRing,
     case: CaseId,
     state: &Value,
 ) -> Option<Result<(), super::KeyError>> {
     let envelope = payload::unwrap(state)?;
-    let aad = SealedCases::aad(case);
+    let scope = super::envelope::wrapped_scope(&envelope)?;
+    let tenant = scope.strip_suffix(&format!("/{case}"))?;
+    let aad = format!("case-state:{tenant}:{case}");
     Some(
         super::envelope::open(keys, aad.as_bytes(), &envelope)
             .await
@@ -131,7 +147,7 @@ impl CaseStore for SealedCases {
         let envelope = super::envelope::seal(
             self.keys.as_ref(),
             &self.scope_for(case),
-            Self::aad(case).as_bytes(),
+            self.aad(case).as_bytes(),
             &plain,
         )
         .await

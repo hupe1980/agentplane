@@ -102,16 +102,14 @@ pub enum RecordKind {
         /// Which canonicalization rule produced this run's derived digests.
         ///
         /// Journaled once, here, because it is a property of the whole run and
-        /// replay needs it before it recomputes anything. Defaulted to **1** on
-        /// read: a record written before this field existed was written under
-        /// the UTF-8 ordering, and reading its absence as "today's rule" is the
-        /// one wrong answer available.
+        /// replay needs it before it recomputes anything. Deliberately
+        /// **required**: a record without it is malformed, because reading
+        /// absence as "today's rule" is the one wrong answer available.
         ///
         /// See [`canon::VERSION`](crate::core::canon::VERSION) for what the
         /// distinction buys — a run under another rule is *unverifiable*, not
         /// *divergent*, and reporting the second for the first quarantines
         /// healthy history.
-        #[serde(default = "canon_v1")]
         canon: u16,
     },
 
@@ -309,6 +307,26 @@ pub enum RecordKind {
         /// Where consumption actually reached. "Budget exhausted" alone does
         /// not tell anyone what to raise it to.
         used: String,
+    },
+
+    /// A step the recorded run was refused on was admitted again, under the
+    /// ceilings in force at resume.
+    ///
+    /// Exhaustion is a pause, not a fault: an operator raises the ceiling and
+    /// resumes. The resume re-evaluates the recorded step refusal against the
+    /// ledger now in force, and when it admits, *that decision* is a fact
+    /// about the run and goes on the record — beside the refusal it
+    /// supersedes, never instead of it. Without this record a strict replay of
+    /// the resumed history stops at the old refusal and reports `Exhausted`
+    /// about a run whose own later records show it finishing: the refusal
+    /// followed by the continuation would read as divergence.
+    ///
+    /// Carries the step in the record body, like the refusal it answers.
+    BudgetReadmitted {
+        /// The ceiling the step was admitted under, in the operator's words —
+        /// so "who raised what to let this continue" is answerable from the
+        /// chain.
+        limit: String,
     },
 
     /// The delegation chain this run acts under, owner first.
@@ -514,6 +532,7 @@ impl RecordKind {
             Self::GroupOpened { .. } => "GroupOpened",
             Self::GroupSettled { .. } => "GroupSettled",
             Self::BudgetRefused { .. } => "BudgetRefused",
+            Self::BudgetReadmitted { .. } => "BudgetReadmitted",
             Self::IdentityBound { .. } => "IdentityBound",
             Self::PolicyDenied { .. } => "PolicyDenied",
             Self::Released { .. } => "Released",
@@ -579,11 +598,6 @@ pub struct RecordBody {
     pub effect_key: Option<EffectKey>,
     #[serde(flatten)]
     pub kind: RecordKind,
-}
-
-/// The rule in force before the version was recorded.
-const fn canon_v1() -> u16 {
-    1
 }
 
 /// A sealed journal entry: body, chain links, and the bytes that were hashed.

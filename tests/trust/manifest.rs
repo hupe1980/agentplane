@@ -3808,6 +3808,138 @@ spec:
     );
 }
 
+/// `cx.complete` resolves the model, its ceilings and the driver from the
+/// declaration — the coded skill holds no provider and names no model.
+///
+/// The gap this closes: a declarative agent's `models.privileged` governed
+/// every call, while a hand-written skill carried its own `Arc<dyn
+/// ModelProvider>` and model id, wiring its manifest never described. The
+/// proof is the journal: the completion effect must carry the declared model
+/// and the role's `max_tokens`, from a skill that wrote neither.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_coded_skill_completes_on_the_manifests_own_model() {
+    use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted};
+    use agentplane::journal::RecordKind;
+    use agentplane::runtime::{Agent, RunStatus, Runtime, StepCtx};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct Asks;
+
+    #[async_trait::async_trait]
+    impl Skill for Asks {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("asks").provides("billing.check")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            input: Tainted<serde_json::Value>,
+        ) -> Result<Outcome, SkillError> {
+            let prompt = Tainted::object([("document".to_owned(), input)]);
+            let completion = cx.complete(&prompt).await?;
+            Ok(Outcome::done(completion.map(|c| json!({ "text": c.text }))))
+        }
+    }
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: biller, version: "1.0.0" }
+spec:
+  capabilities: { provides: [billing.check] }
+  models: { privileged: { provider: fake, model: m-1, max_tokens: 55 } }
+  security: { max_sensitivity_egress: internal }
+  budgets: {}
+"#,
+    )
+    .expect("manifest");
+
+    let provider = agentplane::testkit::FakeProvider::new();
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest).skill(Asks))
+        .build();
+
+    let out = rt
+        .run("billing.check", Tainted::trusted(json!({ "id": "B-1" })))
+        .await
+        .expect("run");
+    assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);
+    assert_eq!(provider.calls(), 1, "one completion, through the registry");
+
+    let records = (Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>)
+        .read(out.run_id, 1)
+        .await
+        .expect("read");
+    let call = records
+        .iter()
+        .find_map(|record| match record.kind() {
+            RecordKind::EffectStarted { descriptor, .. } if descriptor.kind == "model.complete" => {
+                Some(descriptor.args.clone())
+            }
+            _ => None,
+        })
+        .expect("a journaled completion");
+    assert_eq!(call["model"], json!("m-1"), "the declared model answers");
+    assert_eq!(
+        call["max_output_tokens"],
+        json!(55),
+        "the privileged role's declared ceiling rides the call"
+    );
+}
+
+/// Without a manifest there is no declared model, and `cx.complete` says so
+/// instead of inventing a default.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn complete_refuses_a_skill_no_manifest_governs() {
+    use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted};
+    use agentplane::runtime::{RunStatus, Runtime, StepCtx};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct Ungoverned;
+
+    #[async_trait::async_trait]
+    impl Skill for Ungoverned {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("ungoverned")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            input: Tainted<serde_json::Value>,
+        ) -> Result<Outcome, SkillError> {
+            let completion = cx.complete(&input).await?;
+            Ok(Outcome::done(completion.map(|c| json!(c.text))))
+        }
+    }
+
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>)
+        .skill(Ungoverned)
+        .build()
+        .run("ungoverned", Tainted::trusted(json!({})))
+        .await
+        .expect("a verdict");
+    let RunStatus::Failed(why) = out.status else {
+        panic!("an ungoverned skill's `cx.complete` must fail loudly: {out:?}");
+    };
+    assert!(
+        why.contains("no manifest"),
+        "the refusal names what is missing: {why}"
+    );
+}
+
 #[test]
 fn context_grants_are_strict_unique_and_digest_covered() {
     let yaml = r#"
@@ -3995,12 +4127,13 @@ async fn an_agent_is_consulted_as_a_granted_tool_and_replay_wakes_nobody() {
     let editor = Manifest::parse(ROOM_EDITOR).expect("editor");
 
     let provider = agentplane::testkit::FakeProvider::new();
-    // Editor turn 1: consult the researcher. The wire name escapes the dot,
-    // because providers refuse function names containing one — a capability
-    // offered under its raw spelling would never reach the model at all.
+    // Editor turn 1: consult the researcher. The wire name renders the dot
+    // as a hyphen, because a function name must be legal on every provider —
+    // a capability offered under its raw spelling would never reach the model
+    // at all.
     provider.will_call_tool(
         "call_1",
-        "agent__research_dsummarise",
+        "agent__research-summarise",
         serde_json::json!({ "topic": "printer fires" }),
     );
     // The researcher's one completion.
@@ -4514,6 +4647,73 @@ spec:
     Manifest::parse(&read_only).expect("a non-mutating grant is not affected");
 }
 
+/// A mutating grant whose only protected field is a sensitivity ceiling is
+/// refused: it lifts the whole-object gate while gating no authority.
+///
+/// Declaring `protected_fields` is what tells the taint gate to trust the
+/// per-field rules instead of refusing the untrusted bundle whole. A
+/// sensitivity ceiling bounds how *secret* a value may be, not *who authored*
+/// it — and a model completion is comfortably below any ceiling — so a grant
+/// whose every rule is a ceiling would let the loop dispatch a mutation with
+/// recipient, amount and command exactly as the model wrote them. The same
+/// shape as the empty-list refusal above, one step subtler: the reviewer sees
+/// rules where the runtime enforces none that carry authority.
+#[test]
+fn a_sensitivity_only_protected_field_does_not_lift_the_mutating_gate() {
+    let agent = |fields: &str| {
+        format!(
+            r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: teller, version: '1.0.0' }}
+spec:
+  execution: {{ kind: tool-calling, max_turns: 3 }}
+  identity: {{ role: 'Post entries', constraints: 'Be brief.' }}
+  capabilities: {{ provides: [ledger.post] }}
+  models: {{ privileged: {{ provider: fake, model: m-1 }} }}
+  tools:
+    - ref: 'tool://ledger/post'
+      mutates: true
+      description: 'Post an amount to an account'
+      protected_fields:
+{fields}
+  budgets: {{ max_tokens: 1000 }}
+"
+        )
+    };
+
+    let err = Manifest::parse(&agent(
+        "        - path: /account\n          max_sensitivity: internal",
+    ))
+    .expect_err("a sensitivity-only rule set lifted the whole-object gate");
+    let message = err.to_string();
+    for expected in [
+        "tool://ledger/post",
+        "sensitivity",
+        "require_trusted",
+        "allowed_sources",
+    ] {
+        assert!(
+            message.contains(expected),
+            "the refusal does not name '{expected}': {message}"
+        );
+    }
+
+    // A trust rule beside the ceiling is the intended shape and must parse —
+    // the ceiling itself was never the problem.
+    Manifest::parse(&agent(
+        "        - path: /account\n          require_trusted: true\n\
+         \x20       - path: /memo\n          max_sensitivity: internal",
+    ))
+    .expect("a trust-constrained field beside a ceiling-only field is accepted");
+
+    // And a source rule counts the same way trust does.
+    Manifest::parse(&agent(
+        "        - path: /account\n          allowed_sources: [crm]\n          max_sensitivity: internal",
+    ))
+    .expect("a source-constrained field carries authority and is accepted");
+}
+
 /// Oversight on a plane that cannot ask anybody is refused at build.
 ///
 /// The same shape as the tool-loop-with-no-catalogue refusal, and both facts
@@ -4817,6 +5017,72 @@ spec:
             if *field == "spec.oversight.approval"),
         "wrong refusal: {refused}"
     );
+}
+
+/// `tools-only` obliges every mutating grant, not just the one that asked.
+///
+/// The mode's claim is that a person sees the calls that change the world.
+/// Before this refusal it was runtime-identical to `none` the moment one grant
+/// asked: the reviewed file said "tool approval" while the mutating grant
+/// beside the gated one ran unattended — a declared control enforced only
+/// where somebody remembered to also write `requires_approval`.
+#[test]
+fn tools_only_obliges_every_mutating_grant_to_ask() {
+    let agent = |transfer_extra: &str| {
+        format!(
+            r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: teller, version: '1.0.0' }}
+spec:
+  capabilities: {{ provides: [desk.pay] }}
+  models: {{ privileged: {{ provider: fake, model: m-1 }} }}
+  execution: {{ kind: tool-calling, max_turns: 4 }}
+  oversight:
+    approval: tools-only
+    deadline: {{ name: review, kind: hours, params: {{ n: 4 }} }}
+  tools:
+    - ref: 'tool://ledger/read'
+      mutates: false
+      description: Read a balance.
+      requires_approval: true
+    - ref: 'tool://ledger/transfer'
+      mutates: true
+      description: Move funds.
+{transfer_extra}
+      protected_fields:
+        - path: /recipient
+          require_trusted: true
+  budgets: {{}}
+"
+        )
+    };
+
+    let refused = Manifest::parse(&agent(""))
+        .expect_err("a mutating grant no reviewer sees under tools-only was accepted");
+    let message = refused.to_string();
+    for expected in ["tools-only", "tool://ledger/transfer", "requires_approval"] {
+        assert!(
+            message.contains(expected),
+            "the refusal does not name '{expected}': {message}"
+        );
+    }
+
+    // Every mutating grant asking is the mode meaning what it says — and the
+    // read-only grant needs nothing, because the mode never claimed a person
+    // reviews reads.
+    let asking = agent("      requires_approval: true");
+    let compliant = asking.replace(
+        "      mutates: false\n      description: Read a balance.\n      requires_approval: true",
+        "      mutates: false\n      description: Read a balance.",
+    );
+    Manifest::parse(&compliant).expect("a tools-only agent whose mutating grants all ask parses");
+
+    // `required` and `none` add no such obligation: the answer gate and the
+    // triage path are their own controls, and a mutating grant that does not
+    // ask is a legitimate shape under both.
+    let required = agent("").replace("approval: tools-only", "approval: required");
+    Manifest::parse(&required).expect("'required' does not oblige per-call approval");
 }
 
 /// A prompt may not instruct the agent to use a tool it was never granted.

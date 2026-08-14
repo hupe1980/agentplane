@@ -33,6 +33,37 @@
 //!   identity column. A global sequence would leave gaps — Postgres sequences
 //!   are explicitly non-transactional — and a gap is indistinguishable from a
 //!   deleted record when the chain is verified.
+//!
+//! # TLS: refused rather than half-wired
+//!
+//! This backend connects without a TLS connector, and [`connect`] refuses a URL
+//! that *demands* one (`sslmode=require` or stricter) instead of silently
+//! downgrading it to plaintext. That refusal is deliberate and so is the
+//! absence of the connector: libpq's `sslmode` is a gradation, not a switch —
+//! `require` encrypts **without verifying the certificate**, `verify-ca` checks
+//! the chain but not the hostname, and only `verify-full` does what "TLS" is
+//! usually taken to mean. A connector that verified under `require` would break
+//! every self-signed deployment that asked for exactly what it configured; one
+//! that skipped verification to match libpq would be a security feature that
+//! does not verify certificates. Either mistake is silent, which is the worst
+//! property a transport-security seam can have.
+//!
+//! The deployment shapes this backend serves need no connector, and they are
+//! the ordinary ones:
+//!
+//! * **A co-located database** — a Unix socket or loopback TCP, where the bytes
+//!   never cross a network. `sslmode=disable` says what is true.
+//! * **A TLS-terminating proxy** — pgbouncer, a cloud SQL proxy, a service-mesh
+//!   sidecar — that this store reaches in plaintext locally while the proxy
+//!   speaks verified TLS outward. The proxy is administered by whoever
+//!   administers the certificates, which is where that policy lives anyway.
+//!
+//! A deployment that must speak TLS end-to-end from this process should
+//! terminate it in a sidecar until a connector with the full `sslmode`
+//! gradation is wired; the refusal in [`connect`] is what keeps that gap
+//! visible instead of silently unencrypted.
+//!
+//! [`connect`]: PostgresStore::connect
 
 use std::time::Duration;
 
@@ -64,8 +95,14 @@ CREATE TABLE IF NOT EXISTS journal (
     -- somebody else's traffic.
     tenant     TEXT   NOT NULL,
     run_id     TEXT   NOT NULL,
-    seq        BIGINT NOT NULL,
-    epoch      BIGINT NOT NULL,
+    -- Every counter and instant in this schema carries a CHECK for the reason
+    -- `amount_of` gives: the types are unsigned, PostgreSQL has no unsigned
+    -- integer, and a row edited around the application — negative by typo or
+    -- by malice — must fail the edit rather than read back as a value that
+    -- reverses an accumulation. Chain positions and epochs start at one, so
+    -- their floor is 1, not 0.
+    seq        BIGINT NOT NULL CHECK (seq >= 1),
+    epoch      BIGINT NOT NULL CHECK (epoch >= 1),
     kind       TEXT   NOT NULL,
     effect_key TEXT,
     prev_hash  BYTEA  NOT NULL,
@@ -93,7 +130,7 @@ CREATE INDEX IF NOT EXISTS journal_by_case
 CREATE TABLE IF NOT EXISTS run_activity (
     tenant     TEXT   NOT NULL,
     run_id     TEXT   NOT NULL,
-    updated_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL CHECK (updated_at >= 0),
     PRIMARY KEY (tenant, run_id)
 );
 CREATE INDEX IF NOT EXISTS run_activity_recent
@@ -110,8 +147,8 @@ CREATE TABLE IF NOT EXISTS run_lease (
     tenant     TEXT   NOT NULL,
     run_id     TEXT   NOT NULL,
     owner      TEXT   NOT NULL,
-    epoch      BIGINT NOT NULL,
-    expires_at BIGINT NOT NULL,
+    epoch      BIGINT NOT NULL CHECK (epoch >= 1),
+    expires_at BIGINT NOT NULL CHECK (expires_at >= 0),
     PRIMARY KEY (tenant, run_id)
 );
 
@@ -146,8 +183,8 @@ CREATE TABLE IF NOT EXISTS run_seal (
     tenant     TEXT   NOT NULL,
     run_id     TEXT   NOT NULL,
     chain_head BYTEA  NOT NULL,
-    log_index  BIGINT NOT NULL,
-    sealed_at  BIGINT NOT NULL,
+    log_index  BIGINT NOT NULL CHECK (log_index >= 1),
+    sealed_at  BIGINT NOT NULL CHECK (sealed_at >= 0),
     -- How the run ended *when it sealed*. Descriptive: the outcome index that
     -- answers queries lives in run_outcome, fed by the chain's `RunSealed`
     -- records, where the last conclusion wins.
@@ -170,7 +207,7 @@ CREATE TABLE IF NOT EXISTS run_outcome (
     tenant  TEXT   NOT NULL,
     run_id  TEXT   NOT NULL,
     outcome TEXT   NOT NULL,
-    ordinal BIGINT NOT NULL,
+    ordinal BIGINT NOT NULL CHECK (ordinal >= 1),
     PRIMARY KEY (tenant, run_id)
 );
 
@@ -185,7 +222,7 @@ CREATE TABLE IF NOT EXISTS run_cancel (
     run_id       TEXT   NOT NULL,
     actor        TEXT   NOT NULL,
     reason       TEXT   NOT NULL,
-    requested_at BIGINT NOT NULL,
+    requested_at BIGINT NOT NULL CHECK (requested_at >= 0),
     PRIMARY KEY (tenant, run_id)
 );
 
@@ -200,9 +237,9 @@ CREATE TABLE IF NOT EXISTS push_delivery (
     token           TEXT,
     auth_scheme     TEXT,
     auth_credentials TEXT,
-    next_seq        BIGINT NOT NULL,
-    attempts        INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at BIGINT NOT NULL DEFAULT 0,
+    next_seq        BIGINT NOT NULL CHECK (next_seq >= 0),
+    attempts        INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at BIGINT NOT NULL DEFAULT 0 CHECK (next_attempt_at >= 0),
     last_error      TEXT,
     PRIMARY KEY (tenant, task_id, config_id)
 );
@@ -247,13 +284,29 @@ impl PostgresStore {
     ///
     /// The handle is the boundary: a store built for `acme` cannot name a
     /// `globex` run even holding a valid id, because the tenant is part of every
-    /// key rather than a predicate someone remembers to add. The origin moves
-    /// with it, so two tenants' checkpoints are not mistaken for one plane's.
+    /// key rather than a predicate someone remembers to add. The checkpoint
+    /// origin carries the tenant too, so two tenants' checkpoints are not
+    /// mistaken for one plane's — composed at read time from the base name and
+    /// the tenant, never baked into a field. Baking it in made the builder
+    /// order-sensitive: `for_tenant` called twice double-qualified the origin,
+    /// and `origin()` after `for_tenant` silently dropped the tenant — either
+    /// way a checkpoint under a name no verifier ever saw again.
     #[must_use]
     pub fn for_tenant(mut self, tenant: crate::core::TenantId) -> Self {
-        self.origin = format!("{}/{}", self.origin, tenant);
         self.tenant = tenant;
         self
+    }
+
+    /// The name this tenant's Merkle log publishes under.
+    ///
+    /// The default tenant keeps the bare base name, so a single-tenant plane's
+    /// checkpoints read as they always have.
+    fn log_origin(&self) -> String {
+        if self.tenant.as_str() == crate::core::TenantId::DEFAULT {
+            self.origin.clone()
+        } else {
+            format!("{}/{}", self.origin, self.tenant)
+        }
     }
 
     /// This tenant's log leaves, in seal order.
@@ -419,6 +472,28 @@ impl PostgresStore {
         let pg: tokio_postgres::Config = url
             .parse()
             .map_err(|e: tokio_postgres::Error| StoreError::Backend(e.to_string()))?;
+
+        // This pool is built with `NoTls`, so a URL *demanding* TLS would be
+        // silently downgraded to plaintext — a journal of authorization
+        // decisions and labelled payloads crossing the network in the clear,
+        // under a connection string whose author explicitly asked otherwise.
+        // Until a TLS connector is wired, the honest answer is a refusal that
+        // names the gap, not a connection that ignores the word `require`.
+        // `prefer` and `disable` are served as written: neither promises
+        // encryption.
+        match pg.get_ssl_mode() {
+            tokio_postgres::config::SslMode::Disable | tokio_postgres::config::SslMode::Prefer => {}
+            demanded => {
+                return Err(StoreError::Backend(format!(
+                    "the connection URL demands TLS (sslmode {demanded:?}) and this \
+                     build connects without it — connecting anyway would silently \
+                     send the journal in plaintext. Use sslmode=disable (or prefer) \
+                     against a trusted network, or terminate TLS in a proxy this \
+                     store connects to locally"
+                )));
+            }
+        }
+
         let mut cfg = Config::new();
         cfg.host = pg.get_hosts().first().map(|h| match h {
             tokio_postgres::config::Host::Tcp(s) => s.clone(),
@@ -507,6 +582,19 @@ impl PostgresStore {
         epoch: Epoch,
         batch: Vec<Append>,
     ) -> Result<Vec<Record>, StoreError> {
+        // A batch is one run's atomic unit. Everything below — the fence the
+        // caller took, the seal check, the head read, the chain each record
+        // links into — is scoped to `run`, so a record naming another run
+        // would be sealed into this run's chain under this run's fence.
+        // Refused loudly, exactly as the embedded store refuses it: the two
+        // backends must not disagree about what a batch is.
+        if let Some(a) = batch.iter().find(|a| a.run != run) {
+            return Err(StoreError::Backend(format!(
+                "batch spans runs {run} and {} — a batch is one run's atomic unit",
+                a.run
+            )));
+        }
+
         // Sealed is frozen. The Merkle leaf is the chain head at seal time, so
         // an append past it — even by the epoch's rightful holder — advances
         // the true head past what every checkpoint attests. Checked inside the
@@ -580,15 +668,7 @@ impl PostgresStore {
                 .await;
 
             if let Err(e) = result {
-                // The partial unique index refusing a second start is not a
-                // backend failure — it is exactly-once holding, and the caller
-                // must be able to tell the two apart.
-                if e.code() == Some(&SqlState::UNIQUE_VIOLATION)
-                    && let Some(k) = record.effect_key()
-                {
-                    return Err(StoreError::DuplicateEffect(k));
-                }
-                return Err(be(&e));
+                return Err(refused_insert(&e, &record, run, seq));
             }
             sealed.push(record);
         }
@@ -622,6 +702,37 @@ impl PostgresStore {
 
         Ok(sealed)
     }
+}
+
+/// Name what the database refused, in the caller's vocabulary.
+///
+/// A unique violation here is one of two very different facts, and the
+/// **constraint name** is what tells them apart. The partial index
+/// `journal_effect_started` refusing a second start is exactly-once holding —
+/// not a backend failure, and the caller must be able to tell. The primary key
+/// on `(tenant, run_id, seq)` refusing a row is a **race**: two writers
+/// extended one chain concurrently, which the fence should have arbitrated.
+/// Mapping that to `DuplicateEffect` sent operators hunting a repeated effect
+/// that never was.
+fn refused_insert(e: &tokio_postgres::Error, record: &Record, run: RunId, seq: u64) -> StoreError {
+    if e.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+        let constraint = e
+            .as_db_error()
+            .and_then(|d| d.constraint())
+            .unwrap_or_default();
+        if constraint == "journal_effect_started"
+            && let Some(k) = record.effect_key()
+        {
+            return StoreError::DuplicateEffect(k);
+        }
+        return StoreError::Backend(format!(
+            "append raced another writer on run {run} at seq {seq} \
+             (unique violation on '{constraint}') — two connections \
+             extended one chain concurrently, which the lease fence \
+             should have serialised"
+        ));
+    }
+    be(e)
 }
 
 #[async_trait]
@@ -862,16 +973,19 @@ impl JournalStore for PostgresStore {
                 let expires_at: i64 = row.get(2);
                 let epoch = epoch.cast_unsigned();
                 if expires_at.cast_unsigned() <= now {
-                    // Expired or released: take over and fence whoever held it,
-                    // **including this caller**. Checked before ownership on
-                    // purpose — a lapsed lease is not yours to renew, because
-                    // you cannot know whether somebody took over in the gap.
+                    // Expired or released: claim and fence whoever held it,
+                    // **including this caller**. Checked before any ownership
+                    // test on purpose — a lapsed lease is not yours to renew,
+                    // because you cannot know whether somebody took over in
+                    // the gap.
                     epoch + 1
-                } else if held_by == owner {
-                    // Ours and still live: renewal keeps the epoch, or the owner
-                    // fences its own in-flight writes.
-                    epoch
                 } else {
+                    // Still live — held by anyone, this caller included.
+                    // `acquire` claims and never renews: handing a same-owner
+                    // caller the current epoch is two executors on one run
+                    // that fencing cannot tell apart. Renewal is `renew`,
+                    // which proves the caller still holds the exact
+                    // `(owner, epoch)` it claims to.
                     return Err(StoreError::LeaseHeld {
                         run: key,
                         owner: held_by,
@@ -901,6 +1015,52 @@ impl JournalStore for PostgresStore {
         .map_err(|e| be(&e))?;
 
         tx.commit().await.map_err(|e| be(&e))?;
+        Ok(Lease {
+            run,
+            owner: owner.to_owned(),
+            epoch,
+        })
+    }
+
+    async fn renew(
+        &self,
+        run: RunId,
+        owner: &str,
+        epoch: Epoch,
+        ttl: Duration,
+    ) -> Result<Lease, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let now = now_secs();
+        let expires = now + ttl.as_secs().max(1);
+        // One statement, so the check and the write cannot be raced: the row
+        // is extended only where it is still held, unexpired and unreleased by
+        // exactly `(owner, epoch)`. A released row blanks the owner and fails
+        // the ownership predicate; an expired row fails the expiry one,
+        // because whoever claims it next takes epoch + 1 and a renewal that
+        // got in first would resurrect the fenced past. Zero rows updated
+        // means the lease is lost, and a renewal never claims.
+        let n = client
+            .execute(
+                "UPDATE run_lease SET expires_at = $5
+                  WHERE tenant = $1 AND run_id = $2 AND owner = $3 AND epoch = $4
+                    AND expires_at > $6",
+                &[
+                    &self.tenant_name(),
+                    &run.to_string(),
+                    &owner.to_owned(),
+                    &epoch.cast_signed(),
+                    &expires.cast_signed(),
+                    &now.cast_signed(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if n == 0 {
+            return Err(StoreError::LeaseNotHeld {
+                run: run.to_string(),
+                epoch,
+            });
+        }
         Ok(Lease {
             run,
             owner: owner.to_owned(),
@@ -962,33 +1122,58 @@ impl JournalStore for PostgresStore {
         Ok(())
     }
 
-    async fn seal(&self, run: RunId, _epoch: Epoch, outcome: &str) -> Result<Digest, StoreError> {
+    async fn seal(&self, run: RunId, epoch: Epoch, outcome: &str) -> Result<Digest, StoreError> {
+        // One transaction, fenced, mirroring the embedded store. This backend
+        // exists for the topology where two instances race, and a seal is the
+        // write that freezes a chain forever — so it must be arbitrated like
+        // every other write. It used to ignore its epoch and read the head on
+        // a separate connection, which let a fenced zombie seal a run its
+        // replacement was still extending, freezing the Merkle leaf at a head
+        // the true history had already moved past.
+        let mut client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+
+        // The fence takes the lease row lock, so a concurrent append on the
+        // same run either waits for this transaction or is fenced by it — the
+        // head read below cannot go stale between the read and the insert.
+        self.fence(&tx, run, epoch).await?;
+
         // The conclusion is already *in* the chain — the executor appends
-        // `RunSealed` before calling this — so sealing reports the terminal hash
-        // rather than writing a second one. Tamper detection therefore covers
-        // how the run ended, which it would not if the outcome lived in a side
-        // table.
-        let head = self.head(run).await?.hash;
+        // `RunSealed` before calling this — so sealing reports the terminal
+        // hash rather than writing a second one. Tamper detection therefore
+        // covers how the run ended, which it would not if the outcome lived in
+        // a side table.
+        let head_row = tx
+            .query_opt(
+                "SELECT hash FROM journal
+                  WHERE tenant = $1 AND run_id = $2 ORDER BY seq DESC LIMIT 1",
+                &[&self.tenant_name(), &run.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let head = match head_row {
+            Some(row) => digest_from(&row.get::<_, Vec<u8>>(0))?,
+            None => Digest::ZERO,
+        };
 
         // Enter the log. `DO NOTHING` keeps a repeated seal idempotent — a run
         // that seals twice must not take two positions, or the log's size stops
         // matching the number of runs it commits to.
-        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
-        client
-            .execute(
-                "INSERT INTO run_seal (tenant, run_id, chain_head, log_index, sealed_at, outcome)
-                 VALUES ($1, $2, $3, nextval('run_log_position'), $4, $5)
-                 ON CONFLICT (tenant, run_id) DO NOTHING",
-                &[
-                    &self.tenant_name(),
-                    &run.to_string(),
-                    &head.as_bytes().to_vec(),
-                    &now_secs().cast_signed(),
-                    &outcome,
-                ],
-            )
-            .await
-            .map_err(|e| be(&e))?;
+        tx.execute(
+            "INSERT INTO run_seal (tenant, run_id, chain_head, log_index, sealed_at, outcome)
+             VALUES ($1, $2, $3, nextval('run_log_position'), $4, $5)
+             ON CONFLICT (tenant, run_id) DO NOTHING",
+            &[
+                &self.tenant_name(),
+                &run.to_string(),
+                &head.as_bytes().to_vec(),
+                &now_secs().cast_signed(),
+                &outcome,
+            ],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+        tx.commit().await.map_err(|e| be(&e))?;
 
         Ok(head)
     }
@@ -996,7 +1181,7 @@ impl JournalStore for PostgresStore {
     async fn checkpoint(&self) -> Result<crate::journal::Checkpoint, StoreError> {
         let leaves = self.log_leaves().await?;
         Ok(crate::journal::Checkpoint {
-            origin: self.origin.clone(),
+            origin: self.log_origin(),
             size: leaves.len() as u64,
             root: crate::core::merkle::root(&leaves),
         })

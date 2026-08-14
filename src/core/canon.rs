@@ -64,31 +64,30 @@ use serde_json::Value;
 
 /// Which canonicalization rule this build implements.
 ///
-/// **1** was UTF-8 byte ordering of object keys. **2** is RFC 8785's UTF-16
-/// code-unit ordering, adopted so a signed Agent Card verifies against the
-/// standard rather than only against this crate. **3** adds RFC 8785's
-/// ECMAScript number formatting for doubles — `4.5` stays `4.5` but `1e30`
-/// becomes `1e+30` and `100.0` becomes `100` — completing JCS for everything a
-/// `Value` can hold except integers beyond ±2⁵³, which stay exact for the
-/// reason the module docs give.
+/// **1** is RFC 8785: UTF-16 code-unit ordering of object keys (so a signed
+/// Agent Card verifies against the standard rather than only against this
+/// crate) and ECMAScript number formatting for doubles — `4.5` stays `4.5`
+/// but `1e30` becomes `1e+30` and `100.0` becomes `100` — completing JCS for
+/// everything a `Value` can hold except integers beyond ±2⁵³, which stay
+/// exact for the reason the module docs give.
 ///
 /// # Why a digest is not enough on its own
 ///
-/// The rule change moved every derived digest — effect keys, manifest digests,
-/// plan digests — and nothing on the record said which rule produced them. The
-/// journal chain was never at risk, because it hashes the bytes it stored rather
-/// than re-canonicalizing them. The exposure is **replay**: a run recorded under
-/// rule 1 and replayed by a build implementing rule 2 recomputes different
-/// effect keys and is quarantined as *non-determinism* — a healthy run, reported
-/// as the most serious conclusion this runtime reaches, with nothing on the
-/// record to say the rule moved underneath it.
+/// A rule change moves every derived digest — effect keys, manifest digests,
+/// plan digests — and nothing on the record would say which rule produced
+/// them. The journal chain is never at risk, because it hashes the bytes it
+/// stored rather than re-canonicalizing them. The exposure is **replay**: a
+/// run recorded under one rule and replayed by a build implementing another
+/// recomputes different effect keys and is quarantined as *non-determinism* —
+/// a healthy run, reported as the most serious conclusion this runtime
+/// reaches, with nothing on the record to say the rule moved underneath it.
 ///
 /// So the version is journaled at admission and replay compares it first. A run
 /// written under another rule is **unverifiable by this build**, which is a
 /// different sentence from *this run diverged* and the one the evidence
 /// supports. That distinction is the whole point: an audit must report unknown
 /// scope as prominently as corruption, and never as corruption.
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 1;
 
 /// Serialize to canonical bytes.
 ///

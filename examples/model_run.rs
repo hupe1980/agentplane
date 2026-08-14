@@ -58,9 +58,12 @@ fn schema() -> Value {
 }
 
 /// Reads a ticket, asks a model to triage it.
+///
+/// The field is the *driver interface*, not the fake: a skill that names the
+/// concrete provider type couples itself to one deployment's wiring.
 #[derive(Debug)]
 struct Triage {
-    provider: Arc<FakeProvider>,
+    provider: Arc<dyn ModelProvider>,
 }
 
 #[async_trait::async_trait]
@@ -74,15 +77,17 @@ impl Skill for Triage {
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
+        let provider = Arc::clone(&self.provider);
         let prompt = input.map(|input| json!({ "task": "triage this ticket", "ticket": input }));
-        let call = ModelCall::new(
-            Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
-            model(),
-            prompt.peek().clone(),
-        )
-        .expecting(schema());
-
-        let completion = cx.sink(call, &prompt).await?;
+        // `sink_with` hands the labelled value to the effect and the gates in
+        // one motion: the closure receives the inner value, so the bytes the
+        // egress ceiling checks and the bytes the provider is sent cannot be
+        // two versions of one prompt.
+        let completion = cx
+            .sink_with(&prompt, |value| {
+                ModelCall::new(provider, model(), value).expecting(schema())
+            })
+            .await?;
 
         // Whatever came back is a plausible string produced from a context
         // window that held the ticket, and the ticket arrived from outside. The
@@ -105,7 +110,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = Runtime::builder(Arc::clone(&store))
         .owner("example")
         .skill(Triage {
-            provider: Arc::clone(&provider),
+            // Coerces to `Arc<dyn ModelProvider>` at the field: the fake is a
+            // detail of this example's wiring, not of the skill.
+            provider: provider.clone(),
         })
         .build();
 
@@ -160,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .owner("example")
         .budget(Budget::unlimited().tokens(300))
         .skill(Retries {
-            provider: Arc::clone(&provider),
+            provider: provider.clone(),
         })
         .build();
 
@@ -199,7 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// would pass with the metering removed.
 #[derive(Debug)]
 struct Retries {
-    provider: Arc<FakeProvider>,
+    provider: Arc<dyn ModelProvider>,
 }
 
 #[async_trait::async_trait]
@@ -213,12 +220,9 @@ impl Skill for Retries {
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
-        let ask = |prompt: Value| {
-            ModelCall::new(
-                Arc::clone(&self.provider) as Arc<dyn ModelProvider>,
-                model(),
-                prompt,
-            )
+        let provider = Arc::clone(&self.provider);
+        let ask = |provider: Arc<dyn ModelProvider>, prompt: Value| {
+            ModelCall::new(provider, model(), prompt)
         };
 
         // Swallowed, as an agent rewording its prompt would.
@@ -226,13 +230,13 @@ impl Skill for Retries {
             .clone()
             .map(|ticket| json!({ "task": "triage", "ticket": ticket }));
         let _ = cx
-            .sink(ask(first_prompt.peek().clone()), &first_prompt)
+            .sink_with(&first_prompt, |value| ask(Arc::clone(&provider), value))
             .await;
 
         let second_prompt =
             input.map(|ticket| json!({ "task": "triage, briefly", "ticket": ticket }));
         let completion = cx
-            .sink(ask(second_prompt.peek().clone()), &second_prompt)
+            .sink_with(&second_prompt, |value| ask(provider, value))
             .await?;
         Ok(Outcome::done(completion.map(|c| json!({ "text": c.text }))))
     }

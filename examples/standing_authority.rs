@@ -72,8 +72,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .await?;
 
-    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .authorities(Arc::clone(&store) as Arc<dyn AuthorityStore>)
+    let journal: Arc<dyn JournalStore> = store.clone();
+    let authorities: Arc<dyn AuthorityStore> = store.clone();
+    let runtime = Runtime::builder(journal)
+        .authorities(authorities)
         .skill(Purchase)
         .build();
 

@@ -164,6 +164,16 @@ impl JournalStore for StagedAtomic {
         self.inner.acquire(run, owner, ttl).await
     }
 
+    async fn renew(
+        &self,
+        run: RunId,
+        owner: &str,
+        epoch: Epoch,
+        ttl: std::time::Duration,
+    ) -> Result<crate::journal::Lease, StoreError> {
+        self.inner.renew(run, owner, epoch, ttl).await
+    }
+
     async fn release_lease(&self, run: RunId, epoch: Epoch) -> Result<(), StoreError> {
         self.inner.release_lease(run, epoch).await
     }

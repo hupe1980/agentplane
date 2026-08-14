@@ -1033,6 +1033,11 @@ async fn a_peers_message_is_untrusted_and_carries_its_sender() {
         "the input's provenance does not name the peer that sent it, so a \
          protected field cannot say which counterparty it trusts: {sources:?}"
     );
+    assert!(
+        sources.iter().any(|s| s == "peer:acme-peer"),
+        "the provenance is not the one documented spelling `peer:{{actor}}` — \
+         a sink field naming the counterparty would miss it: {sources:?}"
+    );
     assert_eq!(
         input["text"], "please settle INV-9",
         "the message text did not reach the skill: {input:#}"
@@ -1393,6 +1398,73 @@ async fn list_tasks_filters_context_and_uses_opaque_cursor_pages() {
     );
 }
 
+/// `includeArtifacts` is a metered read, and the meter says its own name.
+///
+/// Each completed task's artifacts are a full strict replay, and a page holds
+/// up to a hundred tasks — so the replays per request are budgeted, a task
+/// past the budget comes back with its omission **marked** in `Task.metadata`
+/// (a bounded result must not be shaped like a complete one),
+/// and sealed runs already replayed are served from cache so repeated listings
+/// converge on complete instead of paying the same replays forever.
+#[tokio::test]
+async fn include_artifacts_is_budgeted_marked_and_cached() {
+    let f = fixture();
+    let server = A2aServer::new(
+        f.rt.clone(),
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &f.manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("the fixture wires a policy engine")
+    .artifact_replay_budget(1);
+    let router = server.router();
+
+    for n in 0..3 {
+        send(
+            &router,
+            rpc(
+                "SendMessage",
+                &json!({"message": {
+                    "messageId": format!("budget-{n}"),
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "go"}]
+                }}),
+                Some("peer-a"),
+            ),
+        )
+        .await;
+    }
+
+    let list = json!({"includeArtifacts": true});
+    let omitted_key = agentplane::api::a2a::ARTIFACTS_OMITTED_KEY;
+    let count = |body: &Value| {
+        let tasks = body["result"]["tasks"].as_array().expect("tasks").clone();
+        assert_eq!(tasks.len(), 3, "{body:#}");
+        let with = tasks.iter().filter(|t| t["artifacts"].is_array()).count();
+        let marked = tasks
+            .iter()
+            .filter(|t| t["metadata"][omitted_key] == json!(true))
+            .count();
+        (with, marked)
+    };
+
+    // One replay allowed: one task complete, two marked — never two silent
+    // absences shaped like tasks without artifacts.
+    let (_, first) = send(&router, rpc("ListTasks", &list, Some("peer-a"))).await;
+    assert_eq!(count(&first), (1, 2), "{first:#}");
+
+    // The replayed run is cached, so the same request converges: one more
+    // replay, one fewer mark.
+    let (_, second) = send(&router, rpc("ListTasks", &list, Some("peer-a"))).await;
+    assert_eq!(count(&second), (2, 1), "{second:#}");
+
+    // And the third finishes the job — cache hits are free, so a budget of one
+    // still reaches a complete listing.
+    let (_, third) = send(&router, rpc("ListTasks", &list, Some("peer-a"))).await;
+    assert_eq!(count(&third), (3, 0), "{third:#}");
+}
+
 #[tokio::test]
 async fn list_tasks_omits_tasks_the_caller_cannot_read() {
     let f = fixture();
@@ -1707,6 +1779,106 @@ async fn cancelling_a_finished_task_is_not_cancelable() {
         "cancelling a completed run reported something other than \
          not-cancelable: {body:#}"
     );
+}
+
+/// One counterparty, one provenance spelling: `peer:{actor}`, on every door.
+///
+/// Three spellings used to exist for the same peer — bare `{actor}` on
+/// operator-API events, `a2a:peer:{actor}` on A2A task continuations,
+/// `peer:{actor}` on A2A message inputs. Nothing downstream distinguishes
+/// transports: an event's `source` becomes the delivered value's provenance
+/// exactly as a message input's `SourceId` does, so a protected sink field
+/// naming the counterparty it accepts would match or miss depending on which
+/// door the value came through. This pins the unified spelling on both A2A
+/// doors; the operator API routes through the same helper.
+#[tokio::test]
+async fn a_peers_provenance_is_spelled_the_same_on_every_door() {
+    let f = continuation_fixture();
+    let router = f.router();
+    let (_, first) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("begin")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = first["result"]["task"]["id"].as_str().unwrap().to_owned();
+
+    // Continue the task, so the peer's message travels the *event* door.
+    let continuation = json!({"message": {
+        "messageId": "m-followup",
+        "taskId": task,
+        "role": "ROLE_USER",
+        "parts": [{"data": {"approved": true}, "mediaType": "application/json"}]
+    }});
+    let (_, completed) = send(&router, rpc("SendMessage", &continuation, Some("peer-a"))).await;
+    assert_eq!(
+        completed["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{completed:#}"
+    );
+
+    let run = RunId::parse(&task).unwrap();
+    let records = f.store.read(run, 1).await.expect("journal");
+    let event_source = records
+        .iter()
+        .find_map(|record| match record.kind() {
+            agentplane::journal::RecordKind::EffectDone {
+                source: Some(source),
+                ..
+            } => Some(source.clone()),
+            _ => None,
+        })
+        .expect("the awaited event recorded its sender");
+    assert_eq!(
+        event_source, "peer:peer-a",
+        "the event door spells the peer's provenance differently from the \
+         message door, so a sink field naming the counterparty matches on one \
+         transport and misses on the other"
+    );
+}
+
+/// The cancel response is a `Task`, and it carries the task's `contextId`.
+///
+/// Every other path resolves the context from the run's records; this one
+/// hard-coded it absent, so the one response a canceling caller holds was the
+/// one task object it could not correlate or continue — A2A 1.0 puts
+/// `contextId` on every task, not on every task except this reply.
+#[tokio::test]
+async fn cancelling_a_task_answers_with_its_context_id() {
+    let f = continuation_fixture();
+    let router = f.router();
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("begin")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        sent["result"]["task"]["status"]["state"], "TASK_STATE_INPUT_REQUIRED",
+        "{sent:#}"
+    );
+    let id = sent["result"]["task"]["id"].as_str().unwrap().to_owned();
+    let context = sent["result"]["task"]["contextId"]
+        .as_str()
+        .expect("every task carries a contextId")
+        .to_owned();
+
+    let (_, body) = send(
+        &router,
+        rpc("CancelTask", &json!({"id": id}), Some("peer-a")),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["contextId"].as_str(),
+        Some(context.as_str()),
+        "the cancel response dropped the contextId every other path resolves: {body:#}"
+    );
+    assert_eq!(body["result"]["id"], json!(id));
 }
 
 /// An unknown task id is not found — and so is an unparseable one.

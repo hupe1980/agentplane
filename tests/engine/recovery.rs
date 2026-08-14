@@ -478,14 +478,28 @@ async fn a_live_lease_blocks_takeover_and_says_so_precisely() {
         other => panic!("expected a lease conflict, not a fencing error: {other:?}"),
     }
 
-    // The owner can always renew without bumping its own epoch.
+    // The owner renews through `renew`, which keeps the epoch — and never
+    // through `acquire`, which is a pure claim and refuses even the owner:
+    // handing a second entry point on the same instance the live epoch is two
+    // executors fencing cannot tell apart.
     let renewed = store
-        .acquire(run, "instance-a", std::time::Duration::from_mins(1))
+        .renew(run, "instance-a", 1, std::time::Duration::from_mins(1))
         .await
         .unwrap();
     assert_eq!(
         renewed.epoch, 1,
         "renewal must not advance the fencing epoch"
+    );
+    assert!(
+        matches!(
+            store
+                .acquire(run, "instance-a", std::time::Duration::from_mins(1))
+                .await,
+            Err(StoreError::LeaseHeld { .. })
+        ),
+        "acquire renewed the caller's own held lease — a claim and a renewal \
+         are different operations, and conflating them is how a heartbeat \
+         resurrects a released lease"
     );
 }
 
@@ -569,9 +583,11 @@ async fn an_orphaned_mutating_effect_is_quarantined_not_retried() {
         .await
         .unwrap();
 
-    // Same instance identity as the lease above: this is one process restarting
-    // after a crash, which is the realistic recovery path. A *different*
-    // instance would have to wait out the lease first.
+    // The crashed process's lease is claimable, not renewable — `acquire` is
+    // a pure claim, so even the same instance waits out (or, here, releases)
+    // the lease it lost. What matters to this test is what the *resume* does
+    // with the orphaned effect, not who performs it.
+    store.release_lease(run, lease.epoch).await.unwrap();
     let calls = tally();
     let no_crash = Arc::new(AtomicUsize::new(NO_CRASH));
     let rt = Runtime::builder(store.clone())

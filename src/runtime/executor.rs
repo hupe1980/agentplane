@@ -15,9 +15,9 @@ use serde_json::Value;
 
 use crate::case::{CaseStore, EventStore, TaskStore, TimerStore};
 use crate::core::{
-    ArgSource, Budget, Calendar, Capability, CorrelationKey, Delivery, Digest, InboundEvent,
-    Ledger, Outcome, Phase, PlanIR, PlanNode, PolicyBundleIdentity, RunId, RuntimeError, Skill,
-    Spend, StepId, Tainted, WallClock,
+    ArgSource, Budget, Calendar, Capability, CorrelationKey, Delivery, Digest, EffectDescriptor,
+    InboundEvent, Ledger, Outcome, Phase, PlanIR, PlanNode, PolicyBundleIdentity, RunId,
+    RuntimeError, Skill, SkillDescriptor, Spend, StepId, Tainted, WallClock,
 };
 use crate::journal::{Append, JournalStore, Record, RecordKind, ReplayCursor, StepCursor};
 use crate::runtime::BuildError;
@@ -76,6 +76,73 @@ pub struct RunOutcome {
     /// it had been dropped at the boundary.
     pub output: Option<Tainted<Value>>,
 }
+
+impl RunOutcome {
+    /// The output if the run succeeded, or a [`RunFailure`] saying why not.
+    ///
+    /// Every caller that acts on a run's answer asks the same two questions —
+    /// did it work, and what did it say — and pattern-matching
+    /// [`status`](Self::status) to learn the first is how the second gets read
+    /// off a run that quarantined. This folds the pair into one `?`:
+    ///
+    /// ```ignore
+    /// let answer = runtime.run("greet", input).await?.success()?;
+    /// ```
+    ///
+    /// `status` stays public for the callers whose branches genuinely differ —
+    /// a suspended run is not a failed one, and an operator surface treats
+    /// them differently. This is for the caller to whom anything short of an
+    /// answer is an error.
+    ///
+    /// # Errors
+    ///
+    /// [`RunFailure`] for every non-succeeded status, carrying the run id and
+    /// the status itself.
+    pub fn success(self) -> Result<Tainted<Value>, RunFailure> {
+        match self.status {
+            // A succeeded run's answer; `Null` for the degenerate run that
+            // finished without producing one, which is still a success.
+            RunStatus::Succeeded => {
+                Ok(self.output.unwrap_or_else(|| Tainted::trusted(Value::Null)))
+            }
+            status => Err(RunFailure {
+                run_id: self.run_id,
+                status,
+            }),
+        }
+    }
+}
+
+/// A run that stopped short of an answer, as an error a caller can `?`.
+///
+/// Carries the [`RunStatus`] whole rather than a flattened string, so a caller
+/// that started with [`RunOutcome::success`] and later needs to tell a
+/// suspension from a quarantine can match on [`status`](Self::status) without
+/// re-plumbing the call site.
+#[derive(Debug, Clone)]
+pub struct RunFailure {
+    pub run_id: RunId,
+    pub status: RunStatus,
+}
+
+impl std::fmt::Display for RunFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "run {} did not succeed: ", self.run_id)?;
+        match &self.status {
+            RunStatus::Succeeded => unreachable!("a success is not a failure"),
+            RunStatus::Failed(reason) => write!(f, "it failed — {reason}"),
+            RunStatus::Suspended(reason) => write!(f, "it is suspended — {reason:?}"),
+            RunStatus::Exhausted(limit) => write!(f, "a budget stopped it — {limit}"),
+            RunStatus::Quarantined(reason) => write!(f, "it is quarantined — {reason}"),
+            RunStatus::Replanning(reason) => write!(f, "it asked to replan — {reason}"),
+            RunStatus::Cancelled { actor, reason } => {
+                write!(f, "{actor} cancelled it — {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RunFailure {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunStatus {
@@ -273,6 +340,14 @@ pub struct Runtime {
     /// registry resolution, and an absent entry means nobody vouched.
     #[cfg(feature = "manifest")]
     published_by: HashMap<String, crate::core::KeyId>,
+    /// Model drivers by the name a manifest calls them.
+    ///
+    /// Kept after build — not only consumed by it — so a *hand-written* skill
+    /// can reach the driver its manifest's model role names through
+    /// [`StepCtx::complete`], instead of smuggling an `Arc<dyn ModelProvider>`
+    /// field past the declaration.
+    #[cfg(feature = "manifest")]
+    providers: HashMap<String, Arc<dyn crate::model::ModelProvider>>,
     owner: String,
     /// How long a run's lease lasts, and how long a crashed owner's runs stay
     /// unclaimable.
@@ -324,7 +399,48 @@ pub struct Runtime {
     outbox: Option<Arc<crate::push::Outbox>>,
 }
 
+/// A backend that implements every store a full plane runs on.
+///
+/// Blanket-implemented, so it is a *description* rather than an obligation:
+/// any type providing the six store traits — journal, cases, tasks, events,
+/// timers, memory — is a `FullBackend` without saying so, and both shipped
+/// backends are. What it buys is [`Runtime::builder_on`], where the
+/// alternative was six casts of one `Arc` that every deployment spelled out
+/// and none could get differently.
+pub trait FullBackend:
+    JournalStore + CaseStore + TaskStore + EventStore + TimerStore + crate::memory::MemoryStore
+{
+}
+
+impl<B> FullBackend for B where
+    B: JournalStore + CaseStore + TaskStore + EventStore + TimerStore + crate::memory::MemoryStore
+{
+}
+
 impl Runtime {
+    /// A builder with the whole case layer wired to one backend.
+    ///
+    /// The one-call form of the six-cast litany: journal, cases, tasks,
+    /// events, timers and memory all backed by `store`, which is what a
+    /// deployment on a single `RedbStore` or `PostgresStore` means anyway. The
+    /// à-la-carte methods remain — [`cases`](RuntimeBuilder::cases) and
+    /// friends override an individual store afterwards, and
+    /// [`builder`](Self::builder) still starts from the journal alone for a
+    /// plane that wants nothing else.
+    ///
+    /// Blob storage is deliberately not included: bytes routinely live in a
+    /// different system than rows, so [`blobs`](RuntimeBuilder::blobs) stays
+    /// an explicit decision.
+    #[must_use]
+    pub fn builder_on<B: FullBackend + 'static>(store: Arc<B>) -> RuntimeBuilder {
+        Self::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+            .tasks(Arc::clone(&store) as Arc<dyn TaskStore>)
+            .events(Arc::clone(&store) as Arc<dyn EventStore>)
+            .timers(Arc::clone(&store) as Arc<dyn TimerStore>)
+            .memory(store as Arc<dyn crate::memory::MemoryStore>)
+    }
+
     #[must_use]
     pub fn builder(store: Arc<dyn JournalStore>) -> RuntimeBuilder {
         RuntimeBuilder {
@@ -365,6 +481,15 @@ impl Runtime {
             #[cfg(feature = "push")]
             outbox: None,
         }
+    }
+
+    /// The driver registered under a manifest's name for it, if any.
+    #[cfg(feature = "manifest")]
+    pub(crate) fn model_provider(
+        &self,
+        name: &str,
+    ) -> Option<Arc<dyn crate::model::ModelProvider>> {
+        self.providers.get(name).map(Arc::clone)
     }
 
     /// The case store, if this runtime has one.
@@ -506,8 +631,23 @@ impl Runtime {
         // Resuming a run that has already concluded is a no-op inside `replay`,
         // which reads the recorded status back rather than re-executing — so
         // there is no "is it finished?" check to race with here.
+        //
+        // Driven **only when the run is genuinely idle**: `replay` claims the
+        // lease before it reads, and a `LeaseHeld` refusal means somebody is
+        // executing the run right now — here or on another instance. That is
+        // not a failure of this call. The request is already durable, and the
+        // live owner checks for it at every step boundary (the cancellation
+        // read at the top of the executor's ready-set loop), so the stop
+        // arrives without a second executor ever touching the run. Resuming
+        // anyway is what this used to do, and on the owner's own instance the
+        // old lease semantics handed the resume the *same epoch* the live
+        // execution was writing under — two executors on one chain that
+        // fencing, by construction, could not tell apart.
         if fresh {
-            self.replay(run, Mode::Resume).await?;
+            match self.replay(run, Mode::Resume).await {
+                Ok(_) | Err(RuntimeError::LeaseHeld { .. }) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(fresh)
     }
@@ -781,15 +921,21 @@ impl Runtime {
         Heartbeat(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(period).await;
-                match store.acquire(run, &owner, ttl).await {
-                    // Still ours, at the epoch we are writing under.
-                    Ok(lease) if lease.epoch == epoch => {}
-                    // Somebody fenced us, or we renewed late enough that our own
-                    // renewal bumped the epoch — which fences us just the same.
-                    // Stop either way: the run's next append will fail, which is
-                    // the correct outcome, and renewing now would only prolong a
-                    // run that is no longer allowed to write.
-                    _ => return,
+                // `renew`, never `acquire`. A renewal extends only a lease
+                // still held by exactly this `(owner, epoch)`; it cannot
+                // claim. That distinction is load-bearing here: this task
+                // races the run's own conclusion, and an acquire arriving
+                // just after `conclude` released the lease would re-take it —
+                // a live, never-released lease over a concluded run, which
+                // the recovery sweep then "recovers" forever.
+                //
+                // A failed renewal means the lease was lost — released by the
+                // conclusion, lapsed and reclaimed, or taken over. Stop
+                // either way: the run's next append will be fenced, which is
+                // the correct outcome, and claiming now would only resurrect
+                // ownership this instance no longer has.
+                if store.renew(run, &owner, epoch, ttl).await.is_err() {
+                    return;
                 }
             }
         }))
@@ -1020,12 +1166,7 @@ impl Runtime {
         // caller's mistake and must be an error, not a run that exists and
         // immediately fails.
         let skill = self.resolve(target)?;
-        let capability = skill
-            .descriptor()
-            .provides
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| Capability::new(skill.descriptor().name));
+        let capability = first_capability(&skill.descriptor());
 
         let run = RunId::generate();
         let admitted = self
@@ -1175,12 +1316,7 @@ impl Runtime {
     ) -> Result<RunOutcome, RuntimeError> {
         // A bare target is the degenerate plan: one node, terminal.
         let skill = self.resolve(target)?;
-        let capability = skill
-            .descriptor()
-            .provides
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| Capability::new(skill.descriptor().name));
+        let capability = first_capability(&skill.descriptor());
         self.admit_plan(PlanIR::single(capability), input, case)
             .await
     }
@@ -1402,6 +1538,48 @@ impl Runtime {
         // that its next request has to step over.
         self.check_quota(run).await?;
 
+        // From here a concurrency slot is reserved, and every error path below
+        // must give it back. `check_quota`'s own refusals reserve nothing; an
+        // error *after* the reservation — a lease that cannot be taken, a case
+        // store that refuses, an append that fails — used to leak the slot
+        // permanently, so a tenant whose admissions failed transiently was
+        // throttled down to zero by its own error handling, one failure at a
+        // time. Best-effort, like `settle_quota`: the slot row names the run,
+        // so one that survives an unreachable store is attributable rather
+        // than a counter that silently drifted.
+        let out = self
+            .admit_reserved(run, plan, input, case, agent, governed_by)
+            .await;
+        if out.is_err()
+            && let Some(quotas) = self.quotas.as_ref()
+            && let Err(e) = quotas.release(run).await
+        {
+            tracing::debug!(%run, error = %e, "could not release the quota slot of a failed admission");
+        }
+        out
+    }
+
+    /// Admission past the quota reservation: the lease, the records, the case
+    /// binding, the outbox.
+    ///
+    /// Every error path hands the lease back. A lease left standing over a
+    /// failed admission is not idle bookkeeping: it expires unreleased, which
+    /// is the exact signature the recovery sweep reads as "an instance died
+    /// holding this run" — so a half-admitted run (records appended, outbox
+    /// registration failed) would be *executed* by the sweeper a TTL later,
+    /// having never been admitted. The one error that concludes rather than
+    /// merely unwinding is the post-append one, where records already exist:
+    /// the run is concluded `failed` in its own chain first, so nothing later
+    /// reads an open journal as work in progress.
+    async fn admit_reserved(
+        &self,
+        run: RunId,
+        plan: PlanIR,
+        input: Tainted<Value>,
+        case: Option<CaseBinding>,
+        agent: String,
+        governed_by: Option<crate::journal::AgentIdentity>,
+    ) -> Result<Admitted, RuntimeError> {
         // Admission: take ownership, then record what we are about to do —
         // before doing any of it.
         let lease = self
@@ -1410,8 +1588,34 @@ impl Runtime {
             .await
             .map_err(RuntimeError::from_store)?;
 
+        let out = self
+            .admit_under_lease(run, &lease, plan, input, case, &agent, governed_by)
+            .await;
+        if out.is_err()
+            && let Err(e) = self.store.release_lease(run, lease.epoch).await
+        {
+            tracing::debug!(
+                %run,
+                error = %e,
+                "could not release the lease of a failed admission; it will expire on its own"
+            );
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn admit_under_lease(
+        &self,
+        run: RunId,
+        lease: &crate::journal::Lease,
+        plan: PlanIR,
+        input: Tainted<Value>,
+        case: Option<CaseBinding>,
+        agent: &str,
+        governed_by: Option<crate::journal::AgentIdentity>,
+    ) -> Result<Admitted, RuntimeError> {
         let mut records = vec![
-            Append::new(run, self.admission(&agent, governed_by, &input)),
+            Append::new(run, self.admission(agent, governed_by, &input)),
             // From here the plan is an authorization graph: compiled from
             // trusted input, frozen before anything untrusted was read, and
             // recorded so the journal that follows can be checked against it.
@@ -1539,17 +1743,56 @@ impl Runtime {
         //
         // After the append rather than before: the cursor starts at sequence
         // one, so a registration written for a run whose admission then failed
-        // would sit against an empty journal forever.
+        // would sit against an empty journal forever. The price of that order
+        // is paid here instead: the admission records above are already
+        // durable, so a registration failure must **conclude** the run rather
+        // than merely return — an open journal under a lease that then lapses
+        // is exactly what the recovery sweep reads as a crashed run, and it
+        // would execute a run whose admission failed. Concluded `failed`, in
+        // the chain, with the reason beside it; the caller's cleanup then
+        // releases the lease.
         #[cfg(feature = "push")]
-        if let Some(outbox) = &self.outbox {
-            outbox.open(run).await.map_err(RuntimeError::from_store)?;
+        if let Some(outbox) = &self.outbox
+            && let Err(open_failed) = outbox.open(run).await
+        {
+            let head = self
+                .store
+                .head(run)
+                .await
+                .map_err(RuntimeError::from_store)?;
+            self.store
+                .append(
+                    lease.epoch,
+                    vec![
+                        Append::new(
+                            run,
+                            RecordKind::Note {
+                                text: format!(
+                                    "admission failed after its records were written: the \
+                                     outbox registration was refused ({open_failed}) — the \
+                                     run is concluded failed and was never executed"
+                                ),
+                            },
+                        ),
+                        Append::new(
+                            run,
+                            RecordKind::RunSealed {
+                                outcome: RunStatus::Failed(String::new()).as_str().to_owned(),
+                                chain_head: head.hash,
+                            },
+                        ),
+                    ],
+                )
+                .await
+                .map_err(RuntimeError::from_store)?;
+            return Err(RuntimeError::from_store(open_failed));
         }
 
         Ok(Admitted {
             run,
             epoch: lease.epoch,
-            budget: self.budget_for(&agent),
-            agent,
+            budget: self.budget_for(agent),
+            agent: agent.to_owned(),
             plan,
             input,
             case: case_ctx,
@@ -1574,6 +1817,8 @@ impl Runtime {
                 agent: a.agent,
                 refusal: None,
                 successors: Vec::new(),
+                started: BTreeSet::new(),
+                finished: BTreeSet::new(),
             },
             &mut cursor,
         )
@@ -1630,6 +1875,54 @@ impl Runtime {
     /// journal. That is the whole point — a resumed run does not re-issue the
     /// invoice it already issued.
     pub async fn replay(&self, run: RunId, mode: Mode) -> Result<RunOutcome, RuntimeError> {
+        // ── Ownership before observation ───────────────────────────────────
+        //
+        // Resume writes, so it takes the lease *before* it reads. The old
+        // order — snapshot the records, then acquire — left a window in which
+        // a live owner could append past the snapshot; the resume then
+        // replayed a prefix of the true history and continued live from a
+        // frontier that was not the frontier, re-deriving keys the owner had
+        // already written. Claiming first means the snapshot below is taken
+        // under this instance's own fence. Strict verifies and never writes,
+        // so it needs no lease — and must not take one, or every regression
+        // check would fence a run somebody may be legitimately running.
+        let lease = if mode == Mode::Resume {
+            Some(
+                self.store
+                    .acquire(run, &self.owner, self.lease_ttl)
+                    .await
+                    .map_err(RuntimeError::from_store)?,
+            )
+        } else {
+            None
+        };
+
+        let outcome = self.replay_under(run, mode, lease.as_ref()).await;
+
+        // Idempotent: a resume that reached execution already handed its lease
+        // back in `conclude`, and re-releasing the same epoch changes nothing.
+        // What this covers is every path that returns *before* executing — a
+        // closed run's no-op, a refused resume, an unverifiable chain — which
+        // would otherwise strand the freshly claimed lease until it expired
+        // and the recovery sweep "recovered" a run nobody was running.
+        if let Some(lease) = &lease
+            && let Err(e) = self.store.release_lease(run, lease.epoch).await
+        {
+            tracing::debug!(
+                %run,
+                error = %e,
+                "could not hand back the resume lease; it will expire on its own"
+            );
+        }
+        outcome
+    }
+
+    async fn replay_under(
+        &self,
+        run: RunId,
+        mode: Mode,
+        lease: Option<&crate::journal::Lease>,
+    ) -> Result<RunOutcome, RuntimeError> {
         let records = self
             .store
             .read(run, 1)
@@ -1692,6 +1985,28 @@ impl Runtime {
             });
         }
 
+        // A run whose journal holds compensation-phase records is not
+        // resumable once it stands concluded. The unwind *reversed* work — a
+        // hold released, a refund issued — and a resume that replays the
+        // forward history and continues would conclude success over a world
+        // where the work was undone: the journal would say "done" about
+        // effects its own later records say were taken back. Scoped to runs
+        // with a standing conclusion, deliberately: a run that is mid-unwind
+        // (a compensation suspended for four eyes, a crash between reversals)
+        // has concluded nothing, and resuming it is how the unwind finishes.
+        if mode == Mode::Resume
+            && let Some(outcome) = recorded_conclusion(&records)
+            && records
+                .iter()
+                .any(|r| matches!(r.kind(), RecordKind::StepCompensated { .. }))
+        {
+            return Err(RuntimeError::PlanContract(format!(
+                "run {run} concluded '{outcome}' after compensating completed steps — \
+                 the work was reversed, and resuming over undone work would report \
+                 success about a world where it no longer stands. Start a fresh run"
+            )));
+        }
+
         // Resume can dispatch new effects after it reaches the end of history.
         // They must be judged by the same complete bundle recorded at
         // admission, or one run would claim one policy while later effects were
@@ -1705,20 +2020,14 @@ impl Runtime {
 
         let mut cursor = ReplayCursor::from_records(&records);
 
-        // Strict verification must not write, and it does not: appends happen
-        // only past the end of history, which Strict mode refuses to reach.
-        let epoch = if mode == Mode::Strict {
-            records.last().map_or(1, |r| r.body.epoch)
-        } else {
-            self.store
-                .acquire(run, &self.owner, self.lease_ttl)
-                .await
-                .map_err(RuntimeError::from_store)?
-                .epoch
-        };
+        // Strict verification must not write, and it does not: it holds no
+        // lease, and appends happen only past the end of history, which
+        // Strict mode refuses to reach. Resume writes under the lease it
+        // claimed before reading.
+        let epoch = lease.map_or_else(|| records.last().map_or(1, |r| r.body.epoch), |l| l.epoch);
 
         // Strict verification never writes, so it holds no lease to renew.
-        let _heartbeat = (mode != Mode::Strict).then(|| self.heartbeat(run, epoch));
+        let _heartbeat = lease.map(|l| self.heartbeat(run, l.epoch));
         self.execute(
             Execution {
                 run,
@@ -1750,6 +2059,8 @@ impl Runtime {
                     })
                     .skip(1)
                     .collect(),
+                started: recorded_started_steps(&records),
+                finished: recorded_finished_steps(&records),
             },
             &mut cursor,
         )
@@ -1807,6 +2118,8 @@ impl Runtime {
             agent,
             refusal: recorded_refusal,
             successors,
+            started,
+            finished,
         } = plan;
         let writing = !matches!(mode, Mode::Strict);
         let case_id = case.as_ref().map(super::ctx::CaseContext::id);
@@ -1922,10 +2235,11 @@ impl Runtime {
                     &ledger,
                     mode,
                     recorded_refusal.as_ref(),
+                    cursor,
                     Journalling {
                         run,
                         epoch,
-                        writing: writing && recorded_refusal.is_none(),
+                        writing,
                         stamp: &stamp,
                     },
                 )
@@ -1947,10 +2261,58 @@ impl Runtime {
                         stamp: &stamp,
                         input: &input,
                         outputs: &outputs,
+                        started: &started,
+                        finished: &finished,
                     },
                 )
                 .await;
             let outcomes = collect(dispatched, &ready, cursor)?;
+
+            // ── Strict verification consumes everything, per step ──────────
+            //
+            // Divergence has two directions, and the ordered key comparison
+            // only sees one of them. A build that asks for a *different*
+            // effect fails at the mismatch; a build that asks for **fewer**
+            // effects than the record sails past the remainder and would
+            // report the step verified — a false confirmation about exactly
+            // the history a verification pass exists to check. So a step that
+            // finished with journaled effects still unread is the same
+            // quarantine-grade finding as a key mismatch, named by the first
+            // effect nothing requested.
+            if mode == Mode::Strict {
+                for &(step, ref status, _) in &outcomes {
+                    // A step that stopped — suspended, failed, refused — ended
+                    // where its history says it ended, and the stop itself is
+                    // the verified finding. Only a step that claims to have
+                    // *finished* owes a fully consumed slice.
+                    if !matches!(status, RunStatus::Succeeded) {
+                        continue;
+                    }
+                    if let Some(key) = cursor.unconsumed_in(step, Phase::Forward) {
+                        self.meter.count(metrics::DIVERGENCES, "");
+                        tracing::error!(
+                            target: telemetry::NONDETERMINISM,
+                            %step, %key, unconsumed = true,
+                        );
+                        return self
+                            .conclude(
+                                run,
+                                epoch,
+                                RunStatus::Quarantined(format!(
+                                    "strict replay verified less than the run recorded: \
+                                     step {step} finished with journaled effect {key} never \
+                                     requested — this build performs fewer effects than the \
+                                     recorded one"
+                                )),
+                                None,
+                                writing,
+                                case_id,
+                                Spend::default(),
+                            )
+                            .await;
+                    }
+                }
+            }
 
             // A step that stops for any reason stops the run: whatever remains
             // either depended on it, or will be dispatched when it resumes.
@@ -2008,6 +2370,38 @@ impl Runtime {
                     )
                     .await;
             }
+        }
+
+        // ── Strict verification consumes everything, at the end ────────────
+        //
+        // The per-batch check above covers steps this build dispatched; this
+        // covers the ones it never asked for at all — a step a changed guard
+        // now skips, a compensation slice nothing requested. Either way the
+        // record holds work this build cannot account for, and "verified" must
+        // not be the answer.
+        if mode == Mode::Strict
+            && let Some((step, phase, key)) = cursor.first_unconsumed()
+        {
+            self.meter.count(metrics::DIVERGENCES, "");
+            tracing::error!(
+                target: telemetry::NONDETERMINISM,
+                %step, %key, unconsumed = true,
+            );
+            return self
+                .conclude(
+                    run,
+                    epoch,
+                    RunStatus::Quarantined(format!(
+                        "strict replay verified less than the run recorded: journaled \
+                         effect {key} (step {step}, {phase:?} phase) was never requested \
+                         — this build performs fewer effects than the recorded one"
+                    )),
+                    None,
+                    writing,
+                    case_id,
+                    Spend::default(),
+                )
+                .await;
         }
 
         // Read into a value first. A `MutexGuard` built inline as an argument
@@ -2069,6 +2463,8 @@ impl Runtime {
                         ledger: batch.ledger,
                         writing: batch.writing,
                         stamp: batch.stamp,
+                        already_started: batch.started.contains(&step),
+                        already_finished: batch.finished.contains(&step),
                     },
                     batch.input,
                     batch.outputs,
@@ -2232,34 +2628,86 @@ impl Runtime {
 
     /// Decide which of a ready set may start, in ready order.
     ///
-    /// On replay the verdict comes from the journal instead of the ledger, for
-    /// the same reason an effect's does: a run replayed under a larger budget
-    /// stopped where it stopped. Recomputing it here made a step-limited run
-    /// replay as *succeeded* — a false audit result, not merely a confusing one.
+    /// Three regimes, one per mode, and the middle one is the subtle case:
+    ///
+    /// * **Strict** consumes recorded verdicts and recomputes none. A run
+    ///   replayed under a larger budget stopped where it stopped; recomputing
+    ///   made a step-limited run replay as *succeeded* — a false audit result.
+    /// * **Resume** takes each verdict from wherever the truth lives. A step
+    ///   with unconsumed history was admitted by the run that recorded it,
+    ///   and the history *is* the verdict. A step at the frontier is about to
+    ///   run **live**, and every live step is metered — keying this on "is
+    ///   the mode a replay" instead of "will this step dispatch live" let a
+    ///   resumed run cross `max_steps` unmetered for as long as it kept
+    ///   running. A *recorded refusal* is re-evaluated against the ledger now
+    ///   in force: exhaustion is a pause, and raising the ceiling and
+    ///   resuming is how it un-pauses.
+    /// * **Live** asks the ledger, which is the ordinary case.
     async fn admit_ready(
         &self,
         ready: &[StepId],
         ledger: &Arc<std::sync::Mutex<Ledger>>,
         mode: Mode,
         recorded: Option<&(StepId, String, String)>,
+        cursor: &ReplayCursor,
         journal: Journalling<'_>,
     ) -> Result<(Vec<StepId>, Option<crate::core::BudgetExceeded>), RuntimeError> {
         let mut admitted = Vec::new();
 
         for &step in ready {
-            let verdict = if let Some((at, limit, used)) = recorded {
-                if *at == step {
-                    Err(crate::core::BudgetExceeded::Recorded {
-                        limit: limit.clone(),
-                        used: used.clone(),
-                    })
-                } else {
-                    Ok(())
+            // ── A recorded step refusal at this step ───────────────────────
+            if let Some((at, limit, used)) = recorded
+                && *at == step
+            {
+                if mode == Mode::Strict {
+                    // Verbatim: the recorded run stopped here, and a
+                    // verification pass reaches the same conclusion without
+                    // consulting today's ledger.
+                    return Ok((
+                        admitted,
+                        Some(crate::core::BudgetExceeded::Recorded {
+                            limit: limit.clone(),
+                            used: used.clone(),
+                        }),
+                    ));
                 }
-            } else if mode.is_replaying() {
-                Ok(())
-            } else {
-                ledger.lock().expect("budget mutex").admit_step()
+                // Resume: the replayed prefix has already billed the journaled
+                // historical usage into this ledger, so the question is "does
+                // the budget now in force admit one more step over what the
+                // run already spent". Still no → the run concludes exhausted
+                // again, and the standing refusal already says so — no second
+                // record. Yes → the re-admission is its own record, beside
+                // the refusal it supersedes, so a strict replay of this
+                // history reads refusal-then-continuation as a decision
+                // somebody made rather than as divergence.
+                if let Err(exceeded) = ledger.lock().expect("budget mutex").admit_step() {
+                    return Ok((admitted, Some(exceeded)));
+                }
+                if journal.writing {
+                    self.store
+                        .append(
+                            journal.epoch,
+                            vec![(journal.stamp)(
+                                Append::new(
+                                    journal.run,
+                                    RecordKind::BudgetReadmitted {
+                                        limit: limit.clone(),
+                                    },
+                                )
+                                .step(step),
+                            )],
+                        )
+                        .await
+                        .map_err(RuntimeError::from_store)?;
+                }
+                admitted.push(step);
+                continue;
+            }
+
+            let verdict = match mode {
+                Mode::Strict => Ok(()),
+                Mode::Resume if !cursor.exhausted(step, Phase::Forward) => Ok(()),
+                Mode::Live | Mode::Resume => ledger.lock().expect("budget mutex").admit_step(),
             };
 
             let Err(exceeded) = verdict else {
@@ -2369,7 +2817,18 @@ impl Runtime {
             // place is not stopping it — and the operator who asked is entitled
             // to assume "stop" means the world is put back, not that the
             // process merely exited.
-            RunStatus::Failed(_) | RunStatus::Exhausted(_) | RunStatus::Cancelled { .. } => {}
+            //
+            // **Exhausted is deliberately not here.** Exhaustion is a pause,
+            // not a fault: the run did what it was told, and what it was told
+            // included a ceiling. Its mutations stand, because the operator's
+            // two honest options both need them standing — raise the ceiling
+            // and resume (which continues *over* the completed work), or
+            // cancel (which unwinds through this same function under a status
+            // that does). Unwinding on exhaustion made the three ends of an
+            // exhausted run contradict each other: the work was reversed, the
+            // run stayed resumable, and the resume then reported success over
+            // a world where the work no longer stood.
+            RunStatus::Failed(_) | RunStatus::Cancelled { .. } => {}
             other => return Ok(other),
         }
 
@@ -2601,10 +3060,10 @@ impl Runtime {
     ) -> Result<Result<Vec<(StepId, Capability)>, RunStatus>, RuntimeError> {
         if let Some(step) = self.undecided_effect(run).await? {
             return Ok(Err(RunStatus::Quarantined(format!(
-                "step {step} announced a mutating effect that never concluded, so \
-                 the run cannot be unwound — its outcome is unknown, and \
-                 compensating around it would undo everything except the one thing \
-                 nobody can account for"
+                "step {step} holds a mutating effect whose outcome is unknown — it \
+                 was announced and never concluded, or concluded in doubt with no \
+                 reconciliation — so the run cannot be unwound: compensating around \
+                 it would undo everything except the one thing nobody can account for"
             ))));
         }
         Ok(Ok(Self::with_interrupted_steps(
@@ -2657,24 +3116,80 @@ impl Runtime {
             .await
             .map_err(RuntimeError::from_store)?;
 
-        let mut open: BTreeMap<crate::core::EffectKey, StepId> = BTreeMap::new();
+        // Two shapes of doubt, and both must stop an unwind.
+        //
+        // An **orphan**: a mutating `EffectStarted` with no terminal record —
+        // the crash shape. And a **terminal `InDoubt`**: the call *concluded*,
+        // with a record saying the runtime does not know whether it reached
+        // the world. The second was invisible here for as long as only orphans
+        // were tracked, and the consequence was concrete: a run whose last
+        // attempt failed in doubt was cancelled, and the unwind compensated
+        // every step around a call that may have landed — the refund for money
+        // nobody took, issued through the control added to prevent it.
+        //
+        // A doubt is resolved by evidence, not by time: a later
+        // `EffectReconciled` that lands or clears it, or — for an effect whose
+        // declaration made repeating safe — a later attempt of the same
+        // dispatch (same step, same descriptor) that completed, which under
+        // that declaration is the same single performance finally landing.
+        let mut open: BTreeMap<crate::core::EffectKey, (StepId, EffectDescriptor)> =
+            BTreeMap::new();
+        let mut doubts: BTreeMap<crate::core::EffectKey, (StepId, EffectDescriptor)> =
+            BTreeMap::new();
         for r in &records {
             let Some(key) = r.effect_key() else { continue };
             match r.kind() {
-                RecordKind::EffectStarted { mutates: true, .. } => {
+                RecordKind::EffectStarted {
+                    mutates: true,
+                    descriptor,
+                    ..
+                } => {
                     if let Some(step) = r.body.step {
-                        open.insert(key, step);
+                        open.insert(key, (step, descriptor.clone()));
                     }
                 }
-                RecordKind::EffectDone { .. }
-                | RecordKind::EffectFailed { .. }
-                | RecordKind::EffectReconciled { .. } => {
-                    open.remove(&key);
+                RecordKind::EffectDone { .. } => {
+                    if let Some((step, descriptor)) = open.remove(&key) {
+                        // A completed attempt settles any doubted earlier
+                        // attempt of the same dispatch: the effect declared
+                        // repetition safe (or it would never have been
+                        // retried through doubt), so the landing is the one
+                        // performance resolving.
+                        doubts.retain(|_, (s, d)| !(*s == step && *d == descriptor));
+                    }
+                }
+                RecordKind::EffectFailed { disposition, .. } => {
+                    if let Some((step, descriptor)) = open.remove(&key)
+                        && *disposition == crate::core::Disposition::InDoubt
+                    {
+                        doubts.insert(key, (step, descriptor));
+                    }
+                }
+                RecordKind::EffectReconciled { disposition, .. } => {
+                    let settled = open.remove(&key);
+                    match disposition {
+                        // The probe answered: it landed, or it never happened.
+                        // Either way the doubt is resolved.
+                        crate::core::Disposition::Landed
+                        | crate::core::Disposition::DidNotHappen => {
+                            doubts.remove(&key);
+                        }
+                        // Asked, and still unknown.
+                        crate::core::Disposition::InDoubt => {
+                            if let Some(entry) = settled {
+                                doubts.insert(key, entry);
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
         }
-        Ok(open.values().min().copied())
+        Ok(open
+            .values()
+            .map(|(step, _)| *step)
+            .chain(doubts.values().map(|(step, _)| *step))
+            .min())
     }
 
     /// Execute one plan node.
@@ -2734,6 +3249,8 @@ impl Runtime {
             writing,
             stamp,
             agent,
+            already_started,
+            already_finished,
         } = ctx;
         let step = node.id;
         let skill = self.resolve(&node.capability.0)?;
@@ -2742,7 +3259,14 @@ impl Runtime {
         // provenance flows through the graph without anyone threading it by hand.
         let step_input = assemble(node, run_input, outputs)?;
 
-        if mode == Mode::Live {
+        // Announce a step doing new work, once: always in `Live`, and on a
+        // resume only for a step the journal never announced — a frontier
+        // step running for the first time. Keying this on the mode alone got
+        // both directions wrong: resumed frontier steps went unannounced, and
+        // the `!Strict` finish gate below duplicated `StepFinished` for every
+        // fully replayed step on every resume.
+        let announce = writes_step_record(mode, !already_started);
+        if announce {
             self.store
                 .append(
                     epoch,
@@ -2792,6 +3316,7 @@ impl Runtime {
         );
         let result = skill.invoke(&mut cx, step_input).await;
         let result = settle_abandoned_group(&mut cx, result).await;
+        let wrote = cx.wrote_records();
         let cursor = cx.into_cursor();
         ledger.lock().expect("budget mutex").record_step();
 
@@ -2801,7 +3326,15 @@ impl Runtime {
             tracing::error!(target: telemetry::QUARANTINED, %step, reason = %why);
         }
 
-        if writing {
+        // Record the ending only where the journal does not already hold it:
+        // every live step; a resumed step that did new work; and a resumed
+        // step reaching an ending the record never captured — how a suspended
+        // step that finishes purely from replayed history (its awaited event
+        // recorded by the delivery) still gets its one `StepFinished`. What
+        // this rules out is a duplicate ending for every fully replayed
+        // completed step, appended on every resume of a run doing nothing new.
+        let record_ending = writes_step_record(mode, announce || wrote || !already_finished);
+        if writing && record_ending {
             // A suspended step has not finished, so it records why it stopped
             // rather than claiming an outcome.
             let record = match &status {
@@ -3109,6 +3642,12 @@ struct Batch<'a> {
     stamp: &'a (dyn Fn(Append) -> Append + Send + Sync),
     input: &'a Tainted<Value>,
     outputs: &'a BTreeMap<StepId, Tainted<Value>>,
+    /// Steps whose `StepStarted` the journal already holds. Empty on a live
+    /// run.
+    started: &'a BTreeSet<StepId>,
+    /// Steps whose `StepFinished` the journal already holds. Empty on a live
+    /// run.
+    finished: &'a BTreeSet<StepId>,
 }
 
 /// What producing a successor plan needs.
@@ -3170,19 +3709,99 @@ struct StepRun<'a> {
     writing: bool,
     stamp: &'a (dyn Fn(Append) -> Append + Send + Sync),
     agent: &'a str,
+    /// Whether the journal already announced this step. Always `false` live.
+    already_started: bool,
+    /// Whether the journal already records this step finishing. Always
+    /// `false` live.
+    already_finished: bool,
 }
 
-/// Where the recorded run was refused by a *step* limit, if it was.
+/// Where the recorded run was refused by a *step* limit, if the refusal still
+/// stands.
 ///
 /// A step-level refusal has no effect key, so it cannot ride the replay cursor
 /// the way an effect's does; it is lifted from the records instead.
+///
+/// **The last word wins.** An exhausted run may be resumed under a raised
+/// ceiling; when the resume re-admits the refused step it journals a
+/// `BudgetReadmitted` beside the old refusal, and from then on the refusal is
+/// history that was *superseded*, not a verdict to re-serve. Without this, a
+/// strict replay of the resumed history would stop at the old refusal and
+/// report `Exhausted` about a run whose own later records show it finishing —
+/// the refusal followed by the continuation would read as divergence.
 fn recorded_step_refusal(records: &[Record]) -> Option<(StepId, String, String)> {
-    records.iter().find_map(|r| match r.kind() {
-        RecordKind::BudgetRefused { limit, used } if r.effect_key().is_none() => {
-            r.body.step.map(|s| (s, limit.clone(), used.clone()))
+    let mut standing: Option<(StepId, String, String)> = None;
+    for r in records {
+        match r.kind() {
+            RecordKind::BudgetRefused { limit, used } if r.effect_key().is_none() => {
+                if let Some(step) = r.body.step {
+                    standing = Some((step, limit.clone(), used.clone()));
+                }
+            }
+            RecordKind::BudgetReadmitted { .. }
+                if standing
+                    .as_ref()
+                    .is_some_and(|(s, _, _)| Some(*s) == r.body.step) =>
+            {
+                standing = None;
+            }
+            _ => {}
         }
+    }
+    standing
+}
+
+/// The run's most recent recorded conclusion, if it has one.
+///
+/// `None` for a run that has only ever suspended — a suspension is not a
+/// conclusion, and `conclude` writes no `RunSealed` for it.
+fn recorded_conclusion(records: &[Record]) -> Option<String> {
+    records.iter().rev().find_map(|r| match r.kind() {
+        RecordKind::RunSealed { outcome, .. } => Some(outcome.clone()),
         _ => None,
     })
+}
+
+/// Whether this pass writes a step-level record: always live, never under
+/// strict verification, and on a resume only when `new_fact` — the record is
+/// not already in the journal, or the step did new work.
+const fn writes_step_record(mode: Mode, new_fact: bool) -> bool {
+    match mode {
+        Mode::Live => true,
+        Mode::Resume => new_fact,
+        Mode::Strict => false,
+    }
+}
+
+/// The steps whose start is already on the record.
+///
+/// Read back so a resume neither re-announces a step history already announced
+/// nor forgets to announce one it is starting for the first time.
+fn recorded_started_steps(records: &[Record]) -> BTreeSet<StepId> {
+    records
+        .iter()
+        .filter_map(|r| match r.kind() {
+            RecordKind::StepStarted { .. } => r.body.step,
+            _ => None,
+        })
+        .collect()
+}
+
+/// The steps whose ending is already on the record.
+///
+/// Read back so a resume records a `StepFinished` exactly for the steps that
+/// reach an ending the journal does not yet hold: a fully replayed completed
+/// step keeps its one record, and a suspended step that finally finishes —
+/// even purely from replayed history, its awaited event having been recorded
+/// by the delivery — gets the one it never had.
+fn recorded_finished_steps(records: &[Record]) -> BTreeSet<StepId> {
+    records
+        .iter()
+        .filter_map(|r| match r.kind() {
+            RecordKind::StepFinished { .. } => r.body.step,
+            _ => None,
+        })
+        .collect()
 }
 
 /// Every capability an agent advertises is provided by one of **its own**
@@ -3255,7 +3874,11 @@ fn register_skill(
     {
         return Err(BuildError::DuplicateSkillName { name: d.name });
     }
-    for cap in d.provides {
+    // `capabilities()`, not the raw field: a descriptor that declared nothing
+    // answers its own name, and registering that here is what makes
+    // `run("greet")` and an `agent/greet` grant resolve without a hello-world
+    // program inventing a second name for its one skill.
+    for cap in d.capabilities() {
         if let Some(first) = caps.get(&cap)
             && first != &d.name
         {
@@ -3269,6 +3892,16 @@ fn register_skill(
     }
     skills.insert(d.name.clone(), skill);
     Ok(d.name)
+}
+
+/// The capability a bare `run(target, ..)` admits: the first declared, or the
+/// skill's own name — [`SkillDescriptor::capabilities`] is never empty.
+fn first_capability(descriptor: &SkillDescriptor) -> Capability {
+    descriptor
+        .capabilities()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| Capability::new(descriptor.name.clone()))
 }
 
 /// The business keys a case is identified by, for the binding record.
@@ -3644,6 +4277,13 @@ struct Execution<'a> {
     /// run. Read back rather than re-synthesised, because a planner asked twice
     /// can answer differently.
     successors: Vec<PlanIR>,
+    /// Steps whose `StepStarted` is already on the record. Empty on a live
+    /// run. Read back so a resume neither re-announces a step nor forgets to
+    /// announce one it starts for the first time.
+    started: BTreeSet<StepId>,
+    /// Steps whose `StepFinished` is already on the record. Empty on a live
+    /// run.
+    finished: BTreeSet<StepId>,
     run: RunId,
     epoch: u64,
     plan: &'a PlanIR,
@@ -4384,6 +5024,20 @@ impl RuntimeBuilder {
                 tenant.clone(),
             ));
         }
+        // The outbox's store keeps the operator destinations' bearer tokens —
+        // credentials like any caller's, and the one store here reached through
+        // a handle the embedder built rather than registered. Sealing it in the
+        // same sweep is what keeps `keyring()` one decision rather than five
+        // and a sixth.
+        #[cfg(feature = "push")]
+        if let Some(outbox) = self.outbox.take() {
+            self.outbox = Some(Arc::new(
+                outbox
+                    .as_ref()
+                    .clone()
+                    .sealed(Arc::clone(&keys), tenant.clone()),
+            ));
+        }
         if let Some(tasks) = self.tasks.take() {
             self.tasks = Some(crate::keyring::SealedTasks::wrap(tasks, keys, tenant));
         }
@@ -4765,7 +5419,7 @@ impl RuntimeBuilder {
             // its declaration is checked against below.
             let mut mine: HashSet<Capability> = HashSet::new();
             for s in agent.skills {
-                mine.extend(s.descriptor().provides);
+                mine.extend(s.descriptor().capabilities());
                 let name = register_skill(s, &mut by_capability, &mut skills)?;
                 governed_by.insert(name, Arc::clone(&m));
             }
@@ -4962,6 +5616,8 @@ impl RuntimeBuilder {
             by_capability,
             #[cfg(feature = "manifest")]
             published_by,
+            #[cfg(feature = "manifest")]
+            providers: self.providers,
             meter: super::metrics::Meter::new(self.metric_tenant, &self.tenant),
             tenant: self.tenant,
             owner: self.owner.unwrap_or_else(default_owner),
@@ -5125,11 +5781,58 @@ impl Runtime {
         // Record the event as the awaited effect's result, then let replay do
         // the rest: the resumed run reads it back like any other completed
         // effect, and none of the suspension machinery exists twice.
-        let lease = self
-            .store
-            .acquire(sub.run, &self.owner, self.lease_ttl)
-            .await
-            .map_err(RuntimeError::from_store)?;
+        //
+        // The lease may be briefly held: an event can arrive in the window
+        // between the run registering its subscription and its owner finishing
+        // the suspension bookkeeping — the owner is *concluding*, and will
+        // release within milliseconds. That race used to be fatal in the
+        // quietest possible way: the delivery failed `LeaseHeld` **after** the
+        // event was durably claimed for this run, the counterparty's retry
+        // deduplicated against the claimed event, and nothing ever resumed the
+        // run — a message that arrived in time, parked forever. So the claim
+        // is retried under a bounded backoff; if the owner is genuinely
+        // stalled past the bound, the event is *left claimed* for this run
+        // and reported as buffered — the sweep's redelivery pass finds a
+        // waiting subscription with a claimed event and finishes the job on a
+        // later tick, so the bound bounds latency, never delivery.
+        let mut backoff = Duration::from_millis(25);
+        let lease = loop {
+            match self
+                .store
+                .acquire(sub.run, &self.owner, self.lease_ttl)
+                .await
+            {
+                Ok(lease) => break lease,
+                Err(crate::core::StoreError::LeaseHeld { .. })
+                    if backoff < Duration::from_secs(1) =>
+                {
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+                Err(crate::core::StoreError::LeaseHeld { .. }) => {
+                    // The claim retired the subscription, so nothing lists
+                    // this run as waiting any more — and the claimed event
+                    // blocks every dedup'd retry of itself. Re-registering
+                    // the subscription is what keeps the pair findable: the
+                    // sweep's redelivery pass walks waiting subscriptions,
+                    // re-claims (a claim by the same run is returned, not
+                    // filtered), and finishes the delivery once the owner
+                    // concludes.
+                    events
+                        .subscribe(&sub, now_for_admission())
+                        .await
+                        .map_err(RuntimeError::from_store)?;
+                    tracing::warn!(
+                        run = %sub.run,
+                        event = %event.id,
+                        "an event was claimed for a run whose owner did not conclude \
+                         within the retry window; the sweep will deliver it"
+                    );
+                    return Ok(Delivery::Buffered);
+                }
+                Err(e) => return Err(RuntimeError::from_store(e)),
+            }
+        };
 
         let already_recorded = self
             .store
@@ -5176,8 +5879,78 @@ impl Runtime {
             .await
             .map_err(RuntimeError::from_store)?;
 
-        self.replay(sub.run, Mode::Resume).await?;
+        // The bookkeeping lease has done its work — the event is recorded as
+        // the awaited effect's result. `replay` claims its own lease before it
+        // reads (which fences this epoch, under which nothing is left to
+        // write), so this one is handed back first rather than deadlocking
+        // the resume against its own delivery.
+        if let Err(e) = self.store.release_lease(sub.run, lease.epoch).await {
+            tracing::debug!(run = %sub.run, error = %e, "could not hand back the delivery lease");
+        }
+        match self.replay(sub.run, Mode::Resume).await {
+            // A `LeaseHeld` means somebody claimed the run in the gap — a
+            // concurrent delivery, a recovery sweep. The event is durably
+            // recorded, so whoever holds the lease replays it; this delivery
+            // still delivered.
+            Ok(_) | Err(RuntimeError::LeaseHeld { .. }) => {}
+            Err(e) => return Err(e),
+        }
         Ok(Delivery::Resumed { run: sub.run })
+    }
+
+    /// Finish deliveries that died between the claim and the resume.
+    ///
+    /// A delivery that raced a live owner leaves an event durably claimed for
+    /// a run nothing resumed, and the counterparty's retries deduplicate
+    /// against that claim — so no future delivery drives the run, and a
+    /// message that arrived in time is parked forever. The giving-up delivery
+    /// re-registers the subscription precisely so the pair stays findable;
+    /// this pass walks the waiting subscriptions, re-claims (idempotently —
+    /// a claim by the same run is returned, not filtered), and finishes the
+    /// delivery. Runs whose owner is *still* live are skipped and found again
+    /// next tick, so the delivery's retry bound bounds latency, never
+    /// delivery.
+    ///
+    /// What this does **not** cover, honestly: a crash inside the store
+    /// commit between an event's claim and the resume retires the
+    /// subscription with nothing left to re-register it, and that window
+    /// stays what it always was — recorded rather than closed, with later
+    /// events for the same correlation dead-lettering as its symptom.
+    pub(crate) async fn redeliver_claimed(&self, limit: usize) -> Result<usize, RuntimeError> {
+        let Some(events) = self.events.as_ref() else {
+            return Ok(0);
+        };
+        let waiting = events
+            .waiting(limit)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        let mut delivered = 0usize;
+        for sub in waiting {
+            let Some(buffered) = events
+                .claim_for(&sub, now_for_admission())
+                .await
+                .map_err(RuntimeError::from_store)?
+            else {
+                continue;
+            };
+            match self
+                .resume_subscription(events, sub.clone(), &buffered.event)
+                .await
+            {
+                Ok(Delivery::Resumed { .. }) => delivered += 1,
+                // Still held live: the owner is working, and will either
+                // consume the claim itself or conclude and be found next tick.
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(
+                        run = %sub.run,
+                        %error,
+                        "a claimed event's redelivery failed; retried next tick",
+                    );
+                }
+            }
+        }
+        Ok(delivered)
     }
 
     /// Retire events that nobody claimed within `grace`.

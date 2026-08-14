@@ -578,6 +578,196 @@ async fn one_tenants_run_does_not_join_another_tenants_case() {
     );
 }
 
+/// One tenant's worklist is not another tenant's, even holding a valid id.
+///
+/// A task id is derived, travels in URLs and webhook payloads, and is not a
+/// secret — so the attacker here holds a **valid** id belonging to the other
+/// tenant, because a guessed one proves nothing. Reading it must be a miss;
+/// claiming or deciding it must fail as *not found*, not as *held*; and the
+/// other tenant's queue must not list it. Each half is paired with the owner
+/// still finding its own row, since a query broken for everybody passes every
+/// negative assertion.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn one_tenants_tasks_are_not_another_tenants_to_decide() {
+    use agentplane::case::{ClaimError, TaskStore};
+    use agentplane::core::{
+        EffectKey, Justification, OnExpiry, Priority, RunId, Task, TaskId, TaskState, TenantId,
+    };
+    use agentplane::store::RedbStore;
+
+    let base = RedbStore::open_in_memory().expect("store");
+    let acme = base
+        .clone()
+        .for_tenant(TenantId::new("acme").expect("valid"));
+    let globex = base.for_tenant(TenantId::new("globex").expect("valid"));
+
+    let run = RunId::generate();
+    let task = Task {
+        id: TaskId::derive(run, EffectKey::from_hex(&"cc".repeat(32)).expect("a key")),
+        run,
+        case: None,
+        kind: "approval".into(),
+        justification: Justification::new("needs a person", serde_json::json!({})),
+        candidate_roles: vec!["ops".into()],
+        excluded_actors: Vec::new(),
+        assignee: None,
+        priority: Priority::Normal,
+        state: TaskState::Open,
+        on_expiry: OnExpiry::Deny,
+        created_at: ts(1_000),
+        due_at: None,
+    };
+    acme.open(&task).await.expect("acme opens");
+
+    // The valid id, presented across the boundary: a miss, never a row.
+    assert!(
+        globex.task(task.id).await.expect("globex reads").is_none(),
+        "a tenant read another tenant's task while holding nothing but its id"
+    );
+    assert!(
+        matches!(
+            globex.claim(task.id, "carol", &["ops".to_owned()]).await,
+            Err(ClaimError::NotFound(_))
+        ),
+        "a claim across the tenant boundary was answered with something other \
+         than not-found — even 'held by alice' leaks who is reviewing what"
+    );
+    assert!(
+        globex
+            .queue(&["ops".to_owned()], 10)
+            .await
+            .expect("globex queue")
+            .is_empty(),
+        "another tenant's task appeared in this tenant's queue"
+    );
+    assert_eq!(globex.open_count().await.expect("globex count"), 0);
+
+    // The positive halves: the owner still sees and claims its own work.
+    assert_eq!(
+        acme.queue(&["ops".to_owned()], 10)
+            .await
+            .expect("acme queue")
+            .len(),
+        1,
+        "the owning tenant lost its own queue"
+    );
+    assert_eq!(acme.open_count().await.expect("acme count"), 1);
+    assert!(
+        acme.claim(task.id, "alice", &["ops".to_owned()])
+            .await
+            .is_ok(),
+        "the owning tenant could not claim its own task"
+    );
+}
+
+/// One tenant's batch reservations are not another tenant's.
+///
+/// A batch id and an item key are both caller-chosen strings, so two tenants
+/// using `batch-1`/`item-001` is ordinary. A reservation that crossed the
+/// boundary would hand one tenant the other's run id — the exactly-once
+/// arbiter for work that is not theirs.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn one_tenants_batch_reservations_are_not_another_tenants() {
+    use agentplane::batch::BatchStore;
+    use agentplane::core::{BatchId, RunId, TenantId};
+    use agentplane::store::RedbStore;
+
+    let base = RedbStore::open_in_memory().expect("store");
+    let acme = base
+        .clone()
+        .for_tenant(TenantId::new("acme").expect("valid"));
+    let globex = base.for_tenant(TenantId::new("globex").expect("valid"));
+
+    let batch = BatchId::generate();
+    let theirs = RunId::generate();
+    acme.open(batch, "digest").await.expect("acme opens");
+    acme.reserve(batch, "item-001", theirs)
+        .await
+        .expect("acme reserves");
+    acme.mark_exhausted(batch).await.expect("acme exhausts");
+
+    // The same batch id, the same item key, across the boundary: globex must
+    // get its *own* reservation, not acme's run id.
+    let mine = RunId::generate();
+    globex.open(batch, "digest").await.expect("globex opens");
+    let reserved = globex
+        .reserve(batch, "item-001", mine)
+        .await
+        .expect("globex reserves");
+    assert_eq!(
+        reserved.run, mine,
+        "a reservation crossed the tenant boundary and handed this tenant \
+         another tenant's run id"
+    );
+    assert!(
+        !globex.is_exhausted(batch).await.expect("globex reads"),
+        "another tenant's exhaustion closed this tenant's batch"
+    );
+    // The positive half: acme's original reservation still stands.
+    let original = acme
+        .reserve(batch, "item-001", RunId::generate())
+        .await
+        .expect("acme re-reserves");
+    assert_eq!(
+        original.run, theirs,
+        "the owning tenant's reservation lost its original run id"
+    );
+    assert!(acme.is_exhausted(batch).await.expect("acme reads"));
+}
+
+/// One tenant's dead letters are not another tenant's to read.
+///
+/// The dead-letter view is read by an operator deciding what went wrong, and
+/// event payloads are the caller's data — a listing that walked every tenant's
+/// retired events would show one tenant the traffic of all of them.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn one_tenants_dead_letters_are_not_another_tenants() {
+    use agentplane::case::EventStore;
+    use agentplane::core::{CorrelationKey, InboundEvent, TenantId};
+    use agentplane::store::RedbStore;
+
+    let base = RedbStore::open_in_memory().expect("store");
+    let acme = base
+        .clone()
+        .for_tenant(TenantId::new("acme").expect("valid"));
+    let globex = base.for_tenant(TenantId::new("globex").expect("valid"));
+
+    let event = InboundEvent {
+        source: "erp".to_owned(),
+        id: "evt-dead-1".to_owned(),
+        kind: "ack.received".to_owned(),
+        correlation: vec![CorrelationKey::new("document", "DOC-9")],
+        payload: serde_json::json!({"payer": "Ada Lovelace"}),
+    };
+    assert!(acme.buffer(&event, ts(1)).await.expect("acme buffers"));
+    assert_eq!(
+        acme.sweep_unclaimed(ts(100), "nobody was waiting")
+            .await
+            .expect("acme sweeps"),
+        1
+    );
+
+    assert!(
+        globex
+            .dead_letters(10)
+            .await
+            .expect("globex reads")
+            .is_empty(),
+        "another tenant's dead letters appeared in this tenant's listing"
+    );
+    // The positive half: the owner still reads its own.
+    let letters = acme.dead_letters(10).await.expect("acme reads");
+    assert_eq!(
+        letters.len(),
+        1,
+        "the owning tenant lost its own dead letter"
+    );
+    assert_eq!(letters[0].event.id, "evt-dead-1");
+}
+
 /// A plane and a store scoped to different tenants is refused at build.
 ///
 /// The two are set separately — the plane's tenant scopes data keys and the

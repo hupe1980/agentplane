@@ -88,18 +88,16 @@ impl Skill for Triage {
             })
         });
 
-        let call = ModelCall::new(
-            Arc::clone(&self.provider),
-            ModelId::new("openai", MODEL),
-            prompt.peek().clone(),
-        )
-        .expecting(schema());
-
-        // Through `cx.sink`, which binds the labelled value to the call the
-        // policy gate checked. The completion comes back labelled: it was
-        // generated from a context window that held the ticket, and the ticket
-        // came from outside.
-        let completion = cx.sink(call, &prompt).await?;
+        // Through `cx.sink_with`, which hands the labelled value to the call
+        // and the policy gate in one motion. The completion comes back
+        // labelled: it was generated from a context window that held the
+        // ticket, and the ticket came from outside.
+        let provider = Arc::clone(&self.provider);
+        let completion = cx
+            .sink_with(&prompt, |value| {
+                ModelCall::new(provider, ModelId::new("openai", MODEL), value).expecting(schema())
+            })
+            .await?;
         assert_eq!(completion.label().trust, Trust::Untrusted);
 
         Ok(Outcome::done(completion.map(|c| {

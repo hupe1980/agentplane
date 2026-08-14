@@ -275,12 +275,13 @@ Until something runs on a clock, a deadline is a number in a table and an
 unclaimed event is a row nobody reads. That is the failure this runtime is built
 against — not a crash, but a silence.
 
-One tick, five findings — four of them loud, and the first one routine healing
-that still means an instance died:
+One tick, six findings — four of them loud, and the first two routine healing
+that still means something died:
 
 | Finding | What happens |
 |---|---|
 | An instance died holding a run | The run is taken over at `epoch + 1` and resumed |
+| A claimed event's delivery died | The delivery is finished; reported as `events_redelivered` |
 | An obligation is approaching | `DeadlineTransition` → `Warned` |
 | An obligation passed unmet | `DeadlineTransition` → `Breached`; the **case** is escalated |
 | A task's window closed | The declared `on_expiry` is applied |
@@ -331,10 +332,13 @@ means admission acquired and died before its first append landed. No run
 exists — the atomic admission batch never committed, so nothing was declared,
 authorized or performed — and clearing the lease is the whole recovery.
 
-What the pass does **not** cover, stated rather than implied: a crash inside
-the one store-commit between an event's claim and the lease acquisition that
-resumes it. That window is one transaction wide; its symptom is later events
-for the same correlation dead-lettering, which the sweep already reports.
+The claimed-event window is covered by its own pass. A delivery can die
+between an event's claim and the resume that consumes it — a crash in that
+window, or an owner that outlives the delivery's bounded retry — and the
+message then belongs to nobody: claimed, so no longer waiting; undelivered, so
+no run holds it. The sweep finishes those deliveries and reports each under
+`events_redelivered`. The redelivery is the system healing; a persistent count
+means deliveries keep dying, which is worth asking why.
 
 ### A finding has to be findable
 
@@ -473,6 +477,14 @@ no Merkle leaf, so it is checked on chain and signatures and the report says in
 `not_checked` that nothing pins its tail until it seals. The finding is the
 opposite case — a run whose own records carry a *sealing* conclusion, in a log
 that holds no leaf for it. That is history the log no longer commits to.
+
+For a sealed run, the log's leaf is held to the **verified chain's own head**,
+before the tree math and independent of any checkpoint race. A truncated but
+internally consistent prefix of a sealed run verifies on its own, and the log's
+genuine leaf verifies against the genuine tree — so an audit that checked each
+half without holding them to each other was verifying two halves of two
+different claims. A mismatch is a finding: records were removed or replaced
+after sealing, and the served history is not the one the checkpoint commits to.
 
 `verify` is the drill, and it takes the file alone. It re-seals every record
 through the same function the store sealed with — so agreement is evidence about

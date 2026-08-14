@@ -274,6 +274,40 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|error| be(&error))?;
 
+        // Sliding retention starts at the write, not at the first touch.
+        // Initialized lazily, an item with a window and no fixed expiry was
+        // *immortal* until somebody touched it — opt-in garbage that never
+        // collects. The write is itself an access, so the window opens here
+        // and each journaled touch slides it; a version written without the
+        // window drops the row, because retention is a property of what is
+        // currently believed.
+        match stored.access_retention_seconds {
+            Some(window) => {
+                let expiry = stored
+                    .created_at
+                    .unix_timestamp()
+                    .saturating_add(i64::try_from(window).unwrap_or(i64::MAX));
+                tx.execute(
+                    "INSERT INTO memory_access_expiry (tenant, id, expires_at)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (tenant, id) DO UPDATE
+                     SET expires_at =
+                         GREATEST(memory_access_expiry.expires_at, EXCLUDED.expires_at)",
+                    &[&tenant, &stored.id, &expiry],
+                )
+                .await
+                .map_err(|error| be(&error))?;
+            }
+            None => {
+                tx.execute(
+                    "DELETE FROM memory_access_expiry WHERE tenant = $1 AND id = $2",
+                    &[&tenant, &stored.id],
+                )
+                .await
+                .map_err(|error| be(&error))?;
+            }
+        }
+
         tx.execute(
             "DELETE FROM memory_derived WHERE tenant = $1 AND derived_id = $2",
             &[&tenant, &stored.id],
@@ -301,6 +335,10 @@ impl MemoryStore for PostgresStore {
         let tenant = self.tenant_name();
         let limit = i64::try_from(query.limit)
             .map_err(|_| StoreError::Backend("memory recall limit exceeds BIGINT".to_owned()))?;
+        // `expires_at` is a hard ceiling: sliding access retention may shorten
+        // a life below it, never extend one past it — so the effective expiry
+        // is the *earlier* of the two (`LEAST`, with absent sides coalesced to
+        // +infinity so they never win).
         let rows = client
             .query(
                                 "SELECT item.item FROM memory_items item
@@ -310,9 +348,9 @@ impl MemoryStore for PostgresStore {
                                      AND ($3::TEXT IS NULL OR item.purpose = $3)
                                      AND ($4::BIGINT IS NULL
                                                 OR (item.expires_at IS NULL AND access.expires_at IS NULL)
-                                                OR GREATEST(
-                                                        COALESCE(item.expires_at, -9223372036854775808),
-                                                        COALESCE(access.expires_at, -9223372036854775808)
+                                                OR LEAST(
+                                                        COALESCE(item.expires_at, 9223372036854775807),
+                                                        COALESCE(access.expires_at, 9223372036854775807)
                                                 ) > $4)
                                  ORDER BY item.trust_rank ASC, item.created_at DESC, item.id ASC LIMIT $5",
                                 &[
@@ -646,6 +684,17 @@ impl MemoryStore for PostgresStore {
         )
         .await
         .map_err(|error| be(&error))?;
+        // Exclusive against the shared graph lock every memory write takes,
+        // exactly as `forget_cascading` is — the sweep is an erasure, and an
+        // erasure that held only the lifecycle lock raced `remember`: a new
+        // derivative could be created under a source mid-expiry, committing a
+        // summary whose source this transaction was already erasing.
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&format!("memory-graph:{}:{tenant}", tenant.len())],
+        )
+        .await
+        .map_err(|error| be(&error))?;
         let rows = tx
             .query(
                 "SELECT item.id
@@ -656,9 +705,12 @@ impl MemoryStore for PostgresStore {
                    ON hold.tenant = item.tenant AND hold.id = item.id
                  WHERE item.tenant = $1 AND item.current
                                      AND (item.expires_at IS NOT NULL OR access.expires_at IS NOT NULL)
-                                     AND GREATEST(
-                                             COALESCE(item.expires_at, -9223372036854775808),
-                                             COALESCE(access.expires_at, -9223372036854775808)
+                                     -- The recall rule, applied to erasure: the
+                                     -- ceiling wins, so a touched-up window never
+                                     -- carries an item past its immutable expires_at.
+                                     AND LEAST(
+                                             COALESCE(item.expires_at, 9223372036854775807),
+                                             COALESCE(access.expires_at, 9223372036854775807)
                                      ) <= $2
                    AND hold.id IS NULL
                  FOR UPDATE OF item",
@@ -674,12 +726,16 @@ impl MemoryStore for PostgresStore {
             )
             .await
             .map_err(|error| be(&error))?;
-            tx.execute(
-                "DELETE FROM memory_derived WHERE tenant = $1 AND derived_id = $2",
-                &[&tenant, id],
-            )
-            .await
-            .map_err(|error| be(&error))?;
+            // Derivation edges deliberately stay — both directions, exactly as
+            // `forget` keeps them. An expired memory becomes a tombstone, not a
+            // hole in the graph: with U → E → D and E expired here, a later
+            // `forget_cascading(U)` must still route *through* E to reach D,
+            // and this sweep once deleted E's incoming edges — severing exactly
+            // that path, so the poisoned source's summary-of-a-summary outlived
+            // the erasure. The read path keeps a kept edge harmless
+            // (`derivatives` joins on a current row), and the tombstone
+            // prevents id reuse from attaching this lineage to unrelated
+            // future content.
             tx.execute(
                 "DELETE FROM memory_items WHERE tenant = $1 AND id = $2",
                 &[&tenant, id],

@@ -57,12 +57,18 @@ use crate::journal::{Append, Checkpoint, JournalStore};
 /// a declaration that does nothing — a reader would parse a future format as
 /// far as the lines happened to look familiar, and report findings about a
 /// file it never understood.
-/// Version 2 added the case layer: `agentplane.export.case` lines between the
-/// last run block and the trailer, and the `cases` count in both. A hard cut
-/// rather than an optional extension, because a reader that tolerated their
-/// absence could not tell *this plane has no cases* from *the case layer was
-/// dropped from this file* — and the second is the finding that matters.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// Two shapes are load-bearing enough to state with the constant, because
+/// each was once tempting to do the other way. The case layer is mandatory,
+/// never an optional extension: a reader that tolerated its absence could not
+/// tell *this plane has no cases* from *the case layer was dropped from this
+/// file* — and the second is the finding that matters. And every record line
+/// carries `raw`, the **exact bytes the chain hashed**, which is what
+/// verification recomputes over: verifying a re-serialization of the parsed
+/// body would hold only while this build's canonicalization agreed
+/// byte-for-byte with the writer's — the wire-bytes rule the journal itself
+/// refuses to bend, bent by its own export.
+pub const FORMAT_VERSION: u32 = 1;
 
 /// The first line of an export: what this is and how to read it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -101,6 +107,9 @@ pub struct Header {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ExportedRecord<'r> {
     pub seq: crate::core::Seq,
+    /// The typed view, for a reader's eyes. Verification never touches it —
+    /// see `raw` — and the verifier holds the two to each other so this cannot
+    /// quietly say something the hashed bytes do not.
     pub body: &'r crate::journal::RecordBody,
     pub prev_hash: &'r crate::core::Digest,
     pub hash: &'r crate::core::Digest,
@@ -108,6 +117,15 @@ pub struct ExportedRecord<'r> {
     /// ordinary state and is emitted as such rather than omitted, so a reader
     /// can tell *unsigned* from *a field this export forgot*.
     pub attestation: Option<&'r crate::core::Attestation>,
+    /// The exact bytes [`hash`](Self::hash) covers, verbatim.
+    ///
+    /// This is the wire-bytes rule, applied to the export: the chain is over
+    /// history **as written**, and a verifier that re-serialized the parsed
+    /// body was holding the file to *this build's* canonicalization rather
+    /// than to the bytes the store sealed. Canonical record bytes are UTF-8
+    /// JSON, so they travel as a string — escaped, exact, and recoverable
+    /// byte-for-byte.
+    pub raw: std::borrow::Cow<'r, str>,
 }
 
 impl<'r> From<&'r crate::journal::Record> for ExportedRecord<'r> {
@@ -118,6 +136,7 @@ impl<'r> From<&'r crate::journal::Record> for ExportedRecord<'r> {
             prev_hash: &r.prev_hash,
             hash: &r.hash,
             attestation: r.attestation.as_ref(),
+            raw: String::from_utf8_lossy(r.raw()),
         }
     }
 }
@@ -760,13 +779,18 @@ fn read_header(value: &serde_json::Value, report: &mut VerifyReport) {
     }
 }
 
-/// Re-seal one record and hold it to the hash it carries.
+/// Rehash one record's wire bytes and hold them to the hash it carries.
 ///
-/// The re-seal is the whole check. Comparing the file's `prev_hash` against the
-/// previous line's `hash` would only prove the file agrees with itself, which an
-/// editor who recomputed the chain also achieves; putting the body back through
-/// the function the store sealed with is what makes agreement evidence about the
-/// bytes.
+/// The rehash is the whole check, and it runs over `raw` — the exact bytes the
+/// store hashed — never over a re-serialization of the parsed body. That is
+/// the journal's own wire-bytes rule: re-serializing would hold the file to
+/// *this build's* canonicalization instead of to what was written, so an
+/// export from a build whose rule differed would report tampering where there
+/// was only time, and — worse — an edit that re-serializes identically would
+/// pass. Comparing the file's `prev_hash` against the previous line's `hash`
+/// would only prove the file agrees with itself, which an editor who
+/// recomputed the chain also achieves; rehashing the wire bytes is what makes
+/// agreement evidence about them.
 fn read_record(
     value: &serde_json::Value,
     pass: &mut RunPass,
@@ -774,20 +798,41 @@ fn read_record(
     stamped: &mut std::collections::BTreeSet<crate::core::CaseId>,
 ) {
     let current = pass.run;
-    let (Some(body), Some(claimed)) = (
-        value
-            .get("body")
-            .and_then(|b| serde_json::from_value::<crate::journal::RecordBody>(b.clone()).ok()),
+    let (Some(raw), Some(claimed)) = (
+        value.get("raw").and_then(serde_json::Value::as_str),
         value
             .get("hash")
             .and_then(|h| serde_json::from_value::<crate::core::Digest>(h.clone()).ok()),
     ) else {
+        report.findings.push(format!(
+            "run {current}: a record line carries no wire bytes or no hash — nothing ties \
+             it to the chain"
+        ));
+        pass.clean = false;
+        return;
+    };
+    let raw_bytes = raw.as_bytes();
+    // The body verification reads is parsed from the wire bytes — the one
+    // source the hash actually covers.
+    let Ok(body) = serde_json::from_slice::<crate::journal::RecordBody>(raw_bytes) else {
         report
             .findings
             .push(format!("run {current}: a record line is malformed"));
         pass.clean = false;
         return;
     };
+    // The readable `body` is a courtesy copy, and it is held to the bytes: a
+    // file whose display half says something its hashed half does not is the
+    // quiet edit — every hash verifies, and the reader was shown a lie.
+    let wire: serde_json::Value = serde_json::from_slice(raw_bytes).unwrap_or_default();
+    if value.get("body") != Some(&wire) {
+        report.findings.push(format!(
+            "run {current}: record {}'s readable body does not match its wire bytes — the \
+             display copy was edited, and every hash still verifies over the real one",
+            body.seq
+        ));
+        pass.clean = false;
+    }
     // Collected for the case-coverage settlement: a stamp is the journal
     // naming a matter, and the case layer must carry every matter it names.
     if let Some(case) = body.case {
@@ -818,32 +863,29 @@ fn read_record(
     }
     pass.last_seq = body.seq;
 
-    match crate::journal::Record::seal(body, pass.prev) {
-        Ok(mut record) => {
-            if record.hash != claimed {
-                report.findings.push(format!(
-                    "run {current}: record {} does not recompute to the hash it carries \
-                     — it was edited after it was sealed",
-                    pass.last_seq
-                ));
-                pass.clean = false;
-            }
-            pass.prev = record.hash;
-            record.attestation = value
-                .get("attestation")
-                .and_then(|a| {
-                    serde_json::from_value::<Option<crate::core::Attestation>>(a.clone()).ok()
-                })
-                .flatten();
-            pass.resealed.push(record);
-        }
-        Err(e) => {
-            report.findings.push(format!(
-                "run {current}: record {} cannot be sealed: {e}",
-                pass.last_seq
-            ));
-            pass.clean = false;
-        }
+    let attestation = value
+        .get("attestation")
+        .and_then(|a| serde_json::from_value::<Option<crate::core::Attestation>>(a.clone()).ok())
+        .flatten();
+    if let Ok(record) = crate::journal::Record::from_stored_attested(
+        raw_bytes.to_vec(),
+        pass.prev,
+        claimed,
+        attestation,
+    ) {
+        pass.prev = record.hash;
+        pass.resealed.push(record);
+    } else {
+        report.findings.push(format!(
+            "run {current}: record {} does not recompute to the hash it carries \
+             — it was edited after it was sealed",
+            pass.last_seq
+        ));
+        pass.clean = false;
+        // The head walks forward over the bytes actually present, so the
+        // leaf comparison at the end of the block speaks about what this
+        // file carries rather than about the first mismatch.
+        pass.prev = crate::core::Digest::chain(pass.prev, raw_bytes);
     }
 }
 
@@ -1199,9 +1241,22 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
                 if value.get("attestation").is_some_and(|a| !a.is_null()) {
                     parsed.signed += 1;
                 }
-                let Some(body) = value.get("body").and_then(|b| {
-                    serde_json::from_value::<crate::journal::RecordBody>(b.clone()).ok()
-                }) else {
+                // The wire bytes are the source of truth, exactly as they are
+                // for the verifier: the readable `body` is a courtesy copy,
+                // and a restore replaying the copy would rebuild whatever the
+                // display half said rather than what the chain covered.
+                let Some(body) = value
+                    .get("raw")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| {
+                        serde_json::from_slice::<crate::journal::RecordBody>(raw.as_bytes()).ok()
+                    })
+                    .or_else(|| {
+                        value.get("body").and_then(|b| {
+                            serde_json::from_value::<crate::journal::RecordBody>(b.clone()).ok()
+                        })
+                    })
+                else {
                     continue;
                 };
                 if let Some(current) = parsed.runs.last_mut() {

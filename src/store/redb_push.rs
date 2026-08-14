@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::core::{RunId, Secret, Seq, StoreError};
-use crate::push::{PushAuthentication, PushConfig, PushRegistration, PushStore};
+use crate::push::{
+    DueBatch, PushAuthentication, PushConfig, PushNamespace, PushRegistration, PushStore,
+};
 
 use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
@@ -28,6 +30,35 @@ struct Cursor {
     attempts: u32,
     next_attempt_at: u64,
     last_error: Option<String>,
+}
+
+/// One config row and its cursor into a registration, shared by
+/// [`PushStore::due`] and [`PushStore::due_in`] so the two scans cannot decode
+/// one table two ways.
+fn registration_from(
+    task: &str,
+    id: &str,
+    value: StoredPush<'_>,
+    cursor: Cursor,
+) -> Result<PushRegistration, StoreError> {
+    let (url, token, has_token, auth_scheme, auth_credentials, has_auth) = value;
+    let task = RunId::parse(task).map_err(|error| StoreError::Backend(error.to_string()))?;
+    Ok(PushRegistration {
+        config: PushConfig {
+            id: id.to_owned(),
+            task,
+            url: url.to_owned(),
+            token: (has_token == 1).then(|| Secret::new(token)),
+            authentication: (has_auth == 1).then(|| PushAuthentication {
+                scheme: auth_scheme.to_owned(),
+                credentials: Secret::new(auth_credentials),
+            }),
+        },
+        next_seq: cursor.next_seq,
+        attempts: cursor.attempts,
+        next_attempt_at: cursor.next_attempt_at,
+        last_error: cursor.last_error,
+    })
 }
 
 #[async_trait]
@@ -189,28 +220,68 @@ impl PushStore for RedbStore {
                 else {
                     continue;
                 };
-                let (url, token, has_token, auth_scheme, auth_credentials, has_auth) =
-                    value.value();
-                let task =
-                    RunId::parse(task).map_err(|error| StoreError::Backend(error.to_string()))?;
-                out.push(PushRegistration {
-                    config: PushConfig {
-                        id: id.to_owned(),
-                        task,
-                        url: url.to_owned(),
-                        token: (has_token == 1).then(|| Secret::new(token)),
-                        authentication: (has_auth == 1).then(|| PushAuthentication {
-                            scheme: auth_scheme.to_owned(),
-                            credentials: Secret::new(auth_credentials),
-                        }),
-                    },
-                    next_seq: cursor.next_seq,
-                    attempts: cursor.attempts,
-                    next_attempt_at: cursor.next_attempt_at,
-                    last_error: cursor.last_error,
-                });
+                out.push(registration_from(task, id, value.value(), cursor)?);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    async fn due_in(
+        &self,
+        at: u64,
+        limit: usize,
+        namespace: PushNamespace,
+    ) -> Result<DueBatch, StoreError> {
+        let tenant = self.tenant_name();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(configs) = r.open_table(PUSH) else {
+                return Ok(DueBatch::default());
+            };
+            let Ok(cursors) = r.open_table(PUSH_CURSOR) else {
+                return Ok(DueBatch::default());
+            };
+            // One pass, skip-and-count: the paging default is correct here and
+            // linear in the other namespace's backlog *per window*, re-reading
+            // the head on every doubling. This scan walks the cursor table
+            // once. Ownership is decided on the id alone — it is in the key —
+            // so a foreign row costs a count and never a config read, and the
+            // count runs to the end of the table: `unserved` documents itself
+            // as a lower bound, and the exact foreign backlog is the most
+            // honest lower bound a full scan can give.
+            let mut batch = DueBatch::default();
+            for entry in cursors
+                .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                .map_err(|e| be(&e))?
+            {
+                let (key, raw) = entry.map_err(|e| be(&e))?;
+                let cursor: Cursor = serde_json::from_str(raw.value())
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+                if cursor.next_attempt_at > at {
+                    continue;
+                }
+                let (_, task, id) = key.value();
+                if !namespace.owns_id(id) {
+                    batch.unserved = batch.unserved.saturating_add(1);
+                    continue;
+                }
+                if batch.rows.len() >= limit {
+                    // Own rows past the window are neither served nor foreign;
+                    // the scan continues only so the foreign count is whole.
+                    continue;
+                }
+                let Some(value) = configs
+                    .get((tenant.as_str(), task, id))
+                    .map_err(|e| be(&e))?
+                else {
+                    continue;
+                };
+                batch
+                    .rows
+                    .push(registration_from(task, id, value.value(), cursor)?);
+            }
+            Ok(batch)
         })
         .await
     }

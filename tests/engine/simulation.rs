@@ -191,6 +191,11 @@ async fn crash_at(records: &[Record], n: usize, run: RunId) -> Arc<RedbStore> {
         }
         store.append(lease.epoch, vec![a]).await.unwrap();
     }
+    // The rebuilt store models a store whose owner is gone. Released rather
+    // than waited out: `acquire` is a pure claim now, so a held lease — the
+    // fixture's own included — refuses the resume the way a live owner's
+    // would, and what a crash actually leaves is a lease anyone may claim.
+    store.release_lease(run, lease.epoch).await.unwrap();
     store
 }
 

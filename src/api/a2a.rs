@@ -858,6 +858,60 @@ pub struct A2aServer {
     /// See [`Self::filter_scan_budget`] for why this is a ceiling and not a
     /// page size.
     filter_scan_budget: usize,
+    /// How many strict replays one `ListTasks` with `includeArtifacts` may
+    /// perform. See [`Self::artifact_replay_budget`].
+    artifact_replay_budget: usize,
+    /// Artifact projections of **sealed** runs, so a poll loop does not buy a
+    /// strict replay per read. See [`ArtifactCache`].
+    artifact_cache: Arc<std::sync::Mutex<ArtifactCache>>,
+}
+
+/// A bounded in-process cache of sealed runs' artifact projections.
+///
+/// A completed task's artifacts exist only as a projection of its journal, so
+/// every read recovers them by **strict replay** — the most expensive read
+/// this surface performs. The cache is sound because it holds only sealed
+/// runs: a seal is the last record a run ever gets, so the projection is a
+/// pure function of an immutable history and can never go stale. Bounded and
+/// evicting oldest-first, because an unbounded cache is a leak with a
+/// performance story; insertion order is enough where every entry is equally
+/// immutable.
+#[derive(Debug, Default)]
+struct ArtifactCache {
+    map: std::collections::HashMap<RunId, Option<Vec<A2aArtifact>>>,
+    order: std::collections::VecDeque<RunId>,
+}
+
+/// How many sealed runs' artifact projections stay cached per server.
+const ARTIFACT_CACHE_CAPACITY: usize = 256;
+
+/// What one bounded artifact read produced.
+enum ArtifactRead {
+    /// The projection — from the cache or from one counted replay.
+    Artifacts(Option<Vec<A2aArtifact>>),
+    /// The request's replay budget is spent; the caller must say so.
+    OverBudget,
+}
+
+impl ArtifactCache {
+    /// A hit, already wrapped as the read it answers.
+    fn get(&self, run: RunId) -> Option<ArtifactRead> {
+        self.map
+            .get(&run)
+            .map(|artifacts| ArtifactRead::Artifacts(artifacts.clone()))
+    }
+
+    fn insert(&mut self, run: RunId, artifacts: Option<Vec<A2aArtifact>>) {
+        if self.map.insert(run, artifacts).is_none() {
+            self.order.push_back(run);
+        }
+        while self.map.len() > ARTIFACT_CACHE_CAPACITY {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&evicted);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -868,15 +922,15 @@ struct PushRuntime {
 
 /// Durable A2A webhook delivery, driven by an operator scheduler.
 ///
-/// A thin binding of [`DeliveryWorker`](crate::push::DeliveryWorker) to the A2A
-/// projection. The cursor discipline lives in `push` because it has nothing to
-/// do with A2A — it lived here only because A2A was the first caller, which made
-/// the one mechanism an operator most wants reachable only by speaking somebody
-/// else's protocol.
-#[derive(Debug, Clone)]
-pub struct A2aPushWorker {
-    inner: crate::push::DeliveryWorker,
-}
+/// A name, not a type of its own: [`A2aServer::push_worker`] hands back the
+/// [`DeliveryWorker`](crate::push::DeliveryWorker) itself, bound to the A2A
+/// projection. The struct this alias replaced was a pure delegation shell — its
+/// own docs said so — that re-stated the loop's retry ceiling and its default
+/// in a second place, which is two copies of one contract with nothing holding
+/// them together. The cursor discipline lives in `push` because it has nothing
+/// to do with A2A; what is A2A about this worker is only the projection it was
+/// constructed with.
+pub type A2aPushWorker = crate::push::DeliveryWorker;
 
 /// Outcome of one bounded push sweep.
 ///
@@ -914,8 +968,8 @@ impl crate::push::Projection for A2aProjection {
             .map_err(|error| crate::core::StoreError::Backend(error.to_string()))
     }
 
-    fn owns(&self, registration: &crate::push::PushRegistration) -> bool {
-        !crate::push::is_operator_id(&registration.config.id)
+    fn namespace(&self) -> crate::push::PushNamespace {
+        crate::push::PushNamespace::Caller
     }
 }
 
@@ -1102,6 +1156,8 @@ impl A2aServer {
             skills,
             push: None,
             filter_scan_budget: FILTER_SCAN_BUDGET,
+            artifact_replay_budget: ARTIFACT_REPLAY_BUDGET,
+            artifact_cache: Arc::new(std::sync::Mutex::new(ArtifactCache::default())),
         })
     }
 
@@ -1123,6 +1179,66 @@ impl A2aServer {
     pub fn filter_scan_budget(mut self, budget: usize) -> Self {
         self.filter_scan_budget = budget.max(1);
         self
+    }
+
+    /// Bound what one `ListTasks` with `includeArtifacts` may cost.
+    ///
+    /// A completed task's artifacts are recovered by strict replay, and a page
+    /// holds up to a hundred tasks — so without a ceiling, one authenticated
+    /// request buys a hundred full replays, per request, forever. Replays
+    /// served from the sealed-run cache cost nothing and do not count; past
+    /// the budget a task's artifacts are **omitted and marked** (see
+    /// [`ARTIFACTS_OMITTED_KEY`]) rather than the request refused, because
+    /// unlike `totalSize` an artifact list is per-task enrichment: omitting
+    /// one is honest as long as it does not look complete, and `GetTask` on
+    /// the marked id recovers exactly that task's artifacts.
+    #[must_use]
+    pub fn artifact_replay_budget(mut self, budget: usize) -> Self {
+        self.artifact_replay_budget = budget.max(1);
+        self
+    }
+
+    /// A task's artifacts, replaying at most once per sealed run.
+    ///
+    /// Consults [`ArtifactCache`] first and fills it for completed runs; the
+    /// uncached fall-through is [`task_artifacts`]. `budget` is decremented on
+    /// every actual replay, and `None` for the budget means unmetered — the
+    /// single-task paths, where one replay is the request's stated cost.
+    ///
+    /// A budget hit comes back as [`ArtifactRead::OverBudget`], never as an
+    /// absent list, so the caller must decide how to mark it — silence here
+    /// would be a bounded result shaped exactly like a complete one.
+    async fn artifacts_bounded(
+        &self,
+        run: RunId,
+        state: TaskState,
+        budget: Option<&mut usize>,
+    ) -> Result<ArtifactRead, crate::core::RuntimeError> {
+        if state != TaskState::Completed {
+            return Ok(ArtifactRead::Artifacts(None));
+        }
+        if let Some(cached) = self
+            .artifact_cache
+            .lock()
+            .expect("the artifact cache mutex is never poisoned")
+            .get(run)
+        {
+            return Ok(cached);
+        }
+        if let Some(budget) = &budget
+            && **budget == 0
+        {
+            return Ok(ArtifactRead::OverBudget);
+        }
+        let artifacts = task_artifacts(&self.runtime, run, state).await?;
+        if let Some(budget) = budget {
+            *budget -= 1;
+        }
+        self.artifact_cache
+            .lock()
+            .expect("the artifact cache mutex is never poisoned")
+            .insert(run, artifacts.clone());
+        Ok(ArtifactRead::Artifacts(artifacts))
     }
 
     /// Publish a **signed** card.
@@ -1156,7 +1272,9 @@ impl A2aServer {
     /// cursor advances only after a receiver returns 2xx, so a crash between
     /// POST and acknowledgement persistence repeats an event and never loses
     /// one. Call [`A2aServer::push_worker`] before consuming the server into its
-    /// router and schedule [`A2aPushWorker::run_once`] from every instance.
+    /// router and schedule
+    /// [`DeliveryWorker::run_once`](crate::push::DeliveryWorker::run_once) from
+    /// every instance.
     pub fn with_push(
         mut self,
         store: Arc<dyn crate::push::PushStore>,
@@ -1172,17 +1290,24 @@ impl A2aServer {
     }
 
     /// A cloneable worker handle, when push is configured.
+    ///
+    /// The worker is [`crate::push::DeliveryWorker`] itself, bound to the A2A
+    /// projection — rows belonging to an operator
+    /// [`Outbox`](crate::push::Outbox) are left alone, because the projection
+    /// declares the caller namespace and the store's due query filters on it.
+    /// Retry ceiling, backoff and abandonment reporting are the loop's own;
+    /// see its docs rather than a restatement here.
     #[must_use]
     pub fn push_worker(&self) -> Option<A2aPushWorker> {
-        self.push.clone().map(|push| A2aPushWorker {
-            inner: crate::push::DeliveryWorker::new(
+        self.push.clone().map(|push| {
+            crate::push::DeliveryWorker::new(
                 Arc::clone(self.runtime.journal()),
                 push.store,
                 push.transport,
                 Arc::new(A2aProjection {
                     runtime: Arc::clone(&self.runtime),
                 }),
-            ),
+            )
         })
     }
 
@@ -1351,57 +1476,6 @@ impl A2aServer {
     }
 }
 
-impl A2aPushWorker {
-    /// How many consecutive failures a receiver gets before it is abandoned.
-    ///
-    /// The delivery loop's own default, named here too because it is part of
-    /// this type's contract and a reader should not have to follow a link to
-    /// find out what happens to a webhook that stops answering.
-    pub const DEFAULT_MAX_ATTEMPTS: u32 = crate::push::DeliveryWorker::DEFAULT_MAX_ATTEMPTS;
-
-    /// Change the ceiling above.
-    ///
-    /// Zero is refused, for the reason [`WitnessQuorum`] refuses an empty
-    /// quorum: it would spell *never deliver anything* as if it were a retry
-    /// policy.
-    ///
-    /// # Panics
-    ///
-    /// If `attempts` is zero.
-    ///
-    /// [`WitnessQuorum`]: crate::journal::WitnessQuorum
-    #[must_use]
-    pub fn max_attempts(self, attempts: u32) -> Self {
-        Self {
-            inner: self.inner.max_attempts(attempts),
-        }
-    }
-
-    /// Deliver at most `limit` due registrations once.
-    ///
-    /// `at` is Unix time in seconds and is explicit to make backoff tests
-    /// deterministic. The operator owns scheduling and the clock.
-    /// Multiple workers may race and produce duplicates, which A2A receivers
-    /// must tolerate; cursor updates use monotonic advancement, so they cannot
-    /// lose an event.
-    ///
-    /// Rows belonging to an operator [`Outbox`](crate::push::Outbox) are left
-    /// alone: they share this store, and delivering one with the A2A projection
-    /// would post a `StreamResponse` to a deployment's own bus.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError`](crate::core::StoreError) when the push store or a
-    /// journal cannot be read.
-    pub async fn run_once(
-        &self,
-        at: u64,
-        limit: usize,
-    ) -> Result<PushSweepReport, crate::core::StoreError> {
-        self.inner.run_once(at, limit).await
-    }
-}
-
 /// The public Agent Card.
 ///
 /// Unauthenticated on purpose — see the module docs. It is derived from the
@@ -1543,7 +1617,7 @@ async fn stream_method(
             // for at that point.
             let input = Tainted::from_source(
                 message.to_input(),
-                SourceId::new(format!("peer:{}", caller.actor)),
+                SourceId::new(super::peer_source(&caller.actor)),
             );
             match spawn_a2a(&server, &skill, input, &message).await {
                 Ok(run) => {
@@ -1796,7 +1870,11 @@ async fn continue_task(
     }
 
     let event = crate::core::InboundEvent {
-        source: format!("a2a:peer:{}", caller.actor),
+        // `peer:{actor}`, the one spelling a counterparty's provenance has on
+        // every transport — see [`super::peer_source`]. This source becomes the
+        // delivered value's provenance, so a transport-qualified variant here
+        // would give one counterparty two names.
+        source: super::peer_source(&caller.actor),
         id: message.message_id.clone(),
         kind,
         correlation,
@@ -1865,7 +1943,7 @@ async fn send_message(
     // a skill that wants to act on this has to pass a gate to do it.
     let input = Tainted::from_source(
         message.to_input(),
-        SourceId::new(format!("peer:{}", caller.actor)),
+        SourceId::new(super::peer_source(&caller.actor)),
     );
 
     // Non-blocking: the spec requires returning as soon as the task exists,
@@ -2175,9 +2253,16 @@ async fn load_task(
 
     let mut task = task_of(id, state, &detail, case.clone());
     task.history = task_history(id, &records, history_length, case.as_deref());
-    task.artifacts = task_artifacts(&server.runtime, id, state)
+    // Unmetered: one task, one replay, and the sealed-run cache spares the
+    // poll loop that reads the same finished task every few seconds.
+    task.artifacts = match server
+        .artifacts_bounded(id, state, None)
         .await
-        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
+        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?
+    {
+        ArtifactRead::Artifacts(artifacts) => artifacts,
+        ArtifactRead::OverBudget => unreachable!("an unmetered read has no budget to exceed"),
+    };
     serde_json::to_value(task)
         .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))
 }
@@ -2208,6 +2293,29 @@ const TASK_SCAN: usize = 256;
 /// without it the cost was every run the tenant ever wrote, per request,
 /// forever.
 const FILTER_SCAN_BUDGET: usize = 1024;
+
+/// Default for [`A2aServer::artifact_replay_budget`]: the most strict replays
+/// one `ListTasks` with `includeArtifacts` may perform.
+///
+/// A cost ceiling in the same spirit as [`FILTER_SCAN_BUDGET`], for the other
+/// caller-priced read: each completed task's artifacts are a full strict
+/// replay, a page holds up to a hundred tasks, and the sealed-run cache means
+/// only first sight of a run pays it. Sixteen replays is a bounded worst case
+/// per request; a page that wanted more marks the remainder omitted, and a
+/// second request finds the first sixteen cached.
+const ARTIFACT_REPLAY_BUDGET: usize = 16;
+
+/// The task-metadata key marking artifacts withheld by the replay budget.
+///
+/// A bounded result must not be shaped like a complete one — a silent
+/// truncation reads as an answer. A
+/// task past the budget is returned without artifacts — indistinguishable from
+/// several honest states — so the omission says its own name, in `Task.metadata`
+/// because that is the field A2A gives a server for exactly this kind of
+/// annotation; a new top-level response member would be a schema no client
+/// expects. `GetTask` on the marked id recovers the artifacts, and warms the
+/// cache doing it.
+pub const ARTIFACTS_OMITTED_KEY: &str = "io.agentplane.a2a/artifactsOmitted";
 
 #[allow(clippy::too_many_lines)]
 async fn list_tasks(
@@ -2375,12 +2483,24 @@ async fn list_tasks(
         String::new()
     };
     let mut tasks = Vec::with_capacity(visible.len());
+    // The replay budget for this whole request. Cache hits are free; each
+    // cache miss is a strict replay and spends one. Past it a task's artifacts
+    // are omitted **and marked** — see [`ARTIFACTS_OMITTED_KEY`] for why the
+    // omission must say its own name.
+    let mut replays_left = server.artifact_replay_budget;
     for (run, _, task) in visible {
         let mut task = task.clone();
         if params.include_artifacts {
-            task.artifacts = task_artifacts(&server.runtime, *run, task.status.state)
+            match server
+                .artifacts_bounded(*run, task.status.state, Some(&mut replays_left))
                 .await
-                .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
+                .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?
+            {
+                ArtifactRead::Artifacts(artifacts) => task.artifacts = artifacts,
+                ArtifactRead::OverBudget => {
+                    task.metadata = Some(json!({ ARTIFACTS_OMITTED_KEY: true }));
+                }
+            }
         }
         tasks.push(task);
     }
@@ -2504,6 +2624,11 @@ fn task_history(
     })
 }
 
+/// The uncached artifact projection: one strict replay of a completed run.
+///
+/// Server request paths go through [`A2aServer::artifacts_bounded`], which
+/// caches sealed runs and meters `ListTasks`; this stays the raw read for the
+/// stream module, whose per-record use is bounded by the stream itself.
 pub(super) async fn task_artifacts(
     runtime: &Runtime,
     run: RunId,
@@ -2579,6 +2704,14 @@ async fn cancel_task(
         .await
         .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))?;
 
+    // The same resolution every other path uses, from the records already in
+    // hand: A2A 1.0 puts `contextId` on every task, and the one place that
+    // hard-coded it absent handed a canceling caller a task it could not
+    // continue or correlate.
+    let case = records
+        .iter()
+        .find_map(|record| record.body.case.map(|case| case.to_string()));
+
     // Still `WORKING`, deliberately. The request is durable, and the run stops
     // at its next step boundary — reporting `CANCELED` here would claim it had
     // already stopped and unwound, which is exactly what has not happened yet.
@@ -2586,7 +2719,7 @@ async fn cancel_task(
         id,
         TaskState::Working,
         "cancellation requested",
-        None,
+        case,
     ))
     .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))
 }

@@ -32,8 +32,206 @@ archaeology presented as a record.
 
 ## [Unreleased]
 
-Two audit rounds, two structural closures: recovery gained its initiator, and
-the case layer crossed the export boundary.
+Three audit rounds. Recovery gained its initiator, the case layer crossed the
+export boundary, and a full-surface audit closed the rest — most of it one
+shape repeated: a gate correct on the first pass and absent on the second, a
+crash or a resume being the pass nobody re-checked.
+
+### Fixed — security: the second pass is the same run as the first
+
+- **Resume enforces every gate on its live tail.** A resumed run is a live run
+  from its frontier on, and the tail past the recorded prefix ran under fewer
+  gates than the first attempt: the egress and sensitivity ceilings, the
+  mutates strengthening on tool grants, the delegation depth and the step
+  budget were applied live and not on resume — so a crash *removed controls*,
+  and the run that finished was not the run that was admitted. The resume tail
+  now dispatches through the same gate stack, and manifest-sink and delegation
+  refusals are journaled as `PolicyDenied` under the key the refused dispatch
+  would have carried, so a strict or resumed pass consumes the refusal instead
+  of re-deciding a verdict that is already history.
+
+- **The lease protocol split: `acquire` claims, `renew` extends** (breaking:
+  `JournalStore::renew` is a required method; same-owner re-acquire of a held
+  lease is now an error). `acquire` used to renew for the same owner, and two
+  failures hid in the convenience. A heartbeat racing its own run's conclusion
+  could re-take the lease the conclusion had just *released* — a concluded run
+  with a live lease, which the recovery sweep then "recovers" forever. And a
+  second entry point on the same instance — a cancel, a delivery — could
+  "acquire" a run mid-execution and drive a second execution under the **same
+  epoch**, the split-brain fencing exists to prevent and cannot see. `acquire`
+  is now a pure claim that always bumps the epoch and refuses a held lease
+  even from its own holder; heartbeats call `renew`, which succeeds only for
+  the exact `(owner, epoch)` and keeps it. Beside it: cancelling a live run is
+  acknowledged and observed at the next step boundary, and the claimed-event/
+  lease race — a delivery dying between claim and resume — is finished by a
+  new sweep pass, reported as `SweepReport.events_redelivered`.
+
+- **Cedar fails closed on evaluation errors.** Cedar is total: a `when` clause
+  reading an attribute that does not exist makes the rule silently vanish, and
+  an `Allow` could arrive with evaluation errors beside it — a policy set that
+  was *broken*, reported as permission. An `Allow` accompanied by evaluation
+  errors is now a denial, reported as malformed rather than as a refusal,
+  because "the rules say no" and "the rules are broken" call for opposite
+  responses.
+
+- **Exhaustion pauses instead of unwinding.** Unwinding on exhaustion made the
+  three ends of an exhausted run contradict each other: the work was reversed,
+  the run stayed resumable, and the resume then reported success over a world
+  where the work no longer stood. An exhausted run's mutations now stand,
+  because the operator's two honest options both need them standing: raise the
+  ceiling and resume — the resume re-evaluates the recorded budget refusal
+  against the current ledger and journals **`BudgetReadmitted`** (new record)
+  naming the ceiling it continued under — or cancel, which unwinds. One door
+  closes with it: a run that has already compensated is closed to resume, with
+  "start a fresh run" as the refusal, because continuing over reversed work
+  would report success about a world where it no longer stands.
+
+- **Doubt is terminal for retries and opaque to cancellation.** A mutating
+  effect whose retries end `InDoubt` quarantines the run rather than failing
+  it — a failure invites the unwind, and compensating a call that may have
+  landed is a reversal for work nobody can account for. Cancellation obeys the
+  same rule from the other direction: it refuses to unwind through recorded
+  doubt.
+
+- **Strict replay fails on effects the build never requested.** A build that
+  asked for *fewer* effects than history holds used to pass strict — the
+  verification checked what ran, not what remained — so a deleted step read as
+  a verified history. Strict now fails naming the first unconsumed key.
+
+- **Admission and its error paths clean up after themselves.** A refused
+  admission used to leak its lease and its quota slot, throttling the tenant
+  on ghosts; both are released now. The sweeper writes each decision durably
+  before applying it; a census failure degrades the metrics report instead of
+  discarding it; strict replay no longer writes deadline registrations; and a
+  resume acquires the lease *before* reading history — reading first raced the
+  owner it was about to fence — and no longer duplicates `StepFinished`
+  records.
+
+- **A declarative tool loop honours `spec.output.schema` on every turn** and
+  validates the settled answer. Which turn answers is the model's choice, so a
+  schema attached only where the runtime guessed the answer would land is a
+  contract the model can step around by answering a turn early.
+
+- **Three decorative-control shapes are refused at parse.** A mutating grant
+  needs at least one protected field carrying a trust or source rule — a
+  ceiling-only field bounds how *secret* an argument may be, not who authored
+  it, so the model's untrusted completion filled every authority-bearing field
+  unconstrained. `oversight.approval: tools-only` requires every mutating
+  grant to declare `requires_approval` — a mode that gates tool calls while
+  the transfer beside them runs unattended is a declared control nothing
+  enforces. And the quarantined role's `max_tokens`/`reasoning_effort` are now
+  enforced on every call the role serves (`ModelRole`) rather than parsed and
+  dropped.
+
+- **A completion's label floor is its egress ceiling.** A caller who raised
+  `max_sensitivity` to show the model a confidential prompt has said what
+  class of data the answer derives from, and a completion labelled below its
+  own prompt is a laundering primitive — ask the model to restate the secret
+  and read it back a level down. The output sensitivity floor now derives from
+  the ceiling, and streamed labels never dip below the terminal floor.
+
+### Fixed — storage and sealing
+
+- **Postgres, correctness pass**: seal is fenced and transactional;
+  `match_waiter` locks the subscription row; a task claim's CAS checks state;
+  batches cannot span runs; the sweep cutoff is `<=` (an obligation due *at*
+  the tick was invisible to it); dead letters carry their correlation keys;
+  a write against a missing row returns `NotFound` instead of succeeding over
+  nothing; unique violations are classified by constraint; new indexes and
+  `CHECK` constraints. And a URL demanding TLS (`sslmode=require` or stricter)
+  is **refused rather than silently downgraded** to plaintext — libpq's
+  `sslmode` is a gradation, not a switch, and the module doc now lays out the
+  shapes that need no connector and the sidecar answer for the one that does.
+
+- **Memory lifecycle**: an expired item keeps its derivation edges, so an
+  erasure cascade routes *through* the tombstone instead of stopping at it —
+  summaries of an expired source were unreachable exactly when the request
+  mattered. The Postgres expiry sweep takes the graph lock. And sliding
+  retention opens its window at the write, with `expires_at` a hard ceiling
+  (`min`, not `max`) — an untouched item now expires instead of outliving the
+  bound its declaration promised.
+
+- **The journal's sealed set widened, and the envelope binds identity.**
+  Sealed: `RunAdmitted.input`, `EffectStarted.descriptor.args`,
+  `EffectDone.output`, `EffectReconciled.output`, `EffectFailed.error` (the
+  message only), `Note.text`, `PlanFrozen.plan`. The last four were caller
+  data in the clear beside sealed prompts — a reconciliation probe's output is
+  the same data an `EffectDone`'s is, and a frozen plan embeds the trusted
+  input it was compiled from. AAD binds tenant and record identity, so
+  ciphertext moved to another record fails to authenticate. `blob::erase_run`
+  is the erasure verb for case-less runs (sealed under `tenant/<run>`), and
+  push webhook credentials seal at rest — `SealedPush`, wrapped automatically
+  by `RuntimeBuilder::keyring`.
+
+- **`agentplane audit` binds the verified chain head to the Merkle leaf.** A
+  truncated-but-internally-consistent prefix of a sealed run verified: the
+  prefix's chain passes on its own, and the log's genuine leaf passes against
+  the genuine tree — two halves of two different claims. The leaf is now held
+  to the recomputed head before the tree math, and a mismatch is a finding:
+  the served history is not the one the checkpoint commits to.
+
+### Fixed — wire
+
+- **Push delivery filters ownership in the store query** and reports foreign
+  backlog as `unserved` — visibility for the operator, instead of a worker
+  paging past registrations it will never serve. `A2aPushWorker` is now a type
+  alias of `push::DeliveryWorker`.
+- **Peer failures are honest about what is known**: HTTP 5xx and unknown RPC
+  errors are `PeerError::InDoubt` — "the outcome is unknown" — and `TimedOut`
+  means a timeout, nothing else. Mapping a 5xx to a retryable failure is how a
+  peer's half-applied task gets a second application.
+- **A2A**: `CancelTask` carries `contextId`; `ListTasks` artifact inclusion is
+  budgeted, with tasks past the budget marked
+  `io.agentplane.a2a/artifactsOmitted` and a sealed-run cache so the
+  reassembly is not paid twice; peer provenance is `peer:{actor}` everywhere,
+  one spelling for every path a peer's data enters.
+- **Media ingest fails loudly on a blob store returning a foreign digest** —
+  trusting the store's answer would journal an address whose bytes are
+  somebody else's. Bracketed IPv6 literals now work, judged by the address
+  policy rather than dying in DNS resolution.
+
+### Changed — DX, breaking, each with its one-line migration
+
+- **`Effect::source()` names the concrete source**: `tool://{server}/{name}`,
+  `model:{provider}/{model}`, `agent/{capability}`. The family spellings no
+  longer match — rewrite `allowed_sources: [effect:model.complete]` as the
+  concrete identity, e.g. `model:anthropic/claude-sonnet-5`.
+- **`cx.sink_with(&args, |v| Effect::new(.., v))` is the dispatch shape** —
+  move the effect's construction into the closure and delete the
+  `.peek().clone()`; two-arg `sink` remains for effects binding their outbound
+  value internally.
+- **`Runtime::builder_on(store)`** wires all six stores of a `FullBackend` in
+  one call — replace the six-cast chain.
+- **`SkillDescriptor::provides` defaults to the skill name** — delete
+  `.provides(x)` wherever `x` is the name; keep it where the capability
+  genuinely differs (declaring replaces the default, it does not add).
+- **The prelude re-exports `async_trait`** — drop the `cargo add async-trait`
+  step; `use agentplane::prelude::*` is enough.
+- **`RunOutcome::success() -> Result<Tainted<Value>, RunFailure>`** — replace
+  the status match with `.success()?` where anything short of an answer is an
+  error.
+- **`cx.complete(prompt)` / `complete_with`** — a manifest-governed skill uses
+  the declaration's model through the plane's registry; delete the
+  `Arc<dyn ModelProvider>` field from the skill struct.
+- **Tool wire names render `.` as `-`** (`agent__blog-research`), and `-` or
+  `__` inside a tool/server component is refused at declaration — rename the
+  component; fixtures asserting the old wire spelling need the new one.
+- **CLI**: `replay <run-id> --store <db> --manifest <file> [--strict]`
+  replaces `run --replay/--strict`; `run --input -` reads stdin; new
+  `card <manifest> --url <base>` prints the derived Agent Card.
+
+### Changed — the version hard cut
+
+- **`export::FORMAT_VERSION` and `canon::VERSION` are both 1.** The case-layer
+  export below landed as "format 2", and the numbers were starting to tell a
+  version story for a format nobody has frozen — pre-freeze, the standing
+  policy is a hard cut, and a version sequence implies a compatibility promise
+  this stage deliberately does not make. The constants collapsed back to 1;
+  the entry below keeps its name because that is what the change was called
+  when it landed, and the case lines are simply part of format 1.
+  `RunAdmitted.canon` is required rather than defaulted, and an export carries
+  each record's **raw wire bytes** — verification rehashes those, holding the
+  file to the writer's bytes rather than to this build's re-serialization.
 
 ### Added — the case layer exports, verifies and restores (format 2)
 

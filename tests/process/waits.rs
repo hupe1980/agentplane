@@ -814,3 +814,93 @@ async fn an_awaited_events_sender_is_in_its_provenance_and_survives_replay() {
          so every taint gate downstream may reach a different verdict"
     );
 }
+
+// ── Delivery racing a live owner ────────────────────────────────────────────
+
+/// An event delivered while another instance holds the run is never parked.
+///
+/// The race shape: the event arrives in the window between the run
+/// registering its subscription and its owner finishing the suspension
+/// bookkeeping — the store claims the event for the run, and the resume then
+/// finds the lease still held. That used to be fatal in the quietest possible
+/// way: the delivery failed, the counterparty's retry deduplicated against
+/// the *claimed* event, and nothing ever resumed the run. A message that
+/// arrived in time, parked forever behind its own claim.
+///
+/// Now the delivery retries under a bound, gives up honestly when the owner
+/// outlives it, and the sweep's redelivery pass finishes the job once the
+/// owner concludes — so the bound bounds latency, never delivery.
+#[tokio::test]
+async fn a_delivery_racing_a_live_owner_is_finished_by_the_sweep() {
+    let f = fixture("D-9");
+
+    let out =
+        f.rt.run_correlated(
+            "demo.request",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-9")],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended());
+
+    // Another instance holds the run — the concluding-owner window, stretched
+    // past the delivery's bounded retry.
+    let journal = f.store.clone() as Arc<dyn JournalStore>;
+    let lease = journal
+        .acquire(
+            out.run_id,
+            "other-instance",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+    let delivery =
+        f.rt.deliver(&reply("EV-9", "D-9", json!({ "status": "ok" })))
+            .await
+            .unwrap();
+    assert_eq!(
+        delivery,
+        Delivery::Buffered,
+        "a delivery that cannot resume yet is held, not failed"
+    );
+
+    // The counterparty retries; deduplication holds, so no retry can drive
+    // the run. This is exactly why the sweep pass below has to exist.
+    assert_eq!(
+        f.rt.deliver(&reply("EV-9", "D-9", json!({ "status": "ok" })))
+            .await
+            .unwrap(),
+        Delivery::Duplicate
+    );
+
+    // The owner concludes; the next sweep finishes the delivery.
+    journal
+        .release_lease(out.run_id, lease.epoch)
+        .await
+        .unwrap();
+    let report =
+        f.rt.sweep(Timestamp::now_utc(), std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+    assert_eq!(
+        report.events_redelivered, 1,
+        "the sweep must finish the delivery the race interrupted — the event \
+         is otherwise parked forever behind its own claim"
+    );
+    assert!(
+        journal
+            .runs_by_outcome("succeeded", 10)
+            .await
+            .unwrap()
+            .contains(&out.run_id),
+        "the resumed run completed with the delivered reply"
+    );
+    assert_eq!(
+        f.sends.load(Ordering::SeqCst),
+        1,
+        "the request went out once"
+    );
+}

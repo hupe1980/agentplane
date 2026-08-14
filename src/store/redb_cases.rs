@@ -596,6 +596,9 @@ impl CaseStore for RedbStore {
                     .is_none()
                 {
                     let mut runs = w.open_table(CASE_RUNS).map_err(|e| be(&e))?;
+                    // Zero-based, matching `import_case`'s enumeration and the
+                    // SQL backend — one rule for what position the first run
+                    // holds, whichever door it came through.
                     let next = runs
                         .range(
                             (tenant.as_str(), c.as_str(), 0u64)
@@ -605,7 +608,7 @@ impl CaseStore for RedbStore {
                         .next_back()
                         .transpose()
                         .map_err(|e| be(&e))?
-                        .map_or(1, |(k, _)| k.value().2 + 1);
+                        .map_or(0, |(k, _)| k.value().2 + 1);
                     runs.insert((tenant.as_str(), c.as_str(), next), r.as_str())
                         .map_err(|e| be(&e))?;
                     seen.insert((tenant.as_str(), c.as_str(), r.as_str()), next)

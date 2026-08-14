@@ -98,13 +98,26 @@ pub struct MemoryItem {
     /// Exact-version reads remain available for replay until an explicit
     /// lifecycle sweep erases the memory. The cutoff is evaluated against the
     /// journaled `Recall::as_of`, never an ambient store clock.
+    ///
+    /// This is a **hard ceiling** and it is immutable: sliding access
+    /// retention may shorten a memory's life below it, and nothing — no touch,
+    /// however recent — extends a life past it. The effective expiry is the
+    /// *earlier* of this and the access window.
     #[serde(
         default,
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
     pub expires_at: Option<Timestamp>,
-    /// Sliding retention window refreshed only by an explicit journaled touch.
+    /// Sliding retention window, in seconds of disuse.
+    ///
+    /// The window opens **at the write** — the write is itself an access — so
+    /// an untouched memory expires `created_at + window` rather than living
+    /// forever waiting for its first touch, and each explicit journaled touch
+    /// slides it forward. It only ever operates *inside* `expires_at`: sliding
+    /// retention answers "collect this once nobody reads it", the fixed expiry
+    /// answers "this is gone on Thursday whatever happens", and where both are
+    /// set the earlier instant wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_retention_seconds: Option<u64>,
     /// Set when a later version replaced this one.
@@ -160,6 +173,9 @@ impl MemoryWrite {
     }
 
     /// Expire this memory from fresh recall at a deterministic instant.
+    ///
+    /// A hard ceiling: a sliding window set beside it may collect the memory
+    /// earlier, and no touch carries it past this.
     #[must_use]
     pub const fn expires_at(mut self, at: Timestamp) -> Self {
         self.expires_at = Some(at);
@@ -167,6 +183,11 @@ impl MemoryWrite {
     }
 
     /// Keep the memory for this long after each explicitly journaled recall.
+    ///
+    /// The window opens at the write itself, so an untouched memory is
+    /// collected `seconds` after it was stored rather than kept forever
+    /// waiting for a first touch — and it never extends past an `expires_at`
+    /// set beside it.
     #[must_use]
     pub const fn retain_after_access(mut self, seconds: u64) -> Self {
         self.access_retention_seconds = Some(seconds);
@@ -736,11 +757,21 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// Whether an id is currently protected by legal hold.
     async fn legal_hold(&self, id: &str) -> Result<bool, StoreError>;
 
-    /// Atomically erase current memories whose `expires_at <= at` unless held.
-    /// Returns the number of memory ids erased.
+    /// Atomically erase current memories whose effective expiry has passed,
+    /// unless held. Returns the number of memory ids erased.
+    ///
+    /// The effective expiry is `min(expires_at, access window)` — the hard
+    /// ceiling wins, and a lapsed sliding window collects an item its ceiling
+    /// would still have kept. The cutoff is inclusive (`<= at`), and the sweep
+    /// keeps derivation edges in both directions exactly as `forget` does, so
+    /// a later cascading erasure still routes through the tombstone.
     async fn sweep_expired(&self, at: Timestamp) -> Result<usize, StoreError>;
 
     /// Refresh sliding access retention for current ids at a journaled instant.
+    ///
+    /// Slides each touched id's window to `at + window`. It cannot extend a
+    /// life past an `expires_at` — that ceiling is immutable, and both recall
+    /// and the sweep take the earlier of the two.
     async fn touch(&self, ids: &[String], at: Timestamp) -> Result<(), StoreError>;
 }
 

@@ -205,6 +205,33 @@ pub enum Finding {
     #[error("run {run} claims a position the log's own root does not support")]
     BadInclusion { run: RunId },
 
+    /// The chain the store *served* is not the chain the log committed to.
+    ///
+    /// The one that catches a truncated-but-internally-consistent record set:
+    /// a prefix of a chain verifies on its own, and the leaf the log holds is
+    /// the terminal hash of the *whole* run — so an audit that verified the
+    /// records and then checked the store-supplied leaf against the tree,
+    /// without ever holding the two to each other, was verifying two halves of
+    /// two different claims.
+    #[error(
+        "run {run}: the log's leaf is not the verified chain's head — records were \
+         removed or replaced after sealing, and the served history is not the one \
+         the checkpoint commits to"
+    )]
+    LeafMismatch { run: RunId },
+
+    /// The sealing record's own claim disagrees with the chain it sits in.
+    ///
+    /// `RunSealed.chain_head` is the head the conclusion was drawn over — by
+    /// construction, the record's own `prev_hash`. A mismatch means the
+    /// conclusion was composed against a different history than the one it was
+    /// appended to, which no honest writer produces.
+    #[error(
+        "run {run}: the sealing record claims a chain head that is not the head it \
+         sits on — the conclusion was drawn over a different history"
+    )]
+    SealClaim { run: RunId },
+
     /// The one that needs an outside artifact.
     #[error(
         "the log cannot prove it only grew since the checkpoint of size {old_size} — \
@@ -260,6 +287,9 @@ enum Placement {
     /// The run's own records carry a sealing conclusion, and the log holds no
     /// leaf for it: history the log no longer commits to.
     NotInLog,
+    /// The log holds a leaf that is not the verified chain's head: the served
+    /// records are not the history the log committed to.
+    LeafMismatch,
     /// In the log by its own claim, at a position the root does not support.
     BadInclusion,
     /// The log grew faster than the audit could catch its checkpoint up, so
@@ -280,6 +310,7 @@ async fn placement(
     store: &Arc<dyn JournalStore>,
     run: RunId,
     records: &[Record],
+    head: Digest,
     current: &mut Checkpoint,
 ) -> Result<Placement, StoreError> {
     let Some(inc) = store.inclusion_proof(run).await? else {
@@ -303,6 +334,17 @@ async fn placement(
             Placement::Open
         });
     };
+
+    // The leaf must be the verified chain's own head, checked **before** the
+    // tree math and independent of any checkpoint race. `inc.seal` is
+    // store-supplied; the head was recomputed from the served bytes. Verifying
+    // each without holding them to each other let a store serve a truncated —
+    // but internally consistent — prefix of a sealed run and have both halves
+    // pass: the prefix's chain verifies, and the log's genuine leaf verifies
+    // against the genuine tree.
+    if inc.seal != head {
+        return Ok(Placement::LeafMismatch);
+    }
 
     if inc.size != current.size {
         *current = store.checkpoint().await?;
@@ -372,6 +414,50 @@ fn warrant_in(run: RunId, records: &[Record]) -> Option<Warrant> {
     })
 }
 
+/// What an audit cannot conclude from the evidence it was given.
+///
+/// Reported up front and as loudly as failures: an audit that quietly skipped
+/// a check it had no inputs for, and then said "verified", is the
+/// reassuring-but-empty artifact this module exists to avoid.
+fn missing_evidence(evidence: &Evidence<'_>) -> Vec<String> {
+    let mut out = Vec::new();
+    if evidence.verifier.is_none() {
+        out.push(
+            "signatures — no public key was supplied, so this audit cannot say who \
+             wrote anything"
+                .to_owned(),
+        );
+    }
+    if evidence.prior.is_none() {
+        out.push(
+            "deletion — no earlier checkpoint was supplied, so this audit cannot \
+             detect a run that was removed. Every check below passes over a store \
+             somebody emptied"
+                .to_owned(),
+        );
+    }
+    out
+}
+
+/// The sealing record's own claim, held to the chain it sits in.
+///
+/// `RunSealed.chain_head` is the head the conclusion was drawn over, which is
+/// by construction its own record's `prev_hash` — checkable only after the
+/// chain has verified, so `prev_hash` is evidence rather than input. A run
+/// with no conclusion has made no claim, and holds vacuously.
+fn seal_claim_holds(records: &[Record]) -> bool {
+    records
+        .iter()
+        .rev()
+        .find_map(|r| match r.kind() {
+            crate::journal::RecordKind::RunSealed { chain_head, .. } => {
+                Some(*chain_head == r.prev_hash)
+            }
+            _ => None,
+        })
+        .unwrap_or(true)
+}
+
 /// Check a plane's history.
 ///
 /// `runs` is what to look at — an auditor sampling, or everything they were
@@ -389,27 +475,11 @@ pub async fn audit(
 ) -> Result<AuditReport, StoreError> {
     let mut current = store.checkpoint().await?;
     let mut findings = Vec::new();
-    let mut not_checked = Vec::new();
+    let mut not_checked = missing_evidence(evidence);
     let mut sound = Vec::new();
     let mut releases = Vec::new();
     let mut warrants = Vec::new();
     let mut open_runs = 0usize;
-
-    if evidence.verifier.is_none() {
-        not_checked.push(
-            "signatures — no public key was supplied, so this audit cannot say who \
-             wrote anything"
-                .to_owned(),
-        );
-    }
-    if evidence.prior.is_none() {
-        not_checked.push(
-            "deletion — no earlier checkpoint was supplied, so this audit cannot \
-             detect a run that was removed. Every check below passes over a store \
-             somebody emptied"
-                .to_owned(),
-        );
-    }
 
     // ── Per run ────────────────────────────────────────────────────────────
     for &run in runs {
@@ -420,11 +490,23 @@ pub async fn audit(
             }
             None => Record::verify_chain(&records, Digest::ZERO),
         };
-        if let Err(e) = chain {
-            findings.push(Finding::Chain {
-                run,
-                detail: e.to_string(),
-            });
+        // The head is kept, not merely the verdict: it is the one value that
+        // ties the verified bytes to the log's leaf below, and discarding it
+        // was what let the two halves of this audit verify two different
+        // histories.
+        let head = match chain {
+            Ok(head) => head,
+            Err(e) => {
+                findings.push(Finding::Chain {
+                    run,
+                    detail: e.to_string(),
+                });
+                continue;
+            }
+        };
+
+        if !seal_claim_holds(&records) {
+            findings.push(Finding::SealClaim { run });
             continue;
         }
 
@@ -435,13 +517,14 @@ pub async fn audit(
         releases.extend(releases_in(run, &records));
         warrants.extend(warrant_in(run, &records));
 
-        match placement(store, run, &records, &mut current).await? {
+        match placement(store, run, &records, head, &mut current).await? {
             Placement::Sound => sound.push(run),
             Placement::Open => {
                 open_runs += 1;
                 sound.push(run);
             }
             Placement::NotInLog => findings.push(Finding::NotInLog { run }),
+            Placement::LeafMismatch => findings.push(Finding::LeafMismatch { run }),
             Placement::BadInclusion => findings.push(Finding::BadInclusion { run }),
             Placement::Unpinned => not_checked.push(format!(
                 "run {run}: the log grew throughout the audit, so this run's inclusion \

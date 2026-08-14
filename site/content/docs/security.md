@@ -661,16 +661,21 @@ something to remove deliberately, not something to inherit.
 
 **The failure mode to know about.** Cedar is *total*: a `when` clause reading an
 attribute that is not in the context does not raise — the policy is simply
-unsatisfied. So a `forbid` keyed on a misspelled attribute **disappears**, and
-whatever `permit` accompanies it decides. A taint gate in this repository read
-`context.args_trust`, which the runtime has never sent, and it failed open while
-every test around it passed. Check a policy against the shape above, or against a
-real run; never against a context assembled to suit the rule.
+unsatisfied, and an evaluation error surfaces only in the diagnostics beside
+the decision. So a `forbid` keyed on a misspelled attribute contributes
+nothing, and whatever `permit` accompanies it would decide. The adapter
+refuses to let that happen: **an `Allow` accompanied by evaluation errors is
+denied**, because the one rule that would have said no may be exactly the one
+that broke. A taint gate in this repository once read `context.args_trust`,
+which the runtime has never sent — under the old behaviour it failed open
+while every test around it passed, which is why the conservative answer is now
+structural. Check a policy against the shape above, or against a real run;
+never against a context assembled to suit the rule.
 
-The adapter reports an evaluation *error* distinctly from an ordinary denial, in
-the reason string and as its own `tracing` event, because both reach an operator
-as "denied" while one means *the rules say no* and the other means *the rules are
-broken and the plane has been enforcing nothing anyone intended*.
+The adapter reports an evaluation *error* distinctly from an ordinary denial,
+in the reason string and as its own `tracing` event, because both reach an
+operator as "denied" while one means *the rules say no* and the other means
+*the rules are broken* — a defect to fix, not a decision to appeal.
 
 ### Identity covers executable policy, not just rules
 
@@ -954,6 +959,15 @@ An open run in `Resume` mode can cross the end of history and dispatch effects.
 It must present exactly the bundle recorded at admission; any difference is a
 loud `PolicyBundleChanged` refusal. `Strict` replay dispatches nothing, so it
 does not need the historical evaluator and does not compare bundles.
+
+The live tail past the recorded prefix runs under **every** gate the original
+live pass ran under — the egress and sensitivity ceilings, the mutates
+strengthening on tool grants, the delegation depth, the step budget — because a
+resumed run is a live run from its frontier on, and a gate that only the first
+attempt met is a gate a crash removes. Manifest-sink and delegation refusals
+are journaled as `PolicyDenied` under the key the refused dispatch would have
+carried, so a strict or resumed pass over the refused run consumes the record
+instead of re-deciding a verdict that is already history.
 
 ### Replay never re-opens the gate
 

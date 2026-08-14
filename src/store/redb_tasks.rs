@@ -417,8 +417,16 @@ impl TaskStore for RedbStore {
             let tasks = r.open_table(TASKS).map_err(|e| be(&e))?;
             let mut out = Vec::new();
             // The index is keyed by priority rank then age, so redb's ascending
-            // order is already the queue order.
-            for e in q.iter().map_err(|e| be(&e))? {
+            // order is already the queue order — ranged to this tenant, like
+            // every sibling read, so the walk's cost is this tenant's queue
+            // rather than everybody's.
+            for e in q
+                .range(
+                    (tenant.as_str(), 0u8, i64::MIN, "")
+                        ..=(tenant.as_str(), u8::MAX, i64::MAX, MAX_STR),
+                )
+                .map_err(|e| be(&e))?
+            {
                 if out.len() >= limit {
                     break;
                 }

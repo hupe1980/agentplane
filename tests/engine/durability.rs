@@ -318,15 +318,25 @@ async fn strict_replay_rejects_a_build_that_does_something_different() {
         .await
         .unwrap();
 
-    // Fewer effects: the second recorded key never gets requested, and the
-    // first requested key at position 1 is now a different one.
+    // Fewer effects: the second recorded key is never requested. That is
+    // divergence just as surely as a mismatched key — this build is a
+    // different program from the one that wrote the record — and it is the
+    // direction ordered comparison alone cannot see, because there is nothing
+    // left to compare against. Strict verification must therefore check
+    // consumption: a pass that reported `Succeeded` here was confirming a
+    // history it had only read half of.
     count.store(1, Ordering::SeqCst);
     let replayed = rt.replay(first.run_id, Mode::Strict).await.unwrap();
-    assert_eq!(
-        replayed.status,
-        RunStatus::Succeeded,
-        "a prefix of history replays cleanly; the divergence shows as unused records"
-    );
+    match replayed.status {
+        RunStatus::Quarantined(msg) => assert!(
+            msg.contains("never requested"),
+            "the finding must name the first unconsumed effect: {msg}"
+        ),
+        other => panic!(
+            "a build performing fewer effects than the record passed strict \
+             verification: {other:?}"
+        ),
+    }
 
     // Whereas performing a *differently named* effect at the same position is
     // caught immediately by the key.
@@ -810,8 +820,8 @@ async fn history_under_an_older_canonicalization_rule_is_unverifiable_not_diverg
         .build();
     let run = agentplane::core::RunId::generate();
 
-    // History whose admission names canonicalization rule 1 — what every record
-    // written before the version existed reads as, by `serde` default.
+    // History whose admission names a canonicalization rule this build does
+    // not implement.
     let lease = store
         .acquire(run, "canon", std::time::Duration::from_mins(1))
         .await
@@ -827,7 +837,7 @@ async fn history_under_an_older_canonicalization_rule_is_unverifiable_not_diverg
                     input: json!({}),
                     input_label: agentplane::core::Label::trusted(),
                     policy_bundle: None,
-                    canon: 1,
+                    canon: 999,
                 },
             )],
         )
@@ -841,7 +851,7 @@ async fn history_under_an_older_canonicalization_rule_is_unverifiable_not_diverg
     assert!(
         matches!(
             err,
-            agentplane::core::RuntimeError::CanonicalizationChanged { recorded: 1, .. }
+            agentplane::core::RuntimeError::CanonicalizationChanged { recorded: 999, .. }
         ),
         "a rule change was reported as something else: {err}"
     );

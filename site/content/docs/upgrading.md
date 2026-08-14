@@ -15,6 +15,222 @@ makes a hard cut acceptable at this stage.
 
 ---
 
+## A source rule names the concrete source, not an effect family
+
+An effect's output now carries the identity an operator actually grants as its
+provenance: a tool call answers as `tool://server/name`, a model completion as
+`model:{provider}/{model}`, a commission as `agent/{capability}`. The old
+family spellings — `effect:tool.call`, `effect:model.complete` — are what
+`Effect::source` still says for effects nobody writes source rules about (the
+clock, a case read), and they **no longer match** anything a tool, model or
+commission produces.
+
+```yaml
+# before — satisfied by whichever tool an injected prompt reached first
+- path: /correction
+  allowed_sources: [effect:model.complete]
+
+# after — the rule can finally say what it meant
+- path: /correction
+  allowed_sources: [model:anthropic/claude-sonnet-5]
+```
+
+**Why it is worth your manifests.** A family is too coarse for the one rule
+that matters. "The recipient must come from the CRM lookup" was unsatisfiable
+strictly — every granted tool answered as `effect:tool.call` — and satisfiable
+loosely by whichever tool an injected prompt reached first, which is the
+opposite of what the rule was written to prevent. A rule naming the old
+spelling now refuses every argument it governs, so the failure is loud rather
+than permissive: rewrite it against the concrete source.
+
+---
+
+## `JournalStore::acquire` is a pure claim; renewal is `renew`
+
+`JournalStore` gained `renew(run, owner, epoch, ttl)`, so a store you implement
+stops compiling until it distinguishes the two. And `acquire` no longer renews
+for the same owner: a lease that is currently held and unexpired is refused
+with `LeaseHeld`, **including when the caller itself is the holder**.
+
+**Why the convenience had to go.** Two failures hid in acquire-as-renew. A
+heartbeat racing its own run's conclusion could re-acquire the lease the
+conclusion had just *released*, leaving a live, never-released lease over a
+concluded run — which the recovery sweep then "recovers" forever. And a second
+entry point on the same instance — a cancel, a delivery — could "acquire" the
+lease of a run the instance was actively executing and drive a second execution
+under the **same epoch**, which fencing exists to make impossible and cannot
+see. `renew` succeeds only on a lease held, unexpired and unreleased by exactly
+`(owner, epoch)`, and keeps the epoch — bumping it would fence the owner
+against its own in-flight writes. A failed renewal means *stop*: the caller no
+longer owns the run.
+
+If you implement the trait, the store conformance battery covers both methods;
+run it rather than eyeballing the transaction boundaries — checked-and-written
+must be one store transaction, or a lapse between read and write renews over
+the new owner.
+
+---
+
+## Exhaustion pauses; it no longer unwinds
+
+A run that hits a declared budget keeps its completed work standing. It used to
+unwind, and the three ends of an exhausted run contradicted each other: the
+work was reversed, the run stayed resumable, and the resume then reported
+success over a world where the work no longer stood.
+
+The operator's two honest options both need the work standing. **Raise the
+ceiling and resume** — the resume re-evaluates the recorded budget refusal
+against the current ledger and journals a `BudgetReadmitted` record naming the
+ceiling it continued under, so "who raised what to let this continue" is
+answerable from the chain. Or **cancel**, which unwinds through the same path a
+failure does.
+
+One door closes with it: a run that has already **compensated** is closed to
+resume, because continuing over reversed work would report success about a
+world where it no longer stands. Start a fresh run.
+
+---
+
+## Tool wire names render dots as `-`, and refuse what would collide
+
+How a model names a tool is `server__tool`, with `.` in a component rendered as
+`-`: the grant `tool://agent/blog.research` reaches the model as
+`agent__blog-research`. To keep that mapping invertible, a tool or server
+component containing `-` or `__`, or starting or ending with `_`, is **refused
+at declaration**.
+
+**Why.** The separator has to be recognisable in reverse — the name the model
+picks is matched byte for byte and mapped back to the grant — and a component
+that may itself contain `-` or `__` makes one wire name ambiguous between two
+grants. If a declared name stops parsing, rename the component; fixtures and
+transcripts asserting the old spelling need the new one.
+
+---
+
+## `cx.sink_with` is the dispatch shape; the two-pass spelling is gone from the docs
+
+```rust
+// before — the same data written twice, held together by a runtime check
+let call = ModelCall::new(provider, model, prompt.peek().clone());
+let answer = cx.sink(call, &prompt).await?;
+
+// after — the closure receives the inner value; one argument, not two
+let answer = cx
+    .sink_with(&prompt, |value| ModelCall::new(provider, model, value))
+    .await?;
+```
+
+Fallible construction composes — the closure may return a `Result`, which is
+what `ToolCall::prepare` needs. The two-arg `sink` remains for effects that
+bind their outbound value internally (a governed media fetch derives its bound
+arguments from the URL it was constructed over) and for callers holding an
+effect built elsewhere; the byte-for-byte binding check runs underneath either
+way.
+
+Two smaller cuts travel with it, both removing boilerplate rather than
+breaking code. The prelude now re-exports `async_trait`, so `cargo add
+async-trait` is no longer part of writing a skill. And a skill governed by a
+manifest calls `cx.complete(&prompt)` (or `complete_with` to adjust the call):
+the privileged role supplies the model and its reviewed ceilings, the plane
+supplies the driver — no more `Arc<dyn ModelProvider>` field carrying wiring
+the manifest never described.
+
+---
+
+## A skill's name is its capability unless it says otherwise
+
+`SkillDescriptor::provides` is now a default rather than an obligation: a skill
+that declares nothing answers its own name. Declaring a capability **replaces**
+the default rather than adding to it, so a skill that provides `demo.greet` is
+not also silently reachable as `greet` — one declared surface, not two.
+
+The name/capability split earns its keep in a plan graph, where one skill
+answers an abstract capability another step names; a hello-world program should
+not have to invent two names for one thing. Keep `.provides(..)` exactly where
+the two genuinely differ.
+
+---
+
+## `Runtime::builder_on` wires a full backend in one call
+
+```rust
+// before — six casts of one Arc, spelled out by every deployment
+Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+    .cases(store.clone() as Arc<dyn CaseStore>)
+    .tasks(store.clone() as Arc<dyn TaskStore>)
+    // ... events, timers, memory ...
+
+// after
+Runtime::builder_on(store)
+```
+
+Any backend implementing the six store traits — both shipped ones do — is a
+`FullBackend`. The à-la-carte methods remain and override individual stores
+afterwards; blob storage stays an explicit `.blobs(..)` decision, because bytes
+routinely live in a different system than rows.
+
+---
+
+## `RunOutcome::success()` folds the two questions into one `?`
+
+```rust
+let answer = runtime.run("greet", input).await?.success()?;
+```
+
+Every caller acting on a run's answer asks the same pair — did it work, and
+what did it say — and pattern-matching `status` to learn the first is how the
+second gets read off a run that quarantined. `success()` returns
+`Result<Tainted<Value>, RunFailure>`; the failure carries the run id and the
+whole `RunStatus`, so telling a suspension from a quarantine later needs no
+re-plumbing. `status` and `output` stay public for callers whose branches
+genuinely differ.
+
+---
+
+## The CLI grew a `replay` verb, and `run` lost the flags that belonged to it
+
+```sh
+# before
+agentplane run agent.yaml --replay 01J… --strict
+
+# after — a recorded run is its own verb
+agentplane replay 01J… --store runs.redb --manifest agent.yaml --strict
+```
+
+Re-executing a recorded run needs a store and takes a run id, not an input —
+almost nothing `run` needs, which is why the flags kept failing to parse in
+combinations the help text could not explain. Two additions beside it:
+`run --input -` reads stdin, and `agentplane card <manifest> --url <base>`
+prints the Agent Card a served manifest would advertise, so what a peer will
+see is reviewable before anything listens on a socket.
+
+---
+
+## The journal's sealed set widened, and the envelope binds identity
+
+What `.keyring(..)` seals in the journal is now: `RunAdmitted.input`,
+`EffectStarted.descriptor.args`, `EffectDone.output`,
+`EffectReconciled.output`, `EffectFailed.error` (the message only),
+`Note.text` and `PlanFrozen.plan`. The last four were caller data sitting in
+the clear beside sealed prompts — a reconciliation probe's output is the same
+data `EffectDone.output` is, a note is prose somebody wrote about the case, and
+a frozen plan embeds the trusted input it was compiled from. The envelope's
+associated data now binds the **tenant and the record's identity**, so
+ciphertext moved to another record fails to authenticate rather than opening as
+somebody else's payload.
+
+Two neighbours of the same cut: `blob::erase_run` erases a **case-less** run's
+sealed payloads — the erasure unit is the run, since a run with no case links
+no blobs through the case layer — and push webhook credentials now seal at
+rest (`SealedPush`, wrapped automatically by `RuntimeBuilder::keyring`).
+
+Stores sealed by an earlier build no longer open under this one; the pre-freeze
+remedy is the standing one — recreate the store, or keep the old build to read
+the old history. Verification is unaffected either way: the chain commits to
+ciphertext.
+
+---
+
 ## `memory_formation.subject` may be a binding, and a `$` typo is now refused
 
 Existing literals are unchanged. What changed is that a subject beginning with
@@ -120,8 +336,8 @@ enforced rather than remembered.
 
 The delivery loop — read past the cursor, POST, advance on 2xx, back off, abandon
 a permanent refusal — is now `push::DeliveryWorker`, parameterised by a
-`Projection`. `A2aPushWorker` is a thin binding of it to the A2A projection and
-its API is unchanged; `api::a2a::PushSweepReport` is a re-export.
+`Projection`. `A2aPushWorker` is now a type alias of `push::DeliveryWorker`, so
+existing call sites keep compiling; `api::a2a::PushSweepReport` is a re-export.
 
 It moved because the cursor discipline has nothing to do with A2A. It lived
 inside the A2A server because A2A was the first caller, which made the one
@@ -131,26 +347,31 @@ protocol and only for a caller-supplied URL. See
 
 ---
 
-## Canonicalization rule 3: numbers format per RFC 8785
+## Canonicalization and format versions collapse to 1
 
-A store written under rule 2 still opens and its history still verifies — the
-chain hashes stored bytes, not re-canonicalized ones — but **replaying a run
-recorded under the old rule refuses** with `CanonicalizationChanged`:
-unverifiable by this build, which is a different sentence from *diverged*.
+The canonicalization rule (`canon::VERSION`) and the export format
+(`export::FORMAT_VERSION`) are now both **1**, and the `canon` field on
+`RunAdmitted` is required rather than defaulted. The numbers that used to sit
+there were a version history for a format nobody had frozen — pre-freeze, a
+hard cut is the standing policy, and a version story implies a compatibility
+promise this stage deliberately does not make.
 
-```text
-rule 2   1e30 → "1e30"    100.0 → "100.0"   (serde_json's formatting)
-rule 3   1e30 → "1e+30"   100.0 → "100"     (ECMAScript's, per RFC 8785)
-```
+The rule itself is unchanged: RFC 8785 — UTF-16 key ordering and ECMAScript
+number formatting (`1e30` → `"1e+30"`, `100.0` → `"100"`), with integers
+outside ±2⁵³ refused at card signing because JCS reads every number as a
+double and past that line two distinct integers share one byte string.
 
-**Why it is worth your store.** A signed Agent Card is verified by conforming
-JCS implementations nobody here writes, and the two formattings agree on
-exactly the values that appear in tests and disagree on the ones that appear in
-production. The pre-freeze remedy is the standing one: recreate the store, or
-keep the old build to read the old history. One bound arrives with it: card
-signing now refuses an integer outside ±2⁵³ — JCS reads every number as a
-double, and past that line two distinct integers share one — so carry values
-that large as strings, which the card's own budget fields already do.
+A store written by an earlier build still opens and its history still verifies
+— the chain hashes stored bytes, not re-canonicalized ones — but **replaying a
+run recorded under another rule number refuses** with
+`CanonicalizationChanged`: unverifiable by this build, which is a different
+sentence from *diverged*. The pre-freeze remedy is the standing one: recreate
+the store, or keep the old build to read the old history. Exports from
+earlier builds are likewise refused by `verify`/`restore`, which name the
+version they cannot read. An export now carries each record's **raw wire
+bytes** — the exact bytes the chain hashed — and verification rehashes those
+rather than re-serializing, so a file is held to the writer's bytes instead of
+to this build's idea of them.
 
 ---
 
@@ -236,6 +457,10 @@ Runtime::builder(store)
     .agent(Agent::new(&manifest))
     .build();
 ```
+
+(`Runtime::builder_on(store)` wires all of them to one backend in a single
+call, which is what a deployment on one `RedbStore` or `PostgresStore` means
+anyway.)
 
 **Why it is worth the wiring.** It built cleanly before, and failed at the first
 real approval — with a person already waiting, on the code path a test suite is

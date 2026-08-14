@@ -287,3 +287,13 @@ pub const ACTION_RELEASE: &str = "data:release";
 /// reviewed declaration never mentioned — which is a defect in the code, not a
 /// tightening of the rules.
 pub const ACTION_DECLARED: &str = "effect:declared";
+/// The action string for a value refused at a sink's information-flow gates.
+///
+/// Distinct from both of the above because the response is different again: a
+/// sink refusal is about the *data* — its sensitivity crossed a ceiling, or an
+/// untrusted value reached an authority-bearing position — and the remedy is a
+/// journaled release or a different source, never a rule change or a code fix.
+/// Recorded under the refused effect's key like the other refusals, so a
+/// replay consumes the recorded verdict instead of reporting that this build
+/// performs more effects than the record.
+pub const ACTION_EGRESS: &str = "effect:egress";

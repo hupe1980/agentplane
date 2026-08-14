@@ -109,6 +109,18 @@ pub trait BlobStore: Send + Sync + Debug {
 
     /// Store bytes and return the address they landed at.
     ///
+    /// The returned digest MUST be [`Digest::of`] of exactly the bytes given.
+    /// That is a contract, not a description: callers that case-link before
+    /// writing — governed media,
+    /// [`store_blob`](crate::runtime::StepCtx::store_blob) — commit erasure
+    /// traversal to the digest they computed, so a store answering with any
+    /// other address would file the bytes *outside* that traversal, linked
+    /// under one digest and stored under another where no erasure that follows
+    /// the link can reach them. The media ingest treats a mismatch as a broken
+    /// contract and fails the effect rather than prefer the store's answer.
+    /// Envelope encryption keeps the contract true by addressing ciphertext at
+    /// the **plaintext** digest through [`put_at`](Self::put_at).
+    ///
     /// Writing the same bytes twice is the same write.
     ///
     /// # Errors
@@ -242,6 +254,45 @@ pub async fn erase_case(
         .map_err(|e| BlobError::Backend(e.to_string()))?;
     }
     Ok(n)
+}
+
+/// Destroy the erasure scope of a run that belongs to no case.
+///
+/// The counterpart of [`erase_case`], for the unit that call can never reach:
+/// a record bound to no case seals its payloads under `tenant/<run>` (see
+/// `SealedJournal`), and `erase_case` — which walks a case's blobs and
+/// destroys the *case* scope — was the only erasure verb, so a case-less run's
+/// sealed payloads had no erasure path at all. This is the missing verb: it
+/// destroys exactly the `tenant/<run>` scope, and with it every payload sealed
+/// under that run — in the live store, every replica, and every backup ever
+/// taken, because what is destroyed was never in them.
+///
+/// **The erasure unit is the run.** There is no blob traversal here because
+/// blob writes are scoped to a run's case; a run with no case links no blobs
+/// through the case layer, and anything sealed for it lives in its journal
+/// payloads. The journal's records — chain, routing fields, the fact the run
+/// happened — remain readable and verifiable, which is the whole design: the
+/// chain committed to ciphertext.
+///
+/// Idempotent as [`KeyRing::destroy`](crate::keyring::KeyRing::destroy) is:
+/// the first destruction stands, so a retry cannot rewrite when or why the
+/// data went.
+///
+/// # Errors
+///
+/// If the key ring cannot be reached.
+#[cfg(feature = "keyring")]
+pub async fn erase_run(
+    keyring: &dyn crate::keyring::KeyRing,
+    tenant: &crate::core::TenantId,
+    run: crate::core::RunId,
+    at: crate::core::Timestamp,
+    reason: &str,
+) -> Result<(), BlobError> {
+    keyring
+        .destroy(&crate::keyring::scope(tenant, &run.to_string()), at, reason)
+        .await
+        .map_err(|e| BlobError::Backend(e.to_string()))
 }
 
 /// Check fetched bytes against the address they came from.

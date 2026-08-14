@@ -53,11 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // One call. Stores registered before it are sealed just the same, because
     // the wrapping happens at `build()`.
-    let rt = Runtime::builder(Arc::clone(&raw) as Arc<dyn JournalStore>)
-        .cases(Arc::clone(&raw) as Arc<dyn CaseStore>)
-        .events(Arc::clone(&raw) as Arc<dyn agentplane::case::EventStore>)
-        .tasks(Arc::clone(&raw) as Arc<dyn agentplane::case::TaskStore>)
-        .keyring(Arc::clone(&keys) as Arc<dyn KeyRing>)
+    let ring: Arc<dyn KeyRing> = keys.clone();
+    let rt = Runtime::builder_on(Arc::clone(&raw))
+        .keyring(ring)
         .skill(Intake)
         .build();
 

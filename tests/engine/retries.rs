@@ -649,6 +649,8 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
         )
         .await
         .unwrap();
+    // The process died: its lease is claimable, not renewable.
+    store.release_lease(run, lease.epoch).await.unwrap();
 
     let out = rt.replay(run, Mode::Resume).await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);

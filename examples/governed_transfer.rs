@@ -154,11 +154,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // twice and a chance to disagree about it.
     let catalog = ToolCatalog::from_manifest(&manifest);
 
+    let transport: Arc<dyn ToolClient> = ledger.clone();
     let runtime = Runtime::builder(Arc::clone(&store))
-        .tools(
-            Arc::new(catalog),
-            Arc::clone(&ledger) as Arc<dyn ToolClient>,
-        )
+        .tools(Arc::new(catalog), transport)
         .agent(Agent::new(&manifest).skill(Transfer))
         .try_build()?;
 

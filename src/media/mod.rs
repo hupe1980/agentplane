@@ -804,6 +804,18 @@ impl Effect for GovernedFetch {
                 EffectError::Rejected("media URL argument is not a string".to_owned())
             })?;
         let fetched = self.fetcher.fetch(raw).await.map_err(EffectError::from)?;
+        self.file(fetched).await
+    }
+}
+
+impl GovernedFetch {
+    /// Link, store, and describe the fetched bytes — everything after the wire.
+    ///
+    /// Separate from [`perform`](Effect::perform) so the filing rules can be
+    /// exercised against a misbehaving [`BlobStore`] without a network: the
+    /// fetch half is refused long before it reaches a store in any test that
+    /// cannot dial a public address.
+    async fn file(&self, fetched: FetchBody) -> Result<FetchedMedia, EffectError> {
         let digest = Digest::of(&fetched.bytes);
         // Link before put. A crash may leave a harmless dangling link, which a
         // retry repairs, but it must never leave durable bytes outside the
@@ -817,7 +829,7 @@ impl Effect for GovernedFetch {
                     detail: error.to_string(),
                 })?;
         }
-        let digest =
+        let stored =
             self.blobs
                 .put(&fetched.bytes)
                 .await
@@ -825,6 +837,22 @@ impl Effect for GovernedFetch {
                     driver: "blob.store".to_owned(),
                     detail: error.to_string(),
                 })?;
+        // The digest computed here is the single truth: it is what the case
+        // link above committed to, and what the journal will carry. A store
+        // answering with a different address has broken the content-addressing
+        // contract — `BlobStore::put` MUST return the digest of exactly the
+        // bytes it was given — and taking its word would file the bytes under
+        // a digest the erasure traversal never visits. A hard refusal, not a
+        // value to prefer.
+        if stored != digest {
+            return Err(EffectError::Rejected(format!(
+                "the blob store returned digest {} for bytes whose digest is {} — it has \
+                 broken the content-addressing contract, and filing this artifact under \
+                 its answer would place the bytes outside erasure traversal",
+                stored.to_hex(),
+                digest.to_hex(),
+            )));
+        }
         Ok(FetchedMedia {
             digest,
             media_type: fetched.media_type,
@@ -907,7 +935,17 @@ fn is_redirect(status: reqwest::StatusCode) -> bool {
 }
 
 async fn resolve_public(host: &str, port: u16) -> Result<Vec<SocketAddr>, MediaError> {
-    let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
+    // `Url::host_str` keeps the brackets on an IPv6 literal and `IpAddr`
+    // refuses them — so without stripping, every v6 literal missed the parse,
+    // fell through to a DNS lookup that cannot succeed, and one whole address
+    // family was dead and misreported as a retryable outage. Stripped only for
+    // the parse: the public-address check judges the same addresses either
+    // way, and refusal messages keep the spelling the URL carries.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    let addresses = if let Ok(ip) = bare.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
     } else {
         tokio::net::lookup_host((host, port))
@@ -1138,6 +1176,130 @@ mod tests {
         let mut visited = HashSet::new();
         record_visit(&mut visited, &current).unwrap();
         assert!(record_visit(&mut visited, &current).is_err());
+    }
+
+    /// A bracketed IPv6 literal reaches the address check, and is judged there.
+    ///
+    /// `Url::host_str` keeps the brackets and `IpAddr` refuses them, so before
+    /// the strip every v6 literal fell through to a DNS lookup that cannot
+    /// succeed — the whole address family dead, and misreported as a retryable
+    /// outage instead of judged by the public-address rule. A private literal
+    /// must be refused for the **right** reason: forbidden, not unresolvable.
+    #[tokio::test]
+    async fn a_bracketed_ipv6_literal_is_judged_not_unresolvable() {
+        // Documentation range: private, and never behind a DNS answer.
+        let error = resolve_public("[2001:db8::1]", 443).await.unwrap_err();
+        assert!(
+            matches!(error, MediaError::Refused(_)),
+            "a private v6 literal was not judged by the address rule — it fell \
+             through to DNS and died as retryable: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("forbidden address"),
+            "the refusal does not name the forbidden address: {error}"
+        );
+
+        // A public v6 literal passes the address check entirely — the pin is
+        // that parsing succeeded, so the answer is the literal itself.
+        let addrs = resolve_public("[2606:4700:4700::1111]", 443)
+            .await
+            .expect("a public v6 literal is usable");
+        assert_eq!(
+            addrs,
+            vec![SocketAddr::from((
+                "2606:4700:4700::1111".parse::<IpAddr>().unwrap(),
+                443
+            ))]
+        );
+    }
+
+    /// A store that answers `put` with somebody else's digest is refused.
+    ///
+    /// The digest of record is computed here and case-linked **before** the
+    /// store speaks; a third-party store returning a different digest has
+    /// broken content addressing, and preferring its answer would journal an
+    /// artifact the erasure traversal never visits. The ingest must fail
+    /// loudly instead.
+    #[tokio::test]
+    async fn a_blob_store_that_lies_about_the_digest_fails_the_ingest() {
+        use crate::blob::{BlobError, BlobStore, MemoryBlobs};
+        use crate::core::Timestamp;
+
+        /// Stores faithfully, answers with a phantom digest.
+        #[derive(Debug)]
+        struct Lying(MemoryBlobs);
+
+        #[async_trait]
+        impl BlobStore for Lying {
+            async fn put(&self, bytes: &[u8]) -> Result<Digest, BlobError> {
+                self.0.put(bytes).await?;
+                Ok(Digest::of(b"somebody else's bytes"))
+            }
+            async fn put_at(&self, digest: Digest, bytes: &[u8]) -> Result<(), BlobError> {
+                self.0.put_at(digest, bytes).await
+            }
+            async fn get_raw(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {
+                self.0.get_raw(digest).await
+            }
+            async fn get(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {
+                self.0.get(digest).await
+            }
+            async fn expire(
+                &self,
+                digest: Digest,
+                at: Timestamp,
+                reason: &str,
+            ) -> Result<(), BlobError> {
+                self.0.expire(digest, at, reason).await
+            }
+            async fn has(&self, digest: Digest) -> Result<bool, BlobError> {
+                self.0.has(digest).await
+            }
+        }
+
+        let effect = GovernedMedia::new(policy().external_retention("test/v1")).effect(
+            Arc::new(Lying(MemoryBlobs::new())),
+            "https://media.example/a.png",
+            None,
+        );
+        let fetched = FetchBody {
+            source_url: "https://media.example/a.png".to_owned(),
+            final_url: "https://media.example/a.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            bytes: b"\x89PNG\r\n\x1a\nbody".to_vec(),
+            redirects: 0,
+            validated_by: Vec::new(),
+            hops: Vec::new(),
+        };
+        let error = effect.file(fetched).await.unwrap_err();
+        assert!(
+            matches!(error, EffectError::Rejected(_)),
+            "a lying store's digest was preferred or retried rather than \
+             refused: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("content-addressing contract"),
+            "the refusal does not name the broken contract: {error}"
+        );
+
+        // And the honest store still files: the check refuses lying stores,
+        // not storing.
+        let honest = GovernedMedia::new(policy().external_retention("test/v1")).effect(
+            Arc::new(MemoryBlobs::new()),
+            "https://media.example/a.png",
+            None,
+        );
+        let fetched = FetchBody {
+            source_url: "https://media.example/a.png".to_owned(),
+            final_url: "https://media.example/a.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            bytes: b"\x89PNG\r\n\x1a\nbody".to_vec(),
+            redirects: 0,
+            validated_by: Vec::new(),
+            hops: Vec::new(),
+        };
+        let filed = honest.file(fetched).await.expect("an honest store files");
+        assert_eq!(filed.digest, Digest::of(b"\x89PNG\r\n\x1a\nbody"));
     }
 
     #[tokio::test]

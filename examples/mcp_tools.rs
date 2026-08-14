@@ -204,15 +204,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     provider.will_call_tool("call_2", "tickets__read", json!({ "id": "7" }));
     provider.will_say("AC-1 holds 42, and ticket 7 says the printer is on fire.");
 
-    let store = Arc::new(RedbStore::open_in_memory()?);
-    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .provider("fake", Arc::clone(&provider) as Arc<dyn ModelProvider>)
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
+    let driver: Arc<dyn ModelProvider> = provider.clone();
+    let transport: Arc<dyn ToolClient> = tickets.clone();
+    let rt = Runtime::builder(Arc::clone(&store))
+        .provider("fake", driver)
         .agent(Agent::new(&manifest))
         // Tools compiled into this binary. The box answers for every server its
         // own tools name — here, `ledger`.
         .toolbox(ToolBox::new().with::<ReadBalance>())
         // And the MCP connection answers for `tickets`.
-        .tool_server("tickets", Arc::clone(&tickets) as Arc<dyn ToolClient>)
+        .tool_server("tickets", transport)
         .build();
 
     println!("\n2. the model uses both, and neither knows about the other");

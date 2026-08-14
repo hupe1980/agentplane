@@ -1056,8 +1056,28 @@ impl EventStore for RedbStore {
 
             let mut out = Vec::new();
             // Registration order is the index's own order, so this is a bounded
-            // walk rather than reading every wait and sorting them.
-            for e in by_time.iter().map_err(|e| be(&e))? {
+            // walk rather than reading every wait and sorting them — and it is
+            // ranged to this tenant, like every sibling read. The whole-table
+            // walk this replaces leaned on the row lookup below being
+            // tenant-keyed, which held for *leaking* but not for *counting*:
+            // another tenant registering the same `(run, effect, key)` tuple —
+            // all attacker-suppliable strings — made this tenant's row match
+            // twice, and one wait listed as two is an operator paging over
+            // phantom backlog another tenant controls the size of.
+            for e in by_time
+                .range(
+                    (tenant.as_str(), i64::MIN, "", "", "", "")
+                        ..=(
+                            tenant.as_str(),
+                            i64::MAX,
+                            MAX_STR,
+                            MAX_STR,
+                            MAX_STR,
+                            MAX_STR,
+                        ),
+                )
+                .map_err(|e| be(&e))?
+            {
                 if out.len() >= limit {
                     break;
                 }
