@@ -12,7 +12,9 @@
 //! twice.
 //!
 //! So the variant stays exactly what it was and only the *payload* is sealed —
-//! every field that carries the caller's data, enumerated in [`payloads`].
+//! every field that carries the caller's data, enumerated in `payloads`
+//! (crate-private: the list is a rule this crate applies, not a surface a
+//! caller selects from).
 //! Everything the runtime routes on (`seq`, `run`, `case`, `step`, `phase`,
 //! `epoch`, `effect_key`, and the variant itself) stays in the clear, so
 //! exactly-once, the case scan, the outcome index and the chain all keep

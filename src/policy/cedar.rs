@@ -96,8 +96,8 @@ const ADAPTER_CONFIGURATION: &[u8] =
     b"principal=Agent;action=Action;resource=Resource;context=action-schema";
 
 /// Target of the `tracing` event emitted when null stripping changed the
-/// context a rule evaluated — see [`without_nulls`] for why stripping exists
-/// and what it can and cannot change.
+/// context a rule evaluated — see `without_nulls` (crate-private) for why
+/// stripping exists and what it can and cannot change.
 ///
 /// Emitted at `debug`, deliberately: a model call's request profile carries a
 /// `null` for every optional knob nobody set, so the common case would make a
