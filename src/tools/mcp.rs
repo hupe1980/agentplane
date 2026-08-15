@@ -95,6 +95,7 @@ impl McpDataSafety {
 pub struct McpAccess {
     prompts: BTreeMap<String, McpDataSafety>,
     resources: BTreeMap<String, McpDataSafety>,
+    task_input: Option<McpDataSafety>,
 }
 
 impl McpAccess {
@@ -112,6 +113,24 @@ impl McpAccess {
     #[must_use]
     pub fn resource(mut self, uri: impl Into<String>, safety: McpDataSafety) -> Self {
         self.resources.insert(uri.into(), safety);
+        self
+    }
+
+    /// Permit answering this server's outstanding input requests, up to a
+    /// ceiling.
+    ///
+    /// One grant for the whole server rather than one per task, because a task
+    /// id is minted by the server at runtime and an operator cannot review a
+    /// name that does not exist yet. Only [`max_input`](McpDataSafety::max_input)
+    /// is read — `tasks/update` returns nothing to label.
+    ///
+    /// Ungranted, `update_task` refuses. That is the same rule prompts and
+    /// resources follow and it is the important half here: an elicitation is a
+    /// server *asking this plane for data*, which is the direction an operator
+    /// most needs to have said yes to.
+    #[must_use]
+    pub fn task_input(mut self, safety: McpDataSafety) -> Self {
+        self.task_input = Some(safety);
         self
     }
 
@@ -268,6 +287,15 @@ impl McpClient {
         input_responses: InputResponses,
     ) -> Result<McpTaskUpdate, ToolError> {
         self.check_task_server(&task)?;
+        let Some(safety) = self.access.task_input else {
+            return Err(ToolError::Refused {
+                tool: ToolId::new(&self.server, format!("task/{}", task.id)),
+                detail: "the operator did not grant this server input responses — an \
+                         elicitation is a server asking this plane for data, and nothing \
+                         about the server raising one says it may have an answer"
+                    .to_owned(),
+            });
+        };
         // The serialized responses are what `sink_arguments` exposes to the
         // egress gate, while `perform` sends the typed value itself. Falling
         // back to `Null` on a serialization failure would fail *open*: the
@@ -288,6 +316,7 @@ impl McpClient {
             task,
             input_responses,
             arguments,
+            safety,
             service: Arc::clone(&self.service),
         })
     }
@@ -490,14 +519,19 @@ impl Effect for McpPrompt {
     type Output = Value;
 
     fn descriptor(&self) -> EffectDescriptor {
+        // The grant's sensitivities are deliberately absent. They are what the
+        // operator will *allow*, not what this call asks the server for, and an
+        // effect key is what was asked — so a catalogue edit would otherwise
+        // recompute a different key for a call that never changed, and every
+        // historical run through this prompt would fail its audit replay as
+        // divergence. The declaration a replayed value carries is read back
+        // from its own record instead; see `core::DeclaredOutput`.
         EffectDescriptor::new(
             "mcp.prompt/get",
             serde_json::json!({
                 "server": self.server,
                 "name": self.name,
                 "arguments": self.arguments,
-                "max_input_sensitivity": self.safety.max_input_sensitivity,
-                "output_sensitivity": self.safety.output_sensitivity,
             }),
         )
     }
@@ -562,12 +596,13 @@ impl Effect for McpResource {
     type Output = Value;
 
     fn descriptor(&self) -> EffectDescriptor {
+        // Without the grant's ceiling, for the reason `McpPrompt` states: a
+        // reviewed allowance is not part of what a read asks for.
         EffectDescriptor::new(
             "mcp.resource/read",
             serde_json::json!({
                 "server": self.server,
                 "uri": self.uri,
-                "output_sensitivity": self.safety.output_sensitivity,
             }),
         )
     }
@@ -623,6 +658,7 @@ pub struct McpTaskUpdate {
     task: McpTask,
     input_responses: InputResponses,
     arguments: Value,
+    safety: McpDataSafety,
     service: Arc<RunningService<RoleClient, ClientInfo>>,
 }
 
@@ -650,6 +686,20 @@ impl Effect for McpTaskUpdate {
         // server consumed the responses. Never submit human input twice by
         // guessing after a severed connection.
         Recovery::RequiresOperator
+    }
+
+    /// The operator's ceiling for this server, as
+    /// [`McpPrompt`] takes for a prompt's arguments. Answering an elicitation
+    /// sends data to the same server by the same connection, so a plane that
+    /// may hand it internal data one way and not the other is drawing a line
+    /// nobody outside could defend.
+    ///
+    /// What this does **not** relax is the whole-value taint gate below it:
+    /// `tasks/update` mutates, and it declares no protected fields, so an
+    /// untrusted response is refused whatever this ceiling says. A model's
+    /// answer reaches an MCP server through a release or not at all.
+    fn max_sensitivity(&self) -> Sensitivity {
+        self.safety.max_input_sensitivity
     }
 
     fn sink_arguments(&self) -> Option<&Value> {

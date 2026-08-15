@@ -188,6 +188,10 @@ pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError
 
 #[async_trait]
 impl CaseStore for RedbStore {
+    fn tenant(&self) -> &str {
+        self.tenant_str()
+    }
+
     async fn correlate(&self, keys: &[CorrelationKey]) -> Result<Option<CaseId>, StoreError> {
         let tenant = self.tenant_name();
         if keys.is_empty() {

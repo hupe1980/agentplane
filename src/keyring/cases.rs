@@ -39,15 +39,23 @@ pub struct SealedCases {
 impl SealedCases {
     /// Seal this store's case state under `keys`.
     ///
-    /// `tenant` must be the tenant the wrapped store serves. Unlike the
-    /// journal, [`CaseStore`] does not say who it answers for, so this is one
-    /// of the two-arguments-that-must-agree shapes the rest of this crate
-    /// avoids — supply it from the same place the plane's tenant comes from.
-    /// A mismatch does not leak across tenants (the scope simply differs), but
-    /// it does put case state under a scope `erase_case` will not destroy,
-    /// which is an erasure that silently misses.
+    /// `tenant` is the tenant the wrapped store serves, and it is **checked
+    /// against the store** rather than trusted.
+    ///
+    /// A mismatch does not leak across tenants — the two scopes are both real —
+    /// but it seals case state under a scope `erase_case` will never name, so
+    /// the erasure destroys its key, reports success, and leaves these rows
+    /// readable. Refusing here is what keeps the sealing scope and the row
+    /// scope one fact rather than two that agree by convention.
+    ///
+    /// # Panics
+    ///
+    /// If `tenant` is not the tenant `inner` serves. This is the deployment's
+    /// own wiring, decided once at startup, so it is refused where it is
+    /// written rather than at the far end of a deletion request.
     #[must_use]
     pub fn wrap(inner: Arc<dyn CaseStore>, keys: Arc<dyn KeyRing>, tenant: TenantId) -> Arc<Self> {
+        super::assert_serves(inner.tenant(), &tenant, "case");
         Arc::new(Self {
             inner,
             keys,
@@ -136,6 +144,10 @@ pub async fn probe_sealed_case_state(
 
 #[async_trait]
 impl CaseStore for SealedCases {
+    fn tenant(&self) -> &str {
+        self.tenant.as_str()
+    }
+
     async fn put_state(
         &self,
         case: CaseId,

@@ -172,6 +172,10 @@ fn eligible(task: &Task, id: TaskId, actor: &str, roles: &[String]) -> Result<()
 
 #[async_trait]
 impl TaskStore for RedbStore {
+    fn tenant(&self) -> &str {
+        self.tenant_str()
+    }
+
     async fn open(&self, task: &Task) -> Result<Task, StoreError> {
         let tenant = self.tenant_name();
         let id = task.id.to_hex();

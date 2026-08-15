@@ -956,6 +956,7 @@ mod atomic_fixtures {
             Ok(vec![Append::new(
                 self.1,
                 RecordKind::EffectDone {
+                    declared: agentplane::core::DeclaredOutput::untrusted(),
                     output,
                     source: None,
                     spend: agentplane::core::Spend::default(),

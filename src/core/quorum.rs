@@ -35,12 +35,46 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 /// How many judgements, from how many angles, and how many must agree.
+///
+/// # Deserialization takes the same door as `new`
+///
+/// A derived `Deserialize` would reach the private fields directly, which is
+/// the `Quorum::new(need, lenses)` this type deliberately does not offer. It is
+/// the door that matters most here: a [`PlanNode`] carries an optional quorum,
+/// plans are deserialized — from a store, from a journal, from a [`Replanner`]
+/// parsing a model's proposal — and a panel is exactly the control a hijacked
+/// plan wants weakened. `need: 0` then reports [`Verdict::Pass`] having judged
+/// nothing, and a non-majority threshold reports whichever side `tally`
+/// happens to count first.
+///
+/// [`PlanNode`]: crate::core::PlanNode
+/// [`Replanner`]: crate::plan::Replanner
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "DeclaredQuorum")]
 pub struct Quorum {
     /// How many must agree for the panel to have decided.
     need: u32,
     /// The angles to judge from. One judgement per lens.
     lenses: Vec<String>,
+}
+
+/// The wire form of a [`Quorum`], before it has been checked.
+///
+/// Exists only so `serde` has a shape to build that is *not* a `Quorum`. It
+/// carries no invariant, which is the point: the only way across is
+/// [`Quorum::new`].
+#[derive(Deserialize)]
+struct DeclaredQuorum {
+    need: u32,
+    lenses: Vec<String>,
+}
+
+impl TryFrom<DeclaredQuorum> for Quorum {
+    type Error = QuorumError;
+
+    fn try_from(d: DeclaredQuorum) -> Result<Self, Self::Error> {
+        Self::new(d.need, d.lenses)
+    }
 }
 
 impl Quorum {

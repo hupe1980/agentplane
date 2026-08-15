@@ -338,6 +338,10 @@ fn oldest_waiter(
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl EventStore for RedbStore {
+    fn tenant(&self) -> &str {
+        self.tenant_str()
+    }
+
     async fn buffer(&self, event: &InboundEvent, at: Timestamp) -> Result<bool, StoreError> {
         let tenant = self.tenant_name();
         let id = event.dedup_key();

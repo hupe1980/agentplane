@@ -849,8 +849,6 @@ impl<'a> StepCtx<'a> {
         effect: E,
         outbound: Option<&crate::core::Label>,
     ) -> Result<Tainted<E::Output>, StepError> {
-        let trust = effect.trust();
-        let declared = effect.output_sensitivity();
         // Captured before dispatch consumes the effect. This is the name a
         // `ProtectedField::from_sources` rule matches, so it is per *effect* —
         // `tool://crm/lookup`, `model:openai/gpt-4o` — not per family: a rule
@@ -877,16 +875,19 @@ impl<'a> StepCtx<'a> {
                 ),
             });
         }
-        let output = self.effect_unlabelled(effect, outbound).await?;
+        // The declaration comes back with the value, because for a replayed
+        // effect it is **history** rather than a fresh reading of the
+        // catalogue. See `DeclaredOutput` for what re-reading would cost.
+        let (output, declared) = self.effect_unlabelled(effect, outbound).await?;
 
-        let labelled = match trust {
+        let labelled = match declared.trust {
             crate::core::Trust::Trusted => Tainted::trusted(output),
             crate::core::Trust::Untrusted => Tainted::from_source(output, source),
         };
         // Raised, never lowered: an untrusted result is already `Internal`, and
         // an effect that could declare its output *less* sensitive than its
         // provenance implies would be a laundering primitive.
-        let sensitivity = labelled.label().sensitivity.max(declared);
+        let sensitivity = labelled.label().sensitivity.max(declared.sensitivity);
         let label = labelled.label().clone().with_sensitivity(sensitivity);
         Ok(Tainted::with_label(labelled.into_unlabelled(), label))
     }
@@ -896,11 +897,16 @@ impl<'a> StepCtx<'a> {
     /// Split out so the label is applied at exactly one place: a second exit
     /// from this function that forgot to wrap would be an unlabelled tool
     /// result, which is the hole the labelling exists to close.
+    ///
+    /// Returns the [`DeclaredOutput`](crate::core::DeclaredOutput) that applies
+    /// to the value beside it, which is **not** always the one the effect would
+    /// answer now: a value read back from history carries the declaration that
+    /// was recorded with it, so a catalogue edited since cannot relabel it.
     async fn effect_unlabelled<E: Effect>(
         &mut self,
         mut effect: E,
         outbound: Option<&crate::core::Label>,
-    ) -> Result<E::Output, StepError> {
+    ) -> Result<(E::Output, crate::core::DeclaredOutput), StepError> {
         // Checked once, on the path *both* `effect` and `sink` take, and before
         // the retry loop because a depth violation is not attempt-dependent.
         //
@@ -940,9 +946,14 @@ impl<'a> StepCtx<'a> {
             // ── Replay: is this attempt already in history? ────────────────
             if self.mode.is_replaying() {
                 match self.cursor.next(key)? {
-                    Some(EffectReplay::Done { output, spend, .. }) => {
+                    Some(EffectReplay::Done {
+                        output,
+                        spend,
+                        declared,
+                        ..
+                    }) => {
                         self.replayed_done(&descriptor.kind, attempt, spend);
-                        return Ok(serde_json::from_value(output)?);
+                        return Ok((serde_json::from_value(output)?, declared));
                     }
                     Some(
                         refusal @ (EffectReplay::Refused { .. } | EffectReplay::Denied { .. }),
@@ -981,7 +992,10 @@ impl<'a> StepCtx<'a> {
                             .orphan_verdict(&effect, key, attempt, &recorded, &recovery, &policy)
                             .await?
                         {
-                            return Ok(output);
+                            // Recovered by a probe this pass ran, so the
+                            // declaration this pass reads is the one its own
+                            // `EffectReconciled` record just carried.
+                            return Ok((output, crate::core::DeclaredOutput::of(&effect)));
                         }
                         attempt += 1;
                         continue;
@@ -1026,7 +1040,9 @@ impl<'a> StepCtx<'a> {
                 .traced_attempt(&effect, key, attempt, waited, outbound)
                 .await?
             {
-                Ok(output) => return Ok(output),
+                // Dispatched live, so the effect's own answer is both what the
+                // value carries and what the `EffectDone` record just stored.
+                Ok(output) => return Ok((output, crate::core::DeclaredOutput::of(&effect))),
                 Err(e) => e,
             };
 
@@ -1034,7 +1050,7 @@ impl<'a> StepCtx<'a> {
                 .failed_attempt_verdict(&effect, key, attempt, &recovery, &policy, &failure)
                 .await?
             {
-                return Ok(output);
+                return Ok((output, crate::core::DeclaredOutput::of(&effect)));
             }
             attempt += 1;
         }
@@ -1236,6 +1252,11 @@ impl<'a> StepCtx<'a> {
             key,
             RecordKind::EffectReconciled {
                 disposition: outcome.disposition(),
+                // Present exactly when the probe recovered a value, so the two
+                // are derived from one match rather than from two.
+                declared: output
+                    .is_some()
+                    .then(|| crate::core::DeclaredOutput::of(effect)),
                 output,
                 spend,
                 detail,
@@ -1265,6 +1286,9 @@ impl<'a> StepCtx<'a> {
                 output,
                 source,
                 spend,
+                // An inbound payload's label is rebuilt from `source` and the
+                // wait's own kind, which `label_inbound` holds together.
+                declared: _,
             }) => {
                 self.bill(spend);
                 Ok(Some(ReplayedWait::Recorded(Self::label_inbound(
@@ -2076,54 +2100,41 @@ impl<'a> StepCtx<'a> {
     /// The refusal occupies the dispatch's position: the ordinal is consumed
     /// and the record keyed exactly as the effect would have been (attempt 1 —
     /// nothing was attempted), for the same reason a budget refusal and a
-    /// policy denial are keyed. A sink refusal used to leave *no* record —
-    /// these gates fire before `effect_unlabelled` derives a key, so there was
-    /// nothing convenient to file it under — and the consequence surfaced one
-    /// mode later: a strict pass over the refused run reached the same gate,
-    /// found nothing to consume, and a resumed pass re-decided a verdict that
-    /// was already history. Journaled only where writes are enabled: on a
-    /// replayed prefix the live pass's own record is the verdict, and this
-    /// pass re-deriving the same refusal from the same labels is the
-    /// deterministic zone agreeing with itself, not news.
+    /// policy denial are keyed. Without a record the refusal is invisible one
+    /// mode later: a strict pass over the refused run finds nothing to consume
+    /// and reports history left over.
     ///
-    /// On that replayed prefix the record is also **consumed**. These gates
-    /// fire from code, on every mode, so the replay re-derives the refusal
-    /// before the dispatch path ever consults the cursor — and a record
-    /// nobody reads makes strict verification end with history left over,
-    /// reported as a quarantine about a divergence that never happened.
+    /// Reached only where the dispatch would be **live**, because that is the
+    /// only place a sink gate runs at all. A replayed prefix does not re-decide
+    /// these verdicts; it reads the record this wrote, through the same cursor
+    /// arm that replays a policy denial.
+    ///
+    /// # It stays a [`StepError::Policy`], and the record says so
+    ///
+    /// A sink gate refusing one call is something a tool-calling loop can act
+    /// on: the model is told `REFUSED` and may try another route. An
+    /// authorization denial is not — it ends the run. Both are journaled as
+    /// `PolicyDenied`, so the record carries
+    /// [`ACTION_EGRESS`](crate::core::ACTION_EGRESS) to keep the two
+    /// distinguishable, and `recorded_refusal` rebuilds this shape from it. A
+    /// replay that turned a sink refusal into a denial would end a run the
+    /// original completed.
     async fn refuse_sink(
         &mut self,
         descriptor: &EffectDescriptor,
         denial: PolicyError,
     ) -> StepError {
         let key = self.next_effect_key(descriptor);
-        if self.mode.is_replaying() {
-            match self.cursor.next(key) {
-                // The verdict this pass just re-derived, as recorded.
-                Ok(Some(EffectReplay::Denied { .. })) => return denial.into(),
-                // History holds something else at this position: the recorded
-                // run dispatched where this build refuses.
-                Ok(Some(_)) => return StepError::ReplayOverrun { actual: key },
-                // Strict cannot refuse what history never met.
-                Ok(None) if self.mode == Mode::Strict => {
-                    return StepError::ReplayOverrun { actual: key };
-                }
-                // Past the frontier of a resume: a live decision, recorded below.
-                Ok(None) => {}
-                Err(e) => return e,
-            }
-        }
-        if self.writes_enabled()
-            && let Err(e) = self
-                .append_effect(
-                    key,
-                    RecordKind::PolicyDenied {
-                        reason: denial.to_string(),
-                        action: crate::core::ACTION_EGRESS.to_owned(),
-                        resource: descriptor.kind.clone(),
-                    },
-                )
-                .await
+        if let Err(e) = self
+            .append_effect(
+                key,
+                RecordKind::PolicyDenied {
+                    reason: denial.to_string(),
+                    action: crate::core::ACTION_EGRESS.to_owned(),
+                    resource: descriptor.kind.clone(),
+                },
+            )
+            .await
         {
             // A runtime that cannot record what it refused must not report
             // the tidier error instead.
@@ -2229,34 +2240,40 @@ impl<'a> StepCtx<'a> {
         let label = args.effective_label(&sink_id);
         let label = &label;
 
-        // Manifest-derived ceilings apply to **live dispatch only** — and
-        // "live dispatch" is a property of the *cursor*, not of the mode.
+        // **Every sink gate applies to live dispatch only**, and "live
+        // dispatch" is a property of the *cursor*, not of the mode.
         //
-        // A replayed effect reads its result back from the journal; if
-        // today's manifest were consulted for it, a tightened ceiling would
-        // refuse an effect that already happened and a loosened one would
-        // bless an effect that was refused. Either way the replay stops
-        // reproducing the run and starts re-judging it under rules that did
-        // not exist at the time — which this design rejects for policy and
-        // must reject for declarations too, since a manifest is policy a
-        // reviewer wrote.
+        // A replayed effect reads its result back from the journal, and the
+        // verdict these gates reached the first time is already in that
+        // journal — a pass as the `EffectDone` beside it, a refusal as its own
+        // record the cursor hands back. So there is nothing here for a replay
+        // to decide, and deciding anyway is how a replay stops reproducing the
+        // run and starts re-judging it: a tightened ceiling refuses an effect
+        // that already happened, a loosened one blesses an effect that was
+        // refused.
+        //
+        // This covers the effect's own declarations as well as the manifest's,
+        // because for every effect that reaches a sink the "code" reading is
+        // wrong. A tool's ceiling and protected fields come from the operator's
+        // `ToolSafety`, an MCP prompt's from a reviewed grant, a peer's from
+        // its `PeerGrant` — configuration, all of it, editable without
+        // recompiling and absent from the effect key. Judging a replayed
+        // effect against today's copy makes an operator's catalogue edit
+        // retroactively change what a finished run was allowed to do.
         //
         // But `Resume` is only *replaying* until its history runs out, and
         // then it dispatches **live** — new calls, against the real world,
         // for the rest of the run. Keying these gates on the mode instead of
-        // on cursor exhaustion switched them off for that entire live tail:
-        // a run refused by the egress ceiling, resumed, sailed the same value
+        // on cursor exhaustion switches them off for that entire live tail:
+        // a run refused by the egress ceiling, resumed, sails the same value
         // past the same ceiling — an enforcement whose second attempt is a
         // bypass is not an enforcement. `writes_enabled` is precisely "will
         // this effect dispatch live": always in `Live`, past the frontier in
         // `Resume`, never in `Strict` (which cannot dispatch at all — an
         // exhausted cursor there is `ReplayOverrun`, not permission).
-        //
-        // The sink's *own* ceiling still applies everywhere: that is code, and
-        // a code change that alters an outcome is divergence, which quarantine
-        // exists to catch.
+        let live_dispatch = self.writes_enabled();
         #[cfg(feature = "manifest")]
-        let manifest_gates = self.writes_enabled();
+        let manifest_gates = live_dispatch;
 
         let ceiling = {
             let effect_ceiling = effect.max_sensitivity();
@@ -2283,7 +2300,7 @@ impl<'a> StepCtx<'a> {
             #[cfg(not(feature = "manifest"))]
             effect_ceiling
         };
-        if label.sensitivity > ceiling {
+        if live_dispatch && label.sensitivity > ceiling {
             let denial = PolicyError::EgressCeiling {
                 sink: sink_name,
                 actual: label.sensitivity,
@@ -2349,8 +2366,9 @@ impl<'a> StepCtx<'a> {
         #[cfg(not(feature = "manifest"))]
         let mutates = effect.mutates();
 
-        if let Err(refusal) =
-            Self::enforce_protected_fields(&effect, args, sink_name, &sink_id, mutates)
+        if live_dispatch
+            && let Err(refusal) =
+                Self::enforce_protected_fields(&effect, args, sink_name, &sink_id, mutates)
         {
             // The whole-value taint gate and the per-field rules are sink
             // gates like the ceilings above, and their refusals are recorded
@@ -2799,6 +2817,7 @@ impl<'a> StepCtx<'a> {
                         // sender to record.
                         source: None,
                         spend,
+                        declared: crate::core::DeclaredOutput::of(effect),
                     },
                 )
                 .await?;
@@ -2896,6 +2915,13 @@ fn recorded_refusal(replay: EffectReplay) -> StepError {
     match replay {
         EffectReplay::Refused { limit, used } => {
             StepError::Budget(crate::core::BudgetExceeded::Recorded { limit, used })
+        }
+        // Which gate refused is recorded in `action`, and rebuilding the right
+        // shape from it is what keeps a replay from ending a run the original
+        // finished: a sink refusal is one call the model may route around, an
+        // authorization denial is the run.
+        EffectReplay::Denied { reason, action, .. } if action == crate::core::ACTION_EGRESS => {
+            StepError::Policy(PolicyError::Recorded { reason })
         }
         EffectReplay::Denied {
             reason,
@@ -3196,7 +3222,18 @@ impl StepCtx<'_> {
     /// vector derived from an untrusted document is untrusted, and sending
     /// confidential text to an embedding service is an egress like any other.
     ///
+    /// `max_sensitivity` is that egress decision, and it is a parameter because
+    /// there is no answer this crate could pick for every deployment. Note what
+    /// it has to admit for the call to be useful at all: a query worth embedding
+    /// has almost always crossed a trust boundary — a user's question, a model's
+    /// paraphrase, a recalled memory — and anything that has is already
+    /// [`Internal`](Sensitivity::Internal). This is the same ceiling
+    /// [`SemanticQuery::max_sensitivity`] carries for the *retriever*, asked
+    /// separately because they are two providers and a deployment may well
+    /// trust one and not the other.
+    ///
     /// [`SemanticQuery::embedding`]: crate::memory::SemanticQuery::embedding
+    /// [`SemanticQuery::max_sensitivity`]: crate::memory::SemanticQuery::max_sensitivity
     ///
     /// # Errors
     ///
@@ -3206,6 +3243,7 @@ impl StepCtx<'_> {
         &mut self,
         embedder: Arc<dyn crate::memory::Embedder>,
         text: Tainted<String>,
+        max_sensitivity: crate::core::Sensitivity,
     ) -> Result<Tainted<Vec<f32>>, StepError> {
         let plain = text.peek().clone();
         let arguments = text.map(serde_json::Value::String);
@@ -3213,6 +3251,7 @@ impl StepCtx<'_> {
             embedder,
             text: plain,
             arguments: value,
+            max_sensitivity,
         })
         .await
     }
@@ -4288,6 +4327,11 @@ impl StepCtx<'_> {
                     output: buffered.event.payload.clone(),
                     source: Some(buffered.event.source.clone()),
                     spend: crate::core::Spend::default(),
+                    // What `label_inbound` builds, stated rather than derived:
+                    // an inbound payload is another party's data, and the
+                    // provenance half of its label comes from `source` beside
+                    // this and the wait's own kind.
+                    declared: crate::core::DeclaredOutput::untrusted(),
                 },
             )
             .await?;

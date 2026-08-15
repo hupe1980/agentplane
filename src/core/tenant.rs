@@ -19,8 +19,34 @@ use serde::{Deserialize, Serialize};
 /// reaches storage keys and key-ring scopes, so a name containing a separator
 /// could make two different tenants produce one scope — the failure that looks
 /// like nothing at all until one of them erases the other's data.
+///
+/// # Deserialization is a constructor, and it takes the same door
+///
+/// `#[serde(try_from)]` rather than a derived `Deserialize`, because a derive
+/// would reach the private field directly and hand out exactly the names
+/// [`new`](Self::new) exists to refuse. That is not a hypothetical door: a
+/// tenant arrives from a credential claim an [`Authenticator`] parsed, a store
+/// row, or a journal record, and every one of those is `serde` rather than a
+/// call to `new`. A `TenantId` holding `acme/prod` makes
+/// [`keyring::scope`](crate::keyring::scope) derive one key scope for two
+/// distinct tenants, so either tenant's erasure destroys the other's key and
+/// reports success.
+///
+/// A stored name that no longer parses is therefore a **read error**, which is
+/// the honest outcome: silently accepting it is what lets the collision exist.
+///
+/// [`Authenticator`]: crate::api::Authenticator
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct TenantId(String);
+
+impl TryFrom<String> for TenantId {
+    type Error = TenantError;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::new(name)
+    }
+}
 
 /// Why a tenant name was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

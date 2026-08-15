@@ -9,11 +9,58 @@ call site that stops working is the intended way to find out. What this page owe
 you is the *reason* and the shortest correct fix — a refusal you have to reverse
 engineer costs an afternoon, which is one afternoon more than the change saved.
 
-Every entry here is a **parse-time, build-time or replay-time** refusal. None
-of them changes what a running agent does silently, which is the property that
-makes a hard cut acceptable at this stage.
+Every entry here is a **parse-time, build-time, read-time or replay-time**
+refusal. None of them changes what a running agent does silently, which is the
+property that makes a hard cut acceptable at this stage.
 
 ---
+
+## `Delegation`, `TenantId` and `Quorum` now validate when deserialized
+
+Each of these establishes an invariant in a fallible constructor. Each also
+derived `Deserialize`, which wrote the private fields directly — so a value that
+the constructor refuses could be *loaded*, and loading is the common path: these
+arrive from a credential, a store row, a journal record or a peer far more often
+than from a call to `new`.
+
+Deserializing now goes through the constructor. A value that never satisfied the
+invariant fails to load instead:
+
+```text
+a tenant id may not contain '/': it becomes part of composite keys and key-ring
+scopes, where a separator makes two distinct tenants collide into one
+```
+
+**Nothing this crate writes can produce such a value**, so an ordinary
+deployment sees no change. You are affected if you hand-wrote a fixture, or if
+your `Authenticator` or `DelegationScheme` builds one of these types by parsing
+JSON rather than by calling its constructor:
+
+```rust
+// before — compiles, and silently yields a chain that may widen
+let chain: Delegation = serde_json::from_value(claims["chain"].clone())?;
+```
+
+```rust
+// after — the same line now returns the attenuation error when the chain
+// widens, exceeds MAX_DELEGATION_DEPTH, or is empty. Handle it as a
+// credential rejection, which is what it is.
+let chain: Delegation = serde_json::from_value(claims["chain"].clone())
+    .map_err(|e| MyAuthError::Untrustworthy(e.to_string()))?;
+```
+
+**Why a read error is the right outcome.** For `TenantId` the value at stake is
+a key scope: units already contain separators (`event/{source}/{id}`), so a
+tenant named `acme/event/counterparty` derives the identical scope to tenant
+`acme` with unit `event/counterparty/42`. Both stores write, nothing fails, and
+either tenant's erasure destroys the other's key and reports success. Accepting
+the name quietly is what creates that pair.
+
+One API change came with it: `Delegation` stores its owner as a field rather
+than as the head of a list, so an empty chain is unrepresentable rather than a
+value whose `owner()` panics. `owner()` and `depth()` are now `const fn`. The
+serialized form is unchanged — still `{"links": [...]}`, owner first — so stored
+chains and journaled records read back exactly as before.
 
 ## A Cedar rule reading a conditional context attribute now refuses to build
 
@@ -72,16 +119,223 @@ match on `PolicyDecision` exhaustively, add the arm.
 
 ---
 
-## A budget ceiling of zero is refused at parse
+## Journals from an older build are refused, and the record version is `1`
+
+`EffectDone` now carries the trust and sensitivity the effect declared for its
+output, and `EffectReconciled` carries them for a recovered one. Both are
+required fields, so a journal written by an earlier build is refused on read:
+
+```text
+record EffectDone is v4, and this build writes and reads v1 only. Record shapes
+change by hard cut until the format freeze, so a journal at another version is
+refused rather than read with fields quietly defaulted …
+```
+
+**The fix is a fresh journal.** Nothing migrates, on purpose: the missing field
+was never written, and defaulting it would answer an audit question falsely
+rather than fail to answer it.
+
+The number moved *down*, from 4 to 1, which is the other half of the same
+decision. `canon::VERSION` and `export::FORMAT_VERSION` are both 1 and stay
+there until the format freeze; a record version that counted the pre-release
+cuts implied those journals were readable, which they never were. After the
+freeze, bumping becomes an RFC-level change and the `Upcaster` seam starts
+earning its keep.
+
+---
+
+## A replayed value keeps the label it was read under
+
+This is a behaviour change rather than a refusal, and the only one on this page,
+because the old behaviour could not be made to fail loudly — that was the
+problem with it.
+
+An effect's output label has three parts. Its provenance comes from
+`Effect::source`, which every effect derives from something already inside its
+key. The other two — `Effect::trust` and `Effect::output_sensitivity` — come
+from **operator configuration**: a `ToolSafety` entry, an MCP grant, a
+`PeerGrant`. Those are edited without recompiling, and none of them reaches the
+effect key.
+
+They were re-read from the catalogue on every replay. So lowering one:
+
+```rust
+// yesterday
+.tool(ToolId::new("crm", "lookup"), ToolSafety::read_only()
+    .output_sensitivity(Sensitivity::Secret))
+// today
+.tool(ToolId::new("crm", "lookup"), ToolSafety::read_only()
+    .output_sensitivity(Sensitivity::Public))
+```
+
+silently declassified every value replay handed back. Nothing diverged, because
+nothing about the call had changed. The damage is not confined to audits: a
+`Resume` replays its prefix and then dispatches live, so a run suspended while
+holding a `Secret` result woke holding a `Public` one, and its live tail could
+send it where the original label forbade.
+
+The declaration is now journaled with the result and read back. **Nothing to
+fix in your code** — but two consequences are worth knowing. Editing a
+catalogue no longer changes what a finished run was allowed to do, which is the
+point. And a value whose declared sensitivity you *raise* keeps the lower label
+on existing history; if that matters, the runs predating the change are the ones
+to re-examine, not the catalogue.
+
+---
+
+## Sink gates apply to live dispatch only, and MCP grants left the effect key
+
+The manifest-derived ceilings already worked this way. Now the effect's own
+`max_sensitivity`, its `protected_fields` and the whole-value taint gate do
+too: on a replayed prefix the verdict is read from the journal — a pass as the
+`EffectDone` beside it, a refusal as its own record — instead of being decided
+again.
+
+The reason is the same one the entry above gives. For every effect that reaches
+a sink, "the sink's own ceiling is code" was not true: a tool's ceiling comes
+from `ToolSafety`, an MCP prompt's from a reviewed grant, a peer's from its
+`PeerGrant`.
+
+Two visible consequences:
+
+* **`McpPrompt` and `McpResource` no longer hash their grant's sensitivities
+  into the effect key.** They did, which turned an operator raising a ceiling
+  into `NonDeterminism` for every historical run through that prompt — an audit
+  replay failing over a configuration edit. If you have journals whose replay
+  you want to compare across such an edit, they are readable again.
+* **A sink refusal read back from the journal is a `PolicyError::Recorded`**,
+  carrying the recorded wording. It stays a `StepError::Policy`, so a
+  tool-calling loop still tells the model `REFUSED` and may route around it — a
+  replay that turned it into `StepError::Denied` would end a run the original
+  finished.
+
+---
+
+## `cx.embed` takes the ceiling it sends text under
+
+```rust
+// before
+cx.embed(embedder, text).await?
+// after
+cx.embed(embedder, text, Sensitivity::Internal).await?
+```
+
+`Embed` declared no ceiling of its own, so it inherited the trait default of
+`Public`. Embedding is an egress — the text goes to a provider — and every
+query worth embedding has crossed a trust boundary, which makes it at least
+`Internal`. The path was therefore reachable only by embedding a hard-coded
+literal, and the ceiling nobody could raise was the strictest one available.
+
+`SemanticQuery::max_sensitivity` is unchanged and still separate: the embedder
+and the retriever are two providers, and a deployment may well trust one and
+not the other.
+
+---
+
+## Answering an MCP elicitation needs its own grant
+
+```rust
+McpAccess::new()
+    .prompt("summarize", McpDataSafety::public())
+    .task_input(McpDataSafety::public().max_input(Sensitivity::Internal))
+//   ^ new; without it, `update_task` refuses
+```
+
+```text
+the operator did not grant this server input responses — an elicitation is a
+server asking this plane for data, and nothing about the server raising one
+says it may have an answer
+```
+
+`update_task` was reachable by anyone holding a task handle, at a `Public`
+ceiling no operator had chosen and nothing let them raise — while `prompts/get`
+and `resources/read` on the same connection both required a grant. One grant per
+server rather than per task, because a task id is minted at runtime and an
+operator cannot review a name that does not exist yet.
+
+The whole-value taint gate is unchanged and still stands in front of this: an
+untrusted response reaches an MCP server through a `release` or not at all.
+
+---
+
+## A skill may not answer a capability its manifest does not advertise
+
+The plane already refused the converse — a manifest advertising a capability no
+skill provides. This is the direction that left no trace:
+
+```rust
+Runtime::builder(store)
+    .agent(Agent::new(&manifest)          // provides: [work.do]
+        .skill(Worker)                    // answers work.do
+        .skill(Helper))                   // answers work.helper  ← now refused
+    .try_build()?;
+```
+
+```text
+BuildError::ProvidesWhatItDoesNotAdvertise {
+    agent: "…", undeclared: ["work.helper"],
+}
+```
+
+Everything about the old behaviour worked: the extra skill was governed by that
+manifest, its budget and grants applied, and runs journaled correctly. The only
+thing wrong was that `spec.capabilities.provides` did not mention it — and that
+file is what gets reviewed, digested, pinned, and turned into the A2A card. A
+reviewer approving it approved a smaller surface than the plane served.
+
+**The fix is one line**: add the capability to `provides`. If it genuinely
+belongs to a different agent, register it on one — a skill passed to
+`RuntimeBuilder::skill` rather than to an `Agent` has no declaration to
+contradict and is untouched.
+
+---
+
+## A declarative agent with no model is refused at parse
+
+`spec.execution` says the runtime drives the agent by calling a model, and the
+model is *named* rather than defaulted — falling back to another registered
+driver would run the agent on a model its own declaration does not name. So a
+document with `execution` and no `spec.models.privileged` could never assemble
+a plane, and `agentplane validate` used to approve it anyway:
+
+```text
+spec.execution cannot be enforced here: this agent's behaviour is declared, so
+the runtime drives it by calling a model — and no `spec.models.privileged`
+names one …
+```
+
+`BuildError::DeclarativeWithoutModel` remains as the backstop, for a `Manifest`
+constructed in Rust without passing a parser. What changed is that the refusal
+now arrives from `validate`, before a deploy, rather than from whichever
+process first tried to build a plane.
+
+An agent with **no** `spec.execution` is untouched: a coded skill chooses its
+own models, which is a different and legitimate claim.
+
+---
+
+## A budget ceiling of zero is refused, at parse *and* at build
 
 `budgets: { max_tokens: 0 }` — and the same for `max_effects`, `max_steps`,
-`max_minor_units` and `max_wallclock_secs` — is now a parse error. It read like "no permission to
-spend"; what it did was refuse the **first effect of any kind**, because every
-ceiling is an accumulate-and-compare checked before the work. An agent
-declaring it could never perform a single tool call, model-free or not.
+`max_minor_units` and `max_wallclock_secs` — is a parse error. It read like "no
+permission to spend"; what it did was refuse the **first effect of any kind**,
+because every ceiling is an accumulate-and-compare checked before the work. An
+agent declaring it could never perform a single tool call, model-free or not.
+
+The same budget reaches the runtime through `RuntimeBuilder::budget` without
+passing a parser, so a plane wired in Rust is refused too:
+
+```text
+BuildError::BudgetPermitsNothing { field: "max_tokens" }
+```
+
+Both refusals come from one rule, `Budget::bricked_ceiling`, so a sixth ceiling
+cannot be added to one list and forgotten in the other. `max_replans` and
+`max_denials` are deliberately excluded: zero is meaningful for both — *do not
+replan*, and *the first refusal ends the run*.
 
 Omit the ceiling for "no limit". To stop a tenant's work, use the emergency
-stop, which is the control that means it.
+stop (`QuotaStore::set_halt`), which is the control that means it.
 
 ---
 
@@ -815,6 +1069,85 @@ the wire rather than a label — the line is `— <name> <base64>`, so a name
 carrying a space, a newline or an em dash serialises without complaint and
 reads back as a different name, a truncated payload, or a signature line nobody
 wrote. Add `?` or `.expect(..)` at the call site.
+
+## A store scoped to another tenant is refused at build
+
+If the plane and one of its state stores disagree about the tenant, `try_build`
+now refuses:
+
+```text
+this plane runs as tenant 'acme' but its case store serves 'default'. With a
+key ring wired the plane seals that state under 'acme' while the store keeps it
+under 'default' — both scopes are real, so nothing fails at runtime and an
+erasure for either tenant destroys a key that does not reach these rows
+```
+
+The journal and blob stores already answered this question. `CaseStore`,
+`EventStore`, `TaskStore`, `MemoryStore` and `PushStore` now do too, so the
+mismatch is caught before anything is sealed rather than discovered when a
+deletion request turns out not to have reached the data.
+
+**The fix is to scope every handle the way the plane is scoped**:
+
+```rust
+// before — the plane is acme, every store is on `default`, and this built
+let store = RedbStore::open("plane.redb")?;
+let runtime = Runtime::builder(Arc::new(store))
+    .tenant(TenantId::new("acme")?)
+    .cases(Arc::new(RedbStore::open("cases.redb")?))
+    .keyring(keys)
+    .try_build()?;
+```
+
+```rust
+// after
+let tenant = TenantId::new("acme")?;
+let runtime = Runtime::builder(Arc::new(
+        RedbStore::open("plane.redb")?.for_tenant(tenant.clone()),
+    ))
+    .tenant(tenant.clone())
+    .cases(Arc::new(RedbStore::open("cases.redb")?.for_tenant(tenant)))
+    .keyring(keys)
+    .try_build()?;
+```
+
+A single-tenant deployment is unaffected: an unscoped store answers `default`,
+which is what an unscoped plane runs as.
+
+If you implement one of those traits yourself, override `tenant()` to return
+the tenant your handle is actually scoped to. The default is `default`, which
+is refused against a non-default plane — deliberately the safe direction, since
+a store that silently claimed the plane's tenant would defeat the check.
+
+---
+
+## `Bedrock::from_client` reads the region from the client
+
+The region is no longer a second argument, and both constructors are fallible:
+
+```rust
+// before — two copies of one fact, free to disagree, and the journal
+// attested the one nothing checked
+let driver = Bedrock::from_client(client, "eu-west-1");
+let embedder = BedrockEmbedder::from_client(client, "eu-central-1", model, dialect);
+```
+
+```rust
+// after — the region comes from the client that will do the connecting
+let driver = Bedrock::from_client(client)?;
+let embedder = BedrockEmbedder::from_client(client, model, dialect)?;
+```
+
+The region goes into `request_profile` for the driver and into `revision()` for
+the embedder, so both are effect identity: a driver built with a `us-east-1`
+client and the string `"eu-west-1"` sent its calls to Virginia and recorded
+Ireland. A client carrying no region is now refused, because an empty region on
+the record reads as an answered question.
+
+`from_env(region)` is unchanged apart from its error type — it sets the region
+on the config it builds, so the client it hands over already carries it.
+
+---
 
 ---
 

@@ -129,6 +129,10 @@ const fn trust_rank(trust: crate::core::Trust) -> i16 {
 
 #[async_trait]
 impl MemoryStore for PostgresStore {
+    fn tenant(&self) -> &str {
+        self.tenant_str()
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn remember(&self, item: &MemoryItem) -> Result<u64, StoreError> {
         let mut client = self.pool_ref().get().await.map_err(|error| {

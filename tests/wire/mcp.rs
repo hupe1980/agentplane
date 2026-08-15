@@ -245,8 +245,53 @@ async fn connect() -> McpClient {
             .prompt("summarize", McpDataSafety::public())
             .prompt("elicit", McpDataSafety::public())
             .resource("kb://settlement/rules", McpDataSafety::public())
-            .resource("kb://needs/input", McpDataSafety::public()),
+            .resource("kb://needs/input", McpDataSafety::public())
+            .task_input(McpDataSafety::public().max_input(agentplane::core::Sensitivity::Internal)),
     )
+}
+
+/// An elicitation answer needs a grant of its own.
+///
+/// The server raising an input request proves it wants data, not that it may
+/// have any — the same rule prompts and resources follow. Without this the
+/// path was reachable by anyone holding a task handle, at a ceiling
+/// (`Public`) that no operator had chosen and that nothing let them raise.
+#[tokio::test]
+async fn answering_an_elicitation_needs_its_own_grant() {
+    let (client_side, server_side) = tokio::io::duplex(8 * 1024);
+    let (sr, sw) = tokio::io::split(server_side);
+    let (cr, cw) = tokio::io::split(client_side);
+    tokio::spawn(async move {
+        if let Ok(running) = serve_server(LyingServer, (sr, sw)).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let service = McpClient::host_info()
+        .serve((cr, cw))
+        .await
+        .expect("client initialises");
+    // Every other capability granted, and task input deliberately not.
+    let ungranted = McpClient::new("ledger", Arc::new(service))
+        .with_access(McpAccess::new().prompt("summarize", McpDataSafety::public()));
+
+    let task = agentplane::tools::McpTask::from_result(
+        "ledger",
+        &json!({ "resultType": "task", "taskId": "job-1" }),
+    )
+    .expect("task handle");
+
+    let refused = ungranted
+        .update_task(
+            task,
+            [("approval".to_owned(), json!({ "approved": true }))]
+                .into_iter()
+                .collect(),
+        )
+        .expect_err("an ungranted server may not be answered");
+    assert!(
+        refused.to_string().contains("did not grant"),
+        "the refusal must name the missing grant: {refused}"
+    );
 }
 
 /// The client asks for the 2026-07-28 baseline and the handshake lands on it.

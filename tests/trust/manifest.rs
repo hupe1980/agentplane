@@ -4489,32 +4489,36 @@ async fn an_agent_grant_naming_no_capability_refuses_the_build() {
     );
 }
 
-/// An agent consulting itself is a loop wearing a grant.
-#[tokio::test]
-async fn an_agent_granting_its_own_capability_refuses_the_build() {
-    use agentplane::runtime::{Agent, BuildError, Runtime};
-
+/// **An agent consulting itself is a loop wearing a grant, and the file says so.**
+///
+/// This was treated as a plane property and refused at build. It is not: the
+/// grant is in `spec.tools` and the capability is in `spec.capabilities.provides`,
+/// both on the same page, and a reviewer reading that page is looking at
+/// everything needed to see the regress. Whether it terminates depends on a
+/// model's judgement, which is the one thing no ceiling bounds.
+///
+/// `BuildError::AgentToolSelfReference` stays as the backstop for a `Manifest`
+/// constructed in Rust without passing a parser.
+#[test]
+fn an_agent_granting_its_own_capability_is_refused_at_parse() {
     let narcissist = ROOM_EDITOR.replace(
         "tool://agent/research.summarise",
         "tool://agent/blog.report",
     );
-    let manifest = Manifest::parse(&narcissist).expect("parses — the loop is a plane property");
-    let provider = agentplane::testkit::FakeProvider::new();
-    let store: std::sync::Arc<dyn agentplane::journal::JournalStore> =
-        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let err = Manifest::parse(&narcissist)
+        .expect_err("a grant to call itself must not parse — both halves are on this page");
+    let message = err.to_string();
+    for expected in ["spec.tools[].ref", "capability the agent itself provides"] {
+        assert!(
+            message.contains(expected),
+            "the refusal does not say '{expected}': {message}"
+        );
+    }
 
-    let err = Runtime::builder(store)
-        .provider(
-            "fake",
-            provider as std::sync::Arc<dyn agentplane::model::ModelProvider>,
-        )
-        .agent(Agent::new(&manifest))
-        .try_build()
-        .expect_err("self-consultation must refuse the build");
-    assert!(
-        matches!(&err, BuildError::AgentToolSelfReference { .. }),
-        "wrong refusal: {err}"
-    );
+    // The positive half: the same document consulting a *different* agent
+    // parses, so this is a rule about the self-reference and not about agent
+    // grants at all.
+    Manifest::parse(ROOM_EDITOR).expect("consulting another agent is the whole point of a room");
 }
 
 /// The `agent` server name is reserved for agents on this plane.
@@ -5536,4 +5540,230 @@ spec:
         &[ToolId::new("ledger", "read")],
         "the ungranted call must be refused before the transport is reached"
     );
+}
+
+/// **The zero ceiling is refused however the budget arrives.**
+///
+/// `a_zero_ceiling_is_refused_at_parse` covers the manifest. A plane wired in
+/// Rust reaches the identical `Budget` without passing a parser, and an
+/// embedder who calls `RuntimeBuilder::budget` is not doing anything unusual —
+/// it is the shape this crate documents first. A rule enforced on one of two
+/// doors is a rule whose enforcement depends on which door the caller happens
+/// to use, and the caller who finds out is the one whose agent refused its
+/// first effect on every run it ever made.
+///
+/// Both messages come from one definition, `Budget::bricked_ceiling`, so a
+/// sixth ceiling cannot be added to one list and forgotten in the other.
+#[test]
+fn a_zero_ceiling_is_refused_however_the_budget_arrives() {
+    use agentplane::core::Budget;
+    use agentplane::runtime::{BuildError, Runtime};
+
+    let store = || {
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"))
+            as std::sync::Arc<dyn agentplane::journal::JournalStore>
+    };
+
+    // Every ceiling that is already reached at zero, and the non-zero column
+    // that proves the refusal is about the value rather than the field.
+    let with_ceiling = |name: &str, n: u64| {
+        let mut b = Budget::unlimited();
+        let small = usize::try_from(n).expect("test ceilings are small");
+        match name {
+            "max_steps" => b.max_steps = Some(small),
+            "max_effects" => b.max_effects = Some(small),
+            "max_tokens" => b.max_tokens = Some(n),
+            "max_minor_units" => b.max_minor_units = Some(n),
+            "max_wallclock_secs" => b.max_wallclock_secs = Some(n),
+            other => panic!("no such ceiling: {other}"),
+        }
+        b
+    };
+
+    for (name, ok) in [
+        ("max_steps", 25),
+        ("max_effects", 10),
+        ("max_tokens", 120_000),
+        ("max_minor_units", 250),
+        ("max_wallclock_secs", 60),
+    ] {
+        let err = Runtime::builder(store())
+            .budget(with_ceiling(name, 0))
+            .try_build()
+            .expect_err("a plane was built with a ceiling that permits nothing");
+        assert!(
+            matches!(err, BuildError::BudgetPermitsNothing { field } if field == name),
+            "`{name}: 0` was refused as something other than a bricked ceiling: {err}"
+        );
+        let message = err.to_string();
+        for expected in [
+            name,
+            "permits nothing at all",
+            "not merely no model spend",
+            "QuotaStore::set_halt",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal of `{name}: 0` does not say '{expected}': {message}"
+            );
+        }
+
+        Runtime::builder(store())
+            .budget(with_ceiling(name, ok))
+            .try_build()
+            .unwrap_or_else(|e| panic!("a real ceiling on `{name}` was refused: {e}"));
+    }
+
+    // The two ceilings where zero *means* something: do not replan, and let the
+    // first refusal end the run. Refusing these would be the same mistake in
+    // the other direction.
+    for meaningful in [
+        Budget {
+            max_replans: Some(0),
+            ..Budget::unlimited()
+        },
+        Budget {
+            max_denials: Some(0),
+            ..Budget::unlimited()
+        },
+    ] {
+        Runtime::builder(store())
+            .budget(meaningful)
+            .try_build()
+            .expect("zero is a meaningful value for max_replans and max_denials");
+    }
+}
+
+/// **A declarative agent with no model is refused before a deploy, not during.**
+///
+/// `spec.execution` says the runtime drives this agent by calling a model, and
+/// the model is *named* rather than defaulted — falling back to some other
+/// registered driver would run the agent on a model its own declaration does
+/// not name. So a document with `execution` and no `models.privileged` cannot
+/// ever assemble a plane.
+///
+/// Both halves of that are on the same page, and `agentplane validate` is the
+/// verb an author runs before deploying. `BuildError::DeclarativeWithoutModel`
+/// stays as the backstop — `Manifest`'s fields are public, so one can be
+/// constructed without passing a parser — but a refusal that only arrives from
+/// whichever process first tried to assemble a plane is a refusal that arrives
+/// after the review.
+#[test]
+fn a_declarative_agent_without_a_model_is_refused_at_parse() {
+    let doc = |execution: &str, models: &str| {
+        format!(
+            r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: driven, version: '1.0.0' }}
+spec:
+  identity: {{ role: 'Answer questions', constraints: 'Be brief.' }}
+  capabilities: {{ provides: [work.do] }}
+  budgets: {{}}
+{execution}{models}"
+        )
+    };
+    let named = "  models: { privileged: { provider: openai, model: gpt-4o } }\n";
+
+    for kind in ["completion", "tool-calling", "planned"] {
+        let execution = format!("  execution: {{ kind: {kind} }}\n");
+
+        let err = Manifest::parse(&doc(&execution, ""))
+            .expect_err("a declarative agent with no model can never assemble");
+        let message = err.to_string();
+        for expected in [
+            "spec.execution",
+            "spec.models.privileged",
+            "nothing to call",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal for `{kind}` does not say '{expected}': {message}"
+            );
+        }
+
+        // The positive half: the same document with a model named parses, so
+        // this is a rule about the missing model rather than about `execution`.
+        Manifest::parse(&doc(&execution, named))
+            .unwrap_or_else(|e| panic!("`{kind}` with a named model was refused: {e}"));
+    }
+
+    // And an agent with no `execution` at all is untouched: a coded skill
+    // chooses its own models, which is a different and legitimate claim.
+    Manifest::parse(&doc("", ""))
+        .expect("a skill-backed agent declares no execution and needs no model");
+
+    // The sibling refusal: a declarative agent's driver is registered once per
+    // capability it provides, so an empty `provides` registers nothing and no
+    // run can ever reach the model, tools and prompt the file names.
+    let silent = doc("  execution: { kind: completion }\n", named)
+        .replace("provides: [work.do]", "provides: []");
+    let err = Manifest::parse(&silent)
+        .expect_err("a declarative agent advertising nothing can never be reached");
+    assert!(
+        err.to_string().contains("advertises no capability"),
+        "the refusal must say what is missing: {err}"
+    );
+}
+
+/// **A capability served but not advertised is a door the review cannot see.**
+///
+/// The crate already refuses the converse — a manifest advertising a capability
+/// no skill provides. This is the direction that leaves no trace. A skill
+/// registered under an agent is *governed* by that manifest: its budget, model
+/// grants, egress ceiling and policy identity all apply, the run journals
+/// correctly, and everything works. What is missing is only that
+/// `spec.capabilities.provides` does not mention it.
+///
+/// That absence is the whole problem, because the declaration is the artifact
+/// that gets read, digested and pinned, and the A2A card is built from it. A
+/// reviewer approving the file approves one surface; the plane serves another.
+/// It is the argument this crate already makes about prompts — a system prompt
+/// composed in the deployer's code has no version, changes in a deploy, and
+/// nothing connects the change to the runs it affected — applied to the
+/// agent's capabilities.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn a_capability_served_must_also_be_advertised() {
+    use agentplane::runtime::{Agent, BuildError, Runtime};
+
+    fn store() -> std::sync::Arc<dyn agentplane::journal::JournalStore> {
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"))
+    }
+
+    let m = Manifest::parse(BOUND).expect("parse");
+
+    // The positive half: exactly what the file names, and nothing else.
+    Runtime::builder(store())
+        .agent(Agent::new(&m).skill(Claims("worker", "work.do")))
+        .try_build()
+        .expect("a skill providing exactly what the manifest advertises must build");
+
+    // One extra capability, quietly reachable and governed by this manifest.
+    let err = Runtime::builder(store())
+        .agent(
+            Agent::new(&m)
+                .skill(Claims("worker", "work.do"))
+                .skill(Claims("extra", "work.undeclared")),
+        )
+        .try_build()
+        .expect_err("a capability the declaration never names was served");
+    assert!(
+        matches!(
+            &err,
+            BuildError::ProvidesWhatItDoesNotAdvertise { undeclared, .. }
+                if undeclared == &["work.undeclared".to_owned()]
+        ),
+        "the refusal must name the undeclared capability, or a reader cannot tell \
+         which of an agent's skills to look at: {err}"
+    );
+
+    // A plane-wide skill registered with `skill()` rather than under an agent
+    // is untouched: it has no declaration to contradict, which is the shape
+    // `skill()` exists beside `agent()` for.
+    Runtime::builder(store())
+        .agent(Agent::new(&m).skill(Claims("worker", "work.do")))
+        .skill(Claims("loose", "anything.at.all"))
+        .try_build()
+        .expect("an ungoverned skill advertises nothing and contradicts nothing");
 }

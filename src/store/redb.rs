@@ -281,6 +281,15 @@ impl RedbStore {
         self.tenant.to_string()
     }
 
+    /// The tenant this handle is scoped to, for the store traits' accessors.
+    ///
+    /// Borrowed, unlike `tenant_name` above: a trait answering *who do you
+    /// serve* is not moving the answer into a closure and should not allocate
+    /// to give it.
+    pub(super) fn tenant_str(&self) -> &str {
+        self.tenant.as_str()
+    }
+
     /// Name this plane's Merkle log.
     ///
     /// Goes into every checkpoint, so two planes' checkpoints cannot be

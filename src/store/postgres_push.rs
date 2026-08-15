@@ -45,6 +45,10 @@ fn registration_from(row: &tokio_postgres::Row) -> Result<PushRegistration, Stor
 
 #[async_trait]
 impl PushStore for PostgresStore {
+    fn tenant(&self) -> &str {
+        self.tenant_str()
+    }
+
     async fn put(&self, config: &PushConfig, next_seq: Seq) -> Result<(), StoreError> {
         let client = self
             .pool_ref()

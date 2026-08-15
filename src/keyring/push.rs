@@ -61,8 +61,15 @@ impl SealedPush {
     /// `tenant` must be the tenant the wrapped store serves — see
     /// [`SealedCases::wrap`](super::SealedCases::wrap) for why this argument
     /// exists and what a mismatch costs.
+    ///
+    /// # Panics
+    ///
+    /// If `tenant` is not the tenant `inner` serves — see
+    /// [`SealedCases::wrap`](super::SealedCases::wrap) for why that pair is
+    /// checked rather than trusted.
     #[must_use]
     pub fn wrap(inner: Arc<dyn PushStore>, keys: Arc<dyn KeyRing>, tenant: TenantId) -> Arc<Self> {
+        super::assert_serves(inner.tenant(), &tenant, "push");
         Arc::new(Self {
             inner,
             keys,
@@ -166,6 +173,10 @@ impl SealedPush {
 
 #[async_trait]
 impl PushStore for SealedPush {
+    fn tenant(&self) -> &str {
+        self.tenant.as_str()
+    }
+
     async fn put(&self, config: &PushConfig, next_seq: Seq) -> Result<(), StoreError> {
         self.inner.put(&self.sealed(config).await?, next_seq).await
     }

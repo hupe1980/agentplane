@@ -386,6 +386,20 @@ destroys the other tenant's data *and reports both requests satisfied*: the
 request nobody made is marked done, and the data that should have survived is
 gone. Encryption does not fix that half; only the path does.
 
+**The plane and its stores must agree, and `try_build` checks.** The tenant
+scopes the plane's data keys; each store handle is scoped separately, so the two
+are set in different places and can differ. When a key ring is wired that
+difference is invisible: `build()` seals case, event, task, memory and outbox
+state under the *plane's* tenant while the store writes its rows under its own,
+both scopes are real, every run works — and an erasure destroys exactly the key
+it was asked for without reaching the rows, then reports success. That is the
+one failure a deletion guarantee may not have, so it is a startup refusal:
+`JournalStore`, `BlobStore`, `CaseStore`, `EventStore`, `TaskStore`,
+`MemoryStore` and `PushStore` each answer a `tenant()` question, and a
+disagreement fails the build naming the store and both tenants. A store that
+does not override the accessor answers `default` — right for a single-tenant
+deployment, and refused against a named plane, which is the safe direction.
+
 **Serving** is tenant-aware: `Planes` maps an authenticated caller's tenant to
 that tenant's plane. Three details carry the weight.
 

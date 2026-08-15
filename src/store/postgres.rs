@@ -504,6 +504,15 @@ impl PostgresStore {
         self.tenant.to_string()
     }
 
+    /// The tenant this handle is scoped to, for the store traits' accessors.
+    ///
+    /// Borrowed rather than owned: `tenant_name` exists because a query
+    /// parameter needs a `String`, and a trait answering *who do you serve*
+    /// should not allocate to say so.
+    pub(super) fn tenant_str(&self) -> &str {
+        self.tenant.as_str()
+    }
+
     /// Connect and apply the schema.
     ///
     /// # Errors

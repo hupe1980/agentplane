@@ -218,15 +218,62 @@ pub enum DelegationError {
 
 /// A verified chain from a human owner down to the acting workload.
 ///
-/// Constructed only through [`Delegation::root`] and [`Delegation::delegate`],
-/// so **every value of this type has already been checked**. There is no
-/// `Delegation::new(links)` that would let an unverified chain exist — the
-/// invariant is carried by the type rather than by a function somebody has to
-/// remember to call.
+/// Constructed only through [`Delegation::root`], [`Delegation::delegate`] and
+/// [`Delegation::rehydrate`], so **every value of this type has already been
+/// checked**. There is no `Delegation::new(links)` that would let an unverified
+/// chain exist — the invariant is carried by the type rather than by a function
+/// somebody has to remember to call.
+///
+/// # Deserialization is one of those constructors
+///
+/// `#[serde(try_from)]` rather than a derived `Deserialize`, which would reach
+/// the fields directly and *be* the `new(links)` this type refuses to offer.
+/// The claim above is what the rest of the crate spends: [`DelegationScheme`]
+/// is a public seam whose implementations parse credentials, and a chain also
+/// arrives from a journal record and from a peer. A derive would let any of
+/// them assert a chain that widens at a hop — [`I6`] inverted, through the one
+/// door nobody reads as a door.
+///
+/// The owner is a field rather than the head of a list for the same reason: a
+/// `Vec` that must be non-empty delegates the invariant to whoever remembers to
+/// check, and the accessors below would each need an `expect` that a hostile
+/// record could reach.
+///
+/// [`I6`]: https://hupe1980.github.io/agentplane/docs/security/
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "DelegationWire", try_from = "DelegationWire")]
 pub struct Delegation {
-    /// Owner first, acting workload last.
+    /// The human the whole chain descends from.
+    root: Principal,
+    /// Each narrowing hop below the owner, delegator first.
+    rest: Vec<Principal>,
+}
+
+/// The wire form of a [`Delegation`]: the links, in order, owner first.
+///
+/// A shape `serde` can build that is not yet a chain. Everything that turns one
+/// into the other goes through [`Delegation::rehydrate`], so the structural
+/// property is re-established on every read rather than assumed from the fact
+/// that something wrote it.
+#[derive(Serialize, Deserialize)]
+struct DelegationWire {
     links: Vec<Principal>,
+}
+
+impl From<Delegation> for DelegationWire {
+    fn from(chain: Delegation) -> Self {
+        Self {
+            links: chain.links().cloned().collect(),
+        }
+    }
+}
+
+impl TryFrom<DelegationWire> for Delegation {
+    type Error = DelegationError;
+
+    fn try_from(wire: DelegationWire) -> Result<Self, Self::Error> {
+        Self::rehydrate(wire.links)
+    }
 }
 
 /// How deep a chain may go before nobody can reason about it.
@@ -242,7 +289,10 @@ impl Delegation {
     /// Start a chain at its owner.
     #[must_use]
     pub fn root(owner: Principal) -> Self {
-        Self { links: vec![owner] }
+        Self {
+            root: owner,
+            rest: Vec::new(),
+        }
     }
 
     /// Extend the chain, narrowing authority.
@@ -273,27 +323,29 @@ impl Delegation {
                 max: MAX_DELEGATION_DEPTH,
             });
         }
-        let mut links = self.links.clone();
-        links.push(to);
-        Ok(Self { links })
+        let mut next = self.clone();
+        next.rest.push(to);
+        Ok(next)
     }
 
     /// The human at the root.
     #[must_use]
-    pub fn owner(&self) -> &Principal {
-        self.links.first().expect("a chain always has a root")
+    pub const fn owner(&self) -> &Principal {
+        &self.root
     }
 
     /// The workload actually acting. The policy principal.
+    ///
+    /// The last hop, or the owner when nobody has been delegated to yet.
     #[must_use]
     pub fn subject(&self) -> &Principal {
-        self.links.last().expect("a chain always has a root")
+        self.rest.last().unwrap_or(&self.root)
     }
 
     /// Hops below the owner. A bare owner has depth 0.
     #[must_use]
-    pub fn depth(&self) -> usize {
-        self.links.len() - 1
+    pub const fn depth(&self) -> usize {
+        self.rest.len()
     }
 
     /// What this chain may actually do.
@@ -308,7 +360,7 @@ impl Delegation {
 
     /// The chain, owner first.
     pub fn links(&self) -> impl Iterator<Item = &Principal> {
-        self.links.iter()
+        std::iter::once(&self.root).chain(self.rest.iter())
     }
 
     /// Rebuild a chain read back from the journal, re-checking it.

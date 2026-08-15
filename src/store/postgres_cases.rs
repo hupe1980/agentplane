@@ -401,6 +401,10 @@ impl PostgresStore {
 
 #[async_trait]
 impl CaseStore for PostgresStore {
+    fn tenant(&self) -> &str {
+        self.tenant_str()
+    }
+
     async fn correlate(&self, keys: &[CorrelationKey]) -> Result<Option<CaseId>, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         for k in keys {
@@ -1084,6 +1088,10 @@ fn deadline_from(row: &tokio_postgres::Row) -> Result<Deadline, StoreError> {
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl EventStore for PostgresStore {
+    fn tenant(&self) -> &str {
+        self.tenant_str()
+    }
+
     async fn buffer(&self, event: &InboundEvent, at: Timestamp) -> Result<bool, StoreError> {
         let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let tx = client.transaction().await.map_err(|e| be(&e))?;
@@ -1817,6 +1825,10 @@ async fn task_on(
 
 #[async_trait]
 impl TaskStore for PostgresStore {
+    fn tenant(&self) -> &str {
+        self.tenant_str()
+    }
+
     async fn open(&self, task: &Task) -> Result<Task, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client

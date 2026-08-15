@@ -1266,38 +1266,25 @@ impl Manifest {
     /// instruction, because a replan is an event that may never occur, so
     /// forbidding it forbids nothing the run needs.
     fn validate_budgets(&self) -> Result<(), ManifestError> {
-        let Some(budgets) = &self.spec.budgets else {
+        // Which ceilings are bricked is `Budget`'s rule, not this layer's: the
+        // same budget reaches the runtime through `RuntimeBuilder::budget`
+        // without passing here, and two copies of the list would agree until
+        // somebody added a sixth ceiling to one of them.
+        let Some(field) = self.budget().bricked_ceiling() else {
             return Ok(());
         };
-        for (field, is_zero) in [
-            ("spec.budgets.max_steps", budgets.max_steps == Some(0)),
-            ("spec.budgets.max_effects", budgets.max_effects == Some(0)),
-            ("spec.budgets.max_tokens", budgets.max_tokens == Some(0)),
-            (
-                "spec.budgets.max_minor_units",
-                budgets.max_minor_units == Some(0),
-            ),
-            (
-                "spec.budgets.max_wallclock_secs",
-                budgets.max_wallclock_secs == Some(0),
-            ),
-        ] {
-            if is_zero {
-                return Err(ManifestError::Syntax(format!(
-                    "{field} is 0, which permits nothing at all — not merely no model \
-                     spend. This ceiling is checked before every step and every effect, \
-                     so at 0 it is already reached and the run is refused its first \
-                     operation of any kind: a read-only tool call, a local lookup, an \
-                     agent that declares no models at all. Such an agent does not run \
-                     once and stop, it fails identically on every run it will ever make. \
-                     Omit the field to mean 'no limit'. To stop a tenant doing work, use \
-                     the operator's emergency stop (`QuotaStore::set_halt`), which \
-                     refuses new runs with a reason attached — a halt says somebody is \
-                     dealing with an incident, where a ceiling only says not right now"
-                )));
-            }
-        }
-        Ok(())
+        Err(ManifestError::Syntax(format!(
+            "spec.budgets.{field} is 0, which permits nothing at all — not merely no \
+             model spend. This ceiling is checked before every step and every effect, \
+             so at 0 it is already reached and the run is refused its first operation \
+             of any kind: a read-only tool call, a local lookup, an agent that declares \
+             no models at all. Such an agent does not run once and stop, it fails \
+             identically on every run it will ever make. Omit the field to mean 'no \
+             limit'. To stop a tenant doing work, use the operator's emergency stop \
+             (`QuotaStore::set_halt`), which refuses new runs with a reason attached — \
+             a halt says somebody is dealing with an incident, where a ceiling only \
+             says not right now"
+        )))
     }
 
     fn validate_context_grants(&self) -> Result<(), ManifestError> {
@@ -1490,6 +1477,20 @@ impl Manifest {
                 return Err(ManifestError::Syntax(format!(
                     "spec.tools: '{reference}' names no capability"
                 )));
+            }
+            // An agent granted the capability it itself provides is granted a
+            // call to itself. Whether that regress terminates depends on a
+            // model's judgement, which is the one thing a ceiling cannot bound
+            // — and both halves of the contradiction are on this page.
+            if self.spec.capabilities.provides.iter().any(|c| c == rest) {
+                return Err(ManifestError::Unenforceable {
+                    field: "spec.tools[].ref",
+                    detail: "this grant names a capability the agent itself provides, so it \
+                             is a grant to call itself. The recursion terminates only if a \
+                             model decides it should, which is not something the declaration \
+                             can bound — grant the capability of a *different* agent, or \
+                             drop the grant",
+                });
             }
             if !grant.mutates {
                 return Err(ManifestError::Unenforceable {
@@ -1778,6 +1779,53 @@ impl Manifest {
 
     /// Model roles, and the one combination that removes a control.
     fn validate_models(&self) -> Result<(), ManifestError> {
+        // A declarative agent's whole behaviour is a model call, and the model
+        // is named rather than defaulted — the runtime will not fall back to
+        // some other registered driver, because that would run the agent on a
+        // model its own declaration does not name. So `execution` without
+        // `models.privileged` is a document that cannot ever assemble, and
+        // both halves of that are on this page.
+        //
+        // The builder refuses it too (`BuildError::DeclarativeWithoutModel`),
+        // which is not the same check twice: `Manifest`'s fields are public, so
+        // a caller may construct one without going through `parse` or `build`,
+        // and the builder is the backstop for that. What this adds is the
+        // refusal arriving from `agentplane validate`, before a deploy, rather
+        // than from whichever process first tried to assemble a plane.
+        // A declarative agent's capabilities are what the runtime registers its
+        // driver under, so an empty `provides` is a declaration the runtime
+        // reads as "register nothing": the model, the tools and the prompt are
+        // all named, and no run can ever reach them.
+        if self.spec.execution.is_some() && self.spec.capabilities.provides.is_empty() {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.capabilities.provides",
+                detail: "this agent's behaviour is declared but it advertises no capability, \
+                         and a declarative agent's driver is registered once per capability \
+                         it provides — so nothing would be registered and no run could ever \
+                         reach the model, tools and prompt named here. Name what this agent \
+                         answers",
+            });
+        }
+        if self.spec.execution.is_some()
+            && self
+                .spec
+                .models
+                .as_ref()
+                .and_then(|m| m.privileged.as_ref())
+                .is_none()
+        {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.execution",
+                detail: "this agent's behaviour is declared, so the runtime drives it by \
+                         calling a model — and no `spec.models.privileged` names one. The \
+                         model is named rather than defaulted, because falling back to \
+                         another registered driver would run the agent on a model its own \
+                         declaration does not name, so there is nothing to call and the \
+                         plane will refuse to assemble. Name a privileged model, or drop \
+                         `spec.execution` and attach a coded skill instead",
+            });
+        }
+
         let Some(models) = &self.spec.models else {
             return Ok(());
         };

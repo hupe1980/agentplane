@@ -37,8 +37,15 @@ impl SealedTasks {
     /// `tenant` must be the tenant the wrapped store serves — see
     /// [`SealedCases::wrap`](super::SealedCases::wrap) for why this argument
     /// exists and what a mismatch costs.
+    ///
+    /// # Panics
+    ///
+    /// If `tenant` is not the tenant `inner` serves — see
+    /// [`SealedCases::wrap`](super::SealedCases::wrap) for why that pair is
+    /// checked rather than trusted.
     #[must_use]
     pub fn wrap(inner: Arc<dyn TaskStore>, keys: Arc<dyn KeyRing>, tenant: TenantId) -> Arc<Self> {
+        super::assert_serves(inner.tenant(), &tenant, "task");
         Arc::new(Self {
             inner,
             keys,
@@ -99,6 +106,10 @@ impl SealedTasks {
 
 #[async_trait]
 impl TaskStore for SealedTasks {
+    fn tenant(&self) -> &str {
+        self.tenant.as_str()
+    }
+
     async fn open(&self, task: &Task) -> Result<Task, StoreError> {
         let plain = crate::core::canon::to_bytes(&task.justification.proposed_action)
             .map_err(|e| StoreError::Backend(format!("a proposal would not serialise: {e}")))?;

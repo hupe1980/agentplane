@@ -764,6 +764,101 @@ async fn a_replayed_effect_carries_the_same_label() {
     assert!(after.iter().any(|(n, untrusted, _)| n == "b" && *untrusted));
 }
 
+/// A catalogue edit cannot relabel a value a finished run already read.
+///
+/// This is the sharp version of the test above. `output_sensitivity` is not a
+/// property of the code — it comes from operator configuration (a `ToolSafety`
+/// entry, an MCP grant, a `PeerGrant`) and it is deliberately **not** part of
+/// the effect key, because a reviewed allowance is not part of what the call
+/// asked for. So lowering one changes no key, diverges nothing, and quietly
+/// re-derives a weaker label for every value replay hands back.
+///
+/// The damage is not confined to audits: a `Resume` replays its prefix and then
+/// dispatches live, so a run suspended while holding a `Secret` tool result
+/// wakes holding a `Public` one and its live tail may send it where the
+/// original label forbade. Reading the declaration back from the record is what
+/// closes it.
+#[tokio::test]
+async fn lowering_a_declared_sensitivity_does_not_declassify_history() {
+    /// One catalogue entry, with the reviewed ceiling it carries.
+    #[derive(Debug, Clone)]
+    struct Catalogued(Sensitivity);
+
+    #[async_trait::async_trait]
+    impl Effect for Catalogued {
+        type Output = Value;
+        fn descriptor(&self) -> EffectDescriptor {
+            // The ceiling is absent here on purpose: it is what the operator
+            // allows, not what this call asks the provider for.
+            EffectDescriptor::new("tool.call", json!({ "tool": "crm/lookup" }))
+        }
+        fn mutates(&self) -> bool {
+            false
+        }
+        fn output_sensitivity(&self) -> Sensitivity {
+            self.0
+        }
+        fn recovery(&self) -> Recovery {
+            Recovery::Retry
+        }
+        async fn perform(&self) -> Result<Value, EffectError> {
+            Ok(json!({ "customer": "Ada Lovelace" }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Reads(Sensitivity);
+
+    #[async_trait::async_trait]
+    impl Skill for Reads {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("reads").provides("reads")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let answer = cx.effect(Catalogued(self.0)).await?;
+            // The observed label, reported as the run's own output so the two
+            // passes can be compared without reaching inside the runtime.
+            let seen = format!("{:?}", answer.label().sensitivity);
+            Ok(Outcome::done(Tainted::trusted(
+                json!({ "sensitivity": seen }),
+            )))
+        }
+    }
+
+    let store = db();
+    let build = |declares: Sensitivity| {
+        Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .skill(Reads(declares))
+            .build()
+    };
+
+    let live = build(Sensitivity::Secret)
+        .run("reads", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        live.output.as_ref().unwrap().peek()["sensitivity"],
+        json!("Secret")
+    );
+
+    // Somebody edits the catalogue. Nothing about the call changed, so nothing
+    // diverges — which is exactly why the label has to come from the record.
+    let replay = build(Sensitivity::Public)
+        .replay(live.run_id, Mode::Strict)
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.output.as_ref().unwrap().peek()["sensitivity"],
+        json!("Secret"),
+        "a value read back from history must carry the sensitivity it was read \
+         under, not the one the catalogue declares today"
+    );
+}
+
 // ── Destination-scoped release ──────────────────────────────────────────────
 
 /// Routes one released value to the sink named in the run input.

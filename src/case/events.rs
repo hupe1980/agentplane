@@ -41,6 +41,23 @@ pub enum TargetedDelivery {
 /// wait forever for something that already happened.
 #[async_trait]
 pub trait EventStore: Send + Sync + Debug {
+    /// Whose rows this handle can reach.
+    ///
+    /// Defaults to [`TenantId::DEFAULT`](crate::core::TenantId::DEFAULT), the
+    /// tenant a store serves until told otherwise. Override it with the tenant
+    /// the handle is actually scoped to.
+    ///
+    /// This exists so a mismatch with the plane's tenant is a **startup
+    /// refusal**. When a key ring is wired, `build()` seals this state under
+    /// the plane's tenant while the store writes rows under its own; the two
+    /// disagreeing is not a leak — the scopes simply differ — but it seals the
+    /// state under a scope erasure will never destroy. That is an erasure that
+    /// reports success and misses, which is the one failure a deletion
+    /// guarantee cannot have.
+    fn tenant(&self) -> &str {
+        crate::core::TenantId::DEFAULT
+    }
+
     /// Record an inbound event, returning `false` if this `(source, id)` was
     /// already seen.
     ///

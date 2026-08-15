@@ -189,6 +189,49 @@ impl Skill for One {
     }
 }
 
+/// Two effects, distinct keys, so the second is the one a ceiling of one
+/// refuses.
+#[derive(Debug)]
+struct Two(Scripted);
+
+#[async_trait::async_trait]
+impl Skill for Two {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("two").provides("demo.two")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _i: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let v = cx.effect(Numbered(self.0.clone(), 1)).await?;
+        let _ = cx.effect(Numbered(self.0.clone(), 2)).await?;
+        Ok(Outcome::done(v))
+    }
+}
+
+/// `Scripted` under a distinct key, since exactly-once is keyed on the
+/// descriptor and two identical ones are one effect.
+#[derive(Debug, Clone)]
+struct Numbered(Scripted, u8);
+
+#[async_trait::async_trait]
+impl Effect for Numbered {
+    type Output = Value;
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(format!("test.op{}", self.1), json!(null))
+    }
+    fn mutates(&self) -> bool {
+        self.0.mutates()
+    }
+    fn recovery(&self) -> Recovery {
+        self.0.recovery()
+    }
+    async fn perform(&self) -> Result<Value, EffectError> {
+        self.0.perform().await
+    }
+}
+
 fn runtime(effect: Scripted) -> (Arc<RedbStore>, Arc<Runtime>) {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
@@ -283,16 +326,19 @@ async fn a_budget_refusal_emits_its_event() {
 
     let rec = Recorder::default();
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    // A ceiling of one, reached by the *second* effect. A ceiling of zero would
+    // be refused at build — it permits nothing at all, so the plane could never
+    // run — and a run that never starts emits no budget event to observe.
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
-        .budget(Budget::default().effects(0))
-        .skill(One(healthy()))
+        .budget(Budget::default().effects(1))
+        .skill(Two(healthy()))
         .build();
 
     let _ambient = crate::ambient_subscriber();
 
     let guard = tracing::subscriber::set_default(rec.clone());
     let out = rt
-        .run("demo.one", Tainted::trusted(json!({})))
+        .run("demo.two", Tainted::trusted(json!({})))
         .await
         .unwrap();
     drop(guard);

@@ -108,6 +108,75 @@ impl EffectDescriptor {
     }
 }
 
+/// What an effect declared about its own output, as a recorded fact.
+///
+/// # Why this is journaled rather than re-read from the effect
+///
+/// An effect's output label has three parts. Its provenance comes from
+/// [`Effect::source`], which every effect derives from something already inside
+/// its key — a tool reference, a provider and model — so a change to it is
+/// divergence and cannot pass unnoticed. The other two, [`Effect::trust`] and
+/// [`Effect::output_sensitivity`], are read from **operator configuration**: a
+/// tool catalogue's `ToolSafety`, an MCP grant, a peer's `PeerGrant`. Those are
+/// edited without touching a line of code, and none of them reaches the key.
+///
+/// So they are recorded when the effect lands and read back on replay. Deriving
+/// them again would let a catalogue edit rewrite the label of a value that was
+/// read months ago: a tool whose declared output sensitivity is lowered from
+/// `Secret` to `Public` hands every suspended run's already-read result back
+/// declassified, and the live tail of that resume may then send it somewhere
+/// the original label forbade. Nothing diverges, because nothing about the call
+/// changed — only what somebody later said about it.
+///
+/// This is the same rule [`RecordKind::RunAdmitted`] follows for the input
+/// label, reached from the other end of the run.
+///
+/// [`RecordKind::RunAdmitted`]: crate::journal::RecordKind::RunAdmitted
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct DeclaredOutput {
+    pub trust: Trust,
+    pub sensitivity: Sensitivity,
+}
+
+impl DeclaredOutput {
+    /// What this effect says about the value it is about to return.
+    #[must_use]
+    pub fn of<E: Effect + ?Sized>(effect: &E) -> Self {
+        Self {
+            trust: effect.trust(),
+            sensitivity: effect.output_sensitivity(),
+        }
+    }
+
+    /// The conservative answer, for a record that carries a value no effect
+    /// produced — a release's own `()`, an inbound event's payload.
+    ///
+    /// Untrusted and `Internal` is not a placeholder: it is what
+    /// [`Label::untrusted`](crate::core::Label::untrusted) builds, so a record
+    /// written on either path describes the same lattice point.
+    #[must_use]
+    pub const fn untrusted() -> Self {
+        Self {
+            trust: Trust::Untrusted,
+            sensitivity: Sensitivity::Internal,
+        }
+    }
+
+    /// The lattice bottom, for the runtime's own data.
+    ///
+    /// Reserved for values that cross no trust boundary — a fired timer's
+    /// instant, which the runtime chose, journaled, and is now reading back.
+    /// The same short list [`Effect::trust`] names, and a fourth member has to
+    /// argue for itself there first.
+    #[must_use]
+    pub const fn trusted() -> Self {
+        Self {
+            trust: Trust::Trusted,
+            sensitivity: Sensitivity::Public,
+        }
+    }
+}
+
 /// What a reconciliation probe established about a call whose outcome was
 /// unknown.
 ///

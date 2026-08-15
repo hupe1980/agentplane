@@ -843,6 +843,11 @@ impl crate::journal::AtomicWork for GroupCommit {
                     output,
                     source: None,
                     spend: crate::core::Spend::default(),
+                    // An atomic member's result never reaches the caller — it
+                    // commits with the frontier, so `commit` returns only the
+                    // deferred members' values. Recorded conservatively so the
+                    // record is honest about a value nothing labelled.
+                    declared: crate::core::DeclaredOutput::untrusted(),
                 })
                 .effect(*key),
             );

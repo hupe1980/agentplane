@@ -150,8 +150,11 @@ impl std::ops::AddAssign for Spend {
 /// The corollary is that zero is not a useful value for any ceiling here except
 /// [`max_replans`](Self::max_replans) and [`max_denials`](Self::max_denials): at
 /// zero the limit is reached before the run starts, and the agent can never do
-/// anything at all. A manifest declaring one is refused at parse — see
-/// `manifest::Budgets`.
+/// anything at all. Refused on both paths that can carry one — the manifest at
+/// parse, and [`RuntimeBuilder::budget`] at build — from the single rule in
+/// [`bricked_ceiling`](Self::bricked_ceiling).
+///
+/// [`RuntimeBuilder::budget`]: crate::runtime::RuntimeBuilder::budget
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budget {
     /// Plan nodes this run may execute, checked before each one starts.
@@ -218,6 +221,41 @@ pub struct Budget {
 }
 
 impl Budget {
+    /// The first ceiling set to zero, if any — the field name, for a message.
+    ///
+    /// Zero is not a small limit here; it is a limit already reached. Every
+    /// ceiling this reports is compared **before** the work and against every
+    /// effect of every kind, so at zero the run is refused its first operation:
+    /// a read-only tool call, a local lookup, an agent that declares no models
+    /// at all. Such a plane does not run once and stop — it fails identically
+    /// on every run it will ever make, which makes it a wiring mistake rather
+    /// than a budget.
+    ///
+    /// [`max_replans`](Self::max_replans) and [`max_denials`](Self::max_denials)
+    /// are excluded, because zero is meaningful for both: it says *do not
+    /// replan* and *the first refusal ends the run*, and a run that never
+    /// replans or is never refused is unaffected by either.
+    #[must_use]
+    pub const fn bricked_ceiling(&self) -> Option<&'static str> {
+        // `matches!` rather than `== Some(0)` so this stays `const`.
+        if matches!(self.max_steps, Some(0)) {
+            return Some("max_steps");
+        }
+        if matches!(self.max_effects, Some(0)) {
+            return Some("max_effects");
+        }
+        if matches!(self.max_tokens, Some(0)) {
+            return Some("max_tokens");
+        }
+        if matches!(self.max_minor_units, Some(0)) {
+            return Some("max_minor_units");
+        }
+        if matches!(self.max_wallclock_secs, Some(0)) {
+            return Some("max_wallclock_secs");
+        }
+        None
+    }
+
     /// No limits. An explicit choice, not an absence of one.
     #[must_use]
     pub const fn unlimited() -> Self {

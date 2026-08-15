@@ -37,8 +37,8 @@
 //!
 //! [`LeafHash`] closes it where the evidence is strongest — construction.
 //! There is one way to make one, it applies the prefix, and a tree built from
-//! raw digests no longer compiles. The prefix bytes are still checked by the
-//! RFC 6962 vectors below; what the type adds is that they cannot be skipped.
+//! raw digests does not compile. The prefix bytes are checked by the RFC 6962
+//! vectors below; what the type adds is that they cannot be skipped.
 
 use crate::core::Digest;
 
@@ -92,13 +92,13 @@ fn node_hash(left: &Digest, right: &Digest) -> Digest {
 ///
 /// Taking [`LeafHash`] rather than [`Digest`] is the second-preimage defence
 /// made structural: a caller who forgets to leaf-hash cannot reach this
-/// function at all, where before they got a plausible root over an
-/// undifferentiated tree and nothing said otherwise.
+/// function at all, rather than getting a plausible root over an
+/// undifferentiated tree with nothing to say so.
 ///
 /// ```compile_fail
 /// use agentplane::core::{merkle, Digest};
-/// // Raw digests are not leaves. This used to compile and produce a tree
-/// // with no domain separation between leaves and interior nodes.
+/// // Raw digests are not leaves: a tree built from them has no domain
+/// // separation between leaves and interior nodes.
 /// let _ = merkle::root(&[Digest::of(b"a"), Digest::of(b"b")]);
 /// ```
 ///
@@ -321,12 +321,11 @@ pub fn verify_consistency(
         // but the pair still has to be a coherent checkpoint. An empty log
         // hashes to `empty_root()` and nothing else, so a caller
         // presenting size 0 beside any other root is presenting a checkpoint
-        // that never existed, and answering `true` would bless it. This arm
-        // used to check the proof and ignore the root entirely, which made
-        // "consistent with the empty log" a sentence that accepted whatever
-        // root was put next to it.
+        // that never existed, and answering `true` would bless it. Checking
+        // the proof and ignoring the root would make "consistent with the
+        // empty log" a sentence that accepts whatever root is put beside it.
         //
-        // What it still does not check, because nothing here can: that the
+        // What this does not check, because nothing here can: that the
         // *new* pair is a real checkpoint. Growth from nothing has no proof
         // to verify against, so a first checkpoint is trusted or witnessed on
         // other grounds — which is what the witness exists for.
@@ -349,9 +348,9 @@ pub fn verify_consistency(
 ///
 /// `complete` says whether the subtree being examined *is* the old tree. When it
 /// is, the prover omits its hash — because the verifier was handed the old root
-/// as a parameter and already has it. Forgetting that is how a correct proof
-/// gets rejected: the first version of this returned `None` there and failed
-/// every log growing from 1 to 2.
+/// as a parameter and already has it. Reading for a hash that was deliberately
+/// not sent is how a correct proof gets rejected, and the smallest case that
+/// shows it is a log growing from 1 to 2.
 fn rebuild(
     m: usize,
     n: usize,

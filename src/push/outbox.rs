@@ -222,6 +222,16 @@ impl Outbox {
         &self.destinations
     }
 
+    /// Whose rows the store behind this outbox can reach.
+    ///
+    /// The builder asks before it seals: the outbox is the one store here
+    /// reached through a handle the embedder constructed rather than
+    /// registered, so its tenant would otherwise be the one the plane never
+    /// gets to check.
+    pub(crate) fn store_tenant(&self) -> &str {
+        self.store.tenant()
+    }
+
     /// The same outbox, with its store's credentials sealed under `keys`.
     ///
     /// An operator destination's bearer — written by [`open`](Self::open) into

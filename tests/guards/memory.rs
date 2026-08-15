@@ -173,7 +173,11 @@ async fn erase_subject_reaches_every_item_however_many() {
     use agentplane::keyring::EncryptedMemoryStore;
     use agentplane::testkit::MemoryKeyRing;
 
-    let inner = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let inner = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(TenantId::new("bulk-erase").expect("tenant")),
+    );
     let encrypted = EncryptedMemoryStore::new(
         Arc::clone(&inner) as Arc<dyn MemoryStore>,
         Arc::new(MemoryKeyRing::new()),
@@ -232,7 +236,11 @@ async fn a_destroyed_subject_key_reads_as_absence_not_an_error() {
     use agentplane::testkit::MemoryKeyRing;
 
     let tenant = TenantId::new("skip-destroyed").expect("tenant");
-    let inner = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let inner = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant.clone()),
+    );
     let ring = Arc::new(MemoryKeyRing::new());
     let encrypted = EncryptedMemoryStore::new(
         Arc::clone(&inner) as Arc<dyn MemoryStore>,
@@ -322,8 +330,16 @@ async fn memory_subject_erasure_makes_backup_ciphertext_unreadable() {
     use agentplane::testkit::MemoryKeyRing;
 
     let tenant = TenantId::new("crypto-memory").expect("tenant");
-    let inner = Arc::new(RedbStore::open_in_memory().expect("live store"));
-    let backup = Arc::new(RedbStore::open_in_memory().expect("backup store"));
+    let inner = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("live store")
+            .for_tenant(tenant.clone()),
+    );
+    let backup = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("backup store")
+            .for_tenant(tenant.clone()),
+    );
     let keys = Arc::new(MemoryKeyRing::new());
     let encrypted = Arc::new(EncryptedMemoryStore::new(
         Arc::clone(&inner) as Arc<dyn MemoryStore>,
@@ -392,7 +408,11 @@ async fn encrypted_memory_preserves_plaintext_derivation_commitments() {
     use agentplane::memory::Selected;
     use agentplane::testkit::MemoryKeyRing;
 
-    let inner = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let inner = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(TenantId::new("derived-memory").expect("tenant")),
+    );
     let encrypted = EncryptedMemoryStore::new(
         Arc::clone(&inner) as Arc<dyn MemoryStore>,
         Arc::new(MemoryKeyRing::new()),
@@ -1823,7 +1843,14 @@ impl agentplane::memory::Embedder for DriftingEmbedder {
 }
 
 #[derive(Debug)]
-struct Embeds(Arc<DriftingEmbedder>);
+/// Embeds a query that came from somewhere, at a declared ceiling.
+///
+/// The text is deliberately **untrusted**, which is what a real query is: a
+/// user's question, a model's paraphrase, a recalled memory. Anything that
+/// crossed a trust boundary is already `Internal`, so a fixture embedding a
+/// trusted literal would pass under a ceiling of `Public` and prove nothing
+/// about the call anybody actually makes.
+struct Embeds(Arc<DriftingEmbedder>, Sensitivity);
 
 #[async_trait::async_trait]
 impl Skill for Embeds {
@@ -1836,14 +1863,56 @@ impl Skill for Embeds {
         cx: &mut StepCtx<'_>,
         _input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
+        let query = Tainted::with_label(
+            "what is the refund policy?".to_owned(),
+            agentplane::core::Label::untrusted(SourceId::new("tool://helpdesk/search")),
+        );
         let vector = cx
             .embed(
                 Arc::clone(&self.0) as Arc<dyn agentplane::memory::Embedder>,
-                Tainted::trusted("what is the refund policy?".to_owned()),
+                query,
+                self.1,
             )
             .await?;
         Ok(Outcome::done(vector.map(|v| json!({ "embedding": v }))))
     }
+}
+
+/// A ceiling of `Public` refuses an embedding of anything real.
+///
+/// The regression this pins: `Embed` declared no ceiling of its own, so it
+/// inherited the trait default of `Public` — and since every query worth
+/// embedding is at least `Internal`, the whole semantic-recall path was
+/// reachable only by embedding a hard-coded literal. The refusal must still be
+/// available (a deployment may genuinely allow only public text to leave), so
+/// this asserts the gate works rather than that it is gone.
+#[tokio::test]
+async fn an_embedding_above_its_declared_ceiling_is_refused() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let embedder = Arc::new(DriftingEmbedder(std::sync::atomic::AtomicUsize::new(0)));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Embeds(Arc::clone(&embedder), Sensitivity::Public))
+        .build();
+
+    let run = rt
+        .run("embeds", Tainted::trusted(json!({})))
+        .await
+        .expect("the run itself completes; the effect inside it is refused");
+    let RunStatus::Failed(why) = &run.status else {
+        panic!(
+            "an embedding above the ceiling must not succeed: {:?}",
+            run.status
+        )
+    };
+    assert!(
+        why.contains("egress") || why.contains("sensitivity"),
+        "the refusal must name the ceiling it hit: {why}"
+    );
+    assert_eq!(
+        embedder.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing may reach the embedding service once the gate refuses"
+    );
 }
 
 /// A replayed run reads its vector back rather than embedding again.
@@ -1860,7 +1929,7 @@ async fn a_replayed_run_reads_its_embedding_back_rather_than_asking_again() {
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
     let embedder = Arc::new(DriftingEmbedder(std::sync::atomic::AtomicUsize::new(0)));
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .skill(Embeds(Arc::clone(&embedder)))
+        .skill(Embeds(Arc::clone(&embedder), Sensitivity::Internal))
         .build();
 
     let live = rt
@@ -1993,7 +2062,11 @@ async fn the_encrypted_memory_store_takes_the_lifecycle_lock() {
         }
     }
 
-    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let store = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(TenantId::new("acme").expect("tenant")),
+    );
     let coordinator = Arc::new(Counting::default());
     let sealed = EncryptedMemoryStore::new(
         Arc::clone(&store) as Arc<dyn MemoryStore>,

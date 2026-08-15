@@ -48,12 +48,19 @@ impl SealedJournal {
     /// construction. `RuntimeBuilder` already refuses a plane whose store is
     /// scoped to another tenant, so the two agree there; this makes them agree
     /// for a hand-wired store too.
+    ///
+    /// # Panics
+    ///
+    /// If `tenant` is not the tenant `inner` serves — see
+    /// [`SealedCases::wrap`](super::SealedCases::wrap) for why that pair is
+    /// checked rather than trusted.
     #[must_use]
     pub fn wrap(
         inner: Arc<dyn JournalStore>,
         keys: Arc<dyn KeyRing>,
         tenant: TenantId,
     ) -> Arc<Self> {
+        super::assert_serves(inner.tenant(), &tenant, "journal");
         Arc::new(Self {
             inner,
             keys,

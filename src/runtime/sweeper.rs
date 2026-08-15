@@ -718,6 +718,9 @@ impl Runtime {
                     // A timer has no sender.
                     source: None,
                     spend: crate::core::Spend::default(),
+                    // The runtime's own instant, chosen and journaled here —
+                    // one of the few values that crosses no trust boundary.
+                    declared: crate::core::DeclaredOutput::trusted(),
                 },
             )
             .effect(timer.effect)

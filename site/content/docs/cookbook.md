@@ -1825,6 +1825,15 @@ failure is `DidNotHappen`.
 host anybody can register under a domain, including one an attacker controls the
 moment a subdomain is left dangling. There are no wildcards, deliberately.
 
+**Which drivers ask.** Anthropic, `OpenAI`, Gemini and the `OpenAI`-compatible
+driver, plus the `OpenAI` embedder. **Bedrock does not** — it is handed a built
+AWS client whose endpoint the SDK will not disclose, so the only host it could
+check is one derived from the region, which an endpoint override makes a
+fiction. Constrain a Bedrock plane where the SDK does: a VPC endpoint, an egress
+proxy, or an IAM policy. What the driver does give you is the region on the
+record — read from the client, and part of effect identity, so a change of
+region is replay divergence rather than a quiet move.
+
 ## ⚖️ Judge a high-stakes step more than once
 
 ```rust
@@ -2072,7 +2081,14 @@ run on the next replay:
 
 ```rust
 let query_vector = cx
-    .embed(embedder, Tainted::trusted("refund policy".to_owned()))
+    .embed(
+        embedder,
+        Tainted::trusted("refund policy".to_owned()),
+        // Embedding sends the text to a provider, so it is an egress and the
+        // ceiling is yours to set. A real query is untrusted — a user's
+        // question, a model's rewrite — and therefore already `Internal`.
+        Sensitivity::Internal,
+    )
     .await?
     .peek()
     .clone();
@@ -2157,7 +2173,10 @@ a 1536-wide vector and a 512-wide one from the same model rank against different
 geometry, and the effect key is what stops a replay reading one as the other.
 `BedrockEmbedder` puts the **region** in it too, because a Bedrock model id names
 a model rather than a deployment: the same id in two regions is two services, and
-a vector from one has no standing in an index built from the other. It embeds one
+a vector from one has no standing in an index built from the other. The region is
+read from the client rather than passed beside it — it decides which index a
+vector belongs to, so a copy that could disagree with the service the vectors
+actually came from would be the copy the revision attests. It embeds one
 text per call on purpose — one effect is one observation, and a batching driver
 would have to decide how a partial failure maps onto several effect keys.
 
@@ -2231,7 +2250,13 @@ let (history, _version) = cx.case_state().await?;
 let standalone = cx.sink_with(&prompt, |value| ModelCall::new(provider, model, value)).await?;
 
 // 3. Embed the rewritten question — never the raw turn.
-let vector = cx.embed(embedder, standalone.map(|c| c.text.clone())).await?;
+let vector = cx
+    .embed(
+        embedder,
+        standalone.map(|c| c.text.clone()),
+        Sensitivity::Internal,
+    )
+    .await?;
 
 // 4. Retrieve, 5. answer with what came back.
 ```

@@ -276,9 +276,9 @@ pub trait JournalStore: Send + Sync + Debug {
     ///
     /// A stored run id that does not parse is **corruption**, reported as
     /// [`StoreError::Corrupt`] rather than silently thinned out of the page.
-    /// Both shipped backends hold this; one used to skip and the other used to
-    /// refuse, and a listing that quietly loses the quarantined run is the
-    /// unreachable-signal failure this method exists to remove.
+    /// Every backend must hold this: a listing that quietly drops the
+    /// quarantined run it could not parse is the unreachable-signal failure
+    /// this method exists to remove, and it reads as a clean page.
     ///
     /// Bounded, and the bound is visible: `limit` results means *at least*
     /// that many, not exactly.
@@ -368,9 +368,9 @@ pub trait JournalStore: Send + Sync + Debug {
     /// and unexpired is refused with [`StoreError::LeaseHeld`], **including
     /// when the caller itself is the holder**.
     ///
-    /// That last refusal is deliberate, and it used to be the opposite:
-    /// `acquire` renewed for the same owner. Two failures hid in that
-    /// convenience. A heartbeat racing its own run's conclusion could
+    /// That last refusal is deliberate. Letting `acquire` renew for the same
+    /// owner would be the convenient reading, and two failures hide in it. A
+    /// heartbeat racing its own run's conclusion could
     /// re-acquire the lease the conclusion had just *released*, leaving a
     /// live, never-released lease over a concluded run — which the recovery
     /// sweep then "recovers" forever. And a second entry point on the same

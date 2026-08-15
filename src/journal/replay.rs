@@ -52,6 +52,14 @@ pub enum EffectReplay {
         /// taint gate downstream may reach a different verdict.
         source: Option<String>,
         spend: crate::core::Spend,
+        /// The trust and sensitivity the effect declared when it landed.
+        ///
+        /// Read back for the same reason the spend is, and with a sharper
+        /// consequence: these two are sourced from operator configuration
+        /// rather than from code, so re-deriving them lets a catalogue edit
+        /// relabel a value the run read months ago — with nothing diverging,
+        /// because nothing about the call changed.
+        declared: crate::core::DeclaredOutput,
     },
     /// It failed, and the failure is part of history — including what that
     /// failure said about whether the call reached the outside world.
@@ -140,6 +148,7 @@ impl StepCursor {
                 output,
                 source,
                 spend,
+                declared,
             } => {
                 self.settle(
                     key,
@@ -147,40 +156,20 @@ impl StepCursor {
                         output: output.clone(),
                         source: source.clone(),
                         spend: *spend,
+                        declared: *declared,
                     },
                 );
             }
-            // A reconciliation verdict collapses into the vocabulary the
-            // replay loop already speaks, so nothing downstream needs a
-            // separate path for it:
-            //
-            //   Landed        -> the effect is done, with the recovered output
-            //   DidNotHappen  -> a failure that is safe to repeat
-            //   InDoubt       -> a failure that is not
-            //
-            // It overwrites whatever the attempt's earlier record said,
-            // because the probe is the later and better-informed answer.
             RecordKind::EffectReconciled {
                 disposition,
                 output,
                 spend,
+                declared,
                 ..
             } => {
                 self.settle(
                     key,
-                    match (disposition, output) {
-                        (Disposition::Landed, Some(output)) => EffectReplay::Done {
-                            output: output.clone(),
-                            source: None,
-                            spend: *spend,
-                        },
-                        (d, _) => EffectReplay::Failed {
-                            error: "resolved by reconciliation".to_owned(),
-                            disposition: *d,
-                            spend: crate::core::Spend::default(),
-                            permanent: false,
-                        },
-                    },
+                    Self::reconciled(*disposition, output.as_ref(), *spend, *declared),
                 );
             }
             // A refusal has no preceding `EffectStarted` — the whole point
@@ -232,6 +221,41 @@ impl StepCursor {
         }
     }
 
+    /// A reconciliation verdict, in the vocabulary the replay loop already
+    /// speaks — so nothing downstream needs a separate path for it:
+    ///
+    ///   `Landed`       -> the effect is done, with the recovered output
+    ///   `DidNotHappen` -> a failure that is safe to repeat
+    ///   `InDoubt`      -> a failure that is not
+    ///
+    /// It overwrites whatever the attempt's earlier record said, because the
+    /// probe is the later and better-informed answer.
+    fn reconciled(
+        disposition: Disposition,
+        output: Option<&serde_json::Value>,
+        spend: crate::core::Spend,
+        declared: Option<crate::core::DeclaredOutput>,
+    ) -> EffectReplay {
+        match (disposition, output) {
+            (Disposition::Landed, Some(output)) => EffectReplay::Done {
+                output: output.clone(),
+                source: None,
+                spend,
+                // A `Landed` verdict without a declaration is a record this
+                // runtime does not write. Reading it as trusted would be the
+                // relabel the field exists to stop, so the conservative point
+                // stands in.
+                declared: declared.unwrap_or_else(crate::core::DeclaredOutput::untrusted),
+            },
+            (disposition, _) => EffectReplay::Failed {
+                error: "resolved by reconciliation".to_owned(),
+                disposition,
+                spend: crate::core::Spend::default(),
+                permanent: false,
+            },
+        }
+    }
+
     fn record_release(&mut self, key: EffectKey, seq: Seq) {
         self.effects.push((
             key,
@@ -240,6 +264,11 @@ impl StepCursor {
                 output: serde_json::Value::Null,
                 source: None,
                 spend: crate::core::Spend::default(),
+                // A release records no value of its own to label: the released
+                // value belongs to the caller and its new label is in the
+                // `Released` record. The conservative point keeps this from
+                // being the one synthesized `Done` that means *trusted*.
+                declared: crate::core::DeclaredOutput::untrusted(),
             },
         ));
     }
@@ -449,6 +478,7 @@ mod tests {
                 S0,
                 key(1),
                 RecordKind::EffectDone {
+                    declared: crate::core::DeclaredOutput::untrusted(),
                     output: json!("recorded"),
                     source: None,
                     spend: crate::core::Spend::default(),
@@ -459,6 +489,7 @@ mod tests {
         assert_eq!(
             next(&mut cur, S0, key(1)).unwrap(),
             Some(EffectReplay::Done {
+                declared: crate::core::DeclaredOutput::untrusted(),
                 output: json!("recorded"),
                 source: None,
                 spend: crate::core::Spend::default()
@@ -477,6 +508,7 @@ mod tests {
                 S0,
                 key(1),
                 RecordKind::EffectDone {
+                    declared: crate::core::DeclaredOutput::untrusted(),
                     output: json!(1),
                     source: None,
                     spend: crate::core::Spend::default(),
@@ -499,6 +531,7 @@ mod tests {
                 S0,
                 key(1),
                 RecordKind::EffectDone {
+                    declared: crate::core::DeclaredOutput::untrusted(),
                     output: json!(1),
                     source: None,
                     spend: crate::core::Spend::default(),
@@ -509,6 +542,7 @@ mod tests {
                 S0,
                 key(2),
                 RecordKind::EffectDone {
+                    declared: crate::core::DeclaredOutput::untrusted(),
                     output: json!(2),
                     source: None,
                     spend: crate::core::Spend::default(),
@@ -536,6 +570,7 @@ mod tests {
                 S1,
                 key(10),
                 RecordKind::EffectDone {
+                    declared: crate::core::DeclaredOutput::untrusted(),
                     output: json!("b"),
                     source: None,
                     spend: crate::core::Spend::default(),
@@ -545,6 +580,7 @@ mod tests {
                 S0,
                 key(1),
                 RecordKind::EffectDone {
+                    declared: crate::core::DeclaredOutput::untrusted(),
                     output: json!("a"),
                     source: None,
                     spend: crate::core::Spend::default(),
@@ -557,6 +593,7 @@ mod tests {
         assert_eq!(
             next(&mut cur, S0, key(1)).unwrap(),
             Some(EffectReplay::Done {
+                declared: crate::core::DeclaredOutput::untrusted(),
                 output: json!("a"),
                 source: None,
                 spend: crate::core::Spend::default()
@@ -565,6 +602,7 @@ mod tests {
         assert_eq!(
             next(&mut cur, S1, key(10)).unwrap(),
             Some(EffectReplay::Done {
+                declared: crate::core::DeclaredOutput::untrusted(),
                 output: json!("b"),
                 source: None,
                 spend: crate::core::Spend::default()
@@ -583,6 +621,7 @@ mod tests {
                 S0,
                 key(1),
                 RecordKind::EffectDone {
+                    declared: crate::core::DeclaredOutput::untrusted(),
                     output: json!(1),
                     source: None,
                     spend: crate::core::Spend::default(),
@@ -593,6 +632,7 @@ mod tests {
                 S1,
                 key(10),
                 RecordKind::EffectDone {
+                    declared: crate::core::DeclaredOutput::untrusted(),
                     output: json!(2),
                     source: None,
                     spend: crate::core::Spend::default(),
@@ -626,6 +666,7 @@ mod tests {
                 S0,
                 key(1),
                 RecordKind::EffectDone {
+                    declared: crate::core::DeclaredOutput::untrusted(),
                     output: json!(1),
                     source: None,
                     spend: crate::core::Spend::default(),

@@ -13,10 +13,12 @@
 //! hand-written card is a second source of truth about capability, and the two
 //! disagree the first time somebody edits one.
 //!
-//! This crate already refuses an agent whose manifest advertises a capability no
-//! skill provides — a card that lies, caught at startup. Deriving the published
-//! card from the same field extends that refusal outward: a peer cannot be told
-//! about a capability the plane would not dispatch.
+//! The plane refuses an agent whose manifest advertises a capability no skill
+//! provides, **and** one whose skills answer a capability the manifest does not
+//! advertise. Both are caught at startup, and deriving the published card from
+//! that same field carries both outward: a peer cannot be told about a
+//! capability the plane would not dispatch, and the plane will not dispatch one
+//! no peer was told about.
 //!
 //! # What it will not claim
 //!
@@ -293,8 +295,9 @@ impl AgentCard {
         );
 
         // One skill per advertised capability, and no others. The plane refuses
-        // to start if a capability here has no skill behind it, so a card built
-        // from this field cannot advertise work the plane would not dispatch.
+        // to start if a capability here has no skill behind it, or if a skill
+        // answers one this field omits — so a card built from it advertises
+        // exactly the surface the plane serves, in both directions.
         let skills = manifest
             .spec
             .capabilities

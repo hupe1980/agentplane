@@ -30,11 +30,254 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
-## [0.17.0] — 2026-08-15
+## [0.18.0] — 2026-08-15
 
-Field feedback from a regulated deployment upgrading 28 specialists, and the
-report was right about every symptom and wrong about one cause — which is the
-part worth keeping, because the wrong cause would have produced the wrong fix.
+Three adversarial passes — over the information-flow layer, the evidence layer,
+and the type boundaries themselves — each turning up one shape that then
+repeated.
+
+The first is **a decision input that was a lookup rather than a fact**. A
+value's label was re-derived on every replay from declarations that live in
+operator configuration, so editing a catalogue rewrote what a finished run had
+been permitted to do — and, because a resume replays its prefix and then
+dispatches live, rewrote it for runs still in flight. Three of the entries below
+are that one defect reached from different directions.
+
+The second is **a rule enforced at one of its doors**. Field feedback on 0.17.0
+supplied the first instance and, read against the reporting deployment's own
+source, the second; it turned up three more times once it had a name.
+
+The third is that shape carried to its sharpest form: **a validated type whose
+derived deserializer is a second constructor**. Three types said in their own
+doc comments that a bad state was unrepresentable, and `#[derive(Deserialize)]`
+wrote it directly into their private fields. It is now shape 28 in the
+constitution's catalogue.
+
+### Fixed — three types where `serde` was the constructor nobody counted
+
+Each of these establishes an invariant in a fallible constructor, keeps its
+fields private so nothing else can reach them, and says so in prose. Each also
+derived `Deserialize`, which reaches those fields and needs no permission. The
+severity is in which door it is: a value arrives from a credential, a store row,
+a journal record or a peer far more often than from a call to the constructor,
+so the guarded path was the rare one.
+
+**`Delegation` could widen.** The type's own words were "every value of this
+type has already been checked … there is no `Delegation::new(links)` that would
+let an unverified chain exist". The derive was that function. A chain rooted at
+`crm.read` deserialized into one whose subject holds `*` — I6 inverted through
+the path `DelegationScheme` implementations actually take, since a credential
+parser reaches a chain by parsing rather than by calling `delegate`. Depth
+bypassed `MAX_DELEGATION_DEPTH` the same way, and an empty `links` array
+deserialized into a chain whose `owner()` then panicked.
+
+`Delegation` now deserializes through `rehydrate`, which is the re-check written
+for exactly this and previously reachable only when someone remembered to call
+it. The owner is a field rather than the head of a `Vec`, so the empty chain is
+not a refused value but an unrepresentable one, and the two accessors that
+carried `expect("a chain always has a root")` no longer need it. The wire form
+is unchanged.
+
+**`TenantId` could carry the separator its key scope splits on.** The newtype
+exists, in its own words, because "a name containing a separator could make two
+different tenants produce one scope — the failure that looks like nothing at all
+until one of them erases the other's data". Units already contain separators
+(`event/{source}/{id}`, `memory/{subject}`), so this is not a corner: tenant
+`acme` with unit `event/counterparty/42` and tenant `acme/event/counterparty`
+with unit `42` derive the identical key scope. Both stores write, nothing fails,
+and either tenant's erasure destroys the other's key and reports success. A
+tenant name reaches the runtime from a credential claim an `Authenticator`
+parsed and from stored rows — all `serde`.
+
+**`Quorum` could need nobody.** `need: 0` reported `Pass` having judged nothing,
+and a non-majority threshold — the case `QuorumError::NotAMajority` describes as
+resolvable "depending on tally order rather than on the judgements" — did
+precisely that, with 2 of 4 splitting 2–2 reported as `Pass`. A quorum rides on
+`PlanNode`, and plans are deserialized from a store, from a journal, and from a
+`Replanner` parsing a model's proposal. That last one is untrusted output, and a
+panel is the control a hijacked plan most wants weakened.
+
+All three now use `#[serde(try_from)]` onto a wire type that carries no
+invariant, so the constructor is the only road in and the compiler keeps it that
+way. That is deliberately not a validating call at each read site, which would
+be the same mistake one layer out.
+
+**This is a breaking change in the honest direction.** A stored value that never
+satisfied the invariant now fails to deserialize instead of loading. Nothing
+this crate writes can produce one; a hand-written fixture or a bespoke
+`Authenticator` can, and a read error is the correct outcome — silently
+accepting it is what let the collision exist. See
+[upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/).
+
+### Fixed — a catalogue edit could declassify history
+
+An effect's output label has three parts. Its provenance comes from
+`Effect::source`, which every effect derives from something already inside its
+key, so it cannot move without divergence. The other two — `Effect::trust` and
+`Effect::output_sensitivity` — come from operator configuration: a `ToolSafety`
+entry, an MCP grant, a `PeerGrant`. Those change with an edit, they recompile
+nothing, and none of them reaches the effect key.
+
+They were re-read from the catalogue on every replay. So lowering a tool's
+declared `output_sensitivity` from `Secret` to `Public` silently relabelled
+every value any past run had read through that tool. Nothing diverged, because
+nothing about the call had changed — the mechanism designed to catch a program
+reading history it did not write cannot see a configuration edit, and should
+not be asked to.
+
+Calling this an audit problem understates it. `Mode::Resume` replays its prefix
+and then dispatches **live**, so a run suspended while holding a `Secret` tool
+result woke holding a `Public` one, and the live tail of that resume could send
+it to a sink the original label forbade. The exfiltration path this crate cares
+most about, opened by a config change nobody would think to review as one.
+
+`EffectDone` now carries a `DeclaredOutput` — the trust and sensitivity the
+effect declared when it landed — and `EffectReconciled` carries one for a
+recovered output. Replay reads them back. The field is required rather than
+defaulted, for the same reason `RunAdmitted.input_label` is: both halves of a
+missing answer read as *more permissive than the truth*.
+
+The general rule, now stated in CONCEPT §6.3, is worth more than the fix: a
+decision's inputs belong on the record wherever the decision is **reproduced**
+rather than re-made. The spend was already journaled on exactly this argument.
+The label was the half nobody had followed through.
+
+### Fixed — sink gates re-judged effects that had already happened
+
+The manifest-derived ceilings had applied to live dispatch only since they
+existed, with a comment explaining why: a replayed effect reads its result from
+the journal, so consulting today's manifest would refuse an effect that already
+happened or bless one that was refused. The same comment then exempted the
+effect's own ceiling and protected fields on the grounds that *those are code,
+and a code change that alters an outcome is divergence*.
+
+That reading does not survive contact with the effects that actually reach
+sinks. A tool's `max_sensitivity` and `protected_fields` come from an operator
+catalogue; an MCP prompt's come from a reviewed grant; a peer's come from its
+`PeerGrant`. All configuration, none of it in any key. Every sink gate now
+applies to live dispatch only — the verdict is in the journal either way, as
+the result beside the effect or as the refusal's own record — and past the
+frontier of a resume they all apply in full, unchanged.
+
+Two consequences fell out, and both were latent bugs of their own:
+
+**`McpPrompt` and `McpResource` hashed their grant's sensitivities into the
+effect key.** That was the workaround for the entry above — turning a silent
+relabel into a loud divergence — and it worked by making an operator who raised
+a ceiling break the audit replay of every historical run through that prompt.
+A configuration edit should not cost the verifiability of finished runs. With
+the label now journaled the workaround has nothing left to protect, and the
+grants are out of the key.
+
+**A sink refusal read back from the journal became a `StepError::Denied`.**
+Live, it is a `StepError::Policy`, which a tool-calling loop reports to the
+model as `REFUSED` so it can try another route; a denial ends the run. Once
+replay stopped re-deriving these and started reading the record, the two shapes
+diverged and a replayed run would end where the original had continued. The
+`PolicyDenied` record already distinguishes them by `action`, so
+`PolicyError::Recorded` rebuilds the right one — carrying the recorded wording,
+for the reason `BudgetExceeded::Recorded` does.
+
+### Fixed — `cx.embed` could only embed a literal
+
+`Embed` declared no `max_sensitivity`, so it inherited the trait default,
+`Public`. Embedding is an egress — the text goes to a provider — and everything
+that has crossed a trust boundary is already `Internal`. Every query worth
+embedding is one: a user's question, a model's rewrite, a recalled memory. The
+whole semantic-recall path was therefore reachable only by embedding a
+hard-coded trusted string, which is what the one test covering it did.
+
+`cx.embed` now takes the ceiling. It is a parameter and not a constant because
+there is no answer this crate could pick for every deployment — and the
+neighbouring `SemanticQuery::max_sensitivity` had been asking for exactly that
+decision, about the retriever, since it was written. Two providers, two
+ceilings.
+
+### Fixed — answering an MCP elicitation needed no grant
+
+`prompts/get` and `resources/read` each require an operator grant, on the rule
+that a server describing a capability proves it exists and not that an agent may
+use it. `tasks/update` — which sends this plane's data back to the same server —
+required none, and ran at a `Public` ceiling nobody had chosen and nothing let
+them raise.
+
+`McpAccess::task_input` grants it, per server rather than per task, because a
+task id is minted at runtime and an operator cannot review a name that does not
+exist yet. Ungranted, `update_task` refuses. The whole-value taint gate is
+unchanged and still in front: an untrusted response reaches an MCP server
+through a `release` or not at all.
+
+### Changed — the record format version is `1`
+
+`canon::VERSION` and `export::FORMAT_VERSION` are both `1` and stay there until
+the format freeze. The record version had been counting the pre-release cuts,
+reaching 4, with a refusal message narrating each one.
+
+The count implied those journals were readable. They never were — the reason
+each cut refuses rather than lifts is that the old record still *parses*, with
+moved and added fields taking their defaults, so a resumed run answers an audit
+question falsely instead of failing to answer it. Collapsing to `1` says the
+same thing in a number: this build reads what this build writes, and anything
+else is a fresh journal. After the freeze the `Upcaster` seam takes over, which
+is why it stays wired now rather than being introduced by the first migration
+that needs it.
+
+### Fixed — a capability served but never advertised
+
+The plane refused a manifest advertising a capability no skill provides, and
+accepted a skill answering a capability the manifest never names. The second is
+the quiet one: the skill is governed by that manifest — budget, model grants,
+egress ceiling and policy identity all apply — the run journals correctly, and
+nothing anywhere records that the agent answers more than its file claims.
+
+The declaration is the artifact that gets reviewed, digested and pinned, and
+`peers::card` builds the A2A card from exactly that field. So the gap was a door
+in a reviewed surface that the review could not see. It is the argument this
+crate already makes about prompts — one composed in the deployer's code has no
+version, changes in a deploy, and nothing connects the change to the runs it
+affected — applied to an agent's capabilities.
+
+`BuildError::ProvidesWhatItDoesNotAdvertise` names the extra capabilities. A
+skill registered with `RuntimeBuilder::skill` rather than under an `Agent` has
+no declaration to contradict and is unaffected.
+
+### Fixed — two checks that arrived one stage too late
+
+Both from field feedback on a model-free specialist that was bricked by its own
+declaration, and both the same shape: the manifest layer knew enough to refuse
+at parse and refused somewhere else instead, or not at all.
+
+- **A zero budget ceiling was refused at parse and accepted at the builder.**
+  See below — the rule now lives on `Budget` and both doors ask it.
+- **A declarative agent with no model parsed clean.** `spec.execution` means
+  the runtime drives the agent by calling a model, and the model is named
+  rather than defaulted, so `execution` without `spec.models.privileged` is a
+  document that can never assemble. It was refused at build
+  (`BuildError::DeclarativeWithoutModel`) — which is after the review, since
+  `agentplane validate` is the verb an author runs before deploying. Both
+  halves are on the same page, so it is refused at parse; the build check stays
+  as the backstop for a `Manifest` built in Rust.
+
+### Fixed — a rule enforced at one of its two doors
+
+A zero budget ceiling was refused when it arrived in a manifest and accepted
+when it arrived through `RuntimeBuilder::budget` — and the builder is the path
+this crate documents first. An embedder wiring `max_tokens: 0` in Rust got a
+plane that refused its first effect on every run it would ever make, with the
+`Budget` doc comment describing the manifest's refusal as though it were the
+whole rule.
+
+`Budget::bricked_ceiling` is now the single definition of which ceilings are
+already spent at zero, and both the parser and `RuntimeBuilder::try_build`
+(`BuildError::BudgetPermitsNothing`) refuse from it. `max_replans` and
+`max_denials` stay excluded, because zero means something for both.
+
+Worth stating as a shape rather than a bug: the manifest layer is where
+declarations get checked, so it accumulates checks — and every one of them is a
+rule about a value that some embedder reaches without a manifest. A check that
+lives only there is a check whose enforcement depends on which door the caller
+used. `StandingAuthority::validate` had this right already, by putting the rule
+on the type.
 
 ### Fixed — security: the evidence layer, where nothing was verifying anything
 
@@ -109,8 +352,94 @@ or a checkpoint from outside the file.
 Also removed: a staleness comparison in `MemoryWitness` that the check eight
 lines above had already made and refused, so the branch could not be taken.
 
+### Fixed — an erasure that reports success and misses
+
+The plane's tenant scopes its data keys; each store handle is scoped
+separately. When a key ring is wired, `build()` seals case, event, task, memory
+and outbox state under the **plane's** tenant while the store writes its rows
+under its **own** — and if those two disagree, nothing is wrong in a way
+anything can see. Both scopes are real. The run works. The erasure works: it
+destroys exactly the key it was asked for, reports success, and does not reach
+the rows, because they were sealed under the other scope.
+
+That is the one failure a deletion guarantee may not have, and it was already
+solved — for the journal and the blob store, which answer a `tenant()` question
+at build so a mismatch is a startup refusal. The other five store traits had no
+such accessor, so the same mismatch on those was unaskable. The sealed wrappers
+took the tenant as a **second argument beside the store**, with a doc comment
+asking the caller to keep two copies of one fact in step.
+
+`CaseStore`, `EventStore`, `TaskStore`, `MemoryStore` and `PushStore` now carry
+the same `tenant()` accessor the journal has, defaulting to `default`, and
+`try_build` refuses a disagreement with `BuildError::StateStoreTenant` before it
+seals anything. The refusal names the store and both tenants. A store that never
+overrides the accessor answers `default` and is refused against a non-default
+plane — the safe direction, and the reason this catches a wiring mistake rather
+than proving isolation.
+
+`build` can only ask that of a store it is *given*. A wrapper an embedder seals
+before handing it over reports, from the outside, the tenant it was told to seal
+for — which is the plane's, with the disagreement one layer down. So the six
+wrappers check the pair where both halves are in hand and refuse at the wrap.
+Six tests in this repository were wiring an unscoped store and sealing it for a
+named tenant, which is how easy the shape is to write.
+
+### Fixed — a driver attesting a destination it was not told about
+
+`Bedrock::from_client(client, region)` took the region beside the client that
+already held one. That region is what `request_profile` puts on the record, and
+the profile is effect identity — so a driver built with a `us-east-1` client and
+the string `"eu-west-1"` sent every call to Virginia and swore to Ireland, on a
+record whose purpose is to be evidence. Nothing could notice: the copy the
+journal attests is precisely the copy nothing checks. `BedrockEmbedder` had the
+same shape, where the region is half of `revision()` and therefore decides
+whether a stored vector belongs to the index being queried.
+
+Both now read the region **from the client** and refuse one that carries none.
+The second copy is gone rather than guarded, which is the only fix that cannot
+drift back.
+
+Also documented rather than fixed, because the SDK makes it unfixable: Bedrock
+is the one model driver with no `egress` allowlist. It is handed a built client
+whose endpoint the SDK will not disclose, so the only host it could check is one
+derived from the region — which an endpoint override makes a fiction, and a
+control that looks like one and is not is worse than an absent one. `core::egress`
+now names which drivers ask and says plainly that this one does not.
+
 See [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/) for each
 call-site change.
+
+### Research
+
+Two results read against the design this round, both recorded in CONCEPT §11.1
+because neither changes the mechanism and one of them is the strongest published
+argument against it.
+
+[2605.26497](https://arxiv.org/abs/2605.26497) builds an authorization graph
+from user intent in an isolated context, then compares execution provenance
+against it — catching the right tool called with a parameter sourced from
+somewhere the intent never named. That is the frozen plan beside
+`ProtectedField::from_sources`, derived independently, and it is recorded as
+corroboration rather than as something to import. The difference is which end
+the baseline comes from: theirs is inferred and can therefore detect a
+deviation, this one is reviewed and signed and can therefore refuse one.
+
+[2605.17634](https://arxiv.org/abs/2605.17634) argues data–instruction
+separation is fundamentally limited: an adversary can always construct a context
+in which a blocked flow reads as legitimate, and tightening the norms blocks
+legitimate flows instead. The dilemma binds defences whose norms are *inferred*
+from the interaction. This runtime never asks whether a flow is contextually
+appropriate — it asks whether this value's source was declared for this field,
+by a reviewer, before the data arrived, which no amount of persuasive context
+moves. The argument keeps its full force against the model-level half, which is
+why §6.4 claims containment and not immunity, and it sharpens the cost this
+design accepts: a declaration that is wrong blocks real work.
+
+## [0.17.0] — 2026-08-15
+
+Field feedback from a regulated deployment upgrading 28 specialists, and the
+report was right about every symptom and wrong about one cause — which is the
+part worth keeping, because the wrong cause would have produced the wrong fix.
 
 ### Fixed — a broken policy set is a defect, and says so before it runs
 

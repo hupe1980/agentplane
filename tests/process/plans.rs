@@ -1057,6 +1057,48 @@ fn a_panel_of_identical_judges_cannot_be_declared() {
     );
 }
 
+/// And a plan cannot carry one that arrived through `serde` either.
+///
+/// A plan is deserialized far more often than it is built: from a store, from a
+/// journal, and from a [`Replanner`](agentplane::plan::Replanner) parsing a
+/// model's proposal — which is untrusted output, and a panel is precisely the
+/// control a hijacked plan wants weakened. A derived `Deserialize` would reach
+/// `Quorum`'s private fields and be the `Quorum::new` the type declines to
+/// offer.
+///
+/// The two cases here are the ones that change a verdict rather than merely
+/// looking wrong.
+#[test]
+fn a_deserialized_quorum_cannot_dodge_the_rules_the_constructor_enforces() {
+    use agentplane::core::Quorum;
+
+    // A panel needing nobody reports `Pass` having judged nothing.
+    let err = serde_json::from_value::<Quorum>(serde_json::json!({"need": 0, "lenses": []}))
+        .expect_err("a quorum needing zero agreeing judgements decides nothing");
+    assert!(err.to_string().contains("decides nothing"), "{err}");
+
+    // A non-majority threshold can be met by both sides at once, so `tally`
+    // order decides — 2 of 4 splitting 2–2 would report whichever it counts
+    // first.
+    let err =
+        serde_json::from_value::<Quorum>(serde_json::json!({"need": 2, "lenses": ["a","b","c","d"]}))
+            .expect_err("2 of 4 is not a majority");
+    assert!(err.to_string().contains("is not a majority"), "{err}");
+
+    assert!(
+        serde_json::from_value::<Quorum>(serde_json::json!({"need": 2, "lenses": ["a","a","b"]}))
+            .is_err(),
+        "and a repeated lens is repetition however it arrived"
+    );
+
+    // A declarable panel still deserializes, so the refusals above are the
+    // rules and not the wire shape being unreachable.
+    let ok: Quorum =
+        serde_json::from_value(serde_json::json!({"need": 2, "lenses": ["correctness","policy","arithmetic"]}))
+            .expect("a majority panel of distinct lenses round-trips");
+    assert_eq!(ok, Quorum::new(2, ["correctness", "policy", "arithmetic"]).unwrap());
+}
+
 /// Every collaboration justification must reject *something*.
 ///
 /// The three reasons ask different questions, so a plan failing one may

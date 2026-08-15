@@ -134,6 +134,25 @@ pub(crate) fn content_from_prompt_json(
 }
 
 /// Amazon Bedrock Runtime's Converse driver.
+///
+/// # This driver has no egress allowlist, and that is a gap rather than a design
+///
+/// Every other model driver here takes an [`Egress`](crate::core::Egress) and
+/// refuses a base URL the deployment never granted. This one cannot: it is
+/// handed a built AWS `Client`, and the SDK exposes no way to read back the
+/// endpoint that client will actually reach. A check against the endpoint
+/// *derived* from the region would pass while an endpoint override sent every
+/// call somewhere else — a control that looks like one and is not, which is the
+/// same reason this crate ships no `Egress::allow_all`.
+///
+/// What stands in its place is narrower and worth knowing exactly: the region
+/// is on the record. It is read from the client rather than accepted beside it,
+/// and it enters [`ModelProvider::request_profile`], so it is digest-covered
+/// and a change of region is replay divergence. That says *which service the
+/// client was configured for*. It does not say the call went there, and nothing
+/// in this driver does. A deployment that needs the destination constrained
+/// constrains it where the SDK does — a VPC endpoint, an egress proxy, or an
+/// IAM policy — not here.
 #[derive(Clone)]
 pub struct Bedrock {
     client: Client,
@@ -292,30 +311,59 @@ impl std::fmt::Debug for Bedrock {
 
 impl Bedrock {
     /// Load the standard AWS credential chain for this region.
+    ///
+    /// # Errors
+    ///
+    /// If the region is blank, or the client it builds carries none.
     pub async fn from_env(region: impl Into<String>) -> Result<Self, String> {
         let region = region.into();
         if region.trim().is_empty() {
             return Err("an AWS region is required for Bedrock".to_owned());
         }
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(Region::new(region.clone()))
+            .region(Region::new(region))
             .load()
             .await;
-        Ok(Self::from_client(Client::new(&config), region))
+        Self::from_client(Client::new(&config))
     }
 
     /// Build from an already configured AWS client.
-    #[must_use]
-    pub fn from_client(client: Client, region: impl Into<String>) -> Self {
-        Self {
+    ///
+    /// The region is read **from the client**, not accepted beside it. It is
+    /// what [`ModelProvider::request_profile`] attests, and that profile is
+    /// effect identity — so a region taken as a separate argument is a second
+    /// copy of a fact the client already holds, free to disagree with the
+    /// endpoint the SDK actually reaches. The journal would then attest a
+    /// destination the calls never went to, and a replay would compare against
+    /// it, with nothing anywhere able to notice.
+    ///
+    /// # Errors
+    ///
+    /// If the client carries no region, or a blank one. A client that cannot
+    /// name its region cannot resolve a Bedrock endpoint either, so this is a
+    /// wiring mistake refused where it is written rather than at the far end of
+    /// a run — and recording an empty region would put a fiction on the record
+    /// instead.
+    pub fn from_client(client: Client) -> Result<Self, String> {
+        let region = client
+            .config()
+            .region()
+            .map(|region| region.as_ref().trim().to_owned())
+            .filter(|region| !region.is_empty())
+            .ok_or_else(|| {
+                "the Bedrock client carries no region, so there is nothing true to put in the \
+                 request profile — build it from a config with `.region(..)` set"
+                    .to_owned()
+            })?;
+        Ok(Self {
             client,
-            region: region.into(),
+            region,
             timeout: Duration::from_mins(5),
             schema_mode: SchemaMode::Native,
             stream: true,
             guardrail: None,
             reasoning: None,
-        }
+        })
     }
 
     /// Apply a Bedrock guardrail to every call this driver makes.
@@ -1504,10 +1552,11 @@ mod tests {
             ))
             .build();
         let client = Client::from_conf(config);
-        let plain = Bedrock::from_client(client.clone(), "eu-west-1");
+        let plain = Bedrock::from_client(client.clone()).expect("a client with a region");
         let model = ModelId::new("bedrock", "m");
-        let guarded =
-            Bedrock::from_client(client, "eu-west-1").guardrail(Guardrail::new("gr-7", "3"));
+        let guarded = Bedrock::from_client(client)
+            .expect("a client with a region")
+            .guardrail(Guardrail::new("gr-7", "3"));
 
         assert_eq!(plain.request_profile(&model)["guardrail"], Value::Null);
         assert_eq!(
@@ -1568,7 +1617,8 @@ mod tests {
                 |_req| http::Response::builder().status(200).body("").unwrap(),
             ))
             .build();
-        let driver = Bedrock::from_client(Client::from_conf(config), "eu-west-1");
+        let driver =
+            Bedrock::from_client(Client::from_conf(config)).expect("a client with a region");
         assert_eq!(
             driver.request_profile(&ModelId::new("bedrock", "m")),
             json!({
@@ -1594,6 +1644,59 @@ mod tests {
         );
     }
 
+    /// **The attested region is the client's, and there is no second copy of it
+    /// to disagree.**
+    ///
+    /// `region` is what `request_profile` puts on the record, and that profile
+    /// is effect identity — so a replay is judged against it. Taken as an
+    /// argument beside the client it is a fact stored twice, and the copy the
+    /// journal attests is the one nothing checks: a driver built with a
+    /// `us-east-1` client and the string `"eu-west-1"` would send every call to
+    /// Virginia and swear to Ireland, on a record built to be evidence.
+    ///
+    /// The positive half is what does the work here. That a blank region is
+    /// refused proves only that a constructor validates its input; that the
+    /// profile *follows the client* is the property, and it is the half that
+    /// fails if the parameter ever comes back.
+    #[test]
+    fn the_attested_region_is_the_one_the_client_will_reach() {
+        let stub = |region: Option<&str>| {
+            let mut config = aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version_latest()
+                .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
+                    |_req| http::Response::builder().status(200).body("").unwrap(),
+                ));
+            if let Some(region) = region {
+                config = config.region(Region::new(region.to_owned()));
+            }
+            Bedrock::from_client(Client::from_conf(config.build()))
+        };
+
+        for region in ["us-east-1", "eu-west-1"] {
+            let driver = stub(Some(region)).expect("a client carrying a region");
+            assert_eq!(
+                driver.request_profile(&ModelId::new("bedrock", "m"))["region"],
+                json!(region),
+                "the profile attested a region other than the one the client \
+                 resolves its endpoint from"
+            );
+        }
+
+        // A client with no region cannot name where it went, and an empty
+        // string on the record is worse than a refusal: it is a destination
+        // that reads as answered.
+        let err = stub(None).expect_err("a client with no region was accepted");
+        assert!(
+            err.contains("region"),
+            "the refusal must name the missing region, got: {err}"
+        );
+        let err = stub(Some("   ")).expect_err("a blank region was accepted");
+        assert!(
+            err.contains("region"),
+            "the refusal must name the blank region, got: {err}"
+        );
+    }
+
     fn stub_driver() -> Bedrock {
         let config = aws_sdk_bedrockruntime::Config::builder()
             .region(Region::new("eu-west-1"))
@@ -1602,7 +1705,7 @@ mod tests {
                 |_req| http::Response::builder().status(200).body("").unwrap(),
             ))
             .build();
-        Bedrock::from_client(Client::from_conf(config), "eu-west-1")
+        Bedrock::from_client(Client::from_conf(config)).expect("a client with a region")
     }
 
     /// **Nova's reasoning dialect, rendered exactly as AWS documents it.**

@@ -63,6 +63,10 @@ fn registration_from(
 
 #[async_trait]
 impl PushStore for RedbStore {
+    fn tenant(&self) -> &str {
+        self.tenant_str()
+    }
+
     async fn put(&self, config: &PushConfig, next_seq: Seq) -> Result<(), StoreError> {
         let tenant = self.tenant_name();
         let task = config.task.to_string();

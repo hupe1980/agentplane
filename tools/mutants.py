@@ -56,21 +56,21 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_committed_but_lost_effect_record_is_not_performed_again",
         "replay re-performs a completed effect instead of reading it back",
         """                        self.replayed_done(&descriptor.kind, attempt, spend);
-                        return Ok(serde_json::from_value(output)?);""",
+                        return Ok((serde_json::from_value(output)?, declared));""",
         """                        self.replayed_done(&descriptor.kind, attempt, spend);
-                        let _ = output;""",
+                        let _ = (output, declared);""",
     ),
     "MediaReplayRePerforms": (
         "src/runtime/ctx.rs",
         "strict_replay_does_not_read_media_blobs_or_call_the_model",
         "strict replay re-materializes a media blob and calls the model again",
         """                        self.replayed_done(&descriptor.kind, attempt, spend);
-                        return Ok(serde_json::from_value(output)?);""",
+                        return Ok((serde_json::from_value(output)?, declared));""",
         """                        self.replayed_done(&descriptor.kind, attempt, spend);
                         if descriptor.kind == "model.complete" {
                             let _ = effect.perform().await;
                         }
-                        return Ok(serde_json::from_value(output)?);""",
+                        return Ok((serde_json::from_value(output)?, declared));""",
     ),
     "NoReplayCursor": (
         "src/journal/replay.rs",
@@ -368,15 +368,29 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/ctx.rs",
         "a_sink_refuses_data_above_its_ceiling",
         "a value above the sink's ceiling is sent anyway",
-        "        if label.sensitivity > ceiling {",
+        "        if live_dispatch && label.sensitivity > ceiling {",
         "        if false && label.sensitivity > ceiling {",
+    ),
+    "DeclarationFromCatalogue": (
+        "src/runtime/ctx.rs",
+        "lowering_a_declared_sensitivity_does_not_declassify_history",
+        "a replayed value is relabelled from today's catalogue instead of its record",
+        "                        return Ok((serde_json::from_value(output)?, declared));",
+        "                        return Ok((\n                            serde_json::from_value(output)?,\n                            crate::core::DeclaredOutput::of(&effect),\n                        ));",
+    ),
+    "EmbedHasNoCeiling": (
+        "src/runtime/effects.rs",
+        "an_embedding_above_its_declared_ceiling_is_refused",
+        "the embedding sink accepts anything, whatever ceiling was declared",
+        "    fn max_sensitivity(&self) -> Sensitivity {\n        self.max_sensitivity\n    }\n\n    fn sink_arguments(&self) -> Option<&serde_json::Value> {\n        Some(&self.arguments)\n    }\n\n    async fn perform(&self) -> Result<Self::Output, EffectError> {\n        self.embedder",
+        "    fn max_sensitivity(&self) -> Sensitivity {\n        Sensitivity::Secret\n    }\n\n    fn sink_arguments(&self) -> Option<&serde_json::Value> {\n        Some(&self.arguments)\n    }\n\n    async fn perform(&self) -> Result<Self::Output, EffectError> {\n        self.embedder",
     ),
     "SensitivityCanLower": (
         "src/runtime/ctx.rs",
         "an_undeclared_effect_keeps_the_sensitivity_its_provenance_implies",
         "an effect may declare its output less sensitive than its provenance",
-        "        let sensitivity = labelled.label().sensitivity.max(declared);",
-        "        let sensitivity = declared;",
+        "        let sensitivity = labelled.label().sensitivity.max(declared.sensitivity);",
+        "        let sensitivity = declared.sensitivity;",
     ),
     # ── Authorization ───────────────────────────────────────────────────────
     "PolicyOnReplay": (
@@ -435,9 +449,28 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         Ok(chain)""",
         """        let mut chain = Self::root(root);
         for link in it {
-            chain.links.push(link);
+            chain.rest.push(link);
         }
         Ok(chain)""",
+    ),
+    # The door nobody reads as a door. A chain reaches the runtime from a
+    # credential an `Authenticator` parsed, from a journal record and from a
+    # peer — all `serde`, none of them a call to `delegate`. A derived
+    # `Deserialize` would reach the fields directly and be the
+    # `Delegation::new(links)` the type declines to offer.
+    "ADeserializedChainSkipsRehydration": (
+        "src/core/identity.rs",
+        "a_deserialized_chain_cannot_widen_skip_the_depth_cap_or_be_empty",
+        "a chain built by `serde` skips the attenuation and depth re-check, so "
+        "presenting a credential is how a delegate holds authority its "
+        "delegator never had",
+        "        Self::rehydrate(wire.links)",
+        """        let mut it = wire.links.into_iter();
+        let root = it.next().ok_or(DelegationError::Empty)?;
+        Ok(Self {
+            root,
+            rest: it.collect(),
+        })""",
     ),
     # ── Tool calls ──────────────────────────────────────────────────────────
     # Obeying a server's `readOnlyHint`. The MCP spec says clients MUST treat
@@ -1165,6 +1198,55 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct Budgets {",
         "#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]\npub struct Budgets {",
     ),
+    "ADeclarativeAgentNeedsNoModelAtParse": (
+        "src/manifest/mod.rs",
+        "a_declarative_agent_without_a_model_is_refused_at_parse",
+        "a manifest declaring `spec.execution` with no privileged model parses "
+        "clean, so `agentplane validate` approves a document that can never "
+        "assemble a plane — and the refusal arrives from whichever process "
+        "first tried to build one, after the review it should have failed",
+        """        if self.spec.execution.is_some()
+            && self
+                .spec
+                .models
+                .as_ref()
+                .and_then(|m| m.privileged.as_ref())
+                .is_none()
+        {""",
+        """        if false {""",
+    ),
+    "AnUndeclaredCapabilityIsServed": (
+        "src/runtime/executor.rs",
+        "a_capability_served_must_also_be_advertised",
+        "a skill may answer a capability its agent's manifest never names, so "
+        "the declaration that gets reviewed, digested and advertised as an A2A "
+        "card describes a smaller surface than the plane actually serves — and "
+        "the extra door is governed, journaled and invisible",
+        """    if !undeclared.is_empty() {
+        return Err(BuildError::ProvidesWhatItDoesNotAdvertise {""",
+        """    if false {
+        return Err(BuildError::ProvidesWhatItDoesNotAdvertise {""",
+    ),
+    "AnAgentMayGrantItselfAtParse": (
+        "src/manifest/mod.rs",
+        "an_agent_granting_its_own_capability_is_refused_at_parse",
+        "a manifest granting `tool://agent/<a capability it itself provides>` "
+        "parses clean, so `agentplane validate` approves a document whose "
+        "grant is a call to itself — a regress that terminates only if a model "
+        "decides it should, and both halves are on the same page",
+        """            if self.spec.capabilities.provides.iter().any(|c| c == rest) {""",
+        """            if false {""",
+    ),
+    "ADeclarativeAgentMayAdvertiseNothing": (
+        "src/manifest/mod.rs",
+        "a_declarative_agent_without_a_model_is_refused_at_parse",
+        "a declarative agent advertising no capability parses clean, and its "
+        "driver is registered once per capability provided — so nothing is "
+        "registered, no run can reach the model, tools and prompt the file "
+        "names, and the document reads as a working agent",
+        """        if self.spec.execution.is_some() && self.spec.capabilities.provides.is_empty() {""",
+        """        if false {""",
+    ),
     "AZeroCeilingIsAccepted": (
         "src/manifest/mod.rs",
         "a_zero_ceiling_is_refused_at_parse",
@@ -1172,8 +1254,26 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "permission to spend' instead refuses the run's first effect of any "
         "kind — a read-only tool call on an agent with no models — and the "
         "agent fails identically on every run it will ever make",
-        "            if is_zero {",
-        "            if false && is_zero {",
+        """        let Some(field) = self.budget().bricked_ceiling() else {
+            return Ok(());
+        };""",
+        """        let Some(field) = None::<&'static str> else {
+            return Ok(());
+        };""",
+    ),
+    "AZeroCeilingIsAcceptedByTheBuilder": (
+        "src/runtime/executor.rs",
+        "a_zero_ceiling_is_refused_however_the_budget_arrives",
+        "a ceiling of 0 wired in Rust is accepted, so a plane built by an "
+        "embedder — who never passes a manifest parser — refuses its first "
+        "effect on every run it will ever make, while the identical budget "
+        "written in YAML is refused at parse",
+        """        if let Some(field) = self.budget.bricked_ceiling() {
+            return Err(BuildError::BudgetPermitsNothing { field });
+        }""",
+        """        if false {
+            return Err(BuildError::BudgetPermitsNothing { field: "max_steps" });
+        }""",
     ),
     "ThePromptIsNotPartOfTheDeclaration": (
         "src/manifest/mod.rs",
@@ -1974,6 +2074,21 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         }""",
         "",
     ),
+    # A plan is deserialized far more often than it is built — from a store,
+    # from a journal, from a replanner parsing a model's proposal. That last one
+    # is untrusted output, and a panel is exactly the control a hijacked plan
+    # wants weakened: `need: 0` reports `Pass` having judged nothing.
+    "ADeserializedQuorumIsUnchecked": (
+        "src/core/quorum.rs",
+        "a_deserialized_quorum_cannot_dodge_the_rules_the_constructor_enforces",
+        "a quorum built by `serde` skips construction, so a panel needing "
+        "nobody passes and a non-majority threshold resolves by tally order",
+        "        Self::new(d.need, d.lenses)",
+        """        Ok(Self {
+            need: d.need,
+            lenses: d.lenses,
+        })""",
+    ),
     "AQuorumNeedsNoSubject": (
         "src/plan/mod.rs",
         "a_quorum_on_a_node_that_judges_nothing_is_refused",
@@ -2438,6 +2553,19 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "unit `prod` produce one indistinguishable scope",
         "            .find(|c| matches!(c, '/' | ':' | '\\0' | '\\n') || c.is_control())",
         "            .find(|c| matches!(c, '\\0' | '\\n') || c.is_control())",
+    ),
+    # The rule above, reached through the door that skips it. A `TenantId`
+    # arrives from a credential claim, a store row and a journal record far more
+    # often than from a call to `new`, and units already carry separators
+    # (`event/{source}/{id}`) — so a name holding one lands on another tenant's
+    # scope exactly, and either tenant's erasure destroys the other's key.
+    "ADeserializedTenantNameIsUnchecked": (
+        "src/core/tenant.rs",
+        "a_deserialized_tenant_name_cannot_carry_a_scope_separator",
+        "a tenant name arriving through `serde` skips the newtype's validation, "
+        "so a name carrying '/' derives another tenant's key scope",
+        "        Self::new(name)",
+        "        Ok(Self(name))",
     ),
     "AStoreKeyDropsTheTenant": (
         "src/store/redb.rs",

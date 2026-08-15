@@ -872,6 +872,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
                         output: Some(serde_json::json!({ "claimant": "Ada Lovelace" })),
                         spend: agentplane::core::Spend::default(),
                         detail: None,
+                        declared: Some(agentplane::core::DeclaredOutput::untrusted()),
                     },
                 )
                 .case(case),
@@ -1458,4 +1459,188 @@ mod sealed_push {
             Some("opaque-a2a-token")
         );
     }
+}
+
+/// **Every store the plane seals is asked which tenant it serves, and a
+/// disagreement is refused at build.**
+///
+/// The plane's tenant scopes the data keys; each store handle is scoped
+/// separately. When the two disagree the result is not a leak and not a failure
+/// — both scopes are real — so the run works, the erasure works, and the
+/// erasure destroys a key that does not reach the rows. A deletion guarantee
+/// cannot have that failure, and nothing at runtime can notice it: the only
+/// moment both facts are in one place is `try_build`.
+///
+/// Seven doors, and the reason the list is exhaustive rather than
+/// representative: each store is wired by its own builder method, so a check
+/// covering four of them is indistinguishable at runtime from one covering all
+/// seven. The positive half — a plane whose stores all agree still builds — is
+/// what stops this passing because the builder refuses everything.
+#[cfg(all(feature = "redb", feature = "keyring"))]
+#[test]
+fn a_store_scoped_to_another_tenant_is_refused_at_build() {
+    use agentplane::core::TenantId;
+    use agentplane::store::RedbStore;
+
+    let plane = TenantId::new("acme").expect("a tenant");
+    let elsewhere = || {
+        Arc::new(
+            RedbStore::open_in_memory()
+                .expect("store")
+                .for_tenant(TenantId::new("other").expect("a tenant")),
+        )
+    };
+    let here = || {
+        Arc::new(
+            RedbStore::open_in_memory()
+                .expect("store")
+                .for_tenant(TenantId::new("acme").expect("a tenant")),
+        )
+    };
+    let keys = || Arc::new(MemoryKeyRing::new()) as Arc<dyn KeyRing>;
+
+    // Each arm wires exactly one store to the wrong tenant, so a check that
+    // covered only some of them leaves the others building cleanly.
+    for door in ["journal", "case", "event", "task", "memory"] {
+        let builder = if door == "journal" {
+            agentplane::runtime::Runtime::builder(elsewhere())
+        } else {
+            let b = agentplane::runtime::Runtime::builder(here());
+            match door {
+                "case" => b.cases(elsewhere()),
+                "event" => b.events(elsewhere()),
+                "task" => b.tasks(elsewhere()),
+                "memory" => b.memory(elsewhere()),
+                other => unreachable!("unlisted door {other}"),
+            }
+        };
+        let err = builder
+            .tenant(TenantId::new("acme").expect("a tenant"))
+            .keyring(keys())
+            .try_build()
+            .expect_err(&format!(
+                "a plane on 'acme' built with its {door} store serving 'other' — \
+                 that plane's erasure destroys a key these rows are not sealed under"
+            ))
+            .to_string();
+        assert!(
+            err.contains("acme") && err.contains("other"),
+            "the refusal for the {door} store must name both tenants, got: {err}"
+        );
+    }
+
+    // The positive half: every store on the plane's own tenant assembles.
+    agentplane::runtime::Runtime::builder(here())
+        .tenant(plane)
+        .keyring(keys())
+        .cases(here())
+        .events(here())
+        .tasks(here())
+        .memory(here())
+        .try_build()
+        .expect("a plane whose stores all serve its own tenant was refused");
+}
+
+/// **A wrapper seals for the tenant its store serves, or it refuses to exist.**
+///
+/// `try_build` asks every store it is *given* which tenant it serves. It cannot
+/// ask the same of a store an embedder sealed before handing it over: from the
+/// outside that wrapper reports the tenant it was told to seal for, which is
+/// the plane's, and the disagreement is one layer down where nothing looks.
+///
+/// So the pair is checked where both halves are in hand — at the wrap. The
+/// positive half matters as much as the refusal: a wrapper whose tenant *does*
+/// match must still build, or this would read as working while actually
+/// refusing every deployment.
+#[cfg(all(feature = "redb", feature = "keyring"))]
+#[test]
+fn sealing_a_store_for_a_tenant_it_does_not_serve_is_refused() {
+    use agentplane::core::TenantId;
+    use agentplane::keyring::SealedCases;
+    use agentplane::store::RedbStore;
+
+    let elsewhere = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(TenantId::new("other").expect("a tenant")),
+    );
+    let keys = Arc::new(MemoryKeyRing::new()) as Arc<dyn KeyRing>;
+
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        SealedCases::wrap(elsewhere, keys, TenantId::new("acme").expect("a tenant"))
+    }));
+    let panic = refused.expect_err(
+        "a case store serving 'other' was sealed for 'acme' — that plane's \
+         erasure destroys a key these rows are not sealed under, and reports \
+         success",
+    );
+    let message = panic
+        .downcast_ref::<String>()
+        .map_or_else(String::new, Clone::clone);
+    assert!(
+        message.contains("other") && message.contains("acme"),
+        "the refusal must name both tenants, got: {message}"
+    );
+
+    // The positive half: agreement still wraps.
+    let here = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(TenantId::new("acme").expect("a tenant")),
+    );
+    let keys = Arc::new(MemoryKeyRing::new()) as Arc<dyn KeyRing>;
+    let _ = SealedCases::wrap(here, keys, TenantId::new("acme").expect("a tenant"));
+}
+
+// ── The tenant name, where a key scope is derived from it ───────────────────
+
+/// A tenant name is a validated newtype, and deserializing must use that gate.
+///
+/// `keyring::scope` composes `tenant/unit`, and its whole collision argument is
+/// that [`TenantId`] refuses `/`. Units already contain separators —
+/// `event/{source}/{id}`, `memory/{subject}` — so a tenant carrying one lands
+/// on another tenant's scope exactly. Both scopes are real, both stores write,
+/// nothing fails: the tenants share one data key, and either one's erasure
+/// destroys the other's and reports success.
+///
+/// A `TenantId` reaches the runtime from a credential claim, a store row and a
+/// journal record, all of which are `serde` rather than a call to `new`.
+#[test]
+fn a_deserialized_tenant_name_cannot_carry_a_scope_separator() {
+    use agentplane::core::TenantId;
+
+    let err = serde_json::from_value::<TenantId>(serde_json::json!("acme/event/counterparty"))
+        .expect_err("a separator must not survive deserialization");
+    assert!(
+        err.to_string().contains("composite keys"),
+        "the refusal must be the newtype's own rule, not a type error any \
+         malformed value would produce: {err}"
+    );
+
+    // The same shape without a separator deserializes, so the refusal above is
+    // the rule rather than the fixture being unreachable.
+    let honest: TenantId =
+        serde_json::from_value(serde_json::json!("acme")).expect("an ordinary name still parses");
+
+    // What the refusal buys. This scope is reachable from tenant `acme` with
+    // unit `event/counterparty/42`; the only other decomposition is a tenant
+    // named `acme/event/counterparty` with unit `42`, and that name is now not
+    // a value anything can hold.
+    let derived = agentplane::keyring::scope(&honest, "event/counterparty/42");
+    let (other_tenant, _unit) = derived.rsplit_once('/').expect("a composed scope");
+    assert!(
+        TenantId::new(other_tenant).is_err(),
+        "'{other_tenant}' would derive the same key scope as tenant 'acme', so \
+         either one's erasure would destroy the other's key and report success"
+    );
+
+    assert!(
+        serde_json::from_value::<TenantId>(serde_json::json!("")).is_err(),
+        "an empty name collides with every deployment that also set none"
+    );
+    assert!(
+        serde_json::from_value::<TenantId>(serde_json::json!("x".repeat(TenantId::MAX_LEN + 1)))
+            .is_err(),
+        "and the length bound is a metric-cardinality bound, so it binds here too"
+    );
 }

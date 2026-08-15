@@ -63,8 +63,15 @@ impl EncryptedMemoryStore {
     /// [`coordinated_by`](Self::coordinated_by) with a coordinator that spans
     /// instances — and [`is_distributed`](Self::is_distributed) is how a caller
     /// checks which it got, rather than inferring it from a constructor name.
+    ///
+    /// # Panics
+    ///
+    /// If `tenant` is not the tenant `inner` serves — see
+    /// [`SealedCases::wrap`](super::SealedCases::wrap) for why that pair is
+    /// checked rather than trusted.
     #[must_use]
     pub fn new(inner: Arc<dyn MemoryStore>, keys: Arc<dyn KeyRing>, tenant: TenantId) -> Self {
+        super::assert_serves(inner.tenant(), &tenant, "memory");
         Self {
             inner,
             keys,
@@ -280,6 +287,10 @@ fn key_error(error: KeyError) -> StoreError {
 
 #[async_trait]
 impl MemoryStore for EncryptedMemoryStore {
+    fn tenant(&self) -> &str {
+        self.tenant.as_str()
+    }
+
     /// This store *does* have a lifecycle lock, so the answer is never `None` —
     /// and whether it spans instances is the coordinator's to say.
     fn erasure_is_distributed(&self) -> Option<bool> {

@@ -34,12 +34,12 @@ use crate::memory::Embedder;
 /// loss of information the caller had: it is the wire's precision meeting the
 /// type the whole retrieval path already uses.
 ///
-/// # The narrowing has to be checked, and the comment here once said it was
+/// # The narrowing has to be checked, not merely declared safe
 ///
 /// `1e39` is an ordinary JSON number — `serde_json` refuses only what no `f64`
-/// can hold — and `1e39 as f32` is `inf`. So the obvious one-liner returned
-/// `Some(inf)`, the caller's `len()` check passed because nothing was dropped,
-/// and an infinite component went into the vector.
+/// can hold — and `1e39 as f32` is `inf`. The obvious one-liner therefore
+/// returns `Some(inf)`, the caller's `len()` check passes because nothing was
+/// dropped, and an infinite component goes into the vector.
 ///
 /// What it does downstream is the reason this is a check rather than a
 /// tidy-up. The query vector is part of the retrieval effect's identity, and
@@ -381,29 +381,47 @@ impl BedrockEmbedder {
             .region(aws_config::Region::new(region.clone()))
             .load()
             .await;
-        Ok(Self::from_client(
-            aws_sdk_bedrockruntime::Client::new(&config),
-            region,
-            model,
-            dialect,
-        ))
+        Self::from_client(aws_sdk_bedrockruntime::Client::new(&config), model, dialect)
     }
 
     /// Build from an already configured AWS client.
-    #[must_use]
+    ///
+    /// The region is read **from the client**, not accepted beside it. It is
+    /// half of [`Embedder::revision`], which decides whether a stored vector
+    /// belongs to the index being queried — so a region taken as a separate
+    /// argument is a second copy of a fact the client already holds, free to
+    /// disagree with the service the vectors actually came from. Two indexes
+    /// built in different regions would then share one revision and be treated
+    /// as comparable.
+    ///
+    /// # Errors
+    ///
+    /// If the client carries no region, or a blank one.
     pub fn from_client(
         client: aws_sdk_bedrockruntime::Client,
-        region: impl Into<String>,
         model: impl Into<String>,
         dialect: EmbeddingDialect,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, StoreError> {
+        let region = client
+            .config()
+            .region()
+            .map(|region| region.as_ref().trim().to_owned())
+            .filter(|region| !region.is_empty())
+            .ok_or_else(|| {
+                StoreError::Backend(
+                    "the Bedrock client carries no region, so an embedding revision cannot name \
+                     the service its vectors came from — build it from a config with `.region(..)` \
+                     set"
+                    .to_owned(),
+                )
+            })?;
+        Ok(Self {
             client,
             model: model.into(),
-            region: region.into(),
+            region,
             dialect,
             dimensions: None,
-        }
+        })
     }
 
     /// Ask Titan for a shortened vector.
@@ -802,10 +820,10 @@ mod bedrock_reply_tests {
             .build();
         BedrockEmbedder::from_client(
             aws_sdk_bedrockruntime::Client::from_conf(config),
-            "eu-central-1",
             "amazon.titan-embed-text-v2:0",
             dialect,
         )
+        .expect("a client with a region")
     }
 
     /// Each dialect reads the shape its vendor answers with.
@@ -896,10 +914,10 @@ mod bedrock_reply_tests {
                 .build();
             BedrockEmbedder::from_client(
                 aws_sdk_bedrockruntime::Client::from_conf(config),
-                region,
                 "amazon.titan-embed-text-v2:0",
                 EmbeddingDialect::Titan,
             )
+            .expect("a client with a region")
         };
 
         assert_eq!(
@@ -916,5 +934,40 @@ mod bedrock_reply_tests {
             "bedrock:eu-central-1/amazon.titan-embed-text-v2:0@256",
             "a width that does not reach the revision lets two geometries share an index"
         );
+    }
+
+    /// A client that cannot name its region cannot revision its vectors.
+    ///
+    /// The assertions above are the positive half: each revision names the
+    /// region its client resolves against, because there is no other place for
+    /// it to come from. This is the half that refuses the client which would
+    /// otherwise revision every vector under an empty region — one index name
+    /// shared by every deployment that forgot to configure one.
+    #[test]
+    fn a_client_without_a_region_cannot_build_an_embedder() {
+        let stub = |region: Option<&str>| {
+            let mut config = aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version_latest()
+                .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
+                    |_req| http::Response::builder().status(200).body("").unwrap(),
+                ));
+            if let Some(region) = region {
+                config = config.region(aws_config::Region::new(region.to_owned()));
+            }
+            BedrockEmbedder::from_client(
+                aws_sdk_bedrockruntime::Client::from_conf(config.build()),
+                "amazon.titan-embed-text-v2:0",
+                EmbeddingDialect::Titan,
+            )
+        };
+
+        for absent in [None, Some("   ")] {
+            let err = stub(absent).expect_err("an embedder with no region was built");
+            assert!(
+                err.to_string().contains("region"),
+                "the refusal must name the missing region, got: {err}"
+            );
+        }
+        stub(Some("eu-central-1")).expect("a client carrying a region was refused");
     }
 }

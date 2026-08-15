@@ -261,6 +261,16 @@ pub enum RecordKind {
         /// and reaches the same budget verdict at the same point.
         #[serde(default, skip_serializing_if = "Spend::is_free_ref")]
         spend: Spend,
+        /// The trust and sensitivity this effect declared for its own output.
+        ///
+        /// Required rather than defaulted, for the same reason
+        /// [`RunAdmitted`](Self::RunAdmitted)'s input label is: both halves of a
+        /// missing answer here read as *more permissive than the truth*, and a
+        /// value silently relabelled trusted or public is the one failure this
+        /// field exists to prevent. See
+        /// [`DeclaredOutput`](crate::core::DeclaredOutput) for why re-reading
+        /// the effect is not equivalent.
+        declared: crate::core::DeclaredOutput,
     },
     EffectFailed {
         error: String,
@@ -419,6 +429,15 @@ pub enum RecordKind {
         /// What the probe reported, when it failed or could not tell.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// The trust and sensitivity declared for a recovered output.
+        ///
+        /// Present exactly when `output` is: a probe that recovered nothing
+        /// labelled nothing. Recorded for the reason
+        /// [`EffectDone`](Self::EffectDone)'s copy is — a recovered result is
+        /// still a result, and the path that reaches one must not be the path
+        /// where a catalogue edit can rewrite the label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        declared: Option<crate::core::DeclaredOutput>,
     },
 
     /// Policy approved a typed label improvement. The record binds the decision
@@ -545,29 +564,21 @@ impl RecordKind {
 
     /// Current schema version for this kind.
     ///
-    /// Bumping it is an RFC-level change: the journal is forever, so every
-    /// version ever written must remain readable via an [`Upcaster`](super::Upcaster).
+    /// **1 until the format freeze**, which is the same answer
+    /// [`canon::VERSION`](crate::core::canon::VERSION) and
+    /// [`export::FORMAT_VERSION`](crate::export::FORMAT_VERSION) give, and for
+    /// the same reason: the project is pre-release, every shape change is a
+    /// hard cut, and a journal written by an older build is refused rather than
+    /// migrated. A number that counted the cuts would suggest those journals are
+    /// readable, which is the opposite of the intent.
     ///
-    /// **v4** renames `RunAdmitted.agent` to `capability` — it always held one —
-    /// and adds `governed_by`, so *which declaration governed this run* is
-    /// answerable from the journal rather than only from whoever still has the
-    /// file. A v3 record read as v4 would name a capability in a field about
-    /// identity and report every run as ungoverned, both silently.
-    ///
-    /// **v3** adds the admitted input's label, so a replay reaches the same taint
-    /// verdicts as the run it reproduces. **v2** was the pre-release format cut. `RunAdmitted.policy` became
-    /// `policy_bundle` and `Declassified` became `Released`, and both are
-    /// incompatible in the quietest possible way: a v1 record still
-    /// deserialises, with the policy digest defaulting to `None`. A run resumed
-    /// from such a record would report that no policy governed it, which is a
-    /// false statement about an audit question rather than a parse failure.
-    ///
-    /// Bumping converts that silence into a refusal. Nothing migrates — the
-    /// project is pre-release and the cut is deliberate — but a journal written
-    /// by an older build is now *detected* instead of misread.
+    /// After the freeze it becomes an RFC-level change to bump: the journal is
+    /// forever, so from then on every version ever written must remain readable
+    /// through an [`Upcaster`](super::Upcaster) — which is what that seam
+    /// exists for and why it is wired now rather than later.
     #[must_use]
     pub fn version(&self) -> u16 {
-        4
+        1
     }
 }
 
@@ -1119,6 +1130,7 @@ mod tests {
         let a = Append::new(
             RunId::generate(),
             RecordKind::EffectDone {
+                declared: crate::core::DeclaredOutput::untrusted(),
                 output: json!(1),
                 source: None,
                 spend: Spend::default(),

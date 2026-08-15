@@ -8,7 +8,9 @@
 //!   longest and most alarming.
 //! * **Delegation only narrows.** A widened scope is refused at construction, so
 //!   an escalating chain is not representable — there is no code path that has
-//!   to remember to check.
+//!   to remember to check. *Construction* includes deserializing: a chain
+//!   arrives from a credential, a journal record and a peer far more often than
+//!   from a call to `delegate`.
 //! * **Depth is bounded.** A request that has travelled too far from the human
 //!   who authorized it is refused.
 //! * **The chain is journaled and read back.** Credentials expire; re-verifying
@@ -223,6 +225,59 @@ fn a_rehydrated_chain_is_rechecked_for_widening() {
         Delegation::rehydrate(Vec::new()),
         Err(DelegationError::Empty)
     ));
+}
+
+/// Deserializing is a constructor, and it takes the same door as the others.
+///
+/// The claim this file's header makes — an escalating chain "is not
+/// representable" — is spent by every caller that gets a `Delegation` from
+/// `serde` rather than from `delegate`: a credential an `Authenticator` parsed,
+/// a journal record, a chain from a peer. A derived `Deserialize` reaches the
+/// fields directly and is exactly the `Delegation::new(links)` this type
+/// refuses to offer.
+///
+/// Each case below is one `rehydrate` refuses, so the assertion is about the
+/// door rather than about the rule — and each is written so that *bypassing*
+/// the check yields a chain the test can see, not an error it cannot
+/// distinguish from a malformed fixture.
+#[test]
+fn a_deserialized_chain_cannot_widen_skip_the_depth_cap_or_be_empty() {
+    let widening = json!({"links": [
+        {"id": "user:hupe",      "scope": ["crm.read"]},
+        {"id": "agent:exfil",    "scope": ["*"]}
+    ]});
+    let err = serde_json::from_value::<Delegation>(widening)
+        .expect_err("a chain rooted at crm.read must not deserialize into one holding '*'");
+    assert!(
+        err.to_string().contains("delegation may only narrow"),
+        "and it must fail with the attenuation rule's own words, not a shape \
+         error that any malformed input would also produce: {err}"
+    );
+
+    // The narrowing chain with the same shape deserializes, so the refusal
+    // above is the rule and not the fixture being unreachable.
+    let narrowing = json!({"links": [
+        {"id": "user:hupe",   "scope": ["crm.*"]},
+        {"id": "agent:audit", "scope": ["crm.read"]}
+    ]});
+    let ok: Delegation = serde_json::from_value(narrowing).expect("narrowing still deserializes");
+    assert_eq!(ok.subject().id, "agent:audit");
+    assert_eq!(ok.depth(), 1);
+
+    let deep = json!({"links": (0..=MAX_DELEGATION_DEPTH + 1)
+        .map(|i| json!({"id": format!("agent:{i}"), "scope": ["*"]}))
+        .collect::<Vec<_>>()});
+    assert!(
+        serde_json::from_value::<Delegation>(deep).is_err(),
+        "the depth cap binds a deserialized chain too, or a credential is how \
+         you buy an extra hop"
+    );
+
+    // An empty chain used to deserialize and then panic in `owner()`. It is
+    // now unrepresentable: the owner is a field, not the head of a list.
+    let err = serde_json::from_value::<Delegation>(json!({"links": []}))
+        .expect_err("an empty chain is refused rather than panicking later");
+    assert!(err.to_string().contains("no principal to act as"), "{err}");
 }
 
 // ── Wired into a run ────────────────────────────────────────────────────────

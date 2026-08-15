@@ -184,6 +184,10 @@ const ACCESS_EXPIRY: TableDefinition<(&str, &str), i64> =
 
 #[async_trait]
 impl MemoryStore for RedbStore {
+    fn tenant(&self) -> &str {
+        self.tenant_str()
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn remember(&self, item: &MemoryItem) -> Result<u64, StoreError> {
         let tenant = self.tenant_name();

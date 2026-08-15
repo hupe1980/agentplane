@@ -445,6 +445,16 @@ unrepresentable, rather than detectable.**
 - `BatchStatus` has no `Succeeded` variant, so "mostly worked" cannot be reported
   as success.
 
+The pattern has one edge worth knowing about, because it is invisible in a diff:
+**deserializing is a construction path too.** A type whose invariant lives in a
+fallible constructor, with private fields to keep everyone else out, hands the
+bad state straight back if it also derives `Deserialize` — and a value reaches a
+runtime from a credential, a store row or a journal record far more often than
+from a call to that constructor. `Delegation`, `TenantId` and `Quorum` therefore
+deserialize *through* their constructors, so a chain that widens, a tenant name
+carrying a key-scope separator, or a panel needing nobody is a read error rather
+than a value. If you write a validated type in your own code, do the same.
+
 When you meet an API here that seems to make something inconvenient, that is
 usually why.
 

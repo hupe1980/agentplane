@@ -197,17 +197,43 @@ pub trait KeyRing: Send + Sync + Debug {
 /// The erasure scope for a unit within a tenant.
 ///
 /// Derived here and nowhere else. The write path and the erasure path must
-/// agree byte-for-byte about which key seals a payload, and the first version of
-/// this had them building the string separately: writes sealed under
-/// `tenant/case` while erasure destroyed `case`, so every erasure reported
-/// success and destroyed nothing. Two places deriving one fact is how that
-/// happens, so there is one place.
+/// agree byte-for-byte about which key seals a payload; deriving the string
+/// separately in each is how writes come to seal under `tenant/case` while
+/// erasure destroys `case`, so every erasure reports success and destroys
+/// nothing. Two places deriving one fact is the defect, so there is one place.
 ///
 /// [`TenantId`](crate::core::TenantId) refuses `/`, which is what stops a tenant
 /// named `acme/prod` from colliding with tenant `acme`, unit `prod`.
 #[must_use]
 pub fn scope(tenant: &crate::core::TenantId, unit: &str) -> String {
     format!("{tenant}/{unit}")
+}
+
+/// Refuse a sealing scope that is not the scope the wrapped store writes under.
+///
+/// Every wrapper here takes the store it seals and the tenant to seal for. Those
+/// are two spellings of one fact, and when they differ nothing fails: both
+/// scopes are real, the rows are written, the state is sealed, and the tenant's
+/// erasure destroys a key that does not reach them. The failure surfaces only as
+/// data that survived a deletion request, long after anyone could connect it to
+/// the wiring.
+///
+/// So the pair is checked where both halves are in hand. The plane's own
+/// `try_build` asks the same question of every store it is given; this covers
+/// the wrapper an embedder builds and hands over already sealed, which `build`
+/// sees only from the outside.
+///
+/// # Panics
+///
+/// If the two disagree. A startup wiring mistake, not a runtime condition.
+pub(crate) fn assert_serves(store: &str, tenant: &crate::core::TenantId, kind: &str) {
+    assert!(
+        store == tenant.as_str(),
+        "this {kind} store serves tenant '{store}' but is being sealed for \
+         '{tenant}'. Both scopes are real, so nothing would fail — an erasure \
+         for either tenant would destroy a key that does not reach these rows, \
+         and report success"
+    );
 }
 
 mod envelope;

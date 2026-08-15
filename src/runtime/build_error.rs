@@ -53,6 +53,33 @@ pub enum BuildError {
     )]
     JournalStoreTenant { plane: String, store: String },
 
+    /// The plane and one of its state stores are scoped to different tenants.
+    ///
+    /// One variant for the five stores whose consequence is the same, with the
+    /// store named as data rather than as five messages that differ only in a
+    /// noun. When a key ring is wired, the plane seals this state under **its**
+    /// tenant while the store writes rows under the store's, and the two scopes
+    /// are both real — so nothing fails, nothing leaks, and the state sits
+    /// under a scope the tenant's erasure does not name.
+    ///
+    /// That is the failure a deletion guarantee may not have: `erase` destroys
+    /// the key it was asked for, reports success, and the sealed rows remain
+    /// readable under the other scope. It is invisible at runtime because
+    /// nothing about it is wrong except which of two correct scopes was used.
+    #[error(
+        "this plane runs as tenant '{plane}' but its {store} store serves \
+         '{tenant}'. With a key ring wired the plane seals that state under \
+         '{plane}' while the store keeps it under '{tenant}' — both scopes are \
+         real, so nothing fails at runtime and an erasure for either tenant \
+         destroys a key that does not reach these rows"
+    )]
+    StateStoreTenant {
+        /// Which store disagreed: `case`, `event`, `task`, `memory` or `push`.
+        store: &'static str,
+        plane: String,
+        tenant: String,
+    },
+
     /// A tool server took the name reserved for agents on this plane.
     #[error(
         "tool server 'agent' is reserved: `tool://agent/<capability>` names an \
@@ -199,6 +226,30 @@ pub enum BuildError {
     )]
     PolicyUnevaluable { problems: String },
 
+    /// A ceiling set to zero, which permits nothing at all.
+    ///
+    /// Zero is not a small budget; it is a budget already spent. These
+    /// ceilings are checked before the work and against every effect of every
+    /// kind, so a plane carrying one refuses its first operation on every run
+    /// it will ever make — including a read-only tool call by an agent that
+    /// declares no model.
+    ///
+    /// The manifest refuses this at parse, and a plane wired in Rust reaches
+    /// the same budget without passing a parser: one rule, both doors.
+    #[error(
+        "the budget's `{field}` is 0, which permits nothing at all — not merely \
+         no model spend. This ceiling is checked before every step and every \
+         effect, so at 0 it is already reached and the run is refused its first \
+         operation of any kind: a read-only tool call, a local lookup, an agent \
+         that declares no models. Such a plane does not run once and stop, it \
+         fails identically on every run it will ever make. Leave the field \
+         `None` to mean 'no limit'. To stop a tenant doing work, use the \
+         operator's emergency stop (`QuotaStore::set_halt`), which refuses new \
+         runs with a reason attached — a halt says somebody is dealing with an \
+         incident, where a ceiling only says not right now"
+    )]
+    BudgetPermitsNothing { field: &'static str },
+
     /// A lease TTL shorter than the store's expiry granularity.
     ///
     /// Both stores keep lease expiry in whole seconds and treat
@@ -300,6 +351,27 @@ pub enum BuildError {
         capability: String,
         first: String,
         second: String,
+    },
+
+    /// A skill answers a capability its agent's declaration never names.
+    ///
+    /// The manifest is the artifact that gets reviewed, digested and pinned,
+    /// and the A2A card is built from it — so a capability served but not
+    /// advertised is a door in a reviewed surface that the review could not
+    /// see. The skill is still governed by the manifest, which is what makes
+    /// this quiet rather than broken: budgets and grants apply, the run
+    /// journals correctly, and nothing anywhere says the agent answers more
+    /// than its file claims.
+    #[error(
+        "agent '{agent}' registers skills answering {undeclared:?}, which \
+         `spec.capabilities.provides` does not name — the declaration is what \
+         gets reviewed, digested and advertised, so a capability added in code \
+         is a surface no reviewer of that file can see. Add it to `provides`, \
+         or register the skill on its own agent"
+    )]
+    ProvidesWhatItDoesNotAdvertise {
+        agent: String,
+        undeclared: Vec<String>,
     },
 
     /// A declarative agent has no model to call.

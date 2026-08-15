@@ -1,19 +1,20 @@
 //! Defining a tool once, as one thing.
 //!
-//! # What this replaces, and why it was wrong
+//! # One artifact, because three cannot be kept in step
 //!
-//! A tool used to be three artifacts that nothing reconciled:
+//! The shape this avoids splits a tool across three artifacts that nothing
+//! reconciles:
 //!
 //! * an argument schema hand-written in the manifest;
-//! * a `ToolClient` implementation that matched on the tool's **name** and read
+//! * a client implementation that matches on the tool's **name** and reads
 //!   arguments out of a `Value` by hand — `arguments["id"].as_str()`;
-//! * whatever JSON the model actually sent.
+//! * whatever JSON the model actually sends.
 //!
-//! Nothing checked that the three agreed. A field renamed in the manifest and
-//! not in the code produced `None`, and a `.unwrap_or(default)` turned that into
-//! a plausible wrong answer rather than an error. Dispatching on the name is
-//! also [stringly-typed control flow] — the shape this codebase rejects
-//! everywhere else.
+//! Nothing can check that the three agree. A field renamed in the manifest and
+//! not in the code yields `None`, and a `.unwrap_or(default)` turns that into a
+//! plausible wrong answer rather than an error. Dispatching on the name is also
+//! [stringly-typed control flow] — the shape this codebase rejects everywhere
+//! else.
 //!
 //! [stringly-typed control flow]: crate::tools
 //!
@@ -180,11 +181,11 @@ pub trait Tool: DeserializeOwned + schemars::JsonSchema + Send + Sync + 'static 
     /// A [`ToolFailure`], which asks the author the **one** question that
     /// decides what the runtime may safely do next: did the world change?
     ///
-    /// This used to be [`ToolError`], the transport vocabulary, and that was
-    /// the wrong shape for a body. It made the author name their own
+    /// Deliberately **not** [`ToolError`], the transport vocabulary, which is
+    /// the wrong shape for a body. That would make the author name their own
     /// [`ToolId`] on every error — boilerplate, and a foot-gun, since nothing
-    /// stopped them naming a *different* tool. Worse, it asked them to pick
-    /// between `Unreachable`, `Refused`, `TimedOut`, `ToolFailed` and
+    /// would stop them naming a *different* tool. Worse, it would ask them to
+    /// pick between `Unreachable`, `Refused`, `TimedOut`, `ToolFailed` and
     /// `Malformed`, which are facts about a wire that a body implementing its
     /// own logic does not have. The mapping from those to a disposition lives
     /// in this crate's head, and getting it wrong in the `DidNotHappen`

@@ -50,8 +50,15 @@ impl SealedEvents {
     /// `tenant` must be the tenant the wrapped store serves — see
     /// [`SealedCases::wrap`](super::SealedCases::wrap) for what a mismatch
     /// costs.
+    ///
+    /// # Panics
+    ///
+    /// If `tenant` is not the tenant `inner` serves — see
+    /// [`SealedCases::wrap`](super::SealedCases::wrap) for why that pair is
+    /// checked rather than trusted.
     #[must_use]
     pub fn wrap(inner: Arc<dyn EventStore>, keys: Arc<dyn KeyRing>, tenant: TenantId) -> Arc<Self> {
+        super::assert_serves(inner.tenant(), &tenant, "event");
         Arc::new(Self {
             inner,
             keys,
@@ -162,6 +169,10 @@ impl SealedEvents {
 
 #[async_trait]
 impl EventStore for SealedEvents {
+    fn tenant(&self) -> &str {
+        self.tenant.as_str()
+    }
+
     async fn buffer(&self, event: &InboundEvent, at: Timestamp) -> Result<bool, StoreError> {
         self.inner.buffer(&self.sealed(event).await?, at).await
     }
@@ -341,8 +352,13 @@ mod aad_tests {
 
         let at = |seconds| Timestamp::from_unix_timestamp(seconds).expect("time");
         let tenant = TenantId::new("event-erase").expect("tenant");
-        let inner = Arc::new(crate::store::RedbStore::open_in_memory().expect("store"))
-            as Arc<dyn EventStore>;
+        // Scoped to the tenant it is sealed for: the two are one fact, and
+        // `wrap` refuses the pair that disagrees.
+        let inner = Arc::new(
+            crate::store::RedbStore::open_in_memory()
+                .expect("store")
+                .for_tenant(tenant.clone()),
+        ) as Arc<dyn EventStore>;
         let ring = Arc::new(MemoryKeyRing::new());
         let sealed = SealedEvents::wrap(
             Arc::clone(&inner),

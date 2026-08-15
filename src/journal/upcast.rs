@@ -42,45 +42,34 @@ pub struct Identity;
 
 impl Upcaster for Identity {
     fn current_version(&self, _kind: &str) -> u16 {
-        4
+        1
     }
 
     fn upcast(&self, kind: &str, version: u16, payload: Value) -> Result<Value, StoreError> {
         match version {
-            4 => Ok(payload),
-            // Refused rather than lifted. v1 is readable — that is the problem:
-            // `RunAdmitted.policy` became `policy_bundle` and `Declassified`
-            // became `Released`, so a v1 record deserialises with the policy
-            // digest silently absent and a resumed run would report that no
-            // policy governed it. A false answer to an audit question is worse
-            // than a refusal to answer.
+            1 => Ok(payload),
+            // Refused rather than guessed at, in both directions.
             //
-            // No lift is offered because there is nothing to lift *to*: the old
-            // records do not carry the bundle identity the new shape requires,
-            // and inventing one would fabricate provenance.
-            1..=3 => Err(StoreError::Corrupt {
-                seq: 0,
-                detail: format!(
-                    "record {kind} is v{version}: this journal predates the current format. \
-                     Every one of these changes is dangerous precisely because the older \
-                     record still *parses*. v1→v2: `RunAdmitted.policy` became \
-                     `policy_bundle` and `Declassified` became `Released`, so the policy \
-                     digest goes silently absent and a resumed run reports that no policy \
-                     governed it. v3→v4: `RunAdmitted.agent` became `capability` and gained \
-                     `governed_by`, so a v3 record names a capability in a field about \
-                     identity and reports every run as ungoverned. The whole journal is \
-                     refused rather than the affected kinds, because a journal containing \
-                     one contains the others. No lift is offered: the old records do not \
-                     carry the identity the new shape requires, and inventing one would \
-                     fabricate provenance. Start a fresh journal — the project is \
-                     pre-release and the cut is deliberate"
-                ),
-            }),
+            // Below: pre-freeze record shapes change by hard cut, and the danger
+            // is that an older record still *parses* — a field that moved or was
+            // added comes back as its serde default, so the journal answers an
+            // audit question falsely instead of failing to answer it. There is
+            // also nothing to lift *to*: the missing field's value was never
+            // written, and inventing one would fabricate provenance. The whole
+            // journal is refused rather than the affected kinds, because a
+            // journal holding one such record holds the rest.
+            //
+            // Above: a version this build has never heard of means somebody
+            // deployed a writer ahead of its readers.
             _ => Err(StoreError::Corrupt {
                 seq: 0,
                 detail: format!(
-                    "record {kind} v{version} is newer than this build understands (v4) — \
-                     readers must be deployed before writers"
+                    "record {kind} is v{version}, and this build writes and reads v1 only. \
+                     Record shapes change by hard cut until the format freeze, so a journal \
+                     at another version is refused rather than read with fields quietly \
+                     defaulted — a false answer to an audit question is worse than a \
+                     refusal to answer. Start a fresh journal; if v{version} is the newer \
+                     one, deploy readers before writers"
                 ),
             }),
         }
@@ -92,21 +81,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// A pre-cut journal is refused, not read with fields quietly missing.
+    /// A journal from an older cut is refused, not read with fields missing.
     ///
-    /// The danger is that v1 *parses*: `RunAdmitted.policy` became
-    /// `policy_bundle`, so an old record deserialises with the policy digest
-    /// defaulting to absent, and a resumed run reports that nothing governed it.
-    /// A false answer to an audit question is worse than a refusal to answer.
+    /// The danger is that it *parses*. A record whose shape has since changed
+    /// still deserialises, with every moved or added field taking its serde
+    /// default — so a resumed run reports, say, that no policy governed it. That
+    /// is a false answer to an audit question, which is worse than a refusal to
+    /// answer, and it is the reason nothing is lifted rather than refused.
     #[test]
-    fn a_pre_cut_journal_is_refused_rather_than_misread() {
+    fn a_journal_from_an_older_cut_is_refused_rather_than_misread() {
         let err = Identity
-            .upcast("RunAdmitted", 1, json!({ "agent": "a", "input": null }))
+            .upcast("RunAdmitted", 0, json!({ "agent": "a", "input": null }))
             .unwrap_err();
         let text = err.to_string();
         assert!(
-            text.contains("policy_bundle") && text.contains("fresh journal"),
-            "the refusal must name what changed and what to do about it: {text}"
+            text.contains("fresh journal"),
+            "the refusal must say what to do about it: {text}"
         );
     }
 

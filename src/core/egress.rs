@@ -26,6 +26,24 @@
 //! configuring nothing, not by configuring something that looks like a control
 //! and is not.
 //!
+//! # Which drivers ask
+//!
+//! The HTTP model drivers do — Anthropic, `OpenAI`, `Gemini` and the
+//! `OpenAI`-compatible one — each refusing an ungranted base URL before a request
+//! is built, so nothing leaves and nothing is metered. Governed media fetches
+//! and push webhooks ask their own, stricter question, in
+//! [`netguard`](crate::netguard).
+//!
+//! **Bedrock does not**, and the exception is named here rather than left for a
+//! reader to infer from a missing method. That driver is handed a built AWS
+//! client whose endpoint the SDK will not disclose, so the only host this type
+//! could be shown is one derived from the region — which an endpoint override
+//! makes a fiction. Its own documentation states what stands in place of a
+//! check. Any *new* driver reaching a host over HTTP is expected to take an
+//! [`Egress`]; a driver that cannot must say so where it is built, because an
+//! uncovered surface that says it is uncovered gets revisited and one that says
+//! nothing does not.
+//!
 //! # Host, not URL
 //!
 //! Matching is on the **host**, and this type never parses a URL. URL parsing is

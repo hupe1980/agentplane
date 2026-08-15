@@ -99,6 +99,12 @@ accessor that decides, because a panel that could not agree is the signal a
 person should look, and resolving it silently converts *we do not know* into
 *approved*.
 
+Those refusals bind a deserialized quorum as well, which is the case that
+matters: a quorum rides on a plan node, and plans are read back from a store, a
+journal, and a replanner parsing a model's proposal. A panel is exactly the
+control a hijacked plan wants weakened, and `need: 0` would otherwise report
+`Pass` having judged nothing.
+
 The plan contract adds the structural half: a node declaring a quorum must
 depend on something. On a node with no subject a panel repeats *the work* rather
 than reviewing it — and for a mutating step, repeats it on the world.
@@ -256,6 +262,33 @@ anything.
 implies, by **maximum**. An effect can raise its output to `Secret`; it cannot
 declare a tool response less sensitive than its provenance implies. An effect
 able to lower its own label would be a laundering primitive with a polite name.
+
+### A label is a recorded fact, not a lookup
+
+The declaration an effect makes about its own output — its trust and its
+sensitivity — is journaled beside the result and read back on replay. It is not
+re-read from the catalogue.
+
+The distinction matters because those two values come from operator
+configuration rather than from code: a `ToolSafety` entry, an MCP grant, a
+`PeerGrant`. None of them is part of the effect key, so editing one changes no
+key and diverges nothing. Re-deriving the label would therefore let somebody
+lower a tool's declared `output_sensitivity` today and, by that act alone,
+relabel every value any past run read through it. A `Resume` replays its prefix
+before dispatching live, so this is not only an audit concern: the run would
+wake holding a value the gates now judge more permissively than they did when
+it was read.
+
+Provenance needs no such treatment, and the asymmetry is the reason to trust
+the rule rather than memorise it: `Effect::source` is derived from something
+already inside the key — a tool reference, a provider and model — so it cannot
+move without divergence.
+
+The same rule governs the sink gates themselves. On a replayed prefix the
+egress ceiling, the protected-field rules and the whole-value taint gate are
+not evaluated again; the verdict the live pass reached is in the journal, as
+the result beside it or as its own refusal record. Past the frontier of a
+`Resume` — where dispatch is live — every gate applies in full.
 
 ### Improving a label without erasing history
 
@@ -1294,3 +1327,4 @@ wrongly:
 | **Revocation** | A delegation is valid until it expires; there is no revocation list, because checking one means I/O on the authorization path — the exact property removed so a gate cannot fail open under load. Chains are short-lived and audience-bound instead |
 | **Implicit flows** | Labels track explicit data flow. Not side channels, not a model leaking through phrasing |
 | **A compromised allowlisted endpoint** | Egress allowlisting decides *where* traffic may go, not what the far side does with it |
+| **Egress allowlisting on Bedrock** | The HTTP model drivers refuse an ungranted base URL before a request is built. The Bedrock driver cannot: it is handed a built AWS client whose endpoint the SDK will not disclose, so the only host it could check is one derived from the region, and an endpoint override makes that a fiction. A control that looks like one and is not is worse than an absent one, so it is absent and named here. Constrain it where the SDK does — a VPC endpoint, an egress proxy, or IAM. The region *is* on the record, read from the client and part of effect identity |

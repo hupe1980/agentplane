@@ -581,6 +581,23 @@ pub enum PolicyError {
         resource: String,
     },
 
+    /// A sink-gate refusal read back from the journal.
+    ///
+    /// Carries the recorded wording rather than re-deriving a variant from it,
+    /// for the reason [`BudgetExceeded::Recorded`](crate::core::BudgetExceeded)
+    /// does: the run stopped for the reason it recorded, and a replay that
+    /// re-worded it makes an auditor compare a run's status against its own
+    /// replay and find a difference that means nothing.
+    ///
+    /// It is a [`PolicyError`] rather than a
+    /// [`StepError::Denied`](crate::core::StepError::Denied) because *which
+    /// gate refused* survives the round trip and matters: a sink gate refuses
+    /// one call, and a tool-calling loop may tell the model and try another
+    /// route, where an authorization denial ends the run. Collapsing the two on
+    /// the way back would end a run the original finished.
+    #[error("{reason}")]
+    Recorded { reason: String },
+
     /// An argument derived from untrusted data reached a mutating sink without
     /// an explicit, policy-authorized release.
     #[error("untrusted data may not reach mutating sink '{sink}' without an authorized release")]

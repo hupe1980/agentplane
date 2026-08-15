@@ -4166,7 +4166,7 @@ fn recorded_groups(
 /// reason to check. That is a declaration reading as a control while governing
 /// nothing, which is the one shape this codebase refuses everywhere.
 #[cfg(feature = "manifest")]
-fn check_advertises_what_it_provides(
+fn check_declaration_matches_skills(
     m: &crate::manifest::Manifest,
     mine: &HashSet<Capability>,
 ) -> Result<(), BuildError> {
@@ -4178,13 +4178,49 @@ fn check_advertises_what_it_provides(
         .filter(|c| !mine.contains(&Capability::new(c.as_str())))
         .cloned()
         .collect();
-    if missing.is_empty() {
-        return Ok(());
+    if !missing.is_empty() {
+        return Err(BuildError::AdvertisesWhatItCannotProvide {
+            agent: m.metadata.name.clone(),
+            missing,
+        });
     }
-    Err(BuildError::AdvertisesWhatItCannotProvide {
-        agent: m.metadata.name.clone(),
-        missing,
-    })
+
+    // And the other direction, which is the one that leaves no trace. A skill
+    // registered under a manifest is *governed* by it — the manifest's budget,
+    // model grants, egress ceiling and policy identity all apply — so a
+    // capability the skill answers and the declaration never names is a
+    // reviewed surface with an unreviewed door in it. The declaration is the
+    // artifact that gets read, digested and pinned, and the A2A card is built
+    // from it, so the extra capability is served and advertised nowhere.
+    //
+    // It is the same argument the manifest already makes about prompts: a
+    // system prompt composed in the deployer's code has no version, changes in
+    // a deploy, and nothing connects the change to the runs it affected. A
+    // capability added in code does the same to the agent's surface.
+    let undeclared: Vec<String> = {
+        let declared: HashSet<Capability> = m
+            .spec
+            .capabilities
+            .provides
+            .iter()
+            .map(|c| Capability::new(c.as_str()))
+            .collect();
+        let mut extra: Vec<String> = mine
+            .iter()
+            .filter(|c| !declared.contains(c))
+            .map(|c| c.0.clone())
+            .collect();
+        // Deterministic, so the message does not depend on hash order.
+        extra.sort();
+        extra
+    };
+    if !undeclared.is_empty() {
+        return Err(BuildError::ProvidesWhatItDoesNotAdvertise {
+            agent: m.metadata.name.clone(),
+            undeclared,
+        });
+    }
+    Ok(())
 }
 
 /// Add one skill to the plane's two lookup tables, refusing a collision.
@@ -5727,13 +5763,35 @@ impl RuntimeBuilder {
                 minimum: MIN_LEASE_TTL,
             });
         }
+        // A ceiling of zero is a budget already spent, and it refuses the
+        // first effect of every run this plane will ever make. The manifest
+        // refuses one at parse; a plane wired in Rust reaches the same `Budget`
+        // without passing a parser, so the rule is applied at both doors from
+        // the one definition in `Budget::bricked_ceiling`.
+        if let Some(field) = self.budget.bricked_ceiling() {
+            return Err(BuildError::BudgetPermitsNothing { field });
+        }
         if let Some(engine) = self.policy.as_ref() {
             preflight_policy(engine.as_ref(), self.identity.as_ref())?;
         }
+        // Before `seal_stores`, necessarily: sealing wraps each handle in one
+        // scoped to the *plane's* tenant, after which every store agrees with
+        // the plane and the question cannot be asked.
+        #[cfg(feature = "push")]
+        let push = self.outbox.as_ref().map(|o| o.store_tenant());
+        #[cfg(not(feature = "push"))]
+        let push: Option<&str> = None;
         check_same_tenant(
             self.store.as_ref(),
             self.blobs.as_ref(),
             self.memories.as_ref(),
+            &[
+                ("case", self.cases.as_ref().map(|s| s.tenant())),
+                ("event", self.events.as_ref().map(|s| s.tenant())),
+                ("task", self.tasks.as_ref().map(|s| s.tenant())),
+                ("memory", self.memories.as_ref().map(|s| s.tenant())),
+                ("push", push),
+            ],
             &self.tenant,
         )?;
         self.seal_stores();
@@ -5924,7 +5982,7 @@ impl RuntimeBuilder {
                 }
             }
 
-            check_advertises_what_it_provides(&m, &mine)?;
+            check_declaration_matches_skills(&m, &mine)?;
         }
 
         // Agent grants are validated against the finished plane, because the
@@ -6104,12 +6162,27 @@ fn preflight_policy(
     })
 }
 
-/// every policy request names the right one. The two are set separately, so the
-/// mismatch is easy to make and invisible once made.
+/// Refuse a plane whose stores answer for somebody else.
+///
+/// The plane's tenant scopes its data keys and names its policy requests; each
+/// store handle is scoped separately. Nothing at runtime looks wrong when the
+/// two disagree — the work is written into another tenant's keyspace while
+/// every erasure and every policy request names the right one — so the mismatch
+/// is easy to make and invisible once made. Asking each store who it serves is
+/// what turns it into a startup refusal.
+///
+/// **A store that does not override its accessor answers `default`.** That is
+/// the honest answer for a single-tenant deployment and the reason the check
+/// can be unconditional, but it is also why this catches a wiring mistake
+/// rather than proving isolation: an implementation that is scoped to `acme`
+/// and never overrode the accessor reports `default` and is refused, which is
+/// the safe direction — the unsafe one would be an implementation that claims a
+/// tenant it does not enforce, and no build-time question can settle that.
 fn check_same_tenant(
     store: &dyn JournalStore,
     blobs: Option<&Arc<dyn crate::blob::BlobStore>>,
     memories: Option<&Arc<dyn crate::memory::MemoryStore>>,
+    state: &[(&'static str, Option<&str>)],
     tenant: &crate::core::TenantId,
 ) -> Result<(), BuildError> {
     if let Some(blobs) = blobs
@@ -6125,6 +6198,22 @@ fn check_same_tenant(
             plane: tenant.to_string(),
             store: store.tenant().to_owned(),
         });
+    }
+
+    // The stores whose state a key ring seals, in the caller's fixed order so a
+    // plane with two mismatches reports the same one every build — an error
+    // that varies between runs of the same wiring sends an operator looking for
+    // a race that is not there.
+    for &(store, serves) in state {
+        if let Some(serves) = serves
+            && serves != tenant.as_str()
+        {
+            return Err(BuildError::StateStoreTenant {
+                store,
+                plane: tenant.to_string(),
+                tenant: serves.to_owned(),
+            });
+        }
     }
 
     // After the tenant checks, deliberately: a store scoped to the wrong tenant
@@ -6308,6 +6397,11 @@ impl Runtime {
                                 // provenance this delivery gave the value.
                                 source: Some(event.source.clone()),
                                 spend: crate::core::Spend::default(),
+                                // An inbound payload is another party's data,
+                                // which is exactly the point this lattice value
+                                // names — the same one the run's own delivery
+                                // path records.
+                                declared: crate::core::DeclaredOutput::untrusted(),
                             },
                         )
                         .effect(sub.effect)

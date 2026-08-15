@@ -401,6 +401,17 @@ pub struct Embed {
     pub(crate) embedder: std::sync::Arc<dyn crate::memory::Embedder>,
     pub(crate) text: String,
     pub(crate) arguments: serde_json::Value,
+    /// The highest sensitivity this embedding service may be shown.
+    ///
+    /// Declared per call rather than fixed, because embedding is an egress:
+    /// the text goes to a provider, and how confidential a text may be before
+    /// it stops being allowed to leave is a deployment's decision, not this
+    /// type's. A fixed [`Public`](Sensitivity::Public) would be that decision
+    /// made once, in the strictest possible place, and would refuse every
+    /// query worth embedding — a model's paraphrase, a recalled memory, a
+    /// customer's own question — since anything that crossed a trust boundary
+    /// is already [`Internal`](Sensitivity::Internal).
+    pub(crate) max_sensitivity: Sensitivity,
 }
 
 #[async_trait]
@@ -423,6 +434,10 @@ impl Effect for Embed {
 
     fn recovery(&self) -> Recovery {
         Recovery::Retry
+    }
+
+    fn max_sensitivity(&self) -> Sensitivity {
+        self.max_sensitivity
     }
 
     fn sink_arguments(&self) -> Option<&serde_json::Value> {
