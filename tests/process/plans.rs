@@ -1080,9 +1080,10 @@ fn a_deserialized_quorum_cannot_dodge_the_rules_the_constructor_enforces() {
     // A non-majority threshold can be met by both sides at once, so `tally`
     // order decides — 2 of 4 splitting 2–2 would report whichever it counts
     // first.
-    let err =
-        serde_json::from_value::<Quorum>(serde_json::json!({"need": 2, "lenses": ["a","b","c","d"]}))
-            .expect_err("2 of 4 is not a majority");
+    let err = serde_json::from_value::<Quorum>(
+        serde_json::json!({"need": 2, "lenses": ["a","b","c","d"]}),
+    )
+    .expect_err("2 of 4 is not a majority");
     assert!(err.to_string().contains("is not a majority"), "{err}");
 
     assert!(
@@ -1093,10 +1094,14 @@ fn a_deserialized_quorum_cannot_dodge_the_rules_the_constructor_enforces() {
 
     // A declarable panel still deserializes, so the refusals above are the
     // rules and not the wire shape being unreachable.
-    let ok: Quorum =
-        serde_json::from_value(serde_json::json!({"need": 2, "lenses": ["correctness","policy","arithmetic"]}))
-            .expect("a majority panel of distinct lenses round-trips");
-    assert_eq!(ok, Quorum::new(2, ["correctness", "policy", "arithmetic"]).unwrap());
+    let ok: Quorum = serde_json::from_value(
+        serde_json::json!({"need": 2, "lenses": ["correctness","policy","arithmetic"]}),
+    )
+    .expect("a majority panel of distinct lenses round-trips");
+    assert_eq!(
+        ok,
+        Quorum::new(2, ["correctness", "policy", "arithmetic"]).unwrap()
+    );
 }
 
 /// Every collaboration justification must reject *something*.
