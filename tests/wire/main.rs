@@ -22,5 +22,6 @@ mod drivers;
 mod mcp;
 mod media;
 mod model;
+mod outbox;
 mod tools;
 mod witness_http;

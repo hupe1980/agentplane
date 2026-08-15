@@ -191,12 +191,23 @@ pub trait CheckpointSigner: Send + Sync + Debug {
     /// The identity this signer writes as.
     fn key_id(&self) -> KeyId;
 
-    /// Sign, or say why not.
+    /// Sign **the message**, or say why not.
+    ///
+    /// Bytes, not a [`Digest`], and the difference is interoperability rather
+    /// than taste. A checkpoint's signature travels as a C2SP `signed-note`
+    /// line, and that format specifies a signature over the note *text*: pure
+    /// Ed25519, not Ed25519 over a pre-hash. Signing the hash instead produces
+    /// sixty-four bytes of the right algorithm under the right key that verify
+    /// against no witness, no auditor and no `signed-note` implementation.
+    ///
+    /// [`CardSigner`](crate::peers::CardSigner) carries the same reasoning for
+    /// JWS — *"signing its hash instead would verify perfectly here and nowhere
+    /// else"*.
     ///
     /// # Errors
     ///
     /// If the signing service refuses or cannot be reached.
-    async fn sign(&self, hash: &Digest) -> Result<Vec<u8>, SignError>;
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignError>;
 }
 
 /// Why a signature could not be produced.
@@ -215,20 +226,13 @@ pub enum SignError {
     Refused { key_id: KeyId, detail: String },
 }
 
-/// Every local signer is a checkpoint signer.
-///
-/// So the common deployment — one Ed25519 key held in process — needs no
-/// adapter, and only somebody actually reaching for a KMS writes code.
-#[async_trait::async_trait]
-impl<T: Signer + ?Sized> CheckpointSigner for T {
-    fn key_id(&self) -> KeyId {
-        Signer::key_id(self)
-    }
-
-    async fn sign(&self, hash: &Digest) -> Result<Vec<u8>, SignError> {
-        Ok(Signer::sign(self, hash))
-    }
-}
+// No blanket `impl<T: Signer> CheckpointSigner for T`, and it must stay that
+// way. [`Signer`] covers a 32-byte digest; a checkpoint signature covers the
+// note text. A blanket impl would let one stand in for the other at every call
+// site without a cast to notice, and the two are the same length, the same
+// algorithm and the same type — only a verifier can tell them apart. Each
+// deployment writes the four lines naming which bytes its key covers; see
+// `Ed25519Signer` under the `signing` feature.
 
 /// Checks a signature against the key that claims to have made it.
 ///

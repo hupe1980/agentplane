@@ -527,17 +527,55 @@ not help. Here is what a request actually looks like.
 At **`effect:perform`**:
 
 ```text
-context.run                 string    the run id
-context.step                long
-context.tenant              string
-context.mutates             bool      whether this effect changes the world
-context.args                record    the effect's own descriptor arguments
-context.label               record    present only for `sink` — see below
-context.owner               string    with a delegation chain
-context.subject             string
-context.delegation_depth    long
-context.scope               list      the chain's effective scope patterns
+always present
+  context.run               string    the run id
+  context.step              long
+  context.tenant            string
+  context.mutates           bool      whether this effect changes the world
+  context.args              record    the effect's own descriptor arguments
+
+conditional — guard with `context has …` before reading
+  context.label             record    sinks only — see below
+  context.owner             string    only where a delegation chain is configured
+  context.subject           string    ditto
+  context.delegation_depth  long      ditto
+  context.scope             list      ditto — the chain's effective scope patterns
 ```
+
+**The conditional half is not optional reading.** Cedar evaluates *every* rule
+against *every* request, so a `when` clause reading an attribute the request
+does not carry does not quietly fail to match — it **errors**. An unevaluable
+rule might have been the `forbid` that would have stopped the call, so the gate
+refuses; one unguarded rule therefore denies every effect of every run, from a
+policy set that parsed cleanly and validated against its schema.
+
+Write the guard, and the rule means the same thing on both shapes:
+
+The unguarded form — deliberately not marked as Cedar, because it is not
+something to copy:
+
+```text
+forbid(principal, action == Action::"effect:perform", resource)
+when { context.delegation_depth >= 1 };          // denies everything
+```
+
+The same rule, evaluable on every shape:
+
+```cedar
+permit(principal, action, resource);
+forbid(principal, action == Action::"effect:perform", resource)
+when { context has delegation_depth && context.delegation_depth >= 1 };
+```
+
+The plane refuses to build rather than letting you find this at the first
+effect of the first run: `try_build` evaluates the compiled set against a
+canonical request of each shape it will actually issue — including, when no
+chain is configured, the shape without the delegation attributes — and reports
+any rule that cannot be evaluated as `BuildError::PolicyUnevaluable`. A run
+that reaches a broken rule anyway is refused as `Malformed` rather than
+`Deny`, because *the rules say no* and *the rules are broken* call for
+opposite responses and the difference should not live in a sentence somebody
+greps for.
 
 `context.label` is the one that makes this different from ordinary
 identity-based authorization, because it says **where the value came from**:
@@ -548,9 +586,13 @@ context.label.trust         "trusted" | "untrusted"
 context.label.sensitivity   "public" | "internal" | "confidential" | "secret"
 ```
 
-It is present only on `sink`, the only call that has a labelled value to bind.
-**Absent is not "trusted"**: a rule requiring a source simply does not match, so
-it fails closed.
+It is present only on `sink`, the only call that has a labelled value to bind —
+so a rule reading it needs `context has label` like any other conditional
+attribute. **Absent is not "trusted", and it is not "the rule quietly does not
+match" either**: an unguarded read errors, and an unevaluable rule refuses the
+call whatever it would have decided. Guarded, a rule requiring a source simply
+does not match on requests that carry no label, which is the fail-closed
+behaviour you want.
 
 For `tool.call`, `context.args` carries `{ server, tool, arguments }` — which is
 what lets a rule speak about one server without speaking about every tool on it.
@@ -1248,7 +1290,7 @@ wrongly:
 |---|---|
 | **The native skill tier is trusted** | A `dyn Skill` compiled into the binary can open its own socket. The gate governs what goes through `cx.effect`, and nothing else. This runtime does not claim to sandbox native code: untrusted executables belong behind a governed MCP/A2A/tool boundary and an OS process or container boundary |
 | **An operator who holds the signing key** | Signatures bind authorship, not existence. Whoever controls the workload identity can produce a perfectly signed alternative history |
-| **Independent split-view detection** | Witness cosigning and consistency-proof verification are built, including refusal of a second history at the same size. `HttpWitness` speaks C2SP `tlog-witness` — a shrunken log (400), a stale cursor (409) and a failed proof (422) each map to their own outcome, and only the first and last are integrity findings. What is absent is not code but a **counterparty**: until a second party runs a witness for your log, a witness you host yourself does not protect auditors from you |
+| **Independent split-view detection** | Witness cosigning and consistency-proof verification are built, including refusal of a second history at the same size. `HttpWitness` speaks C2SP `tlog-witness` — a shrunken log (400), a stale cursor (409) and a failed proof (422) each map to their own outcome, and only the first and last are integrity findings; a `200` counts only once its cosignature verifies as Ed25519 over the submitted note under a registered key. What is absent is not code but a **counterparty**: until a second party runs a witness for your log, a witness you host yourself does not protect auditors from you |
 | **Revocation** | A delegation is valid until it expires; there is no revocation list, because checking one means I/O on the authorization path — the exact property removed so a gate cannot fail open under load. Chains are short-lived and audience-bound instead |
 | **Implicit flows** | Labels track explicit data flow. Not side channels, not a model leaking through phrasing |
 | **A compromised allowlisted endpoint** | Egress allowlisting decides *where* traffic may go, not what the far side does with it |

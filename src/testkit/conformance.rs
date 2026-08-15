@@ -1494,7 +1494,7 @@ async fn the_log_only_grows(fresh: Factory<'_>, r: &mut Report) {
             Ok(Some(inc)) => {
                 let leaf = crate::core::merkle::leaf_hash(&inc.seal);
                 if !crate::core::merkle::verify_inclusion(
-                    &leaf,
+                    leaf,
                     usize::try_from(inc.index).unwrap_or(usize::MAX),
                     usize::try_from(inc.size).unwrap_or(0),
                     &inc.proof,

@@ -1580,8 +1580,13 @@ impl<'a> StepCtx<'a> {
         // it could not say "not with data that passed through that peer".
         //
         // Present only for `sink`, which is the only call that has a labelled
-        // value to bind. Absent is not "trusted": a rule that requires a source
-        // simply does not match, so it fails closed.
+        // value to bind — so a rule reading it must guard on `context has
+        // label`. Unguarded is not "fails closed for this request": Cedar
+        // evaluates every rule against every request, so reading an absent
+        // attribute **errors**, and an unevaluable rule refuses the call
+        // whatever it would have decided. One such rule denies every effect of
+        // every run, which is why `preflight_policy` asks these questions at
+        // build rather than leaving them to the first dispatch.
         if let Some(label) = outbound {
             context["label"] = serde_json::to_value(label).unwrap_or(Value::Null);
         }
@@ -1606,7 +1611,15 @@ impl<'a> StepCtx<'a> {
             return Err(StepError::Budget(exceeded));
         }
 
-        let crate::core::PolicyDecision::Deny { reason } = engine.authorize(&request) else {
+        // Both refusals, one path. `let … else` over `Deny` alone would send
+        // every other variant to the permit branch, so a decision this gate
+        // does not know about becomes an allow — a gate that fails open the
+        // moment the vocabulary grows. `Malformed` is refused like a denial
+        // and journaled like one; what differs is the operator's telemetry,
+        // because the fix is the policy set rather than the request.
+        let decision = engine.authorize(&request);
+        let malformed = decision.is_malformed();
+        let Some(reason) = decision.reason().map(ToOwned::to_owned) else {
             return Ok(());
         };
 
@@ -1616,6 +1629,7 @@ impl<'a> StepCtx<'a> {
             step = %self.step,
             action = crate::core::ACTION_PERFORM,
             resource = %descriptor.kind,
+            policy_error = malformed,
             %reason,
         );
         self.meter
@@ -2574,7 +2588,15 @@ impl<'a> StepCtx<'a> {
             .admit_policy_check()
             .map_err(StepError::Budget)?;
 
-        let crate::core::PolicyDecision::Deny { reason } = engine.authorize(&request) else {
+        // Both refusals, one path. `let … else` over `Deny` alone would send
+        // every other variant to the permit branch, so a decision this gate
+        // does not know about becomes an allow — a gate that fails open the
+        // moment the vocabulary grows. `Malformed` is refused like a denial
+        // and journaled like one; what differs is the operator's telemetry,
+        // because the fix is the policy set rather than the request.
+        let decision = engine.authorize(&request);
+        let malformed = decision.is_malformed();
+        let Some(reason) = decision.reason().map(ToOwned::to_owned) else {
             return Ok(());
         };
 
@@ -2584,6 +2606,7 @@ impl<'a> StepCtx<'a> {
             step = %self.step,
             action = crate::core::ACTION_RELEASE,
             resource = "information_flow.label",
+            policy_error = malformed,
             %reason,
         );
         self.meter

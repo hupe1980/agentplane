@@ -46,6 +46,13 @@ lint:
 #
 # Cheap because the dependency graph is shared: after the first, each is a
 # handful of crates.
+#
+# `clippy` rather than `check`, because `lint` runs four curated configurations
+# and a feature enabled outside all of them is linted by nothing: a
+# `clippy::unused_self` in the push delivery path sat in `push`-without-`testkit`
+# for as long as that combination existed, invisible to every gate. Compiling a
+# feature alone proves it builds; linting it alone is what the rest of the
+# codebase is held to.
 features:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -59,7 +66,7 @@ features:
         if '=' in l and not l.strip().startswith('#') and l.split('=')[0].strip() != 'default'
     ))"); do
         printf '  %s\n' "$f"
-        cargo check --quiet --no-default-features --features "$f"
+        RUSTFLAGS="-D warnings" cargo clippy --quiet --no-default-features --features "$f"
     done
 
 # the full suite, all features

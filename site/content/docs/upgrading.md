@@ -15,6 +15,76 @@ makes a hard cut acceptable at this stage.
 
 ---
 
+## A Cedar rule reading a conditional context attribute now refuses to build
+
+If a rule reads `context.delegation_depth`, `context.owner`, `context.scope`
+or `context.label` without guarding it, the plane no longer assembles:
+
+```text
+this plane's policy set cannot be evaluated: `effect:perform` on
+`preflight.effect`: … record does not have the attribute `delegation_depth` …
+```
+
+**The fix is one operator per rule.** Cedar's `has` makes the read safe on
+every request shape, and the rule means exactly what it meant before:
+
+```text
+# before — correct only while every request happened to carry the attribute
+forbid(principal, action == Action::"effect:perform", resource)
+when { context.delegation_depth >= 1 };
+```
+
+```cedar
+# after
+forbid(principal, action == Action::"effect:perform", resource)
+when { context has delegation_depth && context.delegation_depth >= 1 };
+```
+
+**Why the refusal is worth an afternoon of nobody's time.** Cedar evaluates
+every rule against every request, so an unguarded read of an absent attribute
+*errors* rather than failing to match — and since an unevaluable rule may be
+the `forbid` that would have stopped the call, the gate refuses. One such rule
+denies every effect of every run. This is not new behaviour in the gate: what
+changed is that the refusal now happens at `build`/`try_build`, against a
+canonical request of each shape the plane will issue, instead of at the first
+effect of the first run.
+
+The attributes that are conditional, and when they are present:
+
+| Attribute | Present |
+|---|---|
+| `delegation_depth`, `owner`, `subject`, `scope` | only where a delegation chain is configured (`RuntimeBuilder::acting_as`) |
+| `label` | sinks only — the calls that bind a labelled value |
+
+A plane that *does* configure a chain may read the delegation attributes
+unguarded: the preflight probes the shapes that plane actually produces, not a
+stricter hypothetical, so a working deployment is not refused for a rule that
+is correct there.
+
+Two related changes come with it. `PolicyDecision` gained a **`Malformed`**
+variant, so an engine that cannot evaluate its rules is distinguishable from
+one whose rules refuse — previously the difference existed only inside a
+reason string, and nothing could branch on it without matching message text. A
+`Malformed` decision refuses the call exactly as a denial does; what changes is
+that the operator is told to fix the policy set rather than sent looking for
+the rule that fired, and the operator API answers 500 rather than 403. If you
+match on `PolicyDecision` exhaustively, add the arm.
+
+---
+
+## A budget ceiling of zero is refused at parse
+
+`budgets: { max_tokens: 0 }` — and the same for `max_effects`, `max_steps`,
+`max_minor_units` and `max_wallclock_secs` — is now a parse error. It read like "no permission to
+spend"; what it did was refuse the **first effect of any kind**, because every
+ceiling is an accumulate-and-compare checked before the work. An agent
+declaring it could never perform a single tool call, model-free or not.
+
+Omit the ceiling for "no limit". To stop a tenant's work, use the emergency
+stop, which is the control that means it.
+
+---
+
 ## A source rule names the concrete source, not an effect family
 
 An effect's output now carries the identity an operator actually grants as its
@@ -622,6 +692,129 @@ catalogue — those dispatch through `commission`.
 `--no-default-features --features postgres` compiled, pulled `tokio-postgres` in,
 and exposed **no store module at all**. If you worked around it by also enabling
 `redb`, you no longer need to.
+
+---
+
+## `HttpWitness::new` takes the keys it will believe
+
+A remote witness's `200` used to be taken at its word. It carries a
+`signed-note` signature line, and the client recorded that line as a
+cosignature without checking it, so a quorum was a count of HTTP status codes:
+any endpoint answering `200` with a well-formed base64 string satisfied it.
+
+`HttpWitness::new` now takes a third argument and refuses to build without at
+least one key:
+
+```rust
+use agentplane::journal::{HttpWitness, TrustedWitness};
+
+let witness = HttpWitness::new(
+    "https://witness.example",
+    log_signature,
+    vec![TrustedWitness::ed25519("witness-1", witness_public_key)],
+)?;
+```
+
+Every signature line on a reply is now matched to a trusted key by **name and
+four-byte note key id** — `signed-note` says a verifier must ignore a signature
+sharing one but not the other, and the name is whatever the answering server
+typed — and then verified as Ed25519 over the exact note text that was
+submitted. A reply nothing verifies is a refusal, not a cosignature.
+
+Get the public key from whoever operates the witness. `TrustedWitness::ed25519`
+derives the key id itself; supplying one beside a key would be a second copy of
+one fact, and the copy that is wrong is the one nothing checks.
+
+---
+
+## `CheckpointSigner` signs bytes, and there is no blanket impl
+
+C2SP `signed-note` specifies a signature over the note **text**: pure Ed25519,
+not Ed25519 over a pre-hash. `CheckpointSigner::sign` took a `Digest`, so a
+checkpoint was signed over `SHA-256(note)` — sixty-four bytes of the right
+algorithm under the right key that verify against no witness, no auditor and no
+`signed-note` implementation anywhere.
+
+```rust
+// before
+async fn sign(&self, hash: &Digest) -> Result<Vec<u8>, SignError>;
+// after
+async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignError>;
+```
+
+The blanket `impl<T: Signer> CheckpointSigner for T` is gone with it: `Signer`
+covers a 32-byte digest and this covers a message, and a blanket impl let one
+stand in for the other with no cast to notice. `Ed25519Signer` implements both
+explicitly, so a deployment holding a local key under the `signing` feature
+needs no change. A KMS-backed signer implements `CheckpointSigner` directly and
+must sign the bytes it is handed.
+
+---
+
+## The empty log's Merkle root is `SHA-256("")`
+
+`merkle::root(&[])` returned thirty-two zero bytes. RFC 6962 fixes the empty
+tree's hash, and the root is the one value in this crate that is *not* private:
+it goes into a `tlog-checkpoint`, gets cosigned by witnesses this project does
+not operate, and is recomputed by verifiers it did not write. A size-0
+checkpoint is exactly what a fresh log first submits, so the old value
+disagreed with every conforming implementation at the first opportunity.
+
+Use `merkle::empty_root()` where you compared against `Digest::ZERO`. Zero
+remains the *chain's* genesis link, which is a different thing and unchanged.
+
+A checkpoint claiming size 0 beside any other root is now refused by
+`MemoryWitness` rather than remembered — a witness holds every later checkpoint
+to its first, so one incoherent submission would report every honest one
+afterwards as `Forked`, forever.
+
+---
+
+## `export::verify` takes the checkpoint you were given
+
+The Merkle root rebuilt from an export was compared with the checkpoint in the
+export's **own header**. That catches a dropped run only from an editor who
+forgot to rewrite the header, and this crate already refuses that reasoning one
+level down: a record's `prev_hash` is checked by rehashing the wire bytes, never
+against the previous line, because "the file agrees with itself" is what a
+competent editor achieves.
+
+```rust
+// before
+export::verify(input, verifier)?;
+// after — `None` still works, and now says what it did not check
+export::verify(input, verifier, Some(&checkpoint))?;
+```
+
+With `None`, the report lists **deletion** under `not_checked` instead of
+reporting sound. On the CLI:
+
+```sh
+agentplane verify history.jsonl --checkpoint cp.note
+```
+
+`--checkpoint` reads a `tlog-checkpoint` note, a cosigned signed note, or the
+`current` field of an `audit` report — whichever form you hold it in.
+
+---
+
+## A checkpoint note and a key name are parsed canonically
+
+`Checkpoint::from_note` used `lines()`, which accepted a missing final newline,
+dropped a `\r` before it, and ignored anything after the third line. The
+signature covers the *text*, so several texts mapping to one checkpoint means
+an operator can hand two auditors different bytes that both verify and both
+name the same history. It now requires exactly three newline-terminated lines,
+a non-empty origin, a canonical decimal size, and a canonically padded root.
+
+The crate's base64 decoding is strict for the same reason: `=` only as trailing
+pad, a whole number of quads, and zero bits below the last whole byte.
+
+`SignedNote::with_signature` is fallible, because a key name is structure on
+the wire rather than a label — the line is `— <name> <base64>`, so a name
+carrying a space, a newline or an em dash serialises without complaint and
+reads back as a different name, a truncated payload, or a signature line nobody
+wrote. Add `?` or `.expect(..)` at the call site.
 
 ---
 

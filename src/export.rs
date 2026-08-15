@@ -481,9 +481,20 @@ impl VerifyReport {
 /// * **Chains join, and sequences are contiguous.** A removed record breaks a
 ///   link; a removed *tail* does not, which is why the sequence is checked too.
 /// * **The Merkle root is rebuilt** from the per-run log positions and compared
-///   with the header's checkpoint. This is the one that catches a whole run
-///   dropped from the middle of the export — the per-run chains all still verify,
-///   and only the tree notices.
+///   with `expected` — the checkpoint the reader was given by somebody other
+///   than whoever wrote this file. This is the one that catches a whole run
+///   dropped from the middle of the export: the per-run chains all still
+///   verify, and only the tree notices.
+///
+///   Without `expected` it can only be compared with the file's **own header**,
+///   which reads like the same check and is not: an editor who drops a run and
+///   rewrites the header's size and root produces a file that agrees with
+///   itself perfectly. This crate makes the same argument one level down — a
+///   record's `prev_hash` is checked by rehashing the wire bytes, never against
+///   the previous line, because "the file agrees with itself" is what a
+///   competent editor achieves. So a pass with no `expected` reports the root
+///   check under [`VerifyReport::not_checked`]: internal consistency
+///   established, deletion not.
 /// * **The file is framed.** A missing trailer means the export was cut short,
 ///   and every line before the cut is still perfectly valid.
 /// * **The trailer's own accounting holds.** Its run and record counts are
@@ -503,6 +514,7 @@ impl VerifyReport {
 pub fn verify<R: std::io::BufRead>(
     input: R,
     verifier: Option<&dyn crate::core::Verifier>,
+    expected: Option<&Checkpoint>,
 ) -> Result<VerifyReport, std::io::Error> {
     use crate::core::Digest;
     use serde_json::Value;
@@ -531,7 +543,7 @@ pub fn verify<R: std::io::BufRead>(
     let mut header_seen = false;
     // (index, leaf) for every sealed run, so the tree can be rebuilt in log
     // order rather than in the order the export happened to walk.
-    let mut leaves: Vec<(u64, Digest)> = Vec::new();
+    let mut leaves: Vec<(u64, crate::core::merkle::LeafHash)> = Vec::new();
     let mut pass: Option<RunPass> = None;
     // The reader's own tally, held against the trailer's at the end: every run
     // block seen, every block that carried at least one record, and every block
@@ -606,7 +618,7 @@ pub fn verify<R: std::io::BufRead>(
         &mut empty_blocks,
     );
 
-    settle(&mut report, header_seen, leaves);
+    settle(&mut report, header_seen, leaves, expected);
     settle_trailer(&mut report, &claims, run_blocks, read_runs, &empty_blocks);
     settle_cases(&mut report, &stamped, &carried, blob_digests);
     Ok(report)
@@ -855,7 +867,7 @@ fn settle_cases(
 /// honest reading of a block nothing can be looked up by.
 fn open_run_block(
     value: &serde_json::Value,
-    leaves: &mut Vec<(u64, crate::core::Digest)>,
+    leaves: &mut Vec<(u64, crate::core::merkle::LeafHash)>,
 ) -> Option<RunPass> {
     use crate::core::{Digest, merkle};
     use serde_json::Value;
@@ -917,9 +929,45 @@ struct RunPass {
 fn settle(
     report: &mut VerifyReport,
     header_seen: bool,
-    mut leaves: Vec<(u64, crate::core::Digest)>,
+    mut leaves: Vec<(u64, crate::core::merkle::LeafHash)>,
+    expected: Option<&Checkpoint>,
 ) {
     use crate::core::merkle;
+
+    // Which checkpoint the rebuild is held to, and everything below turns on
+    // it. The header's own is a claim by whoever wrote the file; `expected` is
+    // one the reader was given by somebody else — printed by an earlier audit,
+    // cosigned by a witness, pasted into a ticket. Only the second makes the
+    // Merkle rebuild evidence about *deletion*; against the header it is
+    // evidence that the file is self-consistent, which an editor who dropped a
+    // run and rewrote the header also achieves.
+    let against = if let Some(given) = expected {
+        if header_seen && *given != report.checkpoint {
+            report.findings.push(format!(
+                "the export's header names log '{}' at size {} with root {}, and the \
+                 checkpoint this pass was given names '{}' at size {} with root {} — \
+                 the file describes a different history than the one it is being \
+                 checked against",
+                report.checkpoint.origin,
+                report.checkpoint.size,
+                report.checkpoint.root.to_hex(),
+                given.origin,
+                given.size,
+                given.root.to_hex(),
+            ));
+        }
+        given.clone()
+    } else {
+        report.not_checked.push(
+            "deletion — no checkpoint was supplied, so the Merkle root could only be \
+             rebuilt and compared against this file's own header. That proves the \
+             file is internally consistent, which is also what an editor who dropped \
+             a run and rewrote the header achieves. Pass the checkpoint an earlier \
+             audit printed, or one a witness cosigned"
+                .to_owned(),
+        );
+        report.checkpoint.clone()
+    };
 
     if !header_seen {
         report
@@ -932,7 +980,7 @@ fn settle(
     // links records within a run and knows nothing about its neighbours.
     leaves.sort_by_key(|(index, _)| *index);
     let size = u64::try_from(leaves.len()).unwrap_or(u64::MAX);
-    if size == report.checkpoint.size {
+    if size == against.size {
         // The positions are part of the claim, not bookkeeping: a checkpoint of
         // size N commits to leaves 0..N, so a duplicated or out-of-range
         // position is a relabelled log. Named here rather than left to surface
@@ -947,7 +995,7 @@ fn settle(
         if contiguous {
             let rebuilt =
                 merkle::root(&leaves.into_iter().map(|(_, leaf)| leaf).collect::<Vec<_>>());
-            if rebuilt != report.checkpoint.root {
+            if rebuilt != against.root {
                 report.findings.push(
                     "the Merkle root rebuilt from this export does not match the checkpoint it \
                      claims to be a copy of"
@@ -959,14 +1007,14 @@ fn settle(
                 "the run blocks' log positions are not the contiguous 0..{} the checkpoint \
                  commits to — a position is duplicated or missing, so this file describes a \
                  different log than the one it names",
-                report.checkpoint.size
+                against.size
             ));
         }
     } else {
         report.findings.push(format!(
             "the export carries {size} sealed run(s) and its checkpoint commits to {} — the \
              difference is runs that were in the log and are not in this file",
-            report.checkpoint.size
+            against.size
         ));
     }
 

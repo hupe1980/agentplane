@@ -67,6 +67,8 @@ pub struct Checkpoint {
     pub root: Digest,
 }
 
+use super::note::{b64, unb64};
+
 impl Checkpoint {
     /// The C2SP `tlog-checkpoint` note body: origin, size, base64 root.
     ///
@@ -86,6 +88,23 @@ impl Checkpoint {
         )
     }
 
+    /// Whether this checkpoint's size and root can both be true.
+    ///
+    /// One pair is checkable without holding the log: the empty tree has
+    /// exactly one root, so a checkpoint claiming size 0 beside any other root
+    /// is describing a log that cannot exist. That matters more than a tidy
+    /// invariant because of what a witness does with a first submission — it
+    /// has no prior memory to check against, so it records what it is told and
+    /// holds every later checkpoint to it. One incoherent size-0 submission
+    /// therefore poisons the origin permanently: every honest checkpoint
+    /// afterwards fails consistency against a root no log ever had, and is
+    /// reported as `Forked` — an integrity page, forever, from a single
+    /// malformed request.
+    #[must_use]
+    pub fn is_coherent(&self) -> bool {
+        self.size != 0 || self.root == crate::core::merkle::empty_root()
+    }
+
     /// Read one back.
     ///
     /// # Errors
@@ -93,71 +112,56 @@ impl Checkpoint {
     /// If the note is malformed. Deliberately strict: a checkpoint that parses
     /// "close enough" is a checkpoint that compares against the wrong log.
     pub fn from_note(note: &str) -> Result<Self, StoreError> {
-        let mut lines = note.lines();
         let bad = |what: &str| StoreError::Backend(format!("checkpoint note: {what}"));
-        let origin = lines.next().ok_or_else(|| bad("no origin"))?.to_owned();
-        let size = lines
-            .next()
-            .ok_or_else(|| bad("no size"))?
+        // Split rather than `lines()`, and the difference is the whole
+        // canonicity argument. `lines()` accepts a missing final newline, drops
+        // a `\r` before it, and ignores anything past the third line, so
+        // `origin\r\n42\r\nroot\r\n`, `origin\n42\nroot` and
+        // `origin\n42\nroot\nanything\n` would all name one checkpoint. The
+        // signature covers the *text*, so several texts mapping to one value is
+        // an operator able to hand two auditors different bytes that both
+        // verify and both name the same history. Exactly three lines, each
+        // newline-terminated, nothing after.
+        let body = note.strip_suffix('\n').ok_or_else(|| {
+            bad("the note does not end in a newline, which is part of what \
+                                gets signed")
+        })?;
+        let mut parts = body.split('\n');
+        let origin = parts.next().ok_or_else(|| bad("no origin"))?;
+        let size = parts.next().ok_or_else(|| bad("no size"))?;
+        let root = parts.next().ok_or_else(|| bad("no root"))?;
+        if parts.next().is_some() {
+            return Err(bad(
+                "the note carries more than the three lines tlog-checkpoint defines; \
+                 extra lines are refused rather than ignored, because a parser that \
+                 ignores them lets two different signed texts name one checkpoint",
+            ));
+        }
+        if origin.is_empty() {
+            return Err(bad("the origin is empty, so the note names no log"));
+        }
+        // A leading zero, a `+`, or surrounding space would all be accepted by
+        // `parse` after trimming, and each is a second spelling of one number.
+        if size.is_empty()
+            || !size.bytes().all(|b| b.is_ascii_digit())
+            || (size.len() > 1 && size.starts_with('0'))
+        {
+            return Err(bad(
+                "the size is not a canonical decimal number — no sign, no leading zero, \
+                 no surrounding space, because each is a second spelling of one log",
+            ));
+        }
+        let size = size
             .parse::<u64>()
             .map_err(|e| bad(&format!("size is not a number: {e}")))?;
-        let root = lines.next().ok_or_else(|| bad("no root"))?;
-        let root = unb64(root).ok_or_else(|| bad("root is not base64"))?;
+        let root = unb64(root).ok_or_else(|| bad("root is not canonical RFC 4648 base64"))?;
         let root: [u8; 32] = root.try_into().map_err(|_| bad("root is not 32 bytes"))?;
         Ok(Self {
-            origin,
+            origin: origin.to_owned(),
             size,
             root: Digest::from_bytes(root),
         })
     }
-}
-
-/// Standard base64, without pulling in a dependency for sixty lines of use.
-fn b64(bytes: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(A[((n >> (18 - 6 * i)) & 0x3F) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-fn unb64(s: &str) -> Option<Vec<u8>> {
-    let mut acc = 0u32;
-    let mut bits = 0u8;
-    let mut out = Vec::new();
-    for c in s.trim().bytes() {
-        if c == b'=' {
-            break;
-        }
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        };
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(u8::try_from((acc >> bits) & 0xFF).ok()?);
-        }
-    }
-    Some(out)
 }
 
 /// Evidence that one run is in the log.

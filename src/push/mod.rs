@@ -41,9 +41,11 @@
 
 mod delivery;
 mod outbox;
+mod sign;
 
 pub use delivery::{DeliveryWorker, Projection, PushSweepReport};
 pub use outbox::{Destination, OPERATOR_PREFIX, Outbox, RunCompleted, is_operator_id};
+pub use sign::BodySigning;
 
 /// Which of the two id namespaces a worker serves.
 ///
@@ -465,6 +467,17 @@ pub struct PushSender {
     /// still applies, and the request still carries no proxy, no cookie jar and
     /// no redirects.
     operator: bool,
+    /// The body-signing key for each destination this sender serves, by
+    /// registration id — empty for a caller-facing sender, because a caller's
+    /// webhook has no key of this deployment's to sign with.
+    ///
+    /// Held here rather than in the stored [`PushConfig`] for the reasons
+    /// [`Destination::config_for`] gives: the key is configuration this
+    /// deployment reads at every start, not per-registration state, so it is
+    /// never written to the push store and a rotation takes effect on the next
+    /// sweep. Filled by [`for_operator_destinations`](Self::for_operator_destinations),
+    /// which takes the destinations for that purpose.
+    signing: std::collections::BTreeMap<String, BodySigning>,
 }
 
 /// Delivery transport used by the durable worker.
@@ -492,6 +505,11 @@ impl PushSender {
             #[cfg(feature = "testkit")]
             plaintext_loopback: false,
             operator: false,
+            // A caller's webhook is not signed: the secret would have to come
+            // from the caller, and this crate does not accept one — an
+            // unauthenticated party choosing the key a receiver verifies
+            // against is not a control, it is a formality.
+            signing: std::collections::BTreeMap::new(),
         }
     }
 
@@ -508,14 +526,40 @@ impl PushSender {
     /// This is not an off switch for push. It cannot deliver to a
     /// caller-registered webhook at all: [`Outbox`] owns the rows this serves,
     /// the A2A worker owns the others, and the two id namespaces do not overlap.
+    ///
+    /// # Why it takes the destinations
+    ///
+    /// For the signing keys of whichever of them called
+    /// [`Destination::signed_with`], which live here and not in the stored
+    /// registration: a caller's bearer token has to be persisted because the
+    /// request that carried it is over, while an operator's signing key is this
+    /// deployment's own configuration, read at every start — persisting it
+    /// would put a forge-anything key in a row per run per destination and
+    /// freeze rotation at admission. Taking
+    /// them as an argument rather than offering a `.signing(..)` setter is the
+    /// difference between a control you can forget and one you cannot: a
+    /// destination configured to be signed whose sender was built without it
+    /// would deliver unsigned, and nothing downstream could notice, because a
+    /// receiver's own refusal is the only place a missing signature shows up.
+    /// Pass [`Outbox::destinations`], which is the list that was actually
+    /// registered.
     #[must_use]
-    pub fn for_operator_destinations() -> Self {
+    pub fn for_operator_destinations(destinations: &[Destination]) -> Self {
         Self {
             policy: PushPolicy::new(),
             timeout: Self::DEFAULT_TIMEOUT,
             #[cfg(feature = "testkit")]
             plaintext_loopback: false,
             operator: true,
+            signing: destinations
+                .iter()
+                .filter_map(|destination| {
+                    destination
+                        .signing
+                        .clone()
+                        .map(|signing| (destination.registration_id(), signing))
+                })
+                .collect(),
         }
     }
 
@@ -547,6 +591,11 @@ impl PushSender {
 
     /// Whether the loopback exception is in force. Always false without
     /// `testkit`, which is what lets the delivery path read one flag.
+    ///
+    /// Takes `&self` in every build even though the non-`testkit` body ignores
+    /// it: the call site is one expression across both, and a signature that
+    /// changed with a feature would move the `cfg` to every caller.
+    #[allow(clippy::unused_self)]
     const fn loopback_allowed(&self) -> bool {
         #[cfg(feature = "testkit")]
         {
@@ -665,11 +714,34 @@ impl PushSender {
             .build()
             .map_err(|e| PushError::Unroutable(e.to_string()))?;
 
+        // Serialized here rather than left to `RequestBuilder::json`, because
+        // the signature below has to cover the bytes that are actually sent: a
+        // signature over a *re-serialization* covers a body nobody posted, and
+        // the two stop agreeing the moment anything about the encoding differs.
+        //
+        // Through the canonical writer, not `serde_json` directly, for the
+        // reason `core::canon` gives — with `preserve_order` on, which cargo
+        // turns on for this crate from inside `cedar-policy`, plain
+        // serialization emits whatever order the projection happened to build
+        // the object in. That is legal JSON and a fine body, and it is a poor
+        // thing to sign: a receiver that verifies by re-serializing what it
+        // parsed — which is the ordinary receiver bug — has no stable form to
+        // reproduce, and neither does this plane if it is ever asked to prove
+        // what it sent. Sorted keys cost nothing here and make the bytes a
+        // function of the payload rather than of its construction.
+        let body = crate::core::canon::value_bytes(payload);
+
         let mut request = client
             .post(url)
             // The spec's media type, so a receiver can route on it.
-            .header("Content-Type", "application/a2a+json")
-            .json(payload);
+            .header("Content-Type", "application/a2a+json");
+        // The destination's own key, if the deployment configured one. What a
+        // receiver may conclude from it — and the freshness it deliberately
+        // does not carry — is set out on `BodySigning`.
+        if let Some(signing) = self.signing.get(&config.id) {
+            request = request.header(signing.header_name().clone(), signing.value_for(&body));
+        }
+        let mut request = request.body(body);
         if let Some(authentication) = &config.authentication {
             let value = format!(
                 "{} {}",

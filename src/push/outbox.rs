@@ -55,7 +55,7 @@ use crate::core::{RunId, Seq, StoreError};
 use crate::journal::{Record, RecordKind};
 
 use super::delivery::Projection;
-use super::{PushAuthentication, PushConfig, PushStore};
+use super::{BodySigning, PushAuthentication, PushConfig, PushStore};
 
 /// The marker that tells an operator destination from a caller's webhook.
 ///
@@ -89,6 +89,12 @@ pub struct Destination {
     pub url: String,
     /// HTTP authentication for the receiver, if it wants any.
     pub authentication: Option<PushAuthentication>,
+    /// A body signature for the receiver, if it verifies one.
+    ///
+    /// `None` means deliveries carry no signature at all — not an unsigned
+    /// header, no header. See [`signed_with`](Self::signed_with) for what a
+    /// signature is and is not evidence of.
+    pub signing: Option<BodySigning>,
 }
 
 impl Destination {
@@ -98,6 +104,7 @@ impl Destination {
             name: name.into(),
             url: url.into(),
             authentication: None,
+            signing: None,
         }
     }
 
@@ -114,12 +121,51 @@ impl Destination {
         self
     }
 
+    /// Sign every delivery's body, in `header`, under `secret`.
+    ///
+    /// `HMAC-SHA256` over the exact bytes posted, sent as `sha256=<hex>` — the
+    /// convention receivers are already written against. It is beside
+    /// [`authenticated`](Self::authenticated), not instead of it: a bearer
+    /// header proves the *sender* held a token, which is a claim about the
+    /// connection and not about the bytes, and that token transits every hop
+    /// between here and the receiver.
+    ///
+    /// What the receiver may conclude from a matching signature, and what it
+    /// may not — chiefly that the delivery is authentic but **not fresh**, so
+    /// a captured POST replays forever unless the receiver deduplicates on the
+    /// event's own identity — is set out on [`BodySigning`], and a receiver is
+    /// being written against those limits whether or not anybody read them.
+    ///
+    /// # Panics
+    ///
+    /// If `header` is not an HTTP field name, or the secret is empty. Both are
+    /// this deployment's own configuration, so both are refused where they are
+    /// written rather than at the far end of a run.
+    #[must_use]
+    pub fn signed_with(mut self, header: impl Into<String>, secret: crate::core::Secret) -> Self {
+        self.signing = Some(BodySigning::new(header, secret));
+        self
+    }
+
     /// The stored registration id for this destination.
     #[must_use]
     pub fn registration_id(&self) -> String {
         format!("{OPERATOR_PREFIX}{}", self.name)
     }
 
+    /// The durable registration for this destination on one run.
+    ///
+    /// Note what is **not** here: the signing key. A caller's bearer token has
+    /// to be stored, because it arrived with a request that is long over and
+    /// there is no other copy of it — that is what the row exists for. An
+    /// operator's signing key is the opposite: it is in this deployment's own
+    /// configuration, read at every start, so persisting it would write a copy
+    /// of a key that can forge every future delivery into a row per run per
+    /// destination, and buy nothing. It also decides *when a rotation takes
+    /// effect*: the key the sender holds signs the next sweep, where a
+    /// per-registration copy would keep signing with whatever was configured
+    /// when each run was admitted. The sender is given the destinations for
+    /// this reason — see [`PushSender::for_operator_destinations`](super::PushSender::for_operator_destinations).
     fn config_for(&self, run: RunId) -> PushConfig {
         PushConfig {
             id: self.registration_id(),

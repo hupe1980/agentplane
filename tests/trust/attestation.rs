@@ -358,7 +358,7 @@ async fn a_sealed_run_is_committed_to() {
         assert_eq!(inc.index, u64::try_from(i).unwrap());
         assert!(
             agentplane::core::merkle::verify_inclusion(
-                &agentplane::core::merkle::leaf_hash(&inc.seal),
+                agentplane::core::merkle::leaf_hash(&inc.seal),
                 usize::try_from(inc.index).unwrap(),
                 usize::try_from(inc.size).unwrap(),
                 &inc.proof,
@@ -433,7 +433,13 @@ async fn an_unsealed_run_is_not_in_the_log() {
         .await
         .unwrap();
     assert_eq!(cp.size, 0);
-    assert_eq!(cp.root, Digest::ZERO);
+    assert_eq!(
+        cp.root,
+        agentplane::core::merkle::empty_root(),
+        "an empty log's checkpoint carries RFC 6962's empty-tree root, which a \
+         witness will recompute — not thirty-two zero bytes, which is also what an \
+         uninitialised field looks like"
+    );
 
     assert!(
         (store.clone() as Arc<dyn JournalStore>)

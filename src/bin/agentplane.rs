@@ -174,6 +174,18 @@ struct VerifyArgs {
     /// signed history is the one an attacker who cannot sign would add.
     #[arg(long)]
     key: Vec<String>,
+
+    /// The checkpoint this export is supposed to be a copy of, as a
+    /// `tlog-checkpoint` note or as the JSON an audit report prints.
+    ///
+    /// This is the deletion check, and without it there is none. The Merkle
+    /// root rebuilt from the file can otherwise only be compared with the
+    /// file's own header — which an editor who dropped a run rewrites too —
+    /// so the report says deletion went unchecked. Supply the checkpoint an
+    /// earlier audit printed, or one a witness cosigned: the point is that it
+    /// comes from somewhere other than the file being checked.
+    #[arg(long)]
+    checkpoint: Option<String>,
 }
 
 /// What `audit` takes beyond the shared store arguments: the evidence.
@@ -640,35 +652,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 })
             })
         }
-        Verb::Verify(a) => {
-            let verifier = verifier_from(&a.key)?;
-            let verifier = verifier
-                .as_ref()
-                .map(|v| v as &dyn agentplane::core::Verifier);
-            let report = if a.file == "-" {
-                agentplane::export::verify(std::io::stdin().lock(), verifier)
-            } else {
-                std::fs::File::open(&a.file)
-                    .map_err(|e| format!("reading {}: {e}", a.file))
-                    .and_then(|f| {
-                        agentplane::export::verify(std::io::BufReader::new(f), verifier)
-                            .map_err(|e| e.to_string())
-                    })
-                    .map_err(std::io::Error::other)
-            }
-            .map_err(|e| e.to_string())?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
-            );
-            // Findings fail; `not_checked` does not. A pass with no key has
-            // established less, and saying so is different from failing.
-            Ok(if report.is_sound() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
-        }
+        Verb::Verify(a) => verify_verb(&a),
         Verb::Run(a) => {
             let manifests = manifests_at(&a.manifest)?;
             execute(&manifests, &a)
@@ -683,6 +667,69 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             serve(&manifests, &a)
         }
     }
+}
+
+/// Read a checkpoint an auditor was handed, in either form they hold it in.
+///
+/// Two forms because two things produce one: `audit` prints JSON, and a
+/// witness cosigns a `tlog-checkpoint` note. Requiring a conversion between
+/// them would put a step between the auditor and the check, and the steps
+/// between an auditor and a check are what this crate keeps removing.
+fn read_checkpoint(path: &str) -> Result<agentplane::journal::Checkpoint, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading --checkpoint {path}: {e}"))?;
+    // The note first: it is the form that travels, and it is unambiguous —
+    // JSON never parses as three newline-terminated lines.
+    if let Ok(cp) = agentplane::journal::Checkpoint::from_note(&text) {
+        return Ok(cp);
+    }
+    // A signed note carries the checkpoint as its body, so a reader who was
+    // handed the cosigned artifact does not have to cut the signatures off.
+    if let Ok(note) = agentplane::journal::SignedNote::parse(&text)
+        && let Ok(cp) = agentplane::journal::Checkpoint::from_note(&note.text)
+    {
+        return Ok(cp);
+    }
+    serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "--checkpoint {path} is neither a tlog-checkpoint note nor the `current` \
+             field of an audit report: {e}"
+        )
+    })
+}
+
+/// `verify`: recompute an export from its own bytes, against a checkpoint from
+/// somewhere else.
+fn verify_verb(opts: &VerifyArgs) -> Result<ExitCode, String> {
+    let verifier = verifier_from(&opts.key)?;
+    let expected = match &opts.checkpoint {
+        Some(path) => Some(read_checkpoint(path)?),
+        None => None,
+    };
+    let verifier = verifier
+        .as_ref()
+        .map(|v| v as &dyn agentplane::core::Verifier);
+    let report = if opts.file == "-" {
+        agentplane::export::verify(std::io::stdin().lock(), verifier, expected.as_ref())
+            .map_err(|e| e.to_string())
+    } else {
+        let file =
+            std::fs::File::open(&opts.file).map_err(|e| format!("reading {}: {e}", opts.file))?;
+        agentplane::export::verify(std::io::BufReader::new(file), verifier, expected.as_ref())
+            .map_err(|e| e.to_string())
+    }?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+    );
+    // Findings fail; `not_checked` does not. A pass with no key — or with no
+    // checkpoint — has established less, and saying so is different from
+    // failing.
+    Ok(if report.is_sound() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 /// Print the Agent Card a served manifest would advertise.

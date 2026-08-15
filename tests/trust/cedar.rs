@@ -254,7 +254,10 @@ fn a_forbid_on_an_attribute_the_request_lacks_fails_closed() {
 
     let tainted = sink_context("untrusted", "internal", &["tool:ledger"]);
     let d = ask(&engine, "agent:a", ACTION_PERFORM, TOOL_CALL, &tainted);
-    let PolicyDecision::Deny { reason } = d else {
+    // `Malformed`, not `Deny`: the difference between a rule refusing and the
+    // rules being broken is a variant now, so nothing has to read a sentence to
+    // tell them apart.
+    let PolicyDecision::Malformed { reason } = d else {
         panic!("an Allow reached beside an evaluation error must not stand: {d:?}");
     };
     assert!(
@@ -396,8 +399,8 @@ fn a_policy_that_fails_to_evaluate_is_reported_as_broken_not_as_a_refusal() {
     let ctx = json!({});
     let d = ask(&engine, "agent:a", ACTION_PERFORM, "x", &ctx);
 
-    let PolicyDecision::Deny { reason } = d else {
-        panic!("a policy that cannot evaluate must still deny")
+    let PolicyDecision::Malformed { reason } = d else {
+        panic!("a policy that cannot evaluate must still refuse, as a defect: {d:?}")
     };
     assert!(
         reason.contains("policy error"),
@@ -541,8 +544,8 @@ fn the_declared_schema_is_enforced() {
         "ledger.read",
         &json!({ "risk_tier": "two" }),
     );
-    let PolicyDecision::Deny { reason } = denied else {
-        panic!("a context violating the declared schema was accepted")
+    let PolicyDecision::Malformed { reason } = denied else {
+        panic!("a context violating the declared schema was accepted: {denied:?}")
     };
     assert!(reason.contains("defect"), "wrong refusal: {reason}");
 }
@@ -932,6 +935,19 @@ fn null_stripping_is_visible_to_an_audit() {
         fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
             true
         }
+        /// Without this the test is a coin flip, and it was: `tracing` caches
+        /// one process-wide maximum level, a subscriber that offers no hint
+        /// leaves it wherever the last install left it, and the stripping
+        /// event is `debug`. Run alone the test passed; run beside its
+        /// siblings, another thread's dispatcher guard could drop the cached
+        /// maximum below `debug` while this closure was still inside its
+        /// own — and the event that had already been decided on was never
+        /// emitted, so the sink saw nothing and the assertion blamed the
+        /// stripping. Saying `TRACE` is what keeps the level a property of
+        /// this subscriber rather than of the test schedule.
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
         fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
             tracing::span::Id::from_u64(1)
         }
@@ -970,6 +986,14 @@ fn null_stripping_is_visible_to_an_audit() {
         "args": { "amount": 50, "memo": Value::Null, "tags": ["a", Value::Null] },
     });
     let decision = tracing::subscriber::with_default(sink.clone(), || {
+        // `tracing` caches, once and process-wide, whether anybody is
+        // interested in a callsite. If this `debug!` is first reached on a
+        // thread with no subscriber — which any other test building a plane
+        // can do — the answer "nobody" is cached, and this closure then emits
+        // nothing however correct the stripping is. Rebuilding with the sink
+        // installed makes the test a question about stripping rather than
+        // about which test ran first.
+        tracing::callsite::rebuild_interest_cache();
         ask(&engine, "p", ACTION_PERFORM, TOOL_CALL, &with_nulls)
     });
     assert!(decision.is_permit(), "the stripped request still evaluates");
@@ -1070,4 +1094,89 @@ spec:
         ),
         "a permit-everything policy refused an unsigned manifest: {outcome:?}"
     );
+}
+
+// ── The shape that denies everything, caught before it can ──────────────────
+
+/// **A rule that reads a conditional attribute unguarded is refused at build.**
+///
+/// Cedar evaluates every rule against every request, so a `when` clause reading
+/// an attribute the request does not carry does not fail to match — it errors,
+/// and an unevaluable rule may be the `forbid` that would have stopped the
+/// call, so the gate refuses. One such rule therefore denies every effect of
+/// every run, from a policy set that parsed cleanly and validated against its
+/// schema.
+///
+/// `delegation_depth` is exactly that attribute: it exists only where a
+/// delegation chain does. A deployment wrote this rule against a plane that
+/// always had one, ran it on a plane that did not, and found out at the first
+/// effect of the first run — as a plane that refused everything, with nothing
+/// at boot to say why.
+///
+/// The positive half is the same rule written correctly: guarded with `has`, it
+/// builds, because the guard is what makes it evaluable on both shapes.
+#[test]
+fn a_rule_reading_a_conditional_attribute_unguarded_is_refused_at_build() {
+    let unguarded = r#"
+        permit(principal, action, resource);
+        forbid(principal, action == Action::"effect:perform", resource)
+        when { context.delegation_depth >= 1 };
+    "#;
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let err = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(Arc::new(CedarEngine::new(unguarded).expect("it compiles")))
+        .try_build()
+        .expect_err("a policy set that cannot be evaluated must not assemble a plane");
+    let text = err.to_string();
+    assert!(
+        text.contains("delegation_depth"),
+        "the refusal must name the attribute that could not be read: {text}"
+    );
+    assert!(
+        text.contains("context has"),
+        "the refusal must show the guard that fixes it: {text}"
+    );
+
+    // The guarded form of the same rule — the one the docs should teach — is
+    // evaluable against both shapes and assembles.
+    let guarded = r#"
+        permit(principal, action, resource);
+        forbid(principal, action == Action::"effect:perform", resource)
+        when { context has delegation_depth && context.delegation_depth >= 1 };
+    "#;
+    Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(Arc::new(CedarEngine::new(guarded).expect("it compiles")))
+        .try_build()
+        .expect("a guarded rule is evaluable on every request shape");
+
+    // And the unguarded rule is *correct* on a plane that always carries a
+    // chain, so the check asks the question this plane will actually ask
+    // rather than a stricter one. Probing a shape the plane never produces
+    // would refuse working deployments, which is how a boot check becomes the
+    // thing people disable.
+    Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(Arc::new(CedarEngine::new(unguarded).expect("it compiles")))
+        .acting_as(
+            Delegation::root(Principal::new("user:hupe", Scope::root()))
+                .delegate(Principal::new("pay", Scope::of(["pay"])))
+                .expect("a one-link chain"),
+        )
+        .try_build()
+        .expect("a plane whose requests always carry the attribute may read it");
+}
+
+/// A policy set that merely *denies* still builds.
+///
+/// The preflight asks whether the rules can be evaluated, not whether they are
+/// permissive: a default-deny plane is the recommended posture, and refusing to
+/// boot over it would make this check the reason nobody writes one.
+#[test]
+fn a_default_deny_policy_set_still_assembles() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    Runtime::builder(store as Arc<dyn JournalStore>)
+        .policy(Arc::new(
+            CedarEngine::new("").expect("an empty set compiles"),
+        ))
+        .try_build()
+        .expect("a set that denies everything is a working plane, not a broken one");
 }

@@ -1748,7 +1748,7 @@ let rt = Runtime::builder(store).agent(..).outbox(Arc::clone(&outbox)).try_build
 let worker = DeliveryWorker::new(
     Arc::clone(rt.journal()),
     Arc::clone(&store) as Arc<dyn PushStore>,
-    Arc::new(PushSender::for_operator_destinations()),
+    Arc::new(PushSender::for_operator_destinations(outbox.destinations())),
     Arc::new(RunCompleted::new("urn:mako:agentd")),
 );
 let report = worker.run_once(now_secs, 100).await?;
@@ -1779,6 +1779,37 @@ share one store and are told apart by the `operator:` prefix; the A2A server
 refuses a caller-supplied `pushNotificationConfig.id` that begins with it,
 because operator destinations are exempt from the URL controls precisely on the
 grounds that there is no caller involved.
+
+## ✍️ Sign the body a destination receives
+
+A bearer header proves the *sender* held a token — a claim about the connection,
+not about the bytes — and that token transits every hop between here and the
+receiver. Signing is the other claim, and destinations take both:
+
+```rust
+let bus = Destination::new("bus", "http://events.internal/ingest")
+    .authenticated("Bearer", Secret::new(std::env::var("BUS_TOKEN")?))
+    .signed_with("X-Mako-Signature", Secret::new(std::env::var("BUS_SIGNING_KEY")?));
+```
+
+Every delivery to it then carries `X-Mako-Signature: sha256=<hex>`, which is
+`HMAC-SHA256` over the **exact bytes POSTed** — the GitHub/Stripe convention, so
+a receiver already written against one of those verifies this one. The key is
+never written to the push store: it is deployment configuration read at every
+start, so there is no copy of a forge-anything key sitting in a row per run, and
+rotating it takes effect on the next sweep rather than on the next admission.
+That is why `for_operator_destinations` takes the destinations — a sender built
+without them would deliver unsigned, and only the receiver could ever notice.
+
+**What a valid signature does not prove.** Not freshness: there is no timestamp
+and no nonce in what is MACed, so a captured delivery replays forever and every
+check still passes. Only the receiver closes that, by deduplicating on the
+event's own identity — which `RunCompleted` supplies as CloudEvents' `(source,
+id)` pair, and which a receiver already needs, because at-least-once delivery
+repeats events on an ordinary crash. Not origin in the third-party sense either:
+the secret is symmetric, so anyone holding it can mint the same signature. And
+a receiver must **require** the header — verifying it when present and accepting
+it when absent buys nothing, because an attacker simply omits it.
 
 ## 🔐 Restrict where the plane may connect
 

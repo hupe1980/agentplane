@@ -137,19 +137,46 @@ impl std::ops::AddAssign for Spend {
 /// run that only touches free, local effects. It is not the default, because
 /// "nobody set a limit" and "somebody decided no limit was needed" should not
 /// look the same in a config file.
+///
+/// # A ceiling gates every effect, not only the metered ones
+///
+/// Worth stating once, because the field names invite the opposite reading:
+/// [`admit_effect`](Ledger::admit_effect) evaluates *all* of these limits before
+/// *every* effect, whatever kind it is. A run holding a token ceiling passes it
+/// on the way to a read-only tool call, and a run that has reached any one
+/// ceiling performs no further operation of any kind. So `max_tokens` is not
+/// "what the model may spend" — it is a gate the whole run walks through.
+///
+/// The corollary is that zero is not a useful value for any ceiling here except
+/// [`max_replans`](Self::max_replans) and [`max_denials`](Self::max_denials): at
+/// zero the limit is reached before the run starts, and the agent can never do
+/// anything at all. A manifest declaring one is refused at parse — see
+/// `manifest::Budgets`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budget {
-    /// Plan nodes this run may execute.
+    /// Plan nodes this run may execute, checked before each one starts.
+    ///
+    /// Zero permits no step at all, so a run carrying it cannot begin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_steps: Option<usize>,
-    /// Externally visible operations.
+    /// Externally visible operations, of every kind.
     ///
     /// The blunt instrument that stops a loop nobody predicted, independent of
-    /// what each operation happens to cost.
+    /// what each operation happens to cost — a free local read costs one here
+    /// exactly as a model completion does. Zero permits no effect at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_effects: Option<usize>,
+    /// Metered units the run may consume in total.
+    ///
+    /// Compared before **every** effect, including the effects that consume no
+    /// tokens, so this bounds when the run stops rather than only what the model
+    /// costs. Zero refuses the first effect of any kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// Money in minor units the run may spend in total.
+    ///
+    /// Gates **every** effect, exactly like [`max_tokens`](Self::max_tokens):
+    /// a free effect still has to pass it. Zero refuses the first one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_minor_units: Option<u64>,
     /// How many times a run may change its plan.
@@ -157,12 +184,17 @@ pub struct Budget {
     /// A run that replans without bound is a run that has stopped making
     /// progress and started thrashing, and the ceiling is what turns that from
     /// an unbounded spend into a reported fault.
+    ///
+    /// Zero is meaningful here, unlike the ceilings above: it says the plan the
+    /// run started with is the plan it finishes with, and a run that never
+    /// replans is unaffected by it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_replans: Option<u32>,
     /// Wall-clock ceiling.
     ///
     /// Costs one journaled clock read per step boundary when set — see the
-    /// module docs.
+    /// module docs. Checked against elapsed time, which starts at zero, so a
+    /// zero ceiling refuses the first step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wallclock_secs: Option<u64>,
     /// How many times the policy may refuse this run before it is stopped.
@@ -176,6 +208,11 @@ pub struct Budget {
     /// It is an operational ceiling as much as a security one: a run stuck in a
     /// denial loop has stopped making progress, exactly like one that replans
     /// without bound.
+    ///
+    /// Zero is meaningful here too, and for a different reason than
+    /// [`max_replans`](Self::max_replans): this one is counted *after* the
+    /// refusal and compared with `>`, so zero says the first refusal ends the
+    /// run. A run nothing refuses never notices it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_denials: Option<u32>,
 }
@@ -329,6 +366,12 @@ impl BudgetExceeded {
 /// Lives entirely in the deterministic zone: it reads only numbers that came
 /// out of the journal, so a replayed run reaches the same verdict at the same
 /// point as the original.
+///
+/// Every ceiling it holds gates *every* effect: [`admit_effect`](Self::admit_effect)
+/// evaluates the effect count, the token total, the money total and the clock
+/// before each operation, whatever kind that operation is. A token ceiling is
+/// therefore not a model-spend ceiling — a run that has reached it stops making
+/// free local calls too, which is exactly what makes a zero one uninhabitable.
 #[derive(Debug, Clone, Default)]
 pub struct Ledger {
     budget: Budget,

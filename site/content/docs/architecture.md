@@ -711,6 +711,17 @@ answers three questions:
 
 Delete a run and the root moves; the deleted run can no longer prove inclusion.
 
+"RFC 6962 shape" is two specific things, and both are checkable rather than
+asserted. Leaf and interior hashes are domain-separated by a prefix byte —
+without it an interior node's preimage can be presented as a leaf, and a tree
+of *n* leaves reinterpreted as a different tree with the same root. A leaf hash
+is therefore its own type: a caller who skips the hashing step does not build
+an undifferentiated tree, they fail to compile. And the hashes themselves are
+pinned to values computed by another implementation, because a checkpoint is
+submitted to witnesses running somebody else's code — a tree that agrees only
+with itself would pass every test here and be rejected by every witness in the
+network.
+
 **The third of those is what makes the other two mean anything.** The root moves
 on every ordinary seal, so an auditor comparing two roots and seeing a difference
 has learnt nothing — legitimate growth and deletion-plus-growth look identical. A
@@ -774,6 +785,14 @@ Rust struct.
   it extends the first. The client and wire protocol exist; independence still
   comes from choosing a witness run by somebody other than the operator.
   Hosting your own proves nothing about you.
+* **Cosignatures are verified, not counted.** `HttpWitness::new` takes the
+  `TrustedWitness` keys a deployment accepts and refuses to build without at
+  least one. Each signature line on a `200` is matched to a trusted key by
+  **name and four-byte note key id** — `signed-note`'s conjunction, because a
+  name is whatever the answering server typed — and then checked as pure
+  Ed25519 over the exact note text that was submitted. A quorum is otherwise a
+  count of HTTP status codes, and every guarantee resting on *an independent
+  party observed this log* would be a guarantee about string formatting.
 Both backends maintain the log, and both keep their gaps. redb advances a
 counter row inside the sealing transaction; Postgres uses a **sequence**, because
 several instances seal concurrently there — that is the topology it exists for —

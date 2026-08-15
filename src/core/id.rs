@@ -433,4 +433,41 @@ mod tests {
     fn parsing_rejects_garbage() {
         assert!(RunId::parse("run_not-a-ulid").is_err());
     }
+
+    /// **The digest is SHA-256, pinned to values computed outside this crate.**
+    ///
+    /// Every effect key, chain link, Merkle leaf and blob address in the system
+    /// comes out of these two functions, so what they emit is a durable format
+    /// even though nothing declares it one: change a byte and every historical
+    /// run becomes unverifiable, silently, because the whole suite would agree
+    /// with itself under the new value.
+    ///
+    /// That is what makes a *self-consistent* test worthless here and why these
+    /// literals were produced by `shasum -a 256` and Python's `hashlib` rather
+    /// than by running this code and writing down the answer. They survived a
+    /// `sha2` 0.10 → 0.11 upgrade, which is the class of change they exist for:
+    /// the hasher was swapped underneath and the bytes had to be shown, not
+    /// assumed, to be the same ones.
+    ///
+    /// What this does not pin: the canonicalization that decides *which* bytes
+    /// reach the hasher. That is `canon`'s own contract.
+    #[test]
+    fn the_digest_matches_sha256_computed_elsewhere() {
+        assert_eq!(
+            Digest::of(b"").to_hex(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "the empty digest moved, so every digest in every journal moved with it"
+        );
+        assert_eq!(
+            Digest::of(b"agentplane").to_hex(),
+            "c0f8f77669f4860960387db0dc9984894587bcfcc75d1846ffd3574563833443"
+        );
+        // `chain` is `H(prev ‖ bytes)`, and the concatenation order is the half
+        // a reimplementation gets wrong — reversed, it still hashes, still
+        // verifies against itself, and agrees with no other reader.
+        assert_eq!(
+            Digest::chain(Digest::of(b""), b"agentplane").to_hex(),
+            "171c5eddf30189b0efde9c71eb14f77685fab77d7750152d032f9e7cf4181159"
+        );
+    }
 }

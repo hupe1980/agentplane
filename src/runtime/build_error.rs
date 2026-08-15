@@ -166,6 +166,39 @@ pub enum BuildError {
     )]
     AgentToolSelfReference { agent: String, capability: String },
 
+    /// The policy set cannot be evaluated against a request this plane makes.
+    ///
+    /// Every rule is evaluated against every request, so a rule reading an
+    /// attribute a request does not carry does not merely fail to match — it
+    /// **errors**, and an unevaluable rule may be the `forbid` that would have
+    /// stopped the call, so the gate refuses. A rule guarded on nothing
+    /// therefore denies every effect of every run, from a policy set that
+    /// compiled cleanly and validated against its schema.
+    ///
+    /// Some context attributes are conditional by design: `delegation_depth`,
+    /// `owner` and `scope` exist only where a delegation chain does, and
+    /// `label` only where a value is being sinked. A rule that reads one
+    /// unconditionally is correct exactly until the first request without it.
+    /// The remedy is Cedar's `has`: `context has delegation_depth &&
+    /// context.delegation_depth >= 1`.
+    ///
+    /// Found at build by evaluating the compiled set against a canonical
+    /// request of each shape the runtime issues — cheap, because evaluation is
+    /// total and side-effect free — rather than at the first effect of the
+    /// first run, which is where a deployment discovered it as a plane that
+    /// denied everything.
+    #[error(
+        "this plane's policy set cannot be evaluated: {problems} — every rule is \
+         evaluated against every request, so a rule reading an attribute the \
+         request does not carry errors rather than not matching, and the gate \
+         refuses because the rule that failed may be the one that would have \
+         forbidden the call. Attributes that are conditional by design: \
+         `delegation_depth`, `owner` and `scope` (a delegation chain only), \
+         `label` (sinks only). Guard them — `context has delegation_depth && \
+         context.delegation_depth >= 1`"
+    )]
+    PolicyUnevaluable { problems: String },
+
     /// A lease TTL shorter than the store's expiry granularity.
     ///
     /// Both stores keep lease expiry in whole seconds and treat

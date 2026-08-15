@@ -232,15 +232,19 @@ fn protected_tool_fields_are_strict_and_digest_covered() {
 async fn each_agents_budget_bounds_only_its_own_runs() {
     use agentplane::runtime::{Agent, RunStatus, Runtime};
 
-    // Two agents on one plane, one whose ceiling forbids any effect at all.
-    //  rather than : a metered budget always allows the
-    // first operation, because its cost is unknown until it has run.
+    // Two agents on one plane, one of them on a ceiling its own skill runs into.
+    // An exact count rather than a metered limit, because a metered budget
+    // always allows the first operation — its cost is not known until it has
+    // run. One effect permitted and two asked for, so the ceiling binds on the
+    // second; a ceiling of *zero* would bind before the run started, which is
+    // refused at parse and for good reason — see
+    // `a_zero_ceiling_is_refused_at_parse`.
     let generous = Manifest::parse(BOUND).expect("parse");
     let mean = Manifest::parse(
         &BOUND
             .replace("bound-agent", "mean-agent")
             .replace("work.do", "work.cheap")
-            .replace("budgets: {}", "budgets: { max_effects: 0 }"),
+            .replace("budgets: {}", "budgets: { max_effects: 1 }"),
     )
     .expect("parse");
 
@@ -252,11 +256,13 @@ async fn each_agents_budget_bounds_only_its_own_runs() {
             provider: std::sync::Arc::clone(&provider),
             model: agentplane::model::ModelId::new("fake", "declared-1"),
             capability: "work.do",
+            calls: 2,
         }))
         .agent(Agent::new(&mean).skill(CallsModel {
             provider: std::sync::Arc::clone(&provider),
             model: agentplane::model::ModelId::new("fake", "declared-1"),
             capability: "work.cheap",
+            calls: 2,
         }))
         .build();
 
@@ -279,6 +285,137 @@ async fn each_agents_budget_bounds_only_its_own_runs() {
         "an agent forbidden any effect ran to completion — its neighbour's ceiling applied \
          instead of its own, which is what a plane-wide budget would do: {:?}",
         poor.status
+    );
+}
+
+/// A ceiling of zero is refused at parse, because it bricks the agent.
+///
+/// Reported as `budgets: { max_tokens: 0 }` on an agent declaring `models: {}`,
+/// written to mean "this one does no inference and gets no permission to
+/// spend". Every run it ever made failed with `token budget exhausted: 0
+/// permitted, 0 consumed` — on a **read-only tool call**, with no model
+/// anywhere near it.
+///
+/// The mechanism is the same for every ceiling here, which is why this is a
+/// table rather than one field's bug. They are accumulate-and-compare, checked
+/// *before* the work and refusing once consumption has **reached** the limit:
+/// at zero the limit is reached while the totals are still zero, so the first
+/// step or the first effect of any kind is refused. What made it expensive to
+/// diagnose is that the field names read as if they gate model spend, so the
+/// failure arrives on the one operation nobody suspects.
+///
+/// Refused rather than reinterpreted, because "no budget" and "no limit" are
+/// both defensible readings of a zero and a ceiling whose meaning the runtime
+/// picks is the thing a reviewable manifest exists to abolish. The positive
+/// half is the point: both intents already have a spelling, and the refusal
+/// names them.
+#[test]
+fn a_zero_ceiling_is_refused_at_parse() {
+    let agent = |budgets: &str| {
+        format!(
+            r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: careful, version: '1.0.0' }}
+spec:
+  identity: {{ role: 'Audit ledgers', constraints: 'Be brief.' }}
+  capabilities: {{ provides: [work.do] }}
+  budgets: {budgets}
+"
+        )
+    };
+
+    // Every ceiling the ledger reaches before the run has done anything. The
+    // non-zero column is what proves the refusal is about the zero and not
+    // about the field being present at all.
+    for (field, ok) in [
+        ("max_steps", "25"),
+        ("max_effects", "10"),
+        ("max_tokens", "120000"),
+        ("max_minor_units", "250"),
+        ("max_wallclock_secs", "60"),
+    ] {
+        let err = Manifest::parse(&agent(&format!("{{ {field}: 0 }}")))
+            .expect_err("a ceiling of zero was accepted, and it permits nothing at all");
+        let message = err.to_string();
+        for expected in [
+            // The field, so the refusal points at the line to change.
+            &*format!("spec.budgets.{field}"),
+            // The correction to the mental model that caused this.
+            "permits nothing at all",
+            "not merely no model spend",
+            // Both spellings of what the author actually meant.
+            "Omit the field to mean 'no limit'",
+            "QuotaStore::set_halt",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal of `{field}: 0` does not say '{expected}': {message}"
+            );
+        }
+
+        let m = Manifest::parse(&agent(&format!("{{ {field}: {ok} }}")))
+            .unwrap_or_else(|e| panic!("a real ceiling on `{field}` was refused: {e}"));
+        assert!(
+            m.spec.budgets.is_some(),
+            "`{field}: {ok}` parsed with no budgets at all"
+        );
+    }
+
+    // "No limit" already has a spelling, and it is the one the refusal offers:
+    // an omitted ceiling, inside a `budgets` block that says the absence was
+    // deliberate.
+    let unbounded = Manifest::parse(&agent("{}")).expect("`budgets: {}` is a deliberate choice");
+    assert_eq!(
+        unbounded.budget(),
+        agentplane::core::Budget::unlimited(),
+        "an empty budgets block did not mean unbounded"
+    );
+}
+
+/// The zeros that mean something are not swept up with the ones that do not.
+///
+/// A blanket "no ceiling may be zero" would be easier to write and wrong. Two
+/// of these limits count an *event that may never happen*, so forbidding it
+/// forbids nothing the run needs to do:
+///
+/// - `max_replans: 0` — the plan the run started with is the plan it finishes
+///   with. A run that never replans does not notice the ceiling at all.
+/// - `max_denials: 0` — counted *after* the refusal and compared with `>`, so
+///   zero says the first policy refusal ends the run. A run nothing refuses
+///   runs to completion under it.
+///
+/// The second has no manifest surface today — `spec.budgets` does not expose
+/// `max_denials` — so it is asserted against the [`Ledger`] where it lives.
+/// Both halves are here because the distinction is the whole reason the parse
+/// refusal is a list of five fields rather than "every ceiling".
+#[test]
+fn a_zero_that_means_something_still_parses() {
+    let no_replanning = r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: fixed-plan, version: '1.0.0' }
+spec:
+  capabilities: { provides: [work.do] }
+  budgets: { max_replans: 0, max_tokens: 1000 }
+";
+    let m = Manifest::parse(no_replanning)
+        .expect("`max_replans: 0` is a coherent instruction and must parse");
+    assert_eq!(
+        m.budget().max_replans,
+        Some(0),
+        "the run may not replan, and the ceiling has to reach the runtime saying so"
+    );
+
+    // And a zero denial ceiling still means what it says: the first refusal
+    // ends the run, rather than the run being over before it starts.
+    let mut ledger = agentplane::core::Ledger::new(agentplane::core::Budget::default().denials(0));
+    ledger
+        .admit_effect()
+        .expect("a zero denial ceiling must not refuse an effect nobody was denied");
+    assert!(
+        ledger.record_denial().is_err(),
+        "with no refusals permitted, the first one has to end the run"
     );
 }
 
@@ -1427,6 +1564,9 @@ struct CallsModel {
     /// Which capability this skill answers, so two of them can sit on one plane
     /// under different agents.
     capability: &'static str,
+    /// How many completions it asks for, so a test can hand it a ceiling it
+    /// reaches part-way rather than one that refuses it from a standing start.
+    calls: usize,
 }
 
 #[async_trait::async_trait]
@@ -1441,13 +1581,17 @@ impl agentplane::core::Skill for CallsModel {
         _input: agentplane::core::Tainted<serde_json::Value>,
     ) -> Result<agentplane::core::Outcome, agentplane::core::SkillError> {
         let prompt = agentplane::core::Tainted::trusted(serde_json::json!({ "q": "hello" }));
-        let call = agentplane::model::ModelCall::new(
-            std::sync::Arc::clone(&self.provider)
-                as std::sync::Arc<dyn agentplane::model::ModelProvider>,
-            self.model.clone(),
-            prompt.peek().clone(),
-        );
-        let c = cx.sink(call, &prompt).await?;
+        let mut last = None;
+        for _ in 0..self.calls {
+            let call = agentplane::model::ModelCall::new(
+                std::sync::Arc::clone(&self.provider)
+                    as std::sync::Arc<dyn agentplane::model::ModelProvider>,
+                self.model.clone(),
+                prompt.peek().clone(),
+            );
+            last = Some(cx.sink(call, &prompt).await?);
+        }
+        let c = last.expect("a skill with no calls proves nothing about a ceiling");
         Ok(agentplane::core::Outcome::done(
             c.map(|c| serde_json::json!({ "text": c.text })),
         ))
@@ -1468,6 +1612,7 @@ async fn run_with(model: &str) -> agentplane::runtime::RunOutcome {
             provider,
             model: agentplane::model::ModelId::new("fake", model),
             capability: "work.do",
+            calls: 1,
         }))
         .build();
     rt.run("work.do", Tainted::trusted(serde_json::json!({})))
@@ -1526,6 +1671,7 @@ async fn a_manifest_refusal_is_journaled() {
             provider: Arc::clone(&provider),
             model: agentplane::model::ModelId::new("fake", "undeclared-9"),
             capability: "work.do",
+            calls: 1,
         }))
         .build();
 
@@ -5186,6 +5332,42 @@ spec:
         "{refused}"
     );
     assert!(refused.to_string().contains("improvises"), "{refused}");
+
+    // The extraction model's own instruction is prose a model reads, and it is
+    // offered the same grants — so a tool named there fails the same way, and
+    // scanning only the role and constraints left the one instruction written
+    // for a *different* model unchecked.
+    let forms = |instruction: &str| {
+        format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: recalling, version: "1.0.0" }}
+spec:
+  capabilities: {{ provides: [do.thing] }}
+  models: {{ privileged: {{ provider: fake, model: m-1 }} }}
+  execution: {{ kind: tool-calling }}
+  identity: {{ role: "Summarise", constraints: "Be brief." }}
+  tools:
+    - ref: "tool://obsd/list_overdue"
+      mutates: false
+      description: "List overdue processes."
+  memory_formation:
+    subject: "$case"
+    purpose: "recall"
+    instruction: "{instruction}"
+  budgets: {{}}
+"#
+        )
+    };
+    Manifest::parse(&forms("Note what tool://obsd/list_overdue returned."))
+        .expect("a formation instruction naming a granted tool is fine");
+    let refused = Manifest::parse(&forms("Note it, then call tool://ledger/settle."))
+        .expect_err("a formation instruction naming an ungranted tool must be refused");
+    assert!(
+        refused.to_string().contains("tool://ledger/settle"),
+        "the refusal must name the tool: {refused}"
+    );
 }
 
 /// A directory of embedded manifests is keyed by what each document declares.

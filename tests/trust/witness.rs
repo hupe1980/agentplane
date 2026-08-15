@@ -18,8 +18,8 @@ fn witness() -> MemoryWitness {
 }
 
 /// Leaves for a log of `n` runs, and the checkpoint over them.
-fn log(n: usize) -> (Vec<Digest>, Checkpoint) {
-    let leaves: Vec<Digest> = (0..n)
+fn log(n: usize) -> (Vec<merkle::LeafHash>, Checkpoint) {
+    let leaves: Vec<merkle::LeafHash> = (0..n)
         .map(|i| merkle::leaf_hash(&Digest::of(format!("run-{i}").as_bytes())))
         .collect();
     let cp = Checkpoint {
@@ -160,7 +160,7 @@ async fn resubmitting_the_same_checkpoint_is_allowed() {
 /// witnessing exists to rule out.
 #[tokio::test]
 async fn a_witness_that_cannot_sign_reports_it() {
-    use agentplane::core::{CheckpointSigner, Digest, KeyId, SignError};
+    use agentplane::core::{CheckpointSigner, KeyId, SignError};
 
     /// A KMS having a bad day.
     #[derive(Debug)]
@@ -171,7 +171,7 @@ async fn a_witness_that_cannot_sign_reports_it() {
         fn key_id(&self) -> KeyId {
             "kms-key".into()
         }
-        async fn sign(&self, _hash: &Digest) -> Result<Vec<u8>, SignError> {
+        async fn sign(&self, _message: &[u8]) -> Result<Vec<u8>, SignError> {
             Err(SignError::Unavailable("connection reset".into()))
         }
     }
@@ -197,7 +197,7 @@ async fn a_witness_that_cannot_sign_reports_it() {
 /// A refused key is reported as refused, naming the key.
 #[tokio::test]
 async fn a_revoked_signing_key_names_itself() {
-    use agentplane::core::{CheckpointSigner, Digest, KeyId, SignError};
+    use agentplane::core::{CheckpointSigner, KeyId, SignError};
 
     #[derive(Debug)]
     struct Revoked;
@@ -207,7 +207,7 @@ async fn a_revoked_signing_key_names_itself() {
         fn key_id(&self) -> KeyId {
             "retired-key".into()
         }
-        async fn sign(&self, _hash: &Digest) -> Result<Vec<u8>, SignError> {
+        async fn sign(&self, _message: &[u8]) -> Result<Vec<u8>, SignError> {
             Err(SignError::Refused {
                 key_id: "retired-key".into(),
                 detail: "key is scheduled for deletion".into(),
@@ -242,11 +242,13 @@ fn a_signed_note_round_trips() {
             key_id: [0xDE, 0xAD, 0xBE, 0xEF],
             signature: vec![1, 2, 3, 4, 5],
         })
+        .expect("a well-formed key name")
         .with_signature(NoteSignature {
             name: "witness-1".into(),
             key_id: [0x01, 0x02, 0x03, 0x04],
             signature: vec![9, 9],
-        });
+        })
+        .expect("a well-formed key name");
 
     let back = SignedNote::parse(&note.to_wire()).expect("parse");
     assert_eq!(back, note, "the envelope did not survive a round trip");
@@ -352,7 +354,8 @@ fn the_note_payload_is_rfc4648_base64() {
                 name: "k".into(),
                 key_id: [payload[0], payload[1], payload[2], payload[3]],
                 signature: payload[4..].to_vec(),
-            });
+            })
+            .expect("a well-formed key name");
         let wire = note.to_wire();
         assert!(
             wire.contains(expected),
@@ -636,4 +639,287 @@ async fn a_stale_witness_is_healed_with_a_proof_from_its_cursor() {
         outcome.integrity
     );
     assert!(!outcome.needs_attention());
+}
+
+/// **A cosignature covers the note text, and a real verifier can check it.**
+///
+/// The one property no other test in this file touched: *which bytes* the
+/// signature is over. Every test here asked whether a cosignature came back,
+/// and a cosignature over the wrong message comes back just as readily —
+/// sixty-four bytes, the right algorithm, the right key, verifying nowhere.
+///
+/// It was wrong. `CheckpointSigner::sign` took a `Digest`, so this witness
+/// signed `SHA-256(note)` while [`HttpWitness`] — the client in this same
+/// crate, speaking the same format — verifies over the note text. The two
+/// could not check each other, and neither could any `signed-note` tool
+/// outside the crate. Nothing failed, because nothing verified.
+///
+/// So this checks against `ed25519_dalek` directly rather than against
+/// anything in this crate: a verifier written here would inherit whatever
+/// mistake the signer makes, which is exactly how the last one survived.
+#[tokio::test]
+#[cfg(feature = "signing")]
+async fn a_cosignature_verifies_as_pure_ed25519_over_the_note_text() {
+    use agentplane::policy::Ed25519Signer;
+    use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+
+    let signer = Arc::new(Ed25519Signer::new("witness-1", &[3u8; 32]));
+    let public = VerifyingKey::from_bytes(&signer.verifying_key()).expect("a valid key");
+    let w = MemoryWitness::new(signer);
+
+    let (_, cp) = log(4);
+    let co = w.cosign(&cp, 0, &[]).await.expect("a first checkpoint");
+    let signature =
+        Signature::from_slice(&co.signature).expect("a cosignature is sixty-four bytes");
+
+    let note = cp.to_note();
+    public
+        .verify(note.as_bytes(), &signature)
+        .expect("the cosignature must verify over the note text, as signed-note specifies");
+
+    // The negative half names the specific mistake this replaced, so a future
+    // change back to hashing first fails here rather than in a foreign tool.
+    assert!(
+        public
+            .verify(Digest::of(note.as_bytes()).as_bytes(), &signature)
+            .is_err(),
+        "the signature covers SHA-256(note) rather than the note — 64 bytes that verify \
+         against no witness, no auditor and no signed-note implementation"
+    );
+
+    // And it is a statement about *this* checkpoint, not about checkpoints.
+    let (_, other) = log(5);
+    assert!(
+        public
+            .verify(other.to_note().as_bytes(), &signature)
+            .is_err(),
+        "a cosignature that verifies over a different checkpoint is not evidence of \
+         anything"
+    );
+}
+
+/// **One base64 spelling per value, because the signature covers the text.**
+///
+/// A lax decoder is normally a shrug. Here it is not: a signed note's
+/// signature is over its *bytes*, so if several texts decode to one checkpoint
+/// then an operator holds several artifacts that all verify and all name the
+/// same history — a split view assembled out of encoding slack, with no
+/// rewritten log anywhere to find. There were two decoders in this crate,
+/// hand-rolled and disagreeing: one stopped at the first `=` wherever it fell,
+/// the other deleted every `=` first, so `AB=CD` meant `AB` in one file and
+/// `ABCD` in the other.
+#[test]
+fn a_checkpoint_has_exactly_one_spelling() {
+    let root = merkle::root(&[merkle::leaf_hash(&Digest::of(b"run-0"))]);
+    let canonical = Checkpoint {
+        origin: "example.com/plane-a".into(),
+        size: 1,
+        root,
+    }
+    .to_note();
+
+    // The positive half, so what follows is a canonicity rule rather than a
+    // parser that has stopped working.
+    let back = Checkpoint::from_note(&canonical).expect("its own note must parse");
+    assert_eq!(
+        back.to_note(),
+        canonical,
+        "the note must round-trip byte for byte"
+    );
+
+    let b64_root = canonical.lines().nth(2).expect("three lines").to_owned();
+    for (label, note) in [
+        (
+            "no trailing newline — the newline is part of what gets signed",
+            canonical.trim_end_matches('\n').to_owned(),
+        ),
+        (
+            "carriage returns, which `lines()` silently eats",
+            canonical.replace('\n', "\r\n"),
+        ),
+        (
+            "a fourth line, which a parser reading only three would ignore",
+            format!("{canonical}extra\n"),
+        ),
+        (
+            "a leading zero on the size",
+            format!("example.com/plane-a\n01\n{b64_root}\n"),
+        ),
+        (
+            "a signed size",
+            format!("example.com/plane-a\n+1\n{b64_root}\n"),
+        ),
+        (
+            "a padded size",
+            format!("example.com/plane-a\n 1\n{b64_root}\n"),
+        ),
+        (
+            "an empty origin, which names no log",
+            format!("\n1\n{b64_root}\n"),
+        ),
+        (
+            "an unpadded root",
+            format!(
+                "example.com/plane-a\n1\n{}\n",
+                b64_root.trim_end_matches('=')
+            ),
+        ),
+        (
+            "padding in the middle of the root",
+            format!(
+                "example.com/plane-a\n1\n{}={}\n",
+                &b64_root[..4],
+                &b64_root[5..]
+            ),
+        ),
+        (
+            "a stray character past the last whole quad",
+            format!("example.com/plane-a\n1\n{b64_root}A\n"),
+        ),
+    ] {
+        let parsed = Checkpoint::from_note(&note);
+        assert!(
+            parsed.is_err(),
+            "a note with {label} parsed to a checkpoint, so two texts name one \
+             history and both of them verify:\n{note:?}"
+        );
+    }
+
+    // The trailing-bit rule, which is the subtle one. The root's last base64
+    // character carries four bits of padding; a decoder that ignores them
+    // accepts sixteen spellings of every 32-byte root.
+    let mut chars: Vec<char> = b64_root.chars().collect();
+    let last = chars.len() - 2;
+    let alphabet: Vec<char> = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .chars()
+        .collect();
+    let index = alphabet
+        .iter()
+        .position(|c| *c == chars[last])
+        .expect("in the alphabet");
+    // Flip a padding bit: same 32 bytes, different text.
+    chars[last] = alphabet[index ^ 1];
+    let twin: String = chars.into_iter().collect();
+    assert_ne!(twin, b64_root, "the twin must be a different string");
+    let note = format!("example.com/plane-a\n1\n{twin}\n");
+    assert!(
+        Checkpoint::from_note(&note).is_err(),
+        "a root whose unused trailing bits are not zero decoded to the same 32 bytes \
+         as the canonical spelling, so one checkpoint has sixteen signed texts"
+    );
+}
+
+/// **A key name is structure, not a label.**
+///
+/// The signature line is `— <name> <base64>`: space-delimited, newline
+/// terminated, em-dash introduced. A name carrying any of those three
+/// serialises without complaint and reads back as something else — a
+/// different name, a truncated payload, or an extra signature line nobody
+/// wrote. The rule was written on the field's doc comment and enforced
+/// nowhere, so the only thing standing between an operator and a checkpoint
+/// no auditor can parse was that nobody had typed a space yet.
+#[test]
+fn a_key_name_that_would_break_the_line_is_refused() {
+    use agentplane::journal::{NoteSignature, SignedNote};
+
+    let sig = |name: &str| NoteSignature {
+        name: name.into(),
+        key_id: [1, 2, 3, 4],
+        signature: vec![7; 64],
+    };
+
+    // The positive half, so this is a rule about names rather than a writer
+    // that has stopped accepting them.
+    SignedNote::new("log\n1\nx\n")
+        .expect("valid")
+        .with_signature(sig("example.com/witness-1"))
+        .expect("an ordinary name must still be accepted");
+
+    for name in [
+        "",
+        "two words",
+        "trailing ",
+        "with\nnewline",
+        "with\ttab",
+        "\u{2014}dash",
+        "with\u{0}nul",
+    ] {
+        let note = SignedNote::new("log\n1\nx\n")
+            .expect("valid")
+            .with_signature(sig(name));
+        assert!(
+            note.is_err(),
+            "the name {name:?} was accepted; written out it produces a line that reads \
+             back as something other than what was signed"
+        );
+    }
+
+    // And the reader holds the same rule, or a note that parses can be written
+    // back out as one that does not.
+    for wire in [
+        "log\n1\nx\n\n\u{2014}  AQIDBAUGBwg=\n",
+        "log\n1\nx\n\n\u{2014} \u{2014}name AQIDBAUGBwg=\n",
+    ] {
+        assert!(
+            SignedNote::parse(wire).is_err(),
+            "a wire note with an unwritable key name parsed: {wire:?}"
+        );
+    }
+}
+
+/// **One malformed first submission must not page an operator forever.**
+///
+/// A witness has nothing to check a *first* checkpoint against — that is the
+/// whole shape of the problem it solves — so it records what it is given and
+/// holds everything afterwards to it. A size-0 checkpoint carrying a root the
+/// empty tree does not have names a log that cannot exist, and once it is
+/// remembered no honest checkpoint can ever extend it. Every later submission
+/// then fails consistency and is reported as `Forked`: the integrity bucket,
+/// permanently, for this origin, bought with one malformed request and
+/// indistinguishable from the split view witnessing exists to catch.
+///
+/// The refusal is at the door rather than at the second submission, because by
+/// the second submission the damage is the memory, not the request.
+#[tokio::test]
+async fn an_incoherent_checkpoint_is_refused_before_it_is_remembered() {
+    let w = witness();
+    let poison = Checkpoint {
+        origin: "plane-a".into(),
+        size: 0,
+        root: Digest::of(b"a root no empty log ever had"),
+    };
+
+    let err = w
+        .cosign(&poison, 0, &[])
+        .await
+        .expect_err("a size-0 checkpoint with a non-empty root must not be cosigned");
+    assert!(
+        !matches!(err, WitnessError::Forked { .. }),
+        "an incoherent request is a bad request, not a forked history"
+    );
+
+    // The point of refusing early: the origin is still usable. Left
+    // remembered, the honest log below could never be cosigned again.
+    let (_, cp) = log(3);
+    w.cosign(&cp, 0, &[])
+        .await
+        .expect("the origin must still be usable after refusing a malformed submission");
+    assert_eq!(
+        w.last_seen("plane-a").map(|(size, _)| size),
+        Some(3),
+        "the witness remembered the malformed checkpoint instead of the real one"
+    );
+
+    // The positive half: an *honest* empty checkpoint is fine, and is what a
+    // fresh log actually submits.
+    let fresh = witness();
+    let empty = Checkpoint {
+        origin: "plane-b".into(),
+        size: 0,
+        root: merkle::empty_root(),
+    };
+    fresh
+        .cosign(&empty, 0, &[])
+        .await
+        .expect("a genuinely empty log's checkpoint is coherent and must be cosigned");
 }

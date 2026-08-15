@@ -92,6 +92,15 @@ pub struct Cosignature {
     /// Who cosigned. An auditor decides whether it trusts this identity; the
     /// crate does not, for the same reason it never mints its own signing key.
     pub key_id: KeyId,
+    /// The note key id the signature line carried — `SHA-256(name ‖ 0x0A ‖
+    /// type ‖ public key)[..4]`.
+    ///
+    /// Kept because it is the field the ignore-unknown-keys rule is keyed on:
+    /// `signed-note` says a verifier MUST ignore a signature sharing a name
+    /// *or* an id with a known key but not both. Discarding it — which this
+    /// type did — left the name as the only identity, and a name is whatever
+    /// the answering server typed.
+    pub note_key_id: [u8; 4],
     /// Over the checkpoint's canonical note text, not over its fields — so a
     /// verifier checks exactly the bytes an operator can hand it.
     pub signature: Vec<u8>,
@@ -343,17 +352,29 @@ impl Witness for MemoryWitness {
                     witness_size: remembered_size,
                 });
             }
+            // A checkpoint whose own two halves contradict each other is
+            // refused before it is remembered, and the first submission is why.
+            // A witness has nothing to check a first checkpoint against, so it
+            // records whatever it is given — and a size-0 claim beside a root
+            // the empty tree does not have is a root no log will ever extend.
+            // Every honest checkpoint afterwards then fails consistency and is
+            // reported as `Forked`: a permanent integrity page for this origin,
+            // bought with one malformed request, and indistinguishable from the
+            // event witnessing exists to detect.
+            if !checkpoint.is_coherent() {
+                return Err(WitnessError::Unavailable(format!(
+                    "log '{}': the checkpoint claims size {} with a root the empty tree \
+                     does not have — refused rather than remembered, because a witness \
+                     holds every later checkpoint to its first one",
+                    checkpoint.origin, checkpoint.size
+                )));
+            }
+
             if let Some((remembered, old_root)) = seen.get(&checkpoint.origin).copied() {
-                // The caller says which size its proof starts from; this witness
-                // knows where it actually is. Disagreement is the 409 case, and
-                // reporting it the same way here is what makes this a faithful
-                // model of the remote one rather than a friendlier variant.
-                if old_size != remembered {
-                    return Err(WitnessError::Stale {
-                        origin: checkpoint.origin.clone(),
-                        witness_size: remembered,
-                    });
-                }
+                // Staleness is settled above, against `remembered_size`, and
+                // it is settled once: a second comparison here could never be
+                // reached, and a guarantee enforced twice is one whose real
+                // enforcement nobody can point at.
                 let old_size = remembered;
                 if checkpoint.size < old_size {
                     return Err(WitnessError::Shrank {
@@ -419,7 +440,7 @@ impl Witness for MemoryWitness {
         // asked, and the second is the thing witnessing exists to rule out.
         let signature = self
             .signer
-            .sign(&Digest::of(note.as_bytes()))
+            .sign(note.as_bytes())
             .await
             .map_err(|e| match e {
                 SignError::Unavailable(d) => WitnessError::Unavailable(d),
@@ -429,6 +450,12 @@ impl Witness for MemoryWitness {
             })?;
         Ok(Cosignature {
             key_id: self.signer.key_id(),
+            // The in-process witness signs through the `Signer` seam, which
+            // never exposes a public key — so there is no note key id to
+            // compute here. Zero says "this cosignature did not arrive on a
+            // note line" rather than inventing four bytes that would match
+            // nothing a verifier could check.
+            note_key_id: [0; 4],
             signature,
         })
     }

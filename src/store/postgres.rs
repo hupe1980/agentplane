@@ -309,8 +309,9 @@ impl PostgresStore {
         }
     }
 
-    /// This tenant's log leaves, in seal order.
-    async fn log_leaves(&self) -> Result<Vec<Digest>, StoreError> {
+    /// This tenant's log leaves, in seal order — already leaf-hashed, which
+    /// the type now says rather than the comment.
+    async fn log_leaves(&self) -> Result<Vec<crate::core::merkle::LeafHash>, StoreError> {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
@@ -323,7 +324,7 @@ impl PostgresStore {
             .map(|r| {
                 digest_from(&r.get::<_, Vec<u8>>(0)).map(|d| crate::core::merkle::leaf_hash(&d))
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 

@@ -674,8 +674,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/policy/cedar.rs",
         "a_policy_that_fails_to_evaluate_is_reported_as_broken_not_as_a_refusal",
         "a policy that cannot evaluate is reported as an ordinary refusal",
-        "            cedar_policy::Decision::Deny if !errors.is_empty() => PolicyDecision::deny(format!(",
-        "            cedar_policy::Decision::Deny if false => PolicyDecision::deny(format!(",
+        "            cedar_policy::Decision::Deny if !errors.is_empty() => {",
+        "            cedar_policy::Decision::Deny if false => {",
     ),
     "CedarBundleIgnoresRules": (
         "src/policy/cedar.rs",
@@ -774,6 +774,13 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                 plane: Arc::clone(plane),
             }),
             PolicyDecision::Deny { reason } => Err(ApiError(StatusCode::FORBIDDEN, reason)),
+            // Refused, and it is the plane that is broken rather than the
+            // request: 500 rather than 403, because 403 tells an operator to
+            // fix their credentials and this one is fixed in the policy set.
+            PolicyDecision::Malformed { reason } => {
+                tracing::error!(target: "agentplane::api", policy_error = true, reason, "the policy set could not be evaluated");
+                Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, reason))
+            }
         }""",
         """        let _ = decision;
         Ok(Session {
@@ -907,6 +914,26 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a leaf hash omits its prefix, so a leaf can stand in for an interior node",
         "    bytes.push(LEAF);\n",
         "",
+    ),
+    "TheEmptyLogAcceptsAnyRoot": (
+        "src/core/merkle.rs",
+        "growth_from_the_empty_log_still_names_the_empty_root",
+        "consistency from size 0 ignores the root it was given, so a "
+        "checkpoint no log ever had verifies as the ancestor of one that "
+        "does — and a witness cosigns growth from a tree it never saw",
+        "        return proof.is_empty() && *old_root == empty_root();",
+        "        return proof.is_empty();",
+    ),
+    "TheEmptyLogHashesToZero": (
+        "src/core/merkle.rs",
+        "an_empty_log_hashes_the_way_rfc_6962_says",
+        "the empty tree's root is thirty-two zero bytes instead of "
+        "RFC 6962's SHA-256 of the empty string — a value no conforming "
+        "witness or verifier computes, and one an uninitialised buffer, a "
+        "default-constructed struct and a truncated read all produce by "
+        "accident",
+        """        return empty_root();""",
+        """        return Digest::ZERO;""",
     ),
     "AProofCanBePadded": (
         "src/core/merkle.rs",
@@ -1137,6 +1164,16 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "was supposed to make the limit reviewable hides its absence",
         "#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct Budgets {",
         "#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]\npub struct Budgets {",
+    ),
+    "AZeroCeilingIsAccepted": (
+        "src/manifest/mod.rs",
+        "a_zero_ceiling_is_refused_at_parse",
+        "a ceiling of 0 is accepted, so `max_tokens: 0` written to mean 'no "
+        "permission to spend' instead refuses the run's first effect of any "
+        "kind — a read-only tool call on an agent with no models — and the "
+        "agent fails identically on every run it will ever make",
+        "            if is_zero {",
+        "            if false && is_zero {",
     ),
     "ThePromptIsNotPartOfTheDeclaration": (
         "src/manifest/mod.rs",
@@ -3634,6 +3671,17 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "            \"url\": self.url,\n            \"authentication\": self.authentication.as_ref().map(|auth| serde_json::json!({",
         "            \"url\": self.url,\n            \"token\": self.token.as_ref().map(crate::core::Secret::expose),\n            \"authentication\": self.authentication.as_ref().map(|auth| serde_json::json!({",
     ),
+    "ADeliverySignatureCoversNothing": (
+        "src/push/sign.rs",
+        "a_signed_destination_carries_an_hmac_of_the_exact_bytes_posted",
+        "the body signature is computed over a constant instead of the body, so "
+        "every delivery carries the same valid-looking MAC and a receiver "
+        "verifying it accepts any body at all — the header says the payload was "
+        "written by a holder of the secret, and it no longer says anything about "
+        "the payload",
+        "        let mac = hmac_sha256(self.secret.expose().as_bytes(), body);",
+        "        let mac = hmac_sha256(self.secret.expose().as_bytes(), b\"\");",
+    ),
     "OneTenantReadsAnothersWebhooks": (
         "src/store/redb_push.rs",
         "one_tenants_webhooks_are_not_another_tenants",
@@ -4246,6 +4294,127 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "exception that explains nothing",
         "        if reason.trim().is_empty() {",
         "        if false {",
+    ),
+    "ACheckpointNoteIsReadLineByLine": (
+        "src/journal/store.rs",
+        "a_checkpoint_has_exactly_one_spelling",
+        "a checkpoint note is read with `lines()`, which accepts a missing "
+        "final newline, eats a carriage return before it, and ignores "
+        "everything after the third line — so several different signed texts "
+        "parse to one checkpoint, and an operator can hand two auditors "
+        "different bytes that both verify",
+        """        if parts.next().is_some() {""",
+        """        if false {""",
+    ),
+    "ABase64PaddingBitsAreIgnored": (
+        "src/journal/note.rs",
+        "a_checkpoint_has_exactly_one_spelling",
+        "the unused trailing bits of a base64 tail are not required to be "
+        "zero, so every 32-byte root has sixteen spellings — each a distinct "
+        "note text, each signable, all naming one history",
+        """        if n & ((1 << (24 - take * 8)) - 1) != 0 {
+            return None;
+        }""",
+        """        if false {
+            return None;
+        }""",
+    ),
+    "ABase64PayloadNeedNotBePadded": (
+        "src/journal/note.rs",
+        "a_checkpoint_has_exactly_one_spelling",
+        "base64 input is decoded without checking that it is a whole number "
+        "of quads and that `=` appears only as a trailing pad, so a stray "
+        "character is silently dropped and interior padding truncates the "
+        "value — two ways for one root to have two texts",
+        """    if raw.is_empty() || !raw.len().is_multiple_of(4) {
+        return None;
+    }""",
+        """    if raw.is_empty() {
+        return None;
+    }""",
+    ),
+    "AKeyNameIsFreeText": (
+        "src/journal/note.rs",
+        "a_key_name_that_would_break_the_line_is_refused",
+        "a note signature's key name is written out unchecked, so a name "
+        "carrying a space, a newline or an em dash produces a line that reads "
+        "back as a different name, a truncated payload, or an extra signature "
+        "line nobody wrote",
+        """        Self::validate_name(&signature.name)?;""",
+        """        let _ = Self::validate_name(&signature.name);""",
+    ),
+    "AnExportIsCheckedAgainstItsOwnHeader": (
+        "src/export.rs",
+        "an_export_with_a_rewritten_header_needs_an_outside_checkpoint",
+        "the Merkle root rebuilt from an export is held to the checkpoint in "
+        "the file's own header rather than to the one the reader was given, so "
+        "an editor who drops a run and rewrites the header produces a file "
+        "that verifies clean — the same 'it agrees with itself' the record "
+        "rehash exists to refuse, one level up",
+        """        if header_seen && *given != report.checkpoint {""",
+        """        if false {""",
+    ),
+    "AnIncoherentCheckpointIsRemembered": (
+        "src/journal/witness.rs",
+        "an_incoherent_checkpoint_is_refused_before_it_is_remembered",
+        "a checkpoint claiming size 0 beside a root the empty tree does not "
+        "have is remembered rather than refused, and a witness holds every "
+        "later checkpoint to its first — so one malformed submission makes "
+        "every honest checkpoint for that origin report as forked, forever",
+        """            if !checkpoint.is_coherent() {""",
+        """            if false {""",
+    ),
+    "ACheckpointIsSignedOverItsHash": (
+        "src/journal/witness.rs",
+        "a_cosignature_verifies_as_pure_ed25519_over_the_note_text",
+        "a checkpoint is signed over SHA-256 of its note rather than over the "
+        "note text, which is what C2SP `signed-note` specifies — sixty-four "
+        "bytes of the right algorithm under the right key that verify against "
+        "no witness, no auditor and no tool outside this crate",
+        """            .sign(note.as_bytes())""",
+        """            .sign(crate::core::Digest::of(note.as_bytes()).as_bytes())""",
+    ),
+    "ACosignatureIsNotVerified": (
+        "src/journal/witness_http.rs",
+        "a_cosignature_is_counted_only_if_it_verifies",
+        "the signature on a 200 is parsed and never checked, so any endpoint "
+        "answering with a well-formed base64 string is counted toward a "
+        "quorum — and every guarantee resting on 'an independent party saw "
+        "this log' becomes a guarantee about string formatting",
+        """        if verifying
+            .verify(submitted_note.as_bytes(), &signature)
+            .is_ok()
+        {""",
+        """        if true {""",
+    ),
+    "ACosignatureIsMatchedOnNameAlone": (
+        "src/journal/witness_http.rs",
+        "a_cosignature_is_counted_only_if_it_verifies",
+        "a signature line is matched to a trusted key by name only, dropping "
+        "`signed-note`'s conjunction — so a server that picks the name it "
+        "sends can wear the identity of any witness the operator registered, "
+        "and a rotated-away key keeps counting",
+        """            .find(|k| k.name == line.name && k.note_key_id == line.key_id)""",
+        """            .find(|k| k.name == line.name)""",
+    ),
+    "OnlyTheFirstSignatureLineIsRead": (
+        "src/journal/witness_http.rs",
+        "a_cosignature_is_counted_only_if_it_verifies",
+        "only the first signature line of a 200 is considered, so which "
+        "cosignature counts is decided by the answering server's ordering and "
+        "a real one behind an unknown key's line is discarded",
+        """    for line in &note.signatures {""",
+        """    for line in note.signatures.iter().take(1) {""",
+    ),
+    "AWitnessClientNeedsNoKeys": (
+        "src/journal/witness_http.rs",
+        "a_witness_client_with_no_keys_is_not_a_witness_client",
+        "a witness client is constructible with an empty trusted set, which "
+        "verifies nothing and refuses everything — a misconfiguration that "
+        "reads as a witness being down rather than as never having been "
+        "configured",
+        """        if trusted.is_empty() {""",
+        """        if false {""",
     ),
     "AnUnreadableStaleSizeBecomesZero": (
         "src/journal/witness_http.rs",

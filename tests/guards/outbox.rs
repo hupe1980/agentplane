@@ -403,7 +403,10 @@ async fn the_default_projection_carries_the_outcome_and_not_the_answer() {
 async fn an_operator_sender_reaches_a_private_plaintext_address() {
     use agentplane::push::{PushPolicy, PushSender, PushTransport};
 
-    let operator = PushSender::for_operator_destinations();
+    let operator = PushSender::for_operator_destinations(&[Destination::new(
+        "bus",
+        "http://localhost:1/ingest",
+    )]);
     let config = PushConfig {
         id: Destination::new("bus", "http://localhost:1/ingest").registration_id(),
         task: agentplane::core::RunId::generate(),
@@ -439,7 +442,7 @@ async fn an_operator_sender_reaches_a_private_plaintext_address() {
 fn an_operator_url_must_still_be_a_url() {
     use agentplane::push::{PushSender, PushTransport};
 
-    let operator = PushSender::for_operator_destinations();
+    let operator = PushSender::for_operator_destinations(&[Destination::new("bus", "not a url")]);
     let config = PushConfig {
         id: "operator:bus".to_owned(),
         task: agentplane::core::RunId::generate(),

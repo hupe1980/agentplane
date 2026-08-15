@@ -671,6 +671,13 @@ impl Api {
                 plane: Arc::clone(plane),
             }),
             PolicyDecision::Deny { reason } => Err(ApiError(StatusCode::FORBIDDEN, reason)),
+            // Refused, and it is the plane that is broken rather than the
+            // request: 500 rather than 403, because 403 tells an operator to
+            // fix their credentials and this one is fixed in the policy set.
+            PolicyDecision::Malformed { reason } => {
+                tracing::error!(target: "agentplane::api", policy_error = true, reason, "the policy set could not be evaluated");
+                Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, reason))
+            }
         }
     }
 }

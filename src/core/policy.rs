@@ -203,6 +203,23 @@ pub enum PolicyDecision {
     Deny {
         reason: String,
     },
+    /// The rules could not be evaluated, so nothing may be concluded from
+    /// them — refused, but not by a rule.
+    ///
+    /// A separate variant because *the rules say no* and *the rules are
+    /// broken* call for opposite responses, and while both were spelled
+    /// `Deny` the difference existed only inside a reason string. Nothing
+    /// could branch on it without matching on message text, which is how a
+    /// reworded sentence changes behaviour — so a deployment whose policy set
+    /// had begun erroring on every request read it as ordinary refusals and
+    /// spent an afternoon looking for the rule that fired.
+    ///
+    /// It is still a refusal at the gate: an unevaluable rule may be exactly
+    /// the `forbid` that would have stopped this call. What changes is who is
+    /// told and what they are told to fix — the policy set, not the request.
+    Malformed {
+        reason: String,
+    },
 }
 
 impl PolicyDecision {
@@ -213,9 +230,33 @@ impl PolicyDecision {
         }
     }
 
+    /// Refuse because the rules themselves could not be evaluated.
+    pub fn malformed(reason: impl Into<String>) -> Self {
+        Self::Malformed {
+            reason: reason.into(),
+        }
+    }
+
     #[must_use]
     pub const fn is_permit(&self) -> bool {
         matches!(self, Self::Permit)
+    }
+
+    /// Whether this refusal is a defect in the rules rather than a rule
+    /// firing. The distinction a boot-time check reads, and the one an
+    /// operator's alerting should treat as an incident.
+    #[must_use]
+    pub const fn is_malformed(&self) -> bool {
+        matches!(self, Self::Malformed { .. })
+    }
+
+    /// The reason, whichever kind of refusal this is.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Permit => None,
+            Self::Deny { reason } | Self::Malformed { reason } => Some(reason),
+        }
     }
 }
 
@@ -227,6 +268,32 @@ impl PolicyDecision {
 /// being replayable for reasons nobody can see.
 pub trait PolicyEngine: Send + Sync + Debug {
     fn authorize(&self, request: &PolicyRequest<'_>) -> PolicyDecision;
+
+    /// Can this engine evaluate the requests this plane is about to make?
+    ///
+    /// Asked once, at build, with a canonical request of each shape the plane
+    /// will issue. Each returned string is a problem an operator must fix
+    /// before the plane runs; an empty vector means nothing to report.
+    ///
+    /// The default reports nothing, and that is honest rather than lax: the
+    /// failure this exists to catch belongs to *total* evaluators. Cedar
+    /// answers every request, so a rule reading an attribute a request does
+    /// not carry does not fail to match — it errors, and an unevaluable rule
+    /// may be the `forbid` that would have stopped the call, so the gate
+    /// refuses. One unguarded rule therefore denies every effect of every run
+    /// from a policy set that compiled cleanly. An engine written as Rust code
+    /// has no such trap and has nothing to say here.
+    ///
+    /// Implementations must keep the contract the trait already demands —
+    /// total, pure, no I/O — because this runs during `build`, where a
+    /// blocking call would make assembling a plane depend on a network.
+    ///
+    /// What a caller may **not** conclude from an empty answer: that the rules
+    /// are correct. A set permitting everything reports nothing here.
+    fn preflight(&self, requests: &[PolicyRequest<'_>]) -> Vec<String> {
+        let _ = requests;
+        Vec::new()
+    }
 
     /// Identifies every static input that can affect evaluation.
     ///

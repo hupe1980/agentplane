@@ -1354,3 +1354,74 @@ async fn a_lease_over_an_empty_journal_is_cleared_not_retried() {
     assert_eq!(again.runs_recovered, 0);
     assert_eq!(again.recovery_failures, 0);
 }
+
+/// **Every conclusion but success says why, through one accessor.**
+///
+/// The reason lives inside the variants — a string on `Failed`, a typed
+/// `SuspendReason`, a typed `BudgetExceeded`, an operator's words on
+/// `Cancelled` — so an embedder mapping outcomes onto its own wire type had to
+/// match all of them to find the sentence. The lazy path was to read the status
+/// and stop, and a deployment shipped an empty summary on failed runs for a
+/// while without noticing. `reason()` makes the lazy path the correct one.
+///
+/// Exhaustive by construction: the match below has no `_` arm, so a conclusion
+/// added later cannot be forgotten here — it will not compile until somebody
+/// decides what it says.
+#[test]
+fn every_conclusion_but_success_carries_a_reason() {
+    use agentplane::core::{BudgetExceeded, SuspendReason};
+    use agentplane::runtime::RunStatus;
+
+    let statuses = [
+        RunStatus::Succeeded,
+        RunStatus::Failed("the counterparty refused".into()),
+        RunStatus::Quarantined("an effect's outcome is unknown".into()),
+        RunStatus::Replanning("the plan no longer fits".into()),
+        RunStatus::Cancelled {
+            actor: "ops:hupe".into(),
+            reason: "stopped for the maintenance window".into(),
+        },
+        RunStatus::Suspended(SuspendReason::AwaitingTime {
+            until: agentplane::core::Timestamp::from_unix_timestamp(1_800_000_000).unwrap(),
+        }),
+        RunStatus::Exhausted(BudgetExceeded::Steps { allowed: 3 }),
+    ];
+
+    for status in statuses {
+        let reason = status.reason();
+        match &status {
+            RunStatus::Succeeded => assert!(
+                reason.is_none(),
+                "a success has no reason to give, and inventing one would put a \
+                 sentence in a field an embedder renders as a failure note"
+            ),
+            RunStatus::Failed(_)
+            | RunStatus::Quarantined(_)
+            | RunStatus::Replanning(_)
+            | RunStatus::Cancelled { .. }
+            | RunStatus::Suspended(_)
+            | RunStatus::Exhausted(_) => {
+                let text = reason.unwrap_or_else(|| {
+                    panic!("{} ended without saying why", status.as_str());
+                });
+                assert!(
+                    !text.trim().is_empty(),
+                    "{} gave an empty reason, which is the empty summary this \
+                     accessor exists to stop",
+                    status.as_str()
+                );
+            }
+        }
+    }
+
+    // The typed variants are formatted rather than dropped: "suspended" alone
+    // does not tell an operator what the run is waiting for, and the ceiling a
+    // run hit is the whole content of an exhaustion.
+    assert!(
+        RunStatus::Exhausted(BudgetExceeded::Steps { allowed: 3 })
+            .reason()
+            .expect("exhaustion has a reason")
+            .contains('3'),
+        "the exhaustion's reason must name the ceiling it hit"
+    );
+}

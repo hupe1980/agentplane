@@ -354,7 +354,7 @@ async fn placement(
     }
     let leaf = merkle::leaf_hash(&inc.seal);
     let ok = merkle::verify_inclusion(
-        &leaf,
+        leaf,
         usize::try_from(inc.index).unwrap_or(usize::MAX),
         usize::try_from(inc.size).unwrap_or(0),
         &inc.proof,

@@ -13,7 +13,7 @@
 //! which is off by default and documented as never belonging in a production
 //! build, for exactly that reason.
 
-use crate::core::{Digest, KeyId, Signer, Verifier};
+use crate::core::{CheckpointSigner, Digest, KeyId, SignError, Signer, Verifier};
 
 /// Produces a deterministic, forgeable "signature".
 #[derive(Debug, Clone)]
@@ -49,8 +49,26 @@ impl Signer for StubSigner {
     }
 }
 
+/// Also a checkpoint signer, and equally forgeable.
+///
+/// Signs the message rather than a digest of it, matching what a real witness
+/// key does, so a test reaching for this stub exercises production's shape.
+#[async_trait::async_trait]
+impl CheckpointSigner for StubSigner {
+    fn key_id(&self) -> KeyId {
+        self.key_id.clone()
+    }
+
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignError> {
+        let mut out = Vec::with_capacity(33);
+        out.push(0xAB);
+        out.extend_from_slice(Digest::of(message).as_bytes());
+        Ok(out)
+    }
+}
+
 impl Verifier for StubSigner {
     fn verify(&self, key_id: &str, hash: &Digest, signature: &[u8]) -> bool {
-        key_id == self.key_id && signature == self.sign(hash)
+        key_id == self.key_id && signature == Signer::sign(self, hash)
     }
 }

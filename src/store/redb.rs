@@ -318,8 +318,9 @@ impl RedbStore {
             .map_err(|e| StoreError::Backend(format!("blocking pool: {e}")))?
     }
 
-    /// The log's leaves, in seal order.
-    async fn log_leaves(&self) -> Result<Vec<Digest>, StoreError> {
+    /// The log's leaves, in seal order — already leaf-hashed, which the type
+    /// now says rather than the comment.
+    async fn log_leaves(&self) -> Result<Vec<crate::core::merkle::LeafHash>, StoreError> {
         let tenant = self.tenant.clone();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;

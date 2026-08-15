@@ -30,6 +30,242 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.17.0] — 2026-08-15
+
+Field feedback from a regulated deployment upgrading 28 specialists, and the
+report was right about every symptom and wrong about one cause — which is the
+part worth keeping, because the wrong cause would have produced the wrong fix.
+
+### Fixed — security: the evidence layer, where nothing was verifying anything
+
+An adversarial pass over the parts of this crate whose whole job is to be
+checkable by somebody else. The common shape across every finding: a control
+that produced the right-looking artifact and had no verifier, so the mistake
+could not fail. Each one is now pinned by a test that checks against something
+outside the code that makes it — an external vector, `ed25519_dalek` directly,
+or a checkpoint from outside the file.
+
+- **A witness's cosignature was never verified.** `HttpWitness` parsed the
+  first signature line of a `200`, discarded its four-byte key id, and recorded
+  it. A quorum was therefore a count of HTTP status codes: any endpoint
+  answering `200` with a well-formed base64 string met it, and the whole
+  argument for witnessing — that an independent party observed this log —
+  rested on nothing.
+
+  `HttpWitness::new` now takes the `TrustedWitness` keys the deployment
+  accepts and refuses to build without one. **Every** line is considered, not
+  just the first, so the answering server cannot decide which cosignature
+  counts by reordering its reply. A line is matched by name **and** note key
+  id — `signed-note`'s conjunction, because the name is whatever the server
+  typed — and verified as Ed25519 over the exact note text submitted.
+
+- **The two witnesses in this crate could not check each other.**
+  `CheckpointSigner::sign` took a `Digest`, so `MemoryWitness` signed
+  `SHA-256(note)` while `HttpWitness` verified over the note text, which is
+  what C2SP specifies. Neither could be checked by any `signed-note`
+  implementation outside this crate. Nothing failed, because nothing verified.
+  `sign` takes `&[u8]`, and the blanket `impl<T: Signer> CheckpointSigner for T`
+  — which is how a digest signer came to stand in for a message signer with no
+  cast to notice — is gone. This crate already carried the argument for JWS
+  cards: *signing its hash instead would verify perfectly here and nowhere
+  else.*
+
+- **An export was checked against its own header.** The Merkle root rebuilt
+  from an export was compared with the checkpoint in the export's header, which
+  an editor who drops a run rewrites too. `export::verify` takes the checkpoint
+  the reader was given, and `agentplane verify` grew `--checkpoint`; without
+  one the report lists **deletion** under `not_checked` rather than reporting
+  sound. The same reasoning the record rehash already applied one level down.
+
+- **A checkpoint had more than one spelling.** `Checkpoint::from_note` used
+  `lines()`, accepting a missing final newline, eating a `\r`, and ignoring a
+  fourth line. There were also two hand-rolled base64 decoders that disagreed
+  with each other, neither canonical. The signature covers the *text*, so
+  several texts naming one checkpoint is a split view assembled out of encoding
+  slack. One strict decoder now, and a note is exactly three newline-terminated
+  lines with a canonical origin, size and root.
+
+- **The empty log's root was not RFC 6962's.** `merkle::root(&[])` returned
+  thirty-two zero bytes; the specification says `SHA-256("")`. A size-0
+  checkpoint is what a fresh log first submits, so this disagreed with every
+  conforming verifier at the first opportunity — and zero is also what an
+  uninitialised buffer and a truncated read produce. `merkle::empty_root()`.
+
+- **One malformed submission could page an operator forever.** A witness has
+  nothing to check a *first* checkpoint against, so it recorded whatever it was
+  given. A size-0 checkpoint carrying any other root names a log that cannot
+  exist, and once remembered, every honest checkpoint afterwards failed
+  consistency and was reported as `Forked` — the integrity bucket,
+  permanently, for that origin. `Checkpoint::is_coherent` is checked at the
+  door.
+
+- **A key name was structure treated as a label.** The field's documentation
+  said "no spaces" and nothing enforced it, so a name carrying a space, a
+  newline or an em dash produced a note that serialised fine and read back as a
+  different name, a truncated payload, or a signature line nobody wrote.
+  `SignedNote::with_signature` is fallible, and the reader holds the same rule
+  as the writer.
+
+Also removed: a staleness comparison in `MemoryWitness` that the check eight
+lines above had already made and refused, so the branch could not be taken.
+
+See [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/) for each
+call-site change.
+
+### Fixed — a broken policy set is a defect, and says so before it runs
+
+- **`PolicyDecision` gained `Malformed`** (breaking: match arms). *The rules
+  say no* and *the rules are broken* call for opposite responses, and 0.16
+  already said so — but both were spelled `Deny` and the difference lived
+  inside a reason string, so nothing could branch on it without matching
+  message text. A deployment whose rules had begun erroring on every request
+  read them as ordinary refusals and spent an afternoon looking for the rule
+  that fired. The distinction is a variant now: still refused at the gate,
+  because an unevaluable rule may be the `forbid` that would have stopped the
+  call, but reported as a defect, and the operator API answers 500 rather than
+  403.
+
+- **Two gates would have failed open on it.** Both the effect gate and
+  admission destructured the decision with `let … else` over `Deny`, so every
+  *other* variant took the permit branch — a widened vocabulary opening the
+  door it exists to hold. They now name the permit as the arm that passes and
+  refuse everything else, which is the shape that cannot rot the next time a
+  decision is added.
+
+- **A policy set that cannot answer this plane's questions is refused at
+  build.** Cedar evaluates every rule against every request, so a `when`
+  clause reading an attribute the request does not carry errors rather than
+  failing to match, and one unguarded rule denies every effect of every run
+  from a set that parsed cleanly and validated against its schema. That is
+  what the deployment hit: rules reading `context.delegation_depth`, written
+  when a delegation chain was always configured, on a plane that later ran
+  without one. `try_build` now evaluates the compiled set against a canonical
+  request of each shape the plane will issue and refuses with
+  `BuildError::PolicyUnevaluable`, naming the attribute and the `context has …`
+  guard that fixes it.
+
+  Asked through a new `PolicyEngine::preflight`, not by calling `authorize` at
+  build: the trap belongs to *total* evaluators, and an engine written as Rust
+  code has neither the trap nor anything to say. The default reports nothing.
+  The probes carry the delegation attributes exactly when the plane has a
+  chain configured — the questions this plane will really ask, not a stricter
+  hypothetical, because a boot check that refuses working deployments is one
+  people disable.
+
+  The docs were teaching the misconception: the policy reference said an
+  absent attribute meant a rule "simply does not match, so it fails closed".
+  It errors. The context table now separates always-present attributes from
+  conditional ones, and `upgrading` carries the one-operator fix.
+
+### Fixed — a domain separation the type system now enforces
+
+- **A Merkle leaf is its own type.** `leaf_hash` took a `Digest` and returned
+  one, and `root` took `Digest`s meaning *already-hashed leaves* — so a caller
+  who skipped the call built a tree with no leaf/interior separation, got a
+  plausible root, and nothing noticed. The module docs called the prefix "not
+  optional" while the signature made it exactly that, which is a contract the
+  runtime relies on rather than checks, on a seam published for other people to
+  use. (Breaking: `root`, `inclusion_proof`, `consistency_proof` and
+  `verify_inclusion` take `LeafHash`.)
+
+  Every caller in this crate was already correct, so no root changed and no
+  stored checkpoint moved — this is the mistake becoming unrepresentable rather
+  than a bug being fixed. What it prevents is the second-preimage attack the
+  prefixes exist for: without them an interior node's preimage can be presented
+  as a leaf, and a tree of *n* leaves reinterpreted as a different tree with the
+  same root. A `compile_fail` doctest holds the guarantee, and it is on `root`
+  rather than in the test module, where rustdoc would never have collected it.
+
+  The tree is now also pinned to RFC 6962 hashes computed by another
+  implementation. Checkpoints go to witnesses that verify with somebody else's
+  code, so a tree agreeing only with itself is the failure that matters: these
+  vectors would catch a prefix change that every other test in the file would
+  happily accept.
+
+### Added
+
+- **Operator push destinations can sign their bodies.** Bearer auth proves the
+  sender held a token, not that the body is what the sender wrote — and the
+  token transits every hop. `Destination::signed_with(header, secret)` adds an
+  HMAC-SHA256 over the exact bytes POSTed, as `sha256=<hex>`.
+
+  What it proves: this byte string was written by a holder of the secret and
+  arrived unaltered. What it does not: **freshness** — there is no timestamp or
+  nonce, so a captured delivery verifies forever, and a receiver must dedup on
+  the event's own identity (`RunCompleted` carries CloudEvents' `source`/`id`;
+  a custom projection carries whatever the embedder put there); origin to a
+  third party, since a shared secret is symmetric; and that a destination was
+  signed at all — a receiver has to *require* the header, or an attacker simply
+  omits it.
+
+  Breaking: `PushSender::for_operator_destinations` takes the destinations,
+  because that is where the keys are — a sender for signed destinations cannot
+  be constructed without them, and a missing signature is otherwise visible
+  only at the receiver. The signing key deliberately never reaches the push
+  store: a caller's bearer token must be persisted (the request that carried it
+  is over), while an operator's key is this deployment's own configuration,
+  read at every start — persisting it would put a forge-anything key in a row
+  per run per destination and freeze rotation at admission.
+
+  Delivered bodies are now canonical (RFC 8785) rather than serde's incidental
+  key order, since the signature covers the bytes on the wire and a receiver
+  that re-serializes before verifying should get the same ones.
+
+- **`RunOutcome::reason()` and `RunStatus::reason()`.** The terminal reason
+  lived inside the variants — a string on `Failed`, a typed `SuspendReason`, a
+  typed `BudgetExceeded` — so an embedder mapping outcomes onto a wire type had
+  to match all of them, and the lazy path was to read the status and stop. One
+  deployment shipped an empty summary on failed runs for a while. Typed
+  variants are formatted rather than dropped: an exhaustion names the ceiling
+  it hit, which is the whole content of an exhaustion.
+
+### Changed
+
+- **Every optional feature is now linted alone, not merely compiled.** `just
+  features` ran `cargo check`, so a lint in a configuration outside `lint`'s
+  four curated ones was caught by nothing — a `clippy::unused_self` in the push
+  delivery path lived in `push`-without-`testkit` for as long as that
+  combination existed. Compiling a feature alone proves it builds; linting it
+  alone is what the rest of the codebase is held to.
+
+- **A memory-formation instruction is prose a model reads, and is checked like
+  it.** The refusal that stops a declared prompt sending the model after a tool
+  it was never granted scanned `identity.role` and `identity.constraints` but
+  not `memory_formation.instruction` — the one instruction written for a
+  *different* model, which is offered the same grants and goes the same way:
+  asks, is refused, improvises, and the extraction quietly does something else.
+
+- **`sha2` moved to 0.11 and `hmac` 0.13 is a direct dependency.** Both were
+  already being compiled — `ed25519-dalek` 3.0, `aws-sigv4` and
+  `postgres-protocol` pull them — so this crate had been building two hash
+  majors and reaching for the older one. The signing code that arrived with
+  push destinations was twenty-five hand-written lines of RFC 2104 that passed
+  RFC 4231's vectors; passing vectors is the argument for keeping hand-rolled
+  crypto and it is not good enough here, because a substrate whose pitch is
+  auditability should not ask a reviewer to check a MAC by eye when the audited
+  construction is already in the binary. The vectors stayed and now prove the
+  crate *uses* it correctly.
+
+  Every effect key, chain link, Merkle leaf and blob address comes out of
+  `Digest`, so swapping the hasher underneath had to be shown — not assumed —
+  to change nothing. It is now pinned by golden vectors computed with `shasum`
+  and Python rather than by running this code and writing down the answer,
+  which is a test that would have agreed with itself under any value. The
+  design document claimed such vectors existed; they did not.
+
+- **A budget ceiling of zero is refused at parse.** `max_tokens: 0` read like
+  "no permission to spend" and did something else entirely: every ceiling is an
+  accumulate-and-compare checked *before* the work, so zero refused the first
+  effect of any kind — a model-free agent's single read-only tool call
+  included. The same holds for `max_effects`, `max_steps`, `max_minor_units`
+  and `max_wallclock_secs`; `max_replans: 0` and `max_denials: 0` are
+  untouched, because there zero means something a deployment might want. Omit
+  the ceiling for "no limit"; use the emergency stop to stop a tenant's work,
+  which is the control that says somebody is dealing with an incident rather
+  than "not right now".
+
+---
+
 ## [0.16.0] — 2026-08-14
 
 Four audit rounds. Recovery gained its initiator, the case layer crossed the

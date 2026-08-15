@@ -78,6 +78,17 @@ pub struct RunOutcome {
 }
 
 impl RunOutcome {
+    /// Why this run ended — [`RunStatus::reason`] without the match.
+    ///
+    /// `None` for a success. The accessor is here as well as on the status
+    /// because this is the type an embedder holds after `run(..)`, and a
+    /// summary field that silently stays empty is the shape this exists to
+    /// prevent.
+    #[must_use]
+    pub fn reason(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.status.reason()
+    }
+
     /// The output if the run succeeded, or a [`RunFailure`] saying why not.
     ///
     /// Every caller that acts on a run's answer asks the same two questions —
@@ -186,6 +197,35 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
+    /// Why the run ended, whatever kind of ending it was.
+    ///
+    /// `None` only for [`Succeeded`](Self::Succeeded), which has no reason to
+    /// give. Every other conclusion carries one, and the point of gathering
+    /// them here is that an embedder mapping outcomes onto its own wire type
+    /// should not have to match every variant to find the sentence — a
+    /// deployment shipped an empty summary on failed runs for a while because
+    /// the lazy path was to read the status and stop there.
+    ///
+    /// Borrowed where the variant already holds a string and formatted where
+    /// it holds a typed value: a suspension names what it waits for and an
+    /// exhaustion names the ceiling it hit, and both are worth more than the
+    /// word "suspended". `Cancelled` yields the operator's reason; the actor
+    /// who gave it stays on the variant, because *why* and *who* are two
+    /// questions and only one of them is the reason.
+    #[must_use]
+    pub fn reason(&self) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
+        match self {
+            Self::Succeeded => None,
+            Self::Failed(reason) | Self::Quarantined(reason) | Self::Replanning(reason) => {
+                Some(Cow::Borrowed(reason.as_str()))
+            }
+            Self::Cancelled { reason, .. } => Some(Cow::Borrowed(reason.as_str())),
+            Self::Suspended(reason) => Some(Cow::Owned(reason.to_string())),
+            Self::Exhausted(exceeded) => Some(Cow::Owned(exceeded.to_string())),
+        }
+    }
+
     /// Whether the run stopped without reaching a conclusion.
     #[must_use]
     pub fn is_suspended(&self) -> bool {
@@ -1457,7 +1497,14 @@ impl Runtime {
             resource: capability,
             context: &context,
         };
-        let crate::core::PolicyDecision::Deny { reason } = engine.authorize(&request) else {
+        // Every refusal, not only a rule's. `let … else` over `Deny` alone
+        // admits the run for every other decision, so a policy set that cannot
+        // be evaluated would open the door it exists to hold — the fail-open a
+        // widened vocabulary creates for free unless the permit is the arm that
+        // has to be named.
+        let decision = engine.authorize(&request);
+        let malformed = decision.is_malformed();
+        let Some(reason) = decision.reason().map(ToOwned::to_owned) else {
             return Ok(());
         };
 
@@ -1465,6 +1512,7 @@ impl Runtime {
             target: telemetry::POLICY_DENIED,
             action = crate::core::ACTION_ADMIT,
             resource = %capability,
+            policy_error = malformed,
             %reason,
         );
         self.meter
@@ -5679,6 +5727,9 @@ impl RuntimeBuilder {
                 minimum: MIN_LEASE_TTL,
             });
         }
+        if let Some(engine) = self.policy.as_ref() {
+            preflight_policy(engine.as_ref(), self.identity.as_ref())?;
+        }
         check_same_tenant(
             self.store.as_ref(),
             self.blobs.as_ref(),
@@ -5954,6 +6005,105 @@ impl RuntimeBuilder {
 ///
 /// Not a misconfiguration that shows up at runtime — it *works*, and writes this
 /// tenant's runs into another's keyspace while every key-scoped erasure and
+/// Ask the policy set the questions this plane will ask, before it asks them
+/// for real.
+///
+/// Cedar evaluates **every** rule against **every** request, so a rule reading
+/// an attribute a request does not carry does not quietly fail to match — it
+/// errors, and an unevaluable rule may be the `forbid` that would have stopped
+/// the call, so the gate refuses. One unguarded rule therefore denies every
+/// effect of every run, from a policy set that compiled cleanly and validated
+/// against its schema. A deployment met exactly that: rules written when a
+/// delegation chain was always configured, against a plane that later ran
+/// without one.
+///
+/// The probes are the *thin* shape of each request — the attributes always
+/// present — because that is what exposes an unguarded read of a conditional
+/// one. Evaluation is total and side-effect free, so asking costs nothing and
+/// happens where the answer is still cheap to act on.
+///
+/// What this does **not** establish: that the rules are *right*. A set that
+/// permits everything passes here, as does one whose rules error only on a
+/// shape carrying an attribute of an unexpected type. It answers one question
+/// — can this plane's own requests be evaluated at all — which is the question
+/// whose wrong answer looks like a working plane that refuses everything.
+#[cfg_attr(not(feature = "manifest"), allow(dead_code))]
+fn preflight_policy(
+    engine: &dyn crate::core::PolicyEngine,
+    identity: Option<&crate::core::Delegation>,
+) -> Result<(), BuildError> {
+    use crate::core::{
+        ACTION_ADMIT, ACTION_DECLARED, ACTION_EGRESS, ACTION_PERFORM, ACTION_RELEASE,
+    };
+
+    // Values are placeholders; only the *presence* of each key matters, since
+    // what is being probed is whether a rule can read what it reads.
+    let run = "run_00000000000000000000000000";
+    // Empty objects rather than nulls, for two reasons. A real request never
+    // carries a null here — `args` is the effect's own arguments and `label`
+    // is a label — so a null probe asks a question no gate will ask. And the
+    // adapter *strips* nulls before evaluating, tracing each strip; probing
+    // with them made every plane build walk that path, which is not what a
+    // preflight is for.
+    let effect = serde_json::json!({
+        "run": run,
+        "step": 0,
+        "tenant": "preflight",
+        "mutates": false,
+        "args": {},
+    });
+    let release = serde_json::json!({
+        "run": run,
+        "step": 0,
+        "release": {},
+        "label": {},
+    });
+    let admit = serde_json::json!({
+        "tenant": "preflight",
+        "input": {},
+    });
+    // The delegation attributes are merged by the *same function* the gates
+    // use, so a probe cannot drift from the shape it is standing in for. A
+    // plane with a chain configured carries `owner`, `scope` and
+    // `delegation_depth` on every request, and a rule reading them is correct
+    // there; a plane without one never carries them, and the same rule denies
+    // everything. Which plane this is decides which question gets asked.
+    let (mut effect, mut release, mut admit) = (effect, release, admit);
+    for context in [&mut effect, &mut release, &mut admit] {
+        super::ctx::merge_identity(context, identity);
+    }
+    let probes = [
+        (ACTION_PERFORM, "preflight.effect", &effect),
+        (ACTION_DECLARED, "preflight.effect", &effect),
+        (ACTION_EGRESS, "preflight.effect", &effect),
+        (ACTION_RELEASE, "information_flow.label", &release),
+        (ACTION_ADMIT, "preflight.capability", &admit),
+    ];
+    let requests: Vec<crate::core::PolicyRequest<'_>> = probes
+        .iter()
+        .map(|(action, resource, context)| crate::core::PolicyRequest {
+            principal: "preflight",
+            action,
+            resource,
+            context,
+        })
+        .collect();
+
+    // Asked through the engine's own preflight rather than by calling
+    // `authorize` here, and the difference is not ceremony. An engine written
+    // as Rust code has no missing-attribute trap and nothing to report, so
+    // probing it at build would be asking a question it cannot answer — and it
+    // would consult engines whose contract is about *when* they are consulted.
+    // The engine that has the trap implements the method.
+    let problems = engine.preflight(&requests);
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(BuildError::PolicyUnevaluable {
+        problems: problems.join("; "),
+    })
+}
+
 /// every policy request names the right one. The two are set separately, so the
 /// mismatch is easy to make and invisible once made.
 fn check_same_tenant(

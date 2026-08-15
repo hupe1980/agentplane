@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.16.0"
+version      = "0.17.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -10,17 +10,9 @@ readme       = "README.md"
 keywords     = ["agent", "durable-execution", "replay", "runtime", "llm"]
 categories   = ["asynchronous", "data-structures"]
 
-# What ships, stated as an allowlist.
-#
-# A denylist has to predict every generated file; an allowlist cannot be
-# surprised. That matters more here than for most crates, because a crates.io
-# publish is immutable — a file that should not have shipped cannot be
-# withdrawn, only yanked with the contents still served.
-#
-# Development infrastructure (`tests/`, `spec/`, `tools/`, `justfile`) is
-# deliberately absent: a consumer building this crate has no use for the TLA+
-# specs or the mutation table. The guides live at hupe1980.github.io/agentplane,
-# so the README links out rather than freezing a copy in every release.
+# An allowlist, because a crates.io publish is immutable: a denylist has to
+# predict every generated file, and a file that should not have shipped can
+# only be yanked, not withdrawn.
 #
 # Leading slashes anchor to the package root; without them these are
 # gitignore-style globs matching any depth.
@@ -39,108 +31,83 @@ include = [
     "/clippy.toml",
 ]
 
-# docs.rs builds with default features unless told otherwise, and this crate's
-# story is almost entirely in the feature-gated seams — a reader landing on the
-# published docs would find neither the HTTP surface, nor the drivers, nor the
-# policy adapter.
+# Most of this crate is behind a feature gate, and docs.rs builds with default
+# features unless told otherwise.
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["redb"]
-# Embedded journal + case store, on redb: pure Rust, two crates deep, ACID
-# transactions across tables, and a stable on-disk format. Single-node
-# deployments; Postgres backs the active-active topology.
-#
-# Exactly-once is the table key rather than an index, so a duplicate effect
-# start is inexpressible rather than rejected.
-redb = ["dep:redb"]
-# The agent declaration: tool grants, budgets, egress ceiling, injection
-# pattern. Off by default because the runtime is perfectly usable wired by
-# builder calls; the manifest is what makes those declarations reviewable.
-manifest = ["dep:serde_yaml_ng", "dep:base64", "dep:jsonschema"]
-# Everything the `agentplane` binary needs to run a declarative agent.
-# `signing` is here for the audit verbs: an `audit`/`verify` that could not
-# check a signature would send the independent party back to writing Rust,
-# which is the dependency those verbs exist to remove.
-cli = ["manifest", "redb", "providers", "bedrock", "testkit", "signing", "dep:tracing-subscriber", "dep:clap"]
-# Content-addressed blobs on any backend OpenDAL reaches. Bytes too big for the
-# chain go here and the chain commits to their digest. Deliberately not the
-# journal's own store: an object store has no ordered scan, no multi-key
-# transaction and no unique constraint, which is all the journal needs.
-opendal = ["dep:opendal"]
-# Envelope encryption for payload bytes, and the erasure it makes provable.
-# Destroying the wrapping key makes every copy unreadable at once — live store,
-# replica, and every backup ever taken — which deleting a row cannot do.
-keyring = ["dep:chacha20poly1305", "dep:base64"]
-# A key ring that is somebody else: HashiCorp Vault's transit engine, over its
-# documented HTTP API. The wrapping key is created inside Vault and never leaves
-# it, so erasure is something this crate asks for and cannot undo.
-keyring-vault = ["keyring", "dep:reqwest"]
-# Fault injection and other harness pieces, for this crate's assurance layers
-# and for embedders testing their own stores and skills. Never in a production
-# build — nothing in `testkit` is reachable without it.
-testkit = []
-# Cedar as the authorization engine. Off by default: the crate defines the
-# policy seam and ships no evaluator, for the same reason it ships no tracing
-# exporter — picking one for the embedder is not its call.
-cedar = ["dep:cedar-policy"]
-# PostgreSQL-backed journal. The topology an embedded store cannot serve: several plane
-# instances sharing one store, where fencing and exactly-once must be arbitrated
-# by the database rather than by hoping the writers agree.
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
-# MCP transport. The tool *seam* and its safety model are always available; this
-# is only the wire. Separate because the catalogue is what decides what a tool is
-# allowed to do, and that decision must not depend on which transport is linked.
-mcp = ["dep:rmcp"]
 
-# Reach an MCP server by **running it** — the stdio child process most published
-# servers are. Separate from `mcp` because the host surface is
-# transport-agnostic on purpose (`McpClient::new` takes a connection somebody
-# else made), and this costs 8 crates plus `tokio/process` that an embedder
-# connecting over their own transport should not pay for. It is what lets
-# `agentplane run`/`serve` execute a declarative `tool-calling` agent with no
-# Rust.
+# Embedded journal + case store. Single-node; `postgres` backs active-active.
+redb = ["dep:redb"]
+# PostgreSQL-backed journal: several plane instances sharing one store, where
+# fencing and exactly-once are arbitrated by the database rather than by hoping
+# the writers agree.
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+# The agent declaration: tool grants, budgets, egress ceiling, injection
+# pattern. Off by default — the runtime is usable wired by builder calls; the
+# manifest is what makes those declarations reviewable.
+manifest = ["dep:serde_yaml_ng", "dep:base64", "dep:jsonschema"]
+# Everything the `agentplane` binary needs. `signing` is here for the audit
+# verbs: an `audit`/`verify` that could not check a signature would send the
+# independent party back to writing Rust.
+cli = ["manifest", "redb", "providers", "bedrock", "testkit", "signing", "dep:tracing-subscriber", "dep:clap"]
+# Content-addressed blobs on any backend OpenDAL reaches, for bytes too big for
+# the chain to carry.
+opendal = ["dep:opendal"]
+# Envelope encryption for payload bytes, and the erasure it makes provable:
+# destroying the wrapping key reaches every copy at once, which deleting a row
+# cannot do.
+keyring = ["dep:chacha20poly1305", "dep:base64"]
+# A key ring that is somebody else — Vault's transit engine. The wrapping key
+# never leaves it, so erasure is something this crate asks for and cannot undo.
+keyring-vault = ["keyring", "dep:reqwest"]
+# Fault injection and harness pieces. Never in a production build — nothing in
+# `testkit` is reachable without it.
+testkit = []
+# Cedar as the authorization engine. The crate defines the policy seam and
+# ships no evaluator.
+cedar = ["dep:cedar-policy"]
+# MCP transport, and only the wire: the tool seam and its safety model are
+# unconditional, because what a tool may do must not depend on which transport
+# is linked. The same split applies to `a2a`.
+mcp = ["dep:rmcp"]
+# Reach an MCP server by **running it** — the stdio child process most
+# published servers are. Separate because it costs 8 crates plus
+# `tokio/process`, which an embedder bringing their own transport should not
+# pay for.
 mcp-stdio = ["mcp", "rmcp/transport-child-process"]
-# HTTP surface for operators: the worklist, run status, event delivery. Off by
-# default — a library embedded in someone else's process should not open a port
-# unless asked.
-# `tokio/net` and `rt-multi-thread` are what `agentplane serve` binds a socket
-# with. The base tokio features are `sync`/`rt`/`macros`/`time` — enough for a
-# library driving effects, and short of a server by exactly a listener.
+# HTTP surface for operators: worklist, run status, event delivery. `tokio/net`
+# and `rt-multi-thread` are the listener — the base tokio features are short of
+# a server by exactly that.
 http = ["dep:axum", "tokio/net", "tokio/rt-multi-thread"]
-# Submitting checkpoints to a real witness — the half that makes the split-view
-# guarantee have a counterparty.
-witness-http = ["dep:reqwest"]
-# A2A transport: the wire for peer calls. The peer *seam* — audience-bound
-# credentials, attenuating delegation, the disposition vocabulary — is always
-# available; this is only the JSON-RPC client that carries it. Separate for the
-# same reason `mcp` is: what a peer is allowed to do must not depend on which
-# transport happens to be linked.
+# Submitting checkpoints to a real witness — the half that gives the split-view
+# guarantee a counterparty. `signing` is not optional: a cosignature nobody
+# verifies is not evidence, and verifying one needs the primitive.
+witness-http = ["dep:reqwest", "signing"]
+# A2A transport: the JSON-RPC client. See `mcp` for why this is a wire and not
+# the seam.
 a2a = ["dep:reqwest"]
-# Serve this plane as an A2A agent: the public card plus the JSON-RPC methods.
-# `push` is not optional here: A2A 1.0 defines push notification configs as part
-# of the protocol, and this server implements them unconditionally.
+# Serve this plane as an A2A agent. `push` is not optional: A2A 1.0 defines
+# push notification configs as part of the protocol.
 a2a-server = ["http", "manifest", "push", "dep:async-stream"]
 # Webhook delivery for A2A push notifications: a durable config store plus
 # SSRF-guarded outbound POSTs.
-push = ["dep:reqwest"]
-# Ed25519 signing for journal records. The *seam* — `Signer`, `Verifier`, the
-# attestation on every record, the verifying read path — is always available;
-# this is one concrete implementation, for deployments that do not already have
-# a workload-identity signer to plug in.
+push = ["dep:reqwest", "dep:hmac"]
+# One concrete Ed25519 signer. The seam — `Signer`, `Verifier`, the attestation
+# on every record — is unconditional.
 signing = ["dep:ed25519-dalek"]
 # Model provider drivers over HTTP. The `ModelProvider` trait and the metering
-# rules are always available; this is a concrete driver.
+# rules are unconditional.
 providers = ["dep:reqwest", "dep:jsonschema"]
 # Amazon Bedrock's Converse API. Separate from `providers` because the AWS SDK
-# dependency graph is substantial and neither OpenAI nor Anthropic users should
-# pay for it. The provider-neutral model seam remains unconditional.
+# graph is substantial and OpenAI/Anthropic users should not pay for it.
 bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:aws-smithy-types", "dep:base64", "dep:jsonschema"]
-# Governed remote-media ingestion. Kept separate from model providers because
-# dereferencing an untrusted URL is a security boundary of its own: every DNS
-# answer and redirect is checked and pinned before bytes enter blob storage.
+# Governed remote-media ingestion. Separate because dereferencing an untrusted
+# URL is its own security boundary: every DNS answer and redirect is checked
+# and pinned before bytes enter blob storage.
 media = ["dep:base64", "dep:reqwest", "tokio/net"]
 
 [dependencies]
@@ -159,12 +126,14 @@ jsonschema  = { version = "0.49.5", default-features = false, optional = true }
 futures-core = "0.3"
 thiserror   = "2"
 ulid        = { version = "1", features = ["serde"] }
-sha2        = "0.10"
+sha2        = "0.11"
+# HMAC for signed push bodies: the audited construction, not hand-rolled
+# RFC 2104. Pinned to 0.13 to share `digest` 0.11 with `sha2` above.
+hmac        = { version = "0.13", optional = true }
 hex         = "0.4"
-# Secrets are wiped when they drop. `String` alone leaves the bytes in freed
-# heap — and reallocates copies of them on growth — which no amount of careful
-# `Debug` impl fixes. Small, audited, and unconditional: an API key is not an
-# optional-feature concern.
+# Secrets are wiped when they drop. `String` leaves the bytes in freed heap and
+# reallocates copies on growth, which no `Debug` impl fixes. Unconditional: an
+# API key is not an optional-feature concern.
 zeroize     = { version = "1", features = ["alloc", "derive"] }
 time        = { version = "0.3", features = ["serde-well-known", "macros", "formatting", "parsing"] }
 rand        = "0.9"
@@ -175,17 +144,14 @@ tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 async-stream = { version = "0.3", optional = true }
 tracing     = "0.1"
-# Several controls here are quiet toward the caller and loud toward the
-# operator: an A2A decline names the determining policy in a `tracing` event and
-# tells the peer nothing, so a prober cannot map the authorization vocabulary.
-# With no subscriber installed, that second half reaches nobody.
+# Some controls are quiet toward the caller and loud toward the operator — an
+# A2A decline names the determining policy in a `tracing` event and tells the
+# peer nothing. Without a subscriber installed, that half reaches nobody.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "env-filter"], optional = true }
 # The binary's argument parser. A flag lives on its subcommand's struct, so
-# passing a `serve` flag to `run` fails to parse rather than being silently
-# accepted and ignored — which is what a hand-rolled table did, including for a
-# security control. +9 crates on `cli`, +0 on the library; re-derive with
-# `cargo tree --no-default-features --features cli -e normal --prefix none |
-# sort -u | wc -l`.
+# passing a `serve` flag to `run` fails to parse rather than being accepted and
+# ignored. +9 crates on `cli`, +0 on the library; re-derive with `cargo tree
+# --no-default-features --features cli -e normal --prefix none | sort -u | wc -l`.
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "env", "wrap_help"], optional = true }
 redb        = { version = "3", optional = true }
 # The maintained fork of serde_yaml, which is deprecated. Ten crates deep.
@@ -238,22 +204,17 @@ aws-sdk-bedrockruntime = { version = "1.139.0", default-features = false, featur
 aws-smithy-types = { version = "1.6.1", optional = true }
 
 [dev-dependencies]
-# An **independent** A2A server, as a test double. The conformance kit validates
-# servers, so this crate's *client* had no outside authority to talk to — the
-# one interoperability gap the kit cannot close. Pre-1.0 churn is tolerable for a
-# test double in a way it is not for a shipped boundary: nothing in `src/` links
-# these, and `cargo package` does not carry dev-dependencies.
-#
-# `default-features = false`: the default pulls a TLS stack this needs for
-# nothing — the double binds a loopback port over plain HTTP.
+# An **independent** A2A server, so this crate's *client* has an outside
+# authority to talk to — the one interoperability gap the conformance kit
+# cannot close, since it validates servers. Pre-1.0 churn is acceptable here
+# because nothing in `src/` links these. `default-features = false`: the
+# default pulls a TLS stack a loopback double needs for nothing.
 a2a-lf = { version = "0.3.0", default-features = false }
 a2a-server-lf = { version = "0.4.1", default-features = false }
-# For the Bedrock unit tests: a stub HTTP client, so building an SDK `Config`
-# never constructs the default TLS provider. That provider reads the OS trust
-# store eagerly, and under a fully parallel test run the macOS keychain read
-# can transiently yield zero roots — which aws-smithy answers with a panic, in
-# a test that never needed a connection at all. Already in the tree
-# transitively; this only turns its test feature on for tests.
+# A stub HTTP client for the Bedrock tests, so building an SDK `Config` never
+# constructs the default TLS provider: that provider reads the OS trust store
+# eagerly, and a parallel test run can make the macOS keychain transiently
+# yield zero roots, which aws-smithy answers with a panic.
 aws-smithy-http-client = { version = "1", features = ["test-util"] }
 # For the streaming driver tests: the stub server hands axum a body stream of
 # `Bytes`, including one that errors partway so a severed response can be tested
@@ -270,14 +231,11 @@ tower = { version = "0.5.3", features = ["util"] }
 # intent; this checks the runtime's behaviour.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry"] }
 
-# Examples drive the runtime end to end and therefore need a store. Declaring
-# the requirement keeps `--no-default-features` building: an embedder bringing
-# their own backend must not be forced to compile SQLite.
 # The CLI that makes the declarative tier need no Rust at all.
 #
-# Feature-gated and not built by default, because the library is the product and
-# a binary that pulls in HTTP drivers is not something every dependant wants
-# compiled. `cargo install agentplane --features cli` opts in.
+# Feature-gated because the library is the product, and a binary pulling in
+# HTTP drivers is not something every dependant wants compiled.
+# `cargo install agentplane --features cli` opts in.
 [[bin]]
 name              = "agentplane"
 path              = "src/bin/agentplane.rs"
@@ -371,34 +329,7 @@ required-features = ["redb", "testkit", "manifest", "mcp"]
 name              = "blog_room"
 required-features = ["redb", "testkit", "manifest"]
 
-[lints.rust]
-unsafe_code = "forbid"
-missing_debug_implementations = "warn"
-
-[lints.clippy]
-all       = { level = "warn", priority = -1 }
-pedantic  = { level = "warn", priority = -1 }
-# Ambient non-determinism is denied crate-wide via clippy.toml: every
-# clock/RNG/ID read must go through StepCtx, which journals it.
-module_name_repetitions = "allow"
-missing_errors_doc      = "allow"
-missing_panics_doc      = "allow"
-# `duration_suboptimal_units` asks for `Duration::from_hours` / `from_days`,
-# which are **unstable** — `duration_constructors`, still not stabilised on the
-# declared MSRV, while `from_secs` and `from_mins` are. So the lint's advice is
-# uncompilable here rather than merely unwanted, and following it would trade a
-# readability nit for a nightly dependency.
-#
-# The premise is checkable, which is what keeps this from becoming a decision
-# whose reason expired: `rustc +1.94.1 -e 'fn main(){std::time::Duration::from_hours(1);}'`
-# fails today and will stop failing when the feature lands. Remove this line
-# then; the lint is right about the readability.
-duration_suboptimal_units = "allow"
-must_use_candidate      = "allow"
-
-
-# The A2A server has a full test suite and, until now, nothing a reader could
-# run. `tower::oneshot` drives the router in-process, so the round trip is real
+# `tower::oneshot` drives the router in-process, so the A2A round trip is real
 # without a port, a key, or a second process.
 [[example]]
 name              = "a2a_peer"
@@ -424,3 +355,28 @@ required-features = ["redb", "testkit"]
 [[example]]
 name              = "streaming_run"
 required-features = ["redb", "testkit"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+# Ambient non-determinism is denied crate-wide in clippy.toml: every clock, RNG
+# and ID read must go through StepCtx, which journals it.
+all       = { level = "warn", priority = -1 }
+pedantic  = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+# `duration_suboptimal_units` asks for `Duration::from_hours` / `from_days`,
+# which are **unstable** — `duration_constructors`, still not stabilised on the
+# declared MSRV, while `from_secs` and `from_mins` are. So the lint's advice is
+# uncompilable here rather than merely unwanted, and following it would trade a
+# readability nit for a nightly dependency.
+#
+# The premise is checkable, which is what keeps this from becoming a decision
+# whose reason expired: `rustc +1.94.1 -e 'fn main(){std::time::Duration::from_hours(1);}'`
+# fails today and will stop failing when the feature lands. Remove this line
+# then; the lint is right about the readability.
+duration_suboptimal_units = "allow"
+must_use_candidate      = "allow"

@@ -83,6 +83,23 @@ impl Signer for Ed25519Signer {
     }
 }
 
+/// Signing a checkpoint is signing **bytes**, for the same reason a card is.
+///
+/// C2SP `signed-note` specifies pure Ed25519 over the note text. Signing
+/// `SHA-256(note)` instead — which is what a digest-shaped signer does —
+/// produces 64 bytes that verify against nothing any witness, auditor or
+/// `signed-note` tool will compute.
+#[async_trait::async_trait]
+impl crate::core::CheckpointSigner for Ed25519Signer {
+    fn key_id(&self) -> KeyId {
+        self.key_id.clone()
+    }
+
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, crate::core::SignError> {
+        Ok(self.key.sign(message).to_bytes().to_vec())
+    }
+}
+
 /// Verifies records against a set of known public keys.
 ///
 /// A key the set does not contain fails verification rather than erroring: an

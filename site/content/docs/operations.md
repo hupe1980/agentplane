@@ -441,9 +441,17 @@ toolchain — because that is what an auditor or a departing tenant holds:
 ```sh
 agentplane export --store ./journal.redb > history.jsonl
 agentplane audit  --store ./journal.redb > report.json
-agentplane verify history.jsonl            # check a copy, offline
+agentplane verify history.jsonl --checkpoint cp.note   # check a copy, offline
 agentplane restore history.jsonl --store ./rebuilt.redb
 ```
+
+`--checkpoint` is the deletion check, and without it there is none. The Merkle
+root rebuilt from the file can otherwise only be compared with the file's *own
+header* — which whoever dropped a run rewrites too — so the report lists
+deletion under `not_checked` rather than calling the file sound. Pass the
+checkpoint an earlier `audit` printed, or the `tlog-checkpoint` note a witness
+cosigned: the point is that it comes from somewhere other than the file being
+checked.
 
 `export` writes JSON Lines: a header naming the log, its checkpoint and the
 canonicalization rule the digests were computed under; one line per record

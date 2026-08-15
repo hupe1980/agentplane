@@ -1425,6 +1425,27 @@ impl A2aServer {
                     "this request was not permitted",
                 ))
             }
+            // The rules could not be evaluated. The caller is declined
+            // exactly as for a denial — telling a peer that the plane's
+            // policy set is broken is a fact about our operations, and a
+            // probe would learn which shapes break it — but the operator's
+            // side says defect rather than refusal, because the fix is the
+            // policy set and nobody should be reading rules looking for the
+            // one that fired.
+            PolicyDecision::Malformed { reason } => {
+                tracing::error!(
+                    target: "agentplane::a2a",
+                    action,
+                    resource,
+                    policy_error = true,
+                    reason,
+                    "A2A request refused because the policy set could not be evaluated"
+                );
+                Err(RpcError::new(
+                    code::INVALID_REQUEST,
+                    "this request was not permitted",
+                ))
+            }
         }
     }
 

@@ -297,7 +297,8 @@ async fn a_faithful_export_verifies_from_the_file_alone() {
         .await
         .expect("export");
 
-    let report = agentplane::export::verify(std::io::Cursor::new(&out), None).expect("verify");
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(&out), None, None).expect("verify");
     assert!(
         report.is_sound(),
         "a faithful export did not verify: {:#?}",
@@ -374,8 +375,8 @@ async fn a_run_removed_from_the_middle_is_caught_by_the_rebuilt_root() {
         "the fixture did not actually remove the run"
     );
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, None)
+        .expect("verify");
     assert!(
         !report.is_sound(),
         "a run was removed from the middle of the export and it verified clean — every \
@@ -436,8 +437,8 @@ async fn an_edited_record_fails_to_recompute() {
          that checks no hashes at all"
     );
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, None)
+        .expect("verify");
     assert!(
         !report.is_sound(),
         "a record was edited and the export still verified"
@@ -478,8 +479,8 @@ async fn tampered_wire_bytes_are_caught_even_when_the_readable_body_is_pristine(
         "the fixture edited nothing, so this test would pass against any verifier"
     );
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, None)
+        .expect("verify");
     assert!(
         !report.is_sound(),
         "the wire bytes were edited and the export still verified — the \
@@ -516,8 +517,8 @@ async fn an_edited_display_body_is_a_finding_though_every_hash_verifies() {
     let text = original.replace("\"n\":1", "\"n\":9");
     assert_ne!(original, text, "the fixture edited nothing");
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, None)
+        .expect("verify");
     assert!(
         report.findings.iter().any(|f| f.contains("wire bytes")),
         "a display body disagreeing with its wire bytes went unnoticed: {:#?}",
@@ -646,7 +647,8 @@ async fn a_restored_store_rebuilds_the_same_checkpoint() {
     agentplane::export::to_jsonl(&fresh, None, &runs, &mut again)
         .await
         .expect("re-export");
-    let verified = agentplane::export::verify(std::io::Cursor::new(&again), None).expect("verify");
+    let verified =
+        agentplane::export::verify(std::io::Cursor::new(&again), None, None).expect("verify");
     assert!(
         verified.is_sound(),
         "a restored store exported something that does not verify: {:#?}",
@@ -789,8 +791,8 @@ async fn an_export_of_a_foreign_format_version_is_named_not_guessed_at() {
          that never looks at the version"
     );
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(foreign.as_bytes()), None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(foreign.as_bytes()), None, None)
+        .expect("verify");
     assert!(
         report.findings.iter().any(|f| f.contains("format version")),
         "a future format was verified without saying this build cannot read it: {:#?}",
@@ -852,8 +854,9 @@ async fn a_relabelled_run_block_is_caught_by_its_own_records() {
          verifier that never compares the block to its records"
     );
 
-    let report = agentplane::export::verify(std::io::Cursor::new(relabelled.as_bytes()), None)
-        .expect("verify");
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(relabelled.as_bytes()), None, None)
+            .expect("verify");
     assert!(
         report.findings.iter().any(|f| f.contains("belongs to run")),
         "a run block wearing another run's records verified clean: {:#?}",
@@ -918,8 +921,8 @@ async fn a_duplicated_log_position_is_named_rather_than_left_as_a_root_mismatch(
          that never reads the positions"
     );
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, None)
+        .expect("verify");
     assert!(
         report.findings.iter().any(|f| f.contains("log positions")),
         "two runs claiming one log position were not named: {:#?}",
@@ -1044,7 +1047,8 @@ async fn a_run_sealed_after_the_checkpoint_exports_as_still_open() {
         .await
         .expect("export");
 
-    let report = agentplane::export::verify(std::io::Cursor::new(&out), None).expect("verify");
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(&out), None, None).expect("verify");
     assert!(
         report.is_sound(),
         "an export racing a concurrent seal reported tampering where there was \
@@ -1120,7 +1124,8 @@ async fn an_edited_record_in_an_open_run_is_not_sound() {
 
     // The untouched export lists the open run sound — the positive half, so
     // the assertion below is about the edit rather than about open runs.
-    let clean = agentplane::export::verify(std::io::Cursor::new(&bytes), None).expect("verify");
+    let clean =
+        agentplane::export::verify(std::io::Cursor::new(&bytes), None, None).expect("verify");
     assert!(
         clean.sound.contains(&out.run_id),
         "an untouched open run did not verify: {:#?}",
@@ -1135,8 +1140,8 @@ async fn an_edited_record_in_an_open_run_is_not_sound() {
         .replace("\"n\":1", "\"n\":9");
     assert_ne!(original, edited, "the fixture edited nothing");
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, None)
+        .expect("verify");
     assert!(
         report
             .findings
@@ -1208,7 +1213,8 @@ async fn the_case_layer_survives_export_and_restore() {
     assert_eq!(trailer.cases, 1, "the matter travelled");
 
     // The file alone: sound, and the two halves cover each other.
-    let verified = agentplane::export::verify(std::io::Cursor::new(&bytes), None).expect("verify");
+    let verified =
+        agentplane::export::verify(std::io::Cursor::new(&bytes), None, None).expect("verify");
     assert!(
         verified.is_sound(),
         "the export does not verify: {:#?}",
@@ -1309,8 +1315,8 @@ async fn a_dropped_case_layer_is_a_finding_not_a_quiet_file() {
         });
     assert_ne!(text, dropped, "the fixture removed nothing");
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(dropped.as_bytes()), None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(dropped.as_bytes()), None, None)
+        .expect("verify");
     assert!(
         report
             .findings
@@ -1377,8 +1383,8 @@ async fn a_sealed_journals_export_carries_no_plaintext() {
          is measuring the fixture"
     );
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, None)
+        .expect("verify");
     assert!(
         report.is_sound(),
         "an honest sealed export raised findings — the display copy and the \
@@ -1437,8 +1443,8 @@ async fn a_deleted_tail_record_fails_the_trailer_accounting() {
     let (_, text) = open_run_export().await;
 
     // The positive half first: the untouched file verifies.
-    let clean =
-        agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None).expect("verify");
+    let clean = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, None)
+        .expect("verify");
     assert!(clean.is_sound(), "{:#?}", clean.findings);
 
     // Remove the last record line — the tail cut, on a line boundary.
@@ -1458,8 +1464,8 @@ async fn a_deleted_tail_record_fails_the_trailer_accounting() {
         .join("\n");
     assert_ne!(cut, text, "the fixture removed nothing");
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(cut.as_bytes()), None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(cut.as_bytes()), None, None)
+        .expect("verify");
     assert!(
         !report.is_sound(),
         "an open run's tail record was deleted and the export verified clean — \
@@ -1494,7 +1500,7 @@ async fn a_run_block_with_no_records_is_never_sound() {
         .join("\n");
     assert_ne!(stripped, text, "the fixture removed nothing");
 
-    let report = agentplane::export::verify(std::io::Cursor::new(stripped.as_bytes()), None)
+    let report = agentplane::export::verify(std::io::Cursor::new(stripped.as_bytes()), None, None)
         .expect("verify");
     assert!(
         !report.sound.contains(&run),
@@ -1550,7 +1556,8 @@ async fn a_declared_unreadable_run_is_unchecked_not_a_tamper_finding() {
         .await
         .expect("export");
 
-    let report = agentplane::export::verify(std::io::Cursor::new(&out), None).expect("verify");
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(&out), None, None).expect("verify");
     assert!(
         report.is_sound(),
         "an honestly-declared unreadable run was reported as tampering — an \
@@ -1616,8 +1623,8 @@ async fn a_foreign_canon_rule_is_narrowed_coverage_not_a_finding() {
         .join("\n");
     assert_ne!(foreign, text, "the fixture edited nothing");
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(foreign.as_bytes()), None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(foreign.as_bytes()), None, None)
+        .expect("verify");
     assert!(
         report.is_sound(),
         "an honest export written under another canonicalization rule was \
@@ -1640,8 +1647,8 @@ async fn a_foreign_canon_rule_is_narrowed_coverage_not_a_finding() {
         .replace("\\\"n\\\":1", "\\\"n\\\":9")
         .replace("\"n\":1", "\"n\":9");
     assert_ne!(edited, foreign, "the fixture edited nothing");
-    let caught =
-        agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None).expect("verify");
+    let caught = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, None)
+        .expect("verify");
     assert!(
         caught
             .findings
@@ -1707,7 +1714,8 @@ async fn a_sealing_record_claiming_a_foreign_head_is_caught_offline() {
     agentplane::export::to_jsonl(&store, None, &[run], &mut out)
         .await
         .expect("export");
-    let report = agentplane::export::verify(std::io::Cursor::new(&out), None).expect("verify");
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(&out), None, None).expect("verify");
     assert!(
         report.findings.iter().any(|f| f.contains("chain head")),
         "a conclusion drawn over a different history verified offline — the \
@@ -1725,7 +1733,8 @@ async fn a_sealing_record_claiming_a_foreign_head_is_caught_offline() {
     agentplane::export::to_jsonl(&honest_store, None, &[honest_run], &mut honest)
         .await
         .expect("export");
-    let clean = agentplane::export::verify(std::io::Cursor::new(&honest), None).expect("verify");
+    let clean =
+        agentplane::export::verify(std::io::Cursor::new(&honest), None, None).expect("verify");
     assert!(
         !clean.findings.iter().any(|f| f.contains("chain head")),
         "an honest sealing record was flagged: {:#?}",
@@ -1829,4 +1838,202 @@ async fn a_record_line_without_wire_bytes_refuses_to_restore() {
         e.to_string().contains("wire bytes"),
         "the refusal does not name the missing wire bytes: {e}"
     );
+}
+
+/// **A rebuilt root compared with the file's own header proves nothing.**
+///
+/// `a_run_removed_from_the_middle_is_caught_by_the_rebuilt_root` removes a run
+/// and leaves the header alone, which the rebuild catches. An editor who is
+/// paying attention does not leave the header alone. The header carries the
+/// size and the root, both in the same file, both under the same editor's
+/// hand — so the check that "the tree matches the checkpoint" was, on its own,
+/// a check that the file agrees with itself.
+///
+/// This crate already makes that argument one level down: a record's
+/// `prev_hash` is verified by rehashing the wire bytes, explicitly *not* by
+/// comparing it with the previous line, because agreement between two lines of
+/// one file is what a competent editor achieves. The same sentence is true of
+/// the checkpoint, and it was not being applied.
+///
+/// So the rebuild is held to a checkpoint from **outside** the file, and a
+/// pass without one says plainly that deletion went unchecked rather than
+/// reporting sound.
+#[tokio::test]
+async fn an_export_with_a_rewritten_header_needs_an_outside_checkpoint() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Trivial)
+        .build();
+    let mut runs = Vec::new();
+    for n in 0..3 {
+        runs.push(
+            rt.run("demo.trivial", Tainted::trusted(json!({ "n": n })))
+                .await
+                .expect("run")
+                .run_id,
+        );
+    }
+    let store: Arc<dyn JournalStore> = store;
+    let genuine = store.checkpoint().await.expect("checkpoint");
+
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &runs, &mut out)
+        .await
+        .expect("export");
+    let text = String::from_utf8(out).expect("utf8");
+
+    // What a careful editor produces: the last run gone, and the header and
+    // trailer rewritten to describe the shorter log. This is the file that used
+    // to verify clean.
+    let edited = deleted_tail(&text, &as_written(runs[2]), &genuine);
+    assert_ne!(edited, text, "the fixture edited nothing");
+
+    // Without an outside checkpoint the file is internally perfect, and the
+    // report must not call that sound-with-nothing-to-say.
+    let blind = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, None)
+        .expect("verify");
+    assert!(
+        blind.findings.is_empty(),
+        "the edited file is internally consistent by construction; a finding here means \
+         the fixture broke something else: {:#?}",
+        blind.findings
+    );
+    assert!(
+        blind.not_checked.iter().any(|n| n.starts_with("deletion")),
+        "a pass with no outside checkpoint rebuilt the root against the header the same \
+         editor wrote, and did not say so: {:#?}",
+        blind.not_checked
+    );
+
+    // With the checkpoint an auditor was actually given, the deletion is a
+    // finding — and it names the discrepancy rather than only the root.
+    let checked = agentplane::export::verify(
+        std::io::Cursor::new(edited.as_bytes()),
+        None,
+        Some(&genuine),
+    )
+    .expect("verify");
+    assert!(
+        !checked.is_sound(),
+        "a run was deleted and the header rewritten to match, and the pass holding the \
+         real checkpoint reported sound"
+    );
+    assert!(
+        checked
+            .findings
+            .iter()
+            .any(|f| f.contains("different history than the one it is being checked against")),
+        "the mismatch between the header and the checkpoint the auditor holds must be \
+         named, or a reader sees only a root that differs and cannot tell which side \
+         moved: {:#?}",
+        checked.findings
+    );
+    assert!(
+        !checked
+            .not_checked
+            .iter()
+            .any(|n| n.starts_with("deletion")),
+        "deletion was reported unchecked even though a checkpoint was supplied"
+    );
+
+    // And the honest file, against the real checkpoint, still passes — or this
+    // is a verifier that refuses everything.
+    let honest =
+        agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, Some(&genuine))
+            .expect("verify");
+    assert!(
+        honest.is_sound(),
+        "the unedited export failed against its own genuine checkpoint: {honest:#?}"
+    );
+}
+
+/// The seal of the run at log position `index`, read out of an export's own
+/// run blocks — so the fixture above rebuilds the tree from the file rather
+/// than from a second copy of the runtime's arithmetic.
+fn store_seal(text: &str, index: u64) -> agentplane::core::Digest {
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("kind").and_then(serde_json::Value::as_str) != Some("agentplane.export.run") {
+            continue;
+        }
+        if v.get("index").and_then(serde_json::Value::as_u64) != Some(index) {
+            continue;
+        }
+        let hex = v
+            .get("seal")
+            .and_then(serde_json::Value::as_str)
+            .expect("a sealed run block carries its seal");
+        return agentplane::core::Digest::from_hex(hex).expect("a seal is a digest");
+    }
+    panic!("no run block at log position {index}");
+}
+
+/// Remove the last run block from an export and rewrite the header and trailer
+/// to match, leaving a file that is internally perfect in every respect.
+///
+/// Its own function because the point of the test using it is what the *reader*
+/// can conclude, and forty lines of JSON surgery in the middle of that argument
+/// obscures it.
+fn deleted_tail(text: &str, victim: &str, genuine: &agentplane::journal::Checkpoint) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        if line.contains("agentplane.export.run") {
+            skipping = line.contains(victim);
+        }
+        // The trailer ends every block, or the excision swallows the frame and
+        // the file reads as truncated rather than as edited — a different
+        // finding, and not the one under test.
+        if line.contains("agentplane.export.end") {
+            skipping = false;
+        }
+        if !skipping {
+            kept.push(line.to_owned());
+        }
+    }
+    assert!(text.contains(victim), "the fixture removed nothing");
+
+    // The trailer counts runs and records, so leaving it alone would raise a
+    // count finding instead of the silence this is meant to produce.
+    let last = kept.len() - 1;
+    let mut trailer: serde_json::Value = serde_json::from_str(&kept[last]).expect("trailer");
+    // A record line is the one with no `kind`: header, run, case and trailer
+    // lines all name themselves and records do not.
+    let is_record = |l: &str| {
+        serde_json::from_str::<serde_json::Value>(l)
+            .ok()
+            .is_some_and(|v| v.get("kind").is_none())
+    };
+    let dropped = text.lines().filter(|l| is_record(l)).count()
+        - kept.iter().filter(|l| is_record(l)).count();
+    assert!(dropped > 0, "the fixture removed no records");
+    for (field, by) in [
+        ("runs_requested", 1usize),
+        ("runs_exported", 1),
+        ("records", dropped),
+    ] {
+        if let Some(n) = trailer.get(field).and_then(serde_json::Value::as_u64) {
+            trailer[field] = serde_json::json!(n - by as u64);
+        }
+    }
+    kept[last] = serde_json::to_string(&trailer).expect("json");
+
+    // And the header, rewritten to the log the shortened file actually is.
+    let truncated = agentplane::journal::Checkpoint {
+        origin: genuine.origin.clone(),
+        size: 2,
+        root: agentplane::core::merkle::root(
+            &[0u64, 1]
+                .iter()
+                .map(|i| agentplane::core::merkle::leaf_hash(&store_seal(text, *i)))
+                .collect::<Vec<_>>(),
+        ),
+    };
+    kept[0] = kept[0].replace(
+        &serde_json::to_string(genuine).expect("json"),
+        &serde_json::to_string(&truncated).expect("json"),
+    );
+    kept.join("\n")
 }

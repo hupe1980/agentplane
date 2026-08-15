@@ -39,12 +39,61 @@ use super::note::b64;
 use super::note::{NoteSignature, SignedNote};
 use super::witness::{Cosignature, Witness, WitnessError};
 
+/// A witness this deployment is willing to believe.
+///
+/// Carried as name **and** public key because the ignore-unknown-keys rule is
+/// keyed on both: `signed-note` says a verifier MUST ignore a signature that
+/// shares a name or an id with a known key but not both, and the id is derived
+/// from the key. A name alone is whatever the answering server typed.
+#[derive(Debug, Clone)]
+pub struct TrustedWitness {
+    name: String,
+    public_key: [u8; 32],
+    note_key_id: [u8; 4],
+}
+
+impl TrustedWitness {
+    /// An Ed25519 witness key, as the operator registered it.
+    #[must_use]
+    pub fn ed25519(name: impl Into<String>, public_key: [u8; 32]) -> Self {
+        let name = name.into();
+        // `0x01` is `signed-note`'s Ed25519 signature type, and the id is
+        // derived here rather than accepted from a caller: an id supplied
+        // beside a key is a second copy of one fact, and the copy that is
+        // wrong is the one nothing checks.
+        let note_key_id = super::note::key_id(&name, 0x01, &public_key);
+        Self {
+            name,
+            public_key,
+            note_key_id,
+        }
+    }
+
+    /// The four-byte `signed-note` key id this name and key hash to.
+    #[must_use]
+    pub const fn note_key_id(&self) -> [u8; 4] {
+        self.note_key_id
+    }
+
+    /// The name the operator registered.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// A remote witness reached over `tlog-witness`.
 #[derive(Debug, Clone)]
 pub struct HttpWitness {
     http: reqwest::Client,
     /// The submission prefix. `/add-checkpoint` is appended.
     prefix: String,
+    /// The keys whose cosignatures this deployment accepts.
+    ///
+    /// Without them a client could only record that *something* answered 200,
+    /// and the whole argument for witnessing — that an independent party
+    /// observed this log — would rest on a status code.
+    trusted: Vec<TrustedWitness>,
     /// The checkpoint's own signature, which the witness needs in order to
     /// recognise the log at all.
     ///
@@ -61,17 +110,36 @@ impl HttpWitness {
     ///
     /// # Errors
     ///
-    /// If an HTTP client cannot be built.
+    /// If an HTTP client cannot be built, or if `trusted` is empty — a witness
+    /// whose cosignature nothing can check is not a witness, and accepting one
+    /// would make every quorum below it a count of HTTP status codes.
     pub fn new(
         prefix: impl Into<String>,
         log_signature: NoteSignature,
+        trusted: Vec<TrustedWitness>,
     ) -> Result<Self, WitnessError> {
+        if trusted.is_empty() {
+            return Err(WitnessError::Unavailable(
+                "a witness needs at least one trusted key: a cosignature nobody can \
+                 verify is a 200 with a base64 string in it, and counting those toward \
+                 a quorum is the failure witnessing exists to rule out"
+                    .into(),
+            ));
+        }
+        // The key name is structure on the wire, not a label: a space or a
+        // newline in it produces a signature line that serialises fine and
+        // reads back as a different name or an extra line. Caught here, where
+        // whoever wrote the configuration is present to read the message,
+        // rather than as an unparseable checkpoint an auditor is holding.
+        SignedNote::validate_name(&log_signature.name)
+            .map_err(|e| WitnessError::Unavailable(e.to_string()))?;
         let http = reqwest::Client::builder().build().map_err(|e| {
             WitnessError::Unavailable(format!("could not build an HTTP client: {e}"))
         })?;
         Ok(Self {
             http,
             prefix: prefix.into().trim_end_matches('/').to_owned(),
+            trusted,
             log_signature,
         })
     }
@@ -88,8 +156,10 @@ impl HttpWitness {
         // attribute a checkpoint to a key it trusts answers 403 — it is
         // cosigning a specific log's claim, not an anonymous triple of numbers.
         let note = SignedNote::new(checkpoint.to_note())
-            .unwrap_or_else(|_| unreachable!("a checkpoint note is always a valid note body"))
-            .with_signature(self.log_signature.clone());
+            .and_then(|n| n.with_signature(self.log_signature.clone()))
+            .unwrap_or_else(|e| {
+                unreachable!("a checkpoint note is a valid body and `new` checked the name: {e}")
+            });
         out.push_str(&note.to_wire());
         out
     }
@@ -110,10 +180,14 @@ impl Witness for HttpWitness {
         // the holder of the log knows which checkpoint it proved from.
         let url = format!("{}/add-checkpoint", self.prefix);
 
+        // The bytes actually submitted, kept because the cosignature is a
+        // statement about *these* — verifying against a note rebuilt afterwards
+        // would check a claim nobody made.
+        let body = self.body(checkpoint, old_size, proof);
         let response = self
             .http
             .post(&url)
-            .body(self.body(checkpoint, old_size, proof))
+            .body(body.clone())
             .send()
             .await
             .map_err(|e| WitnessError::Unavailable(format!("{url}: {e}")))?;
@@ -125,7 +199,14 @@ impl Witness for HttpWitness {
             .map_err(|e| WitnessError::Unavailable(format!("{url}: reading the reply: {e}")))?;
 
         match status {
-            200 => parse_cosignature(&text, &checkpoint.origin),
+            200 => {
+                // The signed note is the tail of the request: everything after
+                // the blank line that ends the proof block.
+                let submitted = body
+                    .split_once("\n\n")
+                    .map_or(body.as_str(), |(_, note)| note);
+                verify_cosignature(&text, &checkpoint.origin, submitted, &self.trusted)
+            }
             // Stale, not forked. The body is the witness's own size, so the
             // caller can build the right proof instead of guessing.
             //
@@ -217,24 +298,73 @@ impl Witness for HttpWitness {
     }
 }
 
-/// A 200 body is one or more note signature lines.
-fn parse_cosignature(body: &str, origin: &str) -> Result<Cosignature, WitnessError> {
+/// A 200 body is one or more note signature lines, and at least one of them
+/// has to be a signature this deployment can check.
+///
+/// Every line is considered, not just the first: `tlog-witness` says a 200
+/// carries one *or more*, and reading only the head would let the answering
+/// server decide which cosignature counts by reordering its own reply.
+///
+/// A line is accepted only when its name **and** its four-byte key id match a
+/// trusted key — `signed-note`'s rule, and it is a conjunction for a reason: a
+/// server that may choose the name it sends can otherwise wear any identity
+/// the operator registered. The signature is then verified over the exact note
+/// text that was submitted, which is what a cosignature is a statement about.
+fn verify_cosignature(
+    body: &str,
+    origin: &str,
+    submitted_note: &str,
+    trusted: &[TrustedWitness],
+) -> Result<Cosignature, WitnessError> {
+    use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+
     // Parsed by reusing the note parser rather than splitting by hand, so the
     // em dash and the payload layout are enforced in exactly one place.
     let framed = format!("witness\n\n{body}");
     let note = SignedNote::parse(&framed).map_err(|e| {
         WitnessError::Unavailable(format!("log '{origin}': unreadable cosignature: {e}"))
     })?;
-    let first = note.signatures.into_iter().next().ok_or_else(|| {
+    if note.signatures.is_empty() {
         // A 200 with no signature is the failure that looks like success: the
         // caller would record a cosignature nobody made.
-        WitnessError::Unavailable(format!(
+        return Err(WitnessError::Unavailable(format!(
             "log '{origin}': the witness answered 200 with no signature, which is not a \
              cosignature however encouraging the status code is"
-        ))
-    })?;
-    Ok(Cosignature {
-        key_id: first.name,
-        signature: first.signature,
-    })
+        )));
+    }
+
+    for line in &note.signatures {
+        let Some(key) = trusted
+            .iter()
+            .find(|k| k.name == line.name && k.note_key_id == line.key_id)
+        else {
+            continue;
+        };
+        let Ok(verifying) = VerifyingKey::from_bytes(&key.public_key) else {
+            continue;
+        };
+        let Ok(signature) = Signature::from_slice(&line.signature) else {
+            continue;
+        };
+        if verifying
+            .verify(submitted_note.as_bytes(), &signature)
+            .is_ok()
+        {
+            return Ok(Cosignature {
+                key_id: key.name.clone(),
+                note_key_id: key.note_key_id,
+                signature: line.signature.clone(),
+            });
+        }
+    }
+
+    // Reached when every line was from an unknown key, or was from a known one
+    // and did not verify. Both are the same answer to the only question being
+    // asked — *may I record that this witness saw this checkpoint* — and the
+    // answer is no.
+    Err(WitnessError::Unavailable(format!(
+        "log '{origin}': the witness answered 200, and none of its {} signature line(s) \
+         verified against a trusted key over the checkpoint that was submitted",
+        note.signatures.len()
+    )))
 }

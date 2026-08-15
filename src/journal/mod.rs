@@ -29,4 +29,4 @@ pub use witness::{
     Cosignature, MemoryWitness, QuorumOutcome, Witness, WitnessError, WitnessQuorum, cosign_quorum,
 };
 #[cfg(feature = "witness-http")]
-pub use witness_http::HttpWitness;
+pub use witness_http::{HttpWitness, TrustedWitness};

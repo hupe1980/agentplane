@@ -147,10 +147,49 @@ impl SignedNote {
     }
 
     /// Add a signature.
-    #[must_use]
-    pub fn with_signature(mut self, signature: NoteSignature) -> Self {
+    ///
+    /// Fallible, because a name is not free text. The line is
+    /// `— <name> <base64>`, space-delimited and newline-terminated, so a name
+    /// carrying a space, a newline or an em dash produces a line that
+    /// serialises without complaint and reads back as something else — a
+    /// different name, a truncated payload, or two signature lines where one
+    /// was written.
+    ///
+    /// Checked here rather than in [`NoteSignature`] because this is the type
+    /// that serialises; a `NoteSignature` nobody writes out harms nothing.
+    ///
+    /// # Errors
+    ///
+    /// If the name is empty, or contains whitespace, an em dash, or a control
+    /// character.
+    pub fn with_signature(mut self, signature: NoteSignature) -> Result<Self, StoreError> {
+        Self::validate_name(&signature.name)?;
         self.signatures.push(signature);
-        self
+        Ok(self)
+    }
+
+    /// What a key name may be, checked rather than described.
+    ///
+    /// # Errors
+    ///
+    /// If the name is empty, or contains whitespace, an em dash, or a control
+    /// character.
+    pub fn validate_name(name: &str) -> Result<(), StoreError> {
+        let bad = |what: &str| StoreError::Backend(format!("signed note: a key name {what}"));
+        if name.is_empty() {
+            return Err(bad("is empty, so the signature line names nobody"));
+        }
+        if let Some(c) = name
+            .chars()
+            .find(|c| c.is_whitespace() || c.is_control() || *c == EM_DASH)
+        {
+            return Err(bad(&format!(
+                "contains {c:?}, which the signature line uses as structure — the note \
+                 would serialise and read back as a different name, a truncated payload, \
+                 or an extra signature line nobody wrote"
+            )));
+        }
+        Ok(())
     }
 
     /// The wire form.
@@ -213,6 +252,10 @@ impl SignedNote {
                      be either",
                 ));
             }
+            // The same rule the writer holds, so a note that parses can always
+            // be written back out. `split_once(' ')` already rules out spaces;
+            // an empty name and an em dash it does not.
+            Self::validate_name(name)?;
             signatures.push(NoteSignature {
                 name: name.to_owned(),
                 key_id: [raw[0], raw[1], raw[2], raw[3]],
@@ -250,7 +293,18 @@ pub(crate) fn b64(bytes: &[u8]) -> String {
     out
 }
 
-fn unb64(s: &str) -> Option<Vec<u8>> {
+/// Strict RFC 4648 standard-alphabet decoding — the only decoder in this crate.
+///
+/// One decoder, and a strict one, because laxity here is not the harmless kind.
+/// **The signature covers the text**, so if two spellings of a checkpoint
+/// decode to one checkpoint then an operator holds two artifacts that verify,
+/// name the same history, and are not the same bytes — a split view assembled
+/// out of encoding slack rather than out of a rewritten log.
+///
+/// The three ways a decoder leaks spellings, all refused below: a `=` anywhere
+/// but the trailing pad, a length that is not a whole number of quads, and
+/// non-zero bits below the last whole byte.
+pub(crate) fn unb64(s: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => u32::from(c - b'A'),
@@ -261,16 +315,37 @@ fn unb64(s: &str) -> Option<Vec<u8>> {
             _ => return None,
         })
     };
-    let raw: Vec<u8> = s.bytes().filter(|b| *b != b'=').collect();
-    let mut out = Vec::with_capacity(raw.len() * 3 / 4);
+    let raw = s.as_bytes();
+    // Padded to a multiple of four, always. RFC 4648 makes padding optional
+    // only where a spec says so, and the note format does not — an unpadded
+    // tail is a second spelling of one value.
+    if raw.is_empty() || !raw.len().is_multiple_of(4) {
+        return None;
+    }
+    let pad = raw.iter().rev().take_while(|c| **c == b'=').count();
+    // Padding is a suffix, and at most two characters: three would mean a quad
+    // carrying no data at all.
+    if pad > 2 || raw[..raw.len() - pad].contains(&b'=') {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(raw.len() / 4 * 3 - pad);
     for chunk in raw.chunks(4) {
+        let live = chunk.iter().take_while(|c| **c != b'=').count();
         let mut n = 0u32;
-        for (i, c) in chunk.iter().enumerate() {
+        for (i, c) in chunk[..live].iter().enumerate() {
             n |= val(*c)? << (18 - 6 * i);
         }
-        let take = chunk.len() * 6 / 8;
+        let take = live * 6 / 8;
         for i in 0..take {
             out.push(((n >> (16 - 8 * i)) & 0xff) as u8);
+        }
+        // The bits below the last whole byte are padding bits and the spec says
+        // they are zero. A decoder that ignores them accepts `AB==` and `AC==`
+        // as the same one byte, which is the malleability this file cannot
+        // afford.
+        if n & ((1 << (24 - take * 8)) - 1) != 0 {
+            return None;
         }
     }
     Some(out)

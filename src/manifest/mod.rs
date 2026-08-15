@@ -797,23 +797,59 @@ pub struct Capabilities {
 }
 
 /// Ceilings, in the manifest's own vocabulary.
+///
+/// Every ceiling here except `max_replans` is checked **before** the work and
+/// against *every* effect the run performs, not only its model calls. An
+/// omitted field means no limit; a field set to `0` therefore means the run may
+/// not take its first step or perform its first effect of any kind, and
+/// [`validate`](Manifest::validate) refuses it — see
+/// [`max_tokens`](Self::max_tokens).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budgets {
+    /// Plan nodes this run may execute, checked before each one starts.
+    ///
+    /// Refused at `0`, which would stop the run before its first step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_steps: Option<usize>,
+    /// Externally visible operations of **every** kind — a tool call, a clock
+    /// read and a model completion each cost one, so this is not a model
+    /// ceiling.
+    ///
+    /// Refused at `0`, which would refuse the run's first effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_effects: Option<usize>,
+    /// Metered units consumed, compared against the run's total before **every**
+    /// effect — including effects that consume no tokens at all.
+    ///
+    /// That is the misreading this field attracts, so it is worth stating
+    /// plainly: this is not "how much the model may spend", it is a gate every
+    /// effect passes through, and a run that has reached the ceiling performs no
+    /// further operation of any kind. `0` is refused for exactly that reason —
+    /// it reads as "no permission to spend" and behaves as "this agent can never
+    /// do anything", including on an agent that declares no models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
     /// Money in minor units — cents, not euros. A float here would make a
     /// budget that fails to bind by a rounding error, and money is the one
     /// number nobody accepts "approximately" for.
+    ///
+    /// Gates **every** effect, exactly like [`max_tokens`](Self::max_tokens),
+    /// and `0` is refused for the same reason: a free tool call still has to
+    /// pass the ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_minor_units: Option<u64>,
+    /// How many times the run may change its plan.
+    ///
+    /// `0` is meaningful and accepted: it means the plan the run started with is
+    /// the plan it finishes with. Unlike the ceilings above, this one is
+    /// consumed by an event that may simply never happen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_replans: Option<u32>,
     /// Seconds. Named for its unit so a manifest cannot mean minutes.
+    ///
+    /// Checked before each step and effect against elapsed time, which starts at
+    /// zero — so `0` refuses the first step and is refused at parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wallclock_secs: Option<u64>,
 }
@@ -1205,6 +1241,62 @@ impl Manifest {
         if self.spec.budgets.is_none() {
             return Err(ManifestError::Unbounded);
         }
+        self.validate_budgets()
+    }
+
+    /// A ceiling of zero is refused, because it does not do what the person who
+    /// wrote it meant.
+    ///
+    /// Every ceiling below is accumulate-and-compare, checked *before* the work
+    /// and refusing once consumption has **reached** the limit. At zero the
+    /// limit is reached before anything has happened, so the run is refused its
+    /// first step or its first effect — of any kind, on any agent. Reported
+    /// from a deployment that wrote `max_tokens: 0` on an agent with no models
+    /// at all, meaning "this one does not get to spend money"; every run it
+    /// ever made died on a read-only tool call with `token budget exhausted: 0
+    /// permitted, 0 consumed`.
+    ///
+    /// It is refused rather than reinterpreted because both readings are
+    /// defensible — "no budget" and "no limit" are the two things a zero could
+    /// mean — and a ceiling whose meaning the runtime guesses at is the failure
+    /// this whole document exists to remove. The two ways to say it are already
+    /// there, and the message names them.
+    ///
+    /// `max_replans` is deliberately absent: zero replans is a coherent
+    /// instruction, because a replan is an event that may never occur, so
+    /// forbidding it forbids nothing the run needs.
+    fn validate_budgets(&self) -> Result<(), ManifestError> {
+        let Some(budgets) = &self.spec.budgets else {
+            return Ok(());
+        };
+        for (field, is_zero) in [
+            ("spec.budgets.max_steps", budgets.max_steps == Some(0)),
+            ("spec.budgets.max_effects", budgets.max_effects == Some(0)),
+            ("spec.budgets.max_tokens", budgets.max_tokens == Some(0)),
+            (
+                "spec.budgets.max_minor_units",
+                budgets.max_minor_units == Some(0),
+            ),
+            (
+                "spec.budgets.max_wallclock_secs",
+                budgets.max_wallclock_secs == Some(0),
+            ),
+        ] {
+            if is_zero {
+                return Err(ManifestError::Syntax(format!(
+                    "{field} is 0, which permits nothing at all — not merely no model \
+                     spend. This ceiling is checked before every step and every effect, \
+                     so at 0 it is already reached and the run is refused its first \
+                     operation of any kind: a read-only tool call, a local lookup, an \
+                     agent that declares no models at all. Such an agent does not run \
+                     once and stop, it fails identically on every run it will ever make. \
+                     Omit the field to mean 'no limit'. To stop a tenant doing work, use \
+                     the operator's emergency stop (`QuotaStore::set_halt`), which \
+                     refuses new runs with a reason attached — a halt says somebody is \
+                     dealing with an incident, where a ceiling only says not right now"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1478,10 +1570,20 @@ impl Manifest {
             .iter()
             .map(|g| g.reference.as_str())
             .collect();
-        for (field, text) in [
+        // The extraction model reads its own instruction and is offered the
+        // same grants, so a tool named there goes the same way a tool named in
+        // the role does: asked for, refused, improvised around.
+        let mut prose = vec![
             ("spec.identity.role", identity.role.as_str()),
             ("spec.identity.constraints", identity.constraints.as_str()),
-        ] {
+        ];
+        if let Some(formation) = &self.spec.memory_formation {
+            prose.push((
+                "spec.memory_formation.instruction",
+                formation.instruction.as_str(),
+            ));
+        }
+        for (field, text) in prose {
             for reference in tool_references_in(text) {
                 if !granted.contains(reference.as_str()) {
                     return Err(ManifestError::Syntax(format!(

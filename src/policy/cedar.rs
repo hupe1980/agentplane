@@ -357,7 +357,7 @@ impl PolicyEngine for CedarEngine {
                     malformed = true,
                     %why,
                 );
-                return PolicyDecision::deny(format!(
+                return PolicyDecision::malformed(format!(
                     "the authorization request could not be expressed for evaluation \
                      ({why}) — this is a defect, not a rule: every request of this \
                      shape is being denied"
@@ -404,18 +404,20 @@ impl PolicyEngine for CedarEngine {
             // the trace above and to the deny reason the journal keeps; a
             // model probing the gate sees only the uniform refusal, as it
             // does for every policy denial.
-            cedar_policy::Decision::Allow => PolicyDecision::deny(format!(
+            cedar_policy::Decision::Allow => PolicyDecision::malformed(format!(
                 "policy evaluation error — refusing because a rule that might \
                  have forbidden this call failed to evaluate: {} — this is a \
                  defect in the policy set, not a rule firing",
                 errors.join("; ")
             )),
-            cedar_policy::Decision::Deny if !errors.is_empty() => PolicyDecision::deny(format!(
-                "denied while {} policy error(s) went unevaluated: {} — fix the \
+            cedar_policy::Decision::Deny if !errors.is_empty() => {
+                PolicyDecision::malformed(format!(
+                    "denied while {} policy error(s) went unevaluated: {} — fix the \
                  policy set; this denial may not mean what it appears to",
-                errors.len(),
-                errors.join("; ")
-            )),
+                    errors.len(),
+                    errors.join("; ")
+                ))
+            }
             cedar_policy::Decision::Deny => {
                 let determining: Vec<String> = answer
                     .diagnostics()
@@ -440,6 +442,36 @@ impl PolicyEngine for CedarEngine {
                 }
             }
         }
+    }
+
+    /// Evaluate each probe and report the rules that could not be evaluated.
+    ///
+    /// The trap this catches is Cedar's totality: every rule is evaluated
+    /// against every request, so a `when` clause reading an attribute the
+    /// request does not carry errors rather than failing to match, and an
+    /// unevaluable rule refuses the call because it may be the `forbid` that
+    /// would have stopped it. One such rule denies every effect of every run,
+    /// from a policy set that parsed and validated cleanly — which is exactly
+    /// how a deployment found itself with a plane that refused everything.
+    ///
+    /// Only unevaluable sets are reported. A set that merely *denies* the
+    /// probes is a working default-deny plane, and reporting it would make
+    /// this check the reason nobody writes one.
+    fn preflight(&self, requests: &[PolicyRequest<'_>]) -> Vec<String> {
+        requests
+            .iter()
+            .filter_map(|request| {
+                let decision = self.authorize(request);
+                decision.is_malformed().then(|| {
+                    format!(
+                        "`{}` on `{}`: {}",
+                        request.action,
+                        request.resource,
+                        decision.reason().unwrap_or_default()
+                    )
+                })
+            })
+            .collect()
     }
 
     fn bundle(&self) -> PolicyBundleIdentity {
