@@ -3227,11 +3227,12 @@ impl StepCtx<'_> {
     /// it has to admit for the call to be useful at all: a query worth embedding
     /// has almost always crossed a trust boundary — a user's question, a model's
     /// paraphrase, a recalled memory — and anything that has is already
-    /// [`Internal`](Sensitivity::Internal). This is the same ceiling
+    /// [`Internal`]. This is the same ceiling
     /// [`SemanticQuery::max_sensitivity`] carries for the *retriever*, asked
     /// separately because they are two providers and a deployment may well
     /// trust one and not the other.
     ///
+    /// [`Internal`]: crate::core::Sensitivity::Internal
     /// [`SemanticQuery::embedding`]: crate::memory::SemanticQuery::embedding
     /// [`SemanticQuery::max_sensitivity`]: crate::memory::SemanticQuery::max_sensitivity
     ///
