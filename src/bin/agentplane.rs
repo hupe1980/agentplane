@@ -1195,10 +1195,11 @@ fn spawn_push_worker(worker: agentplane::api::a2a::A2aPushWorker, every: u32) {
             let at = time::OffsetDateTime::now_utc().unix_timestamp();
             let Ok(at) = u64::try_from(at) else { continue };
             match worker.run_once(at, PUSH_BATCH).await {
-                // A batch that came back full is a backlog, and a registration
-                // given up on is a peer that will never hear back. Neither may
-                // produce the same numbers — or the same log level — as a quiet
-                // plane, which is I13 applied to this worker's own report.
+                // A batch that came back full is a backlog, and a parked
+                // registration is a peer that will hear nothing until an
+                // operator re-arms it. Neither may produce the same numbers —
+                // or the same log level — as a quiet plane, which is I13
+                // applied to this worker's own report.
                 Ok(report) if report.needs_attention() => {
                     tracing::warn!(?report, "push delivery needs attention");
                 }

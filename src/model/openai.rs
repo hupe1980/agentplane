@@ -976,8 +976,9 @@ impl ModelProvider for OpenAi {
 
         let status = response.status();
         if !status.is_success() {
+            let headers = response.headers().clone();
             let detail = response.text().await.unwrap_or_default();
-            return Err(classify_status(model, status.as_u16(), &detail));
+            return Err(classify_status(model, status.as_u16(), &headers, &detail));
         }
 
         let mut completion = if self.stream {

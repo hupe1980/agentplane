@@ -69,7 +69,8 @@ impl PushStore for PostgresStore {
                     next_seq = push_delivery.next_seq,
                     attempts = 0,
                     next_attempt_at = 0,
-                    last_error = NULL",
+                    last_error = NULL,
+                    parked = FALSE",
                 &[
                     &self.tenant_name(),
                     &config.task.to_string(),
@@ -164,7 +165,7 @@ impl PushStore for PostgresStore {
                 "SELECT task_id, config_id, url, token, auth_scheme, auth_credentials,
                     next_seq, attempts, next_attempt_at, last_error
                  FROM push_delivery
-                 WHERE tenant = $1 AND next_attempt_at <= $2
+                 WHERE tenant = $1 AND next_attempt_at <= $2 AND NOT parked
                  ORDER BY next_attempt_at, task_id, config_id
                  LIMIT $3",
                 &[
@@ -203,7 +204,7 @@ impl PushStore for PostgresStore {
                 "SELECT task_id, config_id, url, token, auth_scheme, auth_credentials,
                     next_seq, attempts, next_attempt_at, last_error
                  FROM push_delivery
-                 WHERE tenant = $1 AND next_attempt_at <= $2
+                 WHERE tenant = $1 AND next_attempt_at <= $2 AND NOT parked
                    AND (config_id LIKE $4) = $5
                  ORDER BY next_attempt_at, task_id, config_id
                  LIMIT $3",
@@ -225,7 +226,7 @@ impl PushStore for PostgresStore {
         let unserved_row = client
             .query_one(
                 "SELECT COUNT(*) FROM push_delivery
-                 WHERE tenant = $1 AND next_attempt_at <= $2
+                 WHERE tenant = $1 AND next_attempt_at <= $2 AND NOT parked
                    AND (config_id LIKE $3) <> $4",
                 &[
                     &self.tenant_name(),
@@ -256,7 +257,7 @@ impl PushStore for PostgresStore {
             .execute(
                 "UPDATE push_delivery
                  SET next_seq = GREATEST(next_seq, $4), attempts = 0,
-                     next_attempt_at = 0, last_error = NULL
+                     next_attempt_at = 0, last_error = NULL, parked = FALSE
                  WHERE tenant = $1 AND task_id = $2 AND config_id = $3",
                 &[
                     &self.tenant_name(),
@@ -286,7 +287,7 @@ impl PushStore for PostgresStore {
             .execute(
                 "UPDATE push_delivery
                  SET attempts = LEAST(attempts + 1, 2147483647),
-                     next_attempt_at = $4, last_error = $5
+                     next_attempt_at = $4, last_error = $5, parked = FALSE
                  WHERE tenant = $1 AND task_id = $2 AND config_id = $3",
                 &[
                     &self.tenant_name(),
@@ -299,6 +300,72 @@ impl PushStore for PostgresStore {
             .await
             .map_err(|db_error| be(&db_error))?;
         Ok(())
+    }
+
+    async fn park(&self, task: RunId, id: &str, error: &str) -> Result<(), StoreError> {
+        let client = self
+            .pool_ref()
+            .get()
+            .await
+            .map_err(|pool_error| StoreError::Backend(pool_error.to_string()))?;
+        client
+            .execute(
+                "UPDATE push_delivery
+                 SET attempts = LEAST(attempts + 1, 2147483647),
+                     last_error = $4, parked = TRUE
+                 WHERE tenant = $1 AND task_id = $2 AND config_id = $3",
+                &[&self.tenant_name(), &task.to_string(), &id, &error],
+            )
+            .await
+            .map_err(|db_error| be(&db_error))?;
+        Ok(())
+    }
+
+    async fn parked(&self, limit: usize) -> Result<Vec<PushRegistration>, StoreError> {
+        let client = self
+            .pool_ref()
+            .get()
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT task_id, config_id, url, token, auth_scheme, auth_credentials,
+                    next_seq, attempts, next_attempt_at, last_error
+                 FROM push_delivery
+                 WHERE tenant = $1 AND parked
+                 ORDER BY task_id, config_id
+                 LIMIT $2",
+                &[
+                    &self.tenant_name(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        rows.iter().map(registration_from).collect()
+    }
+
+    async fn unpark(&self, task: RunId, id: &str, at: u64) -> Result<bool, StoreError> {
+        let client = self
+            .pool_ref()
+            .get()
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let updated = client
+            .execute(
+                "UPDATE push_delivery
+                 SET parked = FALSE, attempts = 0, next_attempt_at = $4
+                 WHERE tenant = $1 AND task_id = $2 AND config_id = $3 AND parked",
+                &[
+                    &self.tenant_name(),
+                    &task.to_string(),
+                    &id,
+                    &at.cast_signed(),
+                ],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        Ok(updated > 0)
     }
 
     async fn delete(&self, task: RunId, id: &str) -> Result<(), StoreError> {

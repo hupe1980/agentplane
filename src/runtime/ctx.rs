@@ -934,6 +934,11 @@ impl<'a> StepCtx<'a> {
         self.ordinal += 1;
 
         let mut attempt: u32 = 1;
+        // What the last failure's peer said about when to come back. The wait
+        // belongs to the *next* attempt, so it crosses the iteration boundary;
+        // a replayed pass never waits, because the wait already happened and
+        // its outcome is the record being read back.
+        let mut advice: Option<std::time::Duration> = None;
         loop {
             let key = EffectKey::derive(
                 self.step,
@@ -1036,7 +1041,7 @@ impl<'a> StepCtx<'a> {
             self.gate(key, &descriptor, effect.mutates(), outbound)
                 .await?;
 
-            let backoff = policy.backoff(self.run, key, attempt);
+            let backoff = policy.wait_before(self.run, key, attempt, advice.take());
             if !backoff.is_zero() {
                 tokio::time::sleep(backoff).await;
             }
@@ -1058,6 +1063,7 @@ impl<'a> StepCtx<'a> {
             {
                 return Ok((output, crate::core::DeclaredOutput::of(&effect)));
             }
+            advice = failure.retry_after();
             attempt += 1;
         }
     }

@@ -24,28 +24,82 @@ use axum::body::Bytes;
 use axum::http::HeaderMap;
 use serde_json::{Value, json};
 
-/// `HMAC-SHA256`, written out from RFC 2104 against the crate's public
-/// `Digest::of`.
+/// Standard Webhooks' `v1,<base64>` over `{id}.{timestamp}.{body}`, written
+/// out from RFC 2104 against the crate's public `Digest::of`.
 ///
 /// Deliberately a **second implementation**: it concatenates where the sender
 /// streams, and it reaches SHA-256 through a different door. Calling the
 /// sender's own helper would assert that a function equals itself, which is
 /// what a mutation removing the signing would still satisfy.
-fn expected_signature(secret: &str, body: &[u8]) -> String {
+fn expected_signature(key: &[u8], id: &str, at: u64, body: &[u8]) -> String {
     const BLOCK: usize = 64;
-    let key = secret.as_bytes();
     let mut block = [0u8; BLOCK];
     if key.len() > BLOCK {
         block[..32].copy_from_slice(Digest::of(key).as_bytes());
     } else {
         block[..key.len()].copy_from_slice(key);
     }
+    let mut content = Vec::new();
+    content.extend_from_slice(id.as_bytes());
+    content.push(b'.');
+    content.extend_from_slice(at.to_string().as_bytes());
+    content.push(b'.');
+    content.extend_from_slice(body);
+
     let mut inner: Vec<u8> = block.iter().map(|byte| byte ^ 0x36).collect();
-    inner.extend_from_slice(body);
+    inner.extend_from_slice(&content);
     let inner = Digest::of(&inner);
     let mut outer: Vec<u8> = block.iter().map(|byte| byte ^ 0x5c).collect();
     outer.extend_from_slice(inner.as_bytes());
-    format!("sha256={}", Digest::of(&outer).to_hex())
+    format!("v1,{}", base64(Digest::of(&outer).as_bytes()))
+}
+
+/// Standard base64, written out so this file depends on nothing the sender
+/// also depends on.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The decoded bytes of a `whsec_` secret, which is what both ends MAC with.
+fn key_of(secret: &str) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let encoded = secret.trim_start_matches("whsec_").trim_end_matches('=');
+    let mut bits = 0u32;
+    let mut held = 0u32;
+    let mut out = Vec::new();
+    for byte in encoded.bytes() {
+        let value = u32::try_from(
+            ALPHABET
+                .iter()
+                .position(|candidate| *candidate == byte)
+                .expect("the fixture secret is base64"),
+        )
+        .expect("a base64 index is under 64");
+        bits = (bits << 6) | value;
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            out.push(u8::try_from((bits >> held) & 0xff).expect("masked to a byte"));
+        }
+    }
+    out
 }
 
 /// What one POST looked like on the wire.
@@ -99,6 +153,10 @@ impl Skill for Answers {
     }
 }
 
+/// The instant every sweep in this file runs at. It rides in the signature and
+/// in `webhook-timestamp`, so it has to be a value the assertions can name.
+const SWEPT_AT: u64 = 1_700_000_000;
+
 /// Run one completed run through a real `PushSender` to `destination`, and
 /// return what the receiver got.
 async fn deliver(destination: Destination, seen: &Arc<Mutex<Vec<Received>>>) -> Received {
@@ -125,7 +183,7 @@ async fn deliver(destination: Destination, seen: &Arc<Mutex<Vec<Received>>>) -> 
             as Arc<dyn PushTransport>,
         Arc::new(RunCompleted::new("urn:mako:agentd")),
     );
-    let report = worker.run_once(10, 10).await.expect("a sweep");
+    let report = worker.run_once(SWEPT_AT, 10).await.expect("a sweep");
     assert_eq!(report.deliveries, 1, "nothing was delivered: {report:?}");
 
     let received = seen.lock().unwrap();
@@ -138,39 +196,51 @@ async fn deliver(destination: Destination, seen: &Arc<Mutex<Vec<Received>>>) -> 
 /// Not "a header is present", and not "the header matches what the signer
 /// computes" — the expectation is recomputed here from the **bytes the
 /// receiver read off the socket**, by a second HMAC implementation, so the
-/// only way to pass is to have signed exactly those bytes under exactly that
-/// secret. A signature over a re-serialization, over a constant, or over an
-/// empty body all fail here and nowhere else.
-///
-/// What this does not cover: freshness. This delivery replayed tomorrow
-/// carries the same valid signature — see `BodySigning` for why that is the
-/// receiver's dedup problem and not the signature's.
+/// only way to pass is to have signed exactly those bytes, under exactly that
+/// key, bound to exactly the id and instant the delivery announced. A
+/// signature over a re-serialization, over a constant, over an empty body, or
+/// over the body alone all fail here and nowhere else.
 #[tokio::test]
-async fn a_signed_destination_carries_an_hmac_of_the_exact_bytes_posted() {
+async fn a_signed_destination_carries_a_standard_webhooks_signature_over_what_it_posted() {
     let (url, seen) = receiver().await;
-    let secret = "shhh-operator-key";
+    let secret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
     let received = deliver(
-        Destination::new("bus", url).signed_with("X-Mako-Signature", Secret::new(secret)),
+        Destination::new("bus", url).signed_with(&Secret::new(secret)),
         &seen,
     )
     .await;
 
-    let signature = received
-        .headers
-        .get("X-Mako-Signature")
-        .unwrap_or_else(|| {
-            panic!(
-                "a signed destination delivered with no signature header: {:?}",
-                received.headers
-            )
-        })
-        .to_str()
-        .expect("a signature is ASCII hex");
+    let header = |name: &str| {
+        received
+            .headers
+            .get(name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a signed destination delivered without '{name}': {:?}",
+                    received.headers
+                )
+            })
+            .to_str()
+            .expect("the webhook headers are ASCII")
+            .to_owned()
+    };
+
+    // The two facts the signature binds. A receiver reads them from the
+    // headers and compares; if either were absent the check would degrade to a
+    // signature over the body alone, which is what replays forever.
+    let id = header("webhook-id");
+    assert_eq!(
+        header("webhook-timestamp"),
+        SWEPT_AT.to_string(),
+        "the instant a receiver measures its tolerance window against is not \
+         the instant this attempt was made"
+    );
 
     assert_eq!(
-        signature,
-        expected_signature(secret, &received.body),
-        "the signature does not MAC the posted bytes: {}",
+        header("webhook-signature"),
+        expected_signature(&key_of(secret), &id, SWEPT_AT, &received.body),
+        "the signature does not MAC the posted bytes under the announced id \
+         and instant: {}",
         String::from_utf8_lossy(&received.body)
     );
 
@@ -180,11 +250,79 @@ async fn a_signed_destination_carries_an_hmac_of_the_exact_bytes_posted() {
     let event: Value = serde_json::from_slice(&received.body).expect("the body is the CloudEvent");
     assert_eq!(event["type"], json!("io.agentplane.run.completed"));
     assert_eq!(event["source"], json!("urn:mako:agentd"));
-    assert!(
-        event["id"].is_string(),
-        "the payload carries no identity for a receiver to deduplicate on, \
-         which is the only thing that closes replay: {event:#}"
+    assert_eq!(
+        event["id"],
+        json!(id),
+        "the idempotency key a receiver deduplicates on is not the identity \
+         inside the event, so the two disagree about what one message is: \
+         {event:#}"
     );
+}
+
+/// A `whsec_`-prefixed secret is base64 **of the key**, not the key.
+///
+/// The one detail that decides whether an off-the-shelf verifier agrees with
+/// this plane at all: a receiver handed `whsec_…` gives it to its library,
+/// which decodes it. Signing with the prefixed text instead produces a MAC
+/// nothing in the ecosystem accepts, and the symptom is a receiver refusing
+/// every delivery for a reason no log here explains.
+#[tokio::test]
+async fn a_whsec_secret_names_base64_of_the_key_and_not_the_key() {
+    let (url, seen) = receiver().await;
+    let secret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+    let received = deliver(
+        Destination::new("bus", url).signed_with(&Secret::new(secret)),
+        &seen,
+    )
+    .await;
+    let id = received.headers["webhook-id"].to_str().unwrap();
+    let signature = received.headers["webhook-signature"].to_str().unwrap();
+
+    assert_eq!(
+        signature,
+        expected_signature(&key_of(secret), id, SWEPT_AT, &received.body)
+    );
+    assert_ne!(
+        signature,
+        expected_signature(secret.as_bytes(), id, SWEPT_AT, &received.body),
+        "the prefixed text was MACed as if it were the key"
+    );
+}
+
+/// The envelope is announced as one, and the identity a receiver needs rides
+/// with it whether or not anything is signed.
+///
+/// `Content-Type` is how a `CloudEvents` receiver routes: a structured-mode
+/// event under any other media type is a valid event that reaches nothing that
+/// parses one. And `webhook-id` is the only defence a receiver has against
+/// at-least-once delivery, which is the contract this outbox offers rather
+/// than an unusual failure.
+#[tokio::test]
+async fn a_cloudevents_delivery_announces_its_media_type_and_its_identity() {
+    let (url, seen) = receiver().await;
+    let received = deliver(Destination::new("bus", url), &seen).await;
+
+    let content_type = received.headers["content-type"].to_str().unwrap();
+    assert_eq!(
+        content_type, "application/cloudevents+json; charset=UTF-8",
+        "a structured-mode CloudEvent was posted under a media type no \
+         CloudEvents receiver routes on"
+    );
+    let event: Value = serde_json::from_slice(&received.body).expect("the body is the CloudEvent");
+    assert_eq!(event["specversion"], json!("1.0"));
+    assert_eq!(
+        received.headers["webhook-id"].to_str().unwrap(),
+        event["id"].as_str().unwrap(),
+        "the idempotency key and the event's own identity disagree"
+    );
+    assert!(
+        received.headers.contains_key("webhook-timestamp"),
+        "a delivery with no instant leaves a receiver no window to judge \
+         freshness in: {:?}",
+        received.headers
+    );
+    // `subject` is what a receiver filters on without opening `data`.
+    assert_eq!(event["subject"], event["data"]["run"]);
 }
 
 /// The negative half: no key, no header.

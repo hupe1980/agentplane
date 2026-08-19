@@ -928,9 +928,17 @@ derivative creation cannot commit in the gap between traversal and deletion.
 The `push` module provides the durable A2A registration cursor and transport. A
 webhook URL inverts this crate's usual rule that destinations are granted, not
 discovered: it comes from whoever created the task. Three controls stack — an
-operator host grant, HTTPS only, and every resolved address checked with the
-connection pinned to it — and the grant is re-checked at delivery so revoking a
-host stops registrations made while it was granted.
+operator host grant, HTTPS only, and every resolved address checked — and the
+grant is re-checked at delivery so revoking a host stops registrations made
+while it was granted.
+
+The address check runs twice, and the halves cover different things. A
+pre-flight judges **every** destination, including an IP literal, and is what
+produces a typed refusal. The client's DNS resolver judges **every name it
+resolves**, which covers the connections a pooled client opens after that
+pre-flight returned. An IP literal never reaches a resolver and loses nothing by
+it — it has one address, already judged, and cannot rebind. Both call one rule;
+see [one client, judged at connect](@/docs/architecture.md#one-client-judged-at-connect).
 
 A registered receiver gets the same status and artifact `StreamResponse`
 objects as an SSE subscriber. Treating its URL as authorized for that task is

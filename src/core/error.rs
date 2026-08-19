@@ -288,6 +288,27 @@ pub enum EffectError {
     #[error("effect rejected: {0}")]
     Rejected(String),
 
+    /// The peer declined *for now* and said when to come back.
+    ///
+    /// A rate limit is a wait, not a fault, and the peer is the only party who
+    /// knows how long. Separate from [`Rejected`](Self::Rejected) — which is
+    /// also retried — because a computed backoff is a guess, and here there is
+    /// nothing to guess about: the runtime waits the named time, bounded by
+    /// [`RetryPolicy::max_advice`](crate::core::RetryPolicy::max_advice).
+    ///
+    /// `retry_after` is `None` where the peer named no window, which is
+    /// ordinary — the effect's own schedule applies, and the variant still
+    /// carries what that schedule cannot infer: repeating sooner is pointless
+    /// rather than merely unlucky.
+    ///
+    /// Nothing was applied and nothing metered, so a mutating effect is as safe
+    /// to repeat here as a read.
+    #[error("effect rate limited: {detail}")]
+    RateLimited {
+        detail: String,
+        retry_after: Option<std::time::Duration>,
+    },
+
     /// The peer understood the request and said **no** — an answer, not a
     /// fault. Nothing was applied, and nothing was metered.
     ///
@@ -396,6 +417,7 @@ impl EffectError {
             // every retried run's spend.
             Self::Unavailable { .. }
             | Self::Rejected(_)
+            | Self::RateLimited { .. }
             | Self::Refused(_)
             | Self::Timeout { .. }
             | Self::Interrupted { .. }
@@ -406,14 +428,29 @@ impl EffectError {
         }
     }
 
+    /// When the peer asked to be called again, if it named a time.
+    ///
+    /// Unbounded on purpose: this reports what was *said*. What this deployment
+    /// will act on is
+    /// [`RetryPolicy::max_advice`](crate::core::RetryPolicy::max_advice) — one
+    /// bound, at the place that owns the schedule.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::RateLimited { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
     /// What this failure says about whether the call reached the outside world.
     #[must_use]
     pub fn disposition(&self) -> Disposition {
         match self {
             Self::Metered { disposition, .. } | Self::Final { disposition, .. } => *disposition,
-            Self::Unavailable { .. } | Self::Rejected(_) | Self::Refused(_) => {
-                Disposition::DidNotHappen
-            }
+            Self::Unavailable { .. }
+            | Self::Rejected(_)
+            | Self::RateLimited { .. }
+            | Self::Refused(_) => Disposition::DidNotHappen,
             Self::OutputShape(_) | Self::Performed(_) => Disposition::Landed,
             // `Other` shares the in-doubt arm deliberately: an error that does
             // not say what it did is treated as dangerous. A driver that wants

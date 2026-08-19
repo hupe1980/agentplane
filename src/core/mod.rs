@@ -13,6 +13,7 @@ mod budget;
 mod calendar;
 pub mod canon;
 mod case;
+mod cloudevent;
 mod effect;
 pub(crate) mod error;
 mod event;
@@ -34,6 +35,10 @@ pub use attest::{
 };
 pub use budget::{Budget, BudgetExceeded, Consumed, Ledger, Spend};
 pub use calendar::{Calendar, CalendarError, WallClock};
+pub use cloudevent::{
+    CONTENT_TYPE as CLOUDEVENT_CONTENT_TYPE, CloudEvent, CloudEventError,
+    HEADER_PREFIX as CLOUDEVENT_HEADER_PREFIX, SPEC_VERSION as CLOUDEVENT_SPEC_VERSION,
+};
 mod quorum;
 pub use quorum::{Outcome as QuorumOutcome, Quorum, QuorumError, Tally, Verdict};
 
@@ -72,7 +77,7 @@ pub use policy::{
     ACTION_ADMIT, ACTION_DECLARED, ACTION_EGRESS, ACTION_PERFORM, ACTION_RELEASE, DenyAll,
     PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest,
 };
-pub use retry::RetryPolicy;
+pub use retry::{RetryPolicy, retry_after_seconds};
 pub use secret::Secret;
 pub use skill::{AgentRef, Capability, Compensation, Outcome, Skill, SkillDescriptor};
 pub use task::{Decision, Justification, OnExpiry, Priority, Task, TaskId, TaskSpec, TaskState};

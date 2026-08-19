@@ -241,10 +241,15 @@ CREATE TABLE IF NOT EXISTS push_delivery (
     attempts        INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     next_attempt_at BIGINT NOT NULL DEFAULT 0 CHECK (next_attempt_at >= 0),
     last_error      TEXT,
+    -- Stopped, with the cursor kept: a receiver that answered permanently or
+    -- outlasted the retry ceiling. Excluded from the due index so a parked row
+    -- costs nothing per sweep, and still names how far its receiver got.
+    parked          BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (tenant, task_id, config_id)
 );
 CREATE INDEX IF NOT EXISTS push_delivery_due
-    ON push_delivery (tenant, next_attempt_at, task_id, config_id);
+    ON push_delivery (tenant, next_attempt_at, task_id, config_id)
+    WHERE NOT parked;
 ";
 
 /// A journal on `PostgreSQL`.

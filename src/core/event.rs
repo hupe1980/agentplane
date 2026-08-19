@@ -45,7 +45,11 @@ pub struct InboundEvent {
     ///
     /// It is not authority. A producer writes this string; anyone may claim to
     /// be anyone. What it buys is a label a policy can reason about once the
-    /// transport has authenticated the sender by other means.
+    /// transport has authenticated the sender by other means — which is why an
+    /// event arriving as a [`CloudEvent`](crate::core::CloudEvent) takes this
+    /// from the authenticated transport and keeps the producer's own claim
+    /// inside [`id`](Self::id). See
+    /// [`CloudEvent::into_inbound`](crate::core::CloudEvent::into_inbound).
     ///
     /// [CloudEvents]: https://github.com/cloudevents/spec/blob/main/cloudevents/spec.md
     pub source: String,

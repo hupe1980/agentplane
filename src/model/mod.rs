@@ -509,8 +509,18 @@ pub enum ModelError {
     /// Separate from [`Refused`](ModelError::Refused) because the response is
     /// different: this one is worth retrying, and it is the one case here where
     /// retrying is unambiguously safe.
+    ///
+    /// `retry_after` is the provider's own `Retry-After`, in seconds, when it
+    /// named one. Carried rather than discarded because the window it names is
+    /// the only number that makes retrying useful: a computed backoff measured
+    /// in hundreds of milliseconds spends every permitted attempt inside a
+    /// window measured in tens of seconds, and reports the provider as down.
     #[error("'{model}' is rate limiting: {detail}")]
-    RateLimited { model: ModelId, detail: String },
+    RateLimited {
+        model: ModelId,
+        detail: String,
+        retry_after: Option<u64>,
+    },
 
     /// It generated, and then the stream died.
     ///
@@ -1363,10 +1373,26 @@ impl Effect for ModelCall {
                     // request is *wrong* — unknown model, malformed schema,
                     // input filtered — and asking again asks the same rule the
                     // same question. Carried as `Refused` so the retry loop
-                    // spends no attempt on it, where a rate limit or an
-                    // outage stays `Rejected` and retries under policy.
+                    // spends no attempt on it, where an outage stays `Rejected`
+                    // and retries under policy.
                     Disposition::DidNotHappen if matches!(e, ModelError::Refused { .. }) => {
                         EffectError::Refused(detail)
+                    }
+                    // A throttle is a wait, and the provider is the only party
+                    // who knows how long. Carried as `RateLimited` — with the
+                    // window when it named one — so the retry loop waits the
+                    // time it was told instead of a schedule computed in
+                    // ignorance of it.
+                    Disposition::DidNotHappen if matches!(e, ModelError::RateLimited { .. }) => {
+                        EffectError::RateLimited {
+                            detail,
+                            retry_after: match &e {
+                                ModelError::RateLimited { retry_after, .. } => {
+                                    retry_after.map(std::time::Duration::from_secs)
+                                }
+                                _ => None,
+                            },
+                        }
                     }
                     Disposition::DidNotHappen => EffectError::Rejected(detail),
                     Disposition::InDoubt => EffectError::Interrupted {

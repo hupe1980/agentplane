@@ -123,8 +123,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::core::{
-    CaseId, CaseStatus, Decision, Delivery, InboundEvent, PolicyDecision, PolicyRequest, RunId,
-    Task, TaskId, TenantId,
+    CaseId, CaseStatus, CloudEvent, Decision, Delivery, InboundEvent, PolicyDecision,
+    PolicyRequest, RunId, Task, TaskId, TenantId,
 };
 use crate::journal::RecordKind;
 use crate::runtime::Runtime;
@@ -1235,7 +1235,7 @@ async fn case_view(
     })))
 }
 
-/// An event as a caller may state it.
+/// An event as a caller may state it, in this plane's own shape.
 ///
 /// Deliberately **not** [`InboundEvent`]: that carries a `source`, and a caller
 /// does not get to choose one. The source is half the deduplication identity and
@@ -1251,16 +1251,96 @@ struct DeliverBody {
     payload: Value,
 }
 
+/// The two shapes this route accepts, and what each becomes.
+///
+/// A bus speaks [`CloudEvents`](`CloudEvent`); an operator's `curl` speaks
+/// whatever this plane documents. Before both were accepted here, a deployment
+/// whose producers emit `CloudEvents` — which is every deployment that also
+/// **receives** this plane's own `RunCompleted` output — had to translate the
+/// envelope itself, and the translations in the field got the deduplication
+/// identity wrong in the same way each time: they keyed on `id` alone, which
+/// is unique only within one producer, so two counterparties numbering their
+/// messages from one silently collapsed into one.
+///
+/// Both forms end up as an [`InboundEvent`] whose `source` is the
+/// **authenticated caller**, for the reason [`DeliverBody`] gives.
+enum DeliverInput {
+    Native(DeliverBody),
+    Cloud(CloudEvent),
+}
+
+impl DeliverInput {
+    /// Which event kind the policy gate is asked about.
+    fn kind(&self) -> &str {
+        match self {
+            Self::Native(body) => &body.kind,
+            Self::Cloud(event) => event.event_type(),
+        }
+    }
+
+    fn into_event(self, source: String) -> InboundEvent {
+        match self {
+            Self::Native(body) => {
+                let mut event = InboundEvent::new(source, body.id, body.kind, body.payload);
+                event.correlation = body.correlation;
+                event
+            }
+            // The correlation keys of a CloudEvent are the ones a run declared
+            // interest in, and a CloudEvents extension attribute is a flat
+            // lowercase string with no namespace — so there is nothing here to
+            // map them from that would not be this plane inventing a
+            // convention and calling it the spec. A bus that must correlate
+            // posts the native shape, where the keys are stated.
+            Self::Cloud(event) => event.into_inbound(source),
+        }
+    }
+}
+
+/// Read the body as whichever shape it announced.
+///
+/// The `Content-Type` decides, and a `CloudEvent` in *binary* content mode
+/// announces itself with `ce-` headers instead — which is why this takes the
+/// whole header map and not just one value.
+fn parse_delivery(headers: &HeaderMap, body: &[u8]) -> Result<DeliverInput, ApiError> {
+    let structured = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .trim_start()
+                .starts_with("application/cloudevents+json")
+        });
+    let binary = headers.keys().any(|name| {
+        name.as_str()
+            .starts_with(crate::core::CLOUDEVENT_HEADER_PREFIX)
+    });
+    if structured || binary {
+        let pairs: Vec<(&str, &str)> = headers
+            .iter()
+            .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)))
+            .collect();
+        return CloudEvent::from_http(pairs, body)
+            .map(DeliverInput::Cloud)
+            .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()));
+    }
+    serde_json::from_slice::<DeliverBody>(body)
+        .map(DeliverInput::Native)
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))
+}
+
 async fn deliver(
     State(api): State<Api>,
     headers: HeaderMap,
-    Json(body): Json<DeliverBody>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    let input = parse_delivery(&headers, &body)?;
+
     // Authorized on the event *kind*, so a policy set can let a counterparty
     // gateway post `acknowledgement.received` without also letting it post
-    // whatever else the plane happens to wait on.
+    // whatever else the plane happens to wait on. A CloudEvent's `type` is that
+    // kind — the same question, asked of whichever envelope arrived.
     let s = api
-        .gate(&headers, action::EVENT_DELIVER, &body.kind)
+        .gate(&headers, action::EVENT_DELIVER, input.kind())
         .await?;
 
     // The source is who the transport says they are, never who the body claims.
@@ -1268,13 +1348,7 @@ async fn deliver(
     // both halves of — so one counterparty could deduplicate against another's
     // messages by naming them. Spelled `peer:{actor}` like every other door a
     // counterparty's data enters through — see [`peer_source`].
-    let mut event = InboundEvent::new(
-        peer_source(&s.caller.actor),
-        body.id,
-        body.kind,
-        body.payload,
-    );
-    event.correlation = body.correlation;
+    let event = input.into_event(peer_source(&s.caller.actor));
 
     let delivery = s
         .plane

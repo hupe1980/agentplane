@@ -1158,6 +1158,12 @@ fn classify_service(model: &ModelId, error: &ConverseError) -> ModelError {
         ModelError::RateLimited {
             model: model.clone(),
             detail,
+            // The SDK models a throttle as a typed error and does not surface
+            // the response headers at this seam, so there is no window to read.
+            // Nothing is lost that the caller could have used: the AWS client
+            // applies its own adaptive retry beneath this call, and a second
+            // schedule stacked on it would multiply rather than add.
+            retry_after: None,
         }
     } else if error.is_access_denied_exception()
         || error.is_resource_not_found_exception()
@@ -1187,6 +1193,12 @@ fn classify_stream_start(
         ModelError::RateLimited {
             model: model.clone(),
             detail,
+            // The SDK models a throttle as a typed error and does not surface
+            // the response headers at this seam, so there is no window to read.
+            // Nothing is lost that the caller could have used: the AWS client
+            // applies its own adaptive retry beneath this call, and a second
+            // schedule stacked on it would multiply rather than add.
+            retry_after: None,
         }
     } else if error.is_access_denied_exception()
         || error.is_resource_not_found_exception()
@@ -1243,6 +1255,9 @@ fn classify_stream_event(
         ModelError::RateLimited {
             model: model.clone(),
             detail: detail.to_owned(),
+            // See `classify_service`: the SDK does not surface response
+            // headers here, and it retries throttles itself beneath this call.
+            retry_after: None,
         }
     } else if error.is_some_and(
         aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError::is_validation_exception,

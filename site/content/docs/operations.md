@@ -724,6 +724,23 @@ if report.saturated.deadlines {
 }
 ```
 
+### Outbound delivery: two ceilings, and what each one means
+
+A push sweep is bounded twice, and the two answer different questions:
+
+| | Bounds | Symptom when it is the binding one |
+|---|---|---|
+| `run_once(at, limit)` | how many registrations one tick takes | `PushSweepReport::saturated` — more were due than the tick would take |
+| `DeliveryWorker::max_in_flight` | how many receivers are contacted at once (16 by default) | the sweep is not saturated and still slow: it is waiting on receivers |
+
+Raising `limit` without raising `max_in_flight` buys a longer tick rather than a
+faster one; raising `max_in_flight` without `limit` leaves work behind that one
+tick was never going to reach.
+
+Registrations are served concurrently; the records *within* one are not. A
+receiver still gets its records in journal order, and the cursor still advances
+only on a 2xx, because that is the only thing a cursor means.
+
 ## Metrics
 
 ### The runtime does not measure durations
@@ -1035,6 +1052,28 @@ whether a run id exists by comparing a `400` against a `404`.
 | `GET /cases/{case}` | What has happened on this matter, and by when must it end? |
 | `POST /runs/{run}/cancel` | Stop it — `202`, because the run stops at its next boundary |
 | `POST /events` | This message arrived; wake whoever wanted it |
+
+**`POST /events` speaks CloudEvents, and its own shape.** A bus posts a
+[CloudEvents](https://github.com/cloudevents/spec) 1.0 message in either content
+mode — structured (`Content-Type: application/cloudevents+json`) or binary
+(`ce-specversion`, `ce-id`, `ce-source`, `ce-type` headers with the data as the
+body) — and anything else is read as this plane's own
+`{id, kind, correlation, payload}`. The `type` is the event kind the policy gate
+is asked about, either way. An envelope the plane has not understood is a `400`,
+never a guess: an unknown `specversion`, a missing `id`/`source`/`type`,
+`data_base64`, or an extension name that is not lowercase alphanumeric.
+
+The `source` a run is woken under is **the authenticated caller**, never the
+one in the body — otherwise a caller would hold both halves of `(source, id)`
+and could deduplicate against another party's messages by naming them. The
+producer's own `source` is not discarded either: it rides inside the buffered
+event's id, so a gateway relaying two counterparties that both number their
+messages from one still delivers two events rather than swallowing the second as
+a retry.
+
+Correlation keys have no CloudEvents spelling that is not this plane inventing
+one, so a producer that must correlate posts the native shape, where the keys
+are stated.
 
 Two details carry more weight than the plumbing:
 

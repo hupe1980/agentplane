@@ -32,6 +32,7 @@ use agentplane::model::{
 };
 use agentplane::peers::a2a::{A2aClient, EXTENSION_URI, Endpoint, PROTOCOL_VERSION};
 use agentplane::peers::{PeerClient, PeerError, PeerId};
+use agentplane::testkit::FakeProvider;
 use axum::Router;
 use axum::extract::State;
 use axum::routing::post;
@@ -48,19 +49,31 @@ struct Canned {
     /// What the server saw, so a test can assert what we sent.
     seen: SeenBody,
     seen_headers: SeenHeaders,
+    /// A `Retry-After` to answer with, so a driver's reading of it can be
+    /// tested against a real response rather than a hand-built `HeaderMap`.
+    advice: Option<&'static str>,
 }
 
 async fn handle(
     State(canned): State<Canned>,
     headers: axum::http::HeaderMap,
     body: Option<axum::Json<Value>>,
-) -> (axum::http::StatusCode, axum::Json<Value>) {
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
     *canned.seen.lock().unwrap() = body.map(|b| b.0);
     *canned.seen_headers.lock().unwrap() = Some(headers);
-    (
+    let mut response = (
         axum::http::StatusCode::from_u16(canned.status).unwrap(),
         axum::Json(canned.body),
     )
+        .into_response();
+    if let Some(advice) = canned.advice {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static(advice),
+        );
+    }
+    response
 }
 
 /// Start a one-shot server and return its base URL.
@@ -108,6 +121,7 @@ fn canned_observed(status: u16, body: Value) -> (Canned, SeenBody, SeenHeaders) 
             body,
             seen: Arc::clone(&seen),
             seen_headers: Arc::clone(&seen_headers),
+            advice: None,
         },
         seen,
         seen_headers,
@@ -672,6 +686,63 @@ async fn rate_limiting_is_told_apart_from_refusal() {
         assert!(
             matches!(err, ModelError::RateLimited { .. }),
             "HTTP {status} was not read as rate limiting: {err}"
+        );
+    }
+}
+
+/// A named window survives the whole chain: header → driver → effect layer.
+///
+/// Every hop is a place the number can be dropped without anything failing,
+/// and the symptom of dropping it is not an error — it is a run that retries
+/// three times inside the window it was told to wait out and reports the
+/// provider as down. Driven through a real response rather than a hand-built
+/// `HeaderMap`, because the drop this guards against happened at the seam
+/// where the response is consumed for its body.
+#[tokio::test]
+async fn a_providers_retry_window_reaches_the_retry_loop() {
+    for (advice, want) in [
+        (Some("30"), Some(std::time::Duration::from_secs(30))),
+        // No advice is ordinary and means the effect's own schedule applies.
+        (None, None),
+        // Nothing this crate can act on: a date means trusting the provider's
+        // clock against ours, and zero would replace a backoff with no wait.
+        (Some("Wed, 21 Oct 2026 07:28:00 GMT"), None),
+        (Some("0"), None),
+    ] {
+        let (mut c, _) = canned(429, json!({ "error": { "message": "slow down" } }));
+        c.advice = advice;
+        let url = serve(c).await;
+        let provider = Anthropic::new("k").unwrap().base(url);
+
+        let err = provider
+            .complete(ask(&model(), &json!("x")))
+            .await
+            .unwrap_err();
+        let ModelError::RateLimited { retry_after, .. } = &err else {
+            panic!("HTTP 429 was not read as rate limiting: {err}");
+        };
+        assert_eq!(
+            retry_after.map(std::time::Duration::from_secs),
+            want,
+            "Retry-After: {advice:?} reached the driver as {retry_after:?}"
+        );
+
+        // And through the hop the retry loop actually reads: `ModelCall`'s own
+        // `Effect::perform`, which is where a driver's verdict becomes the
+        // failure the schedule is computed from. A window that stops here is a
+        // window nothing waits.
+        let fake = FakeProvider::new();
+        fake.will_fail(ModelError::RateLimited {
+            model: model(),
+            detail: "slow down".into(),
+            retry_after: retry_after.to_owned(),
+        });
+        let call = ModelCall::new(fake, model(), json!("x"));
+        let effect_error = agentplane::core::Effect::perform(&call).await.unwrap_err();
+        assert_eq!(
+            effect_error.retry_after(),
+            want,
+            "the window was dropped between the driver and the effect layer"
         );
     }
 }

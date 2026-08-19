@@ -22,9 +22,9 @@
 //! # Pure, and deliberately not in `core`
 //!
 //! This module makes no network calls: it answers *is this address one we are
-//! willing to reach*, given an address somebody else resolved. Resolution and
-//! connection pinning belong to the caller, because those need a runtime and a
-//! client.
+//! willing to reach*, given an address somebody else resolved. Resolution is
+//! `resolver`'s, which needs a runtime and a client and is therefore gated on a
+//! transport being linked.
 //!
 //! It still does not live in `core`, which may not reference `std::net` at all —
 //! a guard enforces that, and it caught this module on the way in. The rule is
@@ -47,6 +47,11 @@
 //! would simply not be used. With no allowlist set this list is the *only* lock
 //! on that path — which is why it is applied there unconditionally, and why a
 //! deployment that can name its peers should still name them.
+
+#[cfg(any(feature = "push", feature = "a2a"))]
+mod resolver;
+#[cfg(any(feature = "push", feature = "a2a"))]
+pub(crate) use resolver::{Reach, guarded_client, judge};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

@@ -32,11 +32,12 @@ archaeology presented as a record.
 
 ## [0.19.0] — 2026-08-19
 
-Four passes: two over the confidentiality layer — one over its rules, one over
+Six passes: two over the confidentiality layer — one over its rules, one over
 the bytes those rules turned out to imply something about — one over the
 outward-facing edges, the model providers and the two protocols this plane
-speaks, and one over memory, retrieval and the manifest surface in front of
-them.
+speaks, one over memory, retrieval and the manifest surface in front of them,
+one over outbound delivery and the event envelope at both ends of it, and one
+over how this plane *waits* and how it *connects*.
 
 The confidentiality passes each found a shape that was holding something else
 open: the first a release blocker, the second the format's own
@@ -69,6 +70,26 @@ had it: the innermost check is an AEAD, so a reader meeting a construction it
 did not know walked its own layout over somebody else's and reported *the
 sealed payload did not authenticate* — the sentence that means tampering.
 
+The last pass found three defects with one thing in common: **nothing could
+observe any of them**. A rate limit retried three times in a second is correct
+by its policy and reports the provider as down. A delivery sweep that serves
+receivers one at a time produces counters identical to one that does not. A
+fresh TLS handshake per webhook is a cost, not a failure. None of the three
+fails a test, appears in a report, or looks wrong when read — and all three are
+the plane doing exactly what it was told, at the edge where it talks to somebody
+else's server.
+
+The pattern is worth naming because it is not the usual one this document
+records. These are not claims that expired or rules implemented twice; they are
+**defaults that were never a decision** — a schedule computed because computing
+one is what retry loops do, a loop written sequentially because the first
+version had one row, a client rebuilt per request because a pin lives on a
+client. Each was right at the moment it was written and none was ever revisited.
+It is now shape 32 in the constitution's catalogue, and the entry says what
+finding it costs: the other shapes are found by re-reading a claim or diffing
+two implementations, and this one only by asking, of a mechanism nobody is
+complaining about, what one would write there today.
+
 The memory pass found one omission and one failure that could not fail.
 
 **The omission** was a whole half of a tier. A declarative agent could form
@@ -89,6 +110,286 @@ which has no threshold anybody can assert against in a test. This is now shape
 31 in the constitution's catalogue: a total operation cannot report a wrong
 input, so where one sits at a correctness boundary the check has to happen
 somewhere the operation is not.
+
+**The push pass found the same shape twice, on both sides of one envelope.**
+This plane emits `CloudEvents` and could not read one; it labelled every
+delivery `application/a2a+json`, including the structured-mode envelope it had
+just built, which is a valid event that reaches nothing that parses one. Both
+are the constitution's *a claim that nothing re-checks*: the concept document
+said inbound events "align to `CloudEvents` 1.0" and no code in the crate had
+ever parsed the envelope, so alignment meant a struct with similarly named
+fields. The consumer wrote the parser instead — and its version keyed
+deduplication on `id` alone, which is the exact collision the crate's own doc
+comment on `InboundEvent::source` warns about, three paragraphs of it, in the
+file the consumer never had to open.
+
+### Fixed — a rate limit was retried as if nobody knew when to come back
+
+Every HTTP driver classified a 429 as `RateLimited` and threw away the
+`Retry-After` beside it. The retry loop then computed its own schedule: with
+the default policy, three attempts inside about seven hundred milliseconds
+against a window measured in tens of seconds. Every attempt is refused, the
+effect fails, and the run reports the provider as down — while the provider had
+already said, in the response, exactly when it would answer.
+
+Nothing was broken by any local reading. The classification was right, the
+schedule was right for what it was, and the tests passed because a test that
+scripts a rate limit scripts one that clears. What was wrong is a **premise**:
+exponential backoff is a guess about when a service recovers, and it is the
+correct shape only where guessing is all anybody can do. A throttle is the one
+outbound failure in this crate where the peer knows the answer, and the runtime
+was declining to read it.
+
+`ModelError::RateLimited` and a new `EffectError::RateLimited` carry the
+window; `wire::classify_status` takes the response headers; and
+`RetryPolicy::wait_before` is the single place that chooses between the named
+window and the computed schedule. The parsing rule is `core::retry_after_seconds`,
+shared with push — delta-seconds only, because the HTTP-date form means trusting
+the peer's clock against ours, and zero because it would replace a backoff with
+no wait at all. Both read as *no advice*, identically to an absent header.
+
+**Two ceilings, and this is the part worth arguing.** The obvious
+implementation clamps advice to `max_backoff` and ships. That conflates two
+different risks under one number: `max_backoff` is small *because* a guess made
+in ignorance should not be long, and advice is not a guess. Clamping a peer's
+sixty-second window to a ten-second guess-ceiling reproduces the original defect
+with an extra step. So `RetryPolicy::max_advice` is its own ceiling, defaulting
+to a minute, and it bounds the thing that actually needs bounding — how long
+this plane will hold a worker on the word of a party with an interest in never
+being called again. Advice past it is **clamped, not discarded**: waiting part
+of a window is closer to right than ignoring it, and if the window really was
+longer the next refusal names what is left.
+
+What did **not** move is the boundary the retry module already drew. The wait is
+still in-process, so `max_advice` is also a bound on worker occupancy, and a
+rate limit measured in more than minutes is still not a retry — it is
+`cx.sleep()`, which costs a row instead of a thread. Making the runtime suspend
+on a long window is a durable-format question (the wait would have to be
+journaled beside the failure that caused it, so replay consumes it in order),
+and it is recorded as one rather than half-built.
+
+The corroboration is Temporal's, which reached the same two-part answer from the
+other direction: its AI cookbook translates an HTTP `Retry-After` into
+`ApplicationError.next_retry_delay` and bounds what it will accept from the
+header, because the number comes from outside.
+
+### Fixed — one slow receiver decided when everybody else's events went out
+
+`DeliveryWorker::run_once` served its due registrations strictly in order. A
+receiver has fifteen seconds to answer, so four dead endpoints at the head of a
+page delayed every registration behind them by a minute — and a plane with more
+due rows than a tick can drain fell permanently behind on *all* of them because
+of the worst one.
+
+This was invisible in every test and in every report. The sweep's counters are
+identical whether it took a second or a minute, `saturated` describes the page
+and not the clock, and no assertion in the suite could have failed: sequential
+delivery is not wrong, it is slow, and slowness is the one property a test suite
+built on in-memory doubles cannot observe.
+
+Registrations share no cursor, no receiver and no task, so nothing about the
+cursor discipline requires them to be served in order — serving them in order
+requires only that every receiver be as fast as the slowest, which is not a
+property anybody can arrange. The sweep now fans out, bounded by
+`DeliveryWorker::max_in_flight` (16). Bounded rather than free because a sweep
+is the one place this runtime knows how much outbound work exists, and `limit`
+is a page size rather than a concurrency budget.
+
+Ordering **within** a registration is untouched and always will be: that loop is
+a cursor that may only move forward, and concurrency inside it would break the
+only thing a cursor means.
+
+The test is a rendezvous rather than a stopwatch — both deliveries must be in
+flight at once for a barrier to release — so a sequential worker deadlocks there
+instead of merely being slower. A timing assertion would have passed on a fast
+machine that ran them one after another, which is the shape of test this
+project treats as a test that cannot fail.
+
+### Changed — the address rule moved into the client, and the client is reused
+
+`PushSender` and `A2aClient` built a **fresh `reqwest::Client` for every
+request**. Not an oversight: pinning a connection to pre-approved addresses is
+how both stopped a name resolving somewhere else between the check and the
+connect, and a pin is a property of the client. Correct, and it meant a new
+connection pool, a new TLS session and a new handshake per delivery and per
+delegation — the difference between multiplexing over one connection and opening
+a socket per event, paid by exactly the two loops that repeat.
+
+The rule now lives in the client's own DNS resolver
+(`netguard::GuardedResolver`), so one pooled client serves a whole sweep. That
+keeps the guarantee and **strengthens** it: a pooled client opens connections
+long after any pre-flight returned, and those are precisely the ones a one-shot
+check never saw. Pinning covered the request it was computed for; the resolver
+covers every connection there will ever be.
+
+The pre-flight stays, and is not redundant. A DNS hook can only *fail*, so the
+resolver cannot say which refusal happened — and a forbidden address must not
+read as a receiver that is merely down, because one is never retried and the
+other always is. One rule (`netguard::judge`), called twice: once to decide what
+the operator is told, once to decide what the socket reaches. Two spellings of
+it would agree everywhere except the boundary nobody probed, which is the defect
+this crate has already shipped once in this exact area.
+
+**The mutation sweep is what settled the design here, and it is worth
+recording.** The first attempt kept the three settings that make a client
+guarded — the resolver, `no_proxy`, `redirect::none` — spelled out at each
+caller, with a mutation deleting the resolver line. It **survived**: every
+caller-level test still passed, because every caller also runs the pre-flight,
+and no test can make DNS answer one way for a check and another way for a
+connect. An enforcement whose removal nothing observes is the shape this project
+catalogues, so the wiring became structural instead: one `guarded_client`
+constructor, because the three settings are not independent — a proxy is
+resolved *instead of* the destination, so it makes the resolver unreachable, and
+a redirect makes the judged host the wrong host. A client with two of the three
+looks guarded and is not.
+
+That still leaves one testable claim, and it is the one that matters: a guarded
+client must fail to reach a server **genuinely listening on this machine**.
+There is no pre-flight in that test and a real listener is bound, so the default
+resolver would succeed — which is what makes the failure mean something. The
+mutation is killed by it.
+
+One visible consequence: a peer endpoint resolving inward is now
+`PeerError::Refused` rather than sometimes surfacing as `Unreachable` from the
+client build. `Refused` is `DidNotHappen` and never retried, which is the
+correct reading — a forbidden address does not become permitted by waiting.
+
+### Added — one `CloudEvents` envelope, in both directions
+
+`core::CloudEvent` parses a 1.0 message in structured **or** binary HTTP
+content mode, validates it, and emits one; `POST /events` accepts either
+alongside this plane's own shape, and `RunCompleted` builds its payload through
+the same type.
+
+One type rather than an emitter and a reader, because two ends written
+separately drift and nothing fails when they do: an emitter that sorts
+attributes one way, a reader that accepts an attribute nothing emits, and a
+media type that is a string literal in whichever file happened to need it. The
+round trip is now an assertion — what this plane emits is what it would accept.
+
+It **refuses** rather than guesses, and each refusal is a message that would
+otherwise be passed on unread: an unknown `specversion`; an empty or missing
+`id`, `source` or `type`; `data_base64`, because a payload here is a JSON value
+and decoding bytes to hand a run something it cannot address is a conversion
+nobody asked for; an extension name that is not lowercase alphanumeric, because
+a binding with case-insensitive keys delivers it under a different name; and a
+non-JSON `datacontenttype` in binary mode, because wrapping arbitrary bytes in
+a JSON string is a silent retype.
+
+On the way in, the `source` a run is woken under is still the authenticated
+caller and never the body's claim — a caller holding both halves of
+`(source, id)` can deduplicate against another party's messages by naming them.
+What is new is that the producer's claim is no longer *discarded* either: it
+rides inside the buffered event's id. A gateway authenticates as itself, so the
+transport identity cannot separate the producers behind it, and both of them
+number their messages from one. Keying on `id` alone drops the second
+counterparty's message as a retry of the first, silently, which is the failure
+`(source, id)` exists to prevent and the one the field translation kept
+reintroducing.
+
+Correlation keys are deliberately **not** derived from extension attributes. A
+CloudEvents extension is a flat lowercase string with no namespace, so any
+mapping would be this plane inventing a convention and citing the spec for it; a
+producer that must correlate posts the native shape, where the keys are stated.
+
+### Fixed — every push delivery announced the wrong media type
+
+`PushSender` hard-coded `Content-Type: application/a2a+json` for both
+namespaces. A2A's own webhook was correct; the operator outbox posted a
+`CloudEvents` structured-mode envelope under it, and every conformant receiver —
+Knative, Dapr, Event Grid, anything using a CloudEvents SDK — routes on that
+header. The event was well formed, the POST returned 2xx from a permissive
+receiver, and nothing anywhere reported that the envelope had not been
+recognised as one.
+
+The media type is now the payload's to state: `Projection::messages` returns
+`PushMessage`s that each carry one, `PushMessage::cloudevent` takes it and the
+message id from the event itself, and `RunCompleted` posts
+`application/cloudevents+json; charset=UTF-8`.
+
+A single hard-coded header was serviceable while one projection existed. It
+became wrong the moment a second joined the same loop, which is the general
+form: a constant that is correct because there is only one caller is a defect
+scheduled for whenever there are two.
+
+### Changed — body signing is Standard Webhooks, and covers the replay
+
+`Destination::signed_with(&secret)` — no header argument — and every delivery
+carries `webhook-id`, `webhook-timestamp` and, when a key is configured,
+`webhook-signature: v1,<base64>` of `HMAC-SHA256(key, "{id}.{timestamp}.{body}")`.
+
+The old scheme was `sha256=<hex>` over the body alone, in a header the operator
+named. Its own documentation stated the hole: no timestamp and no nonce in the
+signed input, so a captured POST replays forever and every check still passes —
+it is a genuine body, genuinely signed. The stated mitigation was that the
+receiver must deduplicate on the event's identity, which is true and is
+somebody else's discipline, asserted nowhere and defaulting to absent.
+
+Binding the id and the instant into the signature moves that from advice to
+mechanism: a receiver with a tolerance window and an idempotency key has a
+delivery that expires. Choosing the published spelling over a house one is the
+other half — a receiver verifies with a library it did not write, in whichever
+of the spec's eight languages it happens to be, rather than with twenty lines
+somebody transcribed from our documentation. The interoperability is pinned by
+the spec's own published example vector, not only by our own round trip.
+
+Two smaller consequences, both refusals at configuration: a key shorter than 24
+bytes is rejected where it is written, because a MAC key an attacker can search
+is a check that reads exactly like one that means something; and a secret
+spelled `whsec_<base64>` is decoded, because that form names base64 *of the key*
+and signing the prefixed text produces a MAC no conformant verifier accepts —
+a failure that would surface only as a receiver refusing everything, for a
+reason no log on this side explains.
+
+### Fixed — abandoning a push registration deleted the only cursor there was
+
+A receiver that answered permanently, or stayed silent past the retry ceiling,
+had its registration removed and a warning logged. The row *is* the cursor: it
+is the only record of how far that receiver got, so deleting it made the
+undelivered tail of that run unrecoverable without a scan nobody schedules. In
+the one subsystem whose argument is *the journal is the outbox, and a crash may
+repeat an event but cannot lose one*, the documented failure path lost events.
+
+Registrations are now **parked**: `PushStore::park` keeps the row and its
+cursor, `parked` lists them, `unpark` re-arms one at the record its receiver
+never acknowledged. A parked row is excluded from both due queries, so it costs
+no sweep — the objection that killed the obvious fix, a row retried until the
+journal is deleted, does not apply to a row that is not retried at all.
+`PushSweepReport::abandoned` is now `parked`, and both backends carry the flag
+(`push_delivery` gained a column and a partial due index).
+
+### Fixed — a receiver's answer was counted rather than read
+
+Three defects in one retry policy, each invisible in a test that only asserts a
+receiver eventually gets its event.
+
+**Every rejection was transient.** A receiver answering `410 Gone` — the status
+that means *this endpoint is retired* — was retried for the full ceiling like
+one that was rebooting. `410` is now permanent, and deliberately nothing else
+is: a 404 during a deploy and a 401 while a credential rotates are answers that
+change, and parking a run's events on the first of them loses more than the
+wasted retries cost.
+
+**`Retry-After` was discarded.** A receiver naming its own recovery is the one
+party who knows, and a sender that overrides it with a fixed schedule is
+choosing to be told twice. It is now honoured — and bounded to an hour, because
+it is advice from the one party with an interest in never being called again.
+Only the delta-seconds form is read; acting on the HTTP-date form means trusting
+the receiver's clock against ours.
+
+**The backoff had no spread.** Every registration pointed at one receiver fails
+in the same sweep and was scheduled to return at the same instant, so the moment
+that receiver recovered it was hit by its entire backlog at once — a recovering
+service knocked over by the sender that had been waiting politely for it. The
+delay is now drawn from the lower half of the window, offset by a hash of the
+registration and its attempt count. Derived rather than random because
+`run_once` takes its clock from the caller precisely so a schedule is
+reproducible: a random draw would make every backoff assertion in this crate
+unwritable, which is how the omission survived.
+
+The retry ceiling's documentation also claimed "a little over two hours" for
+32 attempts. The schedule sums to about an hour and forty at most. A number in
+prose that no test reads is the same shape as the media type above.
 
 ### Added — `spec.memory.recall`, so a declarative agent can read what it wrote
 

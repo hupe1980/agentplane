@@ -15,6 +15,227 @@ property that makes a hard cut acceptable at this stage.
 
 ---
 
+## `RetryPolicy` gained `max_advice`, and rate limits carry a window
+
+**Affected:** anything constructing a `RetryPolicy` with struct literal syntax,
+anything matching exhaustively on `EffectError`, and any `ModelProvider`
+implementation that builds `ModelError::RateLimited`.
+
+A computed backoff is a guess about when a service recovers. A throttle is the
+one failure where nobody has to guess — and a schedule whose ceiling is smaller
+than the window it retries against spends every attempt inside that window and
+then reports the peer as down. The provider's `Retry-After` is now read, carried
+and honoured.
+
+```rust
+// before — the header was parsed by nothing and the schedule was always computed
+RetryPolicy { max_attempts: 4, initial_backoff, max_backoff, multiplier: 2, jitter: true }
+
+// after — `..Default::default()` picks up the new ceiling
+RetryPolicy { max_attempts: 4, initial_backoff, max_backoff, multiplier: 2, jitter: true,
+              ..RetryPolicy::default() }
+
+// or set it deliberately
+RetryPolicy::attempts(4).wait_at_most(Duration::from_secs(45))
+```
+
+`max_advice` is a **second** ceiling on purpose, defaulting to 60 s. It bounds
+what a *peer* may ask for, where `max_backoff` bounds what this runtime guesses
+for itself; sharing one would mean either guessing for as long as a stranger may
+demand, or discarding advice merely because it is longer than a guess would have
+been. Advice past it is clamped, not discarded.
+
+`EffectError` gained a variant, and `ModelError::RateLimited` gained a field:
+
+```rust
+// before
+Err(EffectError::Rejected("429 slow down".into()))
+ModelError::RateLimited { model, detail }
+
+// after — the window rides along, and `None` is the ordinary case
+Err(EffectError::RateLimited { detail: "429 slow down".into(),
+                               retry_after: Some(Duration::from_secs(30)) })
+ModelError::RateLimited { model, detail, retry_after: Some(30) }
+```
+
+A driver with nothing to report passes `None` and gets the computed schedule,
+which is what `Rejected` did before. `EffectError` is `#[non_exhaustive]`, so a
+match with a `_` arm still builds; one without will not, which is the intended
+way to find the sites that should now distinguish a wait from a fault.
+
+Only the delta-seconds form of `Retry-After` is read. The HTTP-date form is
+legal and deliberately ignored — acting on it means trusting the peer's clock
+against ours — and so is `0`, which would replace a backoff with no wait at all.
+Both read as *no advice*, identically to an absent header.
+
+`wire::classify_status` takes the response headers, so a custom HTTP driver
+calling it needs one more argument:
+
+```rust
+// before
+classify_status(model, status.as_u16(), &body)
+
+// after — grab the headers before the body consumes the response
+let headers = response.headers().clone();
+let body = response.text().await.unwrap_or_default();
+classify_status(model, status.as_u16(), &headers, &body)
+```
+
+---
+
+## Push delivery: a sweep is concurrent, and outbound clients are pooled
+
+**Affected:** deployments tuning `DeliveryWorker`, and anything that relied on
+one sweep contacting receivers in a fixed order.
+
+`DeliveryWorker::run_once` serves its due registrations concurrently, bounded by
+`DeliveryWorker::max_in_flight` (16 by default). It was strictly sequential,
+which meant one receiver sitting on its fifteen-second timeout decided when
+every other registration got its events.
+
+```rust
+// a deployment that wants the old behaviour back, or a tighter bound
+DeliveryWorker::new(journal, store, transport, projection).max_in_flight(1)
+```
+
+Ordering *within* a registration is unchanged and always will be: that loop is a
+cursor that may only move forward.
+
+`PushSender` and `A2aClient` now build **one pooled `reqwest::Client`** each
+instead of one per request. The SSRF rule moved from a per-request address pin
+into the client's own DNS resolver, so every name the pool resolves is judged —
+including on connections opened long after a caller's pre-flight returned, which
+a pin never covered. Nothing in the public API changed; what changes is that a
+sweep to the same receiver reuses its connection and its TLS session.
+
+One consequence worth stating: a peer endpoint that resolves inward is now
+`PeerError::Refused` rather than sometimes surfacing as an `Unreachable` from
+the client build. `Refused` is `DidNotHappen` and never retried, which is the
+correct reading — a forbidden address does not become permitted by waiting.
+
+---
+
+## Push delivery: `Projection` produces messages, and signing is Standard Webhooks
+
+**Affected:** every custom `Projection`, every custom `PushTransport`, and every
+`Destination::signed_with` call.
+
+A projection now returns a `PushMessage` rather than a bare `Value`, because a
+payload has two facts the loop cannot supply: what media type it is, and what
+identity a receiver deduplicates it by.
+
+```rust
+// before
+async fn payloads(&self, record: &Record) -> Result<Vec<Value>, StoreError> {
+    Ok(vec![json!({ "run": record.body.run.to_string() })])
+}
+
+// after
+async fn messages(&self, record: &Record) -> Result<Vec<PushMessage>, StoreError> {
+    Ok(vec![PushMessage::json(
+        record.body.run.to_string(),
+        json!({ "run": record.body.run.to_string() }),
+    )])
+}
+```
+
+`PushMessage::json` sends `application/json`; `PushMessage::cloudevent(&event)`
+takes the media type and the id from the event itself; `.typed("…")` overrides
+the media type. `PushTransport::deliver` gained the same message plus the
+attempt's instant in Unix seconds, which is what the signature binds.
+
+The delivered media type was previously `application/a2a+json` for **every**
+destination, including an operator's `CloudEvents` outbox — a structured-mode
+event under that type is a valid event no CloudEvents receiver routes on.
+`RunCompleted` now posts `application/cloudevents+json; charset=UTF-8`.
+
+Signing changed shape:
+
+```rust
+// before — sha256=<hex> over the body, in a header you chose
+.signed_with("X-Mako-Signature", Secret::new(key))
+
+// after — Standard Webhooks
+.signed_with(&Secret::new(key))
+```
+
+Deliveries now carry `webhook-id`, `webhook-timestamp` and (when signed)
+`webhook-signature: v1,<base64>` of `HMAC-SHA256(key, "{id}.{timestamp}.{body}")`.
+Two things follow for a receiver you control:
+
+- **Rewrite the verifier**, or drop in a [Standard Webhooks] library — the point
+  of the published spelling is that you no longer have to write one.
+- **Keys must be at least 24 bytes**, refused at configuration if not. A secret
+  spelled `whsec_<base64>` names base64 *of the key*; anything else is the key
+  itself.
+
+The old scheme MACed the body alone, so a captured POST replayed forever and
+nothing but receiver-side deduplication closed it. The id and the timestamp are
+now inside the signed content, so a tolerance window works.
+
+[Standard Webhooks]: https://www.standardwebhooks.com/
+
+---
+
+## A failed push registration is parked, not deleted
+
+**Affected:** anything implementing `PushStore`, and anything reading
+`PushSweepReport::abandoned`.
+
+`PushStore` gained `park`, `parked` and `unpark`; `retry` and `advance` must
+clear the parked flag. `PushSweepReport::abandoned` is now `parked`.
+
+A receiver that answered permanently or outlasted the retry ceiling used to have
+its registration **deleted**, which discarded the cursor — the only record of how
+far that receiver got. The undelivered tail of that run was then unrecoverable
+without a scan nobody schedules. Parking keeps the row and takes it out of the
+due order:
+
+```rust
+for row in store.parked(100).await? {
+    store.unpark(row.config.task, &row.config.id, now_secs).await?;
+}
+```
+
+Both backends changed accordingly — the `push_delivery` table gained a `parked`
+column and its due index is now partial. There is no migration: pre-alpha, and
+the schema is created as written.
+
+While here, the retry policy grew three answers it did not have. `410 Gone` is
+permanent (nothing else is — a 404 mid-deploy and a 401 mid-rotation are answers
+that change); `Retry-After` is honoured up to an hour; and the exponential
+schedule is spread by a hash of the registration, so a receiver coming back is
+not hit by its whole backlog at one instant. The spread is derived rather than
+random because `run_once` takes its clock from the caller precisely so a schedule
+is reproducible.
+
+---
+
+## `POST /events` accepts CloudEvents
+
+**Affected:** nobody — this is an addition. It is here because it changes what a
+deployment should be sending.
+
+The plane emits a structured-mode CloudEvent per sealed run and could not read
+one. Every deployment whose producers speak CloudEvents translated the envelope
+by hand, and the translations agreed on getting the deduplication identity
+wrong: they keyed on `id` alone, which is unique only within one producer.
+
+`POST /events` now takes either content mode, and `core::CloudEvent` is the
+envelope for both directions:
+
+```rust
+let event = CloudEvent::from_http(headers, &body)?;   // structured or binary
+let inbound = event.into_inbound(peer_source(&caller));
+```
+
+The `source` a run is woken under is still the authenticated caller — a body may
+not choose it. The producer's own `source` survives inside the buffered id, so a
+gateway relaying two counterparties that both number from one delivers two
+events.
+
+---
+
 ## `spec.memory_formation` moved under `spec.memory`, which also reads
 
 **Affected:** every manifest declaring `memory_formation`.

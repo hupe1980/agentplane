@@ -1143,6 +1143,152 @@ async fn a_delivered_events_source_is_the_authenticated_caller() {
     );
 }
 
+/// A bus posts a `CloudEvent`, and the plane accepts one.
+///
+/// The envelope this plane **emits** — `RunCompleted` posts a structured-mode
+/// `CloudEvent` per sealed run — is the envelope its own event route refused
+/// to read, so every deployment whose producers speak `CloudEvents` had to
+/// translate one by hand. The translations in the field agreed on getting the
+/// deduplication identity wrong: they keyed on `id` alone, which is unique only
+/// within one producer.
+///
+/// Both content modes are accepted, because a bus chooses which it sends and
+/// the receiver does not get a vote.
+#[tokio::test]
+async fn a_cloudevent_is_accepted_in_either_content_mode() {
+    let f = fixture();
+    let router = f.router();
+
+    let structured = Request::builder()
+        .uri("/events")
+        .method("POST")
+        .header(
+            "content-type",
+            "application/cloudevents+json; charset=UTF-8",
+        )
+        .header("x-actor", "bob")
+        .body(Body::from(
+            json!({
+                "specversion": "1.0",
+                "id": "ce-1",
+                "source": "/edmd",
+                "type": "acknowledgement.received",
+                "data": {"ok": true}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let (status, body) = send(&router, structured).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["delivery"], "buffered");
+
+    // The same event again, this time in binary mode. A producer that switched
+    // modes did not produce a second event, and a receiver that thought so
+    // would run the same work twice.
+    let binary = Request::builder()
+        .uri("/events")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("ce-specversion", "1.0")
+        .header("ce-id", "ce-1")
+        .header("ce-source", "/edmd")
+        .header("ce-type", "acknowledgement.received")
+        .header("x-actor", "bob")
+        .body(Body::from(r#"{"ok":true}"#))
+        .unwrap();
+    let (status, body) = send(&router, binary).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["delivery"], "duplicate",
+        "the two content modes of one event were taken as two events: {body}"
+    );
+}
+
+/// Two producers behind one gateway are two producers.
+///
+/// This is the whole reason `CloudEvents` defines uniqueness as `(source, id)`
+/// and not as `id`. A relay authenticates as itself, so the transport identity
+/// cannot separate the producers behind it — and both of them number their
+/// messages from one. Keying on `id` alone silently drops the second
+/// counterparty's message as a retry of the first.
+#[tokio::test]
+async fn two_producers_behind_one_gateway_do_not_collide() {
+    let f = fixture();
+    let router = f.router();
+
+    let from = |source: &str| {
+        Request::builder()
+            .uri("/events")
+            .method("POST")
+            .header("content-type", "application/cloudevents+json")
+            .header("x-actor", "gateway")
+            .body(Body::from(
+                json!({
+                    "specversion": "1.0",
+                    "id": "1",
+                    "source": source,
+                    "type": "acknowledgement.received",
+                    "data": {}
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let (_, first) = send(&router, from("/edmd")).await;
+    assert_eq!(first["delivery"], "buffered");
+    let (_, second) = send(&router, from("/erp")).await;
+    assert_ne!(
+        second["delivery"], "duplicate",
+        "a second producer's message was swallowed as a retry of the first: \
+         {second}"
+    );
+    let (_, retry) = send(&router, from("/edmd")).await;
+    assert_eq!(
+        retry["delivery"], "duplicate",
+        "a genuine retry was taken as a new event: {retry}"
+    );
+}
+
+/// An envelope this plane has not understood is refused, not guessed at.
+#[tokio::test]
+async fn a_cloudevent_this_plane_cannot_read_is_refused() {
+    let f = fixture();
+    let router = f.router();
+
+    for (label, body) in [
+        (
+            "another spec version",
+            json!({"specversion": "0.3", "id": "1", "source": "/x", "type": "t"}),
+        ),
+        (
+            "no id",
+            json!({"specversion": "1.0", "source": "/x", "type": "t"}),
+        ),
+        (
+            "binary data a run cannot address",
+            json!({
+                "specversion": "1.0", "id": "1", "source": "/x", "type": "t",
+                "data_base64": "aGk="
+            }),
+        ),
+    ] {
+        let request = Request::builder()
+            .uri("/events")
+            .method("POST")
+            .header("content-type", "application/cloudevents+json")
+            .header("x-actor", "bob")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, answer) = send(&router, request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label} was accepted: {answer}"
+        );
+    }
+}
+
 // ── Serving several tenants from one process ────────────────────────────────
 
 /// An authenticated caller reaches their own tenant's runs and no others.

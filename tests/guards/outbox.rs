@@ -33,9 +33,16 @@ use serde_json::{Value, json};
 struct Recording {
     payloads: Mutex<Vec<(String, Value)>>,
     failures: Mutex<u32>,
+    /// What to answer instead of an unreachable receiver, if anything.
+    answer: Mutex<Option<Delivered>>,
 }
 
 impl Recording {
+    fn answering(&self, answer: Delivered) {
+        *self.answer.lock().unwrap() = Some(answer);
+        *self.failures.lock().unwrap() = u32::MAX;
+    }
+
     fn fail_next(&self, n: u32) {
         *self.failures.lock().unwrap() = n;
     }
@@ -50,17 +57,27 @@ impl PushTransport for Recording {
         Ok(())
     }
 
-    async fn deliver(&self, config: &PushConfig, payload: &Value) -> Result<Delivered, PushError> {
+    async fn deliver(
+        &self,
+        config: &PushConfig,
+        message: &agentplane::push::PushMessage,
+        _at: u64,
+    ) -> Result<Delivered, PushError> {
         let mut failures = self.failures.lock().unwrap();
         if *failures > 0 {
-            *failures -= 1;
-            return Ok(Delivered::Unreachable("the bus is restarting".to_owned()));
+            *failures = failures.saturating_sub(1);
+            return Ok(self
+                .answer
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| Delivered::Unreachable("the bus is restarting".to_owned())));
         }
         drop(failures);
         self.payloads
             .lock()
             .unwrap()
-            .push((config.id.clone(), payload.clone()));
+            .push((config.id.clone(), message.payload.clone()));
         Ok(Delivered::Accepted)
     }
 }
@@ -197,6 +214,169 @@ async fn two_destinations_are_delivered_to_independently() {
     let mut ids: Vec<String> = f.transport.seen().into_iter().map(|(id, _)| id).collect();
     ids.sort();
     assert_eq!(ids, vec!["operator:audit", "operator:bus"]);
+}
+
+/// A slow receiver does not hold the sweep against everybody else.
+///
+/// The property under test is not a speed-up, it is **isolation**: one endpoint
+/// sitting on its timeout must not decide when every other registration gets
+/// its events. A sequential sweep serves the slow one to completion first, so
+/// the second delivery cannot begin until the first ends — and a plane with
+/// more receivers than one tick can drain falls permanently behind on all of
+/// them because of the worst one.
+///
+/// Written as a rendezvous rather than as a stopwatch: both deliveries must be
+/// **in flight at once** for the barrier to release, so a sequential worker
+/// deadlocks here instead of merely being slower. A timing assertion would pass
+/// on a fast machine that ran them one after another.
+#[tokio::test]
+async fn one_stalled_receiver_does_not_hold_up_the_others() {
+    /// Blocks every delivery until as many are in flight as the barrier wants.
+    #[derive(Debug)]
+    struct Rendezvous {
+        gate: tokio::sync::Barrier,
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PushTransport for Rendezvous {
+        fn validate(&self, _config: &PushConfig) -> Result<(), PushError> {
+            Ok(())
+        }
+
+        async fn deliver(
+            &self,
+            config: &PushConfig,
+            _message: &agentplane::push::PushMessage,
+            _at: u64,
+        ) -> Result<Delivered, PushError> {
+            self.gate.wait().await;
+            self.seen.lock().unwrap().push(config.id.clone());
+            Ok(Delivered::Accepted)
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let outbox = Arc::new(Outbox::new(
+        Arc::clone(&store) as Arc<dyn PushStore>,
+        vec![
+            Destination::new("slow", "https://slow.internal/events"),
+            Destination::new("quick", "https://quick.internal/events"),
+        ],
+    ));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Answers)
+        .outbox(outbox)
+        .try_build()
+        .expect("a coherent plane");
+    rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+        .await
+        .expect("the run completes");
+
+    let transport = Arc::new(Rendezvous {
+        gate: tokio::sync::Barrier::new(2),
+        seen: Mutex::new(Vec::new()),
+    });
+    let worker = DeliveryWorker::new(
+        Arc::clone(rt.journal()),
+        Arc::clone(&store) as Arc<dyn PushStore>,
+        Arc::clone(&transport) as Arc<dyn PushTransport>,
+        Arc::new(RunCompleted::new("urn:mako:agentd")),
+    );
+
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), worker.run_once(10, 10))
+        .await
+        .expect(
+            "the sweep never finished: two registrations were both due and only one was ever in \
+             flight, so a receiver that does not answer decides when the rest of the plane's \
+             events go out",
+        )
+        .expect("a sweep");
+    assert_eq!(report.deliveries, 2);
+    assert_eq!(transport.seen.lock().unwrap().len(), 2);
+}
+
+/// Concurrency is bounded, so a backlog is not answered with a socket per row.
+///
+/// The ceiling is what makes the fan-out safe to leave on: a sweep is the one
+/// place this crate knows how much outbound work exists, and `limit` is a page
+/// size rather than a concurrency budget.
+#[tokio::test]
+async fn a_sweep_opens_no_more_connections_than_its_ceiling() {
+    /// Counts how many deliveries were in flight at the high-water mark.
+    #[derive(Debug, Default)]
+    struct HighWater {
+        live: Mutex<usize>,
+        peak: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PushTransport for HighWater {
+        fn validate(&self, _config: &PushConfig) -> Result<(), PushError> {
+            Ok(())
+        }
+
+        async fn deliver(
+            &self,
+            _config: &PushConfig,
+            _message: &agentplane::push::PushMessage,
+            _at: u64,
+        ) -> Result<Delivered, PushError> {
+            {
+                let mut live = self.live.lock().unwrap();
+                *live += 1;
+                let mut peak = self.peak.lock().unwrap();
+                *peak = (*peak).max(*live);
+            }
+            // A real suspension, not `yield_now`: a self-waking yield goes
+            // straight back on the ready queue, so the peak it measures is the
+            // executor's polling order rather than how many deliveries the
+            // sweep permitted to be outstanding.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            *self.live.lock().unwrap() -= 1;
+            Ok(Delivered::Accepted)
+        }
+    }
+
+    let destinations: Vec<Destination> = (0..8)
+        .map(|n| Destination::new(format!("bus{n}"), format!("https://bus{n}.internal/events")))
+        .collect();
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let outbox = Arc::new(Outbox::new(
+        Arc::clone(&store) as Arc<dyn PushStore>,
+        destinations,
+    ));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Answers)
+        .outbox(outbox)
+        .try_build()
+        .expect("a coherent plane");
+    rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+        .await
+        .expect("the run completes");
+
+    let transport = Arc::new(HighWater::default());
+    let worker = DeliveryWorker::new(
+        Arc::clone(rt.journal()),
+        Arc::clone(&store) as Arc<dyn PushStore>,
+        Arc::clone(&transport) as Arc<dyn PushTransport>,
+        Arc::new(RunCompleted::new("urn:mako:agentd")),
+    )
+    .max_in_flight(3);
+
+    let report = worker.run_once(10, 10).await.expect("a sweep");
+    assert_eq!(report.deliveries, 8, "every destination is still served");
+    let peak = *transport.peak.lock().unwrap();
+    assert!(
+        peak <= 3,
+        "{peak} deliveries were in flight at once against a ceiling of 3 — an \
+         unbounded fan-out answers a backlog by opening a connection per row"
+    );
+    assert!(
+        peak > 1,
+        "the ceiling was never reached ({peak} at the peak), so this test would \
+         pass against a sweep that serves one receiver at a time"
+    );
 }
 
 /// Registration happens at admission, so no record can be missed.
@@ -419,7 +599,14 @@ async fn an_operator_sender_reaches_a_private_plaintext_address() {
         .expect("an operator URL needs no host grant and no https");
     // Nothing is listening on port 1, so the *outcome* is unreachable — which is
     // a transport answer, not a refusal. The refusal is what is being ruled out.
-    match operator.deliver(&config, &json!({ "ping": true })).await {
+    match operator
+        .deliver(
+            &config,
+            &agentplane::push::PushMessage::json("ping", json!({ "ping": true })),
+            0,
+        )
+        .await
+    {
         Ok(Delivered::Unreachable(_)) => {}
         other => panic!("an operator destination was refused rather than dialled: {other:?}"),
     }
@@ -454,4 +641,222 @@ fn an_operator_url_must_still_be_a_url() {
         <PushSender as PushTransport>::validate(&operator, &config),
         Err(PushError::Malformed(_))
     ));
+}
+
+// ── What a receiver's answer means ──────────────────────────────────────────
+
+/// **410 Gone** is the one rejection no wait improves; every other is a wait.
+///
+/// The distinction is the whole reason a status is read rather than counted. A
+/// receiver that has been retired says so — retrying it for two hours is work
+/// nobody wanted, and it buries the one signal an operator could have acted on.
+/// A 500 is the opposite claim: a receiver mid-deploy, mid-rotation or
+/// mid-upgrade answers 4xx and 5xx routinely, and parking a run's events on the
+/// first of those loses more than the wasted retries cost.
+#[tokio::test]
+async fn a_gone_receiver_is_parked_at_once_and_a_failing_one_is_not() {
+    for (answer, parked, retries) in [
+        (
+            Delivered::Rejected {
+                status: 410,
+                retry_after: None,
+            },
+            1,
+            0,
+        ),
+        (
+            Delivered::Rejected {
+                status: 500,
+                retry_after: None,
+            },
+            0,
+            1,
+        ),
+        (
+            Delivered::Rejected {
+                status: 404,
+                retry_after: None,
+            },
+            0,
+            1,
+        ),
+    ] {
+        let f = fixture(vec![Destination::new("bus", "https://bus.internal/events")]);
+        f.transport.answering(answer.clone());
+        f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+            .await
+            .expect("the run completes");
+
+        let report = f.worker().run_once(10, 10).await.expect("a sweep");
+        assert_eq!(
+            (report.parked, report.retries),
+            (parked, retries),
+            "{answer:?} was classified wrongly: {report:?}"
+        );
+    }
+}
+
+/// A receiver naming its own recovery is believed, within a bound.
+///
+/// `Retry-After` on a 429 or a 503 is the one party who knows saying when to
+/// come back, and a sender that overrides it with a fixed schedule is choosing
+/// to be told twice. It is still *advice* from the only party with an interest
+/// in never being called again, so it is clamped — a hostile or broken value
+/// costs an hour, not the life of the deployment.
+#[tokio::test]
+async fn a_receivers_retry_after_is_honoured_and_bounded() {
+    for (advice, expected) in [
+        (Some(90), 90),
+        (Some(u64::MAX), DeliveryWorker::MAX_RETRY_AFTER),
+        (Some(0), 1),
+    ] {
+        let f = fixture(vec![Destination::new("bus", "https://bus.internal/events")]);
+        f.transport.answering(Delivered::Rejected {
+            status: 503,
+            retry_after: advice,
+        });
+        f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+            .await
+            .expect("the run completes");
+        assert_eq!(f.worker().run_once(10, 10).await.unwrap().retries, 1);
+
+        // Not due one second early, and due on the instant it named.
+        assert!(
+            PushStore::due(&*f.store, 10 + expected - 1, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a receiver that asked for {advice:?} seconds was called back early"
+        );
+        assert_eq!(
+            PushStore::due(&*f.store, 10 + expected, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a receiver that asked for {advice:?} seconds was not called back at all"
+        );
+    }
+}
+
+/// Registrations that failed together do not come back together.
+///
+/// Every destination pointed at one receiver fails in the same sweep, so an
+/// undithered schedule sends all of them back at the same instant — and the
+/// moment the receiver recovers it is hit by its whole backlog at once. That is
+/// how a recovering service is knocked over by the sender that was waiting
+/// politely for it.
+///
+/// The spread is derived from the registration rather than drawn at random,
+/// because `run_once` takes its clock from the caller precisely so a schedule
+/// is reproducible. Both halves are asserted: that the instants differ, and
+/// that the same rows under the same clock produce the same instants — the
+/// second is what makes every other backoff assertion in this crate writable.
+#[tokio::test]
+async fn registrations_that_failed_together_do_not_come_back_together() {
+    let f = fixture(
+        (0..8)
+            .map(|n| Destination::new(format!("bus-{n}"), "https://bus.internal/events"))
+            .collect(),
+    );
+    f.transport.fail_next(u32::MAX);
+    let run =
+        f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+            .await
+            .expect("the run completes");
+
+    // Six sweeps, so the window is wide enough for a spread to be visible at
+    // all: the first windows are one and two seconds.
+    let sweep_all = || async {
+        let mut at = 10u64;
+        for _ in 0..6 {
+            f.worker().run_once(at, 10).await.expect("a sweep");
+            at += 4096;
+        }
+        let mut instants: Vec<u64> = PushStore::due(&*f.store, u64::MAX, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.next_attempt_at)
+            .collect();
+        instants.sort_unstable();
+        instants
+    };
+
+    let first = sweep_all().await;
+    assert_eq!(first.len(), 8, "the fixture did not back all eight off");
+    let distinct: std::collections::BTreeSet<_> = first.iter().collect();
+    assert!(
+        distinct.len() > 1,
+        "eight registrations against one receiver all return at the same \
+         instant, which is a thundering herd aimed at a service that just \
+         came back: {first:?}"
+    );
+
+    // `put` preserves the cursor and clears the attempt count, so the same
+    // rows are wound back to where the first pass started.
+    for config in f.store.list(run.run_id).await.expect("the registrations") {
+        f.store.put(&config, 1).await.expect("a reset");
+    }
+    assert_eq!(
+        first,
+        sweep_all().await,
+        "the same registrations under the same clock produced a different \
+         schedule, so no backoff assertion in this crate can be written"
+    );
+}
+
+/// Parking keeps the cursor, and re-arming resumes from it.
+///
+/// This is the difference between a backlog and a loss. The cursor is the only
+/// record of how far a receiver got; deleting the row on the retry ceiling
+/// makes the undelivered tail of that run unrecoverable without a scan nobody
+/// schedules, and leaves an operator who fixed the receiver with nothing to
+/// resume.
+#[tokio::test]
+async fn a_parked_registration_keeps_its_cursor_and_can_be_re_armed() {
+    let f = fixture(vec![Destination::new("bus", "https://bus.internal/events")]);
+    f.transport.answering(Delivered::Rejected {
+        status: 410,
+        retry_after: None,
+    });
+    f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+        .await
+        .expect("the run completes");
+    assert_eq!(f.worker().run_once(10, 10).await.unwrap().parked, 1);
+
+    let parked = f.store.parked(10).await.expect("the parked list");
+    assert_eq!(parked.len(), 1, "the row was deleted, not parked");
+    assert_eq!(parked[0].config.id, "operator:bus");
+    assert!(
+        parked[0]
+            .last_error
+            .as_ref()
+            .is_some_and(|error| error.contains("410")),
+        "a parked row says nothing about why: {parked:?}"
+    );
+    assert!(
+        PushStore::due(&*f.store, u64::MAX, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a parked registration is still swept, so it costs a tick forever"
+    );
+
+    // The receiver comes back. Delivery resumes at the record it never took.
+    *f.transport.answer.lock().unwrap() = None;
+    f.transport.fail_next(0);
+    assert!(
+        f.store
+            .unpark(parked[0].config.task, "operator:bus", 20)
+            .await
+            .unwrap()
+    );
+    let recovered = f.worker().run_once(20, 10).await.expect("a sweep");
+    assert_eq!(
+        (recovered.deliveries, recovered.completed),
+        (1, 1),
+        "an unparked registration did not resume: {recovered:?}"
+    );
+    assert_eq!(f.transport.seen().len(), 1);
 }

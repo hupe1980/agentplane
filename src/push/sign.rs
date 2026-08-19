@@ -14,43 +14,37 @@
 //!
 //! A body signature is a different claim, and a narrower one.
 //!
-//! # What the signature proves
+//! # [Standard Webhooks], rather than a house convention
 //!
-//! `HMAC-SHA256(secret, body)` over the **exact bytes posted**, sent as
-//! `sha256=<lowercase hex>`. A receiver that recomputes it and finds a match
-//! learns exactly one thing: *this byte string was written by a holder of the
-//! shared secret, and reached me unaltered and untruncated*. That is the claim
-//! embedders' other outbound webhooks make, and the reason it is worth having
-//! beside the bearer token rather than instead of it — the token authenticates
-//! the connection, this authenticates the payload.
+//! Three headers ride with every delivery this plane signs:
 //!
-//! # What it does not prove, stated precisely
+//! * `webhook-id` — the message's own identity, stable across retries. It is
+//!   the receiver's idempotency key, and it is sent whether or not a
+//!   destination is signed, because at-least-once delivery makes duplicates
+//!   ordinary rather than exceptional.
+//! * `webhook-timestamp` — Unix seconds, the instant *this attempt* was made.
+//! * `webhook-signature` — `v1,<base64>` of `HMAC-SHA256(key, "{id}.{timestamp}.{body}")`.
 //!
-//! * **Freshness.** There is no timestamp and no nonce in the signature's
-//!   input, so a delivery captured off the wire (or replayed by any hop that
-//!   holds a copy) can be posted again in an hour or in a year, and every check
-//!   still passes — it is a genuine body, genuinely signed. Nothing here
-//!   expires, and a receiver that treats "signature valid" as "this just
-//!   happened" is wrong. The only thing that closes replay is the receiver
-//!   deduplicating on the **delivery's own identity**, which the signature
-//!   cannot supply.
+//! The id and the timestamp are inside the signed content, which is the point
+//! of the construction: a signature over the body alone is replayable forever,
+//! because a captured POST stays a genuine body genuinely signed. With both
+//! bound in, a receiver that refuses timestamps outside a tolerance window and
+//! deduplicates on `webhook-id` has a delivery that expires. Neither half works
+//! alone — the window bounds how long a replay is useful, the id stops it
+//! inside the window.
 //!
-//!   Whether the payload *carries* such an identity is a property of the
-//!   [`Projection`](super::Projection), not of this module, so it is worth
-//!   saying which is true here:
-//!   [`RunCompleted`](super::RunCompleted) carries `source` plus `id` — the run
-//!   id — which is `CloudEvents`' uniqueness pair, so its deliveries **can** be
-//!   deduplicated, and already must be: at-least-once delivery repeats events
-//!   on an ordinary crash, so a receiver that cannot tell a duplicate from a
-//!   second event is broken before any attacker turns up. A projection an
-//!   embedder writes carries whatever that embedder put in it; one whose
-//!   payloads hold nothing unique leaves a receiver with nothing to dedup on,
-//!   and a signature does not fill that hole.
+//! Choosing the published spelling over a house one is what lets a receiver
+//! verify with a library it did not write. The alternative shape — `sha256=`
+//! hex over the bare body, the convention several vendors ship — is a signature
+//! this plane could produce and no off-the-shelf verifier could check against a
+//! replay.
 //!
-//! * **Who.** The secret is symmetric and shared, so it proves the writer was
-//!   *a* holder of it — this plane, the receiver itself, or anything holding
-//!   the configuration. It is not a signature in the public-key sense and
-//!   cannot be shown to a third party as evidence of origin.
+//! # What it still does not prove
+//!
+//! * **Who.** The key is symmetric and shared, so it proves the writer was *a*
+//!   holder of it — this plane, the receiver itself, or anything holding the
+//!   configuration. It is not a signature in the public-key sense and cannot be
+//!   shown to a third party as evidence of origin.
 //!
 //! * **Confidentiality.** The body still travels in whatever the URL's scheme
 //!   provides. Signing a plaintext delivery makes it unforgeable, not private.
@@ -62,31 +56,38 @@
 //!
 //! # One algorithm, and no enum to say so
 //!
-//! HMAC-SHA256, prefixed `sha256=` — the GitHub and Stripe convention, which is
-//! what receivers in the wild are already written against. There is deliberately
-//! no algorithm enum with one variant and no `X-…-Algorithm` header: both would
-//! be declarations that decide nothing today, and the wire format already
-//! carries the label. A second algorithm arrives as a second prefix a receiver
-//! can dispatch on, which is exactly what the prefix is for.
+//! `HMAC-SHA256` under the `v1` label. There is deliberately no algorithm enum
+//! with one variant and no `X-…-Algorithm` header: both would be declarations
+//! that decide nothing today, and the wire format already carries the label. A
+//! second algorithm arrives as a second label a receiver can dispatch on, which
+//! is exactly what the label is for — the spec's own `v1a` (Ed25519) is that
+//! door.
 //!
-//! # Why the construction is written out here
-//!
-//! There is no `hmac` crate in this tree, and `sha2` — which is here
-//! unconditionally, hashing every journal record — is a hash, not a MAC.
-//! The construction is `RustCrypto`'s `hmac`, not twenty-five lines of RFC 2104
-//! written out here. It was written out here first, and passed RFC 4231's
-//! vectors — which is the argument for keeping hand-rolled crypto and is not
-//! good enough for this crate: a substrate whose pitch is auditability should
-//! not ask a reviewer to check a MAC by eye when the audited implementation is
-//! already being compiled into the same binary (`ed25519-dalek`, `aws-sigv4`
-//! and `postgres-protocol` all pull it). The RFC 4231 vectors stayed, and now
-//! prove this crate *uses* the construction correctly — key handling included,
-//! which is the half a caller can still get wrong.
+//! [Standard Webhooks]: https://www.standardwebhooks.com/
 
+use base64::Engine as _;
 use hmac::{KeyInit, Mac, SimpleHmac};
 use sha2::Sha256;
 
 use crate::core::Secret;
+
+/// The message's own identity, and the receiver's idempotency key.
+pub const HEADER_ID: &str = "webhook-id";
+/// Unix seconds at which this attempt was made.
+pub const HEADER_TIMESTAMP: &str = "webhook-timestamp";
+/// `v1,<base64>` over `{id}.{timestamp}.{body}`.
+pub const HEADER_SIGNATURE: &str = "webhook-signature";
+
+/// The prefix Standard Webhooks gives a base64-encoded symmetric key.
+const SYMMETRIC_KEY_PREFIX: &str = "whsec_";
+
+/// The shortest key this accepts, in bytes.
+///
+/// The spec's range is 24–64 bytes. The floor is enforced and the ceiling is
+/// not: a key shorter than this is a MAC an attacker can search, while a longer
+/// one is only wasteful — HMAC hashes a key past the block size, which is a
+/// documented branch and not a weakness.
+const MIN_KEY_BYTES: usize = 24;
 
 /// RFC 2104 over SHA-256, as `hmac` implements it.
 ///
@@ -104,65 +105,91 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-/// A shared secret, and the header its signature rides in.
+/// A shared signing key.
 ///
 /// Constructed through [`Destination::signed_with`](super::Destination::signed_with)
-/// in the ordinary case. The secret is a [`Secret`], so it is redacted in
-/// `Debug` — including inside the [`Destination`](super::Destination) and the
-/// sender that hold it — and wiped when the last copy drops.
-#[derive(Debug, Clone)]
+/// in the ordinary case. The key is held as raw bytes rather than as the
+/// configured string, because a `whsec_`-prefixed secret names base64 of the
+/// key and not the key — signing the prefixed text would produce a MAC that
+/// every conformant verifier rejects, and the failure would surface only as a
+/// receiver refusing everything.
+#[derive(Clone)]
 pub struct BodySigning {
-    /// Parsed once, here, so the delivery path has no way to fail on it. A
-    /// header name that could only be rejected mid-POST would turn a typo in
-    /// the deployment's configuration into a delivery outcome, discovered by
-    /// whoever reads the retry counter.
-    header: reqwest::header::HeaderName,
-    secret: Secret,
+    key: Vec<u8>,
+}
+
+impl std::fmt::Debug for BodySigning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BodySigning")
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for BodySigning {
+    fn drop(&mut self) {
+        self.key.iter_mut().for_each(|byte| *byte = 0);
+    }
 }
 
 impl BodySigning {
+    /// Sign with `secret`.
+    ///
+    /// A secret spelled `whsec_<base64>` — Standard Webhooks' own form, and
+    /// what a receiver's library will be handed — is decoded, so both ends use
+    /// the same bytes. Any other string is the key itself.
+    ///
     /// # Panics
     ///
-    /// If `header` is not a valid HTTP field name, or `secret` is empty. Both
-    /// are configuration this deployment wrote about itself, and both would
-    /// otherwise fail at the far end of a run: an empty MAC key is a signature
-    /// anyone can compute, which is worse than no signature at all because the
-    /// receiver's check passes.
+    /// If the key is shorter than 24 bytes, or a `whsec_` secret is not
+    /// base64. Both are configuration this deployment wrote about itself, and
+    /// both would otherwise fail at the far end of a run: a short MAC key is a
+    /// signature that can be searched, and a check that can be defeated reads
+    /// exactly like one that means something.
     #[must_use]
-    pub fn new(header: impl Into<String>, secret: Secret) -> Self {
-        let header = header.into();
-        let name = reqwest::header::HeaderName::try_from(header.as_str()).unwrap_or_else(|_| {
-            panic!(
-                "push body-signing header '{header}' is not an HTTP field name, so \
-                 every delivery to this destination would fail at the POST"
-            )
-        });
-        assert!(
-            !secret.is_empty(),
-            "a push body-signing secret is empty: the receiver would verify a MAC \
-             anybody can compute, and a check that always passes reads exactly \
-             like one that means something"
+    pub fn new(secret: &Secret) -> Self {
+        let raw = secret.expose();
+        let key = raw.strip_prefix(SYMMETRIC_KEY_PREFIX).map_or_else(
+            || raw.as_bytes().to_vec(),
+            |encoded| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "a push signing secret beginning '{SYMMETRIC_KEY_PREFIX}' names \
+                             base64 of the key, and this one does not decode — every \
+                             delivery would carry a MAC the receiver's library rejects"
+                        )
+                    })
+            },
         );
-        Self {
-            header: name,
-            secret,
-        }
+        assert!(
+            key.len() >= MIN_KEY_BYTES,
+            "a push signing key of {} bytes is shorter than the {MIN_KEY_BYTES} \
+             Standard Webhooks requires: a MAC key an attacker can search is a \
+             check that reads exactly like one that means something",
+            key.len()
+        );
+        Self { key }
     }
 
-    /// The header this signature is sent in.
-    #[must_use]
-    pub fn header(&self) -> &str {
-        self.header.as_str()
-    }
-
-    pub(super) const fn header_name(&self) -> &reqwest::header::HeaderName {
-        &self.header
-    }
-
-    /// The header value for **these exact bytes**: `sha256=<lowercase hex>`.
-    pub(super) fn value_for(&self, body: &[u8]) -> String {
-        let mac = hmac_sha256(self.secret.expose().as_bytes(), body);
-        format!("sha256={}", hex::encode(mac))
+    /// The `webhook-signature` value for one delivery.
+    ///
+    /// `id` and `at` are inside the signed content, not merely beside it — a
+    /// receiver that compares them against the headers is what makes a captured
+    /// POST expire.
+    pub(super) fn value_for(&self, id: &str, at: u64, body: &[u8]) -> String {
+        let mut content = Vec::with_capacity(id.len() + 24 + body.len());
+        content.extend_from_slice(id.as_bytes());
+        content.push(b'.');
+        content.extend_from_slice(at.to_string().as_bytes());
+        content.push(b'.');
+        content.extend_from_slice(body);
+        let mac = hmac_sha256(&self.key, &content);
+        format!(
+            "v1,{}",
+            base64::engine::general_purpose::STANDARD.encode(mac)
+        )
     }
 }
 
@@ -170,9 +197,13 @@ impl BodySigning {
 mod tests {
     use super::*;
 
-    /// RFC 4231's published vectors, which is the only outside authority a
-    /// hand-written MAC can have. Case 1 is the ordinary path, case 2 a short
-    /// text key, and case 6 the longer-than-block-size key that exercises the
+    fn signing(secret: &str) -> BodySigning {
+        BodySigning::new(&Secret::new(secret))
+    }
+
+    /// RFC 4231's published vectors, which is the outside authority the
+    /// construction has. Case 1 is the ordinary path, case 2 a short text key,
+    /// and case 6 the longer-than-block-size key that exercises the
     /// hash-the-key branch.
     #[test]
     fn the_construction_matches_rfc_4231() {
@@ -196,51 +227,76 @@ mod tests {
         );
     }
 
-    /// The value is over the bytes, and the bytes decide it.
+    /// Standard Webhooks' own published example, which is what makes this
+    /// interoperable rather than merely self-consistent: a receiver using any
+    /// of the spec's libraries computes this value.
     #[test]
-    fn the_signature_follows_the_body() {
-        let signing = BodySigning::new("X-Mako-Signature", Secret::new("shared"));
-        let value = signing.value_for(br#"{"a":1}"#);
-        assert!(
-            value.starts_with("sha256="),
-            "the algorithm prefix is how a receiver dispatches: {value}"
+    fn the_signature_matches_the_standard_webhooks_example() {
+        let signing = signing("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw");
+        assert_eq!(
+            signing.value_for(
+                "msg_p5jXN8AQM9LWM0D4loKWxJek",
+                1_614_265_330,
+                b"{\"test\": 2432232314}"
+            ),
+            "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=",
+            "the spec's example verifies with every Standard Webhooks library, and \
+             a value of our own verifies with none of them"
         );
-        assert_eq!(value.len(), "sha256=".len() + 64, "{value}");
+    }
+
+    /// Every input to the MAC changes it, including the two that make a
+    /// captured delivery expire.
+    #[test]
+    fn the_signature_follows_the_body_the_id_and_the_instant() {
+        let signing = signing("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw");
+        let value = signing.value_for("msg-1", 1_700_000_000, br#"{"a":1}"#);
         assert!(
-            value[7..]
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
-            "lowercase hex is the convention receivers compare against: {value}"
+            value.starts_with("v1,"),
+            "the version label is how a receiver dispatches: {value}"
         );
         assert_ne!(
             value,
-            signing.value_for(br#"{"a":2}"#),
+            signing.value_for("msg-1", 1_700_000_000, br#"{"a":2}"#),
             "one byte of the body changed and the signature did not"
         );
         assert_ne!(
             value,
-            BodySigning::new("X-Mako-Signature", Secret::new("other")).value_for(br#"{"a":1}"#),
-            "a different secret produced the same signature"
+            signing.value_for("msg-2", 1_700_000_000, br#"{"a":1}"#),
+            "the id is not covered, so a replay under another id verifies"
+        );
+        assert_ne!(
+            value,
+            signing.value_for("msg-1", 1_700_000_001, br#"{"a":1}"#),
+            "the instant is not covered, so a captured delivery never expires"
+        );
+        assert_ne!(
+            value,
+            BodySigning::new(&Secret::new(
+                "whsec_bm90LXRoZS1zYW1lLWtleS1hdC1hbGwtaGVyZQ=="
+            ))
+            .value_for("msg-1", 1_700_000_000, br#"{"a":1}"#),
+            "a different key produced the same signature"
         );
     }
 
-    /// The secret must not print itself, in any of the values that carry it.
+    /// The key must not print itself.
     #[test]
-    fn a_signing_secret_is_redacted() {
-        let signing = BodySigning::new("X-Mako-Signature", Secret::new("sk-live-abcdef"));
+    fn a_signing_key_is_redacted() {
+        let signing = signing("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw");
         let shown = format!("{signing:#?}");
-        assert!(!shown.contains("abcdef"), "{shown}");
+        assert!(!shown.contains("MfKQ"), "{shown}");
     }
 
     #[test]
-    #[should_panic(expected = "is not an HTTP field name")]
-    fn a_header_name_that_cannot_be_sent_is_refused_at_configuration() {
-        let _ = BodySigning::new("X Mako Signature", Secret::new("shared"));
+    #[should_panic(expected = "shorter than the 24")]
+    fn a_short_signing_key_is_refused_at_configuration() {
+        let _ = signing("too-short");
     }
 
     #[test]
-    #[should_panic(expected = "is empty")]
-    fn an_empty_signing_secret_is_refused() {
-        let _ = BodySigning::new("X-Mako-Signature", Secret::new(""));
+    #[should_panic(expected = "does not decode")]
+    fn a_whsec_secret_that_is_not_base64_is_refused_at_configuration() {
+        let _ = signing("whsec_not base64 at all !!!");
     }
 }

@@ -95,7 +95,7 @@ a2a = ["dep:reqwest"]
 a2a-server = ["http", "manifest", "push", "dep:async-stream"]
 # Webhook delivery for A2A push notifications: a durable config store plus
 # SSRF-guarded outbound POSTs.
-push = ["dep:reqwest", "dep:hmac"]
+push = ["dep:reqwest", "dep:hmac", "dep:base64"]
 # One concrete Ed25519 signer. The seam — `Signer`, `Verifier`, the attestation
 # on every record — is unconditional.
 signing = ["dep:ed25519-dalek"]
@@ -139,8 +139,10 @@ time        = { version = "0.3", features = ["serde-well-known", "macros", "form
 rand        = "0.9"
 rand_chacha = "0.9"
 tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
-# Only `join_all` is used, to dispatch a ready set concurrently. Deliberately
-# not `futures` proper: the executor needs one combinator, not an ecosystem.
+# Two combinators: `join_all` to dispatch a ready set concurrently, and
+# `buffer_unordered` where the set is a backlog rather than a frontier and has
+# to be bounded. Deliberately not `futures` proper: this is a short list, not an
+# ecosystem.
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 async-stream = { version = "0.3", optional = true }
 tracing     = "0.1"

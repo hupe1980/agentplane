@@ -34,8 +34,8 @@
 //!
 //! Everything that is not about caller-supplied URLs is unchanged. The cursor
 //! still advances only on 2xx, the retry ceiling still applies, a permanent
-//! refusal is still abandoned and reported, and delivery still carries no
-//! ambient authority — no proxy, no cookie jar, no redirects.
+//! refusal still parks the registration and is reported, and delivery still
+//! carries no ambient authority — no proxy, no cookie jar, no redirects.
 //!
 //! # The journal is still the outbox
 //!
@@ -49,13 +49,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::json;
 
-use crate::core::{RunId, Seq, StoreError};
+use crate::core::{CloudEvent, RunId, Seq, StoreError};
 use crate::journal::{Record, RecordKind};
 
 use super::delivery::Projection;
-use super::{BodySigning, PushAuthentication, PushConfig, PushStore};
+use super::{BodySigning, PushAuthentication, PushConfig, PushMessage, PushStore};
 
 /// The marker that tells an operator destination from a caller's webhook.
 ///
@@ -121,29 +121,30 @@ impl Destination {
         self
     }
 
-    /// Sign every delivery's body, in `header`, under `secret`.
+    /// Sign every delivery to this destination under `secret`.
     ///
-    /// `HMAC-SHA256` over the exact bytes posted, sent as `sha256=<hex>` — the
-    /// convention receivers are already written against. It is beside
+    /// [Standard Webhooks]: `webhook-signature: v1,<base64>` over
+    /// `{webhook-id}.{webhook-timestamp}.{body}`. It is beside
     /// [`authenticated`](Self::authenticated), not instead of it: a bearer
     /// header proves the *sender* held a token, which is a claim about the
     /// connection and not about the bytes, and that token transits every hop
     /// between here and the receiver.
     ///
-    /// What the receiver may conclude from a matching signature, and what it
-    /// may not — chiefly that the delivery is authentic but **not fresh**, so
-    /// a captured POST replays forever unless the receiver deduplicates on the
-    /// event's own identity — is set out on [`BodySigning`], and a receiver is
+    /// What the receiver must still do itself — refuse a stale
+    /// `webhook-timestamp` and deduplicate on `webhook-id`, without which a
+    /// captured POST replays — is set out on [`BodySigning`], and a receiver is
     /// being written against those limits whether or not anybody read them.
     ///
     /// # Panics
     ///
-    /// If `header` is not an HTTP field name, or the secret is empty. Both are
-    /// this deployment's own configuration, so both are refused where they are
-    /// written rather than at the far end of a run.
+    /// If the key is shorter than 24 bytes, or a `whsec_`-prefixed secret is
+    /// not base64. Both are this deployment's own configuration, so both are
+    /// refused where they are written rather than at the far end of a run.
+    ///
+    /// [Standard Webhooks]: https://www.standardwebhooks.com/
     #[must_use]
-    pub fn signed_with(mut self, header: impl Into<String>, secret: crate::core::Secret) -> Self {
-        self.signing = Some(BodySigning::new(header, secret));
+    pub fn signed_with(mut self, secret: &crate::core::Secret) -> Self {
+        self.signing = Some(BodySigning::new(secret));
         self
     }
 
@@ -298,7 +299,14 @@ impl Outbox {
 /// `id` is the run id and `source` is the deployment, which is the pair
 /// `CloudEvents` defines uniqueness by — so a duplicate delivery, which
 /// at-least-once guarantees will happen, is detectable as a duplicate rather
-/// than as a second event.
+/// than as a second event. The same id rides in the delivery's
+/// [`HEADER_ID`](super::HEADER_ID) header, so a receiver can drop a repeat
+/// before parsing the body and cannot end up with two answers to *which
+/// message is this*.
+///
+/// `subject` is the run, which is what the event is about within this
+/// producer. A receiver filtering by run would otherwise have to open `data` to
+/// find out.
 ///
 /// # There is no `time`, and that is honest
 ///
@@ -336,7 +344,7 @@ impl RunCompleted {
 
 #[async_trait]
 impl Projection for RunCompleted {
-    async fn payloads(&self, record: &Record) -> Result<Vec<Value>, StoreError> {
+    async fn messages(&self, record: &Record) -> Result<Vec<PushMessage>, StoreError> {
         let RecordKind::RunSealed {
             outcome,
             chain_head,
@@ -344,21 +352,24 @@ impl Projection for RunCompleted {
         else {
             return Ok(Vec::new());
         };
-        Ok(vec![json!({
-            "specversion": "1.0",
-            "type": self.event_type,
-            "source": self.source,
-            "id": record.body.run.to_string(),
-            "datacontenttype": "application/json",
-            "data": {
-                "run": record.body.run.to_string(),
+        let run = record.body.run.to_string();
+        let event = CloudEvent::new(&self.source, &run, &self.event_type)
+            // The three required attributes were checked when the source was
+            // configured and the type is a constant; a run id is never empty.
+            .map_err(|error| StoreError::Backend(error.to_string()))?
+            // What the event is *about* within this producer. `source` names
+            // the deployment and `id` is the deduplication half; without a
+            // subject a receiver filtering by run has to open the data.
+            .with_subject(&run)
+            .with_data(json!({
+                "run": run,
                 "case": record.body.case.map(|case| case.to_string()),
                 "outcome": outcome,
                 // The chain head the conclusion was drawn over, so a receiver
                 // can ask this plane to prove the run it was told about.
                 "chain_head": chain_head.to_hex(),
-            },
-        })])
+            }));
+        Ok(vec![PushMessage::cloudevent(&event)])
     }
 
     fn namespace(&self) -> super::PushNamespace {

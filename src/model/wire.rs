@@ -21,7 +21,9 @@ use super::{ModelError, ModelId};
 ///
 /// * **429 and 529** are rate limiting. Separate from an ordinary refusal
 ///   because the response is different: this one is worth retrying, and it is
-///   the one case where retrying is unambiguously safe *and* free.
+///   the one case where retrying is unambiguously safe *and* free. The
+///   provider's `Retry-After` rides along, because it is the only number that
+///   makes the retry useful — see [`ModelError::RateLimited`].
 /// * **408 and 425** are the transient 4xx: a request the *server* timed out
 ///   or declined to process early, not one it judged wrong. Classed with the
 ///   retryable failures, because `Refused` means *repeating is pointless* and
@@ -34,12 +36,18 @@ use super::{ModelError, ModelId};
 ///   [`ModelError::Unavailable`]: guessing "free" lets a retry loop spend
 ///   against a ceiling reading zero, and guessing "fatal" makes a transient blip
 ///   end a run.
-pub fn classify_status(model: &ModelId, status: u16, body: &str) -> ModelError {
+pub fn classify_status(
+    model: &ModelId,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> ModelError {
     let detail = format!("HTTP {status}: {}", trim(body));
     match status {
         429 | 529 => ModelError::RateLimited {
             model: model.clone(),
             detail,
+            retry_after: retry_after(headers),
         },
         408 | 425 => ModelError::Unavailable {
             model: model.clone(),
@@ -54,6 +62,15 @@ pub fn classify_status(model: &ModelId, status: u16, body: &str) -> ModelError {
             detail,
         },
     }
+}
+
+/// The provider's `Retry-After`, in seconds, when it named one.
+///
+/// The parsing rule is [`core::retry_after_seconds`](crate::core::retry_after_seconds),
+/// shared with every other wire this crate reads advice on: delta-seconds only,
+/// because the HTTP-date form means trusting somebody else's clock against ours.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    crate::core::retry_after_seconds(headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?)
 }
 
 /// Classify a transport failure.
@@ -217,11 +234,78 @@ mod tests {
         ModelId::new("test", "m")
     }
 
+    fn no_headers() -> reqwest::header::HeaderMap {
+        reqwest::header::HeaderMap::new()
+    }
+
+    fn advising(value: &str) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_str(value).expect("a header value"),
+        );
+        headers
+    }
+
+    /// The window is the whole point of the classification: without it the
+    /// retry loop computes a schedule in hundreds of milliseconds against a
+    /// limit measured in tens of seconds, spends every permitted attempt
+    /// inside the window, and reports the provider as down.
+    #[test]
+    fn a_named_rate_limit_window_survives_classification() {
+        let e = classify_status(&model(), 429, &advising("42"), "");
+        assert!(
+            matches!(
+                e,
+                ModelError::RateLimited {
+                    retry_after: Some(42),
+                    ..
+                }
+            ),
+            "the provider named its window and the classification dropped it: {e}"
+        );
+    }
+
+    /// A provider that throttles without saying when to come back is ordinary,
+    /// and the effect's own schedule applies. What must not happen is a
+    /// fabricated window: `None` is *no advice*, not zero seconds.
+    #[test]
+    fn an_unnamed_window_is_absent_rather_than_invented() {
+        for value in [
+            "",
+            "  ",
+            "0",
+            "later",
+            "-5",
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+        ] {
+            let e = classify_status(&model(), 429, &advising(value), "");
+            assert!(
+                matches!(
+                    e,
+                    ModelError::RateLimited {
+                        retry_after: None,
+                        ..
+                    }
+                ),
+                "'{value}' is not advice this crate can act on, and reading it as \
+                 one would replace a real backoff with a made-up schedule: {e}"
+            );
+        }
+        assert!(matches!(
+            classify_status(&model(), 429, &no_headers(), ""),
+            ModelError::RateLimited {
+                retry_after: None,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn rate_limiting_is_told_apart_from_refusal() {
         for s in [429u16, 529] {
             assert!(matches!(
-                classify_status(&model(), s, ""),
+                classify_status(&model(), s, &no_headers(), ""),
                 ModelError::RateLimited { .. }
             ));
         }
@@ -230,7 +314,7 @@ mod tests {
     #[test]
     fn a_client_error_did_not_generate() {
         for s in [400u16, 401, 403, 404, 422] {
-            let e = classify_status(&model(), s, "");
+            let e = classify_status(&model(), s, &no_headers(), "");
             assert_eq!(e.disposition(), Disposition::DidNotHappen);
             assert_eq!(e.usage().spend().tokens, 0);
             assert!(
@@ -249,7 +333,7 @@ mod tests {
     #[test]
     fn the_transient_4xx_are_not_judgements() {
         for s in [408u16, 425] {
-            let e = classify_status(&model(), s, "");
+            let e = classify_status(&model(), s, &no_headers(), "");
             assert_eq!(e.disposition(), Disposition::DidNotHappen);
             assert!(
                 matches!(e, ModelError::Unavailable { .. }),
@@ -261,7 +345,7 @@ mod tests {
     #[test]
     fn a_server_error_says_it_does_not_know() {
         assert!(matches!(
-            classify_status(&model(), 500, ""),
+            classify_status(&model(), 500, &no_headers(), ""),
             ModelError::Unavailable { .. }
         ));
     }
@@ -270,7 +354,7 @@ mod tests {
     #[test]
     fn a_long_error_body_is_trimmed() {
         let secret = "x".repeat(5_000);
-        let e = classify_status(&model(), 400, &secret);
+        let e = classify_status(&model(), 400, &no_headers(), &secret);
         let rendered = e.to_string();
         assert!(
             rendered.len() < 600,

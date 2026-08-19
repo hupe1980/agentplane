@@ -14,6 +14,15 @@ use agentplane::core::{RunId, Secret};
 use agentplane::push::{PushAuthentication, PushConfig, PushError, PushPolicy, PushStore};
 use agentplane::store::RedbStore;
 
+/// One status message, in the shape a projection would hand the transport.
+///
+/// The media type and the id are the receiver's routing and idempotency keys;
+/// what these tests assert is the *gate*, so any well-formed message will do.
+fn message() -> agentplane::push::PushMessage {
+    agentplane::push::PushMessage::json("run/1/0", serde_json::json!({"statusUpdate": {}}))
+        .typed("application/a2a+json")
+}
+
 fn config(url: &str) -> PushConfig {
     PushConfig {
         id: "cfg-1".to_owned(),
@@ -113,9 +122,7 @@ async fn a_revoked_host_stops_receiving_notifications() {
 
     // ...delivered under another, which no longer names the host.
     let sender = PushSender::new(PushPolicy::new().allow_host("hooks.other.example"));
-    let refused = sender
-        .deliver(&registered, &serde_json::json!({"statusUpdate": {}}))
-        .await;
+    let refused = sender.deliver(&registered, &message(), 0).await;
     assert!(
         matches!(refused, Err(PushError::HostNotGranted(_))),
         "a webhook registered before its host was revoked was still delivered \
@@ -136,14 +143,60 @@ async fn a_webhook_resolving_to_a_private_address_is_refused() {
     // about where it resolves.
     let sender = PushSender::new(PushPolicy::new().allow_host("localhost"));
     let outcome = sender
-        .deliver(
-            &config("https://localhost/hook"),
-            &serde_json::json!({"statusUpdate": {}}),
-        )
+        .deliver(&config("https://localhost/hook"), &message(), 0)
         .await;
     assert!(
         matches!(outcome, Err(PushError::Unroutable(_))),
         "a granted host resolving to loopback was connected to: {outcome:?}"
+    );
+}
+
+/// The pre-flight and the socket obey the same rule, not two copies of it.
+///
+/// The address check runs twice by construction — once before dispatch, so a
+/// refusal is a *typed* answer an operator can read, and once inside the client
+/// on every connection it opens, because a pooled client outlives the
+/// pre-flight and re-resolves when the pool refills. Two spellings of one rule
+/// would agree everywhere except the boundary nobody probed; this pins that
+/// there is one.
+///
+/// Asserted through the sender's own reach rather than by reaching into the
+/// resolver: what matters is that the value the pre-flight judges against is
+/// the value handed to the client, for each of the three kinds of sender.
+#[tokio::test]
+async fn a_reach_rule_is_one_rule_for_the_preflight_and_the_socket() {
+    use agentplane::push::{Destination, PushSender, PushTransport};
+
+    // A caller-facing sender: the address check applies, so a granted host
+    // resolving inward is refused before anything is sent.
+    let caller = PushSender::new(PushPolicy::new().allow_host("localhost"));
+    assert!(
+        matches!(
+            caller
+                .deliver(&config("https://localhost/hook"), &message(), 0)
+                .await,
+            Err(PushError::Unroutable(_))
+        ),
+        "a caller-named host resolving to loopback was not refused"
+    );
+
+    // An operator-facing sender: resolving inward is the point, and the same
+    // destination is reached. If the two senders shared one reach, exactly one
+    // of these two assertions would fail — which is what makes this a test of
+    // the rule and not of either branch.
+    let operator = PushSender::for_operator_destinations(&[Destination::new(
+        "bus",
+        "http://localhost:9/events",
+    )]);
+    let mut inward = config("http://localhost:9/events");
+    inward.id = "operator:bus".to_owned();
+    assert!(
+        !matches!(
+            operator.deliver(&inward, &message(), 0).await,
+            Err(PushError::Unroutable(_))
+        ),
+        "the deployment's own in-cluster destination was refused as if a caller \
+         had named it, which leaves an operator terminating TLS in a sidecar"
     );
 }
 
@@ -174,10 +227,7 @@ async fn the_loopback_exception_lifts_two_refusals_and_no_others() {
     //    is an *unreachable delivery* rather than a refusal — which is the
     //    distinction that proves the gate opened.
     let outcome = permissive
-        .deliver(
-            &config("http://localhost:1/hook"),
-            &serde_json::json!({"statusUpdate": {}}),
-        )
+        .deliver(&config("http://localhost:1/hook"), &message(), 0)
         .await;
     assert!(
         matches!(outcome, Ok(agentplane::push::Delivered::Unreachable(_))),
@@ -189,10 +239,7 @@ async fn the_loopback_exception_lifts_two_refusals_and_no_others() {
     let public = PushSender::new(PushPolicy::new().allow_host("hooks.acme.example"))
         .allow_plaintext_loopback();
     let outcome = public
-        .deliver(
-            &config("http://hooks.acme.example/a2a"),
-            &serde_json::json!({"statusUpdate": {}}),
-        )
+        .deliver(&config("http://hooks.acme.example/a2a"), &message(), 0)
         .await;
     assert!(
         matches!(outcome, Err(PushError::NotHttps)),
@@ -203,10 +250,7 @@ async fn the_loopback_exception_lifts_two_refusals_and_no_others() {
     //    lifts the second lock; the host grant is the first.
     let ungranted = PushSender::new(PushPolicy::new()).allow_plaintext_loopback();
     let outcome = ungranted
-        .deliver(
-            &config("http://localhost:1/hook"),
-            &serde_json::json!({"statusUpdate": {}}),
-        )
+        .deliver(&config("http://localhost:1/hook"), &message(), 0)
         .await;
     assert!(
         matches!(outcome, Err(PushError::HostNotGranted(_))),
@@ -217,10 +261,7 @@ async fn the_loopback_exception_lifts_two_refusals_and_no_others() {
     //    battery would pass with the gate permanently open.
     let strict = PushSender::new(granted);
     let outcome = strict
-        .deliver(
-            &config("http://localhost:1/hook"),
-            &serde_json::json!({"statusUpdate": {}}),
-        )
+        .deliver(&config("http://localhost:1/hook"), &message(), 0)
         .await;
     assert!(
         matches!(outcome, Err(PushError::NotHttps)),
@@ -243,10 +284,7 @@ async fn a_bracketed_ipv6_webhook_is_judged_not_unresolvable() {
     // behind a DNS answer — so the only correct refusal is the address rule's.
     let sender = PushSender::new(PushPolicy::new().allow_host("[2001:db8::1]"));
     let outcome = sender
-        .deliver(
-            &config("https://[2001:db8::1]/hook"),
-            &serde_json::json!({"statusUpdate": {}}),
-        )
+        .deliver(&config("https://[2001:db8::1]/hook"), &message(), 0)
         .await;
     let error = match outcome {
         Err(PushError::Unroutable(detail)) => detail,
@@ -273,7 +311,8 @@ async fn a_bracketed_ipv6_loopback_literal_is_dialled_under_the_exception() {
     let outcome = <PushSender as agentplane::push::PushTransport>::deliver(
         &sender,
         &config("http://[::1]:1/hook"),
-        &serde_json::json!({"statusUpdate": {}}),
+        &message(),
+        0,
     )
     .await;
     assert!(

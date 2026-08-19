@@ -79,6 +79,10 @@ pub struct CardClient {
     egress: Option<Egress>,
     verifier: Option<Arc<dyn CardVerifier>>,
     timeout: std::time::Duration,
+    /// The one pooled client cards are fetched through. Built on first use,
+    /// because the timeout and the loopback exception arrive through builder
+    /// methods that run after the constructor.
+    http: std::sync::OnceLock<reqwest::Client>,
     /// Lift the public-address check for a card served from this machine.
     /// `testkit` only, and absent from any other build.
     #[cfg(feature = "testkit")]
@@ -91,6 +95,7 @@ impl Default for CardClient {
             egress: None,
             verifier: None,
             timeout: Self::DEFAULT_TIMEOUT,
+            http: std::sync::OnceLock::new(),
             #[cfg(feature = "testkit")]
             loopback: false,
         }
@@ -126,6 +131,33 @@ impl CardClient {
     pub const fn allow_loopback(mut self) -> Self {
         self.loopback = true;
         self
+    }
+
+    /// How far this client is allowed to reach.
+    ///
+    /// One answer, read by both the pre-flight and the client's resolver, so
+    /// the check that reports and the check that enforces cannot disagree.
+    fn reach(&self) -> crate::netguard::Reach {
+        if self.loopback_allowed() {
+            crate::netguard::Reach::PublicOrLoopbackName
+        } else {
+            crate::netguard::Reach::Public
+        }
+    }
+
+    /// The pooled client, built once. A failure is not cached, so one bad start
+    /// does not leave a client that can never fetch.
+    fn http(&self) -> Result<&reqwest::Client, DiscoveryError> {
+        if let Some(client) = self.http.get() {
+            return Ok(client);
+        }
+        // A card is somebody else's document: no ambient identity and no
+        // redirects, which `guarded_client` carries along with the address rule.
+        let client = crate::netguard::guarded_client(self.reach())
+            .timeout(self.timeout)
+            .build()
+            .map_err(|e| DiscoveryError::Unreachable(e.to_string()))?;
+        Ok(self.http.get_or_init(|| client))
     }
 
     /// Whether the loopback exception is in force. Always false without
@@ -236,40 +268,21 @@ impl CardClient {
         let resolved = tokio::net::lookup_host((lookup.as_str(), port))
             .await
             .map_err(|e| DiscoveryError::Unreachable(format!("DNS for '{host}': {e}")))?;
-        // Every answer checked, and the connection pinned to exactly those
-        // addresses. Without the pin the client resolves again and may be
-        // handed a different answer than the one that passed — which is the
-        // rebinding attack this check would otherwise only appear to stop.
-        let addrs = if self.loopback_allowed() && crate::netguard::is_loopback_name(&host) {
-            // Named rather than inferred: the exception covers a host that *is*
-            // loopback, not one that resolved there.
-            let addrs: Vec<_> = resolved.collect();
-            if addrs.is_empty() {
-                return Err(DiscoveryError::Unreachable(format!(
-                    "DNS for '{host}' returned no addresses"
-                )));
+        // Judged before anything is sent, so a card this plane may not fetch is
+        // refused with a typed answer rather than attempted — a forbidden
+        // address is `Refused` and an outage is `Unreachable`, which a connect
+        // error cannot distinguish. The socket obeys the same rule again, in
+        // the client's own resolver.
+        crate::netguard::judge(self.reach(), &host, resolved).map_err(|e| match e {
+            crate::netguard::NetGuardError::NoAddresses { .. } => {
+                DiscoveryError::Unreachable(e.to_string())
             }
-            addrs
-        } else {
-            crate::netguard::all_public(&host, resolved)
-                .map_err(|e| DiscoveryError::Refused(e.to_string()))?
-        };
+            crate::netguard::NetGuardError::Forbidden { .. } => {
+                DiscoveryError::Refused(e.to_string())
+            }
+        })?;
 
-        let mut client = reqwest::Client::builder()
-            .timeout(self.timeout)
-            // No ambient authority, and no redirects: a card is somebody else's
-            // document, and a proxy, a cookie jar or a stored credential would
-            // attach this plane's identity to a request it did not authorize.
-            // Following a redirect would hand the whole check above to whatever
-            // host an allowed one names next.
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none());
-        for addr in &addrs {
-            client = client.resolve(&host, *addr);
-        }
-        let client = client
-            .build()
-            .map_err(|e| DiscoveryError::Unreachable(e.to_string()))?;
+        let client = self.http()?;
 
         let response = client
             .get(url)

@@ -920,6 +920,11 @@ fn stream_error(
         "overloaded_error" | "rate_limit_error" => ModelError::RateLimited {
             model: model.clone(),
             detail,
+            // An in-stream error arrives inside a 200 whose headers were read
+            // and accepted before the first byte of the body. There is no
+            // `Retry-After` on this path, and inventing a window from the
+            // schedule would be a guess wearing the peer's authority.
+            retry_after: None,
         },
         "invalid_request_error"
         | "authentication_error"
@@ -993,11 +998,12 @@ impl ModelProvider for Anthropic {
 
         let status = response.status();
         if !status.is_success() {
+            let headers = response.headers().clone();
             let detail = response.text().await.unwrap_or_default();
             // Shared doctrine, in `super::wire`: which statuses mean the call
             // never generated, which mean it was throttled, and which mean the
             // provider will not say. Two copies of that table would drift.
-            return Err(classify_status(model, status.as_u16(), &detail));
+            return Err(classify_status(model, status.as_u16(), &headers, &detail));
         }
 
         let mut completion = if self.stream {

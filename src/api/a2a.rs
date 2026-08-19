@@ -986,17 +986,36 @@ impl std::fmt::Debug for A2aProjection {
 
 #[async_trait::async_trait]
 impl crate::push::Projection for A2aProjection {
-    async fn payloads(
+    async fn messages(
         &self,
         record: &crate::journal::Record,
-    ) -> Result<Vec<serde_json::Value>, crate::core::StoreError> {
+    ) -> Result<Vec<crate::push::PushMessage>, crate::core::StoreError> {
         let case = record.body.case.map(|case| case.to_string());
-        super::a2a_stream::payloads_for_record(&self.runtime, record, case.as_deref())
-            .await
-            // A projection failure is this plane's own bug and always transient
-            // to the worker; the shape it travels in is the store's error type
-            // because that is what the seam speaks.
-            .map_err(|error| crate::core::StoreError::Backend(error.to_string()))
+        let payloads =
+            super::a2a_stream::payloads_for_record(&self.runtime, record, case.as_deref())
+                .await
+                // A projection failure is this plane's own bug and always transient
+                // to the worker; the shape it travels in is the store's error type
+                // because that is what the seam speaks.
+                .map_err(|error| crate::core::StoreError::Backend(error.to_string()))?;
+        // One record can produce a status event and an artifact event, so the
+        // record's sequence alone is not an identity. The id a receiver
+        // deduplicates on is the task, the sequence and the position within
+        // the record — stable across every retry of the same message, distinct
+        // between the two.
+        Ok(payloads
+            .into_iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                crate::push::PushMessage::json(
+                    format!("{}/{}/{index}", record.body.run, record.body.seq),
+                    payload,
+                )
+                // A2A's media type, so a receiver routes push and streaming
+                // through the same parser.
+                .typed("application/a2a+json")
+            })
+            .collect())
     }
 
     fn namespace(&self) -> crate::push::PushNamespace {

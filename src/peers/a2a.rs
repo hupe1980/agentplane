@@ -130,6 +130,14 @@ pub struct A2aClient {
     /// Where this client may connect, if the deployment says.
     egress: Option<crate::core::Egress>,
     endpoint: Endpoint,
+    /// The one pooled client this peer is reached through.
+    ///
+    /// Built on first use, because the loopback exception arrives through a
+    /// builder method that runs after the constructor. Delegation is a loop —
+    /// an agent that consults a specialist consults it repeatedly — so a client
+    /// per call means a TLS handshake per turn against a peer this plane has an
+    /// open connection to.
+    http: std::sync::OnceLock<reqwest::Client>,
     /// Lift the public-address check for a peer on this machine. `testkit`
     /// only, and absent from any other build.
     #[cfg(feature = "testkit")]
@@ -168,6 +176,7 @@ impl A2aClient {
         Ok(Self {
             egress: None,
             endpoint,
+            http: std::sync::OnceLock::new(),
             #[cfg(feature = "testkit")]
             loopback: false,
         })
@@ -254,13 +263,33 @@ impl A2aClient {
         })
     }
 
-    /// A client that will connect only to addresses this call approved.
-    async fn pinned_client(
+    /// How far this client is allowed to reach.
+    ///
+    /// One answer, read by both the pre-flight below and the pooled client's
+    /// own resolver, so what an operator is told and what the socket obeys
+    /// cannot be two different rules.
+    fn reach(&self) -> crate::netguard::Reach {
+        if self.loopback_allowed() {
+            crate::netguard::Reach::PublicOrLoopbackName
+        } else {
+            crate::netguard::Reach::Public
+        }
+    }
+
+    /// Refuse an endpoint this client may not reach, before anything is sent.
+    ///
+    /// This judges **every** endpoint, including an IP literal, and is what
+    /// turns a forbidden address into [`PeerError::Refused`] — `DidNotHappen`,
+    /// never retried — where a connect error would read as a peer merely down.
+    /// The client's resolver judges every **name** it resolves afterwards,
+    /// which is what a pooled connection obeys when the pool re-resolves long
+    /// after this returned. Neither is sufficient alone.
+    async fn approve(
         &self,
         peer: &PeerId,
         host: &str,
         parsed: &reqwest::Url,
-    ) -> Result<reqwest::Client, PeerError> {
+    ) -> Result<(), PeerError> {
         // `Url::host_str` keeps the brackets on an IPv6 literal and the
         // resolver refuses them. Only the lookup uses the bare form.
         let lookup = host
@@ -275,27 +304,28 @@ impl A2aClient {
                 peer: peer.clone(),
                 detail: format!("DNS for '{host}': {error}"),
             })?;
-        let addrs = if self.loopback_allowed() && crate::netguard::is_loopback_name(host) {
-            // Named rather than inferred: the exception covers a host that *is*
-            // loopback, not one that resolved there.
-            resolved.collect::<Vec<_>>()
-        } else {
-            crate::netguard::all_public(host, resolved).map_err(|error| PeerError::Refused {
+        crate::netguard::judge(self.reach(), host, resolved).map_err(|error| {
+            PeerError::Refused {
                 peer: peer.clone(),
                 detail: error.to_string(),
-            })?
-        };
-        let mut client = reqwest::Client::builder()
-            .timeout(self.endpoint.timeout)
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none());
-        for addr in &addrs {
-            client = client.resolve(host, *addr);
+            }
+        })?;
+        Ok(())
+    }
+
+    /// The pooled client, built once.
+    fn http(&self, peer: &PeerId) -> Result<&reqwest::Client, PeerError> {
+        if let Some(client) = self.http.get() {
+            return Ok(client);
         }
-        client.build().map_err(|error| PeerError::Unreachable {
-            peer: peer.clone(),
-            detail: error.to_string(),
-        })
+        let client = crate::netguard::guarded_client(self.reach())
+            .timeout(self.endpoint.timeout)
+            .build()
+            .map_err(|error| PeerError::Unreachable {
+                peer: peer.clone(),
+                detail: error.to_string(),
+            })?;
+        Ok(self.http.get_or_init(|| client))
     }
 
     /// Whether the loopback exception is in force. Always false without
@@ -350,12 +380,13 @@ impl A2aClient {
         // bearer credential to whatever it names.
         //
         // So the same rule as every other dereference here: every resolved
-        // address checked, the connection pinned to exactly those, and no
-        // redirects — a check on the endpoint says nothing about the third host
-        // it forwards to. Resolved per call rather than at construction because
-        // DNS changes, and a client that pinned once would keep answering with
-        // whatever was true when it was built.
-        let client = self.pinned_client(peer, &host, &parsed).await?;
+        // address checked and no redirects — a check on the endpoint says
+        // nothing about the third host it forwards to. The check also lives in
+        // the client's resolver, which is what lets the client be reused: a
+        // name's answer changes, so each resolution is judged as it happens
+        // rather than once for every connection that follows.
+        self.approve(peer, &host, &parsed).await?;
+        let client = self.http(peer)?;
 
         let mut request = client
             .post(&self.endpoint.url)

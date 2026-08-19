@@ -233,6 +233,22 @@ impl PushStore for SealedPush {
         self.inner.retry(task, id, next_attempt_at, error).await
     }
 
+    async fn park(&self, task: RunId, id: &str, error: &str) -> Result<(), StoreError> {
+        self.inner.park(task, id, error).await
+    }
+
+    async fn parked(&self, limit: usize) -> Result<Vec<PushRegistration>, StoreError> {
+        // The credentials come back here for the same reason `due` opens them:
+        // an operator reading a parked row is about to decide whether to
+        // re-arm it, and a sealed URL or scheme tells them nothing.
+        let rows = self.inner.parked(limit).await?;
+        Ok(self.opened_all(rows).await)
+    }
+
+    async fn unpark(&self, task: RunId, id: &str, at: u64) -> Result<bool, StoreError> {
+        self.inner.unpark(task, id, at).await
+    }
+
     async fn delete(&self, task: RunId, id: &str) -> Result<(), StoreError> {
         self.inner.delete(task, id).await
     }

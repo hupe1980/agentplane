@@ -30,6 +30,9 @@ struct Cursor {
     attempts: u32,
     next_attempt_at: u64,
     last_error: Option<String>,
+    /// Stopped, with the cursor kept. Excluded from both due scans, so a parked
+    /// row costs nothing per tick and still names how far its receiver got.
+    parked: bool,
 }
 
 /// One config row and its cursor into a registration, shared by
@@ -114,6 +117,7 @@ impl PushStore for RedbStore {
                     attempts: 0,
                     next_attempt_at: 0,
                     last_error: None,
+                    parked: false,
                 })
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
                 cursors
@@ -214,7 +218,7 @@ impl PushStore for RedbStore {
                 let (key, raw) = entry.map_err(|e| be(&e))?;
                 let cursor: Cursor = serde_json::from_str(raw.value())
                     .map_err(|error| StoreError::Backend(error.to_string()))?;
-                if cursor.next_attempt_at > at {
+                if cursor.parked || cursor.next_attempt_at > at {
                     continue;
                 }
                 let (_, task, id) = key.value();
@@ -262,7 +266,7 @@ impl PushStore for RedbStore {
                 let (key, raw) = entry.map_err(|e| be(&e))?;
                 let cursor: Cursor = serde_json::from_str(raw.value())
                     .map_err(|error| StoreError::Backend(error.to_string()))?;
-                if cursor.next_attempt_at > at {
+                if cursor.parked || cursor.next_attempt_at > at {
                     continue;
                 }
                 let (_, task, id) = key.value();
@@ -296,6 +300,7 @@ impl PushStore for RedbStore {
             cursor.attempts = 0;
             cursor.next_attempt_at = 0;
             cursor.last_error = None;
+            cursor.parked = false;
         })
         .await
     }
@@ -312,6 +317,91 @@ impl PushStore for RedbStore {
             cursor.attempts = cursor.attempts.saturating_add(1);
             cursor.next_attempt_at = next_attempt_at;
             cursor.last_error = Some(error);
+            cursor.parked = false;
+        })
+        .await
+    }
+
+    async fn park(&self, task: RunId, id: &str, error: &str) -> Result<(), StoreError> {
+        let error = error.to_owned();
+        update_cursor(self, task, id, move |cursor| {
+            cursor.attempts = cursor.attempts.saturating_add(1);
+            cursor.last_error = Some(error);
+            cursor.parked = true;
+        })
+        .await
+    }
+
+    async fn parked(&self, limit: usize) -> Result<Vec<PushRegistration>, StoreError> {
+        let tenant = self.tenant_name();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(configs) = r.open_table(PUSH) else {
+                return Ok(Vec::new());
+            };
+            let Ok(cursors) = r.open_table(PUSH_CURSOR) else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for entry in cursors
+                .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                .map_err(|e| be(&e))?
+            {
+                if out.len() >= limit {
+                    break;
+                }
+                let (key, raw) = entry.map_err(|e| be(&e))?;
+                let cursor: Cursor = serde_json::from_str(raw.value())
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+                if !cursor.parked {
+                    continue;
+                }
+                let (_, task, id) = key.value();
+                let Some(value) = configs
+                    .get((tenant.as_str(), task, id))
+                    .map_err(|e| be(&e))?
+                else {
+                    continue;
+                };
+                out.push(registration_from(task, id, value.value(), cursor)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn unpark(&self, task: RunId, id: &str, at: u64) -> Result<bool, StoreError> {
+        let tenant = self.tenant_name();
+        let task = task.to_string();
+        let id = id.to_owned();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let found = {
+                let mut cursors = w.open_table(PUSH_CURSOR).map_err(|e| be(&e))?;
+                let Some(raw) = cursors
+                    .get((tenant.as_str(), task.as_str(), id.as_str()))
+                    .map_err(|e| be(&e))?
+                else {
+                    return Ok(false);
+                };
+                let mut cursor: Cursor = serde_json::from_str(raw.value())
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+                drop(raw);
+                if !cursor.parked {
+                    return Ok(false);
+                }
+                cursor.parked = false;
+                cursor.attempts = 0;
+                cursor.next_attempt_at = at;
+                let raw = serde_json::to_string(&cursor)
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+                cursors
+                    .insert((tenant.as_str(), task.as_str(), id.as_str()), raw.as_str())
+                    .map_err(|e| be(&e))?;
+                true
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(found)
         })
         .await
     }

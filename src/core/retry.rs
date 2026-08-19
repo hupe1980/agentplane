@@ -36,21 +36,27 @@
 //! So the boundary is drawn by purpose, not by duration:
 //!
 //! * **Retrying a flaky call** — this module. Bounded by `max_backoff`.
-//! * **Waiting for the world** — a rate-limit window, a settlement date, five
-//!   Werktage — is not a retry. Use
-//!   [`StepCtx::sleep`](crate::runtime::StepCtx::sleep), which suspends the run
-//!   and costs a row rather than a thread.
+//! * **Waiting for the world** — a settlement date, five Werktage — is not a
+//!   retry. Use [`StepCtx::sleep`](crate::runtime::StepCtx::sleep), which
+//!   suspends the run and costs a row rather than a thread.
 //!
 //! Setting `max_backoff` to an hour is legal and will hold a worker for an
 //! hour. That is stated rather than prevented, because a deployment that knows
 //! its own concurrency may want exactly that.
 //!
-//! # Backoff is computed, not drawn
+//! # Backoff is computed, not drawn — unless the peer names it
 //!
 //! The runtime forbids ambient randomness, so jitter cannot come from an RNG.
 //! It is derived instead from the hash of the run, the effect key, and the
 //! attempt number — which decorrelates concurrent runs the way jitter is
 //! supposed to, while staying a pure function of things already in the journal.
+//!
+//! A computed schedule is a **guess about when a service recovers**, and one
+//! failure does not need guessing at: a peer that answers *rate limited* and
+//! names its own window. So advice wins where a peer gives it, bounded by
+//! [`max_advice`](RetryPolicy::max_advice). The parsing rule is
+//! [`retry_after_seconds`], shared by every wire here so no surface acts on
+//! advice another would refuse.
 
 use std::time::Duration;
 
@@ -84,6 +90,27 @@ pub struct RetryPolicy {
     /// Whether to spread the delay across runs. See the module docs — this is
     /// derived from a hash, not drawn from an RNG.
     pub jitter: bool,
+    /// The longest this run will wait because a *peer* named a time.
+    ///
+    /// A separate ceiling from [`max_backoff`](Self::max_backoff), because the
+    /// two bound different risks. `max_backoff` bounds a **guess**: nobody knows
+    /// when the service recovers, so waiting long is waste. This bounds
+    /// **somebody else's word** — a `Retry-After` from the one party with an
+    /// interest in never being called again — and the number that makes the
+    /// wait useful is theirs, not ours. Sharing one ceiling would mean either
+    /// guessing for as long as a peer may demand, or discarding advice that is
+    /// merely longer than a guess would have been.
+    ///
+    /// A minute covers every published provider rate-limit window and is short
+    /// enough that a hostile or broken value costs one wasted minute of one
+    /// worker. Advice past it is **clamped, not discarded**: waiting part of a
+    /// window is closer to right than ignoring it, and if the window really was
+    /// longer the next refusal names what is left.
+    ///
+    /// Raising it holds a worker for that long. A rate limit measured in more
+    /// than minutes is not a retry at all — that is
+    /// [`StepCtx::sleep`](crate::runtime::StepCtx::sleep), which costs a row.
+    pub max_advice: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -94,6 +121,7 @@ impl Default for RetryPolicy {
             max_backoff: Duration::from_secs(10),
             multiplier: 2,
             jitter: true,
+            max_advice: Duration::from_secs(60),
         }
     }
 }
@@ -112,6 +140,8 @@ impl RetryPolicy {
             max_backoff: Duration::ZERO,
             multiplier: 1,
             jitter: false,
+            // Nothing to advise: there is no second attempt to schedule.
+            max_advice: Duration::ZERO,
         }
     }
 
@@ -137,6 +167,42 @@ impl RetryPolicy {
     pub fn without_jitter(mut self) -> Self {
         self.jitter = false;
         self
+    }
+
+    /// Change how long a peer's own `Retry-After` may hold a worker.
+    ///
+    /// See [`max_advice`](Self::max_advice) for why this is not `max_backoff`.
+    #[must_use]
+    pub const fn wait_at_most(mut self, advice: Duration) -> Self {
+        self.max_advice = advice;
+        self
+    }
+
+    /// How long to wait before `attempt`, given whatever the peer said.
+    ///
+    /// `advice` wins when present, clamped to [`max_advice`](Self::max_advice),
+    /// **including when it is shorter** than the computed backoff: the peer is
+    /// describing its own recovery, and waiting longer than it asked buys
+    /// nothing.
+    #[must_use]
+    pub fn wait_before(
+        &self,
+        run: RunId,
+        key: EffectKey,
+        attempt: u32,
+        advice: Option<Duration>,
+    ) -> Duration {
+        // Attempt 1 is not a retry, so nothing schedules it — not even a peer.
+        // Advice can only arrive attached to a failure, so this guard is
+        // belt-and-braces rather than reachable, and it keeps the one property
+        // every caller relies on: the first attempt is immediate.
+        if attempt <= 1 {
+            return Duration::ZERO;
+        }
+        match advice {
+            Some(named) if !named.is_zero() => named.min(self.max_advice),
+            _ => self.backoff(run, key, attempt),
+        }
     }
 
     /// Whether another attempt is left after `attempt` has failed.
@@ -194,6 +260,26 @@ impl RetryPolicy {
         let extra = (half.saturating_mul(u128::from(spread))) / u128::from(u64::MAX);
         Duration::from_nanos(u64::try_from(half + extra).unwrap_or(u64::MAX))
     }
+}
+
+/// Parse a `Retry-After` value into seconds.
+///
+/// Only the delta-seconds form is read. The HTTP-date form is equally legal and
+/// is deliberately ignored: acting on it means trusting the sender's clock
+/// against ours, and a peer whose clock is a day fast would park a run for a
+/// day. A value this cannot read is *no advice*, which is the same answer as an
+/// absent header — the caller's own schedule applies.
+///
+/// Here rather than beside either caller because it is the same question on
+/// every wire this crate speaks, and two spellings of a bound are two bounds:
+/// the one that drifts is whichever surface nobody probed.
+#[must_use]
+pub fn retry_after_seconds(value: &str) -> Option<u64> {
+    let seconds = value.trim().parse::<u64>().ok()?;
+    // Zero is a legal encoding of "come back immediately", and taking it
+    // literally would replace the caller's backoff with no wait at all — which
+    // is the one schedule a rate limit must not produce.
+    (seconds > 0).then_some(seconds)
 }
 
 #[cfg(test)]
@@ -255,6 +341,7 @@ mod tests {
             max_backoff: Duration::from_millis(800),
             multiplier: 2,
             jitter: false,
+            ..RetryPolicy::default()
         };
         let run = RunId::generate();
         let at = |n| p.backoff(run, key(), n);
@@ -274,6 +361,7 @@ mod tests {
             max_backoff: Duration::from_mins(1),
             multiplier: u32::MAX,
             jitter: true,
+            ..RetryPolicy::default()
         };
         assert!(p.backoff(RunId::generate(), key(), u32::MAX) <= Duration::from_mins(1));
     }

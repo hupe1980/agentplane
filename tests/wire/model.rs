@@ -279,6 +279,7 @@ fn a_died_mid_stream_call_is_landed_not_in_doubt() {
     let limited = ModelError::RateLimited {
         model: model(),
         detail: "slow down".into(),
+        retry_after: None,
     };
     assert_eq!(limited.disposition(), Disposition::DidNotHappen);
 }

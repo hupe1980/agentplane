@@ -17,10 +17,10 @@
 //! * **An operator grant.** The host must be on an allowlist. A caller may pick
 //!   any URL under a host the deployment permits, and no host it does not. This
 //!   is the primary control; the rest are the second lock.
-//! * **Public addresses only.** Every DNS answer is checked with
-//!   [`netguard`](crate::netguard) and the connection is pinned to those
-//!   addresses, so a name that resolves inward — or answers differently the
-//!   second time — reaches nothing.
+//! * **Public addresses only.** Every destination is checked with
+//!   [`netguard`](crate::netguard) before dispatch, and every name the client
+//!   resolves is checked again as it resolves — so a host that resolves inward,
+//!   or answers differently the second time, reaches nothing.
 //! * **HTTPS only.** The payload describes a task; sending it in clear to an
 //!   address chosen by the recipient is a disclosure with extra steps.
 //!
@@ -32,12 +32,24 @@
 //! that task's output there: task-level policy and the operator host grant are
 //! both checked rather than treating the allowlist as sufficient authority.
 //!
+//! What that union is *called* on the wire is the [`PushMessage`]'s to say, not
+//! this module's: the same loop also carries an operator's structured-mode
+//! `CloudEvents` envelope, and one hard-coded media type would make whichever
+//! of the two lost a body no conformant receiver routes.
+//!
 //! # The journal is the outbox
 //!
 //! A registration stores the first journal sequence it has not acknowledged.
-//! Workers derive `StreamResponse` payloads from those records and advance only
-//! after HTTP 2xx. A crash after POST but before cursor persistence duplicates
-//! an event instead of losing it, which is A2A's at-least-once contract.
+//! Workers derive payloads from those records and advance only after HTTP 2xx.
+//! A crash after POST but before cursor persistence duplicates an event instead
+//! of losing it, which is A2A's at-least-once contract — and why every delivery
+//! carries a [`HEADER_ID`] the receiver can recognise a repeat by.
+//!
+//! A receiver that answers permanently, or that stays silent past the retry
+//! ceiling, has its registration [parked](PushStore::park) rather than deleted.
+//! The cursor is the only record of how far that receiver got; discarding it
+//! turns a receiver outage into an unrecoverable gap, where keeping it turns
+//! the same outage into a list an operator can re-arm.
 
 mod delivery;
 mod outbox;
@@ -45,7 +57,7 @@ mod sign;
 
 pub use delivery::{DeliveryWorker, Projection, PushSweepReport};
 pub use outbox::{Destination, OPERATOR_PREFIX, Outbox, RunCompleted, is_operator_id};
-pub use sign::BodySigning;
+pub use sign::{BodySigning, HEADER_ID, HEADER_SIGNATURE, HEADER_TIMESTAMP};
 
 /// Which of the two id namespaces a worker serves.
 ///
@@ -300,6 +312,8 @@ pub trait PushStore: Send + Sync + Debug {
     async fn list(&self, task: RunId) -> Result<Vec<PushConfig>, StoreError>;
 
     /// Registrations whose retry instant has arrived, in stable order.
+    ///
+    /// Parked rows are excluded — see [`park`](Self::park).
     async fn due(&self, at: u64, limit: usize) -> Result<Vec<PushRegistration>, StoreError>;
 
     /// The due registrations of **one namespace**, however deep in the stable
@@ -352,6 +366,9 @@ pub trait PushStore: Send + Sync + Debug {
     async fn advance(&self, task: RunId, id: &str, next_seq: Seq) -> Result<(), StoreError>;
 
     /// Record a failed attempt without advancing the cursor.
+    ///
+    /// Clears [`park`](Self::park): an attempt was made, so the registration is
+    /// live again whatever it was before.
     async fn retry(
         &self,
         task: RunId,
@@ -359,6 +376,43 @@ pub trait PushStore: Send + Sync + Debug {
         next_attempt_at: u64,
         error: &str,
     ) -> Result<(), StoreError>;
+
+    /// Stop delivering to this registration, and **keep its cursor**.
+    ///
+    /// What a worker does when a receiver has answered permanently, or has
+    /// stayed silent past the retry ceiling. Deleting the row instead would be
+    /// the one place this design loses an event: the cursor is the only record
+    /// of how far a receiver got, and once it is gone the undelivered tail of
+    /// that run is unrecoverable without a scan nobody schedules. A parked row
+    /// is not returned by [`due`](Self::due) or [`due_in`](Self::due_in), so it
+    /// costs no sweep; it is listed by [`parked`](Self::parked) and re-armed by
+    /// [`unpark`](Self::unpark), which is the difference between a backlog an
+    /// operator can act on and a warning line in yesterday's logs.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn park(&self, task: RunId, id: &str, error: &str) -> Result<(), StoreError>;
+
+    /// Parked registrations, in the store's stable order.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn parked(&self, limit: usize) -> Result<Vec<PushRegistration>, StoreError>;
+
+    /// Re-arm a parked registration: due at `at`, with its attempt count reset.
+    ///
+    /// The cursor is untouched, so delivery resumes at the first record the
+    /// receiver never acknowledged rather than at the head of the run. Returns
+    /// whether a parked registration was found — an operator re-arming one that
+    /// is already live, or that never existed, must be told so rather than left
+    /// waiting for a sweep that has nothing to do.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn unpark(&self, task: RunId, id: &str, at: u64) -> Result<bool, StoreError>;
 
     /// Forget one. Idempotent.
     ///
@@ -453,6 +507,13 @@ impl PushPolicy {
 pub struct PushSender {
     policy: PushPolicy,
     timeout: std::time::Duration,
+    /// The one pooled client this sender delivers through, so a sweep reuses
+    /// connections and TLS sessions instead of handshaking per message.
+    ///
+    /// Built on first use rather than in the constructor: the settings it needs
+    /// — the timeout, and whether loopback is permitted — arrive through
+    /// builder methods that run after it.
+    http: std::sync::OnceLock<reqwest::Client>,
     /// Lift the HTTPS requirement and the public-address check for a webhook
     /// on this machine. `testkit` only, and absent from any other build.
     #[cfg(feature = "testkit")]
@@ -480,15 +541,89 @@ pub struct PushSender {
     signing: std::collections::BTreeMap<String, BodySigning>,
 }
 
+/// One POST's worth of body: what to send, and what it is.
+///
+/// The media type travels with the message rather than being fixed by the
+/// transport, because two projections share one delivery loop and speak
+/// different wires — A2A's `application/a2a+json` and a `CloudEvents`
+/// structured-mode `application/cloudevents+json`. A single hard-coded header
+/// makes one of them a body no conformant receiver will route.
+///
+/// The `id` is the receiver's idempotency key. At-least-once delivery repeats
+/// events on an ordinary crash, so a message a receiver cannot recognise twice
+/// is one it must process twice; it must therefore be **stable across
+/// retries** of the same message and distinct between messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushMessage {
+    /// Stable identity for this message, sent as [`HEADER_ID`].
+    ///
+    /// Must be representable as an HTTP header value — a delivery whose id is
+    /// not is refused as [`PushError::Malformed`], because a receiver that
+    /// cannot be told which message this is has no defence against a duplicate.
+    pub id: String,
+    /// The media type of [`payload`](Self::payload), sent as `Content-Type`.
+    pub content_type: String,
+    /// The body, serialized canonically at the POST.
+    pub payload: serde_json::Value,
+}
+
+impl PushMessage {
+    /// A message whose body is plain JSON.
+    #[must_use]
+    pub fn json(id: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            id: id.into(),
+            content_type: "application/json".to_owned(),
+            payload,
+        }
+    }
+
+    /// A message whose body is a `CloudEvents` structured-mode envelope.
+    ///
+    /// The media type and the idempotency id both come from the event, so the
+    /// two facts a receiver needs — to route it, and to recognise it twice —
+    /// cannot be set to something the body does not say.
+    ///
+    /// The id is the event's `id` attribute and not its
+    /// [`origin_id`](crate::core::`CloudEvent`::origin_id). Uniqueness in
+    /// `CloudEvents` is `(source, id)`, and the source half is fixed here by
+    /// the destination: one endpoint is fed by one projection under one
+    /// configured source, so `id` alone separates its messages. The pair is in
+    /// the body regardless, for a receiver that fans several senders into one
+    /// endpoint.
+    #[must_use]
+    pub fn cloudevent(event: &crate::core::CloudEvent) -> Self {
+        Self {
+            id: event.id().to_owned(),
+            content_type: crate::core::CLOUDEVENT_CONTENT_TYPE.to_owned(),
+            payload: event.to_value(),
+        }
+    }
+
+    /// The same message under another media type.
+    #[must_use]
+    pub fn typed(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = content_type.into();
+        self
+    }
+}
+
 /// Delivery transport used by the durable worker.
 #[async_trait]
 pub trait PushTransport: Send + Sync + Debug {
     fn validate(&self, config: &PushConfig) -> Result<(), PushError>;
 
+    /// POST one message.
+    ///
+    /// `at` is Unix seconds for *this attempt*, supplied by the worker rather
+    /// than read here: it is signed alongside the body, and a transport reading
+    /// its own clock would sign an instant no test can pin and no operator
+    /// chose.
     async fn deliver(
         &self,
         config: &PushConfig,
-        payload: &serde_json::Value,
+        message: &PushMessage,
+        at: u64,
     ) -> Result<Delivered, PushError>;
 }
 
@@ -502,6 +637,7 @@ impl PushSender {
         Self {
             policy,
             timeout: Self::DEFAULT_TIMEOUT,
+            http: std::sync::OnceLock::new(),
             #[cfg(feature = "testkit")]
             plaintext_loopback: false,
             operator: false,
@@ -548,6 +684,7 @@ impl PushSender {
         Self {
             policy: PushPolicy::new(),
             timeout: Self::DEFAULT_TIMEOUT,
+            http: std::sync::OnceLock::new(),
             #[cfg(feature = "testkit")]
             plaintext_loopback: false,
             operator: true,
@@ -620,6 +757,38 @@ impl PushSender {
         &self.policy
     }
 
+    /// How far this sender's destinations are allowed to be.
+    ///
+    /// One answer, read by both the pre-flight and the client's resolver, so
+    /// the check that reports and the check that enforces cannot disagree.
+    fn reach(&self) -> crate::netguard::Reach {
+        if self.operator {
+            // The destination is the deployment's own, and resolving inward is
+            // the point of it — an internal bus has no public address.
+            // Refusing that would leave an operator with a sidecar that
+            // terminates TLS and forwards in clear, which is the same exposure
+            // with an extra hop.
+            crate::netguard::Reach::Any
+        } else if self.loopback_allowed() {
+            crate::netguard::Reach::PublicOrLoopbackName
+        } else {
+            crate::netguard::Reach::Public
+        }
+    }
+
+    /// The pooled client, built once. A failure is not cached, so one bad start
+    /// does not leave a sender that can never deliver.
+    fn http(&self) -> Result<&reqwest::Client, PushError> {
+        if let Some(client) = self.http.get() {
+            return Ok(client);
+        }
+        let client = crate::netguard::guarded_client(self.reach())
+            .timeout(self.timeout)
+            .build()
+            .map_err(|e| PushError::Unroutable(e.to_string()))?;
+        Ok(self.http.get_or_init(|| client))
+    }
+
     /// POST one `StreamResponse` to a registered webhook.
     ///
     /// The grant is re-checked here and not only at registration. A registration
@@ -641,7 +810,8 @@ impl PushSender {
     async fn deliver_validated(
         &self,
         config: &PushConfig,
-        payload: &serde_json::Value,
+        message: &PushMessage,
+        at: u64,
     ) -> Result<Delivered, PushError> {
         <Self as PushTransport>::validate(self, config)?;
 
@@ -664,55 +834,19 @@ impl PushSender {
             .and_then(|inner| inner.strip_suffix(']'))
             .unwrap_or(&host)
             .to_owned();
-        // Resolved once, every answer checked, and the connection pinned to
-        // exactly those addresses. Without the pin the client resolves again and
-        // may be handed a different answer than the one that passed — which is
-        // the rebinding attack this check would otherwise only appear to stop.
+        // Judged before anything is sent, so a destination this plane may not
+        // reach is refused rather than attempted — and refused with a *typed*
+        // answer, which is what the client's own resolver cannot give: a
+        // forbidden address and a receiver that is down carry different retry
+        // consequences, and a connect error is all reqwest can report. The
+        // socket obeys the same rule again, in `netguard::guarded_client`.
         let resolved = tokio::net::lookup_host((lookup.as_str(), port))
             .await
             .map_err(|e| PushError::Unroutable(format!("DNS for '{host}': {e}")))?;
-        let addrs = if self.operator {
-            // The destination is the deployment's own, and resolving inward is
-            // the point of it — an internal bus has no public address. Refusing
-            // that would leave an operator with a sidecar that terminates TLS
-            // and forwards in clear, which is the same exposure with a hop.
-            let addrs: Vec<_> = resolved.collect();
-            if addrs.is_empty() {
-                return Err(PushError::Unroutable(format!(
-                    "DNS for '{host}' returned no addresses"
-                )));
-            }
-            addrs
-        } else if self.loopback_allowed() && crate::netguard::is_loopback_name(&host) {
-            // Named rather than inferred: the exception applies to a host that
-            // *is* a loopback literal or `localhost`, not to one that merely
-            // resolved to one. A name that resolves inward is the rebinding
-            // attack, and it stays refused with the flag set.
-            let addrs: Vec<_> = resolved.collect();
-            if addrs.is_empty() {
-                return Err(PushError::Unroutable(format!(
-                    "DNS for '{host}' returned no addresses"
-                )));
-            }
-            addrs
-        } else {
-            crate::netguard::all_public(&host, resolved)
-                .map_err(|e| PushError::Unroutable(e.to_string()))?
-        };
-
-        let mut client = reqwest::Client::builder()
-            .timeout(self.timeout)
-            // No ambient authority: a webhook is somebody else's endpoint, and a
-            // proxy, a cookie jar or a stored credential would attach this
-            // plane's identity to a request it did not authorize.
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none());
-        for addr in &addrs {
-            client = client.resolve(&host, *addr);
-        }
-        let client = client
-            .build()
+        crate::netguard::judge(self.reach(), &host, resolved)
             .map_err(|e| PushError::Unroutable(e.to_string()))?;
+
+        let client = self.http()?;
 
         // Serialized here rather than left to `RequestBuilder::json`, because
         // the signature below has to cover the bytes that are actually sent: a
@@ -729,17 +863,29 @@ impl PushSender {
         // reproduce, and neither does this plane if it is ever asked to prove
         // what it sent. Sorted keys cost nothing here and make the bytes a
         // function of the payload rather than of its construction.
-        let body = crate::core::canon::value_bytes(payload);
+        let body = crate::core::canon::value_bytes(&message.payload);
 
+        let content_type = reqwest::header::HeaderValue::from_str(&message.content_type)
+            .map_err(|error| PushError::Malformed(format!("invalid content type: {error}")))?;
+        let id = reqwest::header::HeaderValue::from_str(&message.id)
+            .map_err(|error| PushError::Malformed(format!("invalid message id: {error}")))?;
         let mut request = client
             .post(url)
-            // The spec's media type, so a receiver can route on it.
-            .header("Content-Type", "application/a2a+json");
+            // What the body is, so a receiver can route on it. The projection
+            // decides it, because two of them share this loop and speak
+            // different wires.
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            // The two facts a receiver needs to survive at-least-once delivery:
+            // which message this is, and when this attempt was made. Sent to
+            // every destination, signed or not — a duplicate is ordinary here,
+            // and a receiver with nothing to deduplicate on processes it twice.
+            .header(HEADER_ID, id)
+            .header(HEADER_TIMESTAMP, at);
         // The destination's own key, if the deployment configured one. What a
-        // receiver may conclude from it — and the freshness it deliberately
-        // does not carry — is set out on `BodySigning`.
+        // receiver may conclude from it, and what it must still do itself, is
+        // set out on `BodySigning`.
         if let Some(signing) = self.signing.get(&config.id) {
-            request = request.header(signing.header_name().clone(), signing.value_for(&body));
+            request = request.header(HEADER_SIGNATURE, signing.value_for(&message.id, at, &body));
         }
         let mut request = request.body(body);
         if let Some(authentication) = &config.authentication {
@@ -760,7 +906,10 @@ impl PushSender {
         // returned `Err` for both "you may not" and "it did not answer".
         Ok(match request.send().await {
             Ok(response) if response.status().is_success() => Delivered::Accepted,
-            Ok(response) => Delivered::Rejected(response.status().as_u16()),
+            Ok(response) => Delivered::Rejected {
+                status: response.status().as_u16(),
+                retry_after: retry_after_seconds(response.headers()),
+            },
             Err(e) => Delivered::Unreachable(e.to_string()),
         })
     }
@@ -788,10 +937,21 @@ impl PushTransport for PushSender {
     async fn deliver(
         &self,
         config: &PushConfig,
-        payload: &serde_json::Value,
+        message: &PushMessage,
+        at: u64,
     ) -> Result<Delivered, PushError> {
-        self.deliver_validated(config, payload).await
+        self.deliver_validated(config, message, at).await
     }
+}
+
+/// `Retry-After` in seconds, when the receiver named one this plane can act on.
+///
+/// The rule is [`core::retry_after_seconds`](crate::core::retry_after_seconds),
+/// shared with the model drivers so no wire in this crate acts on advice
+/// another wire would refuse. A missing header is the ordinary case and means
+/// nothing more than "no advice" — the worker's own backoff applies.
+fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    crate::core::retry_after_seconds(headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?)
 }
 
 /// What happened to one delivery attempt.
@@ -799,9 +959,42 @@ impl PushTransport for PushSender {
 pub enum Delivered {
     /// The receiver answered 2xx, which is the acknowledgement the spec asks for.
     Accepted,
-    /// It answered something else. Its problem, recorded rather than retried
-    /// forever.
-    Rejected(u16),
+    /// It answered something else.
+    Rejected {
+        status: u16,
+        /// What the receiver asked to be waited, in seconds, if it said.
+        ///
+        /// A 429 or a 503 with `Retry-After` is a receiver naming its own
+        /// recovery, and a sender that overrides it with a schedule of its own
+        /// is choosing to be told twice. Honoured in preference to the
+        /// worker's backoff, and bounded there rather than here.
+        retry_after: Option<u64>,
+    },
     /// It did not answer.
     Unreachable(String),
+}
+
+impl Delivered {
+    /// Whether this answer will still be this answer after a wait.
+    ///
+    /// **410 Gone** is the one status that means it: the receiver is stating
+    /// that the resource is permanently absent, which is precisely a webhook
+    /// endpoint that has been retired. Every other rejection is treated as
+    /// transient, including 4xx — a 404 during a deploy, a 401 while a
+    /// credential rotates and a 400 from a receiver mid-upgrade are all
+    /// answers that change, and abandoning a run's events on the first of them
+    /// would lose more than a wasted retry costs.
+    #[must_use]
+    pub const fn is_permanent(&self) -> bool {
+        matches!(self, Self::Rejected { status: 410, .. })
+    }
+
+    /// The receiver's own advice about when to come back.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<u64> {
+        match self {
+            Self::Rejected { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }

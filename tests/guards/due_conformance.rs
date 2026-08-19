@@ -65,6 +65,18 @@ impl PushStore for DefaultPaged {
         self.0.retry(task, id, next_attempt_at, error).await
     }
 
+    async fn park(&self, task: RunId, id: &str, error: &str) -> Result<(), StoreError> {
+        self.0.park(task, id, error).await
+    }
+
+    async fn parked(&self, limit: usize) -> Result<Vec<PushRegistration>, StoreError> {
+        self.0.parked(limit).await
+    }
+
+    async fn unpark(&self, task: RunId, id: &str, at: u64) -> Result<bool, StoreError> {
+        self.0.unpark(task, id, at).await
+    }
+
     async fn delete(&self, task: RunId, id: &str) -> Result<(), StoreError> {
         self.0.delete(task, id).await
     }

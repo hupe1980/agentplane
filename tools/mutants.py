@@ -2696,13 +2696,31 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_delivered_events_source_is_the_authenticated_caller",
         "a caller names the source of the event it delivers, so it controls both "
         "halves of the dedup identity and can deduplicate against another party",
-        "    let mut event = InboundEvent::new(\n"
-        "        peer_source(&s.caller.actor),\n"
-        "        body.id,\n"
-        "        body.kind,\n"
-        "        body.payload,\n"
-        "    );",
-        "    let mut event = InboundEvent::new(\"urn:anonymous\", body.id, body.kind, body.payload);",
+        "    let event = input.into_event(peer_source(&s.caller.actor));",
+        "    let event = input.into_event(\"urn:anonymous\".to_owned());",
+    ),
+    "ACloudEventDedupesOnIdAlone": (
+        "src/core/cloudevent.rs",
+        "two_producers_behind_one_gateway_do_not_collide",
+        "an arriving CloudEvent is deduplicated on `id` alone rather than on "
+        "CloudEvents' `(source, id)` pair, so a gateway relaying two "
+        "counterparties that both number their messages from one swallows the "
+        "second as a retry of the first, silently",
+        "        format!(\"{}\\u{1f}{}\", self.source, self.id)",
+        "        self.id.clone()",
+    ),
+    "AnUnknownEnvelopeIsGuessedAt": (
+        "src/core/cloudevent.rs",
+        "what_is_refused_and_why",
+        "an envelope naming a spec version this plane was not written against "
+        "is accepted anyway, so a payload nobody here has understood is handed "
+        "to a run as if it had been",
+        "        if wire.specversion != SPEC_VERSION {\n"
+        "            return Err(CloudEventError::UnknownSpecVersion(wire.specversion));\n"
+        "        }",
+        "        if false {\n"
+        "            return Err(CloudEventError::UnknownSpecVersion(wire.specversion));\n"
+        "        }",
     ),
     "AnAwaitedEventsSenderIsNotJournaled": (
         "src/runtime/executor.rs",
@@ -3810,8 +3828,67 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "allowlist, a URL that is not https — is rescheduled instead of given "
         "up on, so the registration is retried until the journal is deleted and "
         "the operator sees the same info line a rebooting receiver produces",
-        "        let exhausted = attempts.saturating_add(1) >= self.max_attempts;\n        if permanent || exhausted {",
+        "        let exhausted = attempts.saturating_add(1) >= self.max_attempts;\n        if failure.permanent || exhausted {",
         "        let exhausted = attempts.saturating_add(1) >= self.max_attempts;\n        if exhausted {",
+    ),
+    "APushDeliveryAnnouncesOneMediaType": (
+        "src/push/mod.rs",
+        "a_cloudevents_delivery_announces_its_media_type_and_its_identity",
+        "every delivery is labelled with A2A's media type whatever it carries, "
+        "so an operator's structured-mode CloudEvent is posted under a type no "
+        "CloudEvents receiver routes on — the body is well formed, the POST is "
+        "accepted, and nothing reports that the envelope was not recognised",
+        "        let content_type = reqwest::header::HeaderValue::from_str(&message.content_type)",
+        "        let content_type = reqwest::header::HeaderValue::from_str(\"application/a2a+json\")",
+    ),
+    "AGoneReceiverIsRetriedForTheFullCeiling": (
+        "src/push/mod.rs",
+        "a_gone_receiver_is_parked_at_once_and_a_failing_one_is_not",
+        "a receiver answering 410 Gone — the status that means this endpoint is "
+        "retired — is retried for the whole ceiling like one that is rebooting, "
+        "so the one rejection an operator could have acted on is buried under "
+        "two hours of identical retry lines",
+        "        matches!(self, Self::Rejected { status: 410, .. })",
+        "        matches!(self, Self::Rejected { status: 0, .. })",
+    ),
+    "ARetryAfterIsDiscarded": (
+        "src/push/delivery.rs",
+        "a_receivers_retry_after_is_honoured_and_bounded",
+        "a receiver naming its own recovery through Retry-After is ignored in "
+        "favour of a fixed schedule, so a rate-limited receiver is hammered on "
+        "the sender's cadence and told twice what it already said once",
+        "        if let Some(seconds) = advice {\n"
+        "            return at.saturating_add(seconds.clamp(1, Self::MAX_RETRY_AFTER));\n"
+        "        }",
+        "        if let Some(_seconds) = advice {}",
+    ),
+    "APushBackoffHasNoSpread": (
+        "src/push/delivery.rs",
+        "registrations_that_failed_together_do_not_come_back_together",
+        "every registration that failed against one receiver is scheduled to "
+        "return at the same instant, so the moment that receiver recovers it is "
+        "hit by its entire backlog at once — a recovering service knocked over "
+        "by the sender that had been waiting politely for it",
+        "        let offset = spread(registration, attempts) % (half.saturating_add(1));",
+        "        let offset = 0 * spread(registration, attempts);",
+    ),
+    "AnExhaustedRegistrationLosesItsCursor": (
+        "src/push/delivery.rs",
+        "a_parked_registration_keeps_its_cursor_and_can_be_re_armed",
+        "a registration that answered permanently or outlasted the ceiling is "
+        "deleted rather than parked, discarding the cursor that is the only "
+        "record of how far its receiver got — the undelivered tail of that run "
+        "becomes unrecoverable without a scan nobody schedules",
+        "            self.store\n"
+        "                .park(\n"
+        "                    registration.config.task,\n"
+        "                    &registration.config.id,\n"
+        "                    &failure.error,\n"
+        "                )\n"
+        "                .await?;",
+        "            self.store\n"
+        "                .delete(registration.config.task, &registration.config.id)\n"
+        "                .await?;",
     ),
     "APushCeilingAbandonsOnTheFirstHiccup": (
         "src/push/delivery.rs",
@@ -3825,10 +3902,98 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     "AWebhookMayResolveInward": (
         "src/push/mod.rs",
         "a_webhook_resolving_to_a_private_address_is_refused",
-        "resolved webhook addresses are not checked, so a granted hostname "
-        "pointing at loopback or a metadata service is connected to",
-        "            crate::netguard::all_public(&host, resolved)\n                .map_err(|e| PushError::Unroutable(e.to_string()))?",
-        "            resolved.collect::<Vec<_>>()",
+        "the pre-flight address check is skipped, so a granted hostname pointing "
+        "at loopback or a metadata service is dispatched to rather than refused "
+        "— and the caller is told a receiver is down instead of that a "
+        "destination is forbidden",
+        "        crate::netguard::judge(self.reach(), &host, resolved)\n            .map_err(|e| PushError::Unroutable(e.to_string()))?;",
+        "        let _ = resolved;",
+    ),
+    "ANamedRetryWindowIsIgnored": (
+        "src/core/retry.rs",
+        "a_named_retry_window_is_waited_rather_than_a_computed_one",
+        "a peer's own `Retry-After` is discarded in favour of the computed "
+        "schedule, so a run meets a sixty-second rate-limit window three times "
+        "inside a second, exhausts its attempts and reports the provider as "
+        "down",
+        "            Some(named) if !named.is_zero() => named.min(self.max_advice),",
+        "            Some(_) => self.backoff(run, key, attempt),",
+    ),
+    "ARetryWindowIsObeyedUnbounded": (
+        "src/core/retry.rs",
+        "a_window_longer_than_the_policy_allows_is_clamped_not_obeyed",
+        "advice is obeyed without a ceiling, so a hostile or broken "
+        "`Retry-After` holds a worker for as long as the peer cares to name",
+        "            Some(named) if !named.is_zero() => named.min(self.max_advice),",
+        "            Some(named) if !named.is_zero() => named,",
+    ),
+    # NOTE: `advice.take()` at the read site is deliberately *not* mutated. Every
+    # live iteration reassigns `advice` at the foot of the loop, and the replay
+    # arms that skip that assignment run only while it is still None — so
+    # dropping the `take` is an equivalent mutant, not a gap. What is pinned
+    # instead is that the window leaves the failure at all.
+    "AWindowNeverLeavesTheFailure": (
+        "src/runtime/ctx.rs",
+        "a_named_retry_window_is_waited_rather_than_a_computed_one",
+        "the window a refusal named is never carried to the attempt it is "
+        "supposed to schedule, so every driver reads `Retry-After` correctly "
+        "and the retry loop still computes a schedule in ignorance of it",
+        "            advice = failure.retry_after();",
+        "            advice = None;",
+    ),
+    "AProviderWindowIsDroppedAtTheWire": (
+        "src/model/wire.rs",
+        "a_named_rate_limit_window_survives_classification",
+        "the provider's `Retry-After` is dropped as the response is classified, "
+        "so the one number that makes retrying a rate limit useful never leaves "
+        "the driver",
+        "            retry_after: retry_after(headers),",
+        "            retry_after: None,",
+    ),
+    "ASweepServesOneReceiverAtATime": (
+        "src/push/delivery.rs",
+        "one_stalled_receiver_does_not_hold_up_the_others",
+        "a delivery sweep serves its registrations strictly in order, so one "
+        "receiver sitting on its timeout decides when every other receiver gets "
+        "its events and a plane with a backlog falls permanently behind on all "
+        "of them",
+        "        .buffer_unordered(self.max_in_flight)",
+        "        .buffered(1)",
+    ),
+    "ASweepOpensASocketPerRow": (
+        "src/push/delivery.rs",
+        "a_sweep_opens_no_more_connections_than_its_ceiling",
+        "a delivery sweep ignores its concurrency ceiling, so a large backlog "
+        "is answered by opening a connection for every due row at once",
+        "        .buffer_unordered(self.max_in_flight)",
+        "        .buffer_unordered(usize::MAX)",
+    ),
+    "APooledClientReachesAnything": (
+        "src/netguard/resolver.rs",
+        "netguard::resolver::tests::a_guarded_client_does_not_reach_a_live_server_on_this_machine",
+        "every pooled outbound client is built without its address rule, so the "
+        "connections its pool opens after a caller's pre-flight returned reach "
+        "whatever DNS answers with — the rebinding window a one-shot check "
+        "cannot close",
+        "        .dns_resolver(GuardedResolver::shared(reach))",
+        "",
+    ),
+    "ACallerFacingReachIsTheOperatorsOwn": (
+        "src/netguard/resolver.rs",
+        "a_reach_rule_is_one_rule_for_the_preflight_and_the_socket",
+        "a caller-facing reach is exempted like the deployment's own, so the "
+        "address rule applies to nothing an untrusted party ever names",
+        "        Reach::Public => false,",
+        "        Reach::Public => true,",
+    ),
+    "ALoopbackExemptionIsKeyedOnTheAnswer": (
+        "src/netguard/resolver.rs",
+        "netguard::resolver::tests::a_name_that_is_not_loopback_gets_no_exemption_from_its_answers",
+        "the loopback exemption stops being keyed on the name, so any host an "
+        "attacker can point inward is exempted by the answer it arranged — the "
+        "rebinding attack, admitted by the control meant to refuse it",
+        "        Reach::PublicOrLoopbackName => super::is_loopback_name(host),",
+        "        Reach::PublicOrLoopbackName => true,",
     ),
     "AWebhookTokenIsEchoedBack": (
         "src/push/mod.rs",
@@ -3840,14 +4005,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     "ADeliverySignatureCoversNothing": (
         "src/push/sign.rs",
-        "a_signed_destination_carries_an_hmac_of_the_exact_bytes_posted",
+        "a_signed_destination_carries_a_standard_webhooks_signature_over_what_it_posted",
         "the body signature is computed over a constant instead of the body, so "
         "every delivery carries the same valid-looking MAC and a receiver "
         "verifying it accepts any body at all — the header says the payload was "
         "written by a holder of the secret, and it no longer says anything about "
         "the payload",
-        "        let mac = hmac_sha256(self.secret.expose().as_bytes(), body);",
-        "        let mac = hmac_sha256(self.secret.expose().as_bytes(), b\"\");",
+        "        let mac = hmac_sha256(&self.key, &content);",
+        "        let mac = hmac_sha256(&self.key, b\"\");",
     ),
     "OneTenantReadsAnothersWebhooks": (
         "src/store/redb_push.rs",
@@ -5181,11 +5346,13 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a peer endpoint is connected to without checking where it resolves, so "
         "a discovered card that advertises an internal address gets this run's "
         "payload and a bearer credential posted to it",
-        """            crate::netguard::all_public(host, resolved).map_err(|error| PeerError::Refused {
+        """        crate::netguard::judge(self.reach(), host, resolved).map_err(|error| {
+            PeerError::Refused {
                 peer: peer.clone(),
                 detail: error.to_string(),
-            })?""",
-        """            resolved.collect::<Vec<_>>()""",
+            }
+        })?;""",
+        """        let _ = resolved;""",
     ),
     "CardDiscoveryReachesInward": (
         "src/peers/discovery.rs",
@@ -5193,18 +5360,25 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a card URL is fetched without checking where it resolves, so the first "
         "attacker-influenced string a deployment handles reaches the cloud "
         "metadata service, a database or an internal health endpoint",
-        """            crate::netguard::all_public(&host, resolved)
-                .map_err(|e| DiscoveryError::Refused(e.to_string()))?""",
-        """            resolved.collect::<Vec<_>>()""",
+        """        crate::netguard::judge(self.reach(), &host, resolved).map_err(|e| match e {
+            crate::netguard::NetGuardError::NoAddresses { .. } => {
+                DiscoveryError::Unreachable(e.to_string())
+            }
+            crate::netguard::NetGuardError::Forbidden { .. } => {
+                DiscoveryError::Refused(e.to_string())
+            }
+        })?;""",
+        """        let _ = resolved;""",
     ),
-    "CardDiscoveryFollowsARedirect": (
-        "src/peers/discovery.rs",
+    "AGuardedClientFollowsARedirect": (
+        "src/netguard/resolver.rs",
         "card_discovery_refuses_an_inward_address_a_redirect_and_a_hang",
-        "a card fetch follows redirects, so every check above it applies only "
-        "to the first hop and an allowed card server forwards this plane "
-        "wherever it likes",
-        "            .redirect(reqwest::redirect::Policy::none());",
-        "            .redirect(reqwest::redirect::Policy::limited(10));",
+        "every guarded client follows redirects, so the address and host checks "
+        "apply only to the first hop and an allowed server forwards this plane "
+        "wherever it likes — card discovery, webhook delivery and peer calls at "
+        "once, because they share one constructor",
+        "        .redirect(reqwest::redirect::Policy::none())",
+        "        .redirect(reqwest::redirect::Policy::limited(10))",
     ),
     "ACardFetchIsUnbounded": (
         "src/peers/discovery.rs",

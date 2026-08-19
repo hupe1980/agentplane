@@ -39,6 +39,10 @@ enum Attempt {
     TimedOut,
     /// It landed and the answer would not decode.
     LandedUndecodable,
+    /// The peer throttled it and named a window, in milliseconds.
+    RateLimited(u64),
+    /// The peer throttled it and named nothing.
+    ThrottledSilently,
 }
 
 /// An effect that fails according to a script, one entry per attempt.
@@ -125,6 +129,14 @@ impl Effect for Scripted {
             Attempt::LandedUndecodable => Err(EffectError::OutputShape(
                 serde_json::from_str::<Value>("{{{").unwrap_err(),
             )),
+            Attempt::RateLimited(ms) => Err(EffectError::RateLimited {
+                detail: "slow down".into(),
+                retry_after: Some(Duration::from_millis(ms)),
+            }),
+            Attempt::ThrottledSilently => Err(EffectError::RateLimited {
+                detail: "slow down".into(),
+                retry_after: None,
+            }),
         }
     }
 }
@@ -432,6 +444,148 @@ async fn every_attempt_is_journaled_with_its_number_and_disposition() {
         })
         .collect();
     assert_eq!(backoffs[0], 0, "the first attempt never waits");
+}
+
+// ── A named window beats a computed one ─────────────────────────────────────
+
+/// Reads every attempt's recorded wait, in order.
+fn waits(records: &[agentplane::journal::Record]) -> Vec<u64> {
+    records
+        .iter()
+        .filter_map(|r| match r.kind() {
+            RecordKind::EffectStarted { backoff_ms, .. } => Some(*backoff_ms),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A peer that names its window is obeyed, past the schedule's own ceiling.
+///
+/// This is the defect the advice exists to fix: `fast_policy` caps the computed
+/// backoff at 4 ms, so without honouring the header a run meets a 7 ms window
+/// three times inside 12 ms and reports the provider as down. The schedule is
+/// a guess about when a service recovers; the peer is not guessing.
+#[tokio::test]
+async fn a_named_retry_window_is_waited_rather_than_a_computed_one() {
+    let (e, calls) = scripted(&[Attempt::RateLimited(7)]);
+    let f = fixture(
+        e.policy(RetryPolicy::default().wait_at_most(Duration::from_millis(50))),
+        calls,
+    );
+
+    let out =
+        f.rt.run("demo.once", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    let records = f.store.read(out.run_id, 1).await.unwrap();
+    let waited = waits(&records);
+    assert_eq!(waited[0], 0, "the first attempt never waits");
+    assert_eq!(
+        waited[1], 7,
+        "the peer named seven milliseconds and the run waited {} — a computed \
+         schedule capped at 4 ms cannot produce this number, so anything else \
+         here means the advice was dropped",
+        waited[1]
+    );
+}
+
+/// Advice is bounded by the policy, not obeyed.
+///
+/// The number comes from the one party with an interest in never being called
+/// again. `max_advice` is what stops a hostile or broken `Retry-After` from
+/// holding a worker for as long as it likes.
+///
+/// The advised window is 750 ms rather than the hour a hostile value would
+/// name, and the difference matters to the *test* rather than to the rule: a
+/// build without the ceiling waits the whole advised window before anything can
+/// be asserted, so an hour here would not fail this test — it would hang it for
+/// an hour and then fail. 750 ms is far past the 4 ms the computed schedule
+/// tops out at, which is what makes the assertion unambiguous, and short enough
+/// that removing the ceiling fails in under a second.
+#[tokio::test]
+async fn a_window_longer_than_the_policy_allows_is_clamped_not_obeyed() {
+    let (e, calls) = scripted(&[Attempt::RateLimited(750)]);
+    let f = fixture(
+        e.policy(RetryPolicy::default().wait_at_most(Duration::from_millis(5))),
+        calls,
+    );
+
+    let out =
+        f.rt.run("demo.once", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    let waited = waits(&f.store.read(out.run_id, 1).await.unwrap());
+    assert_eq!(
+        waited[1], 5,
+        "advice past the ceiling held the worker for {} ms; the ceiling is what \
+         makes honouring a stranger's number safe",
+        waited[1]
+    );
+}
+
+/// One refusal must not schedule every later attempt.
+///
+/// The advice belongs to the attempt that follows the failure carrying it. A
+/// window left standing would apply a stale number to every remaining attempt,
+/// which is the shape that turns a single throttle into a run-long stall.
+#[tokio::test]
+async fn a_window_applies_to_the_next_attempt_only() {
+    let (e, calls) = scripted(&[Attempt::RateLimited(9), Attempt::RefusedCleanly]);
+    let f = fixture(
+        e.policy(RetryPolicy::default().wait_at_most(Duration::from_millis(50))),
+        calls,
+    );
+
+    let out =
+        f.rt.run("demo.once", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    let waited = waits(&f.store.read(out.run_id, 1).await.unwrap());
+    assert_eq!(
+        waited[1], 9,
+        "the named window applies to the attempt after it"
+    );
+    assert!(
+        waited[2] <= 4,
+        "attempt three waited {} ms — the second failure named nothing, so the \
+         computed schedule applies and its ceiling is 4 ms",
+        waited[2]
+    );
+}
+
+/// A throttle with no window is still a throttle, and still retried.
+///
+/// The classification carries one fact a computed schedule cannot infer even
+/// when no window comes with it: the call did not happen and nothing was
+/// metered, so a mutating effect is as safe to repeat here as a read.
+#[tokio::test]
+async fn a_throttle_without_a_window_falls_back_to_the_schedule() {
+    let (e, calls) = scripted(&[Attempt::ThrottledSilently]);
+    let f = fixture(e.mutating().recovery(Recovery::RequiresOperator), calls);
+
+    let out =
+        f.rt.run("demo.once", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    assert_eq!(
+        out.status,
+        RunStatus::Succeeded,
+        "a rate limit never reached the peer, so even a mutating effect that \
+         refuses to guess may be repeated"
+    );
+
+    let waited = waits(&f.store.read(out.run_id, 1).await.unwrap());
+    assert!(
+        waited[1] <= 4,
+        "with no advice the computed ceiling applies, got {} ms",
+        waited[1]
+    );
 }
 
 /// Each attempt is a distinct effect key, or the second would collide with the

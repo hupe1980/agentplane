@@ -455,6 +455,30 @@ validation error, an unknown account); keep `Rejected` for the ones a repeat
 might (an overloaded gateway). Conflating them is how a wrong request burns
 every permitted attempt with backoff before failing anyway.
 
+And when the peer says *not now, come back at* — a 429 with a `Retry-After` —
+say so, because it is the one failure where the schedule does not have to be a
+guess:
+
+```rust
+Err(EffectError::RateLimited {
+    detail: format!("HTTP 429: {body}"),
+    // Delta-seconds only. `None` when the peer named nothing, which is
+    // ordinary — the effect's own schedule then applies.
+    retry_after: response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(agentplane::core::retry_after_seconds)
+        .map(Duration::from_secs),
+})
+```
+
+The runtime waits the named window instead of its computed backoff, bounded by
+`RetryPolicy::max_advice` (60 s by default). A `Rejected` here would work and
+would retry after ~100 ms, three times, inside a window measured in tens of
+seconds — and then report the provider as down. The shipped model drivers do
+this for you.
+
 `recovery` says what to do with a call that may have landed: `Retry` (safe to
 repeat), `Reconcile` (ask the provider what happened — implement `reconcile`),
 or `RequiresOperator`. A mutating effect that declares nothing gets
@@ -833,9 +857,16 @@ loop {
 There is deliberately no hidden Tokio worker. Lifecycle, shutdown, frequency
 and alerting belong to the process supervisor. Delivery is at least once: a
 crash after the receiver accepts but before cursor persistence repeats the
-event, and receivers must be idempotent. The journal is the outbox, so there is
-no task-transition/outbox dual write to lose. Configure push before card signing
-because `pushNotifications` is part of the signed document.
+event, and receivers must be idempotent — every POST carries a `webhook-id` for
+exactly that. The journal is the outbox, so there is no task-transition/outbox
+dual write to lose. Configure push before card signing because
+`pushNotifications` is part of the signed document.
+
+`report.needs_attention()` is what to alert on: it is true when the sweep was
+saturated or when it **parked** a registration, and false for an ordinary
+backoff — a receiver that is merely rebooting and one that will never answer
+again produce the same `retries: 1` otherwise. Parked rows keep their cursors;
+read them with `PushStore::parked` and re-arm with `PushStore::unpark`.
 
 ---
 
@@ -1760,19 +1791,45 @@ run's own records past a durable cursor that advances only on 2xx. There is no
 outbox table to fall out of sync with the history — **the journal is the outbox**,
 which is the point.
 
-`RunCompleted` emits one `CloudEvents` message per sealed run carrying the run
-id, the case, the outcome and the chain head. It deliberately does **not** carry
-the answer: a run's output is domain data with a label on it, and a default that
-shipped it would make an egress decision nobody declared. Implement `Projection`
-to shape your own.
+`RunCompleted` emits one `CloudEvents` 1.0 message per sealed run — posted as
+`Content-Type: application/cloudevents+json; charset=UTF-8`, which is what a
+CloudEvents receiver routes on — carrying the run id, the case, the outcome and
+the chain head. It deliberately does **not** carry the answer: a run's output is
+domain data with a label on it, and a default that shipped it would make an
+egress decision nobody declared. Implement `Projection` to shape your own; a
+`PushMessage` carries its own media type and its own id, so your wire is not the
+default's.
+
+Every delivery also carries `webhook-id` and `webhook-timestamp`. The id is the
+receiver's idempotency key — at-least-once delivery repeats events on an
+ordinary crash, so a receiver that cannot recognise a repeat runs the same work
+twice.
 
 **What is relaxed, and why it is not a weakening.** An operator destination skips
 the host allowlist (there is no caller to check — the URL is in the deployment's
 own configuration), HTTPS (an in-cluster collector on plaintext HTTP is ordinary,
 and refusing it pushes operators toward a TLS-terminating sidecar that forwards in
 clear) and the public-address check (resolving inward is the entire point). The
-cursor discipline, the retry ceiling, the abandon-and-report on a permanent
+cursor discipline, the retry ceiling, the park-and-report on a permanent
 refusal, and the no-proxy/no-redirect posture are all unchanged.
+
+**When a receiver stops answering.** `410 Gone` stops delivery at once — it is
+the one status no wait improves. Everything else is transient (a 404 mid-deploy
+and a 401 mid-rotation are answers that change), retried on an exponential
+schedule spread by a hash of the registration so a recovering receiver is not hit
+by its whole backlog at one instant, and honouring `Retry-After` up to an hour
+when the receiver named one. Past the ceiling — or on a permanent answer — the
+registration is **parked**, not deleted: it keeps its cursor, drops out of the
+due order, and shows up in `PushStore::parked`. An operator who fixes the
+receiver calls `PushStore::unpark`, and delivery resumes at the first record that
+receiver never acknowledged.
+
+```rust
+for row in store.parked(100).await? {
+    tracing::warn!(task = %row.config.task, id = %row.config.id, error = ?row.last_error);
+    store.unpark(row.config.task, &row.config.id, now_secs).await?;
+}
+```
 
 **The trap:** reusing an id in the operator namespace. Both kinds of registration
 share one store and are told apart by the `operator:` prefix; the A2A server
@@ -1789,27 +1846,39 @@ receiver. Signing is the other claim, and destinations take both:
 ```rust
 let bus = Destination::new("bus", "http://events.internal/ingest")
     .authenticated("Bearer", Secret::new(std::env::var("BUS_TOKEN")?))
-    .signed_with("X-Mako-Signature", Secret::new(std::env::var("BUS_SIGNING_KEY")?));
+    .signed_with(&Secret::new(std::env::var("BUS_SIGNING_KEY")?));
 ```
 
-Every delivery to it then carries `X-Mako-Signature: sha256=<hex>`, which is
-`HMAC-SHA256` over the **exact bytes POSTed** — the GitHub/Stripe convention, so
-a receiver already written against one of those verifies this one. The key is
-never written to the push store: it is deployment configuration read at every
-start, so there is no copy of a forge-anything key sitting in a row per run, and
-rotating it takes effect on the next sweep rather than on the next admission.
-That is why `for_operator_destinations` takes the destinations — a sender built
-without them would deliver unsigned, and only the receiver could ever notice.
+This is [Standard Webhooks](https://www.standardwebhooks.com/), so a receiver
+verifies with a library it did not write. Every delivery carries three headers:
 
-**What a valid signature does not prove.** Not freshness: there is no timestamp
-and no nonce in what is MACed, so a captured delivery replays forever and every
-check still passes. Only the receiver closes that, by deduplicating on the
-event's own identity — which `RunCompleted` supplies as CloudEvents' `(source,
-id)` pair, and which a receiver already needs, because at-least-once delivery
-repeats events on an ordinary crash. Not origin in the third-party sense either:
-the secret is symmetric, so anyone holding it can mint the same signature. And
-a receiver must **require** the header — verifying it when present and accepting
-it when absent buys nothing, because an attacker simply omits it.
+| header | what it is |
+| --- | --- |
+| `webhook-id` | the message's identity, stable across retries — the idempotency key |
+| `webhook-timestamp` | Unix seconds, the instant *this attempt* was made |
+| `webhook-signature` | `v1,<base64>` of `HMAC-SHA256(key, "{id}.{timestamp}.{body}")` |
+
+The id and the timestamp are **inside** the signed content, which is the point:
+a signature over the body alone is a genuine body genuinely signed, so a captured
+POST replays forever. A receiver that refuses timestamps outside a tolerance
+window *and* deduplicates on `webhook-id` has a delivery that expires — neither
+half works alone.
+
+A secret spelled `whsec_<base64>` names base64 **of the key**, which is what a
+receiver's library will decode; anything else is the key itself. Keys shorter
+than 24 bytes are refused where they are configured. The key is never written to
+the push store: it is deployment configuration read at every start, so there is
+no copy of a forge-anything key sitting in a row per run, and rotating it takes
+effect on the next sweep rather than on the next admission. That is why
+`for_operator_destinations` takes the destinations — a sender built without them
+would deliver unsigned, and only the receiver could ever notice.
+
+**What a valid signature still does not prove.** Not origin in the third-party
+sense: the secret is symmetric, so anyone holding it can mint the same
+signature. Not confidentiality — signing a plaintext delivery makes it
+unforgeable, not private. And a receiver must **require** the header: verifying
+it when present and accepting it when absent buys nothing, because an attacker
+simply omits it.
 
 ## 🔐 Restrict where the plane may connect
 

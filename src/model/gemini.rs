@@ -1024,8 +1024,9 @@ impl ModelProvider for Gemini {
 
         let status = response.status();
         if !status.is_success() {
+            let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(classify_status(model, status.as_u16(), &text));
+            return Err(classify_status(model, status.as_u16(), &headers, &text));
         }
 
         if self.stream {

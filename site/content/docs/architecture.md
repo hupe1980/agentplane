@@ -1221,7 +1221,44 @@ The boundary is drawn by purpose, not duration:
 | | |
 |---|---|
 | Retrying a flaky call | `RetryPolicy` — in-process, bounded by `max_backoff` |
-| Waiting for the world — a rate-limit window, a settlement date, five Werktage | `cx.sleep()` — suspends, costs a row |
+| Waiting for the world — a settlement date, five Werktage | `cx.sleep()` — suspends, costs a row |
+
+### When the peer names the window
+
+A computed backoff is a **guess about when a service recovers**, and it is the
+right shape for a failure nobody can time. It is the wrong shape for a throttle:
+a schedule capped at ten seconds meets a sixty-second rate-limit window three
+times inside a second, exhausts its attempts, and reports the provider as down.
+Correct by the policy, and a false outage.
+
+So a failure that carries a `Retry-After` schedules the next attempt from the
+number the peer gave. Every HTTP driver reads the header, `EffectError::RateLimited`
+carries it, and `RetryPolicy::wait_before` is the one place that chooses between
+the two schedules.
+
+```rust
+// A provider that says "come back in 30s" is waited out, not hammered.
+let policy = RetryPolicy::attempts(4).wait_at_most(Duration::from_secs(45));
+```
+
+Two ceilings, not one, because obeying a stranger and guessing for oneself are
+different risks:
+
+| | Bounds | Default |
+|---|---|---|
+| `max_backoff` | the **guess** — nobody knows when the service recovers, so waiting long is waste | 10 s |
+| `max_advice` | **somebody else's word** — from the one party with an interest in never being called again | 60 s |
+
+Advice past `max_advice` is clamped rather than discarded: waiting part of a
+window is closer to right than ignoring it, and if the window really was longer
+the next refusal names what is left. Advice this runtime cannot act on is *no
+advice*, which is the same answer as an absent header — an HTTP-date, because
+acting on it means trusting the peer's clock against ours, and zero, because it
+would replace a backoff with no wait at all.
+
+The wait is still in-process, so `max_advice` is also a bound on worker
+occupancy. A rate limit measured in more than minutes is not a retry; that is
+`cx.sleep()`.
 
 ## Budgets
 
@@ -1400,7 +1437,8 @@ src/
   memory/    what an agent remembers between runs: versioned items, journaled
              retrieval, and labels taken from provenance rather than content
   netguard/  which IP addresses this plane will connect to — one rule, shared
-             by governed media and webhook delivery
+             by governed media, webhook delivery and both A2A URL legs, applied
+             at connect time so a pooled client stays guarded
   push/      Durable outbound delivery: the journal-as-outbox cursor loop, A2A
              webhook cursors with SSRF-guarded delivery for caller-supplied URLs,
              and an operator-configured outbox for the deployment's own events
@@ -1512,7 +1550,8 @@ invite `Recovery` to resolve an outcome that is not uncertain at all.
 
 A refusal *before* generation — bad request, unknown model, rate limit — is
 `DidNotHappen` and costs nothing. Rate limiting is the one case in this crate
-where retrying is unambiguously safe.
+where retrying is unambiguously safe, and the only one where the peer tells you
+*when* — see [when the peer names the window](#when-the-peer-names-the-window).
 
 ### Why the budget fixture calls twice
 
@@ -1658,10 +1697,12 @@ the interface URL *the card advertised*, carrying this run's payload and a
 bearer credential. A card is a description and never a grant, so a forged one
 cannot widen authority — but it can name an address, and these are the two
 places an address becomes a connection. Each resolves the host, checks every
-answer against `netguard`, **pins** the connection to exactly those addresses,
-refuses redirects, and bounds the whole request. Pinning rather than
-re-resolving is what makes the check real against DNS rebinding; refusing
-redirects is what stops an allowed host handing the decision to a third one. The
+answer against `netguard`, refuses redirects, and bounds the whole request. The
+address check is the client's own DNS resolver, so it holds for **every**
+connection the client opens rather than for the one request a pin was computed
+for — which is what makes it real against DNS rebinding and what lets one
+client be reused. Refusing redirects is what stops an allowed host handing the
+decision to a third one. The
 host allowlist stays optional on both, because a deployment that discovers
 agents from the open internet cannot enumerate them in advance — with none set,
 the address rule is the only lock, which is why it is unconditional. Loopback is
@@ -1940,10 +1981,12 @@ Three controls, none sufficient alone:
   and no host outside it. This is the primary control; the rest are the second
   lock. Matching is exact — suffix matching is how a grant for `acme.example` is
   satisfied by `evil-acme.example`.
-- **Every resolved address checked, and the connection pinned to them.** One
+- **Every resolved address checked, at the moment the socket is opened.** One
   private answer refuses the whole resolution, so a name that answers with a
-  public address and a private one reaches nothing — and pinning means the
-  client cannot be handed a different answer on the second lookup.
+  public address and a private one reaches nothing. The check is the client's
+  own DNS resolver rather than a per-request pin, which is what lets one pooled
+  client serve a whole sweep — see [one client, judged at
+  connect](#one-client-judged-at-connect).
 - **HTTPS only.** The payload describes a task; sending it in clear to an
   address the recipient chose is a disclosure with extra steps.
 
@@ -1961,6 +2004,59 @@ required to process idempotently; monotonic advancement prevents regression.
 Failures back off exponentially, terminal acknowledgement removes the config,
 and registering after completion starts at the terminal record so it is not an
 inert promise.
+
+**A sweep is bounded, not serialised.** Registrations share no cursor, no
+receiver and no task, so nothing about the cursor discipline requires them to be
+served one at a time — and serving them that way requires only that every
+receiver be as fast as the slowest. One endpoint sitting on its fifteen-second
+timeout would decide when the rest of the plane's events go out, and a plane
+with more due rows than a tick can drain falls permanently behind on all of
+them. `DeliveryWorker::max_in_flight` bounds the fan-out (sixteen by default),
+because a sweep is the one place this runtime knows how much outbound work
+exists and `limit` is a page size rather than a concurrency budget. Ordering
+*within* one registration is untouched: that loop is a cursor that may only move
+forward.
+
+#### One client, judged at connect
+
+Pinning a connection to pre-approved addresses is the obvious way to stop a name
+resolving somewhere else between the check and the connect. It costs an HTTP
+client per destination — a pin is a property of the client — so a caller that
+pins builds a fresh connection pool, TLS session and handshake for every
+message. A delivery sweep or an agent delegating to a peer in a loop pays that
+per event.
+
+The rule lives in the client's DNS resolver instead. That keeps the guarantee
+and drops the cost, and strengthens it: a **pooled** client opens connections
+long after any pre-flight returned, and those are exactly the ones a one-shot
+check never saw.
+
+The pre-flight stays, and is not redundant — the two cover different things.
+The pre-flight judges **every** destination once, including an IP literal, and
+is the only one that can say *which* refusal happened: a DNS hook can only fail,
+and a forbidden address must not read as a receiver that is merely down, because
+one is never retried and the other always is. The resolver judges **every name
+resolution**, which is what closes the window between that one check and a
+connection the pool opens later.
+
+An IP-literal host never reaches a resolver — the connector dials it directly —
+and nothing is lost by that: a literal has exactly one address, the pre-flight
+already judged it, and it is the one dialled. A name is the case with a second
+answer in it. One rule, `netguard::judge`, called from both.
+
+The three settings that make a client guarded are one constructor rather than
+three a caller remembers, because they are not independent:
+
+| Setting | Why it is not optional |
+|---|---|
+| custom DNS resolver | it is what judges the address at all |
+| `no_proxy` | a proxied request resolves the **proxy**, so the resolver is never asked about the destination |
+| `redirect::none` | a judgement about the endpoint says nothing about the third host it forwards to |
+
+A client with two of the three looks guarded and is not, and the address it
+would then reach is one no test can make DNS answer with on demand. So the
+guarantee is structural, and the one behaviour a test *can* observe is that a
+guarded client fails to reach a server genuinely listening on this machine.
 
 Artifacts are delivered because A2A defines push and streaming over the same
 union. This makes task-level authorization and the destination host grant
@@ -2922,7 +3018,7 @@ responsibilities.
 | `tests/process/tasks.rs` | Worklist, four-eyes, expiry policy, breach escalation |
 | `tests/process/plans.rs` | Contract validation, ready-set, provenance through the graph |
 | `tests/trust/budgets.rs` | Limits, overshoot semantics, replay billing identically |
-| `tests/engine/retries.rs` | The disposition gate, the policy bound, attempt keys, replay of a retry sequence |
+| `tests/engine/retries.rs` | The disposition gate, the policy bound, attempt keys, replay of a retry sequence, a peer's named window beating the computed one |
 | `tests/engine/reconciliation.rs` | Probing after doubt, the verdict on the record, strict replay staying a pure read |
 | `tests/engine/compensation.rs` | Reverse-order unwind, pivots, undeclared steps, refusing to unwind under doubt |
 | `tests/process/timers.rs` | Durable sleep, the journaled instant, single-delivery wake-ups, abandoned claims |

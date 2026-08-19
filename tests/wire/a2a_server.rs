@@ -248,14 +248,19 @@ impl PushTransport for RecordingPush {
         }
     }
 
-    async fn deliver(&self, config: &PushConfig, payload: &Value) -> Result<Delivered, PushError> {
+    async fn deliver(
+        &self,
+        config: &PushConfig,
+        message: &agentplane::push::PushMessage,
+        _at: u64,
+    ) -> Result<Delivered, PushError> {
         // The real `PushSender` re-checks the grant here, not only at
         // registration, because a registration outlives the configuration that
         // permitted it. A double that skipped it would be exempt from the one
         // control this path exists to apply — and every test written against it
         // would pass with the control removed.
         self.validate(config)?;
-        self.payloads.lock().unwrap().push(payload.clone());
+        self.payloads.lock().unwrap().push(message.payload.clone());
         let mut failures = self.failures.lock().unwrap();
         if *failures > 0 {
             *failures -= 1;
@@ -863,6 +868,7 @@ async fn push_worker_cleans_up_after_advance_won_the_race_with_a_crash() {
 /// abandonment ceiling for a receiver that never recovers; the worker's own
 /// tests own that.
 #[cfg(feature = "testkit")]
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn a_receiver_answering_500_is_rejected_and_the_cursor_does_not_advance() {
     use agentplane::push::{PushPolicy, PushSender};
@@ -917,10 +923,21 @@ async fn a_receiver_answering_500_is_rejected_and_the_cursor_does_not_advance() 
         authentication: None,
     };
     let outcome = sender
-        .deliver(&probe, &json!({"probe": true}))
+        .deliver(
+            &probe,
+            &agentplane::push::PushMessage::json("probe", json!({"probe": true})),
+            0,
+        )
         .await
         .expect("an answered request is an outcome, never a PushError");
-    assert_eq!(outcome, Delivered::Rejected(500), "the status must survive");
+    assert_eq!(
+        outcome,
+        Delivered::Rejected {
+            status: 500,
+            retry_after: None
+        },
+        "the status must survive"
+    );
 
     // Second half: the worker consuming that outcome leaves the cursor where
     // it was. Same registration flow as production, real sender throughout.
@@ -3620,7 +3637,7 @@ async fn a_permanently_refused_webhook_is_abandoned_rather_than_retried_forever(
     let report = worker.run_once(10, 10).await.unwrap();
 
     assert_eq!(
-        report.abandoned, 1,
+        report.parked, 1,
         "a permanent refusal was rescheduled instead of being given up on: {report:?}"
     );
     assert_eq!(
@@ -3631,9 +3648,35 @@ async fn a_permanently_refused_webhook_is_abandoned_rather_than_retried_forever(
         report.needs_attention(),
         "the tick that gave up on a peer's webhook reads exactly like a quiet one: {report:?}"
     );
+    // Out of the due order, and still readable: parking keeps the cursor, so
+    // an operator who re-grants the host resumes at the first record this
+    // receiver never took rather than at the head of the run.
     assert!(
-        f.store.get(task, "revoked").await.unwrap().is_none(),
+        PushStore::due(&*f.store, 1_000_000, 10)
+            .await
+            .unwrap()
+            .is_empty(),
         "a webhook refused by the operator's own grant is still queued"
+    );
+    let parked = f.store.parked(10).await.unwrap();
+    assert_eq!(
+        parked.len(),
+        1,
+        "the refusal deleted the cursor: {parked:?}"
+    );
+    assert!(
+        f.store
+            .unpark(task, &parked[0].config.id, 1_000)
+            .await
+            .unwrap(),
+        "a parked registration could not be re-armed"
+    );
+    let rearmed = PushStore::due(&*f.store, 1_000, 10).await.unwrap();
+    assert_eq!(
+        rearmed.first().map(|row| row.next_seq),
+        Some(parked[0].next_seq),
+        "re-arming rewound the cursor, so an operator who re-grants a host \
+         replays what the receiver already took: {rearmed:?}"
     );
 }
 
@@ -3687,14 +3730,38 @@ async fn an_unreachable_receiver_is_retried_up_to_the_ceiling_and_then_abandoned
         "an ordinary backoff was reported as something a human must clear: {ticks:?}"
     );
     assert_eq!(
-        ticks[2].abandoned, 1,
+        ticks[2].parked, 1,
         "the third failure of a ceiling of three did not give up: {ticks:?}"
     );
     assert!(ticks[2].needs_attention(), "{:?}", ticks[2]);
     assert!(
-        f.store.get(task, "cfg-0").await.unwrap().is_none()
-            && f.store.list(task).await.unwrap().is_empty(),
-        "an abandoned registration is still queued"
+        PushStore::due(&*f.store, 1_000_000, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a parked registration is still queued"
+    );
+    let parked = f.store.parked(10).await.unwrap();
+    assert_eq!(
+        parked.len(),
+        1,
+        "the ceiling deleted the cursor instead of parking it"
+    );
+    // And an operator who fixed the receiver gets it back, from where it
+    // stopped rather than from the top.
+    let id = parked[0].config.id.clone();
+    assert!(
+        f.store.unpark(task, &id, at).await.unwrap(),
+        "a parked registration could not be re-armed"
+    );
+    assert_eq!(
+        PushStore::due(&*f.store, at, 10).await.unwrap().len(),
+        1,
+        "an unparked registration is not due"
+    );
+    assert!(
+        !f.store.unpark(task, &id, at).await.unwrap(),
+        "unparking a live registration reported that it had done something"
     );
 }
 
