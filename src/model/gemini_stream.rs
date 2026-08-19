@@ -122,6 +122,27 @@ impl Accumulator {
         self.generated
     }
 
+    /// The usage block as last reported, wrapped in the envelope shape the
+    /// buffered path's parser reads.
+    ///
+    /// Gemini sends `usageMetadata` on the chunks themselves and reports it
+    /// cumulatively, so a stream that dies mid-answer has already been told
+    /// what it burned. That is the whole reason streaming is this driver's
+    /// default, and reaching it needs an accessor: a severed stream that could
+    /// not see this would report a cost of zero for tokens the provider will
+    /// invoice.
+    ///
+    /// The envelope rather than the bare block, so the caller parses it with
+    /// the *same* function the buffered path uses. That normalisation — thought
+    /// tokens billed as output and added, cached input a subset and not added —
+    /// is the part that costs real money when got wrong, and a second spelling
+    /// of it here would be free to disagree with the first.
+    pub(super) fn usage_envelope(&self) -> Option<Value> {
+        self.usage
+            .clone()
+            .map(|usage| json!({ "usageMetadata": usage }))
+    }
+
     /// The envelope a buffered call would have returned.
     pub(super) fn into_response(self) -> Value {
         let mut response = json!({

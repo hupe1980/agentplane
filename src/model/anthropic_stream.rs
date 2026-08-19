@@ -379,15 +379,15 @@ impl Accumulator {
     /// when a later event repeats one of them.
     #[must_use]
     pub const fn billed(&self) -> Usage {
-        Usage {
-            input_tokens: self.usage.input_tokens
-                + self.usage.cache_write_tokens
-                + self.usage.cache_read_tokens,
-            output_tokens: self.usage.output_tokens,
-            cache_write_tokens: self.usage.cache_write_tokens,
-            cache_read_tokens: self.usage.cache_read_tokens,
-            minor_units: 0,
-        }
+        // The same call the buffered path makes: Anthropic reports cached
+        // counts beside `input_tokens`, and one spelling of that arithmetic is
+        // what keeps the two paths from billing a cached call differently.
+        Usage::with_cache_beside_input(
+            self.usage.input_tokens,
+            self.usage.output_tokens,
+            self.usage.cache_write_tokens,
+            self.usage.cache_read_tokens,
+        )
     }
 }
 

@@ -133,9 +133,19 @@ impl HttpWitness {
         // rather than as an unparseable checkpoint an auditor is holding.
         SignedNote::validate_name(&log_signature.name)
             .map_err(|e| WitnessError::Unavailable(e.to_string()))?;
-        let http = reqwest::Client::builder().build().map_err(|e| {
-            WitnessError::Unavailable(format!("could not build an HTTP client: {e}"))
-        })?;
+        // Bounded, like every other outbound call here. A witness is somebody
+        // else's server and cosigning sits on the path that publishes a
+        // checkpoint, so one that accepts the connection and never answers
+        // holds that path open indefinitely — an availability failure in the
+        // evidence layer, caused by a party whose whole purpose is to be
+        // independent of this one.
+        let http = reqwest::Client::builder()
+            .timeout(Self::TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| {
+                WitnessError::Unavailable(format!("could not build an HTTP client: {e}"))
+            })?;
         Ok(Self {
             http,
             prefix: prefix.into().trim_end_matches('/').to_owned(),
@@ -143,6 +153,13 @@ impl HttpWitness {
             log_signature,
         })
     }
+
+    /// How long a cosignature request may take in total.
+    ///
+    /// Ten seconds: a witness signs a short checkpoint it already holds the
+    /// state for, and one that cannot do so in that time is unavailable in the
+    /// sense the caller already handles.
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// The request body: old size, proof lines, blank line, signed checkpoint.
     fn body(&self, checkpoint: &Checkpoint, old_size: u64, proof: &[Digest]) -> String {

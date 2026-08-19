@@ -416,7 +416,7 @@ pub struct Embed {
 
 #[async_trait]
 impl Effect for Embed {
-    type Output = Vec<f32>;
+    type Output = crate::memory::Embedding;
 
     fn descriptor(&self) -> EffectDescriptor {
         EffectDescriptor::new(
@@ -445,10 +445,19 @@ impl Effect for Embed {
     }
 
     async fn perform(&self) -> Result<Self::Output, EffectError> {
-        self.embedder
+        // The revision is read from the driver rather than taken from a
+        // caller, so the space a vector lives in is a fact about the wiring
+        // and never a claim. `IndexIdentity` is where the cost of a claim is
+        // written down.
+        let vector = self
+            .embedder
             .embed(&self.text)
             .await
-            .map_err(|error| EffectError::Other(error.to_string()))
+            .map_err(|error| EffectError::Other(error.to_string()))?;
+        Ok(crate::memory::Embedding {
+            vector,
+            revision: self.embedder.revision(),
+        })
     }
 }
 

@@ -92,10 +92,9 @@ impl SkillDescriptor {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Outcome {
-    // `Delegate` used to sit here. It was removed rather than left declared,
-    // because no build ever provided it: returning it produced a run failure
-    // saying the feature was unavailable, which is a public API whose only
-    // reachable outcome is an error.
+    // There is deliberately no `Delegate` variant, and its absence is the
+    // enum's one design decision worth stating: an outcome no build can
+    // service is a public API whose only reachable result is an error.
     //
     // Handing work to another agent is an **effect** — see the `blog_room`
     // example. That is not a workaround but the better shape: an effect is

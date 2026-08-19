@@ -354,21 +354,35 @@ fn task_state_from(s: &str) -> Result<TaskState, StoreError> {
     })
 }
 
-fn priority_from(s: &str) -> Priority {
-    match s {
+// The three decoders below refuse an unrecognised string, like the three
+// above them. A decoder that answers with a default cannot report that the
+// row was damaged, so the damage arrives as a *decision*: the whole point of
+// `phase` is telling a step's forward pass from its compensating one, and a
+// silent `Forward` hands the unwind logic a compensating record wearing the
+// wrong half of the saga. `Deny` and `Normal` are safe values and that is
+// precisely what makes them the wrong answer here — a fail-closed default is
+// still a fact this store invented about a row it could not read.
+//
+// Every call site already returns `StoreError`, so refusing costs nothing but
+// the `?`.
+
+fn priority_from(s: &str) -> Result<Priority, StoreError> {
+    Ok(match s {
         "low" => Priority::Low,
+        "normal" => Priority::Normal,
         "high" => Priority::High,
         "urgent" => Priority::Urgent,
-        _ => Priority::Normal,
-    }
+        other => return Err(corrupt("unknown task priority", other)),
+    })
 }
 
-fn expiry_from(s: &str) -> OnExpiry {
-    match s {
+fn expiry_from(s: &str) -> Result<OnExpiry, StoreError> {
+    Ok(match s {
+        "deny" => OnExpiry::Deny,
         "escalate" => OnExpiry::Escalate,
         "proceed" => OnExpiry::Proceed,
-        _ => OnExpiry::Deny,
-    }
+        other => return Err(corrupt("unknown expiry policy", other)),
+    })
 }
 
 fn expiry_str(e: OnExpiry) -> &'static str {
@@ -386,11 +400,12 @@ fn phase_str(p: crate::core::Phase) -> &'static str {
     }
 }
 
-fn phase_from(s: &str) -> crate::core::Phase {
-    match s {
+fn phase_from(s: &str) -> Result<crate::core::Phase, StoreError> {
+    Ok(match s {
+        "forward" => crate::core::Phase::Forward,
         "compensating" => crate::core::Phase::Compensating,
-        _ => crate::core::Phase::Forward,
-    }
+        other => return Err(corrupt("unknown step phase", other)),
+    })
 }
 
 impl PostgresStore {
@@ -1315,7 +1330,7 @@ impl EventStore for PostgresStore {
                     .map_err(|e| corrupt("bad case id", e))?,
                 effect: EffectKey::from_hex(&effect).map_err(|e| corrupt("bad effect key", e))?,
                 step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
-                phase: phase_from(&phase),
+                phase: phase_from(&phase)?,
                 kind: event.kind.clone(),
                 correlation: event.correlation.clone(),
             }));
@@ -1391,7 +1406,7 @@ impl EventStore for PostgresStore {
                 .map_err(|e| corrupt("bad case id", e))?,
             effect: EffectKey::from_hex(&effect).map_err(|e| corrupt("bad effect key", e))?,
             step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
-            phase: phase_from(&phase),
+            phase: phase_from(&phase)?,
             kind: event.kind.clone(),
             correlation: rows
                 .iter()
@@ -1631,7 +1646,7 @@ impl EventStore for PostgresStore {
                     .map_err(|e| corrupt("bad case id", e))?,
                 effect: EffectKey::from_hex(&effect).map_err(|e| corrupt("bad effect key", e))?,
                 step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
-                phase: phase_from(&phase),
+                phase: phase_from(&phase)?,
                 kind: row.get(5),
                 correlation: vec![CorrelationKey::new(
                     row.get::<_, String>(6),
@@ -1790,7 +1805,7 @@ fn timer_from(row: &tokio_postgres::Row) -> Result<Timer, StoreError> {
             .map_err(|e| corrupt("bad case id", e))?,
         effect: EffectKey::from_hex(&effect).map_err(|e| corrupt("bad effect key", e))?,
         step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
-        phase: phase_from(&phase),
+        phase: phase_from(&phase)?,
         fire_at: Timestamp::from_unix_timestamp(row.get::<_, i64>(5))
             .map_err(|e| corrupt("unrepresentable fire_at", e))?,
     })
@@ -2203,9 +2218,9 @@ fn task_from(row: &tokio_postgres::Row) -> Result<Task, StoreError> {
         candidate_roles: split(&roles),
         excluded_actors: split(&excluded),
         assignee: row.get(7),
-        priority: priority_from(&priority),
+        priority: priority_from(&priority)?,
         state: task_state_from(&state)?,
-        on_expiry: expiry_from(&on_expiry),
+        on_expiry: expiry_from(&on_expiry)?,
         created_at: Timestamp::from_unix_timestamp(row.get::<_, i64>(11))
             .map_err(|e| corrupt("unrepresentable created_at", e))?,
         due_at: due
@@ -2458,4 +2473,60 @@ fn item_from(row: &tokio_postgres::Row, key: &str) -> Result<ItemRecord, StoreEr
             minor_units: amount_of(row.get::<_, i64>(4)),
         },
     })
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    /// Every string this store writes is one it reads back as the same value.
+    ///
+    /// The encoder is exhaustive over the type, so the pair cannot drift while
+    /// this passes: a variant added to `Phase`, `OnExpiry` or `Priority`
+    /// changes the encoder's output and this fails on the decoder's refusal.
+    #[test]
+    fn every_written_string_decodes_to_the_value_that_wrote_it() {
+        use crate::core::Phase;
+        for phase in [Phase::Forward, Phase::Compensating] {
+            assert_eq!(phase_from(phase_str(phase)).expect("round trip"), phase);
+        }
+        for expiry in [OnExpiry::Deny, OnExpiry::Escalate, OnExpiry::Proceed] {
+            assert_eq!(expiry_from(expiry_str(expiry)).expect("round trip"), expiry);
+        }
+        for priority in [
+            Priority::Low,
+            Priority::Normal,
+            Priority::High,
+            Priority::Urgent,
+        ] {
+            assert_eq!(
+                priority_from(priority.as_str()).expect("round trip"),
+                priority
+            );
+        }
+    }
+
+    /// **A row this store cannot read is not a row with a default value.**
+    ///
+    /// A decoder that answers with a fallback cannot report damage, so the
+    /// damage arrives as a decision. `phase` is the one with teeth: it tells a
+    /// step's forward pass from its compensating one, so an unreadable value
+    /// answered `Forward` hands the unwind logic a compensating record wearing
+    /// the wrong half of the saga. `Deny` and `Normal` are *safe* values,
+    /// which is exactly what makes them the wrong answer — a fail-closed
+    /// default is still a fact invented about a row nobody could read.
+    #[test]
+    fn an_unreadable_column_is_refused_rather_than_defaulted() {
+        for (what, err) in [
+            ("phase", phase_from("").err()),
+            ("phase", phase_from("Compensating").err()),
+            ("expiry", expiry_from("escalate_later").err()),
+            ("priority", priority_from("normal ").err()),
+        ] {
+            assert!(
+                matches!(err, Some(StoreError::Corrupt { .. })),
+                "an unrecognised {what} decoded to a value instead of refusing"
+            );
+        }
+    }
 }

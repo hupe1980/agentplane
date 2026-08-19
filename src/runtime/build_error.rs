@@ -148,20 +148,52 @@ pub enum BuildError {
         remedy: &'static str,
     },
 
-    /// An agent forms memories on a plane that has nowhere to keep them.
+    /// An agent reads or writes memories on a plane that has nowhere to keep
+    /// them.
     ///
     /// Knowable at build, and expensive at run time in a way most wiring
     /// mistakes are not: formation happens **after** the answer, so the run has
     /// already paid for its model calls, opened its approval task and waited for
     /// a person before failing on a store nobody wired.
     #[error(
-        "agent '{agent}' declares `spec.memory_formation`, so every run ends by writing \
-         durable facts — but this plane has no memory store. Wire one with \
-         `RuntimeBuilder::memory(..)`, or drop the declaration. Formation runs after the \
-         answer, so left to run time this fails once the run has already paid for its \
-         model calls"
+        "agent '{agent}' declares `{declared}`, so its runs reach durable memory — but \
+         this plane has no memory store. Wire one with `RuntimeBuilder::memory(..)`, or \
+         drop the declaration. Left to run time, formation fails only once the run has \
+         already paid for its model calls"
     )]
-    FormationWithoutMemory { agent: String },
+    MemoryWithoutStore {
+        agent: String,
+        /// The declaration that needs a store: `spec.memory.recall` or
+        /// `spec.memory.formation`.
+        declared: &'static str,
+    },
+
+    /// The plane's embedder and its index speak different languages.
+    ///
+    /// The one wiring mistake in this list that would otherwise never fail —
+    /// see [`IndexIdentity`](crate::memory::IndexIdentity). The two strings
+    /// differing is not itself the mistake: an index built from
+    /// `…/search_document` asks for `…/search_query` here.
+    #[error(
+        "this plane embeds with '{embedder}' but its index accepts query vectors from \
+         '{index}'. Two embedding revisions produce vectors of the same width that \
+         compare with the same cosine and mean nothing to each other, so this pairing \
+         would not fail — it would rank unrelated memories confidently on every search. \
+         Wire the embedder the index names, or re-index"
+    )]
+    EmbeddingSpaceMismatch { embedder: String, index: String },
+
+    /// A semantic index on a plane with no authoritative memory.
+    ///
+    /// Every search would fail at its last step, having already paid for an
+    /// embedding call and a retrieval.
+    #[error(
+        "this plane wires a semantic index but no memory store. An index holds only \
+         `(id, version, digest)` commitments — the content is materialised from \
+         authoritative memory and re-checked before anything is exposed — so wire one \
+         with `RuntimeBuilder::memory(..)`"
+    )]
+    SemanticMemoryWithoutStore,
 
     /// A memory subject binds to a case on a plane with no cases.
     ///

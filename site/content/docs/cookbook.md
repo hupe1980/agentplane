@@ -2073,40 +2073,52 @@ Use `MemoryWrite::retain_after_access(seconds)` with
 The refresh is a separate journaled, idempotent touch effect; ordinary recall
 remains read-only and strict replay never extends retention twice.
 
-Semantic ranking stays outside `MemoryStore` and inside the journal. Get the
-query vector from `cx.embed` — **never** by calling an embedder yourself: the
-vector is inside the retrieval effect's identity, and an embedding service does
-not promise the same floats twice, so a self-computed one quarantines a healthy
-run on the next replay:
+Semantic ranking stays outside `MemoryStore` and inside the journal. Wire the
+embedder and the index **as a pair**, and let `cx.semantic_recall` do the rest:
 
 ```rust
-let query_vector = cx
-    .embed(
-        embedder,
-        Tainted::trusted("refund policy".to_owned()),
-        // Embedding sends the text to a provider, so it is an egress and the
-        // ceiling is yours to set. A real query is untrusted — a user's
-        // question, a model's rewrite — and therefore already `Internal`.
-        Sensitivity::Internal,
-    )
-    .await?
-    .peek()
-    .clone();
+let runtime = Runtime::builder(journal)
+    .memory(memories)
+    .semantic_memory(embedder, retriever)   // held to each other at build
+    .skill(Triage)
+    .build();
+```
 
+```rust
 let hits = cx.semantic_recall(
-    retriever, // Arc<dyn SemanticRetriever>
-    Tainted::trusted(SemanticQuery {
-        subject: account.clone(),
-        purpose: Some("support".into()),
-        text: "refund policy".into(),
-        embedding: query_vector,
-        embedding_model: "embed-v3@2026-07-01".into(),
-        index_snapshot: "support-2026-08-05".into(),
-        limit: 5,
-        max_sensitivity: Sensitivity::Internal,
-    }),
+    SemanticSearch::about(account.clone())
+        .for_purpose("support")
+        .limit(5)
+        // Embedding sends the text to a provider and the vector to a
+        // retriever, so a search is an egress twice over and the ceiling is
+        // yours to set. A real query is untrusted — a user's question, a
+        // model's rewrite — and therefore already `Internal`.
+        .max_sensitivity(Sensitivity::Internal),
+    Tainted::trusted("refund policy".to_owned()),
 ).await?;
 ```
+
+No vector, model name or snapshot: the index declares the revision it takes
+queries in, and `build` refuses a plane whose embedder does not speak it.
+
+```rust
+IndexIdentity {
+    snapshot: "support-2026-08-05".into(),
+    // Not what the documents were embedded with: asymmetric embedders embed a
+    // query and a document deliberately differently, so an index built from
+    // `…/search_document` asks for `…/search_query`.
+    query_revision: "voyage-3-large/query".into(),
+}
+```
+
+That check is worth having at wiring because the mistake it catches has no
+symptom. Cosine similarity is defined between any two equal-width vectors, so a
+cross-space query does not throw — it ranks unrelated memories confidently, and
+the only signal is "retrieval quality" months later.
+
+`cx.embed` stays available for building an index or embedding text for another
+purpose. It returns an `Embedding`: the floats **and** the revision that
+produced them, read from the driver.
 
 The effect records the exact vector, embedding revision, immutable index
 snapshot, filters, scores and `(id, version, digest)` selections. Replay does
@@ -2223,11 +2235,15 @@ impl SemanticRetriever for LanceHybrid {
 }
 ```
 
-The rule a retriever must not break: return `Selected` commitments and scores,
-never item content. An index is derived and may be stale, poisoned or simply
+Two rules a retriever must not break. **Return `Selected` commitments and
+scores, never item content.** An index is derived and may be stale, poisoned or simply
 wrong; the runtime materializes the exact versions from `MemoryStore` and
 refuses out-of-scope or changed digests. A retriever that returned text would be
 handing the model something nothing verified.
+
+**And honour the limit.** More hits than were asked for is refused, not
+truncated — truncating would leave the selection's membership decided by the
+seam's iteration order.
 
 `InMemorySemanticRetriever` is the exact-cosine reference and ranks on the
 vector alone — a reference implementation, not a statement about what the seam
@@ -2277,19 +2293,32 @@ deriving all security metadata. If a memory genuinely needs improved trust or
 sensitivity, call `cx.release` first so policy and the journal record the
 decision; then store the released value.
 
-For governed automatic formation, declare `spec.memory_formation` on a
+For governed automatic formation, declare `spec.memory.formation` on a
 declarative agent. It requires a reviewed subject, purpose, extraction
 instruction, item bound and retention. The model proposes only `key/content`;
 runtime derives stable ids and security labels. Coded skills invoke
 `cx.form_memories` explicitly. There is intentionally no generic post-model hook
 that silently stores every conversation.
 
+`spec.memory.recall` is the other half of the same block: it folds the selected
+memories into the prompt under `/memory`, each carrying the label it was written
+with.
+
+```yaml
+memory:
+  recall:
+    subject: "$correlation/customer"
+    purpose: clearing
+    limit: 5
+```
+
 **The third trap, and the one with legal teeth: a literal subject.** The subject
 is the unit `forget_subject` erases, so
 
 ```yaml
-memory_formation:
-  subject: "agent:triage"       # every customer, one pile
+memory:
+  formation:
+    subject: "agent:triage"       # every customer, one pile
 ```
 
 pools every party the agent ever reasoned about under one key. One party's facts
@@ -2297,8 +2326,9 @@ are then recalled into another party's run, and an erasure request naming one
 person cannot be satisfied without destroying everybody's. Bind it instead:
 
 ```yaml
-memory_formation:
-  subject: "$correlation/customer"   # resolved from the run's business keys
+memory:
+  formation:
+    subject: "$correlation/customer"   # resolved from the run's business keys
 ```
 
 `$correlation/<namespace>`, `$case` and `$input/<pointer>` are the three sources;
@@ -2308,7 +2338,7 @@ from untrusted input is whoever supplied it choosing whose memories this run
 writes into. A hand-written skill reads the same values back with
 `cx.correlation_value("customer")`, so the two tiers agree on the scope without
 sharing a naming convention nobody wrote down. Full rules:
-[`spec.memory_formation`](@/docs/manifest.md#spec-memory-formation).
+[`spec.memory`](@/docs/manifest.md#spec-memory).
 
 With feature `keyring`, wrap a single-node memory backend in
 `EncryptedMemoryStore::new`. Content is ciphertext in the backing

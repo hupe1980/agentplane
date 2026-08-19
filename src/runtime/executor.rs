@@ -394,6 +394,7 @@ pub struct Runtime {
     lease_ttl: Duration,
     /// Where this plane's agents remember things, when a deployment wires one.
     memories: Option<Arc<dyn crate::memory::MemoryStore>>,
+    semantic: Option<Arc<super::SemanticMemory>>,
     authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
     /// The catalogue and transport a **skill** reaches tools through.
     ///
@@ -490,6 +491,7 @@ impl Runtime {
             owner: None,
             lease_ttl: LEASE_TTL,
             memories: None,
+            semantic: None,
             authorities: None,
             metric_tenant: super::metrics::TenantLabel::default(),
             quotas: None,
@@ -1322,7 +1324,7 @@ impl Runtime {
     /// run belongs to.
     ///
     /// The **business keys**, because a case accumulates them over months. A run
-    /// that resolved `memory_formation.subject: $correlation/meter` would
+    /// that resolved `memory.formation.subject: $correlation/meter` would
     /// otherwise resolve it against a set the live run never saw, write a second
     /// memory under a second subject, and produce a history that disagrees with
     /// itself with nothing on the record explaining why.
@@ -3203,6 +3205,7 @@ impl Runtime {
                 timers: self.timers.clone(),
                 blobs: self.blobs.clone(),
                 memories: self.memories.clone(),
+                semantic: self.semantic.clone(),
                 authorities: self.authorities.clone(),
                 #[cfg(feature = "manifest")]
                 tools: self.tools.clone(),
@@ -3545,6 +3548,7 @@ impl Runtime {
                 timers: self.timers.clone(),
                 blobs: self.blobs.clone(),
                 memories: self.memories.clone(),
+                semantic: self.semantic.clone(),
                 authorities: self.authorities.clone(),
                 #[cfg(feature = "manifest")]
                 tools: self.tools.clone(),
@@ -4880,6 +4884,7 @@ pub struct RuntimeBuilder {
     owner: Option<String>,
     lease_ttl: Duration,
     memories: Option<Arc<dyn crate::memory::MemoryStore>>,
+    semantic: Option<Arc<super::SemanticMemory>>,
     authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
     metric_tenant: super::metrics::TenantLabel,
     quotas: Option<Arc<dyn crate::quota::QuotaStore>>,
@@ -4990,6 +4995,34 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn memory(mut self, memories: Arc<dyn crate::memory::MemoryStore>) -> Self {
         self.memories = Some(memories);
+        self
+    }
+
+    /// Give this plane a semantic index, and the embedder that speaks its
+    /// language.
+    ///
+    /// Both together, never one at a time: `build` holds
+    /// [`Embedder::revision`] to the [`IndexIdentity::query_revision`] the
+    /// index declares it accepts, and refuses the pair otherwise
+    /// ([`BuildError::EmbeddingSpaceMismatch`] says what a mismatch costs).
+    ///
+    /// Also needs [`memory`](Self::memory): the index holds only commitments,
+    /// and every hit is materialised from the authoritative store before its
+    /// content is exposed.
+    ///
+    /// [`Embedder::revision`]: crate::memory::Embedder::revision
+    /// [`IndexIdentity::query_revision`]: crate::memory::IndexIdentity::query_revision
+    /// [`BuildError::EmbeddingSpaceMismatch`]: crate::runtime::BuildError::EmbeddingSpaceMismatch
+    #[must_use]
+    pub fn semantic_memory(
+        mut self,
+        embedder: Arc<dyn crate::memory::Embedder>,
+        retriever: Arc<dyn crate::memory::SemanticRetriever>,
+    ) -> Self {
+        self.semantic = Some(Arc::new(super::SemanticMemory {
+            embedder,
+            retriever,
+        }));
         self
     }
 
@@ -5794,6 +5827,18 @@ impl RuntimeBuilder {
             ],
             &self.tenant,
         )?;
+        // The one wiring mistake here that would otherwise never fail: a
+        // cross-space query ranks rather than refusing.
+        if let Some(semantic) = &self.semantic {
+            let embedder = semantic.embedder.revision();
+            let index = semantic.retriever.index().query_revision;
+            if embedder != index {
+                return Err(BuildError::EmbeddingSpaceMismatch { embedder, index });
+            }
+            if self.memories.is_none() {
+                return Err(BuildError::SemanticMemoryWithoutStore);
+            }
+        }
         self.seal_stores();
         #[cfg(feature = "manifest")]
         self.settle_tools()?;
@@ -5949,21 +5994,36 @@ impl RuntimeBuilder {
                     }
                 }
 
-                // Formation writes after the answer, so a missing store is a
-                // failure the run pays for in full before reaching. Both facts
-                // are here: the file says memories are written, the plane says
-                // there is nowhere to write them.
-                if let Some(formation) = &m.spec.memory_formation {
-                    if self.memories.is_none() {
-                        return Err(BuildError::FormationWithoutMemory {
-                            agent: m.metadata.name.clone(),
-                        });
-                    }
-                    if formation.subject.needs_case() && self.cases.is_none() {
-                        return Err(BuildError::MemorySubjectUnbindable {
-                            agent: m.metadata.name.clone(),
-                            subject: formation.subject.as_written(),
-                        });
+                // A recall reads before the first model call and formation
+                // writes after the answer, so a missing store costs a run its
+                // first effect or its whole budget depending on which half was
+                // declared. Both facts are here: the file says memories are
+                // reached, the plane says there is nowhere to reach.
+                if let Some(memory) = &m.spec.memory {
+                    let declared: [(&'static str, Option<&crate::manifest::MemorySubject>); 2] = [
+                        (
+                            "spec.memory.recall",
+                            memory.recall.as_ref().map(|r| &r.subject),
+                        ),
+                        (
+                            "spec.memory.formation",
+                            memory.formation.as_ref().map(|f| &f.subject),
+                        ),
+                    ];
+                    for (field, subject) in declared {
+                        let Some(subject) = subject else { continue };
+                        if self.memories.is_none() {
+                            return Err(BuildError::MemoryWithoutStore {
+                                agent: m.metadata.name.clone(),
+                                declared: field,
+                            });
+                        }
+                        if subject.needs_case() && self.cases.is_none() {
+                            return Err(BuildError::MemorySubjectUnbindable {
+                                agent: m.metadata.name.clone(),
+                                subject: subject.as_written(),
+                            });
+                        }
                     }
                 }
 
@@ -6033,6 +6093,7 @@ impl RuntimeBuilder {
             owner: self.owner.unwrap_or_else(default_owner),
             lease_ttl: self.lease_ttl,
             memories: self.memories,
+            semantic: self.semantic,
             authorities: self.authorities,
             #[cfg(feature = "manifest")]
             tools: self.tools,

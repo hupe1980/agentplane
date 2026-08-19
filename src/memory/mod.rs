@@ -333,7 +333,96 @@ impl Recall {
     }
 }
 
-/// A semantic query whose exact vector and index identity are journalable.
+/// What a caller asks a semantic index for.
+///
+/// Deliberately no vector, no model name and no snapshot: those are facts about
+/// the wiring, and the runtime reads them from the seams. See [`IndexIdentity`]
+/// for what a caller stating them wrongly would cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticSearch {
+    pub subject: String,
+    /// Restrict to memories kept for this purpose, when given.
+    pub purpose: Option<String>,
+    pub limit: usize,
+    /// Highest sensitivity the embedder and the retriever may be shown.
+    ///
+    /// One ceiling for both: the text goes to one and its coordinates to the
+    /// other, so a deployment refusing the first has no reason to allow the
+    /// second. `Public` by default.
+    pub max_sensitivity: Sensitivity,
+}
+
+impl SemanticSearch {
+    #[must_use]
+    pub fn about(subject: impl Into<String>) -> Self {
+        Self {
+            subject: subject.into(),
+            purpose: None,
+            limit: 10,
+            max_sensitivity: Sensitivity::Public,
+        }
+    }
+
+    #[must_use]
+    pub fn for_purpose(mut self, purpose: impl Into<String>) -> Self {
+        self.purpose = Some(purpose.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn limit(mut self, n: usize) -> Self {
+        self.limit = n;
+        self
+    }
+
+    #[must_use]
+    pub const fn max_sensitivity(mut self, sensitivity: Sensitivity) -> Self {
+        self.max_sensitivity = sensitivity;
+        self
+    }
+}
+
+/// Which vector space an index lives in, and which snapshot it holds.
+///
+/// Cosine similarity is defined between any two vectors of equal width, so a
+/// query embedded by one revision and searched against an index built by
+/// another does not fail — it ranks unrelated memories confidently, with no
+/// exception to catch and nothing in the output that looks wrong. An index
+/// therefore states the space it accepts, and the pairing is refused at wiring
+/// rather than per query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexIdentity {
+    /// Immutable snapshot of the corpus this index holds.
+    ///
+    /// In the retrieval effect's key, so re-indexing is replay divergence
+    /// rather than a silently different ranking.
+    pub snapshot: String,
+    /// The exact [`Embedder::revision`] a **query** vector must come from.
+    ///
+    /// Not the revision the documents were embedded with: asymmetric embedders
+    /// embed a query and a document deliberately differently, so an index built
+    /// from `…/search_document` names `…/search_query` here.
+    pub query_revision: String,
+}
+
+/// A vector and the space it lives in.
+///
+/// The revision is read from [`Embedder::revision`], never supplied beside the
+/// floats: it is the only thing that makes them comparable to anything, and a
+/// stated space is a space that can be stated wrongly ([`IndexIdentity`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Embedding {
+    pub vector: Vec<f32>,
+    pub revision: String,
+}
+
+/// A semantic query as the journal records it.
+///
+/// Assembled by the runtime from a [`SemanticSearch`], the wired
+/// [`Embedder`] and the wired [`SemanticRetriever`]'s [`IndexIdentity`]. Every
+/// field is in the retrieval effect's key, so a re-indexed corpus or a changed
+/// embedding revision is divergence a replay reports rather than a different
+/// answer nothing explains.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticQuery {
     pub subject: String,
@@ -369,10 +458,8 @@ pub struct SemanticQuery {
     /// inside the deterministic zone therefore quarantines a healthy run at the
     /// next replay, for a reason nothing on the record explains.
     pub embedding: Vec<f32>,
-    /// Stable embedding model and revision.
-    pub embedding_model: String,
-    /// Immutable vector-index snapshot searched by this query.
-    pub index_snapshot: String,
+    /// The space and snapshot this query was resolved against.
+    pub index: IndexIdentity,
     pub limit: usize,
     /// Highest sensitivity this retriever may receive.
     pub max_sensitivity: Sensitivity,
@@ -397,7 +484,7 @@ pub struct SemanticHit {
 ///
 /// Operator-ingested regulatory or reference material is therefore a first-class
 /// use, written once as memory items in a scope nothing else writes to. It is
-/// not *an agent's* learned memory, and it does not have to be: `memory_formation`
+/// not *an agent's* learned memory, and it does not have to be: `memory.formation`
 /// governs what a model may add, retention is optional, and a corpus with no
 /// expiry simply never expires. What this seam cannot do is return documents
 /// that are not memory items — an external corpus has to be ingested rather than
@@ -406,6 +493,13 @@ pub struct SemanticHit {
 pub trait SemanticRetriever: Send + Sync + Debug {
     /// Stable non-secret implementation configuration for effect identity.
     fn profile(&self) -> Value;
+
+    /// The space this index lives in and the snapshot it holds.
+    ///
+    /// Read at wiring, where a mismatch with the plane's embedder is refused,
+    /// and again per query to stamp the journaled record — so an index that
+    /// moves under a running plane shows up as a changed effect key.
+    fn index(&self) -> IndexIdentity;
 
     async fn search(&self, query: &SemanticQuery) -> Result<Vec<SemanticHit>, StoreError>;
 }
@@ -430,12 +524,10 @@ pub trait SemanticRetriever: Send + Sync + Debug {
 /// model revision on the record beside the vector it produced.
 ///
 /// [`OpenAiEmbedder`](crate::model::embeddings::OpenAiEmbedder) is the shipped
-/// one, behind `providers`. This comment used to say the crate shipped none
-/// *"for the reason it ships no policy evaluator"* — which copied a decision
-/// from a case where it holds to one where it does not: the crate ships five
-/// model drivers and a policy evaluator adapter, and the thing it genuinely
-/// refuses is a content *classifier*, for a reason specific to classifiers. An
-/// embedder is a model driver by another name.
+/// one, behind `providers`. Shipping it is not in tension with the crate's
+/// refusal to ship a content *classifier*: that refusal is specific to
+/// classifiers, and an embedder is a model driver by another name — the crate
+/// ships five of those and a policy-evaluator adapter.
 ///
 /// The consequence settled it. Without one, `StepCtx::embed` and therefore the
 /// whole semantic-retrieval tier could not be used without writing Rust — the
@@ -446,8 +538,10 @@ pub trait Embedder: Send + Sync + Debug {
     /// Stable, non-secret identity of the model and revision producing vectors.
     ///
     /// It goes in the effect key beside the text, so a revision change is
-    /// replay divergence rather than a silently different vector. Secrets never
-    /// belong here.
+    /// replay divergence rather than a silently different vector, and it is
+    /// what [`IndexIdentity::query_revision`] is matched against at wiring.
+    /// Anything that changes what the floats *mean* belongs here — the shipped
+    /// drivers fold in width and input type. Secrets never do.
     fn revision(&self) -> String;
 
     /// Embed one text.
@@ -471,43 +565,28 @@ pub struct SemanticVector {
 /// Deterministic exact cosine retriever for tests and small corpora.
 #[derive(Debug, Clone)]
 pub struct InMemorySemanticRetriever {
-    identity: String,
-    snapshot: String,
+    index: IndexIdentity,
     vectors: Vec<SemanticVector>,
 }
 
 impl InMemorySemanticRetriever {
     #[must_use]
-    pub fn new(
-        identity: impl Into<String>,
-        snapshot: impl Into<String>,
-        vectors: Vec<SemanticVector>,
-    ) -> Self {
-        Self {
-            identity: identity.into(),
-            snapshot: snapshot.into(),
-            vectors,
-        }
+    pub fn new(index: IndexIdentity, vectors: Vec<SemanticVector>) -> Self {
+        Self { index, vectors }
     }
 }
 
 #[async_trait]
 impl SemanticRetriever for InMemorySemanticRetriever {
     fn profile(&self) -> Value {
-        serde_json::json!({
-            "driver": "in-memory-exact-cosine/v1",
-            "identity": self.identity,
-            "snapshot": self.snapshot,
-        })
+        serde_json::json!({ "driver": "in-memory-exact-cosine/v1" })
+    }
+
+    fn index(&self) -> IndexIdentity {
+        self.index.clone()
     }
 
     async fn search(&self, query: &SemanticQuery) -> Result<Vec<SemanticHit>, StoreError> {
-        if query.index_snapshot != self.snapshot {
-            return Err(StoreError::Backend(format!(
-                "semantic query names index snapshot '{}' but retriever holds '{}'",
-                query.index_snapshot, self.snapshot
-            )));
-        }
         validate_vector(&query.embedding)?;
         let mut hits = Vec::new();
         for candidate in &self.vectors {
@@ -908,10 +987,12 @@ mod semantic_tests {
     }
 
     #[tokio::test]
-    async fn exact_cosine_retrieval_is_scoped_ranked_and_snapshot_bound() {
+    async fn exact_cosine_retrieval_is_scoped_and_ranked() {
         let retriever = InMemorySemanticRetriever::new(
-            "reference",
-            "snapshot-7",
+            IndexIdentity {
+                snapshot: "snapshot-7".to_owned(),
+                query_revision: "embed-v3@2026-07-01".to_owned(),
+            },
             vec![
                 SemanticVector {
                     subject: "account-1".to_owned(),
@@ -938,8 +1019,7 @@ mod semantic_tests {
             purpose: Some("support".to_owned()),
             text: "query".to_owned(),
             embedding: vec![1.0, 0.0],
-            embedding_model: "embed-v3@2026-07-01".to_owned(),
-            index_snapshot: "snapshot-7".to_owned(),
+            index: retriever.index(),
             limit: 2,
             max_sensitivity: Sensitivity::Internal,
         };
@@ -952,8 +1032,11 @@ mod semantic_tests {
         );
         assert!(hits[0].score > hits[1].score);
 
-        let mut stale = query;
-        stale.index_snapshot = "snapshot-8".to_owned();
-        assert!(retriever.search(&stale).await.is_err());
+        // A vector of another width is a different space wearing the same
+        // struct, and comparing the two would rank on whichever prefix happened
+        // to line up.
+        let mut mismatched = query;
+        mismatched.embedding = vec![1.0, 0.0, 0.0];
+        assert!(retriever.search(&mismatched).await.is_err());
     }
 }

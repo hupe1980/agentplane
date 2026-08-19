@@ -57,10 +57,11 @@ spec:
   oversight:
     approval: required
     deadline: { name: refund-review, kind: working-days, params: { n: 1 } }
-  memory_formation:
-    subject: "$correlation/customer"     # per-party, resolved at run time
-    purpose: "support"
-    instruction: "Record durable facts about this customer."
+  memory:
+    formation:
+      subject: "$correlation/customer"     # per-party, resolved at run time
+      purpose: "support"
+      instruction: "Record durable facts about this customer."
 ```
 
 ## `metadata`
@@ -265,7 +266,7 @@ between agents is an agent of its own, granted as `tool://agent/<capability>`.
 
 **`quarantined` is refused where nothing would select it.** Two things point a
 model at untrusted-derived content on their own: a plan's `parse` steps
-(`execution.kind: planned`) and `memory_formation`. A `completion` or
+(`execution.kind: planned`) and `memory.formation`. A `completion` or
 `tool-calling` agent with neither sends *every* call to the privileged model, so
 declaring the second role there would read as dual-model isolation while one
 model did all the work — a control the file claims and the runtime never
@@ -415,7 +416,7 @@ and returns only on approval. It applies to **both** execution kinds — a
 is the case that most needs a person.
 
 Nothing is written until the answer is approved. In particular
-`memory_formation` runs *after* the decision, because a memory formed from a
+`memory.formation` runs *after* the decision, because a memory formed from a
 refused answer would be read by the next run as established fact — a control that
 governed the reply and not the write would govern the less important half.
 
@@ -489,11 +490,62 @@ a worklist corresponds to an answer that was actually returned. The task carries
 the answer itself; it is untrusted model content, deliberately — a worklist whose
 rows had to be trusted could only carry findings nobody needs to look at.
 
-## `spec.memory_formation`
+## `spec.memory`
 
-Forms bounded durable facts from each declarative answer. Refused without
-`execution` (a coded skill calls `StepCtx::form_memories` explicitly) and without
-a declared `privileged` model.
+What a declarative agent reads from, and writes to, durable memory. Both halves
+are optional; the block is refused if it declares neither, and refused beside a
+coded skill (which calls `StepCtx::recall` and `StepCtx::form_memories` at the
+moments it chooses).
+
+```yaml
+memory:
+  recall:                            # read, before the model is called
+    subject: "$correlation/malo"
+    purpose: clearing
+    limit: 5
+  formation:                         # write, after the answer
+    subject: "$correlation/malo"
+    purpose: clearing
+    instruction: "Record stable facts stated in the source."
+```
+
+There is deliberately **no semantic search here**. Similarity is computed over
+item content, so anything able to write a memory is a ranking signal — an
+attacker who cannot taint a value can still decide *which* clean values a model
+is shown, and no label shows it. A deterministic recall's order is a fixed rule
+no stored item can move, which is what makes it safe to spell as one reviewed
+line. Ranked retrieval is `StepCtx::semantic_recall`.
+
+### `spec.memory.recall`
+
+| Field | Default | Notes |
+|---|---|---|
+| `subject` | **required** | Which pile to read — a literal or a binding, exactly as `formation` writes it. See below. |
+| `purpose` | none | Restrict to one retrieval partition. Absent reads every purpose under the subject. |
+| `limit` | `5` | Between 1 and 50. Selection is most trusted first, then newest. |
+| `refresh_access` | `false` | Slide each selected memory's sliding-retention window forward, as a second journaled effect. |
+
+The memories are folded into the prompt under `/memory`, beside the trusted
+`/system` instruction and the caller's `/input`, as a list of
+`{id, purpose, content, written_at}`. The key is present even when nothing was
+recalled — a prompt whose shape depends on what the store happened to hold is
+one no reviewer can read against the manifest.
+
+Each item arrives carrying **its own label**, so a recall widens nothing: the
+same egress ceiling governs the model call and the same protected-field rules
+govern every tool the answer reaches for. Two consequences:
+
+* A memory above `security.max_sensitivity_egress` **fails the run** at the
+  model call rather than being filtered out — a silent drop would make the
+  answer depend on a ceiling nothing in the transcript mentions.
+* **`execution.kind: planned` may not declare a recall.** That kind refuses
+  untrusted input because its plan is compiled from what the planner reads, and
+  a recalled memory is untrusted whenever whatever wrote it was.
+
+### `spec.memory.formation`
+
+Forms bounded durable facts from each declarative answer. Refused without a
+declared `privileged` model.
 
 | Field | Default | Notes |
 |---|---|---|
@@ -526,10 +578,11 @@ A binding resolves the subject from something the **run** already established:
 | anything else | A literal, exactly as written. `$$x` is the literal `$x`. |
 
 ```yaml
-memory_formation:
-  subject: "$correlation/malo"     # one pile per metering point
-  purpose: clearing
-  instruction: "Record stable facts stated in the source."
+memory:
+  formation:
+    subject: "$correlation/malo"     # one pile per metering point
+    purpose: clearing
+    instruction: "Record stable facts stated in the source."
 ```
 
 Four rules, each a refusal:
@@ -556,9 +609,9 @@ a subject the live run never saw. A hand-written skill reaches the same values
 with `cx.correlation()` and `cx.correlation_value(namespace)`, so reading these
 memories back does not mean guessing at a naming convention.
 
-A plane declaring `memory_formation` with no memory store is also refused at
-`build`: formation runs *after* the answer, so left to run time it fails once the
-run has already paid for its model calls.
+A plane declaring either half with no memory store is refused at `build`. For
+formation the cost of finding out late is the point: it runs *after* the answer,
+so left to run time it fails once the run has already paid for its model calls.
 
 The extraction runs on the **quarantined** model when `spec.models` declares
 one, and on the privileged model otherwise — see `spec.models` above for why.

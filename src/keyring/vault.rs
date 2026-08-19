@@ -18,17 +18,25 @@
 //! | erasure scope | a named key, `transit/keys/<scope>` |
 //! | mint a data key | `POST transit/datakey/plaintext/<scope>` |
 //! | open a data key | `POST transit/decrypt/<scope>` |
-//! | rewrap under a rotated key | `POST transit/rewrap/<scope>` |
-//!
-//! Rotation itself is **not** in that table, and the row that used to claim it
-//! was wrong: `transit/keys/<scope>/rotate` appears nowhere in this file.
-//! Rotating a wrapping key is Vault's operation and its operator's decision —
-//! on their schedule, under their audit, with their approvals — and a runtime
-//! that rotated somebody's key ring because it happened to be running would be
-//! taking a decision that is not its own. What this crate owns is the half that
-//! follows: after a rotation, `rewrap` moves an existing wrapped key onto the
-//! new version without ever seeing the plaintext.
 //! | erase | `DELETE transit/keys/<scope>` |
+//!
+//! Three endpoints Vault offers are deliberately not in that table.
+//! `transit/keys/<scope>/rotate` is the operator's decision — on their
+//! schedule, under their audit, with their approvals — and a runtime that
+//! rotated somebody's key ring because it happened to be running would be
+//! taking a decision that is not its own. `transit/rewrap` and
+//! `transit/keys/<scope>/config` follow from the rule stated in the [module
+//! documentation](crate::keyring): sealed bytes are rotation-immutable, so
+//! there is nothing to rewrap, and the version floor that would make rewrapping
+//! necessary is the one setting this crate must never move on an operator's
+//! behalf.
+//!
+//! What this crate owns instead is *telling the operator when they have moved
+//! it too far*. Raising `min_decryption_version` past a version a live envelope
+//! names makes un-erased history unreadable, and Vault reports that with the
+//! same 400 it uses for "you may not do that". Mapping it to
+//! [`KeyError::Retired`] is what keeps a reversible configuration change from
+//! reaching a report as data loss.
 //!
 //! # Erasure needs to be switched on
 //!
@@ -91,16 +99,6 @@ struct PlaintextData {
     plaintext: String,
 }
 
-#[derive(Deserialize)]
-struct CiphertextReply {
-    data: CiphertextData,
-}
-
-#[derive(Deserialize)]
-struct CiphertextData {
-    ciphertext: String,
-}
-
 impl VaultTransit {
     /// Point at a Vault, with a token that may use the transit mount.
     ///
@@ -112,7 +110,13 @@ impl VaultTransit {
         mount: impl Into<String>,
         token: impl Into<String>,
     ) -> Result<Self, KeyError> {
+        // Bounded, like every other outbound call here. Sealing and opening go
+        // through this client, so an unbounded one lets a key service that
+        // stops answering hold every write that touches a sealed payload —
+        // which with a keyring configured is most of them.
         let http = reqwest::Client::builder()
+            .timeout(Self::TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| KeyError::Unavailable(format!("could not build an HTTP client: {e}")))?;
         Ok(Self {
@@ -122,6 +126,13 @@ impl VaultTransit {
             token: Secret::new(token),
         })
     }
+
+    /// How long one key operation may take in total.
+    ///
+    /// Ten seconds: a transit wrap or unwrap is a small symmetric operation,
+    /// and a service that cannot answer in that time is unavailable — which
+    /// [`KeyError::Unavailable`] already says, and which a caller may retry.
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     fn url(&self, tail: &str) -> String {
         format!("{}/v1/{}/{tail}", self.address, self.mount)
@@ -202,6 +213,40 @@ impl VaultTransit {
 fn is_missing_key(reason: &str) -> bool {
     let r = reason.to_ascii_lowercase();
     r.contains("encryption key not found") || r.contains("could not delete key; not found")
+}
+
+/// Reclassify a decrypt refusal that is really a retired key version.
+///
+/// Applied at [`KeyRing::open`] rather than inside `call`, because this is the
+/// one place the wrapped key's version is in hand, and a [`KeyError::Retired`]
+/// that could not name the version would tell an operator a floor is too high
+/// without saying what it must admit.
+///
+/// Narrow for the same reason [`is_missing_key`] is: Vault answers a retired
+/// version with the same 400 it uses for a permission failure, and reading a
+/// genuine refusal as a retirement would tell somebody to lower a floor that
+/// was never the problem. What this does NOT cover is a key service that
+/// phrases the condition differently — every implementation of [`KeyRing`] owes
+/// its own mapping, and one that skips it degrades to [`KeyError::Refused`],
+/// which is wrong in the safe direction: an operator investigates rather than
+/// being told a reversible setting is unrecoverable loss.
+fn as_retired(e: KeyError, scope: &str, key_id: &str) -> KeyError {
+    let retired = match &e {
+        KeyError::Refused(reason) => {
+            let r = reason.to_ascii_lowercase();
+            r.contains("ciphertext or signature version is disallowed by policy")
+                || r.contains("ciphertext version is disallowed by policy")
+        }
+        _ => false,
+    };
+    if retired {
+        KeyError::Retired {
+            scope: scope.to_owned(),
+            key_id: key_id.to_owned(),
+        }
+    } else {
+        e
+    }
 }
 
 /// Vault reports problems as `{"errors": ["..."]}`.
@@ -297,7 +342,8 @@ impl KeyRing for VaultTransit {
                 Some(serde_json::json!({ "ciphertext": ciphertext })),
                 &wrapped.scope,
             )
-            .await?;
+            .await
+            .map_err(|e| as_retired(e, &wrapped.scope, &wrapped.wrapped_by))?;
         let reply: PlaintextReply = serde_json::from_str(&body)
             .map_err(|e| KeyError::Refused(format!("{url}: unreadable reply: {e}")))?;
         to_key(&reply.data.plaintext, "the data key transit returned")
@@ -319,38 +365,66 @@ impl KeyRing for VaultTransit {
             Err(e) => Err(e),
         }
     }
-
-    async fn rewrap(&self, wrapped: &WrappedKey) -> Result<WrappedKey, KeyError> {
-        let ciphertext = String::from_utf8(wrapped.sealed.clone())
-            .map_err(|_| KeyError::Refused("a transit ciphertext must be text".to_owned()))?;
-        let url = self.url(&format!("rewrap/{}", wrapped.scope));
-        let body = self
-            .call(
-                reqwest::Method::POST,
-                &url,
-                Some(serde_json::json!({ "ciphertext": ciphertext })),
-                &wrapped.scope,
-            )
-            .await?;
-        let reply: CiphertextReply = serde_json::from_str(&body)
-            .map_err(|e| KeyError::Refused(format!("{url}: unreadable reply: {e}")))?;
-        Ok(WrappedKey {
-            scope: wrapped.scope.clone(),
-            wrapped_by: reply
-                .data
-                .ciphertext
-                .split(':')
-                .take(2)
-                .collect::<Vec<_>>()
-                .join(":"),
-            sealed: reply.data.ciphertext.into_bytes(),
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retired ciphertext version is reclassified; a real refusal is not.
+    ///
+    /// Both directions matter and they fail in opposite ways. Left as a bare
+    /// `Refused`, an operator's reversible version floor reaches a drill as
+    /// *neither opens nor was erased* — loss or tampering — and somebody hunts
+    /// a fault that does not exist. Applied too broadly, a genuine permission
+    /// failure would tell them to lower a floor that was never the problem,
+    /// and the real refusal would go uninvestigated.
+    #[test]
+    fn a_retired_ciphertext_version_is_told_apart_from_a_refusal() {
+        let refused = |m: &str| KeyError::Refused(m.to_owned());
+
+        // Vault's wording for a ciphertext below `min_decryption_version`.
+        match as_retired(
+            refused("ciphertext or signature version is disallowed by policy (too old)"),
+            "acme/case-1",
+            "vault:v1",
+        ) {
+            KeyError::Retired { scope, key_id } => {
+                assert_eq!(scope, "acme/case-1");
+                assert_eq!(
+                    key_id, "vault:v1",
+                    "the error must name the version the floor has to readmit"
+                );
+            }
+            other => panic!(
+                "a retired version stayed a bare refusal ({other:?}), so a one-setting \
+                 configuration change reaches an operator as unrecoverable data loss"
+            ),
+        }
+
+        assert!(
+            matches!(
+                as_retired(refused("permission denied"), "acme/case-1", "vault:v1"),
+                KeyError::Refused(_)
+            ),
+            "a permission failure was read as a retired key version, which sends an \
+             operator to lower a floor that was never the problem and leaves the real \
+             refusal uninvestigated"
+        );
+
+        assert!(
+            matches!(
+                as_retired(
+                    KeyError::Unavailable("vault is sealed".to_owned()),
+                    "acme/case-1",
+                    "vault:v1"
+                ),
+                KeyError::Unavailable(_)
+            ),
+            "an outage was reclassified as a retired version, turning something that \
+             comes back on its own into a configuration investigation"
+        );
+    }
 
     /// Base64 for key material, checked where the alphabets differ.
     ///

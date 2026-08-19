@@ -301,13 +301,14 @@ impl Release {
 
     /// The one constructor, and it is checked by the one rule set.
     ///
-    /// It used to restate [`validate`](Self::validate)'s five rules as asserts,
-    /// which is the *two representations of one fact* shape this crate treats as
-    /// a defect everywhere else: the constructor and the deserialization gate
-    /// could drift, and only the second has a mutation holding it. There is now
-    /// one list of rules, consulted from both directions — a safe constructor
-    /// panics on a programmer error, a deserialized value is refused as an
-    /// input, and neither can start disagreeing about which releases are legal.
+    /// It defers to [`validate`](Self::validate) rather than restating its five
+    /// rules as asserts, because two spellings of one rule set is the *two
+    /// representations of one fact* shape this crate treats as a defect
+    /// everywhere else: the constructor and the deserialization gate would be
+    /// free to drift, and only the second has a mutation holding it. One list,
+    /// consulted from both directions — a safe constructor panics on a
+    /// programmer error, a deserialized value is refused as an input, and
+    /// neither can start disagreeing about which releases are legal.
     fn new(
         scope: ReleaseScope,
         fields: impl IntoIterator<Item: Into<String>>,

@@ -2799,14 +2799,15 @@ spec:
   capabilities: { provides: [remember.answer] }
   models: { privileged: { provider: fake, model: memory-1 } }
   execution: { kind: completion }
-  memory_formation:
-    subject: team/support
-    purpose: learned-facts
-    instruction: Extract stable facts only.
-    max_items: 2
-    retention_seconds: 3600
-    access_retention_seconds: 600
-    max_sensitivity: confidential
+  memory:
+    formation:
+      subject: team/support
+      purpose: learned-facts
+      instruction: Extract stable facts only.
+      max_items: 2
+      retention_seconds: 3600
+      access_retention_seconds: 600
+      max_sensitivity: confidential
   budgets: {}
 "#,
     )
@@ -2863,6 +2864,236 @@ spec:
         "formation discarded the source provenance"
     );
     assert_eq!(recalled[0].access_retention_seconds, Some(600));
+}
+
+/// A declared recall reaches the prompt, and reaches it labelled.
+///
+/// Long because the setup is the point: two memories under one subject in two
+/// purposes, so the declared partition is doing work rather than being
+/// satisfied by there being nothing else to select.
+///
+/// Two guarantees in one run, because they only mean anything together. The
+/// memories are *there* — a declarative agent that could form facts and never
+/// read one back had a write-only memory — and they arrive carrying the label
+/// they were written with, so a fact a model produced last week does not become
+/// a trusted instruction this week by the act of being remembered. That
+/// promotion is the cross-session laundering step the whole memory tier is
+/// shaped to refuse, and the recall path is where it would happen.
+#[cfg(all(feature = "redb", feature = "testkit"))]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_recalled_memory_reaches_the_prompt_with_its_own_label() {
+    use agentplane::memory::{MemoryItem, MemoryStore};
+    use agentplane::runtime::{Agent, Runtime};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: recalling, version: "1.0.0" }
+spec:
+  capabilities: { provides: [recall.answer] }
+  models: { privileged: { provider: fake, model: memory-1 } }
+  execution: { kind: completion }
+  security: { max_sensitivity_egress: internal }
+  memory:
+    recall:
+      subject: team/support
+      purpose: learned-facts
+      limit: 3
+  budgets: {}
+"#,
+    )
+    .expect("recall manifest");
+
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let memories = Arc::clone(&store) as Arc<dyn MemoryStore>;
+    let earlier = |id: &str, purpose: &str, content: serde_json::Value| MemoryItem {
+        id: id.to_owned(),
+        subject: "team/support".to_owned(),
+        purpose: purpose.to_owned(),
+        content,
+        provenance: vec![agentplane::core::SourceId::new("model:fake/memory-1")],
+        sensitivity: agentplane::core::Sensitivity::Internal,
+        trust: agentplane::core::Trust::Untrusted,
+        written_by: "run-earlier".to_owned(),
+        version: 0,
+        created_at: agentplane::core::Timestamp::UNIX_EPOCH,
+        expires_at: None,
+        access_retention_seconds: None,
+        superseded_at: None,
+        derived_from: Vec::new(),
+    };
+    memories
+        .remember(&earlier(
+            "language",
+            "learned-facts",
+            json!("Customer prefers German"),
+        ))
+        .await
+        .expect("seed the memory an earlier run would have written");
+    // Another purpose under the same subject, so the declared partition is
+    // doing work rather than being satisfied by there being nothing else.
+    memories
+        .remember(&earlier("payments", "billing", json!("Card ending 4242")))
+        .await
+        .expect("seed a memory kept for another purpose");
+
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_say("answered");
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>)
+        .memory(memories)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .build();
+
+    let outcome = rt
+        .run(
+            "recall.answer",
+            agentplane::core::Tainted::trusted(json!({"q": "language?"})),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome.status, agentplane::runtime::RunStatus::Succeeded),
+        "recall run failed: {:?}",
+        outcome.status
+    );
+
+    let asked = provider.asked();
+    let prompt = &asked[0].prompt;
+    assert_eq!(
+        prompt["memory"],
+        json!([{
+            "id": "language",
+            "purpose": "learned-facts",
+            "content": "Customer prefers German",
+            "written_at": "1970-01-01T00:00:00Z",
+        }]),
+        "the declared recall did not reach the prompt, or reached it unpartitioned"
+    );
+
+    // The label is the half a prompt assertion cannot see, and provenance is
+    // where it shows: the run's answer carries the sources of everything that
+    // reached the prompt. A recall that relabelled its memories on the way in
+    // would produce an identical prompt and lose exactly this.
+    let label = outcome.output.as_ref().expect("an answer").label().clone();
+    assert!(
+        label
+            .provenance
+            .contains(&agentplane::core::SourceId::new("model:fake/memory-1")),
+        "the recalled memory's provenance did not survive into the answer: {label:?}"
+    );
+    assert!(
+        label
+            .provenance
+            .contains(&agentplane::core::SourceId::new("memory:language")),
+        "the recalled memory was promoted out of its own untrusted source: {label:?}"
+    );
+
+    let records = agentplane::journal::JournalStore::read(store.as_ref(), outcome.run_id, 1)
+        .await
+        .expect("journal");
+    assert!(
+        records.iter().any(|record| matches!(
+            record.kind(),
+            agentplane::journal::RecordKind::EffectStarted { descriptor, .. }
+                if descriptor.kind == "memory.recall"
+        )),
+        "the recall was not journaled, so a replay would re-run the selection"
+    );
+}
+
+/// A `planned` agent may not declare a recall.
+///
+/// The kind refuses untrusted *input* because the plan is compiled from what
+/// the planner reads. A recalled memory is untrusted whenever whatever wrote it
+/// was — which, for anything a model formed, is always — so a recall on a
+/// planned agent is that same refusal walked around through the store.
+#[test]
+fn a_planned_agent_may_not_declare_a_recall() {
+    let yaml = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: planner, version: "1.0.0" }
+spec:
+  capabilities: { provides: [plan.it] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: planned, max_turns: 4 }
+  memory:
+    recall:
+      subject: team/support
+      purpose: learned-facts
+  budgets: {}
+"#;
+    let refused = Manifest::parse(yaml).expect_err("a planned agent must not recall");
+    assert!(
+        refused.to_string().contains("planned"),
+        "the refusal must name the kind it is about: {refused}"
+    );
+}
+
+/// A recall's limit is a band, and both ends are refused outside it.
+///
+/// `0` is the one that matters: it reads in review as a ceiling and behaves as
+/// an agent that remembers nothing, which is a declared control performing the
+/// opposite of what a reviewer takes it for.
+#[test]
+fn a_recall_limit_outside_the_declared_band_is_refused() {
+    let with = |limit: &str| {
+        format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: recalling, version: "1.0.0" }}
+spec:
+  capabilities: {{ provides: [recall.answer] }}
+  models: {{ privileged: {{ provider: fake, model: m-1 }} }}
+  execution: {{ kind: completion }}
+  memory:
+    recall:
+      subject: team/support
+      limit: {limit}
+  budgets: {{}}
+"#
+        )
+    };
+    Manifest::parse(&with("1")).expect("one memory is a recall");
+    Manifest::parse(&with("50")).expect("fifty is the top of the band");
+    for outside in ["0", "51"] {
+        let refused =
+            Manifest::parse(&with(outside)).expect_err("a limit outside the band is refused");
+        assert!(
+            refused.to_string().contains("between 1 and 50"),
+            "{refused}"
+        );
+    }
+}
+
+/// A memory block that declares neither half is refused.
+#[test]
+fn an_empty_memory_block_is_refused_rather_than_ignored() {
+    let yaml = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: hollow, version: "1.0.0" }
+spec:
+  capabilities: { provides: [do.it] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: completion }
+  memory: {}
+  budgets: {}
+"#;
+    let refused = Manifest::parse(yaml).expect_err("an empty memory block is refused");
+    assert!(
+        refused.to_string().contains("performs nothing"),
+        "{refused}"
+    );
 }
 
 /// A declarative agent provides exactly one capability.
@@ -2930,12 +3161,13 @@ spec:
     privileged: { provider: fake, model: answerer-1 }
     quarantined: { provider: fake, model: extractor-1 }
   execution: { kind: completion }
-  memory_formation:
-    subject: team/support
-    purpose: learned-facts
-    instruction: Extract stable facts only.
-    max_items: 2
-    max_sensitivity: internal
+  memory:
+    formation:
+      subject: team/support
+      purpose: learned-facts
+      instruction: Extract stable facts only.
+      max_items: 2
+      max_sensitivity: internal
   budgets: {}
 "#,
     )
@@ -4735,7 +4967,7 @@ spec:
         Err(ManifestError::Unenforceable { field, detail }) => {
             assert_eq!(field, "spec.models.quarantined");
             assert!(
-                detail.contains("planned") && detail.contains("memory_formation"),
+                detail.contains("planned") && detail.contains("memory.formation"),
                 "the refusal does not name the two ways to make it live: {detail}"
             );
         }
@@ -4770,8 +5002,8 @@ spec:
     // `tool-calling` **with** formation — the extraction runs on it.
     Manifest::parse(&format!(
         "{head}  execution: {{ kind: tool-calling, max_turns: 5 }}\n  \
-         memory_formation:\n    subject: team/billing\n    purpose: learned\n    \
-         instruction: Extract stable facts only.\n    max_items: 2\n"
+         memory:\n    formation:\n      subject: team/billing\n      purpose: learned\n      \
+         instruction: Extract stable facts only.\n      max_items: 2\n"
     ))
     .expect("memory formation selects the quarantined role");
 
@@ -5008,10 +5240,11 @@ spec:
   capabilities: {{ provides: [file.facts] }}
   models: {{ privileged: {{ provider: fake, model: m-1 }} }}
   execution: {{ kind: completion }}
-  memory_formation:
-    subject: "{subject}"
-    purpose: clearing
-    instruction: Extract stable facts only.
+  memory:
+    formation:
+      subject: "{subject}"
+      purpose: clearing
+      instruction: Extract stable facts only.
   budgets: {{}}
 "#
         )
@@ -5034,15 +5267,21 @@ spec:
     ] {
         let m = Manifest::parse(&with(written)).expect(written);
         assert_eq!(
-            m.spec.memory_formation.as_ref().expect("formation").subject,
+            m.spec
+                .memory
+                .as_ref()
+                .and_then(|m| m.formation.as_ref())
+                .expect("formation")
+                .subject,
             expected
         );
         // The written form is what the digest covers, so it must survive a
         // round trip byte for byte.
         assert_eq!(
             m.spec
-                .memory_formation
+                .memory
                 .as_ref()
+                .and_then(|m| m.formation.as_ref())
                 .expect("formation")
                 .subject
                 .as_written(),
@@ -5083,10 +5322,11 @@ spec:
   capabilities: { provides: [file.facts] }
   models: { privileged: { provider: fake, model: m-1 } }
   execution: { kind: completion }
-  memory_formation:
-    subject: "$correlation/malo"
-    purpose: clearing
-    instruction: Extract stable facts only.
+  memory:
+    formation:
+      subject: "$correlation/malo"
+      purpose: clearing
+      instruction: Extract stable facts only.
   budgets: {}
 "#;
     let manifest = Manifest::parse(FILER).expect("manifest");
@@ -5109,7 +5349,8 @@ spec:
         .try_build()
         .expect_err("formation with nowhere to write must refuse the build");
     assert!(
-        matches!(&err, BuildError::FormationWithoutMemory { agent } if agent == "filer"),
+        matches!(&err, BuildError::MemoryWithoutStore { agent, declared }
+            if agent == "filer" && *declared == "spec.memory.formation"),
         "wrong refusal: {err}"
     );
 
@@ -5356,10 +5597,11 @@ spec:
     - ref: "tool://obsd/list_overdue"
       mutates: false
       description: "List overdue processes."
-  memory_formation:
-    subject: "$case"
-    purpose: "recall"
-    instruction: "{instruction}"
+  memory:
+    formation:
+      subject: "$case"
+      purpose: "recall"
+      instruction: "{instruction}"
   budgets: {{}}
 "#
         )

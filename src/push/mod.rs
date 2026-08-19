@@ -436,7 +436,9 @@ impl PushPolicy {
             .ok_or_else(|| PushError::Malformed("no host".to_owned()))?
             .trim_end_matches('.')
             .to_ascii_lowercase();
-        if parsed.scheme() != "https" && !(allow_loopback && is_loopback_name(&host)) {
+        if parsed.scheme() != "https"
+            && !(allow_loopback && crate::netguard::is_loopback_name(&host))
+        {
             return Err(PushError::NotHttps);
         }
         if !self.hosts.contains(&host) {
@@ -444,25 +446,6 @@ impl PushPolicy {
         }
         Ok(())
     }
-}
-
-/// Whether a host names this machine, without resolving it.
-///
-/// Literals only, plus the one name every stack special-cases. Anything that
-/// merely *resolves* to loopback is deliberately not covered here — that is
-/// [`netguard`](crate::netguard)'s job at delivery, against the answers DNS
-/// actually gave, and a name-based guess in front of it would be a second
-/// implementation of one rule.
-fn is_loopback_name(host: &str) -> bool {
-    if host == "localhost" {
-        return true;
-    }
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    bare.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Delivers notifications, under the controls in the module docs.
@@ -700,7 +683,7 @@ impl PushSender {
                 )));
             }
             addrs
-        } else if self.loopback_allowed() && is_loopback_name(&host) {
+        } else if self.loopback_allowed() && crate::netguard::is_loopback_name(&host) {
             // Named rather than inferred: the exception applies to a host that
             // *is* a loopback literal or `localhost`, not to one that merely
             // resolved to one. A name that resolves inward is the rebinding

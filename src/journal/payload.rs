@@ -174,10 +174,33 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         // Reasoning recorded beside the effects it explains — model output
         // over the caller's data, and nothing routes on it.
         K::Note { text } => vec![SealedField::Text(text)],
-        // Everything else is control-plane: names, states, digests, counts.
-        // Sealing them would cost the readability that makes an unopenable
-        // journal still useful, and buy nothing — none of them carries the
-        // caller's data.
-        _ => Vec::new(),
+        // Control-plane: names, states, digests, counts. Sealing them would
+        // cost the readability that makes an unopenable journal still useful,
+        // and buy nothing — none of them carries the caller's data.
+        //
+        // Listed one by one rather than swept up by a wildcard, and the
+        // verbosity is the feature. A record kind added later carries the
+        // caller's data far more often than not, and under a wildcard it would
+        // default to *unsealed* — compiling, passing every test, and sealing
+        // nothing, which is the failure this module opens by calling silent by
+        // construction. Exhaustively, the compiler asks the question instead:
+        // a new variant does not build until somebody has answered it.
+        K::StepStarted { .. }
+        | K::StepFinished { .. }
+        | K::CaseBound { .. }
+        | K::DeadlineRegistered { .. }
+        | K::DeadlineTransition { .. }
+        | K::RunSuspended { .. }
+        | K::BudgetRefused { .. }
+        | K::BudgetReadmitted { .. }
+        | K::IdentityBound { .. }
+        | K::PolicyDenied { .. }
+        | K::GroupOpened { .. }
+        | K::StepCompensated { .. }
+        | K::Released { .. }
+        | K::RunCancelled { .. }
+        | K::RunSealed { .. }
+        | K::BreakGlass { .. }
+        | K::Swept { .. } => Vec::new(),
     }
 }

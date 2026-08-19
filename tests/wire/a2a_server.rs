@@ -2443,7 +2443,9 @@ async fn this_planes_client_can_call_this_planes_server() {
 
     let peer = PeerId::new("self");
     let chain = Delegation::root(Principal::new("user:operator", Scope::root()));
-    let client = A2aClient::new(Endpoint::new(format!("http://{addr}/a2a"))).unwrap();
+    let client = A2aClient::new(Endpoint::new(format!("http://{addr}/a2a")))
+        .unwrap()
+        .allow_loopback();
     let credential = PeerCredential::for_audience(peer.clone(), "acme-peer");
 
     let answer = client
@@ -2598,6 +2600,39 @@ async fn sse_frames(router: &axum::Router, req: Request<Body>) -> (StatusCode, S
         .filter_map(|d| serde_json::from_str(d).ok())
         .collect();
     (status, content_type, frames)
+}
+
+/// The first `data:` frame of a stream, without waiting for it to close.
+///
+/// The sibling above drains to EOF, which is right for a run that terminates
+/// and wrong for the only tasks a subscription accepts: a subscription to a
+/// **terminal** task is refused before it reaches the stream, and one to a live
+/// task stays open by design. So the surface that opens every subscription is
+/// unreadable by a helper that requires an ending, and this reads the opening
+/// snapshot and hangs up.
+async fn sse_opening_frame(router: &axum::Router, req: Request<Body>) -> Option<Value> {
+    use futures_util::StreamExt as _;
+    let res = router.clone().oneshot(req).await.unwrap();
+    let mut body = res.into_body().into_data_stream();
+    let mut buffered = String::new();
+    // Bounded for the reason the drain is: a stream that never produces its
+    // first frame must fail this test rather than hang CI.
+    let deadline = std::time::Duration::from_secs(10);
+    tokio::time::timeout(deadline, async {
+        while let Some(chunk) = body.next().await {
+            buffered.push_str(&String::from_utf8_lossy(&chunk.ok()?));
+            if let Some(frame) = buffered
+                .lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .find_map(|d| serde_json::from_str::<Value>(d).ok())
+            {
+                return Some(frame);
+            }
+        }
+        None
+    })
+    .await
+    .expect("a subscription produced no opening frame within the deadline")
 }
 
 /// `SendStreamingMessage` answers with an SSE stream that opens with the task.
@@ -2907,7 +2942,9 @@ async fn a_client_discovers_verifies_and_calls_a_tenant_scoped_agent() {
     });
 
     // Discovery, with verification made mandatory.
-    let cards = CardClient::new().verifying_with(Arc::new(verifier) as Arc<dyn CardVerifier>);
+    let cards = CardClient::new()
+        .allow_loopback()
+        .verifying_with(Arc::new(verifier) as Arc<dyn CardVerifier>);
     let card = cards
         .discover(&format!("http://{addr}"))
         .await
@@ -2929,7 +2966,7 @@ async fn a_client_discovers_verifies_and_calls_a_tenant_scoped_agent() {
     // tenant, because the server checks the request against its own card.
     let peer = PeerId::new("acme-plane");
     let chain = Delegation::root(Principal::new("user:operator", Scope::root()));
-    let client = A2aClient::new(endpoint).unwrap();
+    let client = A2aClient::new(endpoint).unwrap().allow_loopback();
     let credential = PeerCredential::for_audience(peer.clone(), "acme:caller");
     client
         .send(
@@ -2981,7 +3018,9 @@ async fn discovery_refuses_a_card_signed_by_a_stranger() {
         let _ = axum::serve(listener, router).await;
     });
 
-    let cards = CardClient::new().verifying_with(Arc::new(verifier) as Arc<dyn CardVerifier>);
+    let cards = CardClient::new()
+        .allow_loopback()
+        .verifying_with(Arc::new(verifier) as Arc<dyn CardVerifier>);
     assert!(
         cards.discover(&format!("http://{addr}")).await.is_err(),
         "a card signed by an unknown key was accepted, so verification checks \
@@ -3014,7 +3053,9 @@ async fn discovery_refuses_an_unsigned_card_when_verification_is_required() {
         let _ = axum::serve(listener, router).await;
     });
 
-    let cards = CardClient::new().verifying_with(Arc::new(verifier) as Arc<dyn CardVerifier>);
+    let cards = CardClient::new()
+        .allow_loopback()
+        .verifying_with(Arc::new(verifier) as Arc<dyn CardVerifier>);
     assert!(
         cards.discover(&format!("http://{addr}")).await.is_err(),
         "an unsigned card was accepted while verification was required — the \
@@ -3025,6 +3066,7 @@ async fn discovery_refuses_an_unsigned_card_when_verification_is_required() {
     // case rather than refusing everything.
     assert!(
         CardClient::new()
+            .allow_loopback()
             .discover(&format!("http://{addr}"))
             .await
             .is_ok()
@@ -3297,6 +3339,240 @@ async fn the_live_answer_and_the_read_back_answer_are_the_same_state() {
         "the immediate response and the read-back disagree about the same task's \
          state — a client that held the response and one that polled for it would \
          see different tasks: live={live}, fetched={fetched}"
+    );
+}
+
+/// **A card URL is a dereference, and gets what every dereference here gets.**
+///
+/// Discovery fetches a URL that arrives from a config, a registry entry or a
+/// message — routinely the first attacker-influenced string a deployment
+/// handles. `netguard`'s own documentation used to enumerate the crate's URL
+/// dereferences as *two*, governed media and push delivery, while this was a
+/// third: a bare client with no address check, no redirect policy and no
+/// timeout, behind an allowlist that is optional and therefore absent by
+/// default.
+///
+/// Three assertions, because the three controls fail independently and only one
+/// of them is visible in a passing fetch.
+#[tokio::test]
+async fn card_discovery_refuses_an_inward_address_a_redirect_and_a_hang() {
+    use agentplane::peers::{CardClient, DiscoveryError, WELL_KNOWN_PATH};
+    use axum::Router;
+    use axum::routing::get;
+
+    // 1. An address that resolves inward. With no allowlist configured this is
+    //    the only lock, and it is the one that stands between a hostile card URL
+    //    and the cloud metadata service.
+    let refused = CardClient::new()
+        .discover("http://169.254.169.254")
+        .await
+        .expect_err("the link-local metadata address was fetched");
+    assert!(
+        matches!(&refused, DiscoveryError::Refused(m) if m.contains("169.254.169.254")),
+        "a card fetch reached the metadata service: {refused:?}"
+    );
+
+    // 2. A redirect. The check above runs on the URL the caller supplied and
+    //    says nothing about where an allowed host forwards to, so following one
+    //    hands the whole decision to the card server.
+    let redirector = Router::new().route(
+        WELL_KNOWN_PATH,
+        get(|| async {
+            (
+                StatusCode::FOUND,
+                [(axum::http::header::LOCATION, "http://169.254.169.254/card")],
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, redirector).await;
+    });
+    let followed = CardClient::new()
+        .allow_loopback()
+        .discover(&format!("http://{addr}"))
+        .await
+        .expect_err("the redirect to the metadata service was followed");
+    // Named, not merely "an error": with redirects off the 302 is returned as
+    // the response, so the refusal says *302*. Accepting any error here would
+    // pass just as well on a malformed body, which is what an empty redirect
+    // response also produces once something else has gone wrong.
+    assert!(
+        matches!(&followed, DiscoveryError::Unreachable(m) if m.contains("302")),
+        "the fetch failed, but not by declining to follow the redirect — the \
+         address check would then be covering only the first hop: {followed:?}"
+    );
+
+    // 3. A server that accepts the connection and never answers. Unbounded is
+    //    the wrong default anywhere, and here an unknown host sets it.
+    let hanging = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hang_addr = hanging.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = hanging.accept().await else {
+                return;
+            };
+            // Held open, never written to.
+            std::mem::forget(stream);
+        }
+    });
+    //
+    // Bounded by the *test* as well as by the client, and that outer bound is
+    // load-bearing: a client with no timeout never returns, so an assertion on
+    // elapsed time is never reached and the failure is a hang. A hang stalls CI
+    // and the mutation sweep and tells nobody what broke, which is the one
+    // failure mode worse than the bug.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        CardClient::new()
+            .allow_loopback()
+            .timeout(std::time::Duration::from_millis(300))
+            .discover(&format!("http://{hang_addr}")),
+    )
+    .await;
+    let timed_out = outcome.expect(
+        "the fetch was not bounded by its own timeout and had to be killed by          this test's — an unknown host can hold a task open indefinitely",
+    );
+    assert!(
+        timed_out.is_err(),
+        "a card fetch against a server that never answers returned a card"
+    );
+}
+
+/// **A card names an address, and the call that follows checks it.**
+///
+/// Discovery being guarded is only half. `AgentCard::endpoint` takes the URL
+/// straight out of a discovered card — a document another party publishes about
+/// itself — and hands it to the client that carries the run's payload and a
+/// bearer credential. A forged card cannot widen a grant, which is what makes
+/// discovery survivable at all; what it can still do is *name an address*, and
+/// the outbound leg is where that address is finally connected to.
+///
+/// So the peer call resolves, checks every answer and pins the connection to
+/// exactly those, the same as discovery and push. Asserted with a peer whose
+/// endpoint is the link-local metadata address, which is what a hostile card
+/// would advertise.
+#[tokio::test]
+async fn a_peer_endpoint_that_resolves_inward_is_refused_before_the_request() {
+    use agentplane::core::{Delegation, Principal, Scope};
+    use agentplane::peers::a2a::{A2aClient, Endpoint};
+    use agentplane::peers::{PeerClient, PeerId};
+
+    let client = A2aClient::new(Endpoint::new("http://169.254.169.254/a2a")).expect("client");
+    let chain = Delegation::root(Principal::new("user:owner", Scope::root()));
+    let error = client
+        .send(
+            &PeerId::new("hostile"),
+            "audit.check",
+            &json!({"question": "what is in the metadata service"}),
+            &chain,
+            None,
+            None,
+        )
+        .await
+        .expect_err("the metadata address was called");
+
+    // `Refused`, not merely an error mentioning the address. Without the check
+    // the client still tries to connect and still fails — with a *transport*
+    // error that names the same host — so an assertion on the message text
+    // passes whether or not anything was checked. The classification is the
+    // only thing that distinguishes "this plane declined to go there" from
+    // "this plane went there and the socket did not open", and they are
+    // different facts: the second one means the address was contacted.
+    assert!(
+        matches!(&error, agentplane::peers::PeerError::Refused { detail, .. }
+            if detail.contains("169.254.169.254")),
+        "a peer call was attempted against the metadata service rather than \
+         refused before the request: {error:?}"
+    );
+    assert_eq!(
+        error.disposition(),
+        agentplane::core::Disposition::DidNotHappen,
+        "a destination refused before the request was built must be recorded as \
+         never having happened, or the runtime treats it as possibly applied"
+    );
+}
+
+/// **Every read-back surface reports one state, and they share one function.**
+///
+/// The sibling above pins the *live* response against `GetTask`. This pins the
+/// three read-back surfaces against each other: `GetTask`, the row the same
+/// task occupies in `ListTasks`, and the snapshot a subscription opens with.
+/// All three answer from the run's history, and each derived its answer from
+/// its own copy of the same match — three copies that would agree right up
+/// until somebody added a record kind or reworded a suspension.
+///
+/// A disagreement here is worse than a wrong answer, because all three clients
+/// are equally correct: one polled, one listed, one subscribed, and the
+/// protocol gives them no way to discover that the plane told them different
+/// things.
+///
+/// Driven on a task that is **input-required** rather than finished, which is
+/// the only state all three can be asked about at once: a subscription to a
+/// terminal task is refused before it reaches the stream, so a completed run
+/// would leave the third surface untested — the gap this test exists to close.
+#[tokio::test]
+async fn every_read_back_surface_reports_the_same_state() {
+    let f = continuation_fixture();
+    let router = f.router();
+    let (status, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": {
+                "messageId": "m-surfaces",
+                "role": "ROLE_USER",
+                "parts": [{"text": "begin"}]
+            }}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    let task_id = sent["result"]["task"]["id"]
+        .as_str()
+        .expect("a task id")
+        .to_owned();
+
+    let (_, fetched) = send(
+        &router,
+        rpc("GetTask", &json!({ "id": task_id }), Some("peer-a")),
+    )
+    .await;
+    let got = fetched["result"]["status"]["state"].clone();
+    assert_eq!(
+        got, "TASK_STATE_INPUT_REQUIRED",
+        "the fixture stopped producing a live task, so the three surfaces below \
+         are being compared on a state only one of them can report: {fetched}"
+    );
+
+    let (_, listed) = send(&router, rpc("ListTasks", &json!({}), Some("peer-a"))).await;
+    let row = listed["result"]["tasks"]
+        .as_array()
+        .expect("a task list")
+        .iter()
+        .find(|t| t["id"] == task_id.as_str())
+        .unwrap_or_else(|| panic!("the task is absent from its own listing: {listed}"));
+    assert_eq!(
+        row["status"]["state"], got,
+        "the same task reads one state from GetTask and another from ListTasks \
+         — a client that polled and a client that listed would each be correct \
+         and disagree: get={got}, list={listed}"
+    );
+
+    let opening = sse_opening_frame(
+        &router,
+        rpc("SubscribeToTask", &json!({ "id": task_id }), Some("peer-a")),
+    )
+    .await
+    .unwrap_or_else(|| panic!("a subscription to a live task carried no frames"));
+    let streamed = opening["result"]["task"]["status"]["state"].clone();
+    assert_eq!(
+        streamed, got,
+        "the snapshot a subscription opens with disagrees with GetTask about the \
+         same task, and the subscribing client has no way to find out: \
+         stream={streamed}, get={got}"
     );
 }
 

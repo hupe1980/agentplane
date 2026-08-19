@@ -324,6 +324,75 @@ async fn the_negotiated_protocol_version_is_pinned_to_2026_07_28() {
     );
 }
 
+/// **A downgraded handshake is visible, not silent.**
+///
+/// MCP negotiation is a designed downgrade: this host offers `2026-07-28`, a
+/// server answers with a version it speaks, and the connection proceeds on
+/// that. Unlike A2A — which asserts its version and refuses a mismatch — that
+/// is the protocol working, so the client does not refuse.
+///
+/// What it must not do is leave the outcome unknowable. An older server serves
+/// `tools/call` correctly and simply never returns a task, so the tasks
+/// extension this module is written against is absent with nothing failing:
+/// a long-running tool behaves synchronously, a governed suspension never
+/// happens, and no error anywhere names the cause. The version is therefore
+/// readable from the client, and `agentplane serve` prints it — the declarative
+/// tier has no Rust in which to ask.
+///
+/// Asserted against the raw string a *server* chose rather than a constant, so
+/// this fails if the accessor ever reports what was offered instead of what was
+/// agreed — which is the one way it could look correct and be useless.
+#[tokio::test]
+async fn the_client_reports_the_version_the_handshake_settled_on() {
+    // Hand-rolled rather than an rmcp `ServerHandler`, because rmcp's server
+    // negotiates: handed a version it supports it echoes that one back, so no
+    // handler can be made to answer with an older one. A server that *does*
+    // is the only thing that tells this accessor apart from a constant — with
+    // a cooperating server both readings are `2026-07-28` and a hardcoded
+    // return passes.
+    let (client_side, server_side) = tokio::io::duplex(8 * 1024);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (r, mut w) = tokio::io::split(server_side);
+        let mut lines = BufReader::new(r).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(request): Result<serde_json::Value, _> = serde_json::from_str(&line) else {
+                continue;
+            };
+            if request["method"] != "initialize" {
+                continue;
+            }
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "old-server", "version": "0.0.0" },
+                }
+            });
+            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+            let _ = w.flush().await;
+        }
+    });
+
+    let (cr, cw) = tokio::io::split(client_side);
+    let service = McpClient::host_info()
+        .serve((cr, cw))
+        .await
+        .expect("an older server is a legal answer, not a failure");
+    let client = McpClient::new("legacy", Arc::new(service));
+
+    assert_eq!(
+        client.negotiated_version().as_deref(),
+        Some("2025-06-18"),
+        "the client reported the version it *offered* rather than the one the \
+         server answered with, so a downgrade — and the absent tasks extension \
+         that comes with it — stays invisible to every deployment that does not \
+         speak rmcp directly"
+    );
+}
+
 /// The advertised annotations arrive intact — and are still not obeyed.
 #[tokio::test]
 async fn a_servers_annotations_are_read_but_do_not_decide_anything() {

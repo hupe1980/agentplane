@@ -271,12 +271,11 @@ fn frames(
 /// The task a stream opens with, read from the journal as it stands now.
 pub async fn current(runtime: &Runtime, run: RunId) -> Option<(A2aTask, Option<String>, Seq)> {
     let records = runtime.journal().read(run, 1).await.ok()?;
+    // The same reading `tasks/get` and `tasks/list` answer with. A stream is a
+    // view of the history rather than a second opinion about it, and a client
+    // that polled and subscribed must not be told two things about one run.
+    let (state, detail) = super::a2a::state_from_history(&records)?;
     let last = records.last()?;
-    let (state, detail) = match last.kind() {
-        RecordKind::RunSuspended { reason } => (TaskState::InputRequired, reason.to_string()),
-        RecordKind::RunSealed { outcome, .. } => (sealed_state(outcome), outcome.clone()),
-        _ => (TaskState::Working, "running".to_owned()),
-    };
     let case = records
         .iter()
         .find_map(|r| r.body.case.map(|c| c.to_string()));

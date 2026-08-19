@@ -249,13 +249,114 @@ can reach, because what was destroyed was never in them. A test restores a backu
 taken *before* the erasure into a fresh store and asserts it stays unreadable;
 that is the property deletion cannot provide.
 
-Three operations fall out of one structure, which is the argument for it:
+Two operations fall out of one structure, which is the argument for it:
 
 | | |
 |---|---|
-| **Erasure** | destroy a data key — its scope's bytes are gone, everywhere |
-| **Rotation** | re-wrap data keys under a new wrapping key; bulk data is never rewritten, so rotating is cheap enough to do on a schedule rather than in a plan |
-| **Revocation** | destroy a wrapping key — everything wrapped under it is unreadable, which is the blast radius a compromised key should have |
+| **Erasure** | destroy a scope's wrapping key — every payload ever sealed under that scope is unreadable, everywhere |
+| **Revocation** | the same act for a different reason; the blast radius a compromised key should have is exactly the scope it wrapped |
+
+### Rotation: sealed bytes never change
+
+Envelope encryption is usually sold on a third operation — rotate the wrapping
+key, re-wrap the data keys, leave bulk data alone. agentplane does not offer it,
+and the omission is a decision rather than missing work.
+
+An envelope carries its wrapped data key inline, and the journal's hash chain
+commits to the envelope bytes. That is what lets an auditor holding no keys
+verify a run whose payloads have been erased — and it is exactly what makes
+re-wrapping impossible: rewriting a journal payload's envelope rewrites a record
+the chain covers, so it breaks the chain it sits inside. Re-wrapping the *other*
+stores would not help either, because a scope's journal payloads and its case
+state share one wrapping key: the scope stays pinned to the oldest version any of
+its journal envelopes names.
+
+So the rule is stated instead: **sealed payload bytes never change, and the
+erasure scope is the rotation unit.** A scope is already narrow — one case, one
+run, one memory subject — so a compromised wrapping key exposes that unit and
+nothing else, which is the blast radius rotation is bought for in the first
+place. Adding a key version is safe and needs nothing from agentplane; envelopes
+sealed before a rotation keep opening.
+
+**This is the model AWS KMS already assumes.** KMS rotates a key's backing
+material on a schedule, keeps *every* previous version in perpetuity, and picks
+the right one from the ciphertext on decrypt — you cannot select a version, and
+you cannot delete one. The only way to remove old key material is to delete the
+whole KMS key, which is precisely erasure. So on KMS, rotation is automatic and
+transparent, and nothing below can arise.
+
+**Vault's transit engine is the one to be careful with,** because it offers a
+lever KMS does not: `min_decryption_version` refuses to decrypt ciphertext below
+a floor. Since envelopes pin their key version for life, raising that floor past
+a live envelope makes un-erased history unreadable — an erasure nobody
+requested, that no retention record explains and no obligation discharges. (This
+is what `rewrap` exists for in Vault's own model, and the reason it cannot serve
+that purpose here is the chain, above.)
+
+agentplane cannot stop an operator moving that floor, so it makes moving it too
+far legible. `KeyError::Retired` is its own answer, distinct from a completed
+erasure and from a plain refusal, and it names the version the floor has to
+readmit:
+
+```text
+the wrapping key version 'vault:v1' for scope 'acme/case-8f2…' has been retired
+by policy — this is not an erasure and not a loss: the sealed bytes are intact
+and become readable again if the key service's minimum decryption version is
+lowered to admit 'vault:v1'
+```
+
+`agentplane drill` reports such a case as a finding that names the remedy, rather
+than as *neither opens nor was its key destroyed* — the sentence that would send
+somebody hunting for tampering while a reversible setting is the whole cause.
+
+### An envelope says which construction it is
+
+Rotation-immutability has a consequence for the *format*, not just for the keys:
+an envelope is read by builds written long after it, for as long as it is
+retained. A mixed-version fleet mid-deploy, a rollback, and a restore from a
+backup taken by a newer plane are all ordinary operations that hand one build
+another build's bytes.
+
+So an envelope leads with the construction it was written to:
+
+```text
+[u8 version][u32 len][wrapped data key][24-byte nonce][ciphertext ‖ tag]
+```
+
+The version is read **before any offset is trusted**, which is the whole point —
+a parser that reads a length first has already committed to a layout it may have
+no rule for. It is one number, exposed as `keyring::ENVELOPE_FORMAT_VERSION`,
+and it names the entire construction: layout, nonce width and AEAD together.
+Changing the cipher changes what the bytes mean, so a second AEAD is a second
+version rather than a second field — and a reader that picked between suites by
+trying them would be a decryption oracle, not a parser.
+
+A version this build does not read is `KeyError::UnknownFormat`, beside
+`Retired` and for the same reason:
+
+```text
+this sealed envelope is format version 2 and this build reads 1 — the bytes are
+intact and not erased; they open under a build that reads version 2
+```
+
+Without the byte, that envelope would have reached the AEAD with its fields read
+from the wrong offsets and come back as *the sealed payload did not
+authenticate* — an incident sentence for a build skew whose remedy is which
+binary is running.
+
+The rule binds readers too. A component that cannot identify what it is holding
+says so rather than staying silent: `drill`'s probe answers *nothing to check*
+only for state that was never sealed. State marked sealed whose envelope will not
+parse, whose version is unknown, or whose erasure scope names a **different
+case** is a finding — the last most of all, because erasing that case destroys a
+key which does not reach those bytes, so the data would survive the deletion
+request.
+
+The version stays `1` until the durable-format freeze, and an envelope at any
+other version is refused rather than lifted. Pre-alpha shape changes are hard
+cuts, and here more sharply than anywhere else in the crate: sealed bytes cannot
+be rewritten into a new shape, so a deployment holding sealed data from an
+earlier release keeps it readable by staying on that release.
 
 Four rules hold the semantics together, each removing a way an erasure could be
 quietly incomplete:

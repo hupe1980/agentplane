@@ -245,9 +245,141 @@ async fn check_sealed(
             "case {case}: the key ring could not be reached ({e}) — whether the sealed \
              state opens was not established either way"
         )),
+        // A finding, because un-erased data is unreadable — but a different
+        // one, with a different person and a different remedy. Folded into the
+        // arm below it would read as loss or tampering and send somebody to
+        // hunt a fault that does not exist, while the actual cause is a key
+        // service configured to refuse a version this envelope still needs and
+        // the actual fix is one setting.
+        Some(Err(e @ KeyError::Retired { .. })) => report.findings.push(format!(
+            "case {case}: {e}. No erasure record accounts for this, so it is an erasure \
+             nobody requested — lower the floor to make the case readable again, or erase \
+             the case properly if that is what was intended"
+        )),
+        // The second reversible cause, and it belongs beside the first rather
+        // than in the arm below for the same reason: the bytes are intact, no
+        // key moved, and the remedy is which build is running. Reported as a
+        // finding all the same — this plane cannot read a case it is holding,
+        // and a drill that stayed quiet about that would answer "everything
+        // opens" for state it never opened.
+        Some(Err(e @ KeyError::UnknownFormat { .. })) => report.findings.push(format!(
+            "case {case}: {e}. Run the plane on a build that reads this version, or restore \
+             this case from an export written by one — nothing here needs a key operation"
+        )),
         Some(Err(e)) => report.findings.push(format!(
             "case {case}: sealed state neither opens nor was its key destroyed ({e}) — \
              an erasure would have said so, which makes this loss or tampering"
         )),
+    }
+}
+
+#[cfg(all(test, feature = "keyring", feature = "testkit"))]
+mod sealed_classification_tests {
+    use super::*;
+    use crate::core::CaseId;
+    use crate::testkit::MemoryKeyRing;
+
+    fn blank() -> DrillReport {
+        DrillReport {
+            cases: 0,
+            blobs_present: 0,
+            blobs_erased: 0,
+            sealed_open: 0,
+            sealed_erased: 0,
+            findings: Vec::new(),
+            not_checked: Vec::new(),
+        }
+    }
+
+    /// State marked sealed whose leading byte is a version nobody here reads.
+    ///
+    /// The version is the first thing the envelope parser looks at, so nothing
+    /// past it has to be well-formed for this to be the answer — which is the
+    /// property being relied on: a build meeting a construction it does not
+    /// know stops before it can misread the rest.
+    fn from_the_future() -> serde_json::Value {
+        crate::journal::payload::wrap(&[
+            crate::keyring::ENVELOPE_FORMAT_VERSION.wrapping_add(1),
+            0,
+            0,
+            0,
+            0,
+        ])
+    }
+
+    /// **A build skew and a suspected loss are different findings.**
+    ///
+    /// Both are findings — this plane is holding a case it cannot read either
+    /// way, and a drill that stayed quiet about that would answer *everything
+    /// opens* for state it never opened. What separates them is who is called
+    /// and what they do: the loss arm's sentence sends somebody to look for
+    /// tampering, and for a version this build does not read there is nothing
+    /// to look for and the remedy is which binary is running.
+    ///
+    /// Folding the two arms together is invisible to a test that only counts
+    /// findings, so this reads the sentence.
+    #[tokio::test]
+    async fn a_version_this_build_cannot_read_is_not_reported_as_loss_or_tampering() {
+        let ring = MemoryKeyRing::new();
+        let mut report = blank();
+        check_sealed(&mut report, &ring, CaseId::generate(), &from_the_future()).await;
+
+        assert_eq!(
+            report.sealed_open, 0,
+            "state that never opened must not be counted as open"
+        );
+        assert_eq!(report.sealed_erased, 0, "nothing was erased — no key moved");
+        assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+        let finding = &report.findings[0];
+        assert!(
+            !finding.contains("loss or tampering"),
+            "a build skew reported in the vocabulary of an incident: {finding}"
+        );
+        assert!(
+            finding.contains("format version") && finding.contains("build"),
+            "the finding must carry its own remedy: {finding}"
+        );
+    }
+
+    /// The new arm must not have swallowed the incident arm with it.
+    ///
+    /// An envelope of this build's own version that is then damaged has no
+    /// benign explanation, and must keep reaching an operator in the words
+    /// that say so.
+    #[tokio::test]
+    async fn damage_at_this_builds_own_version_is_still_loss_or_tampering() {
+        let ring = MemoryKeyRing::new();
+        let truncated =
+            crate::journal::payload::wrap(&[crate::keyring::ENVELOPE_FORMAT_VERSION, 0]);
+
+        let mut report = blank();
+        check_sealed(&mut report, &ring, CaseId::generate(), &truncated).await;
+
+        assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+        assert!(
+            report.findings[0].contains("loss or tampering"),
+            "damage inside a version this build reads must still page somebody: {}",
+            report.findings[0]
+        );
+    }
+
+    /// Readable state is not a sealing question, and the probe says so by
+    /// leaving every counter alone.
+    #[tokio::test]
+    async fn unsealed_state_is_neither_counted_nor_reported() {
+        let ring = MemoryKeyRing::new();
+        let mut report = blank();
+        check_sealed(
+            &mut report,
+            &ring,
+            CaseId::generate(),
+            &serde_json::json!({ "about": "a readable matter" }),
+        )
+        .await;
+        assert_eq!(
+            report,
+            blank(),
+            "unsealed state moved a counter: {report:#?}"
+        );
     }
 }

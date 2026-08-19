@@ -46,9 +46,10 @@
 //! exponential with an explicit sign outside it — because that is the one part
 //! of JCS where `serde_json`'s own formatting disagrees (`1e30` where the
 //! standard says `1e+30`, `100.0` where it says `100`), and a signed Agent
-//! Card is verified by software nobody here writes. This used to be the one
-//! JCS rule deliberately not implemented, held honest by a guard that the card
-//! carries no numbers; implementing it retired the guard and the constraint.
+//! Card is verified by software nobody here writes. It is the one JCS rule
+//! that would otherwise be tempting to skip — the cards this crate emits carry
+//! no numbers — and skipping it would put the constraint *cards carry no
+//! numbers* on every future field rather than on this function.
 //!
 //! **Integers stay exact, and that is a decision rather than a gap.** JCS
 //! treats every number as an IEEE-754 double, under which two distinct `u64`s

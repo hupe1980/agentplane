@@ -126,14 +126,41 @@ impl SealedCases {
 /// scope's wrapping key actually seals, so a relabelled scope fails at `open`
 /// rather than opening under a borrowed identity. The scope must also name
 /// exactly this case, or the envelope was written for a different matter.
+///
+/// # Exactly one thing is an ordinary `None`
+///
+/// State that is **not marked sealed**. Every step after that marker is a
+/// question the probe was asked and must answer: base64 that will not decode,
+/// a header that does not parse, a format version this build does not read, a
+/// scope naming another case. Each of those is a value that claims to be
+/// sealed and cannot be shown to open — the precise condition this probe
+/// exists to surface — and answering `None` to any of them reports *nothing
+/// to check* about the state most in need of checking, in a report whose only
+/// job is to find it.
 pub async fn probe_sealed_case_state(
     keys: &dyn KeyRing,
     case: CaseId,
     state: &Value,
 ) -> Option<Result<(), super::KeyError>> {
-    let envelope = payload::unwrap(state)?;
-    let scope = super::envelope::wrapped_scope(&envelope)?;
-    let tenant = scope.strip_suffix(&format!("/{case}"))?;
+    if !payload::is_sealed(state) {
+        return None;
+    }
+    let Some(envelope) = payload::unwrap(state) else {
+        return Some(Err(super::KeyError::Refused(
+            "the state is marked sealed and its envelope is not valid base64".to_owned(),
+        )));
+    };
+    let scope = match super::envelope::wrapped_scope(&envelope) {
+        Ok(scope) => scope,
+        Err(e) => return Some(Err(e)),
+    };
+    let Some(tenant) = scope.strip_suffix(&format!("/{case}")) else {
+        return Some(Err(super::KeyError::Refused(format!(
+            "this case's sealed state names erasure scope '{scope}', which is not this \
+             case — the envelope was written for a different matter, so erasing this \
+             case would leave it readable"
+        ))));
+    };
     let aad = format!("case-state:{tenant}:{case}");
     Some(
         super::envelope::open(keys, aad.as_bytes(), &envelope)
@@ -268,5 +295,119 @@ impl CaseStore for SealedCases {
 
     async fn census(&self, now: Timestamp) -> Result<crate::case::CaseCensus, StoreError> {
         self.inner.census(now).await
+    }
+}
+
+#[cfg(all(test, feature = "testkit"))]
+mod probe_tests {
+    use super::*;
+    use crate::testkit::MemoryKeyRing;
+    use serde_json::json;
+
+    fn matter() -> CaseId {
+        CaseId::generate()
+    }
+
+    async fn sealed_state(ring: &MemoryKeyRing, tenant: &str, case: CaseId) -> Value {
+        let aad = format!("case-state:{tenant}:{case}");
+        let plain = crate::core::canon::to_bytes(&json!({ "about": "the matter" })).expect("canon");
+        let envelope =
+            super::super::envelope::seal(ring, &format!("{tenant}/{case}"), aad.as_bytes(), &plain)
+                .await
+                .expect("seal");
+        payload::wrap(&envelope)
+    }
+
+    /// Readable state is not a defect, and it is the only ordinary `None`.
+    #[tokio::test]
+    async fn state_that_was_never_sealed_is_an_ordinary_absence() {
+        let ring = MemoryKeyRing::new();
+        assert!(
+            probe_sealed_case_state(&ring, matter(), &json!({ "about": "plain" }))
+                .await
+                .is_none(),
+            "unsealed state is not something a sealing probe has an answer about"
+        );
+    }
+
+    /// The positive half, so the refusals below are not vacuous.
+    #[tokio::test]
+    async fn sealed_state_that_opens_reports_that_it_opened() {
+        let ring = MemoryKeyRing::new();
+        let case = matter();
+        let state = sealed_state(&ring, "acme", case).await;
+        assert_eq!(
+            probe_sealed_case_state(&ring, case, &state).await,
+            Some(Ok(())),
+        );
+    }
+
+    /// **Marked sealed and unreadable must never answer "nothing to check".**
+    ///
+    /// Each row is a value whose `$sealed` marker says *this is ciphertext*
+    /// and which cannot then be shown to open — the precise condition the
+    /// probe exists to surface. Answering `None` to any of them makes the
+    /// drill count the case as carrying no sealed state at all: no finding, no
+    /// unchecked entry, and a report that says everything opens over state it
+    /// never opened. That is detection without delivery in the pass whose only
+    /// job is detection.
+    ///
+    /// The bad-base64 and foreign-scope rows are `Refused` on purpose. Neither
+    /// has a benign remedy — one is damage in the store, the other is an
+    /// envelope written for a different matter, which means erasing this case
+    /// would leave it readable — so both belong in the drill's tampering arm,
+    /// where somebody is paged.
+    #[tokio::test]
+    async fn sealed_state_this_build_cannot_read_is_answered_not_skipped() {
+        let ring = MemoryKeyRing::new();
+        let case = matter();
+        let state = sealed_state(&ring, "acme", case).await;
+        let envelope = payload::unwrap(&state).expect("sealed");
+
+        let mut bumped = envelope.clone();
+        bumped[0] = bumped[0].wrapping_add(1);
+
+        let rows: [(&str, CaseId, Value); 3] = [
+            (
+                "a format version this build does not read",
+                case,
+                payload::wrap(&bumped),
+            ),
+            (
+                // The same envelope, filed against a case it was not sealed
+                // for. Erasing *this* case would destroy a key that does not
+                // reach these bytes, so they would survive the request.
+                "an envelope sealed for another matter",
+                matter(),
+                state.clone(),
+            ),
+            (
+                "a marker whose payload is not base64",
+                case,
+                json!({ payload::SEALED: "not base64 !!" }),
+            ),
+        ];
+
+        for (label, case, value) in rows {
+            assert!(
+                payload::is_sealed(&value),
+                "{label}: the row stopped claiming to be sealed, so it proves nothing"
+            );
+            let answer = probe_sealed_case_state(&ring, case, &value).await;
+            assert!(
+                matches!(answer, Some(Err(_))),
+                "{label} was reported as nothing to check: {answer:?}"
+            );
+        }
+
+        // And the version skew carries the classification the drill routes on,
+        // rather than the one that reads as loss or tampering.
+        assert!(
+            matches!(
+                probe_sealed_case_state(&ring, case, &payload::wrap(&bumped)).await,
+                Some(Err(super::super::KeyError::UnknownFormat { .. }))
+            ),
+            "a version skew must not reach the drill as a suspected loss"
+        );
     }
 }

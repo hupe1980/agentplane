@@ -619,10 +619,10 @@ impossible, since an embedder writing its own `Authenticator` decides what a
 credential means and can mint a `Caller` for any tenant. That seam is where a
 deployment defines identity; it is a deliberate act rather than a forgotten step.
 
-This used to be two calls — `record_break_glass`, then reach for the plane —
-and nothing enforced the order. `record_break_glass` remains for an embedder
-recording a crossing they made some other way; `cross` is what an admin surface
-should use.
+`cross` is what an admin surface should use: it records the crossing and hands
+back the plane in one call, so no ordering is left to the caller.
+`record_break_glass` is for an embedder recording a crossing they made some
+other way.
 
 Same-tenant crossings are refused, because recording routine access as
 break-glass buries the real ones. A tenant this process does not serve is

@@ -1,10 +1,17 @@
 //! Which IP addresses this plane will connect to.
 //!
-//! Two features dereference URLs a caller influences: governed media fetches one
-//! a model was handed, and a push notification posts to one a peer supplied.
-//! Both face the same attack — a hostname that resolves inward, to a metadata
-//! service, a database, or a health endpoint that answers with something
-//! interesting.
+//! Three features dereference a URL somebody else influenced: governed media
+//! fetches one a model was handed, a push notification posts to one a peer
+//! supplied, and Agent Card discovery fetches one that arrived in a config, a
+//! registry entry or a message. All three face the same attack — a hostname
+//! that resolves inward, to a metadata service, a database, or a health
+//! endpoint that answers with something interesting.
+//!
+//! Counting them is part of the control. This module said *two* while discovery
+//! was already the third and unguarded, which is the shape of a claim written
+//! about every other door while looking at this one: the sentence was true when
+//! written, nothing re-checked it, and the door it did not know about was the
+//! one standing open.
 //!
 //! The classification lives here, once, because two implementations of one rule
 //! diverge and the one that diverges is whichever nobody probed at the boundary.
@@ -29,10 +36,17 @@
 //!
 //! A deny-list of private ranges is normally the weaker construction: anything
 //! missed is permitted. It is used here because the alternative — enumerating
-//! the public internet — is not expressible, and because it is never the only
-//! control. Both callers also require an explicit **host** grant, so an address
-//! must be both publicly routable *and* named by an operator. This list is the
-//! second lock, not the first.
+//! the public internet — is not expressible, and because it is usually not the
+//! only control: media and push both also require an explicit **host** grant,
+//! so an address must be both publicly routable *and* named by an operator.
+//! This list is meant as the second lock.
+//!
+//! Card discovery is the exception worth stating rather than glossing: its
+//! allowlist is optional, because a deployment that discovers agents from the
+//! open internet cannot enumerate them in advance and one that refused to try
+//! would simply not be used. With no allowlist set this list is the *only* lock
+//! on that path — which is why it is applied there unconditionally, and why a
+//! deployment that can name its peers should still name them.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -99,6 +113,29 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         || segments[0] == 0x2002
         || (segments[0] & 0xfff0) == 0x3ff0
         || segments[0] == 0x5f00)
+}
+
+/// Whether a host *names* this machine, without resolving it.
+///
+/// Literals only, plus the one name every stack special-cases. Anything that
+/// merely **resolves** to loopback is deliberately not covered: that is
+/// [`all_public`]'s job against the answers DNS actually gave, and a name-based
+/// guess in front of it would be a second implementation of one rule.
+///
+/// The distinction is the whole security content of this function. A loopback
+/// exception keyed on the *name* is one a deployment wrote down; one keyed on
+/// the *resolution* is one an attacker arranges, because making a name resolve
+/// inward is the rebinding attack itself.
+#[must_use]
+pub fn is_loopback_name(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// A host grant, canonicalised the way a fetched or posted URL's host will be.

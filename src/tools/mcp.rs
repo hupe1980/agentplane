@@ -217,6 +217,37 @@ impl McpClient {
         }
     }
 
+    /// The protocol version the handshake actually settled on.
+    ///
+    /// `None` only before the handshake completes, which a constructed client
+    /// is past.
+    ///
+    /// [`host_info`](Self::host_info) *offers* `2026-07-28`, and MCP's
+    /// negotiation is a designed downgrade: a server answers with a version it
+    /// speaks, and the connection proceeds on that. That is the protocol
+    /// working, not a fault — unlike A2A, where a mismatched version is refused
+    /// because its negotiation asserts rather than negotiates, so the two are
+    /// deliberately not treated alike here.
+    ///
+    /// What a downgrade does mean is that features defined by the offered
+    /// version are simply absent: the tasks extension and structured tool
+    /// responses this module is written against. Nothing errors — an older
+    /// server answers `tools/call` correctly and just never returns a task —
+    /// so the symptom is a long-running tool that behaves synchronously and a
+    /// governed suspension that never happens, with nothing anywhere saying
+    /// why.
+    ///
+    /// So the version is readable rather than assumed. `agentplane serve`
+    /// prints it beside each wired server, because the declarative tier has no
+    /// Rust in which to ask, and an operator who cannot see what was negotiated
+    /// cannot know which half of the protocol their server declined.
+    #[must_use]
+    pub fn negotiated_version(&self) -> Option<String> {
+        self.service
+            .peer_info()
+            .map(|info| info.protocol_version.as_str().to_owned())
+    }
+
     /// Grant exact prompt names and resource URIs this host may retrieve.
     #[must_use]
     pub fn with_access(mut self, access: McpAccess) -> Self {

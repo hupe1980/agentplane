@@ -132,6 +132,9 @@ pub(crate) struct Frame {
     pub timers: Option<Arc<dyn TimerStore>>,
     pub blobs: Option<Arc<dyn crate::blob::BlobStore>>,
     pub memories: Option<Arc<dyn crate::memory::MemoryStore>>,
+    /// The plane's embedder and index, paired because a query vector is only
+    /// meaningful against the index it was built for.
+    pub semantic: Option<Arc<super::SemanticMemory>>,
     pub authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
     /// The plane's checked catalogue and transport, for [`StepCtx::call_tool`].
     #[cfg(feature = "manifest")]
@@ -203,6 +206,7 @@ pub struct StepCtx<'a> {
     timers: Option<Arc<dyn TimerStore>>,
     blobs: Option<Arc<dyn crate::blob::BlobStore>>,
     memories: Option<Arc<dyn crate::memory::MemoryStore>>,
+    semantic: Option<Arc<super::SemanticMemory>>,
     authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
     #[cfg(feature = "manifest")]
     tools: Option<(
@@ -272,6 +276,7 @@ impl<'a> StepCtx<'a> {
             timers,
             blobs,
             memories,
+            semantic,
             authorities,
             #[cfg(feature = "manifest")]
             tools,
@@ -303,6 +308,7 @@ impl<'a> StepCtx<'a> {
             timers,
             blobs,
             memories,
+            semantic,
             authorities,
             #[cfg(feature = "manifest")]
             tools,
@@ -3207,16 +3213,18 @@ impl StepCtx<'_> {
         Ok(out)
     }
 
-    /// Turn text into a vector, on the record.
+    /// Turn text into a vector, on the record, through the plane's embedder.
     ///
-    /// The vector this returns is what [`SemanticQuery::embedding`] wants, and
-    /// going through here rather than calling an embedding client directly is
+    /// Going through here rather than calling an embedding client directly is
     /// what makes semantic retrieval replayable at all: the query vector is in
     /// the retrieval effect's key, and an embedding service is under no
     /// obligation to return the same floats twice. Journaled, so a strict replay
     /// reads the vector back instead of asking again — and so the call is
-    /// metered and the model revision that produced it is on the record beside
-    /// the numbers.
+    /// metered and the revision that produced it is on the record beside the
+    /// numbers.
+    ///
+    /// The embedder is the one [`RuntimeBuilder::semantic_memory`] wired, which
+    /// is what makes [`Embedding::revision`] a fact rather than a claim.
     ///
     /// The text carries its own label, and the returned vector carries it too: a
     /// vector derived from an untrusted document is untrusted, and sending
@@ -3227,25 +3235,23 @@ impl StepCtx<'_> {
     /// it has to admit for the call to be useful at all: a query worth embedding
     /// has almost always crossed a trust boundary — a user's question, a model's
     /// paraphrase, a recalled memory — and anything that has is already
-    /// [`Internal`]. This is the same ceiling
-    /// [`SemanticQuery::max_sensitivity`] carries for the *retriever*, asked
-    /// separately because they are two providers and a deployment may well
-    /// trust one and not the other.
+    /// [`Internal`].
     ///
     /// [`Internal`]: crate::core::Sensitivity::Internal
-    /// [`SemanticQuery::embedding`]: crate::memory::SemanticQuery::embedding
-    /// [`SemanticQuery::max_sensitivity`]: crate::memory::SemanticQuery::max_sensitivity
+    /// [`Embedding::revision`]: crate::memory::Embedding::revision
+    /// [`RuntimeBuilder::semantic_memory`]: crate::runtime::RuntimeBuilder::semantic_memory
     ///
     /// # Errors
     ///
-    /// Whatever the effect protocol reports — a refused sink, an exhausted
-    /// budget, or the embedder's own failure.
+    /// [`StepError`] if this plane wired no semantic memory, or whatever the
+    /// effect protocol reports — a refused sink, an exhausted budget, or the
+    /// embedder's own failure.
     pub async fn embed(
         &mut self,
-        embedder: Arc<dyn crate::memory::Embedder>,
         text: Tainted<String>,
         max_sensitivity: crate::core::Sensitivity,
-    ) -> Result<Tainted<Vec<f32>>, StepError> {
+    ) -> Result<Tainted<crate::memory::Embedding>, StepError> {
+        let embedder = Arc::clone(&self.semantic_index()?.embedder);
         let plain = text.peek().clone();
         let arguments = text.map(serde_json::Value::String);
         self.sink_with(&arguments, |value| crate::runtime::effects::Embed {
@@ -3257,16 +3263,53 @@ impl StepCtx<'_> {
         .await
     }
 
-    /// Rank governed memories through a derived semantic index.
+    fn semantic_index(&self) -> Result<&Arc<crate::runtime::SemanticMemory>, StepError> {
+        self.semantic.as_ref().ok_or_else(|| {
+            StepError::Store(crate::core::StoreError::Backend(
+                "this plane wired no semantic memory; \
+                 `Runtime::builder(..).semantic_memory(embedder, retriever)` is what \
+                 gives an agent an index to search"
+                    .to_owned(),
+            ))
+        })
+    }
+
+    /// Rank governed memories by meaning, through the plane's semantic index.
     ///
+    /// Two journaled effects: the text is embedded, then the vector is ranked.
     /// The retriever returns only immutable `(id, version, digest)` commitments
-    /// and scores. The selection is journaled; live execution and replay then
-    /// materialize exact versions from the authoritative memory store and
-    /// verify scope and digest before exposing content.
+    /// and scores — live execution and replay both materialise those exact
+    /// versions from the authoritative [`MemoryStore`] and re-check scope and
+    /// digest before any content is exposed, so an index that has drifted from
+    /// durable truth is a refusal rather than a plausible answer.
+    ///
+    /// The [`SemanticSearch`] states the question; the space it is asked in
+    /// comes from the wired embedder and index, which `build` already held to
+    /// each other ([`IndexIdentity`]).
+    ///
+    /// # The selected set is untrusted-influenced, whatever the items say
+    ///
+    /// Similarity is computed over item content, so anything able to write a
+    /// memory is a ranking signal: an attacker who cannot taint a value can
+    /// still choose *which* clean values a model is shown, and no label shows
+    /// it. Every item still arrives labelled from its own provenance — but a
+    /// caller needing a selection nobody can steer wants
+    /// [`recall`](Self::recall), whose order is a fixed rule no stored item can
+    /// move.
+    ///
+    /// [`MemoryStore`]: crate::memory::MemoryStore
+    /// [`SemanticSearch`]: crate::memory::SemanticSearch
+    /// [`IndexIdentity`]: crate::memory::IndexIdentity
+    ///
+    /// # Errors
+    ///
+    /// [`StepError`] if this plane wired no semantic memory or no memory store,
+    /// if either effect fails, or if the index returned a commitment the
+    /// authoritative store cannot honour.
     pub async fn semantic_recall(
         &mut self,
-        retriever: Arc<dyn crate::memory::SemanticRetriever>,
-        query: Tainted<crate::memory::SemanticQuery>,
+        search: crate::memory::SemanticSearch,
+        text: Tainted<String>,
     ) -> Result<Vec<(Tainted<crate::memory::MemoryItem>, f32)>, StepError> {
         let memories = self.memories.clone().ok_or_else(|| {
             StepError::Store(crate::core::StoreError::Backend(
@@ -3274,11 +3317,28 @@ impl StepCtx<'_> {
                     .to_owned(),
             ))
         })?;
-        let plain = query.peek().clone();
-        let searched = plain.clone();
-        let arguments = query.map(|query| {
-            serde_json::to_value(query).expect("SemanticQuery serialization is infallible")
-        });
+        let retriever = Arc::clone(&self.semantic_index()?.retriever);
+        let written = text.peek().clone();
+        let label = text.label().clone();
+        let embedding = self.embed(text, search.max_sensitivity).await?;
+        let label = label.join(embedding.label());
+        let query = crate::memory::SemanticQuery {
+            subject: search.subject.clone(),
+            purpose: search.purpose.clone(),
+            text: written,
+            index: crate::memory::IndexIdentity {
+                snapshot: retriever.index().snapshot,
+                query_revision: embedding.peek().revision.clone(),
+            },
+            embedding: embedding.into_unlabelled().vector,
+            limit: search.limit,
+            max_sensitivity: search.max_sensitivity,
+        };
+        let searched = query.clone();
+        let arguments = Tainted::with_label(
+            serde_json::to_value(&query).expect("SemanticQuery serialization is infallible"),
+            label,
+        );
         let hits = self
             .sink_with(&arguments, |value| {
                 crate::runtime::effects::SemanticRecall {
@@ -3289,6 +3349,16 @@ impl StepCtx<'_> {
             })
             .await?
             .into_unlabelled();
+        // Refused rather than truncated: every hit costs an authoritative store
+        // read here, and truncating would leave the selection's membership
+        // decided by the seam's iteration order.
+        if hits.len() > query.limit {
+            return Err(StepError::Store(crate::core::StoreError::Backend(format!(
+                "semantic retriever returned {} hits for a limit of {}",
+                hits.len(),
+                query.limit
+            ))));
+        }
         let mut out = Vec::with_capacity(hits.len());
         for hit in hits {
             if !hit.score.is_finite() {
@@ -3310,8 +3380,8 @@ impl StepCtx<'_> {
                     ))
                 })?;
             if item.selection_digest() != hit.selected.digest
-                || item.subject != plain.subject
-                || plain
+                || item.subject != query.subject
+                || query
                     .purpose
                     .as_ref()
                     .is_some_and(|purpose| purpose != &item.purpose)

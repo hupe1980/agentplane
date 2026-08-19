@@ -26,4 +26,18 @@ pub use executor::{
     RuntimeBuilder, SEALED_OUTCOMES,
 };
 pub use group::{EffectGroup, Invariant};
+
+/// The embedder and the index it embeds for, wired as one thing.
+///
+/// They are one field rather than two because neither is usable without the
+/// other and the *pair* is what carries the invariant: a query vector means
+/// something only against an index built in the same space, and a plane that
+/// held them separately could be wired with two that disagree. `build` refuses
+/// that pairing — see [`RuntimeBuilder::semantic_memory`] — so by the time a
+/// run can reach this, the check has already happened.
+#[derive(Debug)]
+pub struct SemanticMemory {
+    pub(crate) embedder: std::sync::Arc<dyn crate::memory::Embedder>,
+    pub(crate) retriever: std::sync::Arc<dyn crate::memory::SemanticRetriever>,
+}
 pub use sweeper::{Saturation, SweepReport, WokenRuns};

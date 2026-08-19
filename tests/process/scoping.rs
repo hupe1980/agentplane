@@ -49,12 +49,13 @@ spec:
       properties:
         deadline_status: {{ type: string }}
         days_left: {{ type: number }}
-  memory_formation:
-    subject: "{subject}"
-    purpose: clearing
-    instruction: Extract stable facts only.
-    max_items: 2
-    max_sensitivity: internal
+  memory:
+    formation:
+      subject: "{subject}"
+      purpose: clearing
+      instruction: Extract stable facts only.
+      max_items: 2
+      max_sensitivity: internal
   budgets: {{}}
 {extra}
 "#
@@ -166,12 +167,13 @@ spec:
     quarantined: { provider: fake, model: q-1, max_tokens: 77 }
   execution: { kind: completion }
   security: { max_sensitivity_egress: internal }
-  memory_formation:
-    subject: "clearing-desk"
-    purpose: clearing
-    instruction: Extract stable facts only.
-    max_items: 2
-    max_sensitivity: internal
+  memory:
+    formation:
+      subject: "clearing-desk"
+      purpose: clearing
+      instruction: Extract stable facts only.
+      max_items: 2
+      max_sensitivity: internal
   budgets: {}
 "#,
     )

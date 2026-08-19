@@ -111,11 +111,12 @@ pub mod code {
     ///
     /// Not in A2A 1.0's error table — the spec defines only permanent
     /// missing-capability codes in `-32001..-32009` and offers no transient or
-    /// back-pressure signal at all. This server previously answered a full
-    /// quota with `-32004 UnsupportedOperationError`, which taught a compliant
-    /// caller that the *operation does not exist here* — the correct response
-    /// to which is to abandon, never to retry — when the truthful answer is
-    /// "not right now". So the code is drawn from JSON-RPC's server-defined
+    /// back-pressure signal at all. Reaching into the table anyway would be
+    /// worse than inventing a code: `-32004 UnsupportedOperationError` for a
+    /// full quota teaches a compliant caller that the *operation does not exist
+    /// here* — the correct response to which is to abandon, never to retry —
+    /// when the truthful answer is "not right now". So the code is drawn from
+    /// JSON-RPC's server-defined
     /// range (`-32000..-32099`), outside the spec's table so no compliant
     /// client can mistake it for a defined permanent condition, and shared
     /// with no other refusal this server emits so it stays unambiguous.
@@ -2292,21 +2293,10 @@ async fn load_task(
         .read(id, 1)
         .await
         .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the journal could not be read"))?;
-    let Some(last) = records.last() else {
-        return Err(RpcError::new(
-            code::TASK_NOT_FOUND,
-            format!("no such task: {id}"),
-        ));
-    };
-
-    // Read from the **last** record, not from whether a suspension appears
-    // anywhere: a run that waited, was resumed and carried on has a suspension
-    // in its history and is not suspended now.
-    let (state, detail) = match last.kind() {
-        RecordKind::RunSuspended { reason } => (TaskState::InputRequired, reason.to_string()),
-        RecordKind::RunSealed { outcome, .. } => (sealed_state(outcome), outcome.clone()),
-        _ => (TaskState::Working, "running".to_owned()),
-    };
+    // No records is no such task: a run this plane never admitted and a task id
+    // a caller invented are the same fact from here.
+    let (state, detail) = state_from_history(&records)
+        .ok_or_else(|| RpcError::new(code::TASK_NOT_FOUND, format!("no such task: {id}")))?;
     let case = records
         .iter()
         .find_map(|r| r.body.case.map(|c| c.to_string()));
@@ -2592,14 +2582,11 @@ fn task_from_records(
     updated: u64,
     history_length: Option<usize>,
 ) -> A2aTask {
-    let (state, detail) = records.last().map_or(
-        (TaskState::Working, "unknown".to_owned()),
-        |record| match record.kind() {
-            RecordKind::RunSuspended { reason } => (TaskState::InputRequired, reason.to_string()),
-            RecordKind::RunSealed { outcome, .. } => (sealed_state(outcome), outcome.clone()),
-            _ => (TaskState::Working, "running".to_owned()),
-        },
-    );
+    // A run with no records is one whose first append has not landed. It is
+    // reported as working rather than refused, because this builds a row in a
+    // listing where a single unreadable run must not fail the page.
+    let (state, detail) =
+        state_from_history(records).unwrap_or((TaskState::Working, "running".to_owned()));
     let case = records
         .iter()
         .find_map(|record| record.body.case.map(|case| case.to_string()));
@@ -2724,6 +2711,32 @@ pub(super) fn sealed_state(outcome: &str) -> TaskState {
         "suspended" => TaskState::InputRequired,
         _ => TaskState::Failed,
     }
+}
+
+/// The A2A state of a run, read from the last record of its history.
+///
+/// Every surface that reports a task's state answers here: `tasks/get`,
+/// `tasks/list`, and the event stream a client subscribes to. They are three
+/// views of one fact, and three copies of this match would agree until somebody
+/// added a record kind or reworded a suspension — after which a client polling
+/// and the same client streaming would be told different things about the same
+/// run, which is worse than either answer being wrong.
+///
+/// **The last record, not any record.** A run that waited, was resumed and
+/// carried on has a suspension in its history and is not suspended now.
+///
+/// An empty history has no state to report and is not this function's to
+/// invent: the caller decides whether that is a task that does not exist or one
+/// whose first record has not landed yet, and those get different answers.
+pub(super) fn state_from_history(
+    records: &[crate::journal::Record],
+) -> Option<(TaskState, String)> {
+    let last = records.last()?;
+    Some(match last.kind() {
+        RecordKind::RunSuspended { reason } => (TaskState::InputRequired, reason.to_string()),
+        RecordKind::RunSealed { outcome, .. } => (sealed_state(outcome), outcome.clone()),
+        _ => (TaskState::Working, "running".to_owned()),
+    })
 }
 
 async fn cancel_task(

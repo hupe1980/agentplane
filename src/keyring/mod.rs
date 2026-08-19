@@ -27,14 +27,48 @@
 //! This is the standard answer to the immutable-log-versus-erasure problem, and
 //! it is the only one that survives contact with a backup regime.
 //!
-//! Three operations fall out of the same structure, which is the argument for it:
+//! Two operations fall out of the same structure, which is the argument for it:
 //!
-//! * **Erasure** — destroy a data key. Its scope's bytes are gone, everywhere.
-//! * **Rotation** — re-wrap data keys under a new wrapping key. Bulk data is
-//!   never rewritten, so rotating is cheap enough to actually do on a schedule
-//!   rather than a plan.
-//! * **Revocation** — destroy a wrapping key. Everything wrapped under it is
-//!   unreadable, which is the blast radius a compromised key should have.
+//! * **Erasure** — destroy a scope's wrapping key. Every payload ever sealed
+//!   under that scope is unreadable, everywhere, including the copies nobody
+//!   can reach.
+//! * **Revocation** — the same act for a different reason. The blast radius a
+//!   compromised key should have is exactly the scope it wrapped.
+//!
+//! # Sealed bytes are rotation-immutable
+//!
+//! A third operation is conspicuously absent, and its absence is a decision
+//! rather than unfinished work. Envelope encryption's usual selling point is
+//! that a wrapping key rotates by *re-wrapping* data keys, leaving bulk data
+//! alone. That operation cannot exist here, and offering it would be a control
+//! that quietly does nothing:
+//!
+//! An envelope carries its wrapped data key **inline**, and the journal's hash
+//! chain commits to the envelope bytes — which is what lets an auditor holding
+//! no keys verify a run whose payloads have been erased. Re-wrapping a journal
+//! payload therefore rewrites a record the chain covers, so it breaks the chain
+//! it sits inside. Nor could re-wrapping the *other* stores buy the operational
+//! thing rotation is wanted for: an erasure scope's journal payloads and its
+//! case state share one wrapping key, so a scope stays pinned to the oldest
+//! version any of its journal envelopes names, and no amount of re-wrapping
+//! case rows moves that floor.
+//!
+//! So the rule is the other half of the choice, stated rather than discovered:
+//! **sealed payload bytes never change, and the erasure scope is the rotation
+//! unit.** A scope is already narrow — one case, one run, one memory subject —
+//! so a compromised wrapping key exposes that unit and nothing else, which is
+//! the blast radius rotation is bought for. Adding a key version is safe and
+//! needs nothing from this crate: envelopes sealed before a rotation keep
+//! opening, which is what AWS KMS does by construction — it retains every prior
+//! version of a key's material in perpetuity, resolves the right one from the
+//! ciphertext, and lets you delete only the whole key, which is erasure.
+//!
+//! *Retiring* a version is the exposure, and only some services offer it.
+//! Vault's transit engine does: `min_decryption_version` refuses ciphertext
+//! below a floor, so raising that floor past a live envelope makes un-erased
+//! history unreadable — an erasure nobody requested and no retention record
+//! explains. That is why [`KeyError::Retired`] exists as its own answer; see
+//! its documentation for why it must not be reported as loss.
 //!
 //! # What is deliberately absent
 //!
@@ -93,7 +127,12 @@ pub struct WrappedKey {
     /// What this key protects: a case, a tenant, whatever the deployment erases
     /// as a unit. Erasure destroys a scope, so the scope *is* the erasure unit.
     pub scope: String,
-    /// Which wrapping key sealed it. Rotation changes this and nothing else.
+    /// Which wrapping key, at which version, sealed it.
+    ///
+    /// Written once and never rewritten: sealed bytes are rotation-immutable,
+    /// so this is the version the key service must still admit for as long as
+    /// this envelope is retained. It is what [`KeyError::Retired`] names when
+    /// that stops being true.
     pub wrapped_by: KeyId,
     /// The sealed data key.
     pub sealed: Vec<u8>,
@@ -118,6 +157,61 @@ pub enum KeyError {
         at: Timestamp,
         reason: String,
     },
+
+    /// The wrapping key still exists, but this envelope names a version the
+    /// key service has been told to stop decrypting.
+    ///
+    /// A third answer, because the two that already existed are both wrong for
+    /// it and wrong in opposite directions. It is not [`Destroyed`]: nobody
+    /// requested an erasure, no retention record explains it, and the bytes
+    /// come back the moment the floor is lowered. It is not [`Refused`] either
+    /// — reported that way it reaches an operator as *this data neither opens
+    /// nor was erased*, which is the signature of loss or tampering, and sends
+    /// somebody to hunt a fault that does not exist while the real remedy is a
+    /// one-line configuration change.
+    ///
+    /// It is reachable only by operator action, and only in one direction:
+    /// sealed bytes are rotation-immutable (see the module documentation), so
+    /// an envelope names its wrapping-key version for as long as it exists, and
+    /// raising a version floor past it is an erasure that no erasure record
+    /// accounts for.
+    ///
+    /// [`Destroyed`]: Self::Destroyed
+    /// [`Refused`]: Self::Refused
+    #[error(
+        "the wrapping key version '{key_id}' for scope '{scope}' has been retired by policy — \
+         this is not an erasure and not a loss: the sealed bytes are intact and become readable \
+         again if the key service's minimum decryption version is lowered to admit '{key_id}'"
+    )]
+    Retired { scope: String, key_id: KeyId },
+
+    /// The bytes are a sealed envelope written to a construction this build
+    /// does not read.
+    ///
+    /// A fourth answer for the same reason [`Retired`] is a third: the two
+    /// obvious classifications are both wrong. It is not [`Destroyed`] —
+    /// nothing was erased and the wrapping key is untouched. It is not
+    /// [`Refused`] either, and this is the direction that matters: without a
+    /// version in the header a reader walks its own layout over somebody
+    /// else's and reaches the AEAD, which reports *this payload did not
+    /// authenticate* — the signature of tampering, for a build skew whose
+    /// remedy is deploying a build that reads version `version`.
+    ///
+    /// Sealed bytes are rotation-immutable (see the module documentation), so
+    /// an envelope outlives the build that wrote it by design. A mixed-version
+    /// fleet, a rollback, or a restore from a backup taken by a newer plane
+    /// all produce this, and all of them are ordinary operations rather than
+    /// incidents.
+    ///
+    /// [`Destroyed`]: Self::Destroyed
+    /// [`Refused`]: Self::Refused
+    /// [`Retired`]: Self::Retired
+    #[error(
+        "this sealed envelope is format version {version} and this build reads {supported} — \
+         the bytes are intact and not erased; they open under a build that reads version \
+         {version}"
+    )]
+    UnknownFormat { version: u8, supported: u8 },
 
     /// The key ring could not be reached. May succeed later.
     #[error("the key ring is unavailable: {0}")]
@@ -168,7 +262,11 @@ pub trait KeyRing: Send + Sync + Debug {
     ///
     /// # Errors
     ///
-    /// [`KeyError::Destroyed`] once the scope has been erased.
+    /// [`KeyError::Destroyed`] once the scope has been erased, and
+    /// [`KeyError::Retired`] when the scope is alive but the key service has
+    /// been configured to stop decrypting the version this envelope names. An
+    /// implementation that collapses the second into [`KeyError::Refused`]
+    /// leaves an operator reading a configuration change as data loss.
     async fn open(&self, wrapped: &WrappedKey) -> Result<DataKey, KeyError>;
 
     /// Destroy a scope's data key. This is the erasure.
@@ -181,17 +279,6 @@ pub trait KeyRing: Send + Sync + Debug {
     ///
     /// If the key ring cannot be reached.
     async fn destroy(&self, scope: &str, at: Timestamp, reason: &str) -> Result<(), KeyError>;
-
-    /// Re-wrap a data key under the current wrapping key.
-    ///
-    /// Rotation touches only the wrapped form — bulk data is never re-encrypted,
-    /// which is what makes rotating cheap enough to do on a schedule instead of
-    /// in a plan nobody executes.
-    ///
-    /// # Errors
-    ///
-    /// [`KeyError::Destroyed`] if the scope has been erased.
-    async fn rewrap(&self, wrapped: &WrappedKey) -> Result<WrappedKey, KeyError>;
 }
 
 /// The erasure scope for a unit within a tenant.
@@ -237,6 +324,21 @@ pub(crate) fn assert_serves(store: &str, tenant: &crate::core::TenantId, kind: &
 }
 
 mod envelope;
+
+/// The sealed-envelope construction this build writes, and the only one it
+/// reads.
+///
+/// Public for the reason [`canon::VERSION`](crate::core::canon::VERSION) and
+/// [`export::FORMAT_VERSION`](crate::export::FORMAT_VERSION) are: an operator
+/// planning a restore, or diagnosing a
+/// [`KeyError::UnknownFormat`], needs to name what this build speaks without
+/// reading the source.
+///
+/// It stays `1` until the durable-format freeze. A number counting the
+/// pre-release cuts would advertise that older envelopes are readable, and the
+/// whole point of a hard cut is that they are not — here more sharply than
+/// elsewhere, because sealed bytes cannot be rewritten into the new shape.
+pub const ENVELOPE_FORMAT_VERSION: u8 = envelope::FORMAT_VERSION;
 
 mod cases;
 pub use cases::{SealedCases, probe_sealed_case_state};

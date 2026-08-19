@@ -13,14 +13,32 @@
 //! grant. Verification below raises the bar on *who answered*; it deliberately
 //! does not turn the card into a permission.
 //!
-//! # Fetching a URL is an egress decision
+//! # Fetching a card is a dereference, and gets what every dereference here gets
 //!
-//! Discovery dereferences a URL, so it is subject to the same rule as every
-//! other outbound fetch in this crate: an [`Egress`](crate::core::Egress) may be
-//! set, and once set it is deny-by-default. A card URL is frequently the first
-//! attacker-influenced string a deployment handles — it arrives in a config, a
-//! registry entry, or a message — and "just fetch it" is how a plane is made to
-//! probe its own network.
+//! A card URL is frequently the first attacker-influenced string a deployment
+//! handles — it arrives in a config, a registry entry, or a message — and "just
+//! fetch it" is how a plane is made to probe its own network. So discovery is
+//! held to the same four controls as governed media and push delivery, which
+//! are the crate's other two URL dereferences:
+//!
+//! * an [`Egress`](crate::core::Egress) host allowlist, deny-by-default once
+//!   set;
+//! * every resolved address checked against [`netguard`](crate::netguard), with
+//!   the connection **pinned** to exactly those addresses — resolving twice is
+//!   how a rebinding attack passes a check and then connects somewhere else;
+//! * **no redirects**, because a check on the URL a caller supplied says
+//!   nothing about the third host an allowed one forwards to;
+//! * a whole-request timeout, so a card server that never finishes answering
+//!   does not hold a task open.
+//!
+//! The allowlist is optional and the other three are not. That asymmetry is
+//! deliberate: an allowlist is a deployment's statement about who it talks to
+//! and cannot be guessed on its behalf, while a plane fetching its own metadata
+//! service is wrong in every deployment. `netguard` documents itself as the
+//! *second* lock rather than the first, so a deployment discovering cards from
+//! the open internet should still set an allowlist — but with none set, the
+//! address rule is what stands between a hostile card URL and the internal
+//! network, and it stands unconditionally.
 
 use std::sync::Arc;
 
@@ -56,16 +74,87 @@ pub enum DiscoveryError {
 }
 
 /// Fetches and checks the cards other agents publish.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CardClient {
     egress: Option<Egress>,
     verifier: Option<Arc<dyn CardVerifier>>,
+    timeout: std::time::Duration,
+    /// Lift the public-address check for a card served from this machine.
+    /// `testkit` only, and absent from any other build.
+    #[cfg(feature = "testkit")]
+    loopback: bool,
+}
+
+impl Default for CardClient {
+    fn default() -> Self {
+        Self {
+            egress: None,
+            verifier: None,
+            timeout: Self::DEFAULT_TIMEOUT,
+            #[cfg(feature = "testkit")]
+            loopback: false,
+        }
+    }
 }
 
 impl CardClient {
+    /// How long a card fetch may take in total.
+    ///
+    /// Ten seconds: a card is a small static document, and a server that cannot
+    /// produce one in that time is not one worth waiting on. Unbounded is the
+    /// wrong default anywhere, and here it lets an unknown host hold a task
+    /// open for as long as it likes.
+    pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Permit a card served from this machine.
+    ///
+    /// Behind `testkit` and therefore **absent from a production build**, which
+    /// is the property that matters: an exception that can only be compiled
+    /// into a test binary cannot be left on by accident in a deployment.
+    ///
+    /// It applies to a host that *is* a loopback literal or `localhost` — never
+    /// to one that merely resolved to one, which is the rebinding attack and
+    /// stays refused with the flag set. See
+    /// [`netguard::is_loopback_name`](crate::netguard::is_loopback_name).
+    #[cfg(feature = "testkit")]
+    #[must_use]
+    pub const fn allow_loopback(mut self) -> Self {
+        self.loopback = true;
+        self
+    }
+
+    /// Whether the loopback exception is in force. Always false without
+    /// `testkit`, which is what lets the fetch path read one flag.
+    #[allow(clippy::unused_self)]
+    const fn loopback_allowed(&self) -> bool {
+        #[cfg(feature = "testkit")]
+        {
+            self.loopback
+        }
+        #[cfg(not(feature = "testkit"))]
+        {
+            false
+        }
+    }
+
+    /// Change the whole-request timeout.
+    ///
+    /// # Panics
+    ///
+    /// If zero, which would spell *never fetch a card* as if it were a policy.
+    #[must_use]
+    pub const fn timeout(mut self, timeout: std::time::Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "a card-fetch timeout of zero refuses every card; configure no discovery instead"
+        );
+        self.timeout = timeout;
+        self
     }
 
     /// Restrict where cards may be fetched from.
@@ -111,23 +200,78 @@ impl CardClient {
     ///
     /// As [`discover`](Self::discover).
     pub async fn fetch(&self, url: &str) -> Result<AgentCard, DiscoveryError> {
+        let parsed = reqwest::Url::parse(url).map_err(|e| DiscoveryError::Malformed {
+            url: url.to_owned(),
+            detail: e.to_string(),
+        })?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| DiscoveryError::Malformed {
+                url: url.to_owned(),
+                detail: "the card URL names no host".to_owned(),
+            })?
+            .to_owned();
+
         if let Some(egress) = &self.egress {
             // Before the request is built, so a refused host is never resolved
             // and never connected to — a refusal issued after a DNS lookup has
             // already told somebody the name was interesting.
             //
-            // The host is extracted here and matched by `Egress` on the host
-            // alone: that type never parses URLs, because URL parsing is where
-            // allowlists break.
-            let host = reqwest::Url::parse(url)
-                .ok()
-                .and_then(|u| u.host_str().map(ToOwned::to_owned));
-            if let Err(e) = egress.permits(host.as_deref()) {
+            // Matched by `Egress` on the host alone: that type never parses
+            // URLs, because URL parsing is where allowlists break.
+            if let Err(e) = egress.permits(Some(host.as_str())) {
                 return Err(DiscoveryError::Refused(e.to_string()));
             }
         }
 
-        let response = reqwest::Client::new()
+        // `Url::host_str` keeps the brackets on an IPv6 literal and the
+        // resolver refuses them. Only the lookup uses the bare form; the
+        // refusal messages keep the spelling the URL carries.
+        let lookup = host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(&host)
+            .to_owned();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let resolved = tokio::net::lookup_host((lookup.as_str(), port))
+            .await
+            .map_err(|e| DiscoveryError::Unreachable(format!("DNS for '{host}': {e}")))?;
+        // Every answer checked, and the connection pinned to exactly those
+        // addresses. Without the pin the client resolves again and may be
+        // handed a different answer than the one that passed — which is the
+        // rebinding attack this check would otherwise only appear to stop.
+        let addrs = if self.loopback_allowed() && crate::netguard::is_loopback_name(&host) {
+            // Named rather than inferred: the exception covers a host that *is*
+            // loopback, not one that resolved there.
+            let addrs: Vec<_> = resolved.collect();
+            if addrs.is_empty() {
+                return Err(DiscoveryError::Unreachable(format!(
+                    "DNS for '{host}' returned no addresses"
+                )));
+            }
+            addrs
+        } else {
+            crate::netguard::all_public(&host, resolved)
+                .map_err(|e| DiscoveryError::Refused(e.to_string()))?
+        };
+
+        let mut client = reqwest::Client::builder()
+            .timeout(self.timeout)
+            // No ambient authority, and no redirects: a card is somebody else's
+            // document, and a proxy, a cookie jar or a stored credential would
+            // attach this plane's identity to a request it did not authorize.
+            // Following a redirect would hand the whole check above to whatever
+            // host an allowed one names next.
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+        for addr in &addrs {
+            client = client.resolve(&host, *addr);
+        }
+        let client = client
+            .build()
+            .map_err(|e| DiscoveryError::Unreachable(e.to_string()))?;
+
+        let response = client
             .get(url)
             .header("Accept", "application/json")
             .send()

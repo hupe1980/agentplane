@@ -162,19 +162,19 @@ async fn a_second_erasure_does_not_rewrite_the_first() {
     );
 }
 
-/// Rotation does not rewrite data, and does not lock anyone out.
+/// Rotation adds a key version; it never invalidates one.
 ///
-/// Bulk data is never re-encrypted — that is what makes rotating cheap enough to
-/// do on a schedule rather than in a plan nobody executes. Payloads sealed
-/// before the rotation must stay readable, or a rotation is an outage; payloads
-/// sealed after it must be stamped with the new key, or nothing rotated.
+/// This is the property the whole rotation story rests on, now that sealed
+/// bytes are rotation-immutable. A wrapping key may gain versions freely —
+/// nothing this crate wrote has to move, and nothing already sealed may stop
+/// opening. If either half failed, rotation would be an outage and no operator
+/// would run one.
 #[tokio::test]
-async fn rotation_rewraps_without_touching_the_payload() {
+async fn rotation_adds_a_version_without_disturbing_sealed_bytes() {
     let (disk, ring, store) = sealed("case-5");
     let digest = store.put(SECRET).await.expect("seal");
     let ciphertext_before = disk.get_raw(digest).await.expect("raw");
     let id_before = ring.current_key_id();
-    // Minted *before* the rotation, so rewrapping it has somewhere to move to.
     let (_dek, old) = ring.data_key("case-5").await.expect("mint");
     assert_eq!(old.wrapped_by, id_before);
 
@@ -188,8 +188,9 @@ async fn rotation_rewraps_without_touching_the_payload() {
     assert_eq!(
         ciphertext_before,
         disk.get_raw(digest).await.expect("raw"),
-        "rotation rewrote the bulk data — the point of envelope encryption is \
-         that it does not have to"
+        "rotation rewrote the bulk data — sealed bytes are rotation-immutable, \
+         and a rotation that touched them would break the journal chain that \
+         commits to them"
     );
     assert_eq!(
         store.get(digest).await.expect("open after rotation"),
@@ -198,28 +199,68 @@ async fn rotation_rewraps_without_touching_the_payload() {
          outage rather than a key rotation"
     );
 
-    // A key wrapped under the old generation is re-wrappable under the new one
-    // without the plaintext ever leaving the ring.
-    let fresh = ring.rewrap(&old).await.expect("rewrap");
+    // The half that keeps the assertions above from passing vacuously: the new
+    // generation must be a genuinely different key, or "still opens after
+    // rotation" is true because no rotation happened.
+    let (_dek, fresh) = ring.data_key("case-5").await.expect("mint after rotation");
     assert_ne!(
         old.wrapped_by, fresh.wrapped_by,
-        "rewrapping did not move the key to the current generation"
-    );
-    assert_eq!(fresh.scope, old.scope, "rewrapping moved the erasure unit");
-    // The half that makes this test non-vacuous: the ring once rotated only
-    // the *label*, so `sealed` came back byte-identical and everything above
-    // passed with no rotation having happened. The new generation must be a
-    // different key, so the re-sealed bytes must differ while the material
-    // inside stays the same.
-    assert_ne!(
-        old.sealed, fresh.sealed,
-        "rewrapping produced identical sealed bytes, so the generations share \
-         one KEK and nothing rotated"
+        "a wrap minted after the rotation names the old version, so the ring \
+         rotated a label rather than a key"
     );
     assert_eq!(
-        ring.open(&fresh).await.expect("open rewrapped").expose(),
-        ring.open(&old).await.expect("open old").expose(),
-        "the rewrapped key opens to different material than the original"
+        ring.open(&old).await.expect("open the old wrap").expose(),
+        ring.open(&old).await.expect("open the old wrap").expose(),
+        "the pre-rotation wrap stopped resolving to its own key version"
+    );
+}
+
+/// A retired key version is not loss, and must not be reported as loss.
+///
+/// A key service that refuses to decrypt below a version floor makes un-erased
+/// history unreadable. That is an operator's reversible configuration, and the
+/// two neighbouring classifications are both actively harmful for it:
+/// `Destroyed` would claim an erasure nobody performed and no retention record
+/// explains, and `Refused` reaches a drill as *neither opens nor was erased* —
+/// the signature of loss or tampering — sending somebody to hunt a fault that
+/// does not exist while the remedy is one setting.
+#[tokio::test]
+async fn a_retired_key_version_is_distinguished_from_erasure_and_from_loss() {
+    let ring = MemoryKeyRing::new();
+    let (dek, wrapped) = ring.data_key("case-9").await.expect("mint");
+    ring.rotate();
+    ring.retire_below(1);
+
+    match ring.open(&wrapped).await {
+        Err(KeyError::Retired { scope, key_id }) => {
+            assert_eq!(scope, "case-9");
+            assert_eq!(
+                key_id, wrapped.wrapped_by,
+                "the error names a different key version than the wrap does, so \
+                 an operator cannot tell which floor to lower"
+            );
+        }
+        Err(KeyError::Destroyed { .. }) => panic!(
+            "a retired version was reported as a completed erasure — the data is \
+             intact and comes back when the floor is lowered, but the operator \
+             has been told it is gone forever"
+        ),
+        other => panic!(
+            "a retired version must be its own answer, not {other:?}: reported as \
+             a bare refusal it reaches a drill as loss or tampering"
+        ),
+    }
+
+    // Reversible, which is exactly what distinguishes it from erasure.
+    ring.retire_below(0);
+    assert_eq!(
+        ring.open(&wrapped)
+            .await
+            .expect("open once readmitted")
+            .expose(),
+        dek.expose(),
+        "lowering the floor did not make the payload readable again, so the \
+         refusal was not really a version floor"
     );
 }
 
@@ -325,12 +366,6 @@ async fn a_key_ring_outage_is_not_reported_as_an_erasure() {
             _at: agentplane::core::Timestamp,
             _reason: &str,
         ) -> Result<(), KeyError> {
-            Err(KeyError::Unavailable("the KMS did not answer".into()))
-        }
-        async fn rewrap(
-            &self,
-            _w: &agentplane::keyring::WrappedKey,
-        ) -> Result<agentplane::keyring::WrappedKey, KeyError> {
             Err(KeyError::Unavailable("the KMS did not answer".into()))
         }
     }

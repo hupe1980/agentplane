@@ -107,7 +107,9 @@ fn chain() -> Delegation {
 #[tokio::test]
 async fn this_crates_client_round_trips_against_the_reference_server() {
     let url = independent_server().await;
-    let client = A2aClient::new(Endpoint::new(url)).expect("client");
+    let client = A2aClient::new(Endpoint::new(url))
+        .expect("client")
+        .allow_loopback();
 
     let reply = client
         .send(
@@ -146,7 +148,9 @@ async fn this_crates_client_round_trips_against_the_reference_server() {
 #[tokio::test]
 async fn an_unserved_http_path_is_did_not_happen() {
     let url = independent_server().await;
-    let client = A2aClient::new(Endpoint::new(format!("{url}/nope"))).expect("client");
+    let client = A2aClient::new(Endpoint::new(format!("{url}/nope")))
+        .expect("client")
+        .allow_loopback();
 
     let err = client
         .send(

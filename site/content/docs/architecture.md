@@ -1632,14 +1632,41 @@ For manifested agents, `spec.context.prompts/resources` is the review artifact
 and `McpAccess::from_manifest` is the deployment catalogue. Server discovery is
 still only a diff: an MCP server cannot grant itself a prompt, resource or tool.
 
+**The negotiated protocol version is readable, because a downgrade costs
+silence.** MCP answers an offered version with one the server speaks, and the
+connection proceeds on that — a designed downgrade, unlike A2A, whose version is
+asserted and whose mismatch is refused. An older server serves `tools/call`
+correctly and simply never returns a task, so the Tasks extension above is
+absent with nothing failing: a long-running tool behaves synchronously, a
+governed suspension never happens, and no error names the cause.
+`McpClient::negotiated_version()` reports what the handshake settled on rather
+than what was offered, and `agentplane serve --mcp` prints it beside each
+server, because the declarative tier has no Rust in which to ask.
+
 ### A2A, calling out (`a2a`)
 
 The outbound effect is deliberately narrow: an A2A 1.0 JSON-RPC `SendMessage`
 call to an operator-pinned endpoint. It sends `A2A-Version: 1.0`, declares its
 extension in `A2A-Extensions`, uses ProtoJSON enum/part forms, and validates that
 the response contains exactly one `task` or `message`. `CardClient` separately
-provides SSRF-safe Agent Card discovery, optional mandatory verification, and
-binding/version/tenant-aware interface selection. The server provides
+provides Agent Card discovery, optional mandatory verification, and
+binding/version/tenant-aware interface selection.
+
+**Both A2A legs dereference a URL somebody else influenced, and both are guarded
+the same way.** Discovery fetches the card URL; the outbound call connects to
+the interface URL *the card advertised*, carrying this run's payload and a
+bearer credential. A card is a description and never a grant, so a forged one
+cannot widen authority — but it can name an address, and these are the two
+places an address becomes a connection. Each resolves the host, checks every
+answer against `netguard`, **pins** the connection to exactly those addresses,
+refuses redirects, and bounds the whole request. Pinning rather than
+re-resolving is what makes the check real against DNS rebinding; refusing
+redirects is what stops an allowed host handing the decision to a third one. The
+host allowlist stays optional on both, because a deployment that discovers
+agents from the open internet cannot enumerate them in advance — with none set,
+the address rule is the only lock, which is why it is unconditional. Loopback is
+permitted only through a `testkit`-gated opt-in, and only for a host that *is* a
+loopback literal or `localhost`, never one that merely resolved there. The server provides
 `GetTask`, `ListTasks`, streaming/subscription, cancellation, durable push, and
 extended cards. A returned Task becomes a typed `PeerTask`; `PeerTaskCall` polls
 it as an untrusted journaled effect under the same peer grant and
@@ -1772,6 +1799,16 @@ the invariant for the one route nobody would think to check.
 | `ListTasks` | newest-first, cursor-paginated and per-task-authorized tasks with context/status/time filters, bounded history, and optional artifacts. A content filter's cost is bounded (`filter_scan_budget`, default 1024 candidate reads): the spec's `totalSize` is the exact pre-pagination count, so an unbounded filter would let one field buy a scan of every run the tenant ever wrote — over budget is a refusal naming `statusTimestampAfter` as the lever that narrows from the index, never a quietly truncated total. Artifact inclusion is budgeted too — reassembling artifacts replays each task's run, so a page past the budget returns the remaining tasks without artifacts and marks each with `io.agentplane.a2a/artifactsOmitted` in `Task.metadata`, because a bounded result must not be shaped like a complete one; `GetTask` on the marked id recovers them, and a sealed-run cache keeps the reassembly from being paid twice |
 | the push-notification configs | durable create/get/list/delete when wired; the protocol-specific refusal otherwise |
 | anything else | `-32601`, method not found |
+
+**One task has one state, whichever surface reports it.** `GetTask`, the row a
+task occupies in `ListTasks`, and the snapshot a subscription opens with are
+three views of one run's history, and they answer from one function that reads
+it. Three copies of that reading would agree until a record kind was added or a
+suspension reworded — after which a client that polled, one that listed and one
+that subscribed would each be told something different, each would be behaving
+correctly, and the protocol gives them no way to discover the disagreement. The
+surfaces differ only in what an *empty* history means: no such task for a fetch,
+a working row for a listing that must not fail its page over one unreadable run.
 
 **Blocking is the default, and unset means blocking** — the spec's rule. A
 successful blocking call returns the skill output as a text or data artifact; a
@@ -2024,6 +2061,22 @@ Details worth stating:
   timeout, five minutes by default, across connection, generation and stream.
   A timeout after streamed output uses the same partial-generation accounting as
   any other severed stream.
+* **A severed stream is classified by what its wire already said.** Three rungs:
+  `Interrupted` once usage is known, which carries a bill; `Unaccounted` after
+  generation without usage, never free and never counted; `Unavailable` before
+  generation, safe to repeat and costing nothing. Which rung a provider can
+  reach is a property of its wire — Anthropic, Gemini and Bedrock report usage
+  as the answer is delivered, so a cut connection carries a bill; OpenAI's
+  Responses stream and the Chat Completions wire report it only in a terminal
+  event, so a cut one can say generation happened and nothing more.
+
+  Every driver must reach the best rung its wire allows, because *this provider
+  cannot do better* and *this driver did not look* produce the same
+  `Unaccounted` and only the first is honest. Under-reaching is invisible to any
+  test that checks the variant rather than the counts, and its cost is that the
+  token ceiling bounding a runaway provider reads zero during exactly the
+  failure it was bought for. Each streaming driver therefore carries a test
+  asserting the rung it claims.
 * **Reasoning effort is typed and digest-covered.** `none`, `minimal`, `low`,
   `medium`, `high`, `xhigh` and `max` map to OpenAI `reasoning.effort`;
   Anthropic accepts its supported subset and renders adaptive thinking plus
@@ -2052,9 +2105,9 @@ Details worth stating:
   input. `ConverseStream` is the default;
   `.buffered()` opts out. Region, stream mode, timeout and schema mode enter the
   provider profile. Access, validation and not-found errors are refusals;
-  throttling and model-not-ready are retryable. Stream failures are
-  `Unavailable` before generation, `Unaccounted` after generation without usage,
-  and `Interrupted` once usage is known. A *universal* reasoning-effort mapping
+  throttling and model-not-ready are retryable. Stream failures follow the three-rung ladder
+  above, reaching `Interrupted` because `ConverseStream` reports usage in its
+  metadata event. A *universal* reasoning-effort mapping
   remains refused rather than guessed across model families; a **declared** one
   is rendered. `.reasoning(ReasoningDialect::Nova)` names the family a driver
   instance serves and sends Amazon Nova 2 extended thinking as
@@ -2112,8 +2165,9 @@ Details worth stating:
 are wrong in different ways — fatal makes a blip end a run, free lets a retry
 loop spend against a ceiling reading zero — so it is treated as safe to repeat
 (a completion does not change the world) with the documented cost that the
-ceiling may under-count by at most one call. A streaming driver, which can see
-partial usage, must report `Interrupted` with what it saw.
+ceiling may under-count by at most one call. A streaming driver whose wire reports usage
+must report `Interrupted` with what it saw, rather than the `Unaccounted` a
+driver that merely did not look would produce.
 
 ## Stopping a run
 
@@ -2184,14 +2238,34 @@ name unrelated future content. Derived writes validate that every named source
 version and commitment exists and remain in the same subject, so subject erasure
 cannot strand a summary elsewhere.
 
-Core recall intentionally filters by subject/purpose and orders newest first. It
-does not hide semantic/vector search inside `MemoryStore`. Embeddings and
-indexes drift; `SemanticRetriever` is a separately journaled effect recording
-query text/vector, embedding model/revision, immutable index snapshot, filters,
-scores and exact final commitments. The runtime then materializes those exact
-versions from authoritative memory and re-checks scope and digest. The built-in
-implementation is deterministic exact cosine for tests and small corpora; an
-external ANN database implements the seam and never becomes memory truth.
+Core recall intentionally filters by subject/purpose and orders most trusted
+first, then newest. It does not hide semantic/vector search inside
+`MemoryStore`. Embeddings and indexes drift; `SemanticRetriever` is a separately
+journaled effect recording query text/vector, embedding revision, immutable
+index snapshot, filters, scores and exact final commitments. The runtime then
+materializes those exact versions from authoritative memory and re-checks scope
+and digest. The built-in implementation is deterministic exact cosine for tests
+and small corpora; an external ANN database implements the seam and never
+becomes memory truth.
+
+**A vector says which space it lives in, and a caller never does.** Cosine
+similarity is defined between any two vectors of equal width, so a query
+embedded by one revision against an index built by another does not fail — it
+ranks unrelated memories confidently, with no exception to catch. An index
+therefore declares the `Embedder::revision` it takes *queries* in,
+`RuntimeBuilder::semantic_memory` takes the embedder and the index together, and
+`build` refuses a pairing that disagrees. The two strings differing is normal:
+asymmetric embedders embed a query and a document deliberately differently, so
+an index built from `…/search_document` asks for `…/search_query`. `cx.embed`
+returns the floats and the revision that produced them; `cx.semantic_recall`
+takes a subject, purpose, limit and ceiling and assembles the rest.
+
+**A declarative agent reads memory as well as writing it.** `spec.memory.recall`
+folds the selected items into the prompt under `/memory`, each carrying the
+label it was written with; `spec.memory.formation` writes after the answer.
+Semantic search stays out of the manifest deliberately: similarity is computed
+over item content, so anything able to write a memory is a ranking signal, and
+accepting that channel belongs where somebody visibly decides to.
 
 Lifecycle is explicit and deterministic. A write may declare immutable
 `expires_at`; fresh recall compares it with `StepCtx`'s journaled clock. Exact

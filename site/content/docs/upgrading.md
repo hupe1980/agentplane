@@ -15,6 +15,239 @@ property that makes a hard cut acceptable at this stage.
 
 ---
 
+## `spec.memory_formation` moved under `spec.memory`, which also reads
+
+**Affected:** every manifest declaring `memory_formation`.
+
+```yaml
+# before
+memory_formation:
+  subject: "$correlation/malo"
+  purpose: clearing
+  instruction: "Record stable facts stated in the source."
+
+# after
+memory:
+  formation:
+    subject: "$correlation/malo"
+    purpose: clearing
+    instruction: "Record stable facts stated in the source."
+```
+
+Every field under `formation` is unchanged. `deny_unknown_fields` means the old
+spelling is a parse error naming the field, not a silently ignored block.
+
+The move exists because the block gained its other half: `spec.memory.recall`,
+so a declarative agent can read what it wrote without dropping into Rust.
+
+```yaml
+memory:
+  recall:
+    subject: "$correlation/malo"
+    purpose: clearing
+    limit: 5              # 1..=50, most trusted first then newest
+    refresh_access: false
+  formation:
+    subject: "$correlation/malo"
+    purpose: clearing
+    instruction: "Record stable facts stated in the source."
+```
+
+The selected memories are folded into the prompt under `/memory`, beside
+`/system` and `/input`, as `{id, purpose, content, written_at}` — each carrying
+**the label it was written with**, so a fact a model produced last week is
+untrusted this week too. Four refusals come with it: an empty `memory: {}`
+block, a `limit` outside `1..=50`, a `memory` block beside a coded skill, and a
+recall on `execution.kind: planned` (that kind refuses untrusted input because
+its plan is compiled from what the planner reads, and a recalled memory is
+untrusted whenever whatever wrote it was).
+
+`BuildError::FormationWithoutMemory` became
+`BuildError::MemoryWithoutStore { agent, declared }`, where `declared` names
+which half wanted a store.
+
+## The embedder and the index are wired together, and a query no longer names its own space
+
+**Affected:** every caller of `cx.embed` or `cx.semantic_recall`, and every
+`SemanticRetriever` implementation.
+
+```rust
+// before — the space was three strings a caller typed
+let vector = cx.embed(embedder, text, Sensitivity::Internal).await?;
+let hits = cx.semantic_recall(retriever, Tainted::trusted(SemanticQuery {
+    subject, purpose, text, embedding: vector.peek().clone(),
+    embedding_model: "embed-v3@2026-07-01".into(),
+    index_snapshot: "support-2026-08-05".into(),
+    limit: 5, max_sensitivity: Sensitivity::Internal,
+})).await?;
+
+// after — the space comes from the wiring, which `build` already checked
+let runtime = Runtime::builder(journal)
+    .memory(memories)
+    .semantic_memory(embedder, retriever)
+    .build();
+
+let hits = cx.semantic_recall(
+    SemanticSearch::about(subject)
+        .for_purpose("support")
+        .limit(5)
+        .max_sensitivity(Sensitivity::Internal),
+    Tainted::trusted("refund policy".to_owned()),
+).await?;
+```
+
+The reason is a failure that never failed. Cosine similarity is defined between
+any two vectors of equal width, so a query embedded by one revision against an
+index built by another returns a ranked list of unrelated memories rather than
+an error — reaching an operator months later as "retrieval quality". Three
+strings a caller typed by hand were three chances to make that mistake per call
+site.
+
+For a `SemanticRetriever` implementation:
+
+```rust
+// new required method
+fn index(&self) -> IndexIdentity {
+    IndexIdentity {
+        snapshot: "support-2026-08-05".into(),
+        // The revision a *query* vector must come from — not what the
+        // documents were embedded with. Asymmetric embedders embed the two
+        // deliberately differently, so an index built from `…/search_document`
+        // names `…/search_query` here.
+        query_revision: "voyage-3-large/query".into(),
+    }
+}
+```
+
+`SemanticQuery` keeps `subject`, `purpose`, `text`, `embedding`, `limit` and
+`max_sensitivity`; its `embedding_model` and `index_snapshot` collapsed into one
+`index: IndexIdentity`, and the runtime fills it in. `InMemorySemanticRetriever::new`
+takes `(IndexIdentity, Vec<SemanticVector>)` — the separate `identity` string is
+gone, since the effect key already carries the profile and the index. Its
+snapshot self-check is gone too: the runtime builds every query from
+`index()`, so the check could only ever compare a value with itself.
+
+`cx.embed` now returns `Tainted<Embedding>` — `{ vector, revision }` — with the
+revision read from the driver rather than supplied by the caller. Two new build
+refusals: `BuildError::EmbeddingSpaceMismatch` and
+`BuildError::SemanticMemoryWithoutStore`. A retriever returning **more hits than
+the query's `limit`** is now refused rather than truncated, so an implementation
+that treated the limit as advisory has to honour it.
+
+---
+
+## Sealed envelopes carry a format version, and older ones do not open
+
+**Affected:** any deployment that configured a `keyring`. This is the heaviest
+break this project ships, and unlike every other entry on this page it is not
+reversible by editing a call site.
+
+Envelopes now lead with the construction they were written to:
+
+```text
+before  [u32 len][wrapped data key][24-byte nonce][ciphertext ‖ tag]
+after   [u8 version][u32 len][wrapped data key][24-byte nonce][ciphertext ‖ tag]
+```
+
+**Bytes sealed by 0.18.0 and earlier do not open under 0.19.0**, and there is
+no migration — not because one was skipped, but because one cannot exist. The
+journal's hash chain commits to the envelope bytes, which is what lets an
+auditor holding no keys verify a run whose payloads were erased; rewriting an
+envelope therefore rewrites a record the chain covers. Sealed bytes are
+rotation-immutable, and that rule applies to the format as much as to the keys.
+
+Two ways forward, and which one applies is a retention question rather than a
+technical one:
+
+- **Sealed data you still need** — stay on 0.18.x for as long as you need to
+  read it. The bytes are intact; only this build declines to guess at them.
+- **Sealed data you do not** — erase the scopes (`agentplane` erasure destroys
+  the wrapping key, which is the discharge a regulator asked for anyway) or
+  drop the stores, then upgrade.
+
+Run `agentplane drill` after upgrading. A case whose state is still in the old
+shape now reports itself by name rather than as suspected tampering:
+
+```text
+case 8f2c…: this sealed envelope is format version 0 and this build reads 1 —
+the bytes are intact and not erased; they open under a build that reads
+version 0
+```
+
+If you implement `KeyRing` yourself, nothing changes — the envelope is built
+above your trait, and `data_key`, `open` and `destroy` are untouched. What is
+worth knowing is the new refusal your callers can now see:
+
+```rust
+// before: a version this build cannot read reached the cipher and came back as
+// "the sealed payload did not authenticate" — indistinguishable from tampering
+Err(KeyError::Refused("the sealed payload did not authenticate".into()))
+
+// after: its own variant, naming what would read it
+Err(KeyError::UnknownFormat { version: 2, supported: 1 })
+```
+
+`keyring::ENVELOPE_FORMAT_VERSION` is the constant to compare against. Like
+`canon::VERSION` and `export::FORMAT_VERSION`, it stays `1` until the
+durable-format freeze.
+
+---
+
+## `KeyRing::rewrap` is gone, and a retired key version is its own error
+
+**Affected:** anyone implementing `KeyRing` themselves. Deployments using
+`VaultTransit` or `MemoryKeyRing` need no change, and no stored bytes move.
+
+Delete your `rewrap` implementation:
+
+```rust
+// before
+#[async_trait]
+impl KeyRing for MyRing {
+    async fn data_key(&self, scope: &str) -> Result<(DataKey, WrappedKey), KeyError> { … }
+    async fn open(&self, wrapped: &WrappedKey) -> Result<DataKey, KeyError> { … }
+    async fn destroy(&self, scope: &str, at: Timestamp, reason: &str) -> Result<(), KeyError> { … }
+    async fn rewrap(&self, wrapped: &WrappedKey) -> Result<WrappedKey, KeyError> { … }
+}
+
+// after — the trait has three methods
+#[async_trait]
+impl KeyRing for MyRing {
+    async fn data_key(&self, scope: &str) -> Result<(DataKey, WrappedKey), KeyError> { … }
+    async fn open(&self, wrapped: &WrappedKey) -> Result<DataKey, KeyError> { … }
+    async fn destroy(&self, scope: &str, at: Timestamp, reason: &str) -> Result<(), KeyError> { … }
+}
+```
+
+Re-wrapping could never have run. The journal's hash chain commits to the
+envelope bytes, and the envelope carries its wrapped data key inline — so
+re-wrapping a journal payload rewrites a record the chain covers. Sealed payload
+bytes are rotation-immutable, and the erasure scope (one case, one run, one
+memory subject) is the rotation unit instead.
+
+**The half worth acting on** is the `KeyError` variant that replaces it. If your
+key service can refuse to decrypt below a version floor — Vault's
+`min_decryption_version`, and most have an equivalent — map that refusal to the
+new variant rather than leaving it as `Refused`:
+
+```rust
+// before: a reversible setting reaches `agentplane drill` as
+// "neither opens nor was its key destroyed" — the signature of loss or tampering
+Err(KeyError::Refused(format!("{url}: {reason}")))
+
+// after: the operator is told which floor to lower
+Err(KeyError::Retired {
+    scope: wrapped.scope.clone(),
+    key_id: wrapped.wrapped_by.clone(),
+})
+```
+
+Skipping this degrades safely — you get `Refused`, which reads as an incident
+rather than as a discharged erasure — but somebody will spend an afternoon
+hunting a fault that is one configuration line.
+
+---
+
 ## `Delegation`, `TenantId` and `Quorum` now validate when deserialized
 
 Each of these establishes an invariant in a fallible constructor. Each also

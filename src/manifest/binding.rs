@@ -7,8 +7,9 @@
 //!
 //! # The gap a literal subject leaves
 //!
-//! `memory_formation.subject` decides which pile a fact lands in, and the pile
-//! is the unit [`MemoryStore::forget_subject`] erases. A literal subject
+//! A declared subject decides which pile a fact lands in — and, for a declared
+//! recall, which pile is read back — and the pile is the unit
+//! [`MemoryStore::forget_subject`] erases. A literal subject
 //! therefore pools every customer, every meter and every matter the agent ever
 //! reasoned about under one key — so one subject's facts are recalled into
 //! another subject's run, and an erasure request naming one person cannot be
@@ -52,7 +53,12 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
-/// Where a formed memory is filed, as the manifest spells it.
+/// Which memory scope a declaration names, as the manifest spells it.
+///
+/// One type for both halves of `spec.memory`: the pile a formation writes to
+/// and the pile a recall reads from are the same kind of thing, and an agent
+/// whose two halves could spell a scope differently would file facts it could
+/// never read.
 ///
 /// Serialises as the string it was written as, so the manifest digest covers
 /// the binding exactly as authored and a round-trip cannot normalise one form

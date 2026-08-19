@@ -38,16 +38,15 @@ impl SealedJournal {
     /// agree byte for byte, so both are derived from one value supplied by one
     /// caller.
     ///
-    /// This used to read the name back out of `inner.tenant()` instead, which
-    /// looked like the safer shape — one fact, one source — and was not.
-    /// [`JournalStore`] is a public seam: an embedder's backend may return a
-    /// name [`TenantId`] refuses, and the fallback was `unwrap_or_default()`.
-    /// Under that, payloads sealed under `default/<case>` while `erase_case`
-    /// destroyed `<tenant>/<case>` — an erasure reporting success over readable
-    /// bytes, which is the one failure in this module that is silent by
-    /// construction. `RuntimeBuilder` already refuses a plane whose store is
-    /// scoped to another tenant, so the two agree there; this makes them agree
-    /// for a hand-wired store too.
+    /// Taking it as an argument is deliberately *not* the same as reading it
+    /// back out of `inner.tenant()`, which looks like the safer shape — one
+    /// fact, one source — and is not. [`JournalStore`] is a public seam, so an
+    /// embedder's backend may return a name [`TenantId`] refuses, and any
+    /// fallback for that case seals payloads under a scope `erase_case` never
+    /// destroys: an erasure reporting success over readable bytes, which is the
+    /// one failure in this module that is silent by construction. Supplied by
+    /// the caller and asserted against the store, both scopes come from one
+    /// value that cannot quietly become a default.
     ///
     /// # Panics
     ///

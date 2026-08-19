@@ -270,22 +270,16 @@ impl ApiResponse {
         let u = self.usage.as_ref();
         let write = u.map_or(0, |u| u.cache_creation_input_tokens);
         let read = u.map_or(0, |u| u.cache_read_input_tokens);
-        Usage {
-            // Anthropic reports cached tokens *beside* `input_tokens`, not
-            // inside it. Reading only `input_tokens` bills a heavily cached call
-            // at nearly nothing while the provider charges a premium for the
-            // write and a tenth of the rate for the read. Added back here, so
-            // `Usage::input_tokens` means everything processed whichever
-            // provider produced it.
-            input_tokens: u.map_or(0, |u| u.input_tokens) + write + read,
-            output_tokens: u.map_or(0, |u| u.output_tokens),
-            cache_write_tokens: write,
-            cache_read_tokens: read,
-            // Priced by the deployment, not guessed here: rates change, differ
-            // per model, and are a contract with the provider rather than this
-            // crate's business.
-            minor_units: 0,
-        }
+        // Anthropic reports cached tokens *beside* `input_tokens` rather than
+        // inside it, which `with_cache_beside_input` is named for. The stream
+        // accumulator reaches the same arithmetic through the same call, so the
+        // two paths cannot come to disagree about what a cached call cost.
+        Usage::with_cache_beside_input(
+            u.map_or(0, |u| u.input_tokens),
+            u.map_or(0, |u| u.output_tokens),
+            write,
+            read,
+        )
     }
 
     fn text(&self) -> String {

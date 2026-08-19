@@ -737,12 +737,13 @@ spec:
     approval: required
     deadline: {{ name: review, kind: hours, params: {{ n: 4 }} }}
 {tools}
-  memory_formation:
-    subject: team/support
-    purpose: learned-facts
-    instruction: Extract stable facts only.
-    max_items: 2
-    max_sensitivity: confidential
+  memory:
+    formation:
+      subject: team/support
+      purpose: learned-facts
+      instruction: Extract stable facts only.
+      max_items: 2
+      max_sensitivity: confidential
   budgets: {{}}
 "#
     ))

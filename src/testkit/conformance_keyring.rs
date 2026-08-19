@@ -12,8 +12,9 @@
 //! * a data key is **fresh per call**, because that is what a service does and
 //!   a caller that assumed otherwise would seal two payloads with one key;
 //! * a wrapped key **opens back to the same material**, or nothing is readable;
-//! * rewrapping **preserves the key** while changing its wrapping, which is what
-//!   makes rotation cheap rather than a re-encryption of everything;
+//! * a wrapped key **names the version that sealed it**, because sealed bytes
+//!   are rotation-immutable and that name is the only record of which key
+//!   version the deployment must keep admitting;
 //! * destroying a scope makes its keys **unopenable**, which is the erasure;
 //! * destruction is **idempotent**, because a retried erasure must not fail and
 //!   must not rewrite its own record.
@@ -36,7 +37,7 @@ pub async fn check(ring: &dyn KeyRing, scope: &str) -> Report {
     let Some(minted) = mint(ring, scope, &mut report).await else {
         return report;
     };
-    rewraps(ring, &minted, &mut report).await;
+    names_its_version(scope, &minted, &mut report);
     erases(ring, scope, &minted, at, &mut report).await;
     report
 }
@@ -89,41 +90,43 @@ async fn mint(
     Some(first)
 }
 
-/// Rewrapping preserves the key and keeps the erasure unit.
-async fn rewraps(
-    ring: &dyn KeyRing,
+/// A wrap carries the erasure unit and the key version that sealed it.
+///
+/// Both halves are load-bearing and neither is checkable by opening a key,
+/// which is why they are asked separately. The scope is what an erasure
+/// request destroys, so a wrap that named a different one would be sealed by a
+/// key no erasure of its data reaches. The version is what a deployment must
+/// keep its key service admitting: sealed bytes are rotation-immutable, so
+/// this string is the *only* record of which key version this envelope will
+/// need for as long as it is retained, and a ring that left it empty leaves an
+/// operator raising a version floor with nothing to check it against.
+fn names_its_version(
+    scope: &str,
     minted: &(crate::keyring::DataKey, crate::keyring::WrappedKey),
     report: &mut Report,
 ) {
     report.checked += 1;
-    let rewrapped = match ring.rewrap(&minted.1).await {
-        Ok(w) => w,
-        Err(e) => {
-            report.record("rewrap is supported", format!("{e}"));
-            return;
-        }
-    };
-    if rewrapped.scope != minted.1.scope {
+    if minted.1.scope != scope {
         report.record(
-            "rewrapping keeps the erasure unit",
+            "a wrap names its erasure unit",
             format!(
-                "the scope moved from '{}' to '{}', so the key is now erased by \
-                 a different request than the data it seals",
-                minted.1.scope, rewrapped.scope
+                "the wrap claims scope '{}' but was minted for '{scope}', so \
+                 erasing '{scope}' would destroy a key that does not reach the \
+                 data this wrap seals — and report success",
+                minted.1.scope
             ),
         );
     }
 
     report.checked += 1;
-    match ring.open(&rewrapped).await {
-        Ok(opened) if opened.expose() == minted.0.expose() => {}
-        Ok(_) => report.record(
-            "rewrapping preserves the key",
-            "the rewrapped key opens to different material, so every payload \
-             sealed before the rotation is now unreadable — a rotation that is \
-             really an outage",
-        ),
-        Err(e) => report.record("rewrapping preserves the key", format!("{e}")),
+    if minted.1.wrapped_by.is_empty() {
+        report.record(
+            "a wrap names the key version that sealed it",
+            "the wrap names no wrapping key. Sealed bytes are never re-wrapped, \
+             so this field is the only surviving record of which key version \
+             must stay decryptable for this payload to be readable; without it \
+             a retired version is indistinguishable from data loss",
+        );
     }
 }
 

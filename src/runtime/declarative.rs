@@ -84,6 +84,7 @@ impl Declarative {
         &self,
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
+        remembered: Option<Tainted<Value>>,
         system: String,
         role: ModelRole,
         egress: Option<crate::core::Sensitivity>,
@@ -117,10 +118,7 @@ impl Declarative {
         // result and the *declared* instruction becomes indistinguishable from
         // the caller's data. `/system` is a protected field precisely so that
         // conflation is refused rather than obeyed.
-        let prompt = Tainted::object([
-            ("system".to_owned(), Tainted::trusted(json!(system))),
-            ("input".to_owned(), input),
-        ]);
+        let prompt = prompt_object(&system, input, remembered);
         let mut exchanges: Vec<crate::model::ToolExchange> = Vec::new();
         let mut continuation: Option<crate::model::ProviderContinuation> = None;
         let mut conversation_label = prompt.label().clone();
@@ -169,6 +167,33 @@ impl Declarative {
                 .await?;
             let label = completion.label().join(&conversation_label);
             let completion = Tainted::with_label(completion.into_unlabelled(), label);
+
+            // **A cut-off turn is not a turn.**
+            //
+            // `Completion::truncated` says the provider stopped because it ran
+            // out of output budget, and it is deliberately not an error at the
+            // driver: a coded caller holding the `Completion` knows whether
+            // early-stopping prose is still useful to them. Here there is no
+            // such caller — this loop *is* the caller — so the judgement has to
+            // be made, and made in the direction the rest of the crate takes
+            // (P7): a partial result must never be shaped like a whole one.
+            //
+            // The two halves are separated because only one of them is
+            // dangerous rather than merely wrong. A truncated turn carrying
+            // tool calls has been cut somewhere inside its own output, and the
+            // arguments of the last call are whatever survived the cut —
+            // syntactically valid JSON that says something the model did not
+            // finish saying. Executing that is not a degraded answer, it is a
+            // side effect performed on a request nobody wrote, which is the
+            // failure this runtime exists to make impossible.
+            if completion.peek().truncated {
+                let reason = if completion.peek().tool_calls.is_empty() {
+                    "the model ran out of output budget mid-answer, so this is a                      partial answer and not the agent's answer — raise                      `max_output_tokens` for this role, or narrow what the agent                      is asked to produce"
+                } else {
+                    "the model ran out of output budget while it was still asking                      for tools, so the last call's arguments are whatever survived                      the cut — running them would act on a request the model never                      finished writing. Raise `max_output_tokens` for this role"
+                };
+                return Ok(Outcome::fail(reason));
+            }
 
             // No tools asked for: the model is answering, and the turn
             // that answers is the last one.
@@ -504,7 +529,7 @@ impl Declarative {
         let Some(declaration) = declaration else {
             return Ok(());
         };
-        let subject = resolve_subject(cx, &declaration.subject, input)?;
+        let subject = resolve_subject(cx, "memory.formation", &declaration.subject, input)?;
         // The extraction runs on the **quarantined** model when one is
         // declared. Formation is the dual-model pattern's quarantined job to
         // the letter — it reads content derived from untrusted input, is
@@ -544,6 +569,47 @@ impl Declarative {
         )
         .await?;
         Ok(())
+    }
+
+    /// Read declared memories, before the prompt exists.
+    ///
+    /// Each item arrives as its id, purpose, content and write time — **not**
+    /// its trust. Printing *"trust: untrusted"* would ask the model to
+    /// adjudicate a security property from text, which is the content-inferred
+    /// trust this module refuses; the label does that work at the sinks the
+    /// answer later reaches.
+    ///
+    /// The key is present even when nothing was recalled. A prompt whose shape
+    /// depends on what the store happened to hold is one no reviewer can read
+    /// against the manifest.
+    async fn recall_into(
+        &self,
+        cx: &mut StepCtx<'_>,
+        memory: Option<&crate::manifest::Memory>,
+        input: &Tainted<Value>,
+    ) -> Result<Option<Tainted<Value>>, SkillError> {
+        let Some(declaration) = memory.and_then(|m| m.recall.as_ref()) else {
+            return Ok(None);
+        };
+        let subject = resolve_subject(cx, "memory.recall", &declaration.subject, input)?;
+        let mut query = crate::memory::Recall::about(subject).limit(declaration.limit);
+        if let Some(purpose) = &declaration.purpose {
+            query = query.for_purpose(purpose.clone());
+        }
+        if declaration.refresh_access {
+            query = query.refresh_access();
+        }
+        let recalled = cx.recall(query).await?;
+        Ok(Some(Tainted::array(recalled.into_iter().map(|item| {
+            item.map(|item| {
+                json!({
+                    "id": item.id,
+                    "purpose": item.purpose,
+                    "content": item.content,
+                    "written_at": crate::core::format_timestamp(item.created_at),
+                })
+            })
+        }))))
     }
 
     /// Plan first over trusted input, then execute without the model.
@@ -936,7 +1002,7 @@ impl Skill for Declarative {
     ) -> Result<Outcome, SkillError> {
         // Read into owned values before any effect runs, so nothing borrows the
         // agent across an await.
-        let (system, role, schema, egress, oversight, granted, formation) = {
+        let (system, role, schema, egress, oversight, granted, memory) = {
             let m = cx.manifest().ok_or_else(|| {
                 // Unreachable through the builder, which only registers this
                 // skill when a manifest declared it. Stated rather than
@@ -964,8 +1030,20 @@ impl Skill for Declarative {
                 m.spec.security.max_sensitivity_egress,
                 m.spec.oversight.as_ref().map(Proposal::from_manifest),
                 m.spec.tools.clone(),
-                m.spec.memory_formation.clone(),
+                m.spec.memory.clone(),
             )
+        };
+        let formation = memory.as_ref().and_then(|m| m.formation.clone());
+        // Before the prompt is assembled, because that is what a recall is
+        // *for*: the memories are part of what the model is asked, not
+        // something it is told afterwards.
+        //
+        // Not attempted under `planned`, rather than attempted and discarded:
+        // a recall is a journaled store read. The refusal itself lives at
+        // parse, where a reviewer meets it.
+        let remembered = match self.kind {
+            ExecutionKind::Planned => None,
+            _ => self.recall_into(cx, memory.as_ref(), &input).await?,
         };
 
         match self.kind {
@@ -980,10 +1058,7 @@ impl Skill for Declarative {
                 // See `tool_loop`: a subject binding resolves against the run's
                 // own input, not against the prompt object it is folded into.
                 let bindable_input = input.clone();
-                let prompt = Tainted::object([
-                    ("system".to_owned(), Tainted::trusted(json!(system))),
-                    ("input".to_owned(), input),
-                ]);
+                let prompt = prompt_object(&system, input, remembered);
                 // The completion's floor derives from the egress ceiling
                 // applied below; see the tool loop's model call for why
                 // nothing restates it here.
@@ -1041,7 +1116,8 @@ impl Skill for Declarative {
 
             ExecutionKind::ToolCalling => {
                 self.tool_loop(
-                    cx, input, system, role, egress, granted, oversight, formation, schema,
+                    cx, input, remembered, system, role, egress, granted, oversight, formation,
+                    schema,
                 )
                 .await
             }
@@ -1349,7 +1425,36 @@ fn bounded_parse_schema(declared: &Value) -> Option<Value> {
     Some(schema)
 }
 
-/// Resolve `memory_formation.subject` for this run.
+/// The object a declarative agent's model call is given.
+///
+/// `Tainted::object`, not `input.map(..)`. The instruction comes from the
+/// manifest — reviewed, and inside the digest — so it is trusted; the input
+/// stays whatever it arrived as; each recalled memory keeps the label it was
+/// written with. `map` cannot prove how a closure reshaped a value, so it
+/// taints the whole result and the declared instruction becomes
+/// indistinguishable from the caller's data. `/system` is a protected field
+/// precisely so that conflation is refused rather than obeyed.
+///
+/// A memory subject binding resolves against the run's **own** input, never
+/// against this object — a pointer in a reviewed file must not be wrong by one
+/// level because the runtime folded the input under a key.
+fn prompt_object(
+    system: &str,
+    input: Tainted<Value>,
+    remembered: Option<Tainted<Value>>,
+) -> Tainted<Value> {
+    let mut parts = vec![
+        ("system".to_owned(), Tainted::trusted(json!(system))),
+        ("input".to_owned(), input),
+    ];
+    if let Some(remembered) = remembered {
+        parts.push(("memory".to_owned(), remembered));
+    }
+    Tainted::object(parts)
+}
+
+/// Resolve a declared memory subject for this run, for the field that declared
+/// it.
 ///
 /// # Every refusal here is the same refusal
 ///
@@ -1369,6 +1474,7 @@ fn bounded_parse_schema(declared: &Value) -> Option<Value> {
 /// runtime's own.
 fn resolve_subject(
     cx: &StepCtx<'_>,
+    field: &str,
     subject: &crate::manifest::MemorySubject,
     input: &Tainted<Value>,
 ) -> Result<String, SkillError> {
@@ -1378,13 +1484,12 @@ fn resolve_subject(
     match subject {
         MemorySubject::Literal(literal) => Ok(literal.clone()),
         MemorySubject::Case => cx.case_id().map(|id| id.to_string()).ok_or_else(|| {
-            refuse(
-                "`memory_formation.subject: $case` needs the run to belong to a case, and \
+            refuse(format!(
+                "`{field}.subject: $case` needs the run to belong to a case, and \
                  this run has none. Admit it with `run_correlated(..)` or `run_in_case(..)` \
                  — filing the memory under a constant instead would pool every matter's \
                  facts under one key"
-                    .to_owned(),
-            )
+            ))
         }),
         MemorySubject::Correlation(namespace) => cx
             .correlation_value(namespace)
@@ -1396,7 +1501,7 @@ fn resolve_subject(
                     .map(|key| key.namespace.as_str())
                     .collect();
                 refuse(format!(
-                    "`memory_formation.subject: $correlation/{namespace}` found no key in \
+                    "`{field}.subject: $correlation/{namespace}` found no key in \
                      that namespace; this run's case is keyed by {held:?}. A memory filed \
                      under the wrong scope is recalled into another subject's run and \
                      survives that subject's erasure, so the run fails rather than \
@@ -1406,13 +1511,13 @@ fn resolve_subject(
         MemorySubject::Input(pointer) => {
             let selected = input.project_pointer(pointer).ok_or_else(|| {
                 refuse(format!(
-                    "`memory_formation.subject: $input{pointer}` selects nothing in this \
+                    "`{field}.subject: $input{pointer}` selects nothing in this \
                      run's input"
                 ))
             })?;
             if selected.label().trust != crate::core::Trust::Trusted {
                 return Err(refuse(format!(
-                    "`memory_formation.subject: $input{pointer}` names an **untrusted** \
+                    "`{field}.subject: $input{pointer}` names an **untrusted** \
                      field, and a subject taken from untrusted input lets whoever supplied \
                      it choose whose memories this run writes into. Bind the subject to a \
                      correlation key instead — those are settled at admission by a \
@@ -1424,7 +1529,7 @@ fn resolve_subject(
                 Value::String(value) if !value.trim().is_empty() => Ok(value.clone()),
                 Value::Number(value) => Ok(value.to_string()),
                 other => Err(refuse(format!(
-                    "`memory_formation.subject: $input{pointer}` selects {}, and a subject \
+                    "`{field}.subject: $input{pointer}` selects {}, and a subject \
                      is a scope name — it must be a non-empty string or a number",
                     match other {
                         Value::String(_) => "an empty string",

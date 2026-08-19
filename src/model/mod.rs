@@ -304,6 +304,40 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Build from a provider that reports cached counts **beside** the prompt
+    /// count rather than inside it.
+    ///
+    /// Anthropic is the convention: `input_tokens` excludes both
+    /// `cache_creation_input_tokens` and `cache_read_input_tokens`, so reading
+    /// it alone bills a heavily cached call at nearly nothing while the
+    /// provider charges a premium for the write and a tenth of the rate for the
+    /// read. `OpenAI` and Gemini report the opposite — cached input is a subset
+    /// of the prompt count — and those drivers pass the prompt count straight
+    /// through.
+    ///
+    /// Here rather than in a driver because a provider that reports this way
+    /// has two paths, buffered and streamed, and the arithmetic is the same
+    /// question on both. Two spellings of it would be free to disagree, and the
+    /// one that drifts is whichever path a deployment does not run in its
+    /// tests — which for a streaming-by-default driver is the buffered one, and
+    /// the symptom is a bill nobody can reconcile rather than a failure.
+    #[must_use]
+    pub const fn with_cache_beside_input(
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_write_tokens: u64,
+        cache_read_tokens: u64,
+    ) -> Self {
+        Self {
+            input_tokens: input_tokens + cache_write_tokens + cache_read_tokens,
+            output_tokens,
+            cache_write_tokens,
+            cache_read_tokens,
+            // Priced by the deployment, not guessed here.
+            minor_units: 0,
+        }
+    }
+
     /// What this counts against a run's ceilings.
     ///
     /// Tokens are summed flat — input plus output — because a *ceiling* is about
@@ -572,11 +606,23 @@ impl ModelError {
     }
 
     /// What was consumed before the failure.
+    ///
+    /// Enumerated rather than defaulted, because the default is **free** and
+    /// this is what the token and cost ceilings are computed from. A variant
+    /// added later that carries a `usage` would compile, pass every test here,
+    /// and report nothing consumed — which is the direction the ceilings exist
+    /// to prevent. `Unaccounted` reports zero deliberately and says so on its
+    /// own documentation: what is unknown there is the amount, not whether it
+    /// happened, and its disposition already carries the latter.
     #[must_use]
     pub const fn usage(&self) -> Usage {
         match self {
             Self::Interrupted { usage, .. } | Self::Unusable { usage, .. } => *usage,
-            _ => Usage {
+            Self::Unreachable { .. }
+            | Self::Refused { .. }
+            | Self::RateLimited { .. }
+            | Self::Unavailable { .. }
+            | Self::Unaccounted { .. } => Usage {
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_write_tokens: 0,

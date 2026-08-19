@@ -28,6 +28,10 @@ struct Fixture {
     cases: Arc<dyn CaseStore>,
     blobs: Arc<dyn BlobStore>,
     keys: Arc<dyn KeyRing>,
+    /// The same ring, concretely, for the operator actions only a real key
+    /// service exposes — moving a decryption floor under an envelope that is
+    /// already sealed.
+    ring: Arc<MemoryKeyRing>,
     tenant: TenantId,
 }
 
@@ -43,7 +47,8 @@ fn fixture() -> Fixture {
     Fixture {
         cases: sealed as Arc<dyn CaseStore>,
         blobs: Arc::new(MemoryBlobs::new()) as Arc<dyn BlobStore>,
-        keys: ring as Arc<dyn KeyRing>,
+        keys: Arc::clone(&ring) as Arc<dyn KeyRing>,
+        ring,
         tenant,
     }
 }
@@ -306,5 +311,84 @@ async fn a_ring_with_nothing_sealed_is_unestablished_coverage() {
             .any(|n| n.contains("sealed-state coverage")),
         "established coverage was reported as unestablished: {:#?}",
         covered.not_checked
+    );
+}
+
+/// **An operator's version floor is neither an erasure nor a loss.**
+///
+/// A key service that refuses to decrypt below a floor — Vault's
+/// `min_decryption_version` — makes un-erased history unreadable the moment
+/// that floor passes a live envelope. Sealed bytes are rotation-immutable, so
+/// an envelope names its wrapping-key version for as long as it is retained
+/// and nothing here can move it out of the way.
+///
+/// Both obvious classifications are wrong, in opposite directions, and this
+/// pins each. Counted as `sealed_erased` it claims an obligation discharged
+/// that nobody requested, and writes off data that is intact and one setting
+/// away from readable. Left in the arm below it reports *neither opens nor was
+/// its key destroyed* — the sentence that sends somebody hunting for tampering
+/// while a reversible configuration line is the whole cause.
+///
+/// So it is a finding, because this plane cannot read a case it is holding,
+/// and the finding must carry its own remedy.
+#[tokio::test]
+async fn a_retired_key_version_is_not_reported_as_loss_or_as_erasure() {
+    let f = fixture();
+    matter(&f, "RETIRED-1", b"the artifact").await;
+
+    // The state is sealed under the generation in force now; the floor moves
+    // afterwards, which is the only order in which this hazard exists.
+    f.ring.rotate();
+    f.ring.retire_below(1);
+
+    let report = drill(&Stores {
+        cases: &f.cases,
+        blobs: Some(&f.blobs),
+        keys: Some(&f.keys),
+    })
+    .await
+    .expect("drill");
+
+    assert_eq!(
+        report.sealed_open, 0,
+        "state behind a version floor cannot have opened"
+    );
+    assert_eq!(
+        report.sealed_erased, 0,
+        "a retired version was counted as a completed erasure — an obligation \
+         reported discharged that nobody requested, over data that is intact"
+    );
+    assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+    let finding = &report.findings[0];
+    assert!(
+        !finding.contains("loss or tampering"),
+        "a reversible version floor reached the operator as an incident: {finding}"
+    );
+    assert!(
+        finding.contains("retired") && finding.contains("lower the floor"),
+        "the finding must name the remedy, or it is an incident by another \
+         name: {finding}"
+    );
+    assert!(
+        !report.is_sound(),
+        "un-erased history nobody can read must fail the drill"
+    );
+
+    // Reversible, which is what distinguishes it from erasure: the same drill
+    // over the same bytes comes back clean once the floor readmits them.
+    f.ring.retire_below(0);
+    let readmitted = drill(&Stores {
+        cases: &f.cases,
+        blobs: Some(&f.blobs),
+        keys: Some(&f.keys),
+    })
+    .await
+    .expect("drill");
+    assert_eq!(readmitted.sealed_open, 1);
+    assert!(
+        readmitted.is_sound(),
+        "lowering the floor did not make the case readable again, so the \
+         refusal was never really a version floor: {:#?}",
+        readmitted.findings
     );
 }

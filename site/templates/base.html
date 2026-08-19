@@ -4,14 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 
-{%- set page_title = page.title | default(value=section.title | default(value=config.title)) -%}
-{%- set page_desc = page.description | default(value=section.description | default(value=config.description)) -%}
-{%- set page_url = page.permalink | default(value=section.permalink | default(value=config.base_url)) -%}
+{#- 404.html renders with neither `page` nor `section` in context, so every
+    lookup below starts from a map that is always defined. -#}
+{%- set this = page | default(value=section | default(value=config)) -%}
+{%- set page_title = this.title | default(value=config.title) -%}
+{%- set page_desc = this.description | default(value=config.description) -%}
+{%- set page_url = this.permalink | default(value=config.base_url) -%}
 
 {#- The homepage carries the keyword-bearing title; inner pages lead with their
     own name so a search result reads "Security model · agentplane". -#}
-{%- if section.extra.home | default(value=false) -%}
+{%- if this.extra.home | default(value=false) -%}
   {%- set head_title = "agentplane — durable, replayable agent runtime for AI agents in Rust" -%}
+{%- elif page_title == config.title -%}
+  {#- 404, which has no page of its own to be named after. -#}
+  {%- set head_title = config.title -%}
 {%- else -%}
   {%- set head_title = page_title ~ " · " ~ config.title -%}
 {%- endif %}
@@ -19,7 +25,7 @@
 <meta name="description" content="{{ page_desc }}">
 <link rel="canonical" href="{{ page_url }}">
 
-<meta property="og:type" content="{% if page.title %}article{% else %}website{% endif %}">
+<meta property="og:type" content="{% if page %}article{% else %}website{% endif %}">
 <meta property="og:site_name" content="{{ config.title }}">
 <meta property="og:title" content="{{ head_title }}">
 <meta property="og:description" content="{{ page_desc }}">
@@ -52,7 +58,7 @@
   "keywords": "agent runtime, durable execution, deterministic replay, AI agent governance, Rust, EU AI Act, audit log"
 }
 </script>
-{%- if page.title %}
+{%- if page %}
 {%- set docs_url = config.base_url ~ "/docs/" %}
 <script type="application/ld+json">
 {

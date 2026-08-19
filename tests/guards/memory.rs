@@ -22,8 +22,8 @@ use agentplane::core::{
 };
 use agentplane::journal::JournalStore;
 use agentplane::memory::{
-    InMemorySemanticRetriever, MemoryItem, MemoryStore, Recall, SemanticHit, SemanticQuery,
-    SemanticRetriever, SemanticVector,
+    Embedder, InMemorySemanticRetriever, IndexIdentity, MemoryItem, MemoryStore, Recall,
+    SemanticHit, SemanticQuery, SemanticRetriever, SemanticSearch, SemanticVector,
 };
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
@@ -774,6 +774,10 @@ impl SemanticRetriever for CountedRetriever {
         self.inner.profile()
     }
 
+    fn index(&self) -> IndexIdentity {
+        self.inner.index()
+    }
+
     async fn search(
         &self,
         query: &SemanticQuery,
@@ -784,8 +788,26 @@ impl SemanticRetriever for CountedRetriever {
     }
 }
 
+/// The one revision this test file's indexes accept.
+const TEST_REVISION: &str = "test-embedding@1";
+
+/// A fixed vector, so what is being tested is the protocol and not a model.
 #[derive(Debug)]
-struct SemanticRecalls(Arc<dyn SemanticRetriever>);
+struct FixedEmbedder(&'static str);
+
+#[async_trait::async_trait]
+impl Embedder for FixedEmbedder {
+    fn revision(&self) -> String {
+        self.0.to_owned()
+    }
+
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>, agentplane::core::StoreError> {
+        Ok(vec![1.0, 0.0])
+    }
+}
+
+#[derive(Debug)]
+struct SemanticRecalls;
 
 #[async_trait::async_trait]
 impl Skill for SemanticRecalls {
@@ -800,17 +822,11 @@ impl Skill for SemanticRecalls {
     ) -> Result<Outcome, SkillError> {
         let found = cx
             .semantic_recall(
-                Arc::clone(&self.0),
-                Tainted::trusted(SemanticQuery {
-                    subject: "acct-semantic".to_owned(),
-                    purpose: Some("support".to_owned()),
-                    text: "refund".to_owned(),
-                    embedding: vec![1.0, 0.0],
-                    embedding_model: "test-embedding@1".to_owned(),
-                    index_snapshot: "snapshot-1".to_owned(),
-                    limit: 1,
-                    max_sensitivity: Sensitivity::Internal,
-                }),
+                SemanticSearch::about("acct-semantic")
+                    .for_purpose("support")
+                    .limit(1)
+                    .max_sensitivity(Sensitivity::Internal),
+                Tainted::trusted("refund".to_owned()),
             )
             .await
             .map_err(SkillError::Step)?;
@@ -1025,8 +1041,10 @@ async fn a_replayed_semantic_recall_does_not_rerank_the_index() {
     let searches = Arc::new(AtomicUsize::new(0));
     let retriever = Arc::new(CountedRetriever {
         inner: InMemorySemanticRetriever::new(
-            "test-index",
-            "snapshot-1",
+            IndexIdentity {
+                snapshot: "snapshot-1".to_owned(),
+                query_revision: TEST_REVISION.to_owned(),
+            },
             vec![SemanticVector {
                 subject: stored.subject.clone(),
                 purpose: stored.purpose.clone(),
@@ -1042,7 +1060,8 @@ async fn a_replayed_semantic_recall_does_not_rerank_the_index() {
     }) as Arc<dyn SemanticRetriever>;
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .memory(memories)
-        .skill(SemanticRecalls(retriever))
+        .semantic_memory(Arc::new(FixedEmbedder(TEST_REVISION)), retriever)
+        .skill(SemanticRecalls)
         .build();
 
     let live = rt
@@ -1842,6 +1861,17 @@ impl agentplane::memory::Embedder for DriftingEmbedder {
     }
 }
 
+/// An index with nothing in it, at whatever space the test needs.
+fn empty_index(revision: &str) -> Arc<dyn SemanticRetriever> {
+    Arc::new(InMemorySemanticRetriever::new(
+        IndexIdentity {
+            snapshot: "empty".to_owned(),
+            query_revision: revision.to_owned(),
+        },
+        Vec::new(),
+    ))
+}
+
 #[derive(Debug)]
 /// Embeds a query that came from somewhere, at a declared ceiling.
 ///
@@ -1850,7 +1880,7 @@ impl agentplane::memory::Embedder for DriftingEmbedder {
 /// crossed a trust boundary is already `Internal`, so a fixture embedding a
 /// trusted literal would pass under a ceiling of `Public` and prove nothing
 /// about the call anybody actually makes.
-struct Embeds(Arc<DriftingEmbedder>, Sensitivity);
+struct Embeds(Sensitivity);
 
 #[async_trait::async_trait]
 impl Skill for Embeds {
@@ -1867,14 +1897,10 @@ impl Skill for Embeds {
             "what is the refund policy?".to_owned(),
             agentplane::core::Label::untrusted(SourceId::new("tool://helpdesk/search")),
         );
-        let vector = cx
-            .embed(
-                Arc::clone(&self.0) as Arc<dyn agentplane::memory::Embedder>,
-                query,
-                self.1,
-            )
-            .await?;
-        Ok(Outcome::done(vector.map(|v| json!({ "embedding": v }))))
+        let vector = cx.embed(query, self.0).await?;
+        Ok(Outcome::done(vector.map(
+            |v| json!({ "embedding": v.vector, "revision": v.revision }),
+        )))
     }
 }
 
@@ -1891,7 +1917,12 @@ async fn an_embedding_above_its_declared_ceiling_is_refused() {
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
     let embedder = Arc::new(DriftingEmbedder(std::sync::atomic::AtomicUsize::new(0)));
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .skill(Embeds(Arc::clone(&embedder), Sensitivity::Public))
+        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+        .semantic_memory(
+            Arc::clone(&embedder) as Arc<dyn Embedder>,
+            empty_index("stub-embed@1"),
+        )
+        .skill(Embeds(Sensitivity::Public))
         .build();
 
     let run = rt
@@ -1915,6 +1946,184 @@ async fn an_embedding_above_its_declared_ceiling_is_refused() {
     );
 }
 
+/// A retriever that overruns the declared limit is refused, not truncated.
+///
+/// The limit is a ceiling the caller declared and the index is a seam somebody
+/// else implemented. Truncating an over-long answer would keep the run going
+/// with a selection whose membership was decided by the seam's iteration order
+/// — a ranking nobody chose, arriving as though it had been.
+#[tokio::test]
+async fn a_retriever_that_overruns_the_limit_is_refused() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let memories = Arc::clone(&store) as Arc<dyn MemoryStore>;
+    for id in ["over-a", "over-b"] {
+        memories
+            .remember(&item(
+                id,
+                "acct-overrun",
+                json!({ "note": id }),
+                Trust::Untrusted,
+            ))
+            .await
+            .expect("remember");
+    }
+    let mut vectors = Vec::new();
+    for id in ["over-a", "over-b"] {
+        let stored = memories
+            .version(id, 1)
+            .await
+            .expect("version")
+            .expect("stored");
+        vectors.push(SemanticVector {
+            subject: stored.subject.clone(),
+            purpose: stored.purpose.clone(),
+            selected: agentplane::memory::Selected {
+                id: stored.id.clone(),
+                version: stored.version,
+                digest: stored.selection_digest(),
+            },
+            embedding: vec![1.0, 0.0],
+        });
+    }
+    let retriever = Arc::new(OverrunningRetriever(InMemorySemanticRetriever::new(
+        IndexIdentity {
+            snapshot: "overrun".to_owned(),
+            query_revision: TEST_REVISION.to_owned(),
+        },
+        vectors,
+    ))) as Arc<dyn SemanticRetriever>;
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(memories)
+        .semantic_memory(
+            Arc::new(FixedEmbedder(TEST_REVISION)) as Arc<dyn Embedder>,
+            retriever,
+        )
+        .skill(OverrunSearch)
+        .build();
+
+    let run = rt
+        .run("overrun-search", Tainted::trusted(json!({})))
+        .await
+        .expect("the run completes; the search inside it is refused");
+    let RunStatus::Failed(why) = &run.status else {
+        panic!("an over-long answer must not be accepted: {:?}", run.status)
+    };
+    assert!(
+        why.contains("hits for a limit of 1"),
+        "the refusal must name what it counted: {why}"
+    );
+}
+
+/// Ignores the limit, exactly as a misconfigured ANN client would.
+#[derive(Debug)]
+struct OverrunningRetriever(InMemorySemanticRetriever);
+
+#[async_trait::async_trait]
+impl SemanticRetriever for OverrunningRetriever {
+    fn profile(&self) -> Value {
+        self.0.profile()
+    }
+
+    fn index(&self) -> IndexIdentity {
+        self.0.index()
+    }
+
+    async fn search(
+        &self,
+        query: &SemanticQuery,
+    ) -> Result<Vec<SemanticHit>, agentplane::core::StoreError> {
+        let mut wide = query.clone();
+        wide.limit = usize::MAX;
+        self.0.search(&wide).await
+    }
+}
+
+#[derive(Debug)]
+struct OverrunSearch;
+
+#[async_trait::async_trait]
+impl Skill for OverrunSearch {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("overrun-search").provides("overrun-search")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let found = cx
+            .semantic_recall(
+                SemanticSearch::about("acct-overrun")
+                    .limit(1)
+                    .max_sensitivity(Sensitivity::Internal),
+                Tainted::trusted("anything".to_owned()),
+            )
+            .await
+            .map_err(SkillError::Step)?;
+        Ok(Outcome::done(Tainted::trusted(json!(found.len()))))
+    }
+}
+
+/// An embedder that does not speak the index's language is refused at build.
+///
+/// The one wiring mistake in this area that would otherwise never surface.
+/// Cosine similarity is defined between any two vectors of equal width, so a
+/// query embedded by one revision and searched against an index built by
+/// another returns a ranked list — at full speed, with a plausible score beside
+/// every hit, and every hit unrelated to the question. Nothing throws. The
+/// symptom reaches an operator months later as "retrieval quality", which is
+/// not a thing anybody debugs by reading wiring code.
+///
+/// What this does **not** cover: whether the index's own vectors really came
+/// from the revision it names. That is a claim about a corpus built outside
+/// this process, and no build-time question can settle it.
+#[tokio::test]
+async fn an_embedder_that_does_not_speak_the_indexs_language_is_refused_at_build() {
+    use agentplane::runtime::BuildError;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let plane = |revision: &'static str| {
+        Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+            .semantic_memory(
+                Arc::new(FixedEmbedder(revision)) as Arc<dyn Embedder>,
+                empty_index(TEST_REVISION),
+            )
+    };
+
+    plane(TEST_REVISION)
+        .try_build()
+        .expect("the index's own revision builds");
+
+    // Not a typo — the shape a real deployment reaches this by. An asymmetric
+    // embedder embeds a query and a document differently, so wiring the
+    // document side against an index that asks for the query side is the
+    // plausible mistake, not a misspelling.
+    let err = plane("test-embedding@1/search_document")
+        .try_build()
+        .expect_err("a foreign embedding space must refuse the build");
+    assert!(
+        matches!(&err, BuildError::EmbeddingSpaceMismatch { embedder, index }
+            if embedder == "test-embedding@1/search_document" && index == TEST_REVISION),
+        "wrong refusal: {err}"
+    );
+
+    // An index with nothing to materialise from fails at the last step of
+    // every search, having already paid for an embedding call.
+    let err = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .semantic_memory(
+            Arc::new(FixedEmbedder(TEST_REVISION)) as Arc<dyn Embedder>,
+            empty_index(TEST_REVISION),
+        )
+        .try_build()
+        .expect_err("an index with no authoritative memory must refuse the build");
+    assert!(
+        matches!(&err, BuildError::SemanticMemoryWithoutStore),
+        "wrong refusal: {err}"
+    );
+}
+
 /// A replayed run reads its vector back rather than embedding again.
 ///
 /// The vector is in the semantic-retrieval effect's key, so a run that asked an
@@ -1929,7 +2138,12 @@ async fn a_replayed_run_reads_its_embedding_back_rather_than_asking_again() {
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
     let embedder = Arc::new(DriftingEmbedder(std::sync::atomic::AtomicUsize::new(0)));
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .skill(Embeds(Arc::clone(&embedder), Sensitivity::Internal))
+        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+        .semantic_memory(
+            Arc::clone(&embedder) as Arc<dyn Embedder>,
+            empty_index("stub-embed@1"),
+        )
+        .skill(Embeds(Sensitivity::Internal))
         .build();
 
     let live = rt

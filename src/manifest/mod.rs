@@ -161,9 +161,90 @@ pub struct Spec {
     /// [`Output`] for why declaring it here rather than in code is the point.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Output>,
-    /// Form bounded durable facts from each declarative agent answer.
+    /// What this agent reads from and writes to durable memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_formation: Option<MemoryFormation>,
+    pub memory: Option<Memory>,
+}
+
+/// A declarative agent's two halves of durable memory: what it reads, and what
+/// it writes.
+///
+/// # Why there is no semantic search here
+///
+/// [`StepCtx::semantic_recall`] exists and is deliberately not declarable.
+/// Similarity is computed over item content, so anything able to write a memory
+/// is a ranking signal: an attacker who cannot taint a value can still decide
+/// *which* clean values a model is shown, and no label anywhere in the run shows
+/// it. A deterministic recall's order is a fixed rule no stored item can move,
+/// which is what makes it safe to spell as one reviewed line — accepting the
+/// other channel belongs where somebody visibly decides to.
+///
+/// [`StepCtx::semantic_recall`]: crate::runtime::StepCtx::semantic_recall
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Memory {
+    /// Read memories into the prompt, before the model is called.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall: Option<MemoryRecall>,
+    /// Form bounded durable facts from each answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formation: Option<MemoryFormation>,
+}
+
+impl Memory {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.recall.is_none() && self.formation.is_none()
+    }
+}
+
+/// What a declarative agent is given to remember, before it answers.
+///
+/// The recalled items are folded into the prompt under `/memory`, beside the
+/// trusted `/system` instruction and the caller's `/input`, and they arrive
+/// carrying **their own labels** — a memory formed from a model's answer is
+/// untrusted here exactly as it was when it was written. So a recall does not
+/// widen what the agent may then do: the same egress ceiling governs the model
+/// call, and the same protected-field rules govern every tool the answer
+/// reaches for.
+///
+/// One consequence: a memory above
+/// [`security.max_sensitivity_egress`](Security::max_sensitivity_egress)
+/// **fails the run** at the model call rather than being filtered out — a
+/// silent drop would make the answer depend on a ceiling nothing in the
+/// transcript mentions. Partition with `purpose`, or raise the ceiling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRecall {
+    /// Which pile to read, with the same three bindings formation writes
+    /// under. See [`MemorySubject`].
+    pub subject: MemorySubject,
+    /// Restrict to memories kept for one purpose.
+    ///
+    /// Absent reads every purpose under the subject, which is the wider
+    /// answer and rarely the wanted one: `purpose` is what keeps a memory
+    /// written for support triage out of a payments decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// How many, at most.
+    ///
+    /// A ceiling on prompt size and on blast radius both. Selection is most
+    /// trusted first, then newest — so a subject with more memories than this
+    /// drops the *least* trusted and oldest, never a trusted memory in favour
+    /// of an attacker's fresh one.
+    #[serde(default = "default_recall_limit")]
+    pub limit: usize,
+    /// Slide each selected memory's access-retention window forward.
+    ///
+    /// Off by default. On, a recall is no longer a pure read — it writes a
+    /// second journaled effect — which is the trade for memories that should
+    /// live as long as they keep being useful.
+    #[serde(default)]
+    pub refresh_access: bool,
+}
+
+const fn default_recall_limit() -> usize {
+    5
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -1204,7 +1285,7 @@ impl Manifest {
         self.validate_topology()?;
         self.validate_models()?;
         self.validate_output()?;
-        self.validate_memory_formation()?;
+        self.validate_memory()?;
         let mut tool_ids = std::collections::BTreeSet::new();
         for grant in &self.spec.tools {
             if grant.reference.trim().is_empty() {
@@ -1578,9 +1659,9 @@ impl Manifest {
             ("spec.identity.role", identity.role.as_str()),
             ("spec.identity.constraints", identity.constraints.as_str()),
         ];
-        if let Some(formation) = &self.spec.memory_formation {
+        if let Some(formation) = self.spec.memory.as_ref().and_then(|m| m.formation.as_ref()) {
             prose.push((
-                "spec.memory_formation.instruction",
+                "spec.memory.formation.instruction",
                 formation.instruction.as_str(),
             ));
         }
@@ -1861,7 +1942,11 @@ impl Manifest {
         if models.quarantined.is_some() {
             let kind = self.spec.execution.as_ref().map(|e| e.kind);
             let selectable = matches!(kind, Some(ExecutionKind::Planned))
-                || self.spec.memory_formation.is_some()
+                || self
+                    .spec
+                    .memory
+                    .as_ref()
+                    .is_some_and(|m| m.formation.is_some())
                 // A coded skill chooses its own models, so the declaration is a
                 // reviewed allowlist rather than something the tier selects
                 // from — that is a different claim and a legitimate one.
@@ -1875,7 +1960,7 @@ impl Manifest {
                              content, and this agent has neither — so every call would go to \
                              the privileged model while the file reads as dual-model \
                              isolation. Use `execution.kind: planned`, declare \
-                             `memory_formation`, or drop the role",
+                             `memory.formation`, or drop the role",
                 });
             }
         }
@@ -1966,16 +2051,83 @@ impl Manifest {
         Ok(())
     }
 
-    fn validate_memory_formation(&self) -> Result<(), ManifestError> {
-        let Some(formation) = &self.spec.memory_formation else {
+    /// Both halves of `spec.memory`, and the tier they need.
+    ///
+    /// The shared refusal is the declarative one: reading and writing durable
+    /// memory are behaviours the *runtime* supplies, so a block beside a coded
+    /// skill is a control nothing performs.
+    fn validate_memory(&self) -> Result<(), ManifestError> {
+        let Some(memory) = &self.spec.memory else {
             return Ok(());
         };
-        if self.spec.execution.is_none() {
+        // `memory: {}` parses, digests, reviews as a memory declaration and
+        // does nothing. Refused for the same reason an oversight block that
+        // performs nothing is.
+        if memory.is_empty() {
             return Err(ManifestError::Unenforceable {
-                field: "spec.memory_formation",
-                detail: "automatic formation is implemented by declarative execution; a coded skill must call StepCtx::form_memories explicitly",
+                field: "spec.memory",
+                detail: "this block declares neither `recall` nor `formation`, so it \
+                         reads in review as a memory declaration and performs nothing. \
+                         State one, or drop the block",
             });
         }
+        if self.spec.execution.is_none() {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.memory",
+                detail: "reading and writing durable memory are behaviours the \
+                         declarative tier supplies; a coded skill calls \
+                         `StepCtx::recall` and `StepCtx::form_memories` at the moments \
+                         it chooses, and this block would govern nothing",
+            });
+        }
+        if let Some(recall) = &memory.recall {
+            self.validate_memory_recall(recall)?;
+        }
+        if let Some(formation) = &memory.formation {
+            self.validate_memory_formation(formation)?;
+        }
+        Ok(())
+    }
+
+    /// A recall reads memories **into the prompt**, which is why the execution
+    /// kind matters.
+    ///
+    /// A `planned` agent refuses untrusted input because its plan is compiled
+    /// from what the planner reads, and a recalled memory is untrusted whenever
+    /// whatever wrote it was. Refused here, where both facts are on one page.
+    fn validate_memory_recall(&self, recall: &MemoryRecall) -> Result<(), ManifestError> {
+        if self.spec.execution.as_ref().map(|e| e.kind) == Some(ExecutionKind::Planned) {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.memory.recall",
+                detail: "a `planned` agent compiles its plan from what the planner reads \
+                         and refuses untrusted input for that reason — and a recalled \
+                         memory is untrusted whenever whatever wrote it was. Use \
+                         `execution.kind: tool-calling`, or recall inside a `parse` \
+                         step's own agent",
+            });
+        }
+        if let MemorySubject::Literal(literal) = &recall.subject
+            && literal.trim().is_empty()
+        {
+            return Err(ManifestError::Empty("spec.memory.recall.subject"));
+        }
+        if recall.purpose.as_ref().is_some_and(|p| p.trim().is_empty()) {
+            return Err(ManifestError::Empty("spec.memory.recall.purpose"));
+        }
+        // A recall that returns nothing is not a narrower recall, it is the
+        // absence of one — spelled as a number a reviewer reads as a ceiling.
+        if !(1..=50).contains(&recall.limit) {
+            return Err(ManifestError::Syntax(
+                "spec.memory.recall.limit must be between 1 and 50 — 0 is a recall that \
+                 reads nothing while reading as a ceiling, and a prompt is not the place \
+                 for an unbounded corpus"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_memory_formation(&self, formation: &MemoryFormation) -> Result<(), ManifestError> {
         if self
             .spec
             .models
@@ -1984,14 +2136,15 @@ impl Manifest {
             .is_none()
         {
             return Err(ManifestError::Unenforceable {
-                field: "spec.memory_formation",
-                detail: "formation needs a declared privileged model",
+                field: "spec.memory.formation",
+                detail: "formation extracts facts with a model, and this agent declares \
+                         no privileged model to extract them with",
             });
         }
         for (field, value) in [
-            ("spec.memory_formation.purpose", formation.purpose.as_str()),
+            ("spec.memory.formation.purpose", formation.purpose.as_str()),
             (
-                "spec.memory_formation.instruction",
+                "spec.memory.formation.instruction",
                 formation.instruction.as_str(),
             ),
         ] {
@@ -2001,7 +2154,7 @@ impl Manifest {
         }
         match &formation.subject {
             MemorySubject::Literal(literal) if literal.trim().is_empty() => {
-                return Err(ManifestError::Empty("spec.memory_formation.subject"));
+                return Err(ManifestError::Empty("spec.memory.formation.subject"));
             }
             // Whether the run has a case is a deployment fact this document
             // cannot see — `RuntimeBuilder::try_build` refuses a plane with no
@@ -2011,7 +2164,7 @@ impl Manifest {
         }
         if !(1..=10).contains(&formation.max_items) {
             return Err(ManifestError::Syntax(
-                "spec.memory_formation.max_items must be between 1 and 10".to_owned(),
+                "spec.memory.formation.max_items must be between 1 and 10".to_owned(),
             ));
         }
         if formation.retention_seconds == Some(0) || formation.access_retention_seconds == Some(0) {

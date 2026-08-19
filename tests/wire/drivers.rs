@@ -250,7 +250,7 @@ async fn a_declined_request_did_not_happen() {
             json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": "no" } }),
         );
         let url = serve(c).await;
-        let client = A2aClient::new(Endpoint::new(url)).unwrap();
+        let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
         let err = client
             .send(
                 &PeerId::new("peer"),
@@ -283,7 +283,7 @@ async fn an_invalid_agent_response_is_in_doubt() {
         }),
     );
     let url = serve(c).await;
-    let client = A2aClient::new(Endpoint::new(url)).unwrap();
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
     let err = client
         .send(
             &PeerId::new("peer"),
@@ -311,7 +311,7 @@ async fn an_internal_error_is_in_doubt_not_a_refusal() {
         json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32603, "message": "boom" } }),
     );
     let url = serve(c).await;
-    let client = A2aClient::new(Endpoint::new(url)).unwrap();
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
     let err = client
         .send(
             &PeerId::new("peer"),
@@ -346,7 +346,7 @@ async fn an_internal_error_is_in_doubt_not_a_refusal() {
 async fn a_server_error_is_in_doubt() {
     let (c, _) = canned(500, json!({ "error": "boom" }));
     let url = serve(c).await;
-    let client = A2aClient::new(Endpoint::new(url)).unwrap();
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
     let err = client
         .send(
             &PeerId::new("peer"),
@@ -379,7 +379,7 @@ async fn a_server_error_is_in_doubt() {
 async fn an_unauthorized_call_did_not_happen() {
     let (c, _) = canned(401, json!({ "error": "no" }));
     let url = serve(c).await;
-    let client = A2aClient::new(Endpoint::new(url)).unwrap();
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
     let err = client
         .send(
             &PeerId::new("peer"),
@@ -418,7 +418,7 @@ async fn a_failed_task_landed() {
         }),
     );
     let url = serve(c).await;
-    let client = A2aClient::new(Endpoint::new(url)).unwrap();
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
     let err = client
         .send(
             &PeerId::new("peer"),
@@ -451,7 +451,7 @@ async fn an_accepted_task_is_not_a_failure() {
         }),
     );
     let url = serve(c).await;
-    let client = A2aClient::new(Endpoint::new(url)).unwrap();
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
     let out = client
         .send(
             &PeerId::new("peer"),
@@ -471,7 +471,9 @@ async fn an_accepted_task_is_not_a_failure() {
 async fn an_unreachable_peer_did_not_happen() {
     // Port 1 on loopback: nothing binds it, and the connection is refused
     // rather than hanging.
-    let client = A2aClient::new(Endpoint::new("http://127.0.0.1:1")).unwrap();
+    let client = A2aClient::new(Endpoint::new("http://127.0.0.1:1"))
+        .unwrap()
+        .allow_loopback();
     let err = client
         .send(
             &PeerId::new("peer"),
@@ -501,7 +503,7 @@ async fn the_delegation_chain_rides_a_declared_extension() {
         }),
     );
     let url = serve(c).await;
-    let client = A2aClient::new(Endpoint::new(url)).unwrap();
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
     client
         .send(
             &PeerId::new("peer"),
@@ -547,7 +549,9 @@ async fn a_malformed_send_message_response_is_in_doubt() {
         json!({ "task": "not-an-object" }),
     ] {
         let (c, _) = canned(200, json!({ "jsonrpc": "2.0", "id": 1, "result": result }));
-        let client = A2aClient::new(Endpoint::new(serve(c).await)).unwrap();
+        let client = A2aClient::new(Endpoint::new(serve(c).await))
+            .unwrap()
+            .allow_loopback();
         let err = client
             .send(
                 &PeerId::new("peer"),
@@ -1665,9 +1669,15 @@ fn the_api_key_is_not_printable() {
 //
 // The reason the streaming path exists is not latency — nothing here is
 // rendering tokens to a person. It is that a *severed* response can still say
-// what it burned, and the two providers differ in how much of that they make
-// possible. Both halves are asserted below, because the asymmetry is a design
-// claim and not an implementation detail.
+// what it burned, and how much of that a provider makes possible is a property
+// of its wire rather than of this crate. Anthropic, Gemini and Bedrock report
+// usage as the answer is delivered, so a cut connection carries a bill;
+// OpenAI's Responses stream and the Chat Completions wire report it only in the
+// terminal event, so a cut one can say generation happened and nothing more.
+//
+// Every driver is asserted against the rung its own wire reaches, because
+// "this provider cannot do better" and "this driver did not look" produce the
+// same `Unaccounted` and only the first is honest.
 
 /// Serves a canned SSE body, optionally cutting the connection partway.
 #[derive(Clone)]
@@ -2121,7 +2131,7 @@ async fn a_peer_call_carries_attested_provenance() {
         }),
     );
     let url = serve(c).await;
-    let client = A2aClient::new(Endpoint::new(url)).unwrap();
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
 
     let payload = json!({ "doc": "INV-9" });
     let signer = agentplane::testkit::StubSigner::default();
@@ -2181,7 +2191,7 @@ async fn a_peer_call_without_provenance_sends_none() {
         }),
     );
     let url = serve(c).await;
-    let client = A2aClient::new(Endpoint::new(url)).unwrap();
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
     client
         .send(
             &PeerId::new("peer"),
@@ -3665,6 +3675,66 @@ async fn gemini_a_stream_severed_after_generation_is_not_free_to_retry() {
         .unwrap_err();
     assert!(matches!(&error, ModelError::Unaccounted { .. }), "{error}");
     assert_eq!(error.disposition(), Disposition::Landed);
+}
+
+/// **A severed Gemini stream reports what it burned.**
+///
+/// Gemini sends `usageMetadata` on the chunks themselves and reports it
+/// cumulatively, so unlike a Responses stream it has already said what a
+/// half-delivered answer cost. That makes `Interrupted` — the one severed
+/// answer carrying a bill — reachable here, and it is the stated reason
+/// streaming is this driver's default.
+///
+/// Without this rung every severed Gemini stream bills zero while the provider
+/// invoices, so the token ceiling that exists to bound a runaway provider
+/// counts nothing during exactly the failure it was bought for. The counts are
+/// asserted rather than merely the variant, because the normalisation is where
+/// the money is: `thoughtsTokenCount` is billed as output and reported beside
+/// `candidatesTokenCount`, and `cachedContentTokenCount` is a subset of the
+/// prompt rather than an addition to it.
+#[tokio::test]
+async fn gemini_a_severed_stream_reports_what_it_burned() {
+    let (url, _q) = serve_gemini_sse(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}],\
+         \"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":30,\
+         \"thoughtsTokenCount\":7,\"cachedContentTokenCount\":40}}\n\n",
+    )
+    .await;
+    let driver = Gemini::new("k").unwrap().base(url);
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("hello");
+
+    let error = driver
+        .complete(gemini_request(&model, &prompt, &[], &[], None))
+        .await
+        .unwrap_err();
+
+    match &error {
+        ModelError::Interrupted { usage, .. } => {
+            assert_eq!(
+                usage.input_tokens, 100,
+                "cached input is a subset of the prompt count, not an addition \
+                 to it — adding it bills the cache twice"
+            );
+            assert_eq!(
+                usage.output_tokens, 37,
+                "thought tokens are billed as output and reported beside the \
+                 candidate count, so a reasoning-heavy answer under-reports by \
+                 most of its bill when they are dropped"
+            );
+            assert_eq!(usage.cache_read_tokens, 40);
+            assert_eq!(usage.spend().tokens, 137);
+        }
+        other => panic!(
+            "a severed stream whose usage the provider already reported must \
+             carry it: {other}"
+        ),
+    }
+    assert_eq!(
+        error.disposition(),
+        Disposition::Landed,
+        "we watched it generate; asking again buys a second bill"
+    );
 }
 
 /// A stream that never generated is safe to repeat.

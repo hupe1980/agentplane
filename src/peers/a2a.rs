@@ -129,11 +129,27 @@ pub use super::PROTOCOL_VERSION;
 pub struct A2aClient {
     /// Where this client may connect, if the deployment says.
     egress: Option<crate::core::Egress>,
-    http: reqwest::Client,
     endpoint: Endpoint,
+    /// Lift the public-address check for a peer on this machine. `testkit`
+    /// only, and absent from any other build.
+    #[cfg(feature = "testkit")]
+    loopback: bool,
 }
 
 impl A2aClient {
+    /// Permit a peer served from this machine.
+    ///
+    /// Behind `testkit` and therefore **absent from a production build**: an
+    /// exception that can only be compiled into a test binary cannot be left on
+    /// by accident in a deployment. It applies to a host that *is* a loopback
+    /// literal or `localhost`, never to one that merely resolved to one.
+    #[cfg(feature = "testkit")]
+    #[must_use]
+    pub const fn allow_loopback(mut self) -> Self {
+        self.loopback = true;
+        self
+    }
+
     /// Restrict where this client may connect.
     ///
     /// Deny-by-default once set: an endpoint whose host is not granted is
@@ -149,17 +165,11 @@ impl A2aClient {
     ///
     /// If the HTTP client cannot be built.
     pub fn new(endpoint: Endpoint) -> Result<Self, PeerError> {
-        let http = reqwest::Client::builder()
-            .timeout(endpoint.timeout)
-            .build()
-            .map_err(|e| PeerError::Unreachable {
-                peer: PeerId::new("<local>"),
-                detail: format!("could not build an HTTP client: {e}"),
-            })?;
         Ok(Self {
             egress: None,
-            http,
             endpoint,
+            #[cfg(feature = "testkit")]
+            loopback: false,
         })
     }
 
@@ -244,6 +254,64 @@ impl A2aClient {
         })
     }
 
+    /// A client that will connect only to addresses this call approved.
+    async fn pinned_client(
+        &self,
+        peer: &PeerId,
+        host: &str,
+        parsed: &reqwest::Url,
+    ) -> Result<reqwest::Client, PeerError> {
+        // `Url::host_str` keeps the brackets on an IPv6 literal and the
+        // resolver refuses them. Only the lookup uses the bare form.
+        let lookup = host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(host)
+            .to_owned();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let resolved = tokio::net::lookup_host((lookup.as_str(), port))
+            .await
+            .map_err(|error| PeerError::Unreachable {
+                peer: peer.clone(),
+                detail: format!("DNS for '{host}': {error}"),
+            })?;
+        let addrs = if self.loopback_allowed() && crate::netguard::is_loopback_name(host) {
+            // Named rather than inferred: the exception covers a host that *is*
+            // loopback, not one that resolved there.
+            resolved.collect::<Vec<_>>()
+        } else {
+            crate::netguard::all_public(host, resolved).map_err(|error| PeerError::Refused {
+                peer: peer.clone(),
+                detail: error.to_string(),
+            })?
+        };
+        let mut client = reqwest::Client::builder()
+            .timeout(self.endpoint.timeout)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+        for addr in &addrs {
+            client = client.resolve(host, *addr);
+        }
+        client.build().map_err(|error| PeerError::Unreachable {
+            peer: peer.clone(),
+            detail: error.to_string(),
+        })
+    }
+
+    /// Whether the loopback exception is in force. Always false without
+    /// `testkit`, which is what lets the call path read one flag.
+    #[allow(clippy::unused_self)]
+    const fn loopback_allowed(&self) -> bool {
+        #[cfg(feature = "testkit")]
+        {
+            self.loopback
+        }
+        #[cfg(not(feature = "testkit"))]
+        {
+            false
+        }
+    }
+
     async fn rpc(
         &self,
         peer: &PeerId,
@@ -252,20 +320,44 @@ impl A2aClient {
     ) -> Result<Value, PeerError> {
         // Before the request is built: a refused destination must reach
         // nothing and must be `DidNotHappen`.
-        if let Some(egress) = &self.egress {
-            let host = reqwest::Url::parse(&self.endpoint.url)
-                .ok()
-                .and_then(|url| url.host_str().map(ToOwned::to_owned));
-            if let Err(error) = egress.permits(host.as_deref()) {
-                return Err(PeerError::Refused {
-                    peer: peer.clone(),
-                    detail: error.to_string(),
-                });
-            }
+        let parsed =
+            reqwest::Url::parse(&self.endpoint.url).map_err(|error| PeerError::Refused {
+                peer: peer.clone(),
+                detail: format!("the peer endpoint is not a URL: {error}"),
+            })?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| PeerError::Refused {
+                peer: peer.clone(),
+                detail: "the peer endpoint names no host".to_owned(),
+            })?
+            .to_owned();
+        if let Some(egress) = &self.egress
+            && let Err(error) = egress.permits(Some(host.as_str()))
+        {
+            return Err(PeerError::Refused {
+                peer: peer.clone(),
+                detail: error.to_string(),
+            });
         }
 
-        let mut request = self
-            .http
+        // An endpoint is not always the operator's own string. `PeerRegistry`
+        // holds ones an operator wrote, but `AgentCard::endpoint` takes the URL
+        // straight out of a **discovered card** — a document another party
+        // publishes about itself. A forged card cannot widen a grant, which is
+        // the property that makes discovery survivable; what it can still do is
+        // name an address, and this request carries the run's payload and a
+        // bearer credential to whatever it names.
+        //
+        // So the same rule as every other dereference here: every resolved
+        // address checked, the connection pinned to exactly those, and no
+        // redirects — a check on the endpoint says nothing about the third host
+        // it forwards to. Resolved per call rather than at construction because
+        // DNS changes, and a client that pinned once would keep answering with
+        // whatever was true when it was built.
+        let client = self.pinned_client(peer, &host, &parsed).await?;
+
+        let mut request = client
             .post(&self.endpoint.url)
             .header("A2A-Version", PROTOCOL_VERSION)
             .header("A2A-Extensions", EXTENSION_URI)

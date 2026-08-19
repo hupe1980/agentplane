@@ -1910,6 +1910,105 @@ async fn run_tool_calling<T: agentplane::tools::Tool>(
     (out, provider)
 }
 
+/// **A turn cut off by the output budget is not a turn.**
+///
+/// Every driver computes `Completion::truncated` — five of them, each with a
+/// paragraph explaining that a partial answer must never be shaped like a whole
+/// one — and until this test nothing anywhere read it. The bit was produced,
+/// documented, and unfalsifiable: there was no input that made any code path
+/// behave differently, so every test asking "did we get a completion" passed.
+///
+/// The dangerous half is the one with tool calls. A turn cut mid-output leaves
+/// the last call's arguments as whatever survived the cut — still syntactically
+/// valid JSON, saying something the model did not finish saying. Running it is
+/// not a degraded answer; it is a side effect performed on a request nobody
+/// wrote. So this asserts the tool never ran, not merely that the run failed:
+/// a refusal that happens *after* the call is no refusal at all.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_truncated_turn_asking_for_tools_never_runs_them() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::testkit::FakeProvider;
+    use agentplane::tools::ToolBox;
+
+    let provider = FakeProvider::new();
+    provider
+        .will_call_tool("call_1", "ledger__read", json!({ "account": "AC-1" }))
+        .truncated();
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let manifest =
+        Manifest::parse(&tool_calling_agent("      max_sensitivity: internal")).expect("parse");
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .toolbox(ToolBox::new().with::<TimesOut>())
+        .build();
+
+    let out = rt
+        .run("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .await
+        .expect("the run completes");
+
+    assert!(
+        matches!(&out.status, RunStatus::Failed(m) if m.contains("output budget")),
+        "a truncated tool-asking turn was accepted as an instruction: {:?}",
+        out.status
+    );
+    assert_eq!(
+        provider.calls(),
+        1,
+        "the loop continued past a turn it could not trust"
+    );
+}
+
+/// The other half: a cut-off *answer* is not the agent's answer either.
+///
+/// Less dangerous than the tool case — nothing acts on it — and still wrong in
+/// the way this crate refuses everywhere else (P7): returning it would settle a
+/// partial result as the run's output with nothing marking it partial. The
+/// coded tier keeps the choice, because a caller holding the `Completion` knows
+/// whether early-stopping prose is useful to them; the declarative tier has no
+/// such caller, so the loop decides.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_truncated_answer_is_not_settled_as_the_runs_output() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::testkit::FakeProvider;
+    use agentplane::tools::ToolBox;
+
+    let provider = FakeProvider::new();
+    provider.will_say("the balance is 4").truncated();
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let manifest =
+        Manifest::parse(&tool_calling_agent("      max_sensitivity: internal")).expect("parse");
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .toolbox(ToolBox::new().with::<TimesOut>())
+        .build();
+
+    let out = rt
+        .run("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .await
+        .expect("the run completes");
+
+    assert!(
+        matches!(&out.status, RunStatus::Failed(m) if m.contains("partial answer")),
+        "a cut-off answer was settled as the run's output: {:?}",
+        out.status
+    );
+}
+
 /// An unknown outcome is not a failed call, and must not be reported as one.
 ///
 /// `StepError::Undecidable` is the runtime saying it cannot tell "never

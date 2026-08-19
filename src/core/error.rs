@@ -378,11 +378,31 @@ impl EffectError {
     /// Zero for everything that never reached a meter. The runtime bills this on
     /// the failure path, so a call that burned tokens and then died is counted
     /// against the run's ceiling rather than being free.
+    ///
+    /// Written out variant by variant rather than defaulting the rest, because
+    /// the default would be **free** and the ceilings this feeds — tokens,
+    /// cost, `max_effects` — exist to bound exactly the runaway a flaky
+    /// provider produces. A variant added later that carries a meter would
+    /// compile, pass every test here, and silently spend nothing; enumerated,
+    /// it does not build until somebody has answered what it cost.
     #[must_use]
     pub fn spend(&self) -> Spend {
         match self {
             Self::Metered { spend, .. } => *spend,
-            _ => Spend::default(),
+            // Nothing reached a meter: refused before dispatch, refused by the
+            // peer, or answered and rejected. `Final` carries the last
+            // attempt's verdict and no meter of its own — every attempt was
+            // billed as it failed, and adding them again here would double
+            // every retried run's spend.
+            Self::Unavailable { .. }
+            | Self::Rejected(_)
+            | Self::Refused(_)
+            | Self::Timeout { .. }
+            | Self::Interrupted { .. }
+            | Self::Performed(_)
+            | Self::OutputShape(_)
+            | Self::Final { .. }
+            | Self::Other(_) => Spend::default(),
         }
     }
 

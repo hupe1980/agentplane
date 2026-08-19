@@ -87,6 +87,37 @@ impl FakeProvider {
         self
     }
 
+    /// Mark the answer queued last as cut off by the output budget.
+    ///
+    /// Composes with every constructor here rather than duplicating them:
+    /// `will_say(..).truncated()`, `will_call_tool(..).truncated()`. A provider
+    /// stops mid-turn for one reason and it can happen to any shape of turn, so
+    /// one modifier is the honest shape — and a per-constructor variant of each
+    /// would be four spellings of one bit.
+    ///
+    /// It exists because the control that reads this bit cannot otherwise be
+    /// tested: a truncated turn is refused by the declarative loop, and a
+    /// refusal no fake can provoke is a rule nothing proves the runtime honours.
+    ///
+    /// # Panics
+    ///
+    /// If nothing is queued, or the last queued item is a failure. Both mean
+    /// the call is being read as arranging something it does not arrange.
+    pub fn truncated(&self) -> &Self {
+        let mut scripted = self.scripted.lock().expect("fake");
+        let last = scripted
+            .back_mut()
+            .expect("`truncated()` modifies the answer queued before it, and none is queued");
+        let completion = last.as_mut().expect(
+            "`truncated()` was called after `will_fail`, but a failure has no answer to cut \
+             off — a provider that ran out of output budget still answered",
+        );
+        completion.truncated = true;
+        completion.stop_reason = Some("max_tokens".to_owned());
+        drop(scripted);
+        self
+    }
+
     /// Queue one failure.
     ///
     /// Use the metered variants — `Unusable`, `Interrupted` — to exercise the

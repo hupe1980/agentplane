@@ -1087,11 +1087,19 @@ async fn connect_mcp_servers(
             .serve(transport)
             .await
             .map_err(|e| format!("the MCP server `{name}` did not initialise: {e}"))?;
-        eprintln!("  mcp: {name} <- {command}");
+        let client = agentplane::tools::McpClient::new(name, Arc::new(service));
+        // The negotiated version, not the offered one. MCP negotiation is a
+        // designed downgrade, and a server that answered with an older version
+        // still serves `tools/call` — it simply never returns a task, so a
+        // long-running tool behaves synchronously and nothing says why. This
+        // tier has no Rust in which to ask, so the line says it.
+        match client.negotiated_version() {
+            Some(version) => eprintln!("  mcp: {name} <- {command} (MCP {version})"),
+            None => eprintln!("  mcp: {name} <- {command}"),
+        }
         wired.push((
             name.to_owned(),
-            Arc::new(agentplane::tools::McpClient::new(name, Arc::new(service)))
-                as Arc<dyn agentplane::tools::ToolClient>,
+            Arc::new(client) as Arc<dyn agentplane::tools::ToolClient>,
         ));
     }
     Ok(wired)
@@ -1485,13 +1493,12 @@ async fn driver(name: &str) -> Result<Arc<dyn ModelProvider>, String> {
 
 /// Every provider name *this* binary can construct.
 ///
-/// Assembled from the same `cfg`s as the dispatch above. It used to be a
-/// hand-written sentence — "this binary ships anthropic, bedrock, gemini,
-/// openai, chat-completions and fake" — which was true only because the `cli`
-/// feature happened to force every one of them on. The moment `bedrock` became
-/// opt-in, that sentence started telling a reader their build had a driver it
-/// did not have, and the compiler has nothing to say about a string. A list
-/// derived from the build cannot disagree with the build.
+/// Assembled from the same `cfg`s as the dispatch above, rather than written
+/// out as prose. A hand-written list is true only for whichever feature set
+/// the author had in mind: the moment a driver becomes opt-in, the sentence
+/// starts telling a reader their build has something it does not, and the
+/// compiler has nothing to say about a string. A list derived from the build
+/// cannot disagree with the build.
 fn shipped_providers() -> Vec<&'static str> {
     #[allow(unused_mut)]
     let mut names: Vec<&'static str> = Vec::new();

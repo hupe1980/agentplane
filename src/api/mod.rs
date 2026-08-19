@@ -175,10 +175,9 @@ impl Caller {
 /// `peer:{actor}`, one spelling for every transport.
 ///
 /// The `{actor}` is the **authenticated** caller, never a name the body
-/// claimed. Three spellings of one counterparty used to exist — bare
-/// `{actor}` on operator-API events, `a2a:peer:{actor}` on A2A task
-/// continuations, `peer:{actor}` on A2A message inputs — and nothing
-/// downstream distinguishes transports: the event `source` becomes the
+/// claimed. One spelling covers every door a counterparty arrives through —
+/// operator-API events, A2A task continuations, A2A message inputs — because
+/// nothing downstream distinguishes transports: the event `source` becomes the
 /// delivered value's provenance exactly as a message input's `SourceId` does.
 /// So a protected sink field naming the one counterparty it accepts a value
 /// from would match or miss depending on which door the value came through,

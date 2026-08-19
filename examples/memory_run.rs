@@ -8,8 +8,8 @@ use std::sync::Arc;
 use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, SourceId, Tainted, Timestamp};
 use agentplane::journal::JournalStore;
 use agentplane::memory::{
-    InMemorySemanticRetriever, MemoryItem, MemoryStore, MemoryWrite, Recall, Selected,
-    SemanticQuery, SemanticRetriever, SemanticVector,
+    Embedder, InMemorySemanticRetriever, IndexIdentity, MemoryItem, MemoryStore, MemoryWrite,
+    Recall, Selected, SemanticSearch, SemanticVector,
 };
 use agentplane::runtime::{Runtime, StepCtx};
 use agentplane::store::RedbStore;
@@ -63,8 +63,33 @@ impl Skill for TeamMemory {
     }
 }
 
+/// The space this example's index lives in. Both halves are one string on
+/// purpose: anything that changes what the floats *mean* — the model, the
+/// width, whether a query is embedded differently from a document — belongs in
+/// the revision, because that is what `build` matches against the index.
+const REVISION: &str = "example-embedding@2";
+
+/// A stand-in for a real embedding service, deterministic so the example is.
 #[derive(Debug)]
-struct SemanticMemory(Arc<dyn SemanticRetriever>);
+struct ExampleEmbedder;
+
+#[async_trait::async_trait]
+impl Embedder for ExampleEmbedder {
+    fn revision(&self) -> String {
+        REVISION.to_owned()
+    }
+
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, agentplane::core::StoreError> {
+        Ok(if text.contains("language") {
+            vec![1.0, 0.0]
+        } else {
+            vec![0.0, 1.0]
+        })
+    }
+}
+
+#[derive(Debug)]
+struct SemanticMemory;
 
 #[async_trait::async_trait]
 impl Skill for SemanticMemory {
@@ -77,19 +102,16 @@ impl Skill for SemanticMemory {
         cx: &mut StepCtx<'_>,
         _input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
+        // No vector, no model name, no snapshot: those come from the wiring,
+        // which `build` already held to itself. A query embedded in the wrong
+        // space would not fail — it would rank unrelated memories.
         let found = cx
             .semantic_recall(
-                Arc::clone(&self.0),
-                Tainted::trusted(SemanticQuery {
-                    subject: "team/support".to_owned(),
-                    purpose: Some("customer-preferences".to_owned()),
-                    text: "preferred language".to_owned(),
-                    embedding: vec![1.0, 0.0],
-                    embedding_model: "example-embedding@1".to_owned(),
-                    index_snapshot: "example-snapshot-1".to_owned(),
-                    limit: 1,
-                    max_sensitivity: agentplane::core::Sensitivity::Internal,
-                }),
+                SemanticSearch::about("team/support")
+                    .for_purpose("customer-preferences")
+                    .limit(1)
+                    .max_sensitivity(agentplane::core::Sensitivity::Internal),
+                Tainted::trusted("preferred language".to_owned()),
             )
             .await?;
         Ok(Outcome::done(
@@ -151,8 +173,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let retriever = Arc::new(InMemorySemanticRetriever::new(
-        "example-index",
-        "example-snapshot-1",
+        IndexIdentity {
+            snapshot: "example-snapshot-1".to_owned(),
+            query_revision: REVISION.to_owned(),
+        },
         vec![SemanticVector {
             subject: stored.subject.clone(),
             purpose: stored.purpose.clone(),
@@ -163,12 +187,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             embedding: vec![1.0, 0.0],
         }],
-    )) as Arc<dyn SemanticRetriever>;
+    ));
     let journal: Arc<dyn JournalStore> = store.clone();
     let memories: Arc<dyn MemoryStore> = store.clone();
     let semantic = Runtime::builder(journal)
         .memory(memories)
-        .skill(SemanticMemory(retriever))
+        .semantic_memory(Arc::new(ExampleEmbedder), retriever)
+        .skill(SemanticMemory)
         .build();
     let ranked = semantic
         .run("support.semantic-memory", Tainted::trusted(json!({})))

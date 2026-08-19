@@ -48,13 +48,15 @@ pub enum Topology {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Collaboration {
-    // `ContextOverflow` used to sit here and was removed rather than kept as a
-    // documented no-op. Whether work exceeds a context window is not a property
-    // of the graph, so the contract could not check it — and an unchecked
-    // justification is not a weak control, it is an *escape hatch*: a plan
-    // refused as false parallelism was approved by editing one word, which made
-    // the two real checks optional for anyone who noticed. I12 leaves two
-    // choices for a control nothing enforces, and this is the other one.
+    // Every justification here is one the contract can check against the
+    // graph, and that is the admission rule rather than a coincidence. A
+    // context-window justification is the tempting variant and is deliberately
+    // absent: whether work exceeds a context window is not a property of the
+    // graph, so nothing could check it — and an unchecked justification is not
+    // a weak control but an *escape hatch*, since a plan refused as false
+    // parallelism would be approved by editing one word, making the two real
+    // checks optional for anyone who noticed. I12 leaves two choices for a
+    // control nothing enforces, and this enum takes the other one.
     /// Sub-tasks operate on disjoint inputs.
     ///
     /// Checked, not taken on trust: overlapping inputs are *false parallelism*,

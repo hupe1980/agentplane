@@ -8,8 +8,9 @@
 //! What it does implement exactly is the *semantics* worth testing without a
 //! KMS, and it implements them the way a service does: a **wrapping key** per
 //! scope and generation, a fresh data key per call sealed under it,
-//! destruction, idempotent tombstones, and rotation that re-wraps under a
-//! genuinely different key.
+//! destruction, idempotent tombstones, rotation that adds a genuinely
+//! different key without disturbing the old ones, and a version floor below
+//! which decryption is refused as retired rather than as loss.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -37,19 +38,20 @@ struct RingState {
     /// generation of a scope at once; rotation adds a generation without
     /// touching the old ones.
     ///
-    /// Generation-dependent on purpose. An earlier shape held one KEK per
-    /// scope and let [`MemoryKeyRing::rotate`] bump only the *label*, so the
-    /// rotation conformance test passed vacuously: `open` ignored
-    /// `wrapped_by`, nothing could ever fail to open, and "payloads sealed
-    /// before the rotation stay readable" was true because nothing had
-    /// rotated. With a key per generation, `open` must consult `wrapped_by`
-    /// to find the right KEK — exactly as a KMS resolves a key version — and
-    /// a wrap this ring never issued is refused instead of silently opened
-    /// with whatever key is current.
+    /// Generation-dependent on purpose. Holding one KEK per scope and letting
+    /// [`MemoryKeyRing::rotate`] bump only a *label* would make every rotation
+    /// property vacuous: `open` could ignore `wrapped_by`, nothing would ever
+    /// fail to open, and "payloads sealed before the rotation stay readable"
+    /// would be true because nothing had rotated. With a key per generation,
+    /// `open` must consult `wrapped_by` to find the right KEK — exactly as a
+    /// KMS resolves a key version — and a wrap this ring never issued is
+    /// refused instead of silently opened with whatever key is current.
     wrapping: HashMap<String, HashMap<u64, [u8; 32]>>,
     destroyed: HashMap<String, (Timestamp, String)>,
     /// Bumped by [`MemoryKeyRing::rotate`]; the id a new wrap is stamped with.
     generation: u64,
+    /// The lowest generation [`MemoryKeyRing::open`] will still decrypt.
+    floor: u64,
 }
 
 impl MemoryKeyRing {
@@ -58,16 +60,26 @@ impl MemoryKeyRing {
         Self::default()
     }
 
-    /// Move to a new wrapping key. Existing data keys stay openable until
-    /// rewrapped, which is what makes rotation not an outage.
+    /// Move to a new wrapping key.
     ///
-    /// The next mint or rewrap draws a **fresh KEK** under the new generation;
-    /// prior generations keep their keys so old wraps still open. What this
-    /// fake has no counterpart for is *retiring* a generation — a real KMS can
-    /// refuse decryption under versions below a floor, and this ring only
-    /// destroys whole scopes.
+    /// The next mint draws a **fresh KEK** under the new generation; prior
+    /// generations keep their keys, so envelopes sealed before the rotation
+    /// still open. That is the property sealed-byte immutability rests on —
+    /// rotation adds a version, it does not invalidate one — and it is what
+    /// makes rotation something other than an outage.
     pub fn rotate(&self) {
         self.state.lock().expect("keyring lock").generation += 1;
+    }
+
+    /// Refuse to decrypt below `generation`, as a KMS version floor does.
+    ///
+    /// Vault's `min_decryption_version` and its equivalents elsewhere. Modelled
+    /// here because it is the one operator action that makes un-erased history
+    /// unreadable, and a ring that could not express it would leave
+    /// [`KeyError::Retired`] unreachable in every test — an error variant no
+    /// test can produce is a classification nothing proves the runtime honours.
+    pub fn retire_below(&self, generation: u64) {
+        self.state.lock().expect("keyring lock").floor = generation;
     }
 
     /// The current wrapping key's id.
@@ -106,9 +118,9 @@ impl MemoryKeyRing {
 
     /// The KEK for one scope and generation, minted on first use.
     ///
-    /// Only the *writing* paths call this — minting a data key, or rewrapping
-    /// under the current generation. The opening path must never mint: a KEK
-    /// invented at decryption time opens nothing and hides the mistake.
+    /// Only the *writing* path calls this — minting a data key under the
+    /// current generation. The opening path must never mint: a KEK invented at
+    /// decryption time opens nothing and hides the mistake.
     fn kek(state: &mut RingState, scope: &str, generation: u64) -> [u8; 32] {
         *state
             .wrapping
@@ -183,6 +195,15 @@ impl KeyRing for MemoryKeyRing {
         // to wrong bytes; only the erasure and rotation *semantics* are
         // faithful here, never the cryptography.
         let generation = Self::generation_of(&wrapped.wrapped_by)?;
+        // Checked before the lookup, so a retired version reports itself as
+        // retired rather than falling through to "no wrapping key for scope",
+        // which reads as loss.
+        if generation < state.floor {
+            return Err(KeyError::Retired {
+                scope: wrapped.scope.clone(),
+                key_id: wrapped.wrapped_by.clone(),
+            });
+        }
         let Some(kek) = state
             .wrapping
             .get(&wrapped.scope)
@@ -215,21 +236,5 @@ impl KeyRing for MemoryKeyRing {
             .entry(scope.to_owned())
             .or_insert_with(|| (at, reason.to_owned()));
         Ok(())
-    }
-
-    async fn rewrap(&self, wrapped: &WrappedKey) -> Result<WrappedKey, KeyError> {
-        // Opened under the generation that sealed it, re-sealed under the
-        // current one — the two KEKs are different keys, so the sealed bytes
-        // actually change and a test asserting "rotation moved the key" is
-        // asserting something that happened.
-        let dek = self.open(wrapped).await?;
-        let mut state = self.state.lock().expect("keyring lock");
-        let generation = state.generation;
-        let kek = Self::kek(&mut state, &wrapped.scope, generation);
-        Ok(WrappedKey {
-            scope: wrapped.scope.clone(),
-            wrapped_by: format!("memory-kek-{generation}"),
-            sealed: Self::xor(&kek, dek.expose()),
-        })
     }
 }

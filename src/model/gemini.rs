@@ -940,11 +940,34 @@ impl Gemini {
 
 /// A stream that stopped before the model said why.
 ///
-/// The whole judgement is whether any part was seen. Before the first one,
-/// nothing is known to have happened and the call is safe to repeat; after it,
-/// the provider generated tokens this driver cannot count — the same state the
-/// other streaming drivers can produce, and the same honest answer.
+/// Three rungs, and which one applies is decided by what the wire has already
+/// said rather than by how far the answer got:
+///
+/// 1. **`usageMetadata` seen** — Gemini reports it on the chunks themselves,
+///    cumulatively, so a stream cut off mid-answer has already been told what
+///    it burned. That is [`ModelError::Interrupted`], the one severed-stream
+///    answer that carries a bill, and it is the reason streaming is this
+///    driver's default.
+/// 2. **content but no usage** — generation happened and the cost is unknown.
+///    [`ModelError::Unaccounted`]: never free, never counted.
+/// 3. **nothing at all** — no evidence anything reached the model, so the call
+///    is safe to repeat and costs nothing.
+///
+/// Rung 1 is not an optimisation. Without it every severed Gemini stream bills
+/// zero, and the token ceiling that exists to bound a runaway provider counts
+/// nothing while the provider spends — the failure the ceiling was bought to
+/// prevent, in the one driver whose wire makes it avoidable.
 fn severed(model: &ModelId, acc: &gemini_stream::Accumulator, detail: &str) -> ModelError {
+    // Parsed by the buffered path's own function, so the normalisation that
+    // costs money — thought tokens billed as output, cached input a subset of
+    // the prompt — has exactly one spelling.
+    if let Some(envelope) = acc.usage_envelope() {
+        return ModelError::Interrupted {
+            model: model.clone(),
+            usage: Gemini::usage(&envelope),
+            detail: detail.to_owned(),
+        };
+    }
     if acc.generated() {
         return ModelError::Unaccounted {
             model: model.clone(),

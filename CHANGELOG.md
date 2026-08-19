@@ -30,6 +30,481 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.19.0] — 2026-08-19
+
+Four passes: two over the confidentiality layer — one over its rules, one over
+the bytes those rules turned out to imply something about — one over the
+outward-facing edges, the model providers and the two protocols this plane
+speaks, and one over memory, retrieval and the manifest surface in front of
+them.
+
+The confidentiality passes each found a shape that was holding something else
+open: the first a release blocker, the second the format's own
+algorithm-agility story.
+
+The edges passes found two shapes, each more than once. **A rule implemented
+once per surface**: a severed Gemini stream threw away usage the provider had
+already reported, because the accumulator holding it had no accessor and the
+other drivers' ladders were never compared; three A2A surfaces each carried
+their own copy of one task-state mapping. Neither is a wrong answer anybody
+could see — both are *agreements that happen to hold*, and both fail on the
+next edit rather than on this one.
+
+**A control counted rather than checked** is the second, and it is the one that
+had teeth. `netguard` opened by naming the crate's URL dereferences as *two*,
+and there were four: both A2A legs — the card fetch, and the call to the
+interface URL that card advertises — connected to an address nobody had
+checked. The sentence was true when it was written, nothing re-checked it, and
+the doors it did not know about were the ones standing open. The same sweep
+found two outbound clients with no timeout at all and a completion field five
+drivers produce and nothing reads.
+
+**A durable format that does not say which format it is.** A sealed envelope
+described its own lengths and not its own construction. That is invisible
+while one build writes and reads the bytes — which is every test — because the
+defect only exists *across* builds, and a durable format is precisely the
+artifact that outlives the build that wrote it. It is now shape 30 in the
+constitution's catalogue, and the sealed envelope is the worst place to have
+had it: the innermost check is an AEAD, so a reader meeting a construction it
+did not know walked its own layout over somebody else's and reported *the
+sealed payload did not authenticate* — the sentence that means tampering.
+
+The memory pass found one omission and one failure that could not fail.
+
+**The omission** was a whole half of a tier. A declarative agent could form
+durable facts on every run and had no way to read one back: recall lived on
+`StepCtx`, so the reading half of memory was reachable only from Rust — in the
+tier whose entire premise is that no Rust is written. Nothing was broken, every
+test passed, and the feature was half a feature.
+
+**The failure that could not fail** is the sharper one, and it is a new shape.
+Cosine similarity is *total*: it is defined between any two vectors of equal
+width. So a query embedded by one model revision and searched against an index
+built by another does not error, degrade or return nothing — it returns a
+confidently ranked list of unrelated memories, at full speed, with a plausible
+score beside every hit. The old API asked a caller to type the embedding model
+and the index snapshot into every query by hand, which is one chance to get it
+wrong per call site, and the only symptom of getting it wrong is *quality* —
+which has no threshold anybody can assert against in a test. This is now shape
+31 in the constitution's catalogue: a total operation cannot report a wrong
+input, so where one sits at a correctness boundary the check has to happen
+somewhere the operation is not.
+
+### Added — `spec.memory.recall`, so a declarative agent can read what it wrote
+
+**Breaking: `spec.memory_formation` moved to `spec.memory.formation`.** Every
+field under it is unchanged, and `deny_unknown_fields` makes the old spelling a
+parse error rather than a block that is silently ignored. The move exists
+because the block gained its other half.
+
+A declared recall reads before the first model call and folds the selected
+memories into the prompt under `/memory`, beside the trusted `/system`
+instruction and the caller's `/input`, as `{id, purpose, content, written_at}`.
+Each item carries **the label it was written with** — a fact a model produced
+last week stays untrusted this week, and the same egress ceiling and the same
+protected-field rules govern everything the answer then reaches for. That is
+the property the memory-poisoning literature says decides the outcome:
+information flow carried *across* the write and back out of the read, rather
+than content inspected at either end, because the attacks that work carry no
+linguistic signal at all
+([2605.22842](https://arxiv.org/abs/2605.22842),
+[2606.04329](https://arxiv.org/abs/2606.04329)).
+
+The `/memory` key is present even when nothing was recalled. A prompt whose
+shape depends on what the store happened to hold is one nobody can read against
+the manifest, and an instruction saying *use what you remember* would address a
+field that sometimes does not exist.
+
+Four refusals arrive with it, and one is a design statement rather than a
+validation: **`execution.kind: planned` may not declare a recall.** That kind
+refuses untrusted input because its plan is compiled from what the planner
+reads, and a recalled memory is untrusted whenever whatever wrote it was —
+allowing it would be that refusal walked around through the store. The other
+three: an empty `memory: {}` block, a `limit` outside `1..=50` (`0` reads in
+review as a ceiling and behaves as an agent that remembers nothing), and a
+`memory` block beside a coded skill, which calls `StepCtx::recall` and
+`StepCtx::form_memories` at moments it chooses. `BuildError::FormationWithoutMemory`
+became `BuildError::MemoryWithoutStore { agent, declared }`, naming which half
+wanted a store.
+
+**There is deliberately no `spec.memory.search`.** Similarity is computed over
+item content, so anything able to write a memory is a ranking signal: an
+attacker who cannot taint a value can still decide *which* clean values a model
+is shown, and no label anywhere in the run shows it. A deterministic recall's
+order is a fixed rule no stored item can move, which is what makes it safe to
+spell as one reviewed line. Ranked retrieval stays a Rust call, where accepting
+that channel is a decision somebody visibly made.
+
+### Changed — the embedding space is wiring, not a string a caller types
+
+**Breaking, for every caller of `cx.embed` and `cx.semantic_recall` and every
+`SemanticRetriever` implementation.** `RuntimeBuilder::semantic_memory(embedder,
+retriever)` takes the two together, and `build` refuses a plane whose embedder
+revision is not the one the index declares it accepts queries in
+(`BuildError::EmbeddingSpaceMismatch`) or that has no authoritative memory to
+materialise hits from (`BuildError::SemanticMemoryWithoutStore`).
+
+`SemanticRetriever` gains `index() -> IndexIdentity { snapshot, query_revision }`.
+`query_revision` is the revision a **query** vector must come from, which is
+deliberately not "what the documents were embedded with": asymmetric embedders
+embed a query and a document differently on purpose, so an index built from
+`…/search_document` names `…/search_query` here. The index states what it
+accepts; matching it is the wiring's job, and the two strings differing is the
+normal case rather than the suspicious one.
+
+So `cx.semantic_recall` now takes a `SemanticSearch` — a subject, an optional
+purpose, a limit and a sensitivity ceiling — and a `Tainted<String>`. It embeds
+and ranks as two journaled effects and assembles the `SemanticQuery` itself.
+`SemanticQuery`'s `embedding_model` and `index_snapshot` collapsed into one
+`index: IndexIdentity` that the runtime fills in, and `cx.embed` returns
+`Tainted<Embedding>` — the floats *and* the revision, read from the driver
+rather than supplied beside it.
+
+A retriever returning more hits than the declared limit is now **refused**
+rather than truncated. Truncating would leave the selection's membership decided
+by the seam's iteration order — a ranking nobody chose, arriving as though
+somebody had — and every extra hit costs an authoritative store read before
+anything downstream could drop it.
+
+`InMemorySemanticRetriever::new` takes `(IndexIdentity, Vec<SemanticVector>)`;
+its separate `identity` string is gone, because the effect key already carries
+the profile and the index. Its own snapshot self-check is gone too: every query
+is now built from `index()`, so that check could only ever compare a value with
+itself — shape 29, arrived at from the other direction.
+
+### Changed — sealed envelopes carry a format version
+
+**Breaking, and it is the heaviest kind this project ships: envelopes written
+by 0.18.0 and earlier do not open.** There is no migration and there cannot
+be one. Sealed bytes are rotation-immutable — the journal's hash chain commits
+to the envelope bytes, which is what lets an auditor holding no keys verify a
+run whose payloads were erased — so nothing can rewrite an old envelope into
+the new shape without breaking the chain around it. A deployment holding
+sealed data from an earlier version keeps it readable by staying on that
+version, or discards it. See
+[upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/).
+
+The layout is now `[u8 version][u32 len][wrapped data key][nonce][ciphertext ‖
+tag]`, and the version is read **before any offset is trusted** — which is the
+whole property, since a parser that reads a length first has already committed
+to a layout it has no rule for. One number, exposed as
+`keyring::ENVELOPE_FORMAT_VERSION`, naming the entire construction: layout,
+nonce width and AEAD together. Not a layout version beside a cipher
+identifier, because changing the cipher changes what the bytes mean, two
+numbers would be two spellings of one decision free to disagree, and a reader
+choosing between suites by trial is an oracle rather than a parser. It stays
+`1` until the durable-format freeze, like every other version in the crate.
+
+This closes the algorithm-agility half of the durable-format freeze blocker
+for the confidentiality layer: a second AEAD is a second version, and a build
+that does not know it refuses instead of guessing.
+
+### Added — `KeyError::UnknownFormat`, so a build skew is not read as tampering
+
+The same argument that produced `KeyError::Retired` one release ago, one layer
+down. An envelope naming a version this build does not read is not
+`Destroyed` — nothing was erased and no key moved — and it must not be
+`Refused`, which reaches `agentplane drill` as *this case's sealed state
+neither opens nor was its key destroyed*: loss or tampering, for a condition
+whose remedy is which binary is running.
+
+It is reachable from ordinary operations rather than incidents, which is why
+it needs to be legible: a mixed-version fleet mid-deploy, a rollback, and a
+restore from a backup taken by a newer plane all produce it. The drill reports
+such a case as a finding carrying its own remedy — it *is* a finding, because
+this plane is holding a case it cannot read — beside the retired-version arm
+and away from the arm that pages somebody.
+
+### Fixed — the drill answered "nothing to check" for state it could not read
+
+The half that made the above worth finding. `probe_sealed_case_state` returned
+`None` to mean *this state was never sealed*, and returned the same `None`
+when the state **was** marked sealed and could not be parsed: base64 that
+would not decode, a header that would not read, and — the one with teeth — an
+envelope whose erasure scope named a **different case**.
+
+So a case the plane could no longer read was counted as a case with nothing to
+check. No finding, no unchecked entry, and `is_sound()` still true: detection
+withheld by the pass whose only job is detection, and invisible to every test
+that counts findings rather than reading them. The foreign-scope row is the
+sharpest of the three, because it is not merely unreadable — erasing that case
+destroys a key which does not reach those bytes, so the data survives the
+deletion request and the drill's answer was that the case was clean.
+
+Past the sealed marker, every failure is now an answer. Damage and a foreign
+scope are refusals that reach the loss-or-tampering arm, which is where they
+belong; only an unknown version gets the reversible classification.
+
+### Fixed — a failure variant added later would have cost nothing
+
+`EffectError::spend` and `ModelError::usage` each matched one variant and
+defaulted the rest to zero. The default is **free**, and these are what the
+token, cost and `max_effects` ceilings are computed from — the ceilings that
+exist to bound exactly the runaway a flaky provider produces. A variant added
+later that burned tokens before dying would have compiled, passed every test,
+and spent nothing. Both are now exhaustive, so the question has to be answered
+before the code builds. No existing variant's answer changed.
+
+### Fixed — a severed Gemini stream billed nothing it had already been told
+
+Gemini sends `usageMetadata` on the chunks themselves, cumulatively, so a
+stream cut off mid-answer has already been told what it burned. The
+accumulator stored it, a unit test pinned that it stored it, and the
+severed-stream classifier could not reach it: there was no accessor, so every
+cut Gemini stream reported `Unaccounted` — generation happened, cost unknown —
+while the driver was holding the cost.
+
+The consequence is the one the ceiling exists to prevent. `Unaccounted` bills
+zero, so the token and cost ceilings that bound a runaway provider counted
+nothing during exactly the failure they were bought for. The driver's own
+`buffered()` documentation had been asserting the opposite the whole time:
+*a severed connection can say what it burned* was the stated reason streaming
+is this driver's default.
+
+Bedrock already had the full three-rung ladder — usage seen is `Interrupted`,
+generation without usage is `Unaccounted`, nothing seen is safe to repeat — and
+Gemini now reaches the same top rung, parsing through the buffered path's own
+function so the normalisation that costs money (thought tokens billed as
+output and added, cached input a subset and not added) keeps one spelling.
+
+The general rule is now in the constitution rather than left per driver:
+**"this provider cannot do better" and "this driver did not look" produce the
+same `Unaccounted`, and only the first is honest.** Under-reaching is invisible
+to every test that checks the variant instead of the counts, so each streaming
+driver owes a test asserting the rung it claims.
+
+### Fixed — three A2A surfaces each kept their own copy of one mapping
+
+`tasks/get`, `tasks/list` and the snapshot a subscription opens with are three
+views of one run's history. Each derived the A2A task state from its own
+byte-identical copy of the same match, and the drift had already started: the
+listing answered `"unknown"` where the others answered `"running"`.
+
+This is the duplicate-rule shape at its most dangerous, because a disagreement
+here is worse than a wrong answer. A client that polled, one that listed and
+one that subscribed would each be told something different about the same task,
+each would be behaving correctly, and the protocol gives them no way to
+discover it. The copies would have agreed right up until somebody added a
+record kind or reworded a suspension.
+
+One function now reads the history. The surfaces differ only in what they do
+with an empty one — no such task for a fetch, a working row for a listing that
+must not fail its page over one unreadable run — which is a real difference and
+is now the only one. A test drives all three over the wire against a task that
+is *input-required*, the one state all three can be asked about at once: a
+subscription to a finished task is refused before it reaches the stream, so a
+completed run would have left the third surface untested.
+
+Note what was **not** unified: `RunStatus → TaskState` and the sealed-outcome
+string mapping stay two functions, as their own documentation insists. The
+enum match is exhaustive and the compiler checks it; folding it into the string
+match behind `_ => Failed` would delete the only compile-time check and produce
+the same wrong answer twice, which is harder to notice than two different ones.
+
+### Fixed — both A2A URL legs were dereferenced without an address check
+
+`netguard`'s own documentation opened by naming the crate's URL dereferences:
+*two features* — governed media and push delivery — each of which resolves a
+host, checks every answer, pins the connection to exactly those addresses,
+refuses redirects and bounds the request. There were four, and the two it did
+not know about are A2A's.
+
+**Card discovery** fetched with a bare client: no address check, no redirect
+policy, no timeout, behind an allowlist that is optional and therefore absent by
+default. A card URL arrives from a config, a registry entry or a message and is
+routinely the first attacker-influenced string a deployment handles, which the
+module's own docs said in the paragraph above the code that did none of it.
+
+**The peer call** is the leg that matters more, because it carries data outward
+rather than fetching. `AgentCard::endpoint` takes the interface URL straight out
+of a *discovered card* and hands it to the client that posts the run's payload
+and a bearer credential. A forged card cannot widen a grant — that is the
+property that makes discovery survivable — but it can name an address, and
+nothing checked which one.
+
+Both now do what media and push already did. Two details are the ones that
+matter: the connection is **pinned** to the addresses that passed, because a
+check followed by a second resolution is the rebinding attack it appears to
+stop; and **redirects are refused**, because every check above applies to the
+first hop only. `is_loopback_name` moved into `netguard`, where the address
+rules live, so push and both A2A legs share one spelling of it — and the
+loopback exception stays `testkit`-gated, absent from any production build, and
+keyed on a host that *is* loopback rather than one that resolved there.
+
+### Fixed — two outbound clients had no timeout at all
+
+Found by the same sweep. `HttpWitness` and `VaultTransit` each built a bare
+`reqwest::Client` with no whole-request timeout, so a server that accepts the
+connection and never answers holds the caller indefinitely. For the witness that
+stalls checkpoint publication — an availability failure in the evidence layer,
+caused by the party whose whole purpose is to be independent of this one. For
+Vault it is worse: sealing and opening go through that client, so with a keyring
+configured it is most writes.
+
+### Fixed — `Completion::truncated` was produced by five drivers and read by none
+
+Every driver computes it, and three of them carry a paragraph explaining why —
+*a partial answer returned as a whole one is a silent truncation, which this
+crate refuses everywhere else*. Nothing anywhere read the bit. It is the
+catalogue's shape 26 exactly: the artifact always had the right shape, so every
+test asking *did we get a completion* passed, and there was no input that made
+any code path behave differently.
+
+The coded tier keeps the choice, which is the documented contract: a caller
+holding the `Completion` knows whether early-stopping prose is useful to them.
+The declarative tier has no such caller — the loop *is* the caller — so it
+decides, and the two halves are separated because only one is dangerous. A
+truncated turn **carrying tool calls** has been cut somewhere inside its own
+output, leaving the last call's arguments as whatever survived: syntactically
+valid JSON saying something the model did not finish saying. Running that is not
+a degraded answer, it is a side effect performed on a request nobody wrote. A
+truncated turn with no tool calls is merely a partial answer, and is refused
+rather than settled as the run's output.
+
+`FakeProvider::truncated()` makes the state producible — a modifier on whatever
+answer was queued last, rather than a variant of each constructor, because a
+provider stops mid-turn for one reason and it can happen to any shape of turn.
+A refusal no fake can provoke is a rule nothing proves the runtime honours.
+
+### Added — `McpClient::negotiated_version`, so a downgrade is not silent
+
+MCP negotiation is a designed downgrade: this host offers `2026-07-28`, a
+server answers with a version it speaks, and the connection proceeds on that.
+The client does not refuse — that is the protocol working, and it is why MCP
+and A2A are treated differently, since A2A asserts its version rather than
+negotiating it.
+
+What was missing is that the outcome was unknowable. An older server serves
+`tools/call` correctly and simply never returns a task, so the Tasks extension
+this module is written against is absent with nothing failing: a long-running
+tool behaves synchronously, a governed suspension never happens, and no error
+anywhere names the cause. `agentplane serve --mcp` now prints the negotiated
+version beside each server, because the declarative tier has no Rust in which
+to ask.
+
+Its test is driven by a hand-rolled server that actually answers `2025-06-18`,
+which matters more than it sounds: rmcp's own server handler *negotiates*, so
+against any cooperating fixture the offered and negotiated versions are the
+same string and an accessor that returned a constant would pass.
+
+### Fixed — one cache-accounting rule, spelled once
+
+Anthropic reports cached tokens *beside* `input_tokens` rather than inside it,
+so both are added back to mean *everything the provider processed*. That
+arithmetic was written twice — once on the buffered path, once in the stream
+accumulator. They agreed, and the copy that drifts is always on whichever path
+a deployment does not exercise, which for a streaming-by-default driver is the
+buffered one. The symptom would have been a bill nobody could reconcile rather
+than a failure. Both now call `Usage::with_cache_beside_input`.
+
+### Security — `h2` advisory RUSTSEC-2026-0258
+
+`h2` is updated to 0.4.16. The advisory is unbounded memory growth from empty
+`DATA` frames, and it reaches this crate through the HTTP/2 stack the A2A
+server listens on — a remote denial of service against the one surface built to
+accept calls from parties this plane does not control.
+
+### Fixed — a Postgres column this store could not read became a decision
+
+Three of the case store's six string decoders refused an unrecognised value
+and three answered with a default, decided by nothing. A decoder that answers
+with a fallback cannot report that the row was damaged, so the damage arrives
+as a *decision* — and `phase` is the one with teeth, because it tells a step's
+forward pass from its compensating one and defaulted to `Forward`. `OnExpiry`
+and `Priority` defaulted to their safe values, which is exactly what made them
+the wrong answer: a fail-closed default is still a fact the store invented
+about a row nobody could read.
+
+All six now refuse, like their neighbours and like the embedded backend, whose
+rows go through serde and have always rejected an unknown variant. Every call
+site already returned `StoreError`, so this costs a `?`.
+
+### Fixed — `bearer` was not a bearer credential
+
+`TokenAuthenticator` compared the `Authorization` scheme case-sensitively, and
+RFC 9110 §11.1 defines it as case-insensitive. The failure has the worst shape
+an authenticator can produce: `bearer <token>` is a legal request, and
+answering it `Missing` tells a conforming client *you sent no credential* — so
+the client retries exactly what it already did. Only the scheme name is
+case-folded; the token keeps its bytes and its constant-time comparison, and a
+test pins both halves, because folding the token would silently shrink the
+space an attacker has to search.
+
+**A seam method the architecture forbids anyone to call.** `KeyRing::rewrap`
+was the standard answer to key rotation, implemented correctly against Vault's
+transit engine, exercised by the conformance battery — and impossible to run.
+It is now shape 29 in the constitution's catalogue, and the interesting part is
+not that it was dead code but that it was *load-bearing in the wrong
+direction*: a baseline requirement read as met because the capability existed,
+which is how the hazard it should have removed went unnamed.
+
+### Removed — `KeyRing::rewrap`
+
+**Breaking.** The method is gone from the trait, from `VaultTransit`, from
+`MemoryKeyRing`, and from the key-ring conformance battery. Implementors of
+`KeyRing` delete their `rewrap` and nothing else changes; no stored bytes move,
+and no wire or durable format is affected.
+
+It could never have run. An envelope carries its wrapped data key inline and the
+journal's hash chain commits to the envelope bytes — the decision that lets an
+auditor holding no keys verify a run whose payloads have been erased. Re-wrapping
+a journal payload therefore rewrites a record the chain covers, breaking the
+chain it sits inside. Re-wrapping only the other stores would not have bought the
+operational result either: a scope's journal payloads and its case state share
+one wrapping key, so the scope stays pinned to the oldest version any of its
+journal envelopes names, and rewriting case rows does not move that floor.
+
+The rule its absence implies is now stated rather than left to be discovered:
+**sealed payload bytes never change, and the erasure scope is the rotation
+unit.** That costs less than it sounds like, because a scope is already one
+case, one run, or one memory subject — a compromised wrapping key exposes that
+unit and nothing else, which is what rotation is bought for. Adding a key version
+stays safe and needs nothing from this crate; envelopes sealed before a rotation
+keep opening, and a test now pins that rather than pinning re-wrapping.
+
+This is also the model AWS KMS assumes: it retains every prior version of a key's
+material in perpetuity, resolves the right one from the ciphertext on decrypt,
+and offers no way to delete an individual version — only the whole key, which is
+erasure. Rotation there is automatic and needs nothing from an application.
+
+### Added — `KeyError::Retired`, so a version floor is not read as data loss
+
+Deleting a capability without asking what it was protecting against leaves the
+hazard and loses the reminder, and here the residue was real. Every KMS can
+refuse to decrypt below a version floor — Vault's `min_decryption_version`.
+Because envelopes now demonstrably pin their key version for life, raising that
+floor past a live envelope makes un-erased history unreadable: an erasure nobody
+requested, that no retention record explains.
+
+Both existing classifications were wrong for it, in opposite directions.
+`Destroyed` would claim a discharged obligation that was never requested.
+`Refused` was what actually happened, and it reached `agentplane drill` as *this
+case's sealed state neither opens nor was its key destroyed* — the sentence that
+pages somebody to look for tampering, while the cause is one reversible setting.
+
+So it is its own answer. `KeyError::Retired { scope, key_id }` names the version
+the floor has to readmit, `VaultTransit` maps Vault's wording onto it, and the
+drill reports such a case as a finding that carries its own remedy instead of a
+suspected loss. `MemoryKeyRing::retire_below` models the floor, because an error
+variant no test can produce is a classification nothing proves the runtime
+honours. The runtime cannot stop an operator moving a floor; what it owes is that
+moving it too far is legible, which is I13 applied to a control it does not own.
+
+This discharges the re-encryption clause of the durable-format freeze blocker,
+which required the design to specify how re-encryption preserves historical
+verification before freeze. The answer is the second of the two the blocker
+named: it does not re-encrypt.
+
+### Fixed — a new record kind would have defaulted to unsealed
+
+`journal::payload::payloads` — the single list deciding which fields are sealed
+at rest — ended in a wildcard arm returning "nothing to seal". A record kind
+added later would have compiled, passed every existing test, and silently
+carried the caller's data in the clear, which is the failure that module's own
+documentation calls silent by construction. The match is now exhaustive over all
+26 kinds, so a new variant does not build until somebody has answered the
+question. Behaviour for existing records is unchanged.
+
 ## [0.18.0] — 2026-08-15
 
 Three adversarial passes — over the information-flow layer, the evidence layer,

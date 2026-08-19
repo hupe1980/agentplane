@@ -382,8 +382,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/effects.rs",
         "an_embedding_above_its_declared_ceiling_is_refused",
         "the embedding sink accepts anything, whatever ceiling was declared",
-        "    fn max_sensitivity(&self) -> Sensitivity {\n        self.max_sensitivity\n    }\n\n    fn sink_arguments(&self) -> Option<&serde_json::Value> {\n        Some(&self.arguments)\n    }\n\n    async fn perform(&self) -> Result<Self::Output, EffectError> {\n        self.embedder",
-        "    fn max_sensitivity(&self) -> Sensitivity {\n        Sensitivity::Secret\n    }\n\n    fn sink_arguments(&self) -> Option<&serde_json::Value> {\n        Some(&self.arguments)\n    }\n\n    async fn perform(&self) -> Result<Self::Output, EffectError> {\n        self.embedder",
+        "    fn max_sensitivity(&self) -> Sensitivity {\n        self.max_sensitivity\n    }\n\n    fn sink_arguments(&self) -> Option<&serde_json::Value> {\n        Some(&self.arguments)\n    }\n\n    async fn perform(&self) -> Result<Self::Output, EffectError> {\n        // The revision",
+        "    fn max_sensitivity(&self) -> Sensitivity {\n        Sensitivity::Secret\n    }\n\n    fn sink_arguments(&self) -> Option<&serde_json::Value> {\n        Some(&self.arguments)\n    }\n\n    async fn perform(&self) -> Result<Self::Output, EffectError> {\n        // The revision",
     ),
     "SensitivityCanLower": (
         "src/runtime/ctx.rs",
@@ -1954,11 +1954,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         '        "TASK_STATE_FAILED" | "TASK_STATE_CANCELED" | "TASK_STATE_REJECTED" if false => {',
     ),
     "CachedTokensAreDropped": (
-        "src/model/anthropic.rs",
+        "src/model/mod.rs",
         "anthropic_cached_tokens_are_added_back",
-        "cached tokens are dropped, so a cached run bills a fraction of its cost",
-        "            input_tokens: u.map_or(0, |u| u.input_tokens) + write + read,",
-        "            input_tokens: u.map_or(0, |u| u.input_tokens),",
+        "a provider that reports cached counts beside the prompt count has them "
+        "dropped rather than added back, so a cached run bills a fraction of "
+        "its cost — on the buffered and streaming paths at once, because both "
+        "reach this one arithmetic",
+        "            input_tokens: input_tokens + cache_write_tokens + cache_read_tokens,",
+        "            input_tokens,",
     ),
     "CachedTokensAreDoubleCounted": (
         "src/model/openai.rs",
@@ -3018,18 +3021,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        };",
         "        self.protected = Vec::new();",
     ),
-    "AToolLoopInstructionIsTaintedByItsCaller": (
+    "ARecalledMemoryEntersThePromptTrusted": (
         "src/runtime/declarative.rs",
-        "a_declared_instruction_survives_an_untrusted_input_in_the_tool_loop",
-        "the tool-calling loop builds its prompt by mapping over the caller's "
-        "input, so the manifest's reviewed instruction inherits the caller's "
-        "label — and this is the tier where it matters most, because the "
-        "model's answer chooses which granted tool runs",
-        "        let prompt = Tainted::object([\n"
-        "            (\"system\".to_owned(), Tainted::trusted(json!(system))),\n"
-        "            (\"input\".to_owned(), input),\n"
-        "        ]);",
-        "        let prompt = input.map(|input| json!({ \"system\": system, \"input\": input }));",
+        "a_recalled_memory_reaches_the_prompt_with_its_own_label",
+        "a declared recall relabels every memory it reads as trusted on the way "
+        "into the prompt, so a fact a model wrote last week is believed this "
+        "week — the cross-session laundering the whole memory tier is shaped to "
+        "refuse, performed by the tier that reads it",
+        "        parts.push((\"memory\".to_owned(), remembered));",
+        "        parts.push((\"memory\".to_owned(), Tainted::trusted(remembered.peek().clone())));",
     ),
     "ADeclaredInstructionIsTaintedByItsCaller": (
         "src/runtime/declarative.rs",
@@ -3039,11 +3039,50 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "inherits the caller's label — the declared order becomes "
         "indistinguishable from the data, and an agent reachable over A2A is "
         "refused as though the peer had written its prompt",
-        "                let prompt = Tainted::object([\n"
-        "                    (\"system\".to_owned(), Tainted::trusted(json!(system))),\n"
-        "                    (\"input\".to_owned(), input),\n"
-        "                ]);",
-        "                let prompt = input.map(|input| json!({ \"system\": system, \"input\": input }));",
+        "    let mut parts = vec![\n"
+        "        (\"system\".to_owned(), Tainted::trusted(json!(system))),",
+        "    let mut parts = vec![\n"
+        "        (\"system\".to_owned(), input.clone().map(|_| json!(system))),",
+    ),
+    "ASemanticLimitIsAdvisory": (
+        "src/runtime/ctx.rs",
+        "a_retriever_that_overruns_the_limit_is_refused",
+        "a retriever may return more hits than the caller's declared limit, so "
+        "the ceiling is advisory: the selection's membership ends up decided by "
+        "the seam's iteration order, and every extra hit costs a store read and "
+        "a slot in whatever window the caller was sizing",
+        "        if hits.len() > query.limit {",
+        "        if false {",
+    ),
+    "TheEmbeddingSpaceIsNotChecked": (
+        "src/runtime/executor.rs",
+        "an_embedder_that_does_not_speak_the_indexs_language_is_refused_at_build",
+        "the plane accepts an embedder whose revision is not the one the index "
+        "declares it takes queries in — cosine similarity is defined between "
+        "any two equal-width vectors, so every search then ranks unrelated "
+        "memories confidently and nothing ever throws",
+        "            if embedder != index {\n"
+        "                return Err(BuildError::EmbeddingSpaceMismatch { embedder, index });\n"
+        "            }",
+        "            let _ = (&embedder, &index);",
+    ),
+    "APlannedAgentMayRecall": (
+        "src/manifest/mod.rs",
+        "a_planned_agent_may_not_declare_a_recall",
+        "a `planned` agent may declare `memory.recall`, so memories written by "
+        "a model reach the planner that compiles the run's authorization order "
+        "— the untrusted-input refusal that kind exists for, walked around "
+        "through the store",
+        "        if self.spec.execution.as_ref().map(|e| e.kind) == Some(ExecutionKind::Planned) {",
+        "        if false {",
+    ),
+    "ARecallMayReadNothing": (
+        "src/manifest/mod.rs",
+        "a_recall_limit_outside_the_declared_band_is_refused",
+        "a recall may declare `limit: 0`, which reads in review as a ceiling "
+        "and behaves as an agent that remembers nothing",
+        "        if !(1..=50).contains(&recall.limit) {",
+        "        if false {",
     ),
     # ── Committing with the journal ─────────────────────────────────────────
     "AtomicMembersRunBeforeTheFrontier": (
@@ -3604,7 +3643,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_webhook_must_be_https",
         "a webhook may be plain http, so a payload describing somebody's task "
         "crosses the network in clear to an address the recipient chose",
-        "        if parsed.scheme() != \"https\" && !(allow_loopback && is_loopback_name(&host)) {\n            return Err(PushError::NotHttps);\n        }",
+        "        if parsed.scheme() != \"https\"\n            && !(allow_loopback && crate::netguard::is_loopback_name(&host))\n        {\n            return Err(PushError::NotHttps);\n        }",
         "",
     ),
     "DeliveryTrustsTheRegistrationTimeCheck": (
@@ -5039,6 +5078,231 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "exists to make loud, muted by the checker written for it",
         "            Err(BlobError::NotFound(_)) => report.findings.push(format!(",
         "            Err(BlobError::NotFound(_)) => drop(format!(",
+    ),
+    "RetirementReadsAsErasure": (
+        "src/drill.rs",
+        "a_retired_key_version_is_not_reported_as_loss_or_as_erasure",
+        "a key version retired by an operator's version floor is counted as a "
+        "completed erasure, so the drill reports an obligation discharged that "
+        "nobody requested and writes off data that is intact and one setting "
+        "away from readable",
+        """        Some(Err(e @ KeyError::Retired { .. })) => report.findings.push(format!(""",
+        """        Some(Err(KeyError::Retired { .. })) => report.sealed_erased += 1,
+        #[allow(unreachable_patterns)]
+        Some(Err(e @ KeyError::Refused(_))) => report.findings.push(format!(""",
+    ),
+    "RetiredCollapsesIntoRefused": (
+        "src/keyring/vault.rs",
+        "a_retired_ciphertext_version_is_told_apart_from_a_refusal",
+        "a Vault refusal naming a retired ciphertext version is left as a bare "
+        "Refused, so a reversible version floor reaches a drill as loss or "
+        "tampering and an operator hunts a fault that does not exist",
+        """    if retired {
+        KeyError::Retired {
+            scope: scope.to_owned(),
+            key_id: key_id.to_owned(),
+        }
+    } else {
+        e
+    }""",
+        """    let _ = (retired, scope, key_id);
+    e""",
+    ),
+    "AnEnvelopeCarriesNoFormatVersion": (
+        "src/keyring/envelope.rs",
+        "an_envelope_leads_with_the_format_version_it_claims",
+        "sealed envelopes are written without a leading format version, so a "
+        "build meeting a construction it does not know walks its own layout "
+        "over somebody else's and reaches the AEAD — reporting a version skew "
+        "as a payload that did not authenticate, which is the signature of "
+        "tampering",
+        "    envelope.push(FORMAT_VERSION);\n",
+        "",
+    ),
+    "AnUnknownEnvelopeVersionReadsAsTampering": (
+        "src/keyring/envelope.rs",
+        "a_version_this_build_does_not_read_is_not_reported_as_tampering",
+        "an envelope naming a format version this build does not read is left "
+        "to fail at the cipher, so a mixed-version fleet, a rollback or a "
+        "restore from a newer plane pages somebody to hunt corruption that "
+        "does not exist",
+        """    if version != FORMAT_VERSION {
+        return Err(KeyError::UnknownFormat {
+            version,
+            supported: FORMAT_VERSION,
+        });
+    }""",
+        "    let _ = version;",
+    ),
+    "AnUnreadableSealedStateIsSkipped": (
+        "src/keyring/cases.rs",
+        "sealed_state_this_build_cannot_read_is_answered_not_skipped",
+        "state marked sealed whose envelope will not parse answers 'nothing to "
+        "check', so the drill counts the case as carrying no sealed state and "
+        "reports that everything opens over state it never opened — detection "
+        "withheld by the pass whose only job is detection",
+        """    let scope = match super::envelope::wrapped_scope(&envelope) {
+        Ok(scope) => scope,
+        Err(e) => return Some(Err(e)),
+    };""",
+        "    let scope = super::envelope::wrapped_scope(&envelope).ok()?;",
+    ),
+    "AForeignEnvelopeIsNotThisCasesProblem": (
+        "src/keyring/cases.rs",
+        "sealed_state_this_build_cannot_read_is_answered_not_skipped",
+        "a case whose sealed state names another case's erasure scope is "
+        "silently skipped, so an envelope this case's erasure would not reach "
+        "is never reported — the bytes survive the deletion request and the "
+        "drill says the case is clean",
+        """    let Some(tenant) = scope.strip_suffix(&format!("/{case}")) else {
+        return Some(Err(super::KeyError::Refused(format!(
+            "this case's sealed state names erasure scope '{scope}', which is not this \\
+             case — the envelope was written for a different matter, so erasing this \\
+             case would leave it readable"
+        ))));
+    };""",
+        """    let tenant = scope.strip_suffix(&format!("/{case}"))?;""",
+    ),
+    "AnUnreadableVersionPagesForTampering": (
+        "src/drill.rs",
+        "a_version_this_build_cannot_read_is_not_reported_as_loss_or_tampering",
+        "a format version this build cannot read is folded into the loss arm, "
+        "so a build skew whose remedy is which binary is running reaches an "
+        "operator as suspected loss or tampering",
+        """        Some(Err(e @ KeyError::UnknownFormat { .. })) => report.findings.push(format!(
+            "case {case}: {e}. Run the plane on a build that reads this version, or restore \\
+             this case from an export written by one — nothing here needs a key operation"
+        )),""",
+        "",
+    ),
+    "APeerEndpointIsConnectedToUnchecked": (
+        "src/peers/a2a.rs",
+        "a_peer_endpoint_that_resolves_inward_is_refused_before_the_request",
+        "a peer endpoint is connected to without checking where it resolves, so "
+        "a discovered card that advertises an internal address gets this run's "
+        "payload and a bearer credential posted to it",
+        """            crate::netguard::all_public(host, resolved).map_err(|error| PeerError::Refused {
+                peer: peer.clone(),
+                detail: error.to_string(),
+            })?""",
+        """            resolved.collect::<Vec<_>>()""",
+    ),
+    "CardDiscoveryReachesInward": (
+        "src/peers/discovery.rs",
+        "card_discovery_refuses_an_inward_address_a_redirect_and_a_hang",
+        "a card URL is fetched without checking where it resolves, so the first "
+        "attacker-influenced string a deployment handles reaches the cloud "
+        "metadata service, a database or an internal health endpoint",
+        """            crate::netguard::all_public(&host, resolved)
+                .map_err(|e| DiscoveryError::Refused(e.to_string()))?""",
+        """            resolved.collect::<Vec<_>>()""",
+    ),
+    "CardDiscoveryFollowsARedirect": (
+        "src/peers/discovery.rs",
+        "card_discovery_refuses_an_inward_address_a_redirect_and_a_hang",
+        "a card fetch follows redirects, so every check above it applies only "
+        "to the first hop and an allowed card server forwards this plane "
+        "wherever it likes",
+        "            .redirect(reqwest::redirect::Policy::none());",
+        "            .redirect(reqwest::redirect::Policy::limited(10));",
+    ),
+    "ACardFetchIsUnbounded": (
+        "src/peers/discovery.rs",
+        "card_discovery_refuses_an_inward_address_a_redirect_and_a_hang",
+        "a card fetch has no whole-request timeout, so an unknown host that "
+        "accepts the connection and never answers holds a task open for as "
+        "long as it likes",
+        "            .timeout(self.timeout)",
+        "",
+    ),
+    "ATruncatedTurnIsRunAsAnInstruction": (
+        "src/runtime/declarative.rs",
+        "a_truncated_turn_asking_for_tools_never_runs_them",
+        "a turn the provider cut off mid-output is executed anyway, so the last "
+        "tool call's arguments are whatever survived the cut — a side effect "
+        "performed on a request the model never finished writing",
+        """            if completion.peek().truncated {""",
+        """            if false && completion.peek().truncated {""",
+    ),
+    "ATruncatedAnswerSettlesAsTheAnswer": (
+        "src/runtime/declarative.rs",
+        "a_truncated_answer_is_not_settled_as_the_runs_output",
+        "a cut-off answer is settled as the run's output with nothing marking "
+        "it partial, which is the silent truncation this crate refuses "
+        "everywhere else",
+        """                let reason = if completion.peek().tool_calls.is_empty() {""",
+        """                let reason = if !completion.peek().tool_calls.is_empty() {""",
+    ),
+    "ASeveredGeminiStreamBillsNothing": (
+        "src/model/gemini.rs",
+        "gemini_a_severed_stream_reports_what_it_burned",
+        "a severed Gemini stream drops the usage the provider already reported "
+        "and bills zero, so the token ceiling that exists to bound a runaway "
+        "provider counts nothing during exactly the failure it was bought for",
+        """    if let Some(envelope) = acc.usage_envelope() {
+        return ModelError::Interrupted {
+            model: model.clone(),
+            usage: Gemini::usage(&envelope),
+            detail: detail.to_owned(),
+        };
+    }""",
+        "",
+    ),
+    "TheMcpClientReportsWhatItOffered": (
+        "src/tools/mcp.rs",
+        "the_client_reports_the_version_the_handshake_settled_on",
+        "the MCP client reports the protocol version it offered rather than the "
+        "one the handshake settled on, so a server that negotiated the "
+        "connection down — losing the tasks extension, and with it every "
+        "governed suspension a long-running tool would have produced — looks "
+        "identical to one that did not",
+        """        self.service
+            .peer_info()
+            .map(|info| info.protocol_version.as_str().to_owned())""",
+        """        let _ = &self.service;
+        Some(rmcp::model::ProtocolVersion::V_2026_07_28.as_str().to_owned())""",
+    ),
+    "TheStreamKeepsItsOwnTaskStateMapping": (
+        "src/api/a2a_stream.rs",
+        "every_read_back_surface_reports_the_same_state",
+        "the event stream derives an A2A task state from its own copy of the "
+        "history mapping rather than the shared one, so a client that polled "
+        "and a client that subscribed can be told different states for one run "
+        "with no way to discover the disagreement",
+        "    let (state, detail) = super::a2a::state_from_history(&records)?;",
+        """    let (state, detail) = match records.last()?.kind() {
+        RecordKind::RunSealed { outcome, .. } => (sealed_state(outcome), outcome.clone()),
+        _ => (TaskState::Working, "running".to_owned()),
+    };""",
+    ),
+    "TheAuthSchemeIsMatchedCaseSensitively": (
+        "src/api/tokens.rs",
+        "the_scheme_is_case_insensitive_and_the_token_is_not",
+        "the bearer auth-scheme is compared case-sensitively against RFC 9110 "
+        "§11.1, so a conforming client sending `bearer <token>` is told it "
+        "presented no credential at all and retries the thing it already did",
+        """        if !scheme.eq_ignore_ascii_case("Bearer") {""",
+        """        if scheme != "Bearer" {""",
+    ),
+    "ADamagedPhaseColumnDecodesAsForward": (
+        "src/store/postgres_cases.rs",
+        "an_unreadable_column_is_refused_rather_than_defaulted",
+        "a step phase this store cannot read decodes to `Forward` instead of "
+        "refusing, so a compensating record comes back wearing the forward "
+        "half of the saga and the unwind logic acts on a value the store "
+        "invented for a row nobody could read",
+        """        other => return Err(corrupt("unknown step phase", other)),""",
+        """        _other => crate::core::Phase::Forward,""",
+    ),
+    "AFailedEffectIsAlwaysFree": (
+        "src/core/error.rs",
+        "a_metered_failure_carries_its_spend_into_the_effect_layer",
+        "a failed effect's spend falls back to zero for every variant that is "
+        "not the metered one, so a variant added later that burned tokens "
+        "before dying costs the run nothing and the ceilings that exist to "
+        "bound a flaky provider stop counting",
+        "            Self::Metered { spend, .. } => *spend,",
+        "            Self::Metered { .. } => Spend::default(),",
     ),
     "TamperedBytesPassTheDrill": (
         "src/drill.rs",

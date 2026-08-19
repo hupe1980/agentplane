@@ -174,12 +174,22 @@ pub struct TokenEntry {
 #[async_trait::async_trait]
 impl Authenticator for TokenAuthenticator {
     async fn authenticate(&self, headers: &HeaderMap) -> Result<Caller, AuthError> {
-        let presented = headers
+        let raw = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or(AuthError::Missing)?;
-        let presented = Secret::new(presented);
+        // The scheme is matched case-insensitively because RFC 9110 §11.1
+        // defines it that way, and the failure of getting this wrong is the
+        // worst-shaped one an authenticator has: `bearer <token>` is a legal
+        // request that would be answered `Missing`, which reads to its sender
+        // as *you sent no credential*. The token itself keeps its exact bytes
+        // and its constant-time comparison — only the scheme name is
+        // case-folded, and only its first seven characters are examined.
+        let (scheme, token) = raw.split_once(' ').ok_or(AuthError::Missing)?;
+        if !scheme.eq_ignore_ascii_case("Bearer") {
+            return Err(AuthError::Missing);
+        }
+        let presented = Secret::new(token);
 
         // Every entry is compared, and the loop does not break on a match.
         // Returning as soon as one matched would make the answer's *timing* a
@@ -193,5 +203,79 @@ impl Authenticator for TokenAuthenticator {
             }
         }
         found.cloned().ok_or(AuthError::Rejected)
+    }
+}
+
+#[cfg(all(test, feature = "manifest"))]
+mod scheme_tests {
+    use super::*;
+
+    fn ring() -> TokenAuthenticator {
+        TokenAuthenticator::from_yaml(
+            "- token: a-long-random-string\n  actor: peer-a\n  roles: [peer]\n",
+        )
+        .expect("one caller")
+    }
+
+    fn presenting(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            value.parse().expect("a header value"),
+        );
+        headers
+    }
+
+    /// **The scheme name is case-insensitive; the token is not.**
+    ///
+    /// RFC 9110 §11.1 defines the auth-scheme as case-insensitive, and the
+    /// failure of reading it otherwise is the worst shape an authenticator
+    /// has: `bearer <token>` is a legal request, and refusing it as `Missing`
+    /// tells a conforming client it sent no credential at all — so the client
+    /// retries the thing it already did.
+    ///
+    /// The second half is what keeps the first from being a weakening: the
+    /// token's own bytes are still compared exactly, so case-folding the
+    /// scheme cannot fold anything a caller had to guess.
+    #[tokio::test]
+    async fn the_scheme_is_case_insensitive_and_the_token_is_not() {
+        let auth = ring();
+        for spelling in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let caller = auth
+                .authenticate(&presenting(&format!("{spelling} a-long-random-string")))
+                .await
+                .unwrap_or_else(|e| panic!("'{spelling}' is a legal auth-scheme spelling: {e}"));
+            assert_eq!(caller.actor, "peer-a");
+        }
+        assert!(
+            matches!(
+                auth.authenticate(&presenting("Bearer A-LONG-RANDOM-STRING"))
+                    .await,
+                Err(AuthError::Rejected)
+            ),
+            "the token was matched case-insensitively, which silently shrinks \
+             the space an attacker has to search"
+        );
+    }
+
+    /// Anything that is not a bearer credential is absent, never a default
+    /// caller — the property the module refuses to trade.
+    #[tokio::test]
+    async fn a_credential_that_is_not_a_bearer_token_names_nobody() {
+        let auth = ring();
+        for raw in [
+            "Basic a-long-random-string",
+            "Bearer",
+            "a-long-random-string",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    auth.authenticate(&presenting(raw)).await,
+                    Err(AuthError::Missing)
+                ),
+                "'{raw}' was read as a presented bearer credential"
+            );
+        }
     }
 }

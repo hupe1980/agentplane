@@ -489,7 +489,7 @@ replayable at all — so a corpus reached this way gets the journaled selection,
 the digest re-check and the scope check for free. A bespoke retrieval tool gets
 none of them.
 
-`spec.memory_formation` is about what an agent *learns*, which is a different
+`spec.memory.formation` is about what an agent *learns*, which is a different
 question and correctly narrower. Nothing requires an item to have been formed to
 be recalled.
 
@@ -501,7 +501,7 @@ subject pools every party the agent ever reasoned about under one key: one
 party's facts are recalled into another party's run, and erasing one destroys
 everybody's.
 
-So `memory_formation.subject` accepts a **binding** — `$correlation/<namespace>`,
+So a declared `subject` accepts a **binding** — `$correlation/<namespace>`,
 `$case`, `$input/<pointer>` — resolved per run. Three properties make it a
 control rather than a convenience:
 
