@@ -582,6 +582,7 @@ async fn an_open_run_refuses_to_resume_under_a_different_policy_bundle() {
                         input_label: agentplane::core::Label::trusted(),
                         policy_bundle: Some(admitted),
                         canon: agentplane::core::canon::VERSION,
+                        idempotency_key: None,
                     },
                 ),
                 Append::new(

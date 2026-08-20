@@ -1686,6 +1686,13 @@ impl CaseStore for CountsRegistrations {
     ) -> Result<Correlation, agentplane::core::StoreError> {
         self.inner.correlate_or_open(kind, keys, at).await
     }
+    async fn detach_run(
+        &self,
+        case: agentplane::core::CaseId,
+        run: agentplane::RunId,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.inner.detach_run(case, run).await
+    }
     async fn case(
         &self,
         id: agentplane::core::CaseId,

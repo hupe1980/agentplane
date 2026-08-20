@@ -259,5 +259,18 @@ if "${BIN[@]}" run "$YAML" --input '{}' --input-file /dev/null >/dev/null 2>&1; 
 fi
 echo "ok: refused, rather than one silently winning"
 
+echo "── admission-key retirement names its own window ──"
+# The window has no default on purpose: retiring a key reopens the door it
+# closed, so a default would be this crate picking somebody else's retry
+# horizon. A verb that silently chose one would be the more dangerous shape.
+if "${BIN[@]}" forget-admissions --store "$jdir/j.redb" >/dev/null 2>&1; then
+    echo "FAIL: \`forget-admissions\` ran without --older-than-days"; exit 1
+fi
+out="$("${BIN[@]}" forget-admissions --store "$jdir/j.redb" --older-than-days 30)"
+grep -q '"retired"' <<<"$out" || {
+    echo "FAIL: the retention pass said nothing, so a growing index looks like a \
+quiet one: $out"; exit 1; }
+echo "ok: retirement requires a window and reports what it retired"
+
 echo
 echo "the CLI runs an agent that is only a file"

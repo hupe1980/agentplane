@@ -618,6 +618,7 @@ async fn a_sealed_journal_hides_payloads_and_still_verifies_without_keys() {
                     input: serde_json::json!({ "patient": "Ada Lovelace" }),
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
                 },
             )],
         )
@@ -654,6 +655,81 @@ async fn a_sealed_journal_hides_payloads_and_still_verifies_without_keys() {
 
     // **The property that matters**: verified with no key ring in sight.
     Record::verify_chain(&raw, Digest::ZERO).expect("the chain verifies without keys");
+}
+
+/// A conclusion's reason is a payload, and reaches the store sealed.
+///
+/// `RunSealed` routes on `outcome`, so the whole record used to be
+/// control-plane and carried nothing to seal. A reason is the same free text
+/// `EffectFailed.error` is — a provider's refusal quoting the request — and a
+/// field added to an existing variant is exactly what an exhaustive match over
+/// *variants* does not ask about.
+#[tokio::test]
+async fn a_conclusions_reason_is_sealed_and_its_outcome_stays_readable() {
+    use agentplane::core::{RunId, TenantId};
+    use agentplane::journal::{Append, JournalStore, RecordKind, payload};
+    use agentplane::keyring::SealedJournal;
+
+    let plain: Arc<dyn JournalStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let keys = Arc::new(MemoryKeyRing::default());
+    let sealed = SealedJournal::wrap(
+        Arc::clone(&plain),
+        Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
+        TenantId::default(),
+    );
+
+    let run = RunId::generate();
+    let lease = sealed
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    sealed
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunSealed {
+                    outcome: "failed".into(),
+                    reason: Some("the registry refused patient Ada Lovelace".into()),
+                    chain_head: agentplane::core::Digest::ZERO,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+
+    let raw = plain.read(run, 1).await.expect("raw read");
+    let RecordKind::RunSealed {
+        outcome, reason, ..
+    } = raw[0].kind()
+    else {
+        panic!("unexpected record: {:?}", raw[0].kind())
+    };
+    assert_eq!(
+        outcome, "failed",
+        "the outcome routes the index and must stay readable with no key"
+    );
+    let reason = reason.as_deref().expect("the reason survives sealing");
+    assert!(
+        payload::is_sealed_text(reason),
+        "the reason reached the store in the clear: {reason}"
+    );
+    assert!(
+        !String::from_utf8_lossy(raw[0].raw()).contains("Lovelace"),
+        "the plaintext is in the bytes the store keeps"
+    );
+
+    // Through the wrapper it opens, so an operator asking why still gets an
+    // answer.
+    let opened = sealed.read(run, 1).await.expect("read");
+    let RecordKind::RunSealed { reason, .. } = opened[0].kind() else {
+        panic!("unexpected record")
+    };
+    assert_eq!(
+        reason.as_deref(),
+        Some("the registry refused patient Ada Lovelace")
+    );
 }
 
 /// After the scope's key is destroyed the payload is unreadable **and the
@@ -693,6 +769,7 @@ async fn erasing_the_key_leaves_the_chain_verifiable() {
                     input: serde_json::json!({ "patient": "Ada Lovelace" }),
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
                 },
             )],
         )
@@ -866,6 +943,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
                         input: serde_json::json!({ "claimant": "Ada Lovelace" }),
                         policy_bundle: None,
                         canon: agentplane::core::canon::VERSION,
+                        idempotency_key: None,
                     },
                 )
                 .case(case),
@@ -1063,6 +1141,7 @@ async fn a_case_less_runs_payloads_are_erasable_by_run() {
                     input: serde_json::json!({ "claimant": "Ada Lovelace" }),
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
                 },
             )],
         )
@@ -1252,6 +1331,7 @@ async fn configuring_a_key_ring_seals_every_store() {
                     input: serde_json::json!({ "who": "Ada" }),
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
                 },
             )],
         )

@@ -328,6 +328,16 @@ impl JournalStore for CountsAcquires {
     async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError> {
         self.inner.runs_by_outcome(outcome, limit).await
     }
+    async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
+        self.inner.admitted_as(key).await
+    }
+
+    async fn forget_admissions(
+        &self,
+        older_than: agentplane::core::Timestamp,
+    ) -> Result<usize, StoreError> {
+        self.inner.forget_admissions(older_than).await
+    }
     async fn recent_runs(
         &self,
         after: Option<(u64, RunId)>,

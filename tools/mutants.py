@@ -5489,6 +5489,66 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "            Err(e @ BlobError::Corrupt { .. }) => report.findings.push(format!(",
         "            Err(e @ BlobError::Corrupt { .. }) => drop(format!(",
     ),
+    # ── At-most-once admission ──────────────────────────────────────────────
+    "AdmissionKeyNotClaimed": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "the store accepts a second run under an admission key it already issued",
+        """                        if let Some(held) = admissions
+                            .get((tenant.as_str(), k.as_str()))
+                            .map_err(|e| be(&e))?
+                            .map(|v| v.value().0.to_owned())
+                        {
+                            return Err(StoreError::DuplicateAdmission { key: k, run: held });
+                        }""",
+        """                        let _ = &admissions;""",
+    ),
+    "DuplicateAdmissionStartsASecondRun": (
+        "src/runtime/executor.rs",
+        "a_duplicate_the_read_missed_is_still_answered_with_the_original",
+        "a duplicate admission is reported as fresh, so a redelivery runs the work again",
+        """                run, ..
+            })) => self.answer_with(parse_holder(&run)?).await,""",
+        """                run, ..
+            })) => Ok(Admission::InFlight(parse_holder(&run)?)),""",
+    ),
+    "SuspendedRunIsNotAnAnswer": (
+        "src/runtime/executor.rs",
+        "a_run_waiting_for_a_human_answers_its_own_redelivery",
+        "a suspension stops counting as a resting point, so a redelivery of a run "
+        "parked on a four-eyes decision opens a second approval",
+        """            RecordKind::RunSuspended { reason } => RunStatus::Suspended(reason.clone()),""",
+        """            RecordKind::RunSuspended { .. } => return Ok(None),""",
+    ),
+    "EmptyAdmissionKeyAccepted": (
+        "src/runtime/executor.rs",
+        "an_empty_admission_key_is_refused",
+        "an empty admission key is accepted, so every message after the first is "
+        "answered with the first one's run",
+        """    if key.trim().is_empty() {""",
+        """    if false {""",
+    ),
+    "ConclusionReasonNotSealed": (
+        "src/journal/payload.rs",
+        "a_conclusions_reason_is_sealed_and_its_outcome_stays_readable",
+        "a run's conclusion reason reaches the store in the clear",
+        """        } => reason.as_mut().map(SealedField::Text).into_iter().collect(),""",
+        """        } => {
+            let _ = reason;
+            Vec::new()
+        }""",
+    ),
+    "RetiringAKeyDoesNotFreeIt": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "retirement reports a count without releasing the keys it counted",
+        """                for key in &stale {
+                    admissions
+                        .remove((tenant.as_str(), key.as_str()))
+                        .map_err(|e| be(&e))?;
+                }""",
+        """                let _ = &mut admissions;""",
+    ),
 }
 
 

@@ -251,6 +251,10 @@ impl CaseStore for SealedCases {
         self.inner.attach_run(case, run).await
     }
 
+    async fn detach_run(&self, case: CaseId, run: RunId) -> Result<bool, StoreError> {
+        self.inner.detach_run(case, run).await
+    }
+
     async fn link_blob(
         &self,
         case: CaseId,

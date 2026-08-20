@@ -360,6 +360,17 @@ impl JournalStore for Faulty {
         self.inner.read(run, from).await
     }
 
+    async fn admitted_as(&self, key: &str) -> Result<Option<crate::core::RunId>, StoreError> {
+        self.inner.admitted_as(key).await
+    }
+
+    async fn forget_admissions(
+        &self,
+        older_than: crate::core::Timestamp,
+    ) -> Result<usize, StoreError> {
+        self.inner.forget_admissions(older_than).await
+    }
+
     async fn runs_by_outcome(
         &self,
         outcome: &str,
@@ -500,6 +511,12 @@ mod tests {
             unreachable!("the test reads capabilities only")
         }
         async fn runs_by_outcome(&self, _: &str, _: usize) -> Result<Vec<RunId>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn admitted_as(&self, _: &str) -> Result<Option<RunId>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn forget_admissions(&self, _: crate::core::Timestamp) -> Result<usize, StoreError> {
             unreachable!("the test reads capabilities only")
         }
         async fn recent_runs(

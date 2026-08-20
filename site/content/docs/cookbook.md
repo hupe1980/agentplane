@@ -1175,6 +1175,69 @@ rather than silently dropped: `reasoning_effort` (no neutral spelling on this
 wire) and governed media (a per-server dialect). Against `api.openai.com`
 itself, use the `openai` driver — Responses is the current primitive there.
 
+## 🔁 Act on an at-least-once message exactly once
+
+```rust
+match rt.run_correlated_once(
+    "claim.assess",
+    Tainted::from_source(body, SourceId::new("bus")),   // it came from outside
+    "claim",
+    &[CorrelationKey::new("claim", &claim_id)],
+    &event.dedup_key(),          // source ␟ id — the message's own identity
+).await? {
+    Admission::Fresh(outcome)    => /* we admitted it */,
+    Admission::Replayed(outcome) => /* already done, or already waiting */,
+    Admission::InFlight(run)     => /* already running — answer 202, not 500 */,
+}
+```
+
+An emitter that retries until it sees a 2xx will redeliver on any lost response.
+The store claims the key in the same transaction that writes the run's first
+record, so a redelivery cannot admit a second run — not on a retry, not across a
+restart, not from another instance sharing the store.
+
+Correlation and the key answer different questions: correlation decides **which
+matter** the message belongs to, the key decides **whether it is acted on at
+all**. Correlation alone joins the duplicate to the right case and then starts a
+second run inside it.
+
+**The trap:** a key that does not name its producer. An id is unique only within
+one emitter, so keying on a bare id lets two counterparties swallow each other's
+messages as apparent retries — and the loser's message is dropped silently.
+`InboundEvent::dedup_key()` is the ready-made spelling.
+
+**The other trap:** reaching for `EventStore::buffer` instead. It also reports
+"already seen" for a `(source, id)` over the same store, and it looks like the
+primitive. It is not: an event nobody subscribes to is dead-lettered by the
+sweep, and a non-empty dead-letter list means *a correlation key is wrong
+somewhere*. Using the buffer as an idempotency ledger dead-letters nearly every
+message admitted directly, so `SweepReport::needs_attention()` is permanently
+true and that signal is spent buying deduplication.
+
+A `Replayed` outcome carries the original's status and reason but no `output`: a
+step's result is reconstructed by replay rather than stored. Re-derive it with
+`rt.replay(run, Mode::Strict)`, which performs no external effect. And note that
+a **suspended** run is a resting point — a redelivery of a message whose run is
+parked on a four-eyes decision is told *this is already waiting for you*, rather
+than opening a second identical approval.
+
+`spawn_once` and `spawn_correlated_once` are the non-blocking pair; they return
+`Spawned { run, fresh }`.
+
+**The third trap:** an empty key. A missing header or an unset variable arrives
+as `""`, and `""` is a perfectly good key — the first message claims it and every
+later message is answered with the first one's run, silently. It is refused, as
+is a key over `MAX_ADMISSION_KEY_BYTES`: the emitter chooses the key, so its size
+is not theirs to decide.
+
+**Retention.** Keys are kept until you retire them. `forget_admissions(older_than)`
+is the verb, and the window must exceed your emitter's retry horizon — a
+redelivery arriving after its key is retired admits a second run, which is the
+failure the key exists to prevent, delivered on a timer. There is deliberately no
+default: other runtimes bound this window automatically (Restate expires a key a
+day after completion, Temporal's is its namespace retention), and both are making
+the same trade in the direction that can surprise you.
+
 ## ⏸️ Wait for a reply that may arrive first
 
 ```rust
@@ -1879,6 +1942,52 @@ signature. Not confidentiality — signing a plaintext delivery makes it
 unforgeable, not private. And a receiver must **require** the header: verifying
 it when present and accepting it when absent buys nothing, because an attacker
 simply omits it.
+
+**Where the secret comes from.** `signed_with` panics on a key under 24 bytes or
+a malformed `whsec_` secret. Use `try_signed_with` when the secret is read from
+configuration inside your own builder — a mistyped environment variable then
+joins your exit code and your log line instead of aborting the process before it
+reaches either.
+
+## 🔎 Verify a webhook you receive
+
+```rust
+let verifier = WebhookVerifier::new(&Secret::new(std::env::var("BUS_SIGNING_KEY")?))?;
+
+let delivery = verifier.verify(
+    headers.iter().map(|(k, v)| (k.as_str(), v.to_str().unwrap_or_default())),
+    &raw_body,   // the exact bytes, never a re-serialization
+    now,         // the clock is the caller's, as everywhere else in this crate
+)?;
+
+rt.run_correlated_once(cap, input, kind, keys, &delivery.id).await?;
+```
+
+The interesting half of verification is not the HMAC — it is the two things
+around it. A signature authenticates **bytes**, not freshness, so a captured POST
+replays forever unless a stale timestamp is refused; and at-least-once delivery
+makes duplicates ordinary, so genuine bytes arrive twice unless the receiver
+deduplicates on the id. Both are what a hand-written check omits, because
+omitting them looks like working software: every test passes, every delivery
+verifies, and the failure is a replay nobody sees.
+
+`verify` refuses the first — five minutes either way, `within()` to change it —
+and hands back `delivery.id` for the second, which is exactly what
+`run_correlated_once` takes as its admission key.
+
+**The trap:** verifying a parsed body. The signature covers the bytes received;
+checking it against a re-serialization is what makes a whitespace-insensitive
+JSON parser a signature bypass. Verify first, parse second.
+
+**Rotating a key.** `also_accepting` adds a second key, and a space-delimited
+`webhook-signature` offering several is accepted — a sender cannot switch keys at
+the same instant as its receivers, and a verifier holding one key makes that
+window zero.
+
+Every refusal is typed (`WebhookRejected`), and none of them is a reason to
+process the body anyway. They are told apart because an operator needs to know
+which is happening: a drifting clock and a replayed capture both present as
+`Stale`.
 
 ## 🔐 Restrict where the plane may connect
 

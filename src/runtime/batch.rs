@@ -161,7 +161,12 @@ impl Runtime {
                 reserved.run,
                 spec.plan.clone(),
                 crate::core::Tainted::trusted(item.input.clone()),
-                None,
+                // A batch item's at-most-once identity is its reservation, not
+                // an admission key: the run id is written to the batch store
+                // before the run starts, so a retry replays that journal rather
+                // than admitting again. Two mechanisms for one invariant would
+                // be two places to disagree.
+                super::executor::Terms::default(),
             )
             .await
         };

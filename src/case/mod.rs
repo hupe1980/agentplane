@@ -139,6 +139,22 @@ pub trait CaseStore: Send + Sync + Debug {
     /// Record that a run touched this case.
     async fn attach_run(&self, case: CaseId, run: RunId) -> Result<(), StoreError>;
 
+    /// Undo an attachment whose run never came to exist.
+    ///
+    /// **Not** a way to remove a run from a matter after the fact: a run that
+    /// wrote records belongs to the case's history permanently. This covers the
+    /// admission that attached and then failed before its first record — a
+    /// refused append, an admission key another instance won by milliseconds —
+    /// leaving a row that answers *"everything about this matter"* with a run
+    /// that never happened.
+    ///
+    /// The position is **not** reused. Attachment order is the case's record of
+    /// what happened in what sequence; a gap is honest, a reused position would
+    /// make two runs share a place in it.
+    ///
+    /// Returns whether a row was there to remove.
+    async fn detach_run(&self, case: CaseId, run: RunId) -> Result<bool, StoreError>;
+
     /// Record that a case produced a blob.
     ///
     /// The case is what an erasure request actually names — nobody asks to

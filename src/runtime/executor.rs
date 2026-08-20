@@ -36,6 +36,41 @@ pub(crate) enum CaseBinding {
     Existing(crate::core::CaseId),
 }
 
+/// What a caller asked admission for, beyond the plan and the input.
+///
+/// One value rather than more positional arguments: admission threads through
+/// five functions, and most call sites pass nothing here.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Terms {
+    /// Which matter this run belongs to, if any.
+    case: Option<CaseBinding>,
+    /// The admission key to claim. Travels to the `RunAdmitted` record, because
+    /// that is where the store claims it — see
+    /// [`JournalStore::admitted_as`](crate::journal::JournalStore::admitted_as).
+    idempotency_key: Option<String>,
+}
+
+impl Terms {
+    fn bound(case: CaseBinding) -> Self {
+        Self {
+            case: Some(case),
+            idempotency_key: None,
+        }
+    }
+
+    fn correlated(kind: &str, keys: &[CorrelationKey]) -> Self {
+        Self::bound(CaseBinding::Correlate {
+            kind: kind.to_owned(),
+            keys: keys.to_vec(),
+        })
+    }
+
+    fn keyed(mut self, key: &str) -> Self {
+        self.idempotency_key = Some(key.to_owned());
+        self
+    }
+}
+
 /// Default lease duration. A crashed owner's runs become claimable this long
 /// after its last heartbeat.
 ///
@@ -122,6 +157,79 @@ impl RunOutcome {
             }),
         }
     }
+}
+
+/// What an idempotent admission did.
+///
+/// A duplicate comes back as an answer rather than an error: a caller that
+/// retried wants the original run, not a conflict it has to interpret.
+///
+/// Exhaustive, unlike the error types: a key is unused, or held by a run that
+/// has rested, or held by one that has not. There is no fourth state to leave
+/// room for, and `#[non_exhaustive]` would cost every caller a `_` arm that
+/// means nothing.
+#[derive(Debug, Clone)]
+pub enum Admission {
+    /// The key was unused. This run is the one it admitted.
+    Fresh(RunOutcome),
+    /// The key already admitted a run that has reached a resting point —
+    /// concluded, or suspended waiting for something. Its answer, again.
+    ///
+    /// A suspension counts, and that is the case this exists for: a run parked
+    /// on a four-eyes decision has already opened the task, so a redelivery
+    /// that admitted would put a second identical approval in front of a
+    /// reviewer.
+    ///
+    /// Carries no `output`. A step's result is reconstructed by replay rather
+    /// than stored, so what the journal answers is *what happened* — status,
+    /// reason, chain head. Re-derive the value with [`replay`](Runtime::replay)
+    /// under [`Mode::Strict`], which performs no external effect.
+    Replayed(RunOutcome),
+    /// The key already admitted a run that has not rested yet — still
+    /// executing, or abandoned and awaiting the recovery sweep.
+    ///
+    /// The honest answer to an emitter is *accepted, already in progress* — a
+    /// 200 or 202 naming this run, never a retry-provoking failure.
+    InFlight(RunId),
+}
+
+impl Admission {
+    /// The run this key admitted, whichever of the three this is.
+    #[must_use]
+    pub const fn run_id(&self) -> RunId {
+        match self {
+            Self::Fresh(outcome) | Self::Replayed(outcome) => outcome.run_id,
+            Self::InFlight(run) => *run,
+        }
+    }
+
+    /// Whether this call is the one that admitted the run.
+    #[must_use]
+    pub const fn is_fresh(&self) -> bool {
+        matches!(self, Self::Fresh(_))
+    }
+
+    /// What the run produced, if it has produced anything yet.
+    #[must_use]
+    pub const fn outcome(&self) -> Option<&RunOutcome> {
+        match self {
+            Self::Fresh(outcome) | Self::Replayed(outcome) => Some(outcome),
+            Self::InFlight(_) => None,
+        }
+    }
+}
+
+/// What an idempotent [`spawn_once`](Runtime::spawn_once) did.
+///
+/// Separate from [`Admission`] because a spawn returns before the work happens,
+/// so it has no outcome to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spawned {
+    /// The run holding the key: the one just started, or the one that already
+    /// held it.
+    pub run: RunId,
+    /// False when the key was already held, so nothing new was started.
+    pub fresh: bool,
 }
 
 /// A run that stopped short of an answer, as an error a caller can `?`.
@@ -853,6 +961,7 @@ impl Runtime {
                     run,
                     RecordKind::RunSealed {
                         outcome: BREAK_GLASS_OUTCOME.to_owned(),
+                        reason: Some(reason.to_owned()),
                         chain_head: head.hash,
                     },
                 )],
@@ -1165,7 +1274,7 @@ impl Runtime {
         target: &str,
         input: Tainted<Value>,
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit(target, input, None).await
+        self.admit(target, input, Terms::default()).await
     }
 
     /// Admit a run and let it proceed in the background, returning its id.
@@ -1195,14 +1304,14 @@ impl Runtime {
         target: &str,
         input: Tainted<Value>,
     ) -> Result<RunId, RuntimeError> {
-        self.spawn_bound(target, input, None).await
+        self.spawn_bound(target, input, Terms::default()).await
     }
 
     async fn spawn_bound(
         self: &Arc<Self>,
         target: &str,
         input: Tainted<Value>,
-        case: Option<CaseBinding>,
+        terms: Terms,
     ) -> Result<RunId, RuntimeError> {
         // Resolved before the id is minted: an unknown capability is the
         // caller's mistake and must be an error, not a run that exists and
@@ -1212,7 +1321,7 @@ impl Runtime {
 
         let run = RunId::generate();
         let admitted = self
-            .admit_only(run, PlanIR::single(capability), input, case)
+            .admit_only(run, PlanIR::single(capability), input, terms)
             .await?;
 
         let plane = Arc::clone(self);
@@ -1226,7 +1335,7 @@ impl Runtime {
         input: Tainted<Value>,
         case: crate::core::CaseId,
     ) -> Result<RunId, RuntimeError> {
-        self.spawn_bound(target, input, Some(CaseBinding::Existing(case)))
+        self.spawn_bound(target, input, Terms::bound(CaseBinding::Existing(case)))
             .await
     }
 
@@ -1237,15 +1346,8 @@ impl Runtime {
         case_kind: &str,
         keys: &[CorrelationKey],
     ) -> Result<RunId, RuntimeError> {
-        self.spawn_bound(
-            target,
-            input,
-            Some(CaseBinding::Correlate {
-                kind: case_kind.to_owned(),
-                keys: keys.to_vec(),
-            }),
-        )
-        .await
+        self.spawn_bound(target, input, Terms::correlated(case_kind, keys))
+            .await
     }
 
     /// Start a new immutable run inside a case that already exists.
@@ -1255,7 +1357,7 @@ impl Runtime {
         input: Tainted<Value>,
         case: crate::core::CaseId,
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit(target, input, Some(CaseBinding::Existing(case)))
+        self.admit(target, input, Terms::bound(CaseBinding::Existing(case)))
             .await
     }
 
@@ -1272,13 +1374,121 @@ impl Runtime {
         case_kind: &str,
         keys: &[CorrelationKey],
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit(
+        self.admit(target, input, Terms::correlated(case_kind, keys))
+            .await
+    }
+
+    /// Run under an admission key, at most once per tenant.
+    ///
+    /// The entry point for an at-least-once emitter: a bus that retries until it
+    /// sees a 2xx, a webhook fan-out, a queue with redelivery. The store claims
+    /// the key in the same transaction that writes the run's first record, so a
+    /// second call under it cannot admit a second run — not on a retry, not
+    /// across a restart, not from another instance sharing the store.
+    ///
+    /// # The key must carry its producer
+    ///
+    /// An id is unique only within one emitter, so a bare message id lets two
+    /// counterparties swallow each other's messages as apparent retries.
+    /// [`InboundEvent::dedup_key`](crate::core::InboundEvent::dedup_key) is the
+    /// ready-made spelling, and the same identity the event buffer uses.
+    ///
+    /// # Not the event buffer
+    ///
+    /// [`EventStore::buffer`](crate::case::EventStore::buffer) also reports
+    /// "already seen" for a `(source, id)` over the same store, and looks like
+    /// the primitive. It is not: an event nobody subscribes to is dead-lettered
+    /// by [`sweep`](Self::sweep), and a non-empty dead-letter list means a
+    /// correlation key is wrong somewhere. Using the buffer as an idempotency
+    /// ledger would dead-letter nearly every message admitted directly, spending
+    /// that signal to buy deduplication. Two concerns can share an identity
+    /// without sharing a table.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run). A key already held is not an error — it comes back
+    /// as [`Admission::Replayed`] or [`Admission::InFlight`].
+    pub async fn run_once(
+        &self,
+        target: &str,
+        input: Tainted<Value>,
+        idempotency_key: &str,
+    ) -> Result<Admission, RuntimeError> {
+        self.admit_once(target, input, Terms::default().keyed(idempotency_key))
+            .await
+    }
+
+    /// Join or open a case by business key and run, at most once per admission
+    /// key.
+    ///
+    /// The shape an inbound message actually has: it names a matter by business
+    /// key *and* carries its own identity. Correlation decides **which case**,
+    /// the admission key decides **whether at all** — correlation alone would
+    /// join the duplicate to the right case and start a second run inside it.
+    ///
+    /// # Errors
+    ///
+    /// As [`run_correlated`](Self::run_correlated).
+    pub async fn run_correlated_once(
+        &self,
+        target: &str,
+        input: Tainted<Value>,
+        case_kind: &str,
+        keys: &[CorrelationKey],
+        idempotency_key: &str,
+    ) -> Result<Admission, RuntimeError> {
+        self.admit_once(
             target,
             input,
-            Some(CaseBinding::Correlate {
-                kind: case_kind.to_owned(),
-                keys: keys.to_vec(),
-            }),
+            Terms::correlated(case_kind, keys).keyed(idempotency_key),
+        )
+        .await
+    }
+
+    /// Admit under a key and return the run id without waiting for it.
+    ///
+    /// What a webhook handler usually wants: admission is durable before this
+    /// returns, so a 2xx means *this message will be acted on* rather than
+    /// *this message was received*.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, as [`spawn`](Self::spawn) does.
+    ///
+    /// # Errors
+    ///
+    /// As [`spawn`](Self::spawn).
+    pub async fn spawn_once(
+        self: &Arc<Self>,
+        target: &str,
+        input: Tainted<Value>,
+        idempotency_key: &str,
+    ) -> Result<Spawned, RuntimeError> {
+        self.spawn_bound_once(target, input, Terms::default().keyed(idempotency_key))
+            .await
+    }
+
+    /// Correlate and spawn, at most once per admission key.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, as [`spawn`](Self::spawn) does.
+    ///
+    /// # Errors
+    ///
+    /// As [`spawn_correlated`](Self::spawn_correlated).
+    pub async fn spawn_correlated_once(
+        self: &Arc<Self>,
+        target: &str,
+        input: Tainted<Value>,
+        case_kind: &str,
+        keys: &[CorrelationKey],
+        idempotency_key: &str,
+    ) -> Result<Spawned, RuntimeError> {
+        self.spawn_bound_once(
+            target,
+            input,
+            Terms::correlated(case_kind, keys).keyed(idempotency_key),
         )
         .await
     }
@@ -1292,7 +1502,7 @@ impl Runtime {
         plan: PlanIR,
         input: Tainted<Value>,
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit_plan(plan, input, None).await
+        self.admit_plan(plan, input, Terms::default()).await
     }
 
     /// Execute an explicit plan inside a long-lived case.
@@ -1303,15 +1513,129 @@ impl Runtime {
         case_kind: &str,
         keys: &[CorrelationKey],
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit_plan(
-            plan,
-            input,
-            Some(CaseBinding::Correlate {
-                kind: case_kind.to_owned(),
-                keys: keys.to_vec(),
+        self.admit_plan(plan, input, Terms::correlated(case_kind, keys))
+            .await
+    }
+
+    /// Admission under a key, for the blocking `_once` entry points.
+    ///
+    /// Two gates, and only the second arbitrates. The read below is an
+    /// optimisation — it saves a redelivery the cost of a policy evaluation, a
+    /// quota reservation, a lease and a correlation lookup — and settles
+    /// nothing, since two instances racing both see nothing here. The
+    /// constraint inside `append` decides, on the same division
+    /// `CaseStore::correlate_or_open` runs on.
+    async fn admit_once(
+        &self,
+        target: &str,
+        input: Tainted<Value>,
+        terms: Terms,
+    ) -> Result<Admission, RuntimeError> {
+        let key = terms
+            .idempotency_key
+            .clone()
+            .expect("admit_once is only reached with a key");
+        validate_admission_key(&key)?;
+        if let Some(held) = self.holder_of(&key).await? {
+            return self.answer_with(held).await;
+        }
+        match self.admit(target, input, terms).await {
+            Ok(outcome) => Ok(Admission::Fresh(outcome)),
+            Err(RuntimeError::Store(crate::core::StoreError::DuplicateAdmission {
+                run, ..
+            })) => self.answer_with(parse_holder(&run)?).await,
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`admit_once`](Self::admit_once) for the non-blocking pair.
+    async fn spawn_bound_once(
+        self: &Arc<Self>,
+        target: &str,
+        input: Tainted<Value>,
+        terms: Terms,
+    ) -> Result<Spawned, RuntimeError> {
+        let key = terms
+            .idempotency_key
+            .clone()
+            .expect("spawn_bound_once is only reached with a key");
+        validate_admission_key(&key)?;
+        if let Some(run) = self.holder_of(&key).await? {
+            return Ok(Spawned { run, fresh: false });
+        }
+        match self.spawn_bound(target, input, terms).await {
+            Ok(run) => Ok(Spawned { run, fresh: true }),
+            Err(RuntimeError::Store(crate::core::StoreError::DuplicateAdmission {
+                run, ..
+            })) => Ok(Spawned {
+                run: parse_holder(&run)?,
+                fresh: false,
             }),
-        )
-        .await
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Which run holds this admission key, if any.
+    async fn holder_of(&self, key: &str) -> Result<Option<RunId>, RuntimeError> {
+        self.store
+            .admitted_as(key)
+            .await
+            .map_err(RuntimeError::from_store)
+    }
+
+    /// Answer a duplicate with what the original run has on the record.
+    async fn answer_with(&self, held: RunId) -> Result<Admission, RuntimeError> {
+        Ok(match self.recorded_outcome(held).await? {
+            Some(outcome) => Admission::Replayed(outcome),
+            None => Admission::InFlight(held),
+        })
+    }
+
+    /// What a run has recorded, **without resuming it**.
+    ///
+    /// `None` while the run is still working — it has records but has reached
+    /// neither a conclusion nor a suspension.
+    ///
+    /// No lease is taken and nothing is appended. The original is frequently
+    /// live when its redelivery lands, and a read that acquired a lease would
+    /// fence a healthy run mid-step in order to report on it.
+    ///
+    /// The **last** record decides, never any record: a run that suspended, was
+    /// resumed and carried on has a suspension in its history and is not
+    /// suspended now. Same rule as the A2A status projection, so the two
+    /// surfaces cannot disagree about one run.
+    ///
+    /// # Errors
+    ///
+    /// If the journal cannot be read.
+    pub async fn recorded_outcome(&self, run: RunId) -> Result<Option<RunOutcome>, RuntimeError> {
+        let records = self
+            .store
+            .read(run, 1)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        let Some(last) = records.last() else {
+            return Ok(None);
+        };
+        let status = match last.kind() {
+            RecordKind::RunSuspended { reason } => RunStatus::Suspended(reason.clone()),
+            RecordKind::RunSealed {
+                outcome, reason, ..
+            } => recorded_status(outcome, reason.as_deref(), &records),
+            _ => return Ok(None),
+        };
+        Ok(Some(RunOutcome {
+            run_id: run,
+            status,
+            chain_head: last.hash,
+            // Reading a record performs nothing, so it consumes nothing — the
+            // same answer the closed-run path gives, and for the same reason:
+            // the spend belongs to the pass that did the work.
+            spend: Spend::default(),
+            // A step's result is reconstructed by replay rather than stored, so
+            // there is none to hand back here. See `Admission::Replayed`.
+            output: None,
+        }))
     }
 
     /// Rebuild a run's case binding **from its history**, never by re-deriving.
@@ -1354,12 +1678,12 @@ impl Runtime {
         &self,
         target: &str,
         input: Tainted<Value>,
-        case: Option<CaseBinding>,
+        terms: Terms,
     ) -> Result<RunOutcome, RuntimeError> {
         // A bare target is the degenerate plan: one node, terminal.
         let skill = self.resolve(target)?;
         let capability = first_capability(&skill.descriptor());
-        self.admit_plan(PlanIR::single(capability), input, case)
+        self.admit_plan(PlanIR::single(capability), input, terms)
             .await
     }
 
@@ -1367,9 +1691,9 @@ impl Runtime {
         &self,
         plan: PlanIR,
         input: Tainted<Value>,
-        case: Option<CaseBinding>,
+        terms: Terms,
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit_plan_as(RunId::generate(), plan, input, case)
+        self.admit_plan_as(RunId::generate(), plan, input, terms)
             .await
     }
 
@@ -1538,6 +1862,7 @@ impl Runtime {
         capability: &str,
         governed_by: Option<crate::journal::AgentIdentity>,
         input: &Tainted<Value>,
+        idempotency_key: Option<String>,
     ) -> RecordKind {
         RecordKind::RunAdmitted {
             capability: capability.to_owned(),
@@ -1546,6 +1871,7 @@ impl Runtime {
             input_label: input.label().clone(),
             policy_bundle: self.policy.as_ref().map(|p| p.bundle()),
             canon: crate::core::canon::VERSION,
+            idempotency_key,
         }
     }
 
@@ -1562,7 +1888,7 @@ impl Runtime {
         run: RunId,
         plan: PlanIR,
         input: Tainted<Value>,
-        case: Option<CaseBinding>,
+        terms: Terms,
     ) -> Result<Admitted, RuntimeError> {
         crate::plan::validate(&plan, &self.contract())
             .map_err(|e| RuntimeError::PlanContract(e.to_string()))?;
@@ -1598,7 +1924,7 @@ impl Runtime {
         // so one that survives an unreachable store is attributable rather
         // than a counter that silently drifted.
         let out = self
-            .admit_reserved(run, plan, input, case, agent, governed_by)
+            .admit_reserved(run, plan, input, terms, agent, governed_by)
             .await;
         if out.is_err()
             && let Some(quotas) = self.quotas.as_ref()
@@ -1626,7 +1952,7 @@ impl Runtime {
         run: RunId,
         plan: PlanIR,
         input: Tainted<Value>,
-        case: Option<CaseBinding>,
+        terms: Terms,
         agent: String,
         governed_by: Option<crate::journal::AgentIdentity>,
     ) -> Result<Admitted, RuntimeError> {
@@ -1639,7 +1965,7 @@ impl Runtime {
             .map_err(RuntimeError::from_store)?;
 
         let out = self
-            .admit_under_lease(run, &lease, plan, input, case, &agent, governed_by)
+            .admit_under_lease(run, &lease, plan, input, terms, &agent, governed_by)
             .await;
         if out.is_err()
             && let Err(e) = self.store.release_lease(run, lease.epoch).await
@@ -1660,12 +1986,19 @@ impl Runtime {
         lease: &crate::journal::Lease,
         plan: PlanIR,
         input: Tainted<Value>,
-        case: Option<CaseBinding>,
+        terms: Terms,
         agent: &str,
         governed_by: Option<crate::journal::AgentIdentity>,
     ) -> Result<Admitted, RuntimeError> {
+        let Terms {
+            case,
+            idempotency_key,
+        } = terms;
         let mut records = vec![
-            Append::new(run, self.admission(agent, governed_by, &input)),
+            Append::new(
+                run,
+                self.admission(agent, governed_by, &input, idempotency_key),
+            ),
             // From here the plan is an authorization graph: compiled from
             // trusted input, frozen before anything untrusted was read, and
             // recorded so the journal that follows can be checked against it.
@@ -1780,10 +2113,26 @@ impl Runtime {
             (None, _) => None,
         };
 
-        self.store
-            .append(lease.epoch, records)
-            .await
-            .map_err(RuntimeError::from_store)?;
+        // The append claims the admission key, so a key already held is refused
+        // here — after the case work above has attached this run. A run whose
+        // records never landed has no history, so leaving it attached would put
+        // a run that never happened into the matter's own account of what did.
+        // Unwound for every failed append: why it failed does not change the
+        // fact that the run does not exist.
+        if let Err(e) = self.store.append(lease.epoch, records).await {
+            if let Some(ctx) = case_ctx.as_ref()
+                && let Err(detach) = ctx.cases.detach_run(ctx.case_id, run).await
+            {
+                tracing::warn!(
+                    %run,
+                    case = %ctx.case_id,
+                    error = %detach,
+                    "a failed admission stayed attached to its case; the case lists a \
+                     run with no journal"
+                );
+            }
+            return Err(RuntimeError::from_store(e));
+        }
 
         // Registered before the run is handed back, and its failure fails
         // admission. A run that started with its destinations unregistered would
@@ -1828,6 +2177,10 @@ impl Runtime {
                             run,
                             RecordKind::RunSealed {
                                 outcome: RunStatus::Failed(String::new()).as_str().to_owned(),
+                                reason: Some(format!(
+                                    "the outbox registration was refused ({open_failed}), so \
+                                     this run was concluded without ever executing"
+                                )),
                                 chain_head: head.hash,
                             },
                         ),
@@ -1887,9 +2240,9 @@ impl Runtime {
         run: RunId,
         plan: PlanIR,
         input: Tainted<Value>,
-        case: Option<CaseBinding>,
+        terms: Terms,
     ) -> Result<RunOutcome, RuntimeError> {
-        let admitted = self.admit_only(run, plan, input, case).await?;
+        let admitted = self.admit_only(run, plan, input, terms).await?;
         self.execute_admitted(admitted).await
     }
 
@@ -3681,6 +4034,7 @@ impl Runtime {
                     run,
                     RecordKind::RunSealed {
                         outcome: status.as_str().to_owned(),
+                        reason: status.reason().map(std::borrow::Cow::into_owned),
                         chain_head: before.hash,
                     },
                 );
@@ -4757,6 +5111,89 @@ fn resume_is_closed(records: &[Record]) -> Option<RunStatus> {
         other => Some(RunStatus::Quarantined(format!(
             "recorded as '{other}', which this build does not recognise as resumable"
         ))),
+    }
+}
+
+/// The longest admission key this runtime accepts.
+///
+/// Bounded because the key is a **counterparty-controlled** string that becomes
+/// part of a storage key: unbounded, it is an index entry an emitter chooses the
+/// size of. 512 bytes is far above what an identity needs — a `CloudEvents`
+/// `source` and `id` together are tens of bytes — and far below what a btree
+/// index refuses, so the refusal is this crate's with a reason rather than the
+/// backend's with an error code.
+pub const MAX_ADMISSION_KEY_BYTES: usize = 512;
+
+/// Refuse a key that cannot mean what the caller thinks it means.
+///
+/// An **empty** key is the important one, and it is refused rather than
+/// accepted as a value. A missing header or an unset variable arrives here as
+/// `""`, and `""` is a perfectly good key: the first message claims it and every
+/// later message — a *different* message — is answered with the first one's run.
+/// That is silent, total message loss produced by a configuration mistake, and
+/// it is exactly what an at-most-once control must not do quietly.
+fn validate_admission_key(key: &str) -> Result<(), RuntimeError> {
+    if key.trim().is_empty() {
+        return Err(RuntimeError::PlanContract(
+            "an admission key is empty — an unset header or variable arrives here as \
+             an empty string, and accepting it would answer every later message with \
+             the first one's run. Use the message's own identity, such as \
+             `InboundEvent::dedup_key()`"
+                .into(),
+        ));
+    }
+    if key.len() > MAX_ADMISSION_KEY_BYTES {
+        return Err(RuntimeError::PlanContract(format!(
+            "an admission key of {} bytes exceeds the {MAX_ADMISSION_KEY_BYTES}-byte \
+             limit — the key is chosen by the emitter and becomes part of a storage \
+             key, so its size is not theirs to decide",
+            key.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The run id a store named as an admission key's holder.
+///
+/// An unparseable holder is corruption in a derived index. Refused rather than
+/// admitted around: "the index is unreadable" is not evidence the key is free.
+fn parse_holder(run: &str) -> Result<RunId, RuntimeError> {
+    RunId::parse(run).map_err(|e| {
+        RuntimeError::PlanContract(format!(
+            "an admission key is held by run '{run}', which does not parse ({e}) —              refusing rather than admitting a second run under a key whose holder              this build cannot read"
+        ))
+    })
+}
+
+/// A sealed run's status, rebuilt from its recorded conclusion.
+///
+/// Distinct from `resume_is_closed`, which asks the narrower *may this run be
+/// resumed* and returns `None` for the conclusions that stay resumable. Every
+/// conclusion has an answer here: a failed run reported as "still working"
+/// would send a redelivery into a second admission.
+fn recorded_status(outcome: &str, reason: Option<&str>, records: &[Record]) -> RunStatus {
+    // A conclusion that carries no reason gets a statement of that fact rather
+    // than an empty string: the empty summary is what `RunStatus::reason`
+    // exists to prevent, and this is the surface a retried delivery reads.
+    let said = || {
+        reason.map_or_else(
+            || "concluded without a recorded reason".to_owned(),
+            ToOwned::to_owned,
+        )
+    };
+    match outcome {
+        "succeeded" => RunStatus::Succeeded,
+        "failed" | "exhausted" => RunStatus::Failed(said()),
+        "quarantined" => RunStatus::Quarantined(said()),
+        "cancelled" => RunStatus::Cancelled {
+            actor: recorded_canceller(records).unwrap_or_else(|| "unknown".into()),
+            reason: said(),
+        },
+        // Fail closed, as the resume path does: a conclusion this build cannot
+        // interpret is not permission to treat the run as ordinary.
+        other => RunStatus::Quarantined(format!(
+            "recorded as '{other}', which this build does not recognise"
+        )),
     }
 }
 
@@ -6753,6 +7190,7 @@ mod resume_agreement_tests {
             kind: RecordKind::RunSealed {
                 outcome: outcome.to_owned(),
                 chain_head: Digest::of(b""),
+                reason: None,
             },
         };
         vec![Record::seal(body, Digest::of(b"")).expect("a sealed record")]

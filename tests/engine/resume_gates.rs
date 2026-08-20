@@ -590,6 +590,7 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         input_label: Label::trusted(),
                         policy_bundle: None,
                         canon: canon::VERSION,
+                        idempotency_key: None,
                     },
                 ),
                 Append::new(

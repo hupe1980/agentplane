@@ -111,6 +111,18 @@ pub enum RecordKind {
         /// *divergent*, and reporting the second for the first quarantines
         /// healthy history.
         canon: u16,
+        /// The admission key this run claimed, if it was admitted idempotently.
+        ///
+        /// The **claim itself**, not a copy of one: the store derives its
+        /// `(tenant, key)` uniqueness index from this field inside `append`, so
+        /// the key is taken exactly when the run becomes real. A ledger written
+        /// before the append could instead strand the key over a run that never
+        /// existed.
+        ///
+        /// `None` for an ordinary admission. The key must carry its producer —
+        /// see [`InboundEvent::dedup_key`](crate::core::InboundEvent::dedup_key).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
 
     /// The plan was compiled from trusted input and frozen.
@@ -482,6 +494,15 @@ pub enum RecordKind {
     /// than one of these, and why the *last* one is the run's answer.
     RunSealed {
         outcome: String,
+        /// Why the run ended this way, when the ending has a why.
+        ///
+        /// `None` for a success, which has none. Without it the chain records
+        /// *that* a run failed and not *why*, so the reason survives only in
+        /// the log of the process that wrote it — and an operator asking six
+        /// weeks later, or a redelivery asking which conclusion it is being
+        /// answered with, gets the word "failed" and nothing else.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
         chain_head: Digest,
     },
 
@@ -995,6 +1016,7 @@ mod tests {
                     input_label: crate::core::Label::trusted(),
                     policy_bundle: None,
                     canon: crate::core::canon::VERSION,
+                    idempotency_key: None,
                 },
             ),
             Digest::ZERO,
@@ -1029,6 +1051,7 @@ mod tests {
                     input_label: crate::core::Label::trusted(),
                     policy_bundle: None,
                     canon: crate::core::canon::VERSION,
+                    idempotency_key: None,
                 },
             ),
             Digest::ZERO,

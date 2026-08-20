@@ -15,6 +15,65 @@ property that makes a hard cut acceptable at this stage.
 
 ---
 
+## `JournalStore` and `CaseStore` each gained a required method
+
+**Affected:** anything implementing either trait — a custom backend, a decorator,
+a test double.
+
+```rust
+// JournalStore — which run holds an admission key, if one does
+async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError>;
+
+// CaseStore — undo an attachment whose run never came to exist
+async fn detach_run(&self, case: CaseId, run: RunId) -> Result<bool, StoreError>;
+```
+
+Neither has a default. `admitted_as` returning `None` by default would make a
+store that forgot it answer *"nothing has been admitted"*, and the duplicate
+would proceed — a fail-open on the control whose whole purpose is refusing a
+second run. A decorator delegates both.
+
+`JournalStore` also gained `forget_admissions(older_than)` — the retention verb
+for the admission index. A `JournalStore` implementation also has to maintain the
+index `admitted_as` reads: a `RunAdmitted` record carrying `idempotency_key: Some(k)` claims
+`(tenant, k)` **inside the same transaction as the append**, and a second one
+under an issued key is refused with `StoreError::DuplicateAdmission` naming the
+holder. `testkit::check_journal_store` covers all of it.
+
+## `RunAdmitted` and `RunSealed` gained fields
+
+**Affected:** anything constructing either record — mostly tests and importers.
+Both are journal record shapes, so an existing journal is refused rather than
+read with the field defaulted.
+
+```rust
+// RunAdmitted — the admission key this run claimed, if any
+idempotency_key: Option<String>,
+
+// RunSealed — why the run ended this way
+reason: Option<String>,
+```
+
+`RunSealed` carried only the outcome word, so the chain recorded *that* a run
+failed and not *why*; the reason survived in the log of the process that wrote it
+and nowhere an operator could query six weeks later. It is `None` for a success,
+which has no why.
+
+## `Destination::signed_with` has a fallible sibling
+
+**Affected:** nothing, unless you want it. `signed_with` still panics on a key
+under 24 bytes or a malformed `whsec_` secret.
+
+```rust
+// when the secret is read from configuration inside your own builder
+let bus = Destination::new("bus", url).try_signed_with(&Secret::new(key))?;
+```
+
+A panic inside a `build()` takes the process down before it reaches the exit code
+and log line that would have named which destination was wrong.
+
+---
+
 ## `RetryPolicy` gained `max_advice`, and rate limits carry a window
 
 **Affected:** anything constructing a `RetryPolicy` with struct literal syntax,

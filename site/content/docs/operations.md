@@ -122,6 +122,17 @@ Two design choices in the battery:
 * **It fails if it checked nothing.** A battery that silently runs zero checks
   reports success, which is the worst outcome available to it.
 
+#### At-most-once admission is part of the contract
+
+A `RunAdmitted` record carrying an idempotency key claims `(tenant, key)` in the
+same transaction as the append, and a second one under an issued key is refused
+with `DuplicateAdmission` naming the holder. The battery checks the refusal, that
+the named holder is the run that actually won, that the key is free before the
+append and taken after it, that a rejected batch spends no key, that retirement
+frees a key without touching the run it named, and that an unkeyed admission
+claims nothing — the direction that would otherwise break every plane never using
+the feature.
+
 Writing it immediately caught a misreading in the battery itself: a *live* lease
 is correctly not stealable — `LeaseHeld`, deliberately distinct from `Fenced`,
 because the two call for opposite responses. A fenced writer must drop the run; a
@@ -432,6 +443,23 @@ that never mentions it has quietly made takeover impossible for everybody.
 The general rule is worth stating because it is easy to satisfy accidentally and
 easy to lose: a control that notices and does not deliver is closer to none than
 to half, because it also manufactures the belief that somebody was told.
+
+### Retention for the admission index
+
+Admission keys are kept until you retire them:
+
+```sh
+agentplane forget-admissions --store ./journal.redb --older-than-days 30
+```
+
+**The window has no default, and that is the decision.** Retiring a key reopens
+the door it closed, so a window shorter than your emitter's retry horizon admits
+a second run on a timer. Runtimes that bound this automatically have to guess at
+that horizon; nothing here can know it.
+
+The index is a row per admitted message and grows with inbound volume — a size
+your database monitoring already reports. The verb prints what it retired, so a
+pass that found nothing is distinguishable from one that said nothing.
 
 ### Taking the record away
 

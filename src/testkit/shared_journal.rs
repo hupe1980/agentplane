@@ -77,6 +77,17 @@ impl JournalStore for SharedJournal {
         self.inner.abandoned_runs(limit).await
     }
 
+    async fn admitted_as(&self, key: &str) -> Result<Option<crate::core::RunId>, StoreError> {
+        self.inner.admitted_as(key).await
+    }
+
+    async fn forget_admissions(
+        &self,
+        older_than: crate::core::Timestamp,
+    ) -> Result<usize, StoreError> {
+        self.inner.forget_admissions(older_than).await
+    }
+
     async fn runs_by_outcome(
         &self,
         outcome: &str,

@@ -203,7 +203,7 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 |---|---|
 | 🧾 | **A journal you can audit** — append-only, hash-chained, per-record signatures naming the workload that wrote them, and a per-plane Merkle log so deleting a whole run is detectable |
 | ⏱️ | **Durable execution** — crash mid-run and resume from the last completed effect; a suspended run costs a row on disk, not a task. Recovery is *initiated*, not merely possible: the sweep finds every run whose owner died holding it — an expired, unreleased lease — and resumes it, journaling the takeover in its own sealed run |
-| 🗂️ | **Cases, not long-lived workflows** — runs stay minutes, business processes span months, so a deploy never has to migrate an in-flight workflow |
+| 🗂️ | **Cases, not long-lived workflows** — runs stay minutes, business processes span months, so a deploy never has to migrate an in-flight workflow. Inbound messages arrive at-least-once, so admission takes an idempotency key and claims it in the same transaction that writes the run's first record: a redelivery is answered with the original run — including when that run is parked on a human decision — rather than opening a second identical approval |
 | 🛡️ | **Policy before live dispatch** — a total, I/O-free gate; denials are journaled, strict replay never re-judges history, and plan authority is checked before step 1 |
 | 🏷️ | **Field-level information flow** — exact outbound arguments are bound to hierarchical provenance; recipient, amount, path, URL and other authority-bearing fields can require trusted or named sources while ordinary content remains untrusted |
 | 💸 | **Budgets that bind** — a failed model call is billed for what it burned, because the provider bills for it too |

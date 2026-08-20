@@ -761,6 +761,20 @@ impl CaseStore for PostgresStore {
         )))
     }
 
+    async fn detach_run(&self, case: CaseId, run: RunId) -> Result<bool, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // The seq is deliberately left spent: `attach_run` allocates MAX+1, so
+        // a removed position is never handed out again. See `detach_run`.
+        let removed = client
+            .execute(
+                "DELETE FROM case_runs WHERE tenant = $1 AND case_id = $2 AND run_id = $3",
+                &[&self.tenant_name(), &case.to_string(), &run.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(removed > 0)
+    }
+
     async fn link_blob(
         &self,
         case: CaseId,

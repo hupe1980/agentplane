@@ -30,6 +30,120 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.20.0] — 2026-08-20
+
+One pass over the receiving edge, from a deployment report: a plane that emits
+signed events at-least-once, and a plane that *takes* them, had asymmetric
+support. The sending half was finished; the receiving half was left to whoever
+wrote the receiver.
+
+### Added — admission is at-most-once when a message says who it is
+
+`run_once`, `run_correlated_once`, `spawn_once` and `spawn_correlated_once` take
+an admission key and return `Admission` — `Fresh`, `Replayed`, or `InFlight`.
+
+The key rides on the `RunAdmitted` record, and the store claims `(tenant, key)`
+**inside the transaction that appends it**. That ordering is the whole design: a
+ledger a caller writes before the run strands the key over a run that never
+existed if the process dies between the two, and every recovery for that is
+machinery this shape does not need. A refused admission — a policy denial, a
+quota ceiling, a rejected batch — spends no key, because the key and the records
+commit together or not at all. Postgres holds it with a primary key on
+`run_admission`; redb holds it with the shape of a table key, the way `CORR_OPEN`
+holds one open case per business key.
+
+A duplicate is answered rather than refused: a caller that retried wants the
+original run, not a conflict to interpret. The case that motivated it is the
+**suspended** one — a run parked on a four-eyes decision has already opened the
+task, so a redelivery that admitted would put a second identical approval in
+front of a reviewer, which is a control degrading into a guess. `Admission` says
+*this is already waiting for you*.
+
+The event buffer was the obvious place to put this and is the wrong one.
+`EventStore::buffer` already reports "already seen" for a `(source, id)` over the
+same store — but an event nobody subscribes to is dead-lettered by the sweep, and
+a non-empty dead-letter list means *a correlation key is wrong somewhere*. A
+receiver using the buffer as an idempotency ledger would dead-letter nearly every
+message it admits, so `needs_attention()` would be permanently true and that
+signal spent buying deduplication. Two concerns can share an identity without
+sharing a table.
+
+`JournalStore::admitted_as` and `CaseStore::detach_run` are new required methods,
+neither with a default — see [upgrading]. The conformance battery covers the
+invariant in both directions, including that an unkeyed admission claims nothing.
+
+### Added — a verifier beside the signer
+
+`WebhookVerifier` checks what `Destination::signed_with` produces: Standard
+Webhooks, over the raw bytes, with a five-minute tolerance and `also_accepting`
+for a rotation.
+
+Shipping only a signer means every receiver writes the interesting half itself,
+and the interesting half is not the HMAC — it is the two things around it. A
+signature authenticates bytes, not freshness, so a captured POST replays forever
+unless a stale timestamp is refused; at-least-once delivery makes duplicates
+ordinary, so genuine bytes arrive twice unless the receiver deduplicates on the
+id. Both are what a second implementation omits, because omitting them looks like
+working software: every test passes, every delivery verifies, and the failure is
+a replay nobody sees.
+
+`verify` refuses the first and returns `VerifiedDelivery { id, timestamp }` for
+the second — `id` is what `run_correlated_once` takes as its admission key, so
+the two halves of this release meet at that field. Refusals are typed, the
+comparison does not short-circuit, and a body is never parsed before it is
+verified.
+
+### Fixed — security: a conclusion's reason reached the store in the clear
+
+`RecordKind::RunSealed` was control-plane — an outcome word and a chain head,
+neither of them the caller's data — so `journal::payload` sealed nothing for it.
+Adding a `reason` to that variant put a provider's refusal, quoting the request
+it refused, into a record the key ring walks past.
+
+The mapping's own comment had defended listing every record kind by name:
+*a new variant does not build until somebody has answered it*. That is true of
+variants and silent about **fields** — `K::RunSealed { .. }` kept matching, kept
+compiling, and kept sealing nothing. Every arm now destructures every field and
+binds the ignored ones explicitly, so the second question reaches the build too.
+It is shape 33 in the constitution's catalogue: an exhaustive match that is
+exhaustive over the wrong axis.
+
+### Added — the admission index has a retention verb, and no default
+
+`JournalStore::forget_admissions(older_than)` retires claimed keys. There is
+deliberately no automatic window: retiring a key reopens the door it closed, so
+the window must exceed the emitter's retry horizon and is the operator's to
+choose. Absent a call, keys are kept — the safe default is the one that cannot
+admit a duplicate on a timer, and the size of the index is something a
+deployment's database monitoring already reports.
+
+`agentplane forget-admissions --store … --older-than-days N` is the operator's
+door to it, for the reason `drill` has one: a verb reachable only from Rust is
+absent from a deployment that is only a YAML file. The window is a required
+argument with no default — choosing one would be this crate picking somebody
+else's retry horizon.
+
+Also refused now: an **empty** admission key, and one over
+`MAX_ADMISSION_KEY_BYTES`. An unset header arrives as `""`, and `""` is a
+perfectly good key — the first message claims it and every later message is
+answered with the first one's run. Silent, total, and produced by a
+configuration mistake.
+
+### Added — `try_signed_with`, and a reason on the seal
+
+`Destination::try_signed_with` and `BodySigning::try_new` report a bad key rather
+than panicking. `signed_with` is usually called inside a deployment's own
+builder, where an abort arrives before the exit code and the log line that would
+have named which destination was wrong — the `build`/`try_build` pair, in the
+small.
+
+`RecordKind::RunSealed` gained `reason`. It carried only the outcome word, so the
+chain recorded *that* a run failed and not *why*: the reason survived in the log
+of the process that wrote it and nowhere an operator, an audit or a replayed
+admission could reach. `None` for a success, which has no why.
+
+[upgrading]: https://hupe1980.github.io/agentplane/docs/upgrading/
+
 ## [0.19.0] — 2026-08-19
 
 Six passes: two over the confidentiality layer — one over its rules, one over

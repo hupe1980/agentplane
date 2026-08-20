@@ -172,6 +172,7 @@ impl SweepLedger {
             run,
             RecordKind::RunSealed {
                 outcome: SWEEP_OUTCOME.to_owned(),
+                reason: None,
                 chain_head: head.hash,
             },
         );

@@ -37,6 +37,7 @@ one builder call:
 | Memory item content | `MemoryStore` | **yes** — `forget`, `forget_cascading`, expiry sweep | unreadable everywhere with an explicit `EncryptedMemoryStore` wrap — **not** covered by `.keyring(..)`, see below |
 | Blob bytes — `cx.store_blob`, fetched media | blob store | **yes** — expiry leaves a tombstone, in the live store only | unreadable everywhere, backups included |
 | Correlation keys, deadline names, task summaries, statuses | case / task store | no, and deliberately — they are what the store is asked questions *about* | unchanged: still readable |
+| Admission keys — a message's `source`/`id` | journal — `RunAdmitted.idempotency_key` — **and** the `run_admission` index | no, and deliberately: the index is looked up by a value the caller holds in the clear, and sealing it would leave a store that cannot refuse a redelivery | unchanged: still readable |
 | Blob digest and classification | journal | no, and it does not need to be — a digest is not the bytes | unchanged |
 
 Read the first column as the floor and the second as what one call buys. Both

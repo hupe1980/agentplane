@@ -988,6 +988,21 @@ pub async fn event_erasure(store: Arc<dyn crate::case::EventStore>) {
     );
 }
 
+fn admitted_under(run: RunId, key: &str) -> Append {
+    Append::new(
+        run,
+        RecordKind::RunAdmitted {
+            capability: "conformance".into(),
+            governed_by: None,
+            input_label: crate::core::Label::trusted(),
+            input: serde_json::Value::Null,
+            policy_bundle: None,
+            canon: crate::core::canon::VERSION,
+            idempotency_key: Some(key.to_owned()),
+        },
+    )
+}
+
 fn admitted(run: RunId) -> Append {
     Append::new(
         run,
@@ -998,6 +1013,7 @@ fn admitted(run: RunId) -> Append {
             input: serde_json::Value::Null,
             policy_bundle: None,
             canon: crate::core::canon::VERSION,
+            idempotency_key: None,
         },
     )
 }
@@ -1008,6 +1024,7 @@ fn concluded(run: RunId, outcome: &str) -> Append {
         run,
         RecordKind::RunSealed {
             outcome: outcome.to_owned(),
+            reason: None,
             chain_head: Digest::ZERO,
         },
     )
@@ -1078,7 +1095,280 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     a_fenced_caller_cannot_release_the_new_owners_lease(fresh, &mut r).await;
     the_discovery_index_pages_in_a_total_order(fresh, &mut r).await;
     abandonment_names_the_dead_not_the_finished(fresh, &mut r).await;
+    an_admission_key_admits_one_run(fresh, &mut r).await;
+    a_key_is_claimed_by_the_append_that_writes_the_run(fresh, &mut r).await;
+    a_refused_admission_leaves_its_key_free(fresh, &mut r).await;
+    an_unkeyed_admission_claims_nothing(fresh, &mut r).await;
+    retiring_a_key_frees_it_and_leaves_the_run(fresh, &mut r).await;
     r
+}
+
+/// A retired key is free again, and the run it named is untouched.
+///
+/// Both halves. Retirement that did not free the key would be a no-op wearing a
+/// row count; retirement that touched the journal would be a retention policy
+/// editing history, and the key's authority is the `RunAdmitted` record.
+async fn retiring_a_key_frees_it_and_leaves_the_run(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let key = "conformance/retired";
+
+    let run = RunId::generate();
+    let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+        return;
+    };
+    if store
+        .append(lease.epoch, vec![admitted_under(run, key)])
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    // A cutoff before the claim retires nothing: the window is a bound on age,
+    // not a switch.
+    match store
+        .forget_admissions(crate::core::Timestamp::from_unix_timestamp(0).expect("epoch"))
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => r.record(
+            "admission keys",
+            format!("a cutoff older than every claim retired {n} of them"),
+        ),
+        Err(e) => {
+            r.record("admission keys", format!("forget_admissions failed: {e}"));
+            return;
+        }
+    }
+    if !matches!(store.admitted_as(key).await, Ok(Some(_))) {
+        r.record(
+            "admission keys",
+            "a key was released by a retirement that reported retiring nothing",
+        );
+    }
+
+    match store
+        .forget_admissions(
+            crate::core::Timestamp::from_unix_timestamp(4_102_444_800).expect("year 2100"),
+        )
+        .await
+    {
+        Ok(1) => {}
+        Ok(n) => r.record(
+            "admission keys",
+            format!("retiring one claim past its window reported {n}"),
+        ),
+        Err(e) => {
+            r.record("admission keys", format!("forget_admissions failed: {e}"));
+            return;
+        }
+    }
+    match store.admitted_as(key).await {
+        Ok(None) => {}
+        Ok(Some(held)) => r.record(
+            "admission keys",
+            format!("a retired key is still held by {held}, so retirement reclaims nothing"),
+        ),
+        Err(e) => r.record("admission keys", format!("admitted_as failed: {e}")),
+    }
+    match store.read(run, 1).await {
+        Ok(records) if !records.is_empty() => {}
+        Ok(_) => r.record(
+            "admission keys",
+            "retiring a key erased the run it named — a retention policy must not \
+             edit history, and the key's authority is the RunAdmitted record",
+        ),
+        Err(e) => r.record("admission keys", format!("the run became unreadable: {e}")),
+    }
+}
+
+/// One admission key admits one run, and the loser is told which run won.
+///
+/// A backend answering the second append with success lets a redelivery start a
+/// second run, and every single-threaded test written for it still passes.
+///
+/// The **holder** is checked, not merely the refusal: a conflict naming the
+/// wrong run sends the caller to a journal answering a different question.
+async fn an_admission_key_admits_one_run(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let key = "conformance/one-message";
+
+    let first = RunId::generate();
+    let Ok(lease) = store.acquire(first, "conformance", LEASE).await else {
+        return;
+    };
+    if let Err(e) = store
+        .append(lease.epoch, vec![admitted_under(first, key)])
+        .await
+    {
+        r.record(
+            "admission keys",
+            format!("the first admission under a fresh key was refused: {e}"),
+        );
+        return;
+    }
+
+    let second = RunId::generate();
+    let Ok(lease) = store.acquire(second, "conformance", LEASE).await else {
+        return;
+    };
+    match store
+        .append(lease.epoch, vec![admitted_under(second, key)])
+        .await
+    {
+        Err(crate::core::StoreError::DuplicateAdmission { run, .. }) => {
+            if run != first.to_string() {
+                r.record(
+                    "admission keys",
+                    format!(
+                        "the refusal named '{run}' as the key's holder, but {first}                          holds it — a caller sent there reads a run that answers a                          different question"
+                    ),
+                );
+            }
+        }
+        Ok(_) => r.record(
+            "admission keys",
+            "a second run was admitted under a key already issued — an emitter's              redelivery would start a second run, which is the whole failure this              refuses"
+                .to_owned(),
+        ),
+        Err(e) => r.record(
+            "admission keys",
+            format!("the duplicate was refused, but not as DuplicateAdmission: {e}"),
+        ),
+    }
+
+    match store.admitted_as(key).await {
+        Ok(Some(held)) if held == first => {}
+        Ok(other) => r.record(
+            "admission keys",
+            format!("admitted_as must name {first}, said {other:?}"),
+        ),
+        Err(e) => r.record("admission keys", format!("admitted_as failed: {e}")),
+    }
+}
+
+/// The key is taken by the append, so it is never taken while the run is not.
+///
+/// A ledger written before the run strands the key over a run that never
+/// existed if the process dies between the two. The property is observable:
+/// before the append, the key must be free.
+async fn a_key_is_claimed_by_the_append_that_writes_the_run(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let key = "conformance/not-yet";
+
+    match store.admitted_as(key).await {
+        Ok(None) => {}
+        Ok(Some(run)) => {
+            r.record(
+                "admission keys",
+                format!("a key nothing has admitted under is held by {run}"),
+            );
+            return;
+        }
+        Err(e) => {
+            r.record("admission keys", format!("admitted_as failed: {e}"));
+            return;
+        }
+    }
+
+    let run = RunId::generate();
+    let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+        return;
+    };
+    // Taking the lease is not admitting: a run that was claimed and never
+    // written has not spent its key, or a crash between the two would burn it.
+    if let Ok(Some(held)) = store.admitted_as(key).await {
+        r.record(
+            "admission keys",
+            format!("taking a lease claimed the key for {held}; only the append may"),
+        );
+    }
+    let _ = store
+        .append(lease.epoch, vec![admitted_under(run, key)])
+        .await;
+    match store.admitted_as(key).await {
+        Ok(Some(held)) if held == run => {}
+        Ok(other) => r.record(
+            "admission keys",
+            format!("after the append the key must be held by {run}, said {other:?}"),
+        ),
+        Err(e) => r.record("admission keys", format!("admitted_as failed: {e}")),
+    }
+}
+
+/// An append that was refused spends no key.
+///
+/// The whole batch commits or none of it does, and the key is part of the batch.
+/// A backend that claimed it and rolled the records back would answer every
+/// future redelivery with a run that does not exist.
+async fn a_refused_admission_leaves_its_key_free(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let key = "conformance/refused";
+
+    let run = RunId::generate();
+    let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+        return;
+    };
+    // Refused for spanning runs — the one rejection every backend must make,
+    // so the check does not depend on which other refusals a backend has.
+    let other = RunId::generate();
+    let refused = store
+        .append(lease.epoch, vec![admitted_under(run, key), admitted(other)])
+        .await;
+    if refused.is_ok() {
+        r.record(
+            "admission keys",
+            "a batch spanning two runs was accepted; the rest of this check              cannot mean anything"
+                .to_owned(),
+        );
+        return;
+    }
+
+    match store.admitted_as(key).await {
+        Ok(None) => {}
+        Ok(Some(held)) => r.record(
+            "admission keys",
+            format!(
+                "a refused append left the key held by {held} — the key committed                  without the run it names, so every future retry is answered with a                  run that has no journal"
+            ),
+        ),
+        Err(e) => r.record("admission keys", format!("admitted_as failed: {e}")),
+    }
+}
+
+/// A run admitted without a key claims none.
+///
+/// A backend filing unkeyed admissions under the empty key would refuse the
+/// second ordinary run as a duplicate of the first — every plane broken by a
+/// feature it never uses.
+async fn an_unkeyed_admission_claims_nothing(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+
+    for _ in 0..2 {
+        let run = RunId::generate();
+        let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+            return;
+        };
+        if let Err(e) = store.append(lease.epoch, vec![admitted(run)]).await {
+            r.record(
+                "admission keys",
+                format!("an admission carrying no key was refused: {e}"),
+            );
+            return;
+        }
+    }
+
+    if let Ok(Some(held)) = store.admitted_as("").await {
+        r.record(
+            "admission keys",
+            format!("an unkeyed admission was filed under the empty key, held by {held}"),
+        );
+    }
 }
 
 /// `abandoned_runs` returns exactly the runs an instance died holding.

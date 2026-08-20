@@ -868,6 +868,18 @@ pub enum StoreError {
     #[error("effect {0} already started in this run")]
     DuplicateEffect(EffectKey),
 
+    /// The `(tenant, idempotency_key)` unique index rejected a second
+    /// admission. At-most-once admission is a database invariant, not a code
+    /// path — for the reason exactly-once above is.
+    ///
+    /// Carries the run that **holds** the key, which is the answer the loser
+    /// needs. The runtime turns this into
+    /// [`Admission::Replayed`](crate::runtime::Admission::Replayed) or
+    /// [`Admission::InFlight`](crate::runtime::Admission::InFlight) before a
+    /// caller sees it.
+    #[error("admission key '{key}' is already held by run {run}")]
+    DuplicateAdmission { key: String, run: String },
+
     /// A case-state write named a version the case has moved past.
     ///
     /// Somebody else wrote to this case between the read and the write. The

@@ -22,8 +22,8 @@ pub use executor::Agent;
 #[cfg(test)]
 pub(crate) use executor::every_status;
 pub use executor::{
-    FullBackend, LEASE_TTL, MIN_LEASE_TTL, RunFailure, RunOutcome, RunStatus, Runtime,
-    RuntimeBuilder, SEALED_OUTCOMES,
+    Admission, FullBackend, LEASE_TTL, MAX_ADMISSION_KEY_BYTES, MIN_LEASE_TTL, RunFailure,
+    RunOutcome, RunStatus, Runtime, RuntimeBuilder, SEALED_OUTCOMES, Spawned,
 };
 pub use group::{EffectGroup, Invariant};
 

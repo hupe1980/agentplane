@@ -139,6 +139,27 @@ let (state, at) = cx.case_state().await?;
 let at = cx.put_case_state(at, next).await?;   // refused if the case moved
 ```
 
+### Admission is at-most-once when a message says who it is
+
+Correlation answers *which case*. It does not answer *whether to run at all* —
+and an emitter that retries until it sees a 2xx makes that a separate question.
+A run admitted with an **admission key** claims it in the same transaction that
+writes the run's first record:
+
+```rust
+rt.run_correlated_once(cap, input, "claim", &keys, &event.dedup_key()).await?
+```
+
+So the key is taken at the instant the run becomes real, and a redelivery is
+answered with the original run rather than starting a second one. The key's home
+is the `RunAdmitted` record and the store's uniqueness index derives from it —
+which is why the guarantee survives a restart and holds across instances sharing
+a store.
+
+A duplicate whose original is parked on a human decision is told *this is already
+waiting for you*: a suspension is a resting point, not a gap to fill with a second
+identical approval.
+
 ## 5. 🎲 Disposition
 
 When an outward call fails, one question decides everything: **did it reach the

@@ -539,10 +539,44 @@ async fn an_edited_display_body_is_a_finding_though_every_hash_verifies() {
 /// restore that got any of the three wrong produces a different root and says so.
 ///
 /// It also exercises the reason this replays `append` rather than writing rows.
-/// `append` maintains six derived indexes, and a restore that rebuilt five would
-/// leave a store that reads perfectly until somebody queries the sixth — so the
-/// assertions below go back through the *query* surfaces rather than only the
-/// checkpoint.
+/// `append` maintains several derived indexes, and a restore that rebuilt all
+/// but one would leave a store that reads perfectly until somebody queries the
+/// one it missed — so the assertions below go back through the *query* surfaces
+/// rather than only the checkpoint.
+/// The admission key the restored run was admitted under.
+const KEY: &str = "urn:test:bus\u{1f}EV-1";
+
+/// Every index `append` derives, queried the way a caller would.
+///
+/// The checkpoint says nothing about these, which is exactly why a restore that
+/// wrote rows directly could pass every hash comparison and still be broken.
+async fn assert_derived_indexes_survived(fresh: &Arc<dyn JournalStore>, keyed: RunId) {
+    let by_outcome = fresh
+        .runs_by_outcome("succeeded", 10)
+        .await
+        .expect("by outcome");
+    assert_eq!(
+        by_outcome.len(),
+        3,
+        "the outcome index did not survive the restore, so the quarantine and \
+         success backlogs are empty on a store that looks healthy"
+    );
+
+    let recent = fresh.recent_runs(None, 10).await.expect("recent");
+    assert_eq!(
+        recent.len(),
+        3,
+        "the discovery index did not survive, so nothing lists over A2A"
+    );
+
+    assert_eq!(
+        fresh.admitted_as(KEY).await.expect("admission index"),
+        Some(keyed),
+        "the admission index did not survive the restore, so every emitter's \
+         redelivery would start a second run against a store that looks healthy"
+    );
+}
+
 #[tokio::test]
 async fn a_restored_store_rebuilds_the_same_checkpoint() {
     let origin = Arc::new(RedbStore::open_in_memory().expect("store"));
@@ -550,7 +584,15 @@ async fn a_restored_store_rebuilds_the_same_checkpoint() {
         .skill(Trivial)
         .build();
     let mut runs = Vec::new();
-    for n in 0..3 {
+    // The first carries an admission key, so the index derived from it has
+    // something to lose.
+    runs.push(
+        rt.run_once("demo.trivial", Tainted::trusted(json!({ "n": 0 })), KEY)
+            .await
+            .expect("run")
+            .run_id(),
+    );
+    for n in 1..3 {
         runs.push(
             rt.run("demo.trivial", Tainted::trusted(json!({ "n": n })))
                 .await
@@ -606,25 +648,7 @@ async fn a_restored_store_rebuilds_the_same_checkpoint() {
         }
     }
 
-    // A derived index, queried the way a caller would. The checkpoint says
-    // nothing about these, which is exactly why a restore that wrote rows
-    // directly could pass everything above and still be broken.
-    let by_outcome = fresh
-        .runs_by_outcome("succeeded", 10)
-        .await
-        .expect("by outcome");
-    assert_eq!(
-        by_outcome.len(),
-        3,
-        "the outcome index did not survive the restore, so the quarantine and \
-         success backlogs are empty on a store that looks healthy"
-    );
-    let recent = fresh.recent_runs(None, 10).await.expect("recent");
-    assert_eq!(
-        recent.len(),
-        3,
-        "the discovery index did not survive, so nothing lists over A2A"
-    );
+    assert_derived_indexes_survived(&fresh, runs[0]).await;
 
     // **The strongest statement available**: a plane wired to the restored store
     // replays a run it never executed, in `Strict` mode — consuming every effect
@@ -704,6 +728,7 @@ async fn a_run_that_changed_hands_restores_with_its_epochs() {
                 RecordKind::RunSealed {
                     outcome: "succeeded".to_owned(),
                     chain_head: head.hash,
+                    reason: None,
                 },
             )],
         )
@@ -957,6 +982,16 @@ impl JournalStore for StaleCheckpoint {
     }
     async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError> {
         self.inner.runs_by_outcome(outcome, limit).await
+    }
+    async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
+        self.inner.admitted_as(key).await
+    }
+
+    async fn forget_admissions(
+        &self,
+        older_than: agentplane::core::Timestamp,
+    ) -> Result<usize, StoreError> {
+        self.inner.forget_admissions(older_than).await
     }
     async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
         self.inner.abandoned_runs(limit).await
@@ -1691,6 +1726,7 @@ async fn a_sealing_record_claiming_a_foreign_head_is_caught_offline() {
                         input: json!({}),
                         policy_bundle: None,
                         canon: agentplane::core::canon::VERSION,
+                        idempotency_key: None,
                     },
                 ),
                 Append::new(
@@ -1699,6 +1735,7 @@ async fn a_sealing_record_claiming_a_foreign_head_is_caught_offline() {
                         outcome: "succeeded".into(),
                         // Not the head this conclusion sits on.
                         chain_head: Digest::of(b"some other history"),
+                        reason: None,
                     },
                 ),
             ],

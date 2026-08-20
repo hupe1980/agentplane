@@ -15,6 +15,7 @@
 //! times. Five groups keep both costs reasonable rather than optimising one
 //! into the other.
 
+mod admission;
 mod batches;
 mod cases;
 mod plans;

@@ -938,6 +938,7 @@ async fn history_under_an_older_canonicalization_rule_is_unverifiable_not_diverg
                     input_label: agentplane::core::Label::trusted(),
                     policy_bundle: None,
                     canon: 999,
+                    idempotency_key: None,
                 },
             )],
         )

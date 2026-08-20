@@ -234,6 +234,20 @@ impl JournalStore for SealedJournal {
         self.inner.runs_by_outcome(outcome, limit).await
     }
 
+    /// Delegated, and the key is **not** sealed on the way through: it is the
+    /// counterparty's message identity rather than content, and the index has to
+    /// be searchable by a value the caller holds in the clear.
+    async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
+        self.inner.admitted_as(key).await
+    }
+
+    async fn forget_admissions(
+        &self,
+        older_than: crate::core::Timestamp,
+    ) -> Result<usize, StoreError> {
+        self.inner.forget_admissions(older_than).await
+    }
+
     async fn recent_runs(
         &self,
         after: Option<(u64, RunId)>,

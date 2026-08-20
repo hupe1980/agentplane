@@ -100,6 +100,19 @@ impl JournalStore for NoExactlyOnce {
     ) -> Result<Vec<agentplane::journal::Record>, agentplane::core::StoreError> {
         self.inner.read(run, from).await
     }
+    async fn admitted_as(
+        &self,
+        key: &str,
+    ) -> Result<Option<agentplane::core::RunId>, agentplane::core::StoreError> {
+        self.inner.admitted_as(key).await
+    }
+
+    async fn forget_admissions(
+        &self,
+        older_than: agentplane::core::Timestamp,
+    ) -> Result<usize, agentplane::core::StoreError> {
+        self.inner.forget_admissions(older_than).await
+    }
     async fn runs_by_outcome(
         &self,
         outcome: &str,

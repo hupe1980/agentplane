@@ -217,6 +217,24 @@ CREATE TABLE IF NOT EXISTS run_outcome (
 CREATE INDEX IF NOT EXISTS run_outcome_by_outcome
     ON run_outcome (tenant, outcome, ordinal);
 
+-- The admission keys this tenant has issued. **Derived**, not authoritative:
+-- fed by the `RunAdmitted` record inside `append`, in the same transaction, so
+-- the key's home stays the chain and this table can be rebuilt from it.
+--
+-- The primary key is the mechanism, not a hint. Two instances admitting one
+-- inbound message concurrently both find nothing and both insert; exactly one
+-- commits, and the loser is told which run won.
+--
+-- Tenant-scoped for the reason `case_correlation` is: an admission key is a
+-- business value, and two tenants using the same one is ordinary.
+CREATE TABLE IF NOT EXISTS run_admission (
+    tenant      TEXT   NOT NULL,
+    key         TEXT   NOT NULL,
+    run_id      TEXT   NOT NULL,
+    admitted_at BIGINT NOT NULL CHECK (admitted_at >= 0),
+    PRIMARY KEY (tenant, key)
+);
+
 CREATE TABLE IF NOT EXISTS run_cancel (
     tenant       TEXT   NOT NULL,
     run_id       TEXT   NOT NULL,
@@ -709,11 +727,19 @@ impl PostgresStore {
 
         let mut sealed = Vec::with_capacity(batch.len());
         let mut conclusion: Option<String> = None;
+        let mut claimed: Option<String> = None;
         for append in batch {
             seq += 1;
             let body = append.into_body(seq, epoch);
-            if let crate::journal::RecordKind::RunSealed { outcome, .. } = &body.kind {
-                conclusion = Some(outcome.clone());
+            match &body.kind {
+                crate::journal::RecordKind::RunSealed { outcome, .. } => {
+                    conclusion = Some(outcome.clone());
+                }
+                crate::journal::RecordKind::RunAdmitted {
+                    idempotency_key: Some(key),
+                    ..
+                } => claimed = Some(key.clone()),
+                _ => {}
             }
             let record = Record::seal_signed(body, prev, self.signer.as_deref())?;
             prev = record.hash;
@@ -760,6 +786,58 @@ impl PostgresStore {
         .await
         .map_err(|error| be(&error))?;
 
+        self.derive_indexes(tx, run, claimed, conclusion).await?;
+
+        Ok(sealed)
+    }
+
+    /// The two indexes that derive from a record in this batch.
+    ///
+    /// Written inside the caller's transaction, which is the point: an index
+    /// committing separately from the record it describes can outlive it,
+    /// precede it, or — for the admission key — let a second run through.
+    async fn derive_indexes(
+        &self,
+        tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
+        run: RunId,
+        claimed: Option<String>,
+        conclusion: Option<String>,
+    ) -> Result<(), StoreError> {
+        // Claimed in the same transaction as the record that carries it, so
+        // the claim and the run are one event. Never an upsert: the conflict
+        // *is* the answer.
+        if let Some(key) = claimed {
+            // `DO NOTHING` rather than letting the unique violation raise: a
+            // failed statement aborts the transaction, and the next thing needed
+            // is a read of *which* run won. The constraint still arbitrates and
+            // still blocks a concurrent inserter until that one commits.
+            let taken = tx
+                .execute(
+                    "INSERT INTO run_admission (tenant, key, run_id, admitted_at)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (tenant, key) DO NOTHING",
+                    &[
+                        &self.tenant_name(),
+                        &key,
+                        &run.to_string(),
+                        &now_secs().cast_signed(),
+                    ],
+                )
+                .await
+                .map_err(|error| be(&error))?;
+            if taken == 0 {
+                let holder = tx
+                    .query_opt(
+                        "SELECT run_id FROM run_admission WHERE tenant = $1 AND key = $2",
+                        &[&self.tenant_name(), &key],
+                    )
+                    .await
+                    .map_err(|error| be(&error))?
+                    .map_or_else(String::new, |row| row.get(0));
+                return Err(StoreError::DuplicateAdmission { key, run: holder });
+            }
+        }
+
         // The outcome index derives from the chain, here, in the same
         // transaction as the record it derives from — and the last conclusion
         // wins. See the schema comment on run_outcome.
@@ -775,7 +853,7 @@ impl PostgresStore {
             .map_err(|error| be(&error))?;
         }
 
-        Ok(sealed)
+        Ok(())
     }
 }
 
@@ -883,6 +961,40 @@ impl JournalStore for PostgresStore {
             )?);
         }
         Ok(out)
+    }
+
+    async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let row = client
+            .query_opt(
+                "SELECT run_id FROM run_admission WHERE tenant = $1 AND key = $2",
+                &[&self.tenant_name(), &key],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        row.map(|row| {
+            let id: &str = row.get(0);
+            RunId::parse(id).map_err(|e| StoreError::Corrupt {
+                seq: 0,
+                detail: format!("run_admission holds an unparseable run id '{id}': {e}"),
+            })
+        })
+        .transpose()
+    }
+
+    async fn forget_admissions(
+        &self,
+        older_than: crate::core::Timestamp,
+    ) -> Result<usize, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let removed = client
+            .execute(
+                "DELETE FROM run_admission WHERE tenant = $1 AND admitted_at < $2",
+                &[&self.tenant_name(), &older_than.unix_timestamp()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(usize::try_from(removed).unwrap_or(usize::MAX))
     }
 
     async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError> {

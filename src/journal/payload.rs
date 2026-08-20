@@ -174,33 +174,93 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         // Reasoning recorded beside the effects it explains — model output
         // over the caller's data, and nothing routes on it.
         K::Note { text } => vec![SealedField::Text(text)],
+        // A conclusion's reason is the same free text `EffectFailed.error` is —
+        // a provider or tool's refusal, quoting the request it refused — lifted
+        // to the run. `outcome` and `chain_head` route and stay clear.
+        K::RunSealed {
+            reason,
+            outcome: _,
+            chain_head: _,
+        } => reason.as_mut().map(SealedField::Text).into_iter().collect(),
+
         // Control-plane: names, states, digests, counts. Sealing them would
         // cost the readability that makes an unopenable journal still useful,
         // and buy nothing — none of them carries the caller's data.
         //
-        // Listed one by one rather than swept up by a wildcard, and the
-        // verbosity is the feature. A record kind added later carries the
-        // caller's data far more often than not, and under a wildcard it would
-        // default to *unsealed* — compiling, passing every test, and sealing
-        // nothing, which is the failure this module opens by calling silent by
-        // construction. Exhaustively, the compiler asks the question instead:
-        // a new variant does not build until somebody has answered it.
-        K::StepStarted { .. }
-        | K::StepFinished { .. }
-        | K::CaseBound { .. }
-        | K::DeadlineRegistered { .. }
-        | K::DeadlineTransition { .. }
-        | K::RunSuspended { .. }
-        | K::BudgetRefused { .. }
-        | K::BudgetReadmitted { .. }
-        | K::IdentityBound { .. }
-        | K::PolicyDenied { .. }
-        | K::GroupOpened { .. }
-        | K::StepCompensated { .. }
-        | K::Released { .. }
-        | K::RunCancelled { .. }
-        | K::RunSealed { .. }
-        | K::BreakGlass { .. }
-        | K::Swept { .. } => Vec::new(),
+        // **Every field is named, and none of these arms uses `..`.** An
+        // exhaustive match over *variants* asks the question when a record kind
+        // is added and stays silent when a **field** is added to one that
+        // already exists — which compiles, passes every test, and seals
+        // nothing. Naming each field is what makes the compiler ask the second
+        // question too, and it is the question that was missed: a run's
+        // conclusion gained a reason, and the arm above is where that field's
+        // answer now lives.
+        // One arm, because the answer is one answer. The fields are still all
+        // named: that is what makes a field added later a build error rather
+        // than a silent no.
+        K::StepStarted { skill: _ }
+        | K::StepFinished { outcome: _ }
+        | K::CaseBound {
+            case_kind: _,
+            opened: _,
+            correlation: _,
+        }
+        | K::DeadlineRegistered {
+            name: _,
+            resolved_at: _,
+            calendar_digest: _,
+        }
+        | K::DeadlineTransition {
+            name: _,
+            from: _,
+            to: _,
+        }
+        // What a run waits for: a kind and a correlation key, both of which the
+        // buffer is asked questions about.
+        | K::RunSuspended { reason: _ }
+        | K::BudgetRefused { limit: _, used: _ }
+        | K::BudgetReadmitted { limit: _ }
+        | K::IdentityBound { chain: _ }
+        // The rule's own words, written by the operator who wrote the rule —
+        // never the request. Naming a reason to a caller is what this crate
+        // refuses; recording it for the operator is why the record exists.
+        | K::PolicyDenied {
+            reason: _,
+            action: _,
+            resource: _,
+        }
+        | K::GroupOpened {
+            group: _,
+            resources: _,
+        }
+        | K::StepCompensated {
+            compensation: _,
+            outcome: _,
+        }
+        // `value` is a **digest**, not the value: the record binds a release
+        // decision to bytes it does not hold, and a digest is not the bytes.
+        | K::Released {
+            releaser: _,
+            release: _,
+            label: _,
+            field_labels: _,
+            result_label: _,
+            result_field_labels: _,
+            value: _,
+        }
+        | K::RunCancelled {
+            actor: _,
+            reason: _,
+        }
+        | K::BreakGlass {
+            actor: _,
+            roles: _,
+            reason: _,
+        }
+        | K::Swept {
+            subject: _,
+            action: _,
+            detail: _,
+        } => Vec::new(),
     }
 }

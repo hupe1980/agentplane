@@ -3015,6 +3015,7 @@ responsibilities.
 | `tests/engine/recovery.rs` | Crash, resume, orphan handling, lease contention |
 | `tests/process/cases.rs` | Correlation, case state across runs, obligations, closure |
 | `tests/process/waits.rs` | Suspension, delivery, the arrive-before-wait race, dead letters |
+| `tests/process/admission.rs` | At-most-once admission: redelivery, racing emitters, a refused admission spending no key |
 | `tests/process/tasks.rs` | Worklist, four-eyes, expiry policy, breach escalation |
 | `tests/process/plans.rs` | Contract validation, ready-set, provenance through the graph |
 | `tests/trust/budgets.rs` | Limits, overshoot semantics, replay billing identically |

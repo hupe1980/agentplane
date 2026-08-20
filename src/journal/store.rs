@@ -299,6 +299,62 @@ pub trait JournalStore: Send + Sync + Debug {
     /// If the store is unreachable.
     async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError>;
 
+    /// The run that holds this admission key, if one does.
+    ///
+    /// A **derived** index, as `runs_by_outcome` is: the key's home is the
+    /// `RunAdmitted` record, and the store maintains this from that record
+    /// inside [`append`](Self::append), in the same transaction. So it rebuilds
+    /// from the journal, and — the load-bearing part — the key is claimed at the
+    /// instant the run becomes real, because taking it *is* writing the run.
+    ///
+    /// Implementations must refuse a second `RunAdmitted` carrying a key this
+    /// tenant already issued, with
+    /// [`StoreError::DuplicateAdmission`](crate::core::StoreError::DuplicateAdmission)
+    /// naming the holder. That refusal is the arbiter and this read is not: two
+    /// instances racing both see `None` here, and the constraint picks the
+    /// winner.
+    ///
+    /// Tenant-scoped, as a correlation key is: an admission key is a business
+    /// value, and two tenants using the same one is ordinary.
+    ///
+    /// **No default**, for the reason [`is_shared`](Self::is_shared) has none: a
+    /// store that forgot this would answer "nothing has been admitted" and the
+    /// duplicate would proceed.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable.
+    async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError>;
+
+    /// Retire admission keys claimed before `older_than`. Returns how many.
+    ///
+    /// **Retiring a key reopens the door it closed**, so this is a verb an
+    /// operator calls deliberately rather than a sweep that runs by default.
+    /// The window MUST exceed the emitter's retry horizon: a redelivery
+    /// arriving after its key is retired admits a second run, which is the
+    /// failure the key exists to prevent, delivered on a timer.
+    ///
+    /// It exists because the alternative is an index that only grows. Other
+    /// durable runtimes bound this by default — Restate expires an idempotency
+    /// key a day after the invocation completes, Temporal's dedup window is its
+    /// namespace retention — and both are making the same trade in the other
+    /// direction. Absent a call to this, keys are kept forever: the safe
+    /// default is the one that cannot silently admit a duplicate, and the size
+    /// of the index is a fact the deployment's own database monitoring already
+    /// reports.
+    ///
+    /// The claimed instant is store-observed, not journaled: it orders
+    /// retirement and nothing else. A key's *authority* is the `RunAdmitted`
+    /// record, which is why retiring a row alters no history.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable.
+    async fn forget_admissions(
+        &self,
+        older_than: crate::core::Timestamp,
+    ) -> Result<usize, StoreError>;
+
     /// Runs ordered by last durable append, newest first, one bounded page.
     ///
     /// A derived discovery index for protocol task listing, never the authority

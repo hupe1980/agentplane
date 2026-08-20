@@ -57,7 +57,10 @@ mod sign;
 
 pub use delivery::{DeliveryWorker, Projection, PushSweepReport};
 pub use outbox::{Destination, OPERATOR_PREFIX, Outbox, RunCompleted, is_operator_id};
-pub use sign::{BodySigning, HEADER_ID, HEADER_SIGNATURE, HEADER_TIMESTAMP};
+pub use sign::{
+    BodySigning, DEFAULT_TOLERANCE, HEADER_ID, HEADER_SIGNATURE, HEADER_TIMESTAMP, SCHEME,
+    SigningKeyError, VerifiedDelivery, WebhookRejected, WebhookVerifier,
+};
 
 /// Which of the two id namespaces a worker serves.
 ///

@@ -122,6 +122,33 @@ enum Verb {
     Restore(RestoreArgs),
     /// Walk the case layer and tell erasure from loss, against the live stores.
     Drill(DrillArgs),
+    /// Retire admission keys older than a window you choose.
+    ForgetAdmissions(ForgetArgs),
+}
+
+/// Retention for the admission index, as a verb.
+///
+/// The same reasoning [`DrillArgs`] carries: `JournalStore::forget_admissions`
+/// could only be reached by writing Rust, and a deployment that is only a YAML
+/// file has an index that grows and no way to trim it.
+///
+/// `--older-than` is **required and has no default**. Retiring a key reopens
+/// the door it closed, so a window shorter than the emitter's retry horizon
+/// admits a second run on a timer — which is the failure the key exists to
+/// prevent. A default here would be this crate choosing somebody else's retry
+/// horizon for them.
+#[derive(clap::Args, Debug)]
+struct ForgetArgs {
+    /// The store holding the admission index.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: String,
+
+    /// Retire keys claimed longer ago than this, as days. Required.
+    ///
+    /// It must exceed how long your emitter keeps retrying a delivery it has
+    /// not seen a 2xx for.
+    #[arg(long)]
+    older_than_days: u32,
 }
 
 /// The live half of the case-layer drill, as a verb.
@@ -579,6 +606,42 @@ fn drill_verb(opts: &DrillArgs) -> Result<ExitCode, String> {
     })
 }
 
+/// Retire admission keys past a window the operator chose.
+///
+/// Prints the count, because a retention pass that says nothing is
+/// indistinguishable from one that found nothing — and the two call for
+/// different responses when the index keeps growing.
+fn forget_admissions_verb(opts: &ForgetArgs) -> Result<ExitCode, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    rt.block_on(async {
+        let store: Arc<dyn JournalStore> =
+            Arc::new(RedbStore::open(&opts.store).map_err(|e| e.to_string())?);
+        // Wall clock by design, like the sweeper's: a retention window is a
+        // question about how long ago something was claimed, not a journaled
+        // observation of a run.
+        #[allow(clippy::disallowed_methods)]
+        let now = time::OffsetDateTime::now_utc();
+        let cutoff = now - std::time::Duration::from_secs(u64::from(opts.older_than_days) * 86_400);
+        let retired = store
+            .forget_admissions(cutoff)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "retired": retired,
+                "older_than_days": opts.older_than_days,
+                "cutoff": cutoff.unix_timestamp(),
+            })
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
 /// Read and validate the manifests, for every verb.
 ///
 /// A manifest that does not validate is not a thing to run, digest, or reason
@@ -620,6 +683,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Verb::Audit(a) => journal_verb(&a.store, Some(&a)),
         Verb::Export(a) => journal_verb(&a, None),
         Verb::Drill(a) => drill_verb(&a),
+        Verb::ForgetAdmissions(a) => forget_admissions_verb(&a),
         Verb::Restore(a) => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

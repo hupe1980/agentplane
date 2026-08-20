@@ -625,6 +625,37 @@ impl CaseStore for RedbStore {
         .await
     }
 
+    async fn detach_run(&self, case: CaseId, run: RunId) -> Result<bool, StoreError> {
+        let tenant = self.tenant_name();
+        let (c, r) = (case.to_string(), run.to_string());
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let removed = {
+                let mut seen = w.open_table(CASE_RUN_SEEN).map_err(|e| be(&e))?;
+                // Both tables or neither: `CASE_RUN_SEEN` is what makes
+                // `attach_run` idempotent, so leaving it behind would mean a
+                // later attach of the same run silently did nothing.
+                match seen
+                    .remove((tenant.as_str(), c.as_str(), r.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|v| v.value())
+                {
+                    Some(seq) => {
+                        w.open_table(CASE_RUNS)
+                            .map_err(|e| be(&e))?
+                            .remove((tenant.as_str(), c.as_str(), seq))
+                            .map_err(|e| be(&e))?;
+                        true
+                    }
+                    None => false,
+                }
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(removed)
+        })
+        .await
+    }
+
     async fn link_blob(
         &self,
         case: CaseId,

@@ -98,6 +98,21 @@ const RUN_BY_OUTCOME: TableDefinition<(&str, &str, u64), &str> =
 /// outcomes, and the failed listing would never drain.
 const RUN_OUTCOME: TableDefinition<(&str, &str), (&str, u64)> = TableDefinition::new("run_outcome");
 
+/// `(tenant, key) -> (run_id, admitted_at)`: the admission keys this tenant has
+/// issued.
+///
+/// A **derived** index, like `RUN_OUTCOME`: the key's home is the `RunAdmitted`
+/// record, and `append` maintains this in the same transaction as that record.
+/// The key *shape* is the constraint, so a second admission under an issued key
+/// is inexpressible rather than refused by a check somebody could reorder
+/// around — the property `CORR_OPEN` relies on for "one open case per business
+/// key".
+///
+/// The tenant leads because an admission key is a business value: without the
+/// scope one tenant's redelivery would be answered with another's run.
+const RUN_ADMISSION: TableDefinition<(&str, &str), (&str, i64)> =
+    TableDefinition::new("run_admission");
+
 /// `(tenant, updated_at, run_id) -> ()`, every run by last durable append.
 const RUN_ACTIVITY: TableDefinition<(&str, u64, &str), ()> = TableDefinition::new("run_activity");
 /// `(tenant, run_id) -> updated_at`, for replacing the activity index row.
@@ -688,6 +703,7 @@ impl JournalStore for RedbStore {
         }
         let signer = self.signer.clone();
         let key = self.run_key(run);
+        let run_id = run.to_string();
         let tenant = self.tenant_name();
 
         self.with_db(move |db| {
@@ -740,11 +756,15 @@ impl JournalStore for RedbStore {
                     let body = append.into_body(head.seq + 1, epoch);
                     let is_start =
                         matches!(body.kind, crate::journal::RecordKind::EffectStarted { .. });
-                    let conclusion = match &body.kind {
+                    let (conclusion, claimed) = match &body.kind {
                         crate::journal::RecordKind::RunSealed { outcome, .. } => {
-                            Some(outcome.clone())
+                            (Some(outcome.clone()), None)
                         }
-                        _ => None,
+                        crate::journal::RecordKind::RunAdmitted {
+                            idempotency_key: Some(k),
+                            ..
+                        } => (None, Some(k.clone())),
+                        _ => (None, None),
                     };
                     let record = Record::seal_signed(body, head.hash, signer.as_deref())?;
                     let seq = record.seq();
@@ -785,6 +805,27 @@ impl JournalStore for RedbStore {
                                     seq,
                                 ),
                                 (),
+                            )
+                            .map_err(|e| be(&e))?;
+                    }
+
+                    // Claimed in the same transaction as the record that
+                    // carries it, so the claim and the run are one event. An
+                    // existing entry is the refusal, never something to
+                    // overwrite.
+                    if let Some(k) = claimed {
+                        let mut admissions = w.open_table(RUN_ADMISSION).map_err(|e| be(&e))?;
+                        if let Some(held) = admissions
+                            .get((tenant.as_str(), k.as_str()))
+                            .map_err(|e| be(&e))?
+                            .map(|v| v.value().0.to_owned())
+                        {
+                            return Err(StoreError::DuplicateAdmission { key: k, run: held });
+                        }
+                        admissions
+                            .insert(
+                                (tenant.as_str(), k.as_str()),
+                                (run_id.as_str(), now_secs().cast_signed()),
                             )
                             .map_err(|e| be(&e))?;
                     }
@@ -1185,6 +1226,74 @@ impl JournalStore for RedbStore {
             };
             w.commit().map_err(|e| be(&e))?;
             Ok(head_hash)
+        })
+        .await
+    }
+
+    async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
+        let tenant = self.tenant_name();
+        let key = key.to_owned();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let admissions = match r.open_table(RUN_ADMISSION) {
+                Ok(t) => t,
+                // A store that has never admitted under a key has no table
+                // yet, and "no table" is the same fact as "no such key".
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(e) => return Err(be(&e)),
+            };
+            let Some(held) = admissions
+                .get((tenant.as_str(), key.as_str()))
+                .map_err(|e| be(&e))?
+                .map(|v| v.value().0.to_owned())
+            else {
+                return Ok(None);
+            };
+            RunId::parse(&held)
+                .map(Some)
+                .map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("run_admission holds an unparseable run id '{held}': {e}"),
+                })
+        })
+        .await
+    }
+
+    async fn forget_admissions(
+        &self,
+        older_than: crate::core::Timestamp,
+    ) -> Result<usize, StoreError> {
+        let tenant = self.tenant_name();
+        let cutoff = older_than.unix_timestamp();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let removed = {
+                let mut admissions = match w.open_table(RUN_ADMISSION) {
+                    Ok(t) => t,
+                    // Nothing has ever been admitted under a key here, so there
+                    // is nothing to retire.
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+                    Err(e) => return Err(be(&e)),
+                };
+                // Collected before removing: redb will not hand out a mutable
+                // borrow while a range iterator over the same table is live.
+                let stale: Vec<String> = admissions
+                    .range((tenant.as_str(), "")..=(tenant.as_str(), MAX_STR))
+                    .map_err(|e| be(&e))?
+                    .filter_map(|entry| {
+                        let (k, v) = entry.ok()?;
+                        (v.value().1 < cutoff).then(|| k.value().1.to_owned())
+                    })
+                    .collect();
+                for key in &stale {
+                    admissions
+                        .remove((tenant.as_str(), key.as_str()))
+                        .map_err(|e| be(&e))?;
+                }
+                stale.len()
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(removed)
         })
         .await
     }

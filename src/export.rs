@@ -1300,11 +1300,18 @@ impl RestoreReport {
 /// # Why this goes through `append` rather than writing rows
 ///
 /// The obvious implementation inserts records verbatim and rebuilds each index
-/// beside them. It is also the one that fails quietly: `append` maintains six
-/// derived structures — the case index, the exactly-once index, the outcome
-/// index and its ordering counter, and both halves of the activity index — and
-/// a restore that reconstructed five of them correctly would produce a store
-/// that reads perfectly until somebody queries the sixth.
+/// beside them. It is also the one that fails quietly: `append` maintains
+/// several derived structures — the case index, the exactly-once index, the
+/// outcome index and its ordering counter, the admission index, both halves of
+/// the activity index — and a restore that reconstructed all but one of them
+/// would produce a store that reads perfectly until somebody queries the one it
+/// missed.
+///
+/// Deliberately not a count. A number here is a claim that has to be re-checked
+/// on every edit and is not, so it goes stale silently and reads as coverage —
+/// the shape this project catalogues and has been bitten by. Going through
+/// `append` is what makes the list not need enumerating: whatever `append`
+/// maintains, a restore maintains.
 ///
 /// So this replays the ordinary write path, and every constraint the store
 /// enforces is enforced here too. Three properties make that reproduce the

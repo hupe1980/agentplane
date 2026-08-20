@@ -388,6 +388,7 @@ async fn a_tenant_cannot_read_another_tenants_run_even_holding_its_id() {
                 input: serde_json::Value::Null,
                 policy_bundle: None,
                 canon: agentplane::core::canon::VERSION,
+                idempotency_key: None,
             },
         )],
     )

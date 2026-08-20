@@ -141,11 +141,36 @@ impl Destination {
     /// not base64. Both are this deployment's own configuration, so both are
     /// refused where they are written rather than at the far end of a run.
     ///
+    /// Use [`try_signed_with`](Self::try_signed_with) where the secret is read
+    /// from configuration inside a builder — a panic there takes the process
+    /// down from underneath the code that was assembling it.
+    ///
     /// [Standard Webhooks]: https://www.standardwebhooks.com/
     #[must_use]
     pub fn signed_with(mut self, secret: &crate::core::Secret) -> Self {
         self.signing = Some(BodySigning::new(secret));
         self
+    }
+
+    /// [`signed_with`](Self::signed_with), reporting a bad key rather than
+    /// aborting.
+    ///
+    /// [`RuntimeBuilder::build`](crate::runtime::RuntimeBuilder::build) and
+    /// [`try_build`](crate::runtime::RuntimeBuilder::try_build) in the small. A
+    /// deployment reads this secret inside its own `build()`, so a mistyped one
+    /// belongs in that builder's error path — with the exit code and the log
+    /// line naming which destination was wrong, none of which a panic reaches.
+    ///
+    /// # Errors
+    ///
+    /// [`SigningKeyError`](super::SigningKeyError) — a `whsec_` secret that is
+    /// not base64, or a key under the 24 bytes Standard Webhooks requires.
+    pub fn try_signed_with(
+        mut self,
+        secret: &crate::core::Secret,
+    ) -> Result<Self, super::SigningKeyError> {
+        self.signing = Some(BodySigning::try_new(secret)?);
+        Ok(self)
     }
 
     /// The stored registration id for this destination.
@@ -348,6 +373,7 @@ impl Projection for RunCompleted {
         let RecordKind::RunSealed {
             outcome,
             chain_head,
+            ..
         } = record.kind()
         else {
             return Ok(Vec::new());

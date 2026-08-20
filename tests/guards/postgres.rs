@@ -734,6 +734,7 @@ async fn journal_is_apart(acme: &PostgresStore, globex: &PostgresStore) {
                 input: serde_json::Value::Null,
                 policy_bundle: None,
                 canon: agentplane::core::canon::VERSION,
+                idempotency_key: None,
             },
         )],
     )

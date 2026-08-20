@@ -588,6 +588,16 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
         async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
             self.0.abandoned_runs(limit).await
         }
+        async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
+            self.0.admitted_as(key).await
+        }
+
+        async fn forget_admissions(
+            &self,
+            older_than: agentplane::core::Timestamp,
+        ) -> Result<usize, StoreError> {
+            self.0.forget_admissions(older_than).await
+        }
         async fn runs_by_outcome(
             &self,
             outcome: &str,
@@ -701,6 +711,7 @@ async fn a_sealing_record_claiming_a_foreign_head_is_a_finding() {
                     input: json!({}),
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
                 },
             ),
             Append::new(
@@ -709,6 +720,7 @@ async fn a_sealing_record_claiming_a_foreign_head_is_a_finding() {
                     outcome: "succeeded".into(),
                     // Not the head this conclusion sits on.
                     chain_head: Digest::of(b"some other history"),
+                    reason: None,
                 },
             ),
         ],
@@ -1351,6 +1363,15 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
         }
         async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
             self.inner.read(run, from).await
+        }
+        async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
+            self.inner.admitted_as(key).await
+        }
+        async fn forget_admissions(
+            &self,
+            older_than: agentplane::core::Timestamp,
+        ) -> Result<usize, StoreError> {
+            self.inner.forget_admissions(older_than).await
         }
         async fn runs_by_outcome(
             &self,
