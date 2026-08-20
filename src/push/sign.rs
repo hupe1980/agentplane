@@ -183,11 +183,15 @@ pub const DEFAULT_TOLERANCE: std::time::Duration = std::time::Duration::from_sec
 
 /// The shortest key this accepts, in bytes.
 ///
+/// Public because a deployment choosing a signing secret is the party the bound
+/// applies to, and a number reachable only from an error message is one they
+/// find out about after they got it wrong.
+///
 /// The spec's range is 24–64 bytes. The floor is enforced and the ceiling is
 /// not: a key shorter than this is a MAC an attacker can search, while a longer
 /// one is only wasteful — HMAC hashes a key past the block size, which is a
 /// documented branch and not a weakness.
-const MIN_KEY_BYTES: usize = 24;
+pub const MIN_KEY_BYTES: usize = 24;
 
 /// RFC 2104 over SHA-256, as `hmac` implements it.
 ///
