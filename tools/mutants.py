@@ -3319,9 +3319,12 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the query vector is in the semantic-retrieval effect key, the run "
         "quarantines itself with nothing on the record explaining why",
         "        self.sink_with(&arguments, |value| crate::runtime::effects::Embed {",
-        "        if true {\n            let v = embedder.embed(&plain).await"
-        ".map_err(StepError::Store)?;\n            return Ok(crate::core::Tainted"
-        "::trusted(v));\n        }\n"
+        "        {\n"
+        "            let vector = embedder.embed(&plain).await.map_err(StepError::Store)?;\n"
+        "            let revision = embedder.revision();\n"
+        "            return Ok(Tainted::trusted(crate::memory::Embedding { vector, revision }));\n"
+        "        }\n"
+        "        #[allow(unreachable_code)]\n"
         "        self.sink_with(&arguments, |value| crate::runtime::effects::Embed {",
     ),
     "MemoryFormsBeforeTheHumanDecides": (
@@ -3970,7 +3973,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     "APooledClientReachesAnything": (
         "src/netguard/resolver.rs",
-        "netguard::resolver::tests::a_guarded_client_does_not_reach_a_live_server_on_this_machine",
+        "a_guarded_client_does_not_reach_a_live_server_on_this_machine",
         "every pooled outbound client is built without its address rule, so the "
         "connections its pool opens after a caller's pre-flight returned reach "
         "whatever DNS answers with — the rebinding window a one-shot check "
@@ -3988,7 +3991,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     "ALoopbackExemptionIsKeyedOnTheAnswer": (
         "src/netguard/resolver.rs",
-        "netguard::resolver::tests::a_name_that_is_not_loopback_gets_no_exemption_from_its_answers",
+        "a_name_that_is_not_loopback_gets_no_exemption_from_its_answers",
         "the loopback exemption stops being keyed on the name, so any host an "
         "attacker can point inward is exempted by the answer it arranged — the "
         "rebinding attack, admitted by the control meant to refuse it",
@@ -5561,7 +5564,7 @@ def check() -> int:
         return 2
 
     bad = 0
-    for name, (path, _test, _desc, find, _replace) in MUTANTS.items():
+    for name, (path, test, _desc, find, _replace) in MUTANTS.items():
         target = ROOT / path
         if not target.exists():
             print(f"{name}: {path} does not exist")
@@ -5570,6 +5573,18 @@ def check() -> int:
         n = target.read_text().count(find)
         if n != 1:
             print(f"{name}: anchors {n} times in {path} (expected 1)")
+            bad += 1
+        # The *test* half, through the same resolver a sweep uses. A name this
+        # cannot place is a row that verifies nothing, and it fails in the
+        # slowest possible way otherwise: the sweep builds the crate, runs
+        # nothing, and reports an error forty minutes in. `--verify` is the
+        # only thing that used to notice, so the answer is to ask its own
+        # locator here rather than to re-implement the question.
+        if _locate(test) is None:
+            print(
+                f"{name}: no test named '{test}'. This field takes a bare "
+                f"function name, not a module path"
+            )
             bad += 1
     print(f"checked {len(MUTANTS)} mutations, {bad} broken")
     return 1 if bad else 0

@@ -1193,6 +1193,26 @@ fn every_test_the_mutation_table_names_exists() {
         let Some(name) = line.strip_prefix('"').and_then(|r| r.strip_suffix("\",")) else {
             continue;
         };
+        // A module path in the test position is a *malformed* test name, not
+        // some other kind of literal, and skipping it is how one reaches a
+        // sweep: the table takes a bare function name, `mutants.py` greps for
+        // `fn <name>(`, and a qualified one resolves to nothing while looking
+        // like a row that was checked. Code snippets carrying `::` are excluded
+        // by the punctuation below rather than by `::` itself, which was
+        // covering both cases with one skip.
+        let qualified = name.contains("::")
+            && !name.contains(' ')
+            && !name.contains('(')
+            && !name.contains('{')
+            && !name.contains('<')
+            && !name.contains('&');
+        assert!(
+            !qualified,
+            "tools/mutants.py names `{name}` as the test that must fail, and \
+             that is a module path. The field takes a bare function name — a \
+             qualified one resolves to no test, so the row verifies nothing and \
+             says so only once a sweep has built the crate."
+        );
         // Test names here are snake_case identifiers and nothing else is.
         if name.contains(' ') || name.contains('/') || name.contains("::") || !name.contains('_') {
             continue;
