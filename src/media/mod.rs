@@ -591,7 +591,10 @@ impl GovernedMedia {
                 self.policy.max_bytes
             )));
         }
-        if let Some(encoding) = response.headers().get(CONTENT_ENCODING) {
+        // Every `Content-Encoding` line, not the first: a response carrying
+        // `identity` on one line and `gzip` on another is one whose body is
+        // coded, and a check that reads only the first line waves it through.
+        for encoding in response.headers().get_all(CONTENT_ENCODING) {
             let encoding = encoding.to_str().unwrap_or("<invalid>");
             if !encoding.eq_ignore_ascii_case("identity") {
                 return Err(MediaError::Refused(format!(
@@ -1398,6 +1401,19 @@ mod tests {
             .unwrap()
             .into();
         assert!(fetcher.read_body(response).await.is_err());
+
+        // A coding smuggled onto a second header line. The first value is the
+        // acceptable `identity`, and a check that reads only the first line
+        // hands a coded body to the signature check and the validators.
+        let smuggled: reqwest::Response = http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "image/png")
+            .header(CONTENT_ENCODING, "identity")
+            .header(CONTENT_ENCODING, "gzip")
+            .body(b"not actually gzip".to_vec())
+            .unwrap()
+            .into();
+        assert!(fetcher.read_body(smuggled).await.is_err());
     }
 
     #[test]

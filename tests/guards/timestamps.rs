@@ -176,6 +176,7 @@ fn a_task_carries_no_component_array() {
         kind: "agent.triage/breach".to_owned(),
         justification: Justification::new("a deadline was missed", serde_json::json!({})),
         candidate_roles: vec!["grid-operations".to_owned()],
+        escalate_to: Vec::new(),
         excluded_actors: Vec::new(),
         assignee: None,
         priority: Priority::High,

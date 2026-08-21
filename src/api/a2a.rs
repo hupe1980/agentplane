@@ -527,6 +527,15 @@ impl A2aMessage {
                 "an inbound Message role must be ROLE_USER",
             ));
         }
+        // The id is half of the admission key — an empty one would fold every
+        // caller's unnamed messages into a single "retry" of the first.
+        if self.message_id.is_empty() {
+            return Err(RpcError::new(
+                code::INVALID_PARAMS,
+                "messageId must be non-empty: it is what lets a retry of this \
+                 message be recognised as the same message",
+            ));
+        }
         if self.parts.is_empty() {
             return Err(RpcError::new(
                 code::CONTENT_TYPE_NOT_SUPPORTED,
@@ -534,6 +543,11 @@ impl A2aMessage {
             ));
         }
         for (index, part) in self.parts.iter().enumerate() {
+            // Only the file modalities are refused. A `mediaType` on a text or
+            // data part is a *label* the spec allows on every part type — a
+            // peer sending `text/markdown` text is conformant, and the card's
+            // input modes are a tailoring hint, not a per-part contract the
+            // server may bounce messages on.
             if part.raw.is_some() || part.url.is_some() {
                 return Err(RpcError::new(
                     code::CONTENT_TYPE_NOT_SUPPORTED,
@@ -547,25 +561,6 @@ impl A2aMessage {
                 return Err(RpcError::new(
                     code::INVALID_PARAMS,
                     format!("message.parts[{index}] must contain exactly one of text or data"),
-                ));
-            }
-            let supported = match (part.text.is_some(), part.data.is_some()) {
-                (true, false) => part
-                    .media_type
-                    .as_deref()
-                    .is_none_or(|value| value == "text/plain"),
-                (false, true) => part
-                    .media_type
-                    .as_deref()
-                    .is_none_or(|value| value == "application/json"),
-                _ => false,
-            };
-            if !supported {
-                return Err(RpcError::new(
-                    code::CONTENT_TYPE_NOT_SUPPORTED,
-                    format!(
-                        "message.parts[{index}] mediaType does not match this agent's text/plain and application/json inputs"
-                    ),
                 ));
             }
         }
@@ -1053,11 +1048,11 @@ pub enum ServerSetupError {
     #[error("push changes the signed Agent Card; configure it before calling signing_cards_with")]
     CardAlreadySigned,
     #[error(
-        "an A2A server serves at least one agent, and no manifest was given —          the well-known card path must answer with a card describing something"
+        "an A2A server serves at least one agent, and no manifest was given — the well-known card path must answer with a card describing something"
     )]
     NoAgents,
     #[error(
-        "agents '{first}' and '{second}' both advertise skill '{skill}', so a          request naming it would be a routing decision the caller did not make.          A2A dispatch is named, never inferred: give the skill distinct          capability names, or serve the two agents from separate planes"
+        "agents '{first}' and '{second}' both advertise skill '{skill}', so a request naming it would be a routing decision the caller did not make. A2A dispatch is named, never inferred: give the skill distinct capability names, or serve the two agents from separate planes"
     )]
     AmbiguousSkill {
         skill: String,
@@ -1089,9 +1084,8 @@ impl A2aServer {
 
     /// Serve several declared agents from one plane.
     ///
-    /// A2A's well-known card path is singular per host, so a plane hosting many
-    /// agents could previously give each its own card only by running a server
-    /// per agent. The first manifest is the one the **well-known card
+    /// A2A's well-known card path is singular per host, so the alternative to
+    /// this is a server per agent. The first manifest is the one the **well-known card
     /// describes** — a room's orchestrator, in the shape the CLI already uses —
     /// and every agent additionally gets its own full card at
     /// [`agent_card_path`](crate::peers::agent_card_path), listed in the
@@ -1686,11 +1680,9 @@ async fn stream_method(
             // reports a refusal has already told the client the work started —
             // and an SSE body cannot carry a JSON-RPC error the client is looking
             // for at that point.
-            let input = Tainted::from_source(
-                message.to_input(),
-                SourceId::new(super::peer_source(&caller.actor)),
-            );
-            match spawn_a2a(&server, &skill, input, &message).await {
+            let source = super::peer_source(&caller.actor);
+            let input = Tainted::from_source(message.to_input(), SourceId::new(&source));
+            match spawn_a2a(&server, &skill, input, &message, &source).await {
                 Ok(run) => {
                     if let Some(push) = params.configuration.as_ref().and_then(|configuration| {
                         configuration.task_push_notification_config.as_ref()
@@ -1855,6 +1847,39 @@ fn parse_params(method: &str, value: &Value) -> Result<CommonParams, RpcError> {
     })
 }
 
+/// Answer a message aimed at a task that has already sealed.
+///
+/// Decided from the task's own journal: the event store's subscription may
+/// already be retired, and routing a retransmit through `deliver_to` would
+/// answer a legitimate retry with a terminal-state error. The journal records
+/// every delivered continuation message verbatim, so the retry of the message
+/// that completed the task is recognisable there — and a *new* message aimed
+/// at a finished task stays refused.
+fn continue_sealed_task(
+    run: RunId,
+    records: &[crate::journal::Record],
+    message: &A2aMessage,
+) -> Result<RunId, RpcError> {
+    let delivered_before = records.iter().any(|record| {
+        matches!(
+            record.kind(),
+            RecordKind::EffectDone { output, .. }
+                if output
+                    .get("$a2a_message")
+                    .and_then(|m| m.get("messageId"))
+                    .and_then(Value::as_str)
+                    == Some(message.message_id.as_str())
+        )
+    });
+    if delivered_before {
+        return Ok(run);
+    }
+    Err(RpcError::new(
+        code::UNSUPPORTED_OPERATION,
+        "this task has completed and is not waiting for input",
+    ))
+}
+
 /// Continue one interrupted A2A task with a client message.
 ///
 /// The run remains append-only: the message becomes the output of the exact
@@ -1908,6 +1933,9 @@ async fn continue_task(
             "this task is not waiting for input",
         ));
     }
+    if matches!(last.kind(), RecordKind::RunSealed { .. }) {
+        return continue_sealed_task(run, &records, message);
+    }
     // Search history rather than only the last record so a transport retry of
     // the message that completed a task can still be recognized as the same
     // `(source, messageId)` and return the current task instead of a spurious
@@ -1955,11 +1983,15 @@ async fn continue_task(
         payload: message.to_input(),
     };
     match server.runtime.deliver_to(run, &event).await {
-        Ok(crate::core::Delivery::Resumed { .. } | crate::core::Delivery::Duplicate) => Ok(run),
-        Ok(crate::core::Delivery::Buffered) => Err(RpcError::new(
-            code::INTERNAL_ERROR,
-            "targeted task input was unexpectedly buffered",
-        )),
+        // `Buffered` is a success too: when the owner's lease is stalled the
+        // input is held durably and the sweep resumes the run — an internal
+        // error here would tell the caller a continuation failed that
+        // actually succeeded-pending.
+        Ok(
+            crate::core::Delivery::Resumed { .. }
+            | crate::core::Delivery::Duplicate
+            | crate::core::Delivery::Buffered,
+        ) => Ok(run),
         Err(crate::core::RuntimeError::PlanContract(_)) => Err(RpcError::new(
             code::UNSUPPORTED_OPERATION,
             "this task is no longer waiting for input",
@@ -2015,10 +2047,8 @@ async fn send_message(
     // Untrusted, and provenanced to the peer that sent it. A protected sink
     // field can then name the one counterparty it will take an amount from, and
     // a skill that wants to act on this has to pass a gate to do it.
-    let input = Tainted::from_source(
-        message.to_input(),
-        SourceId::new(super::peer_source(&caller.actor)),
-    );
+    let source = super::peer_source(&caller.actor);
+    let input = Tainted::from_source(message.to_input(), SourceId::new(&source));
 
     // Non-blocking: the spec requires returning as soon as the task exists,
     // with an in-progress state, leaving the caller to poll `GetTask`. Admission
@@ -2030,7 +2060,7 @@ async fn send_message(
         .as_ref()
         .is_some_and(|c| c.return_immediately)
     {
-        return match spawn_a2a(server, &skill, input, &message).await {
+        return match spawn_a2a(server, &skill, input, &message, &source).await {
             Ok(run) => {
                 if let Some(push) = &inline_push {
                     register_push(server, push, run, 1).await?;
@@ -2054,8 +2084,8 @@ async fn send_message(
         };
     }
 
-    let outcome = match run_a2a(server, &skill, input, &message).await {
-        Ok(outcome) => outcome,
+    let admission = match run_a2a(server, &skill, input, &message, &source).await {
+        Ok(admission) => admission,
         // A policy denial is the agent *declining*, not the agent breaking.
         // Reported as `-32603 Internal error` it reads as "this server is
         // faulty, retry later", and the caller retries a decision that will
@@ -2083,6 +2113,19 @@ async fn send_message(
             return Err(RpcError::new(code::TASK_NOT_FOUND, why));
         }
         Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
+    };
+    let outcome = match admission {
+        crate::runtime::Admission::Fresh(outcome)
+        | crate::runtime::Admission::Replayed(outcome) => outcome,
+        // Another instance is executing this message right now. The honest
+        // answer to a retry is *accepted, already in progress* — a Working
+        // task naming the run — never a retry-provoking failure.
+        crate::runtime::Admission::InFlight(run) => {
+            let case = task_context(server, run).await?;
+            return Ok(json!({
+                "task": task_of(run, TaskState::Working, "accepted", case)
+            }));
+        }
     };
 
     let case = task_context(server, outcome.run_id).await?;
@@ -2113,11 +2156,13 @@ async fn send_message(
     }
     let mut task = task_of_outcome(&outcome);
     task.context_id = case;
-    if let Some(history_length) = params
+    // Unset means the full (capped) history, per the protocol's default —
+    // only an explicit `0` skips the read.
+    let history_length = params
         .configuration
         .as_ref()
-        .and_then(|configuration| configuration.history_length)
-    {
+        .and_then(|configuration| configuration.history_length);
+    if history_length != Some(0) {
         let records = server
             .runtime
             .journal()
@@ -2129,7 +2174,7 @@ async fn send_message(
         task.history = task_history(
             outcome.run_id,
             &records,
-            Some(history_length),
+            history_length,
             task.context_id.as_deref(),
         );
     }
@@ -2141,12 +2186,25 @@ async fn run_a2a(
     skill: &str,
     input: Tainted<Value>,
     message: &A2aMessage,
-) -> Result<crate::runtime::RunOutcome, crate::core::RuntimeError> {
+    source: &str,
+) -> Result<crate::runtime::Admission, crate::core::RuntimeError> {
+    // The key carries its producer, in the spelling `InboundEvent::dedup_key`
+    // blesses: a bare `messageId` would let two counterparties swallow each
+    // other's messages as apparent retries — or *join* each other's cases,
+    // since correlation matches any open case in the tenant. And it is an
+    // **admission** key, not only a correlation key: this crate's own client
+    // keeps `messageId` stable across retries precisely so a peer can
+    // deduplicate, and a server that correlates without deduplicating starts
+    // a second run inside the right case.
+    let keyed = format!("{source}\u{1f}{}", message.message_id);
     if let Some(context) = message.context_id.as_deref() {
         let case = crate::core::CaseId::parse(context).map_err(|_| {
             crate::core::RuntimeError::PlanContract("contextId is not a case issued here".into())
         })?;
-        return server.runtime.run_in_case(skill, input, case).await;
+        return server
+            .runtime
+            .run_in_case_once(skill, input, case, &keyed)
+            .await;
     }
     // Always correlated: `A2aServer::new` refuses a runtime without a case
     // layer, so every task gets a real, continuable context — the contextId
@@ -2154,14 +2212,12 @@ async fn run_a2a(
     // schema and continues nothing.
     server
         .runtime
-        .run_correlated(
+        .run_correlated_once(
             skill,
             input,
             "a2a.context",
-            &[crate::core::CorrelationKey::new(
-                "a2a-message",
-                message.message_id.clone(),
-            )],
+            &[crate::core::CorrelationKey::new("a2a-message", &keyed)],
+            &keyed,
         )
         .await
 }
@@ -2171,26 +2227,33 @@ async fn spawn_a2a(
     skill: &str,
     input: Tainted<Value>,
     message: &A2aMessage,
+    source: &str,
 ) -> Result<RunId, crate::core::RuntimeError> {
+    // Producer-scoped and deduplicating, for the reasons `run_a2a` states. A
+    // duplicate answers with the run the key already admitted, which is
+    // exactly what a retrying caller needs back.
+    let keyed = format!("{source}\u{1f}{}", message.message_id);
     if let Some(context) = message.context_id.as_deref() {
         let case = crate::core::CaseId::parse(context).map_err(|_| {
             crate::core::RuntimeError::PlanContract("contextId is not a case issued here".into())
         })?;
-        return server.runtime.spawn_in_case(skill, input, case).await;
+        return Ok(server
+            .runtime
+            .spawn_in_case_once(skill, input, case, &keyed)
+            .await?
+            .run);
     }
-    // Always correlated, for the reason `run_a2a` states.
-    server
+    Ok(server
         .runtime
-        .spawn_correlated(
+        .spawn_correlated_once(
             skill,
             input,
             "a2a.context",
-            &[crate::core::CorrelationKey::new(
-                "a2a-message",
-                message.message_id.clone(),
-            )],
+            &[crate::core::CorrelationKey::new("a2a-message", &keyed)],
+            &keyed,
         )
-        .await
+        .await?
+        .run)
 }
 
 async fn task_context(server: &A2aServer, run: RunId) -> Result<Option<String>, RpcError> {
@@ -2535,8 +2598,10 @@ async fn list_tasks(
     // easy mistake is reporting the page's length, which tells every caller the
     // total is whatever fits on a screen; the dangerous one is counting the
     // store's index directly, which is cheaper and reveals the tasks policy
-    // just hid.
-    let total_size = matched;
+    // just hid. Saturated at the wire type's ceiling: the proto field is an
+    // `int32`, and a count past it must not overflow a conformant client's
+    // deserializer.
+    let total_size = matched.min(u64::try_from(i32::MAX).unwrap_or(u64::MAX));
 
     let visible = &page[..];
     let next_page_token = if has_more {
@@ -2624,13 +2689,24 @@ fn task_from_records(
     task
 }
 
+/// The most messages an unbounded history request returns.
+///
+/// The protocol reads an **unset** `historyLength` as "the full history", so
+/// the bound is the server's, stated here rather than left to whatever the
+/// journal happens to hold — the same shape as the artifact replay budget.
+const HISTORY_CAP: usize = 128;
+
 fn task_history(
     run: RunId,
     records: &[crate::journal::Record],
     history_length: Option<usize>,
     case: Option<&str>,
 ) -> Option<Vec<A2aMessage>> {
-    history_length.and_then(|limit| {
+    // Unset means full (capped); `0` is the explicit request for none —
+    // the protocol's own default, which a conformant client expecting its
+    // conversation back depends on.
+    let limit = history_length.unwrap_or(HISTORY_CAP);
+    {
         if limit == 0 {
             return None;
         }
@@ -2687,7 +2763,7 @@ fn task_history(
         }
         let keep_from = history.len().saturating_sub(limit);
         (!history.is_empty()).then(|| history.split_off(keep_from))
-    })
+    }
 }
 
 /// The uncached artifact projection: one strict replay of a completed run.

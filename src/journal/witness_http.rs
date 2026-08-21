@@ -228,14 +228,14 @@ impl Witness for HttpWitness {
             // caller can build the right proof instead of guessing.
             //
             // A body that is not a size is *not* a size of zero, and the
-            // difference is not cosmetic. `unwrap_or_default()` stood here, and
-            // it turned an unreadable reply into a definite numeric claim
-            // attributed to the witness — which the caller then acts on, by
-            // building a consistency proof from 0 and resubmitting. The witness
-            // refuses that, and the refusal is classified as `Forked` or
-            // `Shrank`: the **integrity** bucket. So a witness that answered
-            // 409 with a blank body, an HTML error page or a stray newline
-            // manufactured a fork alert, and this variant's own documentation
+            // difference is not cosmetic. Defaulting would turn an unreadable
+            // reply into a definite numeric claim attributed to the witness —
+            // which the caller acts on, by building a consistency proof from 0
+            // and resubmitting. The witness refuses that, and the refusal is
+            // classified as `Forked` or `Shrank`: the **integrity** bucket. A
+            // witness answering 409 with a blank body, an HTML error page or a
+            // stray newline would manufacture a fork alert, and this variant's
+            // own documentation
             // says why that is the worst available outcome — a team paged twice
             // for a routine cursor mismatch stops believing the alert that
             // matters.

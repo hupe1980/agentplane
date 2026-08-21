@@ -70,6 +70,11 @@ impl Skill for ProposesRefund {
             .priority(Priority::High)
             .on_expiry(self.on_expiry);
 
+        // Escalation must name who it widens to — the runtime refuses it bare.
+        if self.on_expiry == OnExpiry::Escalate {
+            spec = spec.escalate_to("senior-compliance");
+        }
+
         if let Some(a) = self.exclude {
             spec = spec.excluding(a);
         }
@@ -489,8 +494,12 @@ async fn a_pre_authorised_task_proceeds_unattended() {
     );
 }
 
-/// Escalation widens the audience and keeps waiting, and is idempotent so the
-/// sweep is safe on a timer.
+/// Escalation widens the audience, frees the reservation, and keeps waiting —
+/// once. The second sweep must find nothing to do, not because escalating
+/// twice is harmless but because an escalated task has left the overdue scan:
+/// its expiry policy has fired, and a bounded oldest-first batch that kept
+/// returning it would eventually hold nothing else, at which point the
+/// `deny`/`proceed` policies queued behind it silently stop firing.
 #[tokio::test]
 async fn an_escalating_task_is_escalated_once() {
     let f = fixture(ProposesRefund::new(OnExpiry::Escalate));
@@ -510,6 +519,12 @@ async fn an_escalating_task_is_escalated_once() {
             .unwrap();
     assert_eq!(first.tasks_escalated, 1);
 
+    // The task has left the scan that drives the sweep, so a plane full of
+    // escalated tasks costs later ticks nothing and starves nobody.
+    assert!(
+        f.store.overdue(later, 10).await.unwrap().is_empty(),
+        "an escalated task must leave the overdue scan"
+    );
     let second =
         f.rt.sweep(later, std::time::Duration::from_secs(31_536_000))
             .await
@@ -519,6 +534,116 @@ async fn an_escalating_task_is_escalated_once() {
     let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
     assert_eq!(task.state, TaskState::Escalated);
     assert!(task.state.is_pending(), "escalation keeps it actionable");
+    assert_eq!(task.assignee, None, "the stale reservation is cleared");
+    assert!(
+        task.candidate_roles
+            .contains(&"senior-compliance".to_owned()),
+        "the declared escalation audience was added: {:?}",
+        task.candidate_roles
+    );
+    assert!(
+        task.candidate_roles
+            .contains(&"compliance-officer".to_owned()),
+        "widening is a union — the original reviewers remain eligible"
+    );
+}
+
+/// The runtime refuses an escalation that names nobody, in both task shapes.
+///
+/// `OnExpiry::Escalate` with an empty `escalate_to` is "widen the audience"
+/// with no audience to add — a state flag wearing a control's name. The run
+/// fails at the declaration rather than the window closing on a promise the
+/// sweep cannot keep.
+#[tokio::test]
+async fn an_escalation_naming_nobody_is_refused() {
+    #[derive(Debug)]
+    struct BareEscalation;
+    #[async_trait::async_trait]
+    impl Skill for BareEscalation {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("bare-escalation").provides("demo.bare")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            cx.deadline("approval", &DeadlineSpec::days(2), None)
+                .await?;
+            let spec = TaskSpec::new("bare", Justification::new("x", json!({})), "approval")
+                .role("ops")
+                .on_expiry(OnExpiry::Escalate);
+            let d = cx.task(&spec).await?;
+            Ok(Outcome::done(Tainted::trusted(json!(d.approved))))
+        }
+    }
+
+    // The converse shape: an escalation audience beside a policy that never
+    // escalates is a declaration nothing reads.
+    #[derive(Debug)]
+    struct AudienceWithoutEscalation;
+    #[async_trait::async_trait]
+    impl Skill for AudienceWithoutEscalation {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("audience-no-escalation").provides("demo.noesc")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            cx.deadline("approval", &DeadlineSpec::days(2), None)
+                .await?;
+            let spec = TaskSpec::new("noesc", Justification::new("x", json!({})), "approval")
+                .role("ops")
+                .escalate_to("ops-lead");
+            let d = cx.task(&spec).await?;
+            Ok(Outcome::done(Tainted::trusted(json!(d.approved))))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(store.clone() as Arc<dyn TaskStore>)
+        .skill(BareEscalation)
+        .skill(AudienceWithoutEscalation)
+        .build();
+
+    let out = rt
+        .run_correlated(
+            "demo.bare",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-12")],
+        )
+        .await
+        .unwrap();
+    match out.status {
+        RunStatus::Failed(msg) => assert!(
+            msg.contains("escalate_to"),
+            "the refusal names the missing declaration: {msg}"
+        ),
+        other => panic!("an escalation naming nobody must fail the run: {other:?}"),
+    }
+
+    let out2 = rt
+        .run_correlated(
+            "demo.noesc",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-13")],
+        )
+        .await
+        .unwrap();
+    match out2.status {
+        RunStatus::Failed(msg) => assert!(
+            msg.contains("never escalates"),
+            "the refusal names the dead declaration: {msg}"
+        ),
+        other => panic!("an unread escalation audience must fail the run: {other:?}"),
+    }
 }
 
 // ── Deadline breach ─────────────────────────────────────────────────────────

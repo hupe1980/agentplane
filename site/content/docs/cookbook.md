@@ -1919,7 +1919,12 @@ verifies with a library it did not write. Every delivery carries three headers:
 | --- | --- |
 | `webhook-id` | the message's identity, stable across retries — the idempotency key |
 | `webhook-timestamp` | Unix seconds, the instant *this attempt* was made |
-| `webhook-signature` | `v1,<base64>` of `HMAC-SHA256(key, "{id}.{timestamp}.{body}")` |
+| `webhook-signature` | `v1,<base64>` of `HMAC-SHA256(key, "{id}.{timestamp}.{body}")` — one element per configured key, space-separated |
+
+Mid-rotation, chain `.also_signed_with(&new_secret)` onto the destination:
+every delivery is then signed under both keys, a receiver holding either
+verifies, and the old secret retires at the receiver's pace instead of on a
+flag day.
 
 The id and the timestamp are **inside** the signed content, which is the point:
 a signature over the body alone is a genuine body genuinely signed, so a captured
@@ -2299,9 +2304,13 @@ purpose. It returns an `Embedding`: the floats **and** the revision that
 produced them, read from the driver.
 
 The effect records the exact vector, embedding revision, immutable index
-snapshot, filters, scores and `(id, version, digest)` selections. Replay does
-not rerank. It materializes exact versions from authoritative memory and rejects
-out-of-scope or changed commitments.
+snapshot, filters, scores, lifecycle cutoff and `(id, version, digest)`
+selections — screened before recording: a hit naming a version that is no
+longer current (superseded by a correction, expired, or erased by a retention
+sweep) leaves the selection, so a stale index serves the still-current subset
+instead of stale facts or an error. Replay does not rerank. It materializes
+the recorded versions from authoritative memory and rejects out-of-scope or
+changed commitments.
 
 ### The embedder
 

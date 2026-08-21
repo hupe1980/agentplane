@@ -170,7 +170,11 @@ impl Skill for SendRequest {
                     .priority(Priority::High)
                     // Four eyes: whoever proposed this does not approve it.
                     .excluding("agent:switch-bot")
-                    .on_expiry(OnExpiry::Escalate),
+                    // Escalation must say who it widens to; a bare `Escalate`
+                    // is refused, because widening is its one enforceable
+                    // meaning.
+                    .on_expiry(OnExpiry::Escalate)
+                    .escalate_to("mako-team-lead"),
                 )
                 .await?;
 

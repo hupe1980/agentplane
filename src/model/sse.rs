@@ -63,6 +63,11 @@ pub struct Decoder {
     /// Tracked separately from `data` being non-empty: a `data:` line with an
     /// empty value is still a data line, and the spec dispatches it.
     started: bool,
+    /// Bytes that do not yet decode: the front half of a codepoint whose back
+    /// half is still in flight. At most three bytes by construction.
+    pending: Vec<u8>,
+    /// Whether the stream's one permitted leading BOM has been checked for.
+    bom_checked: bool,
     /// Maximum bytes retained by one partial line or assembled event.
     max_event_bytes: usize,
 }
@@ -74,6 +79,8 @@ impl Default for Decoder {
             name: String::new(),
             data: String::new(),
             started: false,
+            pending: Vec::new(),
+            bom_checked: false,
             max_event_bytes: DEFAULT_MAX_EVENT_BYTES,
         }
     }
@@ -97,9 +104,44 @@ impl Decoder {
     ///
     /// Lossy on invalid UTF-8 rather than failing. A malformed byte in a
     /// provider's stream should degrade the text of one event, not abort a call
-    /// that has already been paid for.
+    /// that has already been paid for. **Incomplete** UTF-8 is not malformed:
+    /// TLS frames land anywhere, including mid-codepoint, and a per-chunk lossy
+    /// decode would turn every split multi-byte character into two replacement
+    /// chars — silently, because the JSON around it still parses. The tail of
+    /// a codepoint still in flight is held back instead.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Event>, DecodeError> {
-        self.partial.push_str(&String::from_utf8_lossy(chunk));
+        self.pending.extend_from_slice(chunk);
+        let mut text = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    self.pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    text.push_str(&String::from_utf8_lossy(&self.pending[..valid]));
+                    if let Some(bad) = error.error_len() {
+                        // Genuinely invalid bytes: one replacement char, move on.
+                        text.push('\u{FFFD}');
+                        self.pending.drain(..valid + bad);
+                    } else {
+                        // The front half of a codepoint. Kept for the next chunk.
+                        self.pending.drain(..valid);
+                        break;
+                    }
+                }
+            }
+        }
+        // The stream may open with one BOM, which the spec says to ignore.
+        if !self.bom_checked && !text.is_empty() {
+            self.bom_checked = true;
+            if let Some(rest) = text.strip_prefix('\u{feff}') {
+                text = rest.to_owned();
+            }
+        }
+        self.partial.push_str(&text);
         let mut out = Vec::new();
 
         // Consume whole lines only. Whatever trails the last terminator stays in
@@ -211,6 +253,37 @@ fn split_line(buf: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A codepoint split across chunk boundaries is reassembled, not replaced.
+    ///
+    /// TLS frames land anywhere. A decoder that treats each chunk as complete
+    /// UTF-8 turns a split `ü` into two U+FFFD — and the JSON around it still
+    /// parses, so the corruption flows silently into the journal.
+    #[test]
+    fn a_codepoint_split_across_chunks_survives() {
+        let mut d = Decoder::new();
+        let payload = "data: {\"text\":\"grüßt\"}\n\n".as_bytes();
+        let cut = payload.iter().position(|&b| b == 0xC3).expect("ü start") + 1;
+        let mut events = d.push(&payload[..cut]).expect("front half");
+        events.extend(d.push(&payload[cut..]).expect("back half"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].data, "{\"text\":\"grüßt\"}",
+            "a split multi-byte character must reassemble, not degrade"
+        );
+    }
+
+    /// One leading BOM is ignored, as the spec instructs; a later one is data.
+    #[test]
+    fn a_leading_bom_is_stripped_and_only_the_leading_one() {
+        let mut d = Decoder::new();
+        let events = d
+            .push("\u{feff}data: one\n\ndata: \u{feff}two\n\n".as_bytes())
+            .expect("events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data, "one");
+        assert_eq!(events[1].data, "\u{feff}two");
+    }
 
     fn all(chunks: &[&str]) -> Vec<Event> {
         let mut d = Decoder::new();

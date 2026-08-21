@@ -789,10 +789,9 @@ impl Runtime {
         // live owner checks for it at every step boundary (the cancellation
         // read at the top of the executor's ready-set loop), so the stop
         // arrives without a second executor ever touching the run. Resuming
-        // anyway is what this used to do, and on the owner's own instance the
-        // old lease semantics handed the resume the *same epoch* the live
-        // execution was writing under — two executors on one chain that
-        // fencing, by construction, could not tell apart.
+        // anyway would, on the owner's own instance, hand the resume the *same
+        // epoch* the live execution is writing under — two executors on one
+        // chain that fencing, by construction, cannot tell apart.
         if fresh {
             match self.replay(run, Mode::Resume).await {
                 Ok(_) | Err(RuntimeError::LeaseHeld { .. }) => {}
@@ -1339,6 +1338,30 @@ impl Runtime {
             .await
     }
 
+    /// [`spawn_in_case`](Self::spawn_in_case), at most once per admission key.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, as [`spawn`](Self::spawn) does.
+    ///
+    /// # Errors
+    ///
+    /// As [`spawn_in_case`](Self::spawn_in_case).
+    pub async fn spawn_in_case_once(
+        self: &Arc<Self>,
+        target: &str,
+        input: Tainted<Value>,
+        case: crate::core::CaseId,
+        idempotency_key: &str,
+    ) -> Result<Spawned, RuntimeError> {
+        self.spawn_bound_once(
+            target,
+            input,
+            Terms::bound(CaseBinding::Existing(case)).keyed(idempotency_key),
+        )
+        .await
+    }
+
     pub async fn spawn_correlated(
         self: &Arc<Self>,
         target: &str,
@@ -1359,6 +1382,26 @@ impl Runtime {
     ) -> Result<RunOutcome, RuntimeError> {
         self.admit(target, input, Terms::bound(CaseBinding::Existing(case)))
             .await
+    }
+
+    /// [`run_in_case`](Self::run_in_case), at most once per admission key.
+    ///
+    /// # Errors
+    ///
+    /// As [`run_in_case`](Self::run_in_case).
+    pub async fn run_in_case_once(
+        &self,
+        target: &str,
+        input: Tainted<Value>,
+        case: crate::core::CaseId,
+        idempotency_key: &str,
+    ) -> Result<Admission, RuntimeError> {
+        self.admit_once(
+            target,
+            input,
+            Terms::bound(CaseBinding::Existing(case)).keyed(idempotency_key),
+        )
+        .await
     }
 
     /// Join or open a case by business key, then run.
@@ -1917,9 +1960,9 @@ impl Runtime {
         // From here a concurrency slot is reserved, and every error path below
         // must give it back. `check_quota`'s own refusals reserve nothing; an
         // error *after* the reservation — a lease that cannot be taken, a case
-        // store that refuses, an append that fails — used to leak the slot
-        // permanently, so a tenant whose admissions failed transiently was
-        // throttled down to zero by its own error handling, one failure at a
+        // store that refuses, an append that fails — that kept the slot would
+        // leak it permanently, throttling a tenant whose admissions fail
+        // transiently down to zero by its own error handling, one failure at a
         // time. Best-effort, like `settle_quota`: the slot row names the run,
         // so one that survives an unreachable store is attributable rather
         // than a counter that silently drifted.
@@ -3008,7 +3051,7 @@ impl Runtime {
     ) -> Result<PlanIR, RunStatus> {
         if let Some(source) = untrusted_in(outputs) {
             return Err(RunStatus::Failed(format!(
-                "replanning refused: untrusted data from {source} is already in                  working memory, and the plan is an authorization graph —                  letting it change now would let that data choose what runs                  next ({})",
+                "replanning refused: untrusted data from {source} is already in working memory, and the plan is an authorization graph — letting it change now would let that data choose what runs next ({})",
                 cx.reason
             )));
         }
@@ -3030,7 +3073,7 @@ impl Runtime {
 
         let replanner = self.replanner.as_ref().ok_or_else(|| {
             RunStatus::Failed(format!(
-                "a step asked to replan and this runtime has no planner — build                  it with `.replanner(..)` ({})",
+                "a step asked to replan and this runtime has no planner — build it with `.replanner(..)` ({})",
                 cx.reason
             ))
         })?;
@@ -3065,7 +3108,7 @@ impl Runtime {
 
         if next.derived_from != Some(cx.current.digest()) {
             return Err(RunStatus::Failed(
-                "the successor plan does not name its predecessor — use                  `PlanIR::succeed_with`, or the audit trail has a hole where the                  lineage should be"
+                "the successor plan does not name its predecessor — use `PlanIR::succeed_with`, or the audit trail has a hole where the lineage should be"
                     .into(),
             ));
         }
@@ -3390,11 +3433,9 @@ impl Runtime {
             // A compensation may legitimately need to wait — a refund that needs
             // four eyes is still a refund. Suspension is not failure: the run is
             // healthy, its frame is durable, and it will finish unwinding when
-            // the answer arrives.
-            //
-            // Reported as a failure in an earlier version, which quarantined a
-            // run that was doing exactly the right thing and told the operator
-            // the compensation had broken.
+            // the answer arrives. Reporting it as a failure would quarantine a
+            // run doing exactly the right thing and tell the operator the
+            // compensation had broken.
             if let Err(crate::core::SkillError::Step(crate::core::StepError::Suspended(reason))) =
                 &result
             {
@@ -4981,6 +5022,10 @@ fn classify(
                     tracing::error!(target: telemetry::UNDECIDABLE, %key, %detail);
                     meter.count(metrics::UNDECIDABLE, "");
                 }
+                SkillError::Step(StepError::Unreproducible { what, detail }) => {
+                    tracing::error!(target: telemetry::UNREPRODUCIBLE, %what, %detail);
+                    meter.count(metrics::UNREPRODUCIBLE, "");
+                }
                 _ => {}
             }
 
@@ -4991,6 +5036,7 @@ fn classify(
                         | StepError::ReplayOverrun { .. }
                         | StepError::Undecidable { .. }
                         | StepError::GroupUnsettled { .. }
+                        | StepError::Unreproducible { .. }
                 )
             );
             if untrustworthy {
@@ -5056,8 +5102,8 @@ struct Execution<'a> {
 ///
 /// # Why the seal, and not the last step
 ///
-/// This used to scan backwards for a `StepFinished` and read its outcome. Two
-/// things were wrong with that, and the second is severe:
+/// Scanning backwards for a `StepFinished` and reading its outcome is wrong
+/// twice, and the second is severe:
 ///
 /// * A step's outcome is not the run's. They coincide only in a one-step plan.
 /// * `find_map` **skips** a record it does not recognise and keeps looking. A
@@ -5160,7 +5206,7 @@ fn validate_admission_key(key: &str) -> Result<(), RuntimeError> {
 fn parse_holder(run: &str) -> Result<RunId, RuntimeError> {
     RunId::parse(run).map_err(|e| {
         RuntimeError::PlanContract(format!(
-            "an admission key is held by run '{run}', which does not parse ({e}) —              refusing rather than admitting a second run under a key whose holder              this build cannot read"
+            "an admission key is held by run '{run}', which does not parse ({e}) — refusing rather than admitting a second run under a key whose holder this build cannot read"
         ))
     })
 }
@@ -5628,9 +5674,10 @@ impl RuntimeBuilder {
     ///
     /// That split matters for a daemon assembling a plane from files it did not
     /// write: a bad manifest is an *input* there, and a panic takes down every
-    /// other tenant in the process to report it. This method's documentation
-    /// used to carry a `# Panics` section describing `build`'s refusals, which
-    /// sent readers looking for a fallible variant of the wrong call.
+    /// other tenant in the process to report it. A `# Panics` section here,
+    /// describing `build`'s refusals, would send readers looking for a
+    /// fallible variant of the wrong call — the refusals are documented where
+    /// they fire.
     #[cfg(feature = "manifest")]
     #[must_use]
     pub fn agent(mut self, agent: Agent) -> Self {
@@ -5724,14 +5771,13 @@ impl RuntimeBuilder {
 
     /// A tool server this plane reaches over some transport of its own.
     ///
-    /// An MCP connection is the usual one. Registering it does three things that
-    /// were previously impossible together:
+    /// An MCP connection is the usual one. Registering it does three things:
     ///
     /// * a plane may reach **several** servers, because the router resolves the
     ///   `tool://server/name` a grant carries rather than handing every id to one
     ///   client;
     /// * typed in-process tools and remote servers can be used by the *same*
-    ///   agent, which is the ordinary shape and used to be unrepresentable;
+    ///   agent, which is the ordinary shape;
     /// * a grant naming a server nobody wired is refused at build, in the same
     ///   breath as a grant nothing implements — both mean the model would be
     ///   offered a tool that fails when chosen.
@@ -6823,10 +6869,10 @@ impl Runtime {
         // The lease may be briefly held: an event can arrive in the window
         // between the run registering its subscription and its owner finishing
         // the suspension bookkeeping — the owner is *concluding*, and will
-        // release within milliseconds. That race used to be fatal in the
-        // quietest possible way: the delivery failed `LeaseHeld` **after** the
-        // event was durably claimed for this run, the counterparty's retry
-        // deduplicated against the claimed event, and nothing ever resumed the
+        // release within milliseconds. Failing that race would be fatal in the
+        // quietest possible way: the delivery fails `LeaseHeld` **after** the
+        // event is durably claimed for this run, the counterparty's retry
+        // deduplicates against the claimed event, and nothing ever resumes the
         // run — a message that arrived in time, parked forever. So the claim
         // is retried under a bounded backoff; if the owner is genuinely
         // stalled past the bound, the event is *left claimed* for this run

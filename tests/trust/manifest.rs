@@ -1991,6 +1991,58 @@ fn proceeding_with_no_human_must_be_stated() {
     Manifest::parse(&deliberate).expect("stated explicitly, it is a legitimate choice");
 }
 
+/// Escalation must name who it widens to, and every audience it would widen.
+///
+/// `on_expiry: escalate` promises a wider audience; the runtime's whole
+/// enforcement of that promise is adding `escalate_to` to the task's roles.
+/// Declared without the list, the promise has no operand — a state flag
+/// wearing a control's name. And an empty `approvers` already means *anyone*,
+/// which no list can widen, so escalation over it is refused too.
+#[test]
+fn escalation_must_name_its_audience() {
+    let bare = DECLARATIVE.replace(
+        "  identity:",
+        "  oversight:\n    approval: required\n    approvers: [support]\n    deadline: { name: same-day, kind: hours, params: { n: 8 } }\n    on_expiry: escalate\n  identity:",
+    );
+    assert!(
+        matches!(
+            Manifest::parse(&bare),
+            Err(ManifestError::Unenforceable { .. })
+        ),
+        "'escalate' with no escalate_to promises a widening the runtime cannot perform"
+    );
+
+    let anyone = bare.replace("    approvers: [support]\n", "").replace(
+        "    on_expiry: escalate\n",
+        "    on_expiry: escalate\n    escalate_to: [ops-lead]\n",
+    );
+    assert!(
+        matches!(
+            Manifest::parse(&anyone),
+            Err(ManifestError::Unenforceable { .. })
+        ),
+        "'escalate' over an empty approvers list was accepted — 'anyone' cannot be widened"
+    );
+
+    let unread = DECLARATIVE.replace(
+        "  identity:",
+        "  oversight:\n    approval: required\n    approvers: [support]\n    deadline: { name: same-day, kind: hours, params: { n: 8 } }\n    escalate_to: [ops-lead]\n  identity:",
+    );
+    assert!(
+        matches!(
+            Manifest::parse(&unread),
+            Err(ManifestError::Unenforceable { .. })
+        ),
+        "escalate_to beside a policy that never escalates is a declaration nothing reads"
+    );
+
+    let sound = DECLARATIVE.replace(
+        "  identity:",
+        "  oversight:\n    approval: required\n    approvers: [support]\n    deadline: { name: same-day, kind: hours, params: { n: 8 } }\n    on_expiry: escalate\n    escalate_to: [ops-lead]\n  identity:",
+    );
+    Manifest::parse(&sound).expect("a bounded escalation is a legitimate declaration");
+}
+
 /// The default when the window closes is to refuse.
 #[test]
 fn an_unstated_expiry_denies() {
@@ -4492,6 +4544,135 @@ spec:
         .unwrap();
     assert!(matches!(outcome.status, RunStatus::Failed(_)));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// The other half of the gate above: a **granted** read dispatches, and what
+/// refuses one is a real disagreement — the wiring declaring a ceiling the
+/// reviewed grant does not. The grant's ceilings live in no effect key, so the
+/// gate compares them against what the effect itself declares; a comparison
+/// against anything else refuses every granted read or none.
+async fn granted_context_read(
+    wired_output: agentplane::core::Sensitivity,
+) -> (agentplane::runtime::RunStatus, usize) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use agentplane::core::{
+        Effect, EffectDescriptor, EffectError, Outcome, Recovery, Sensitivity, Skill,
+        SkillDescriptor, SkillError, Tainted,
+    };
+    use agentplane::journal::JournalStore;
+    use agentplane::runtime::{Agent, Runtime, StepCtx};
+    use serde_json::json;
+
+    #[derive(Debug)]
+    struct ContextRead {
+        calls: Arc<AtomicUsize>,
+        output: Sensitivity,
+    }
+
+    #[async_trait::async_trait]
+    impl Effect for ContextRead {
+        type Output = serde_json::Value;
+
+        fn descriptor(&self) -> EffectDescriptor {
+            EffectDescriptor::new(
+                "mcp.resource/read",
+                json!({ "server": "knowledge", "uri": "kb://granted" }),
+            )
+        }
+
+        fn mutates(&self) -> bool {
+            false
+        }
+
+        fn recovery(&self) -> Recovery {
+            Recovery::Retry
+        }
+
+        fn output_sensitivity(&self) -> Sensitivity {
+            self.output
+        }
+
+        async fn perform(&self) -> Result<Self::Output, EffectError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"fact": true}))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadsContext {
+        calls: Arc<AtomicUsize>,
+        output: Sensitivity,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for ReadsContext {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("reader").provides("context.read")
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<serde_json::Value>,
+        ) -> Result<Outcome, SkillError> {
+            let output = cx
+                .effect(ContextRead {
+                    calls: Arc::clone(&self.calls),
+                    output: self.output,
+                })
+                .await?;
+            Ok(Outcome::done(output))
+        }
+    }
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: reader, version: "1" }
+spec:
+  budgets: {}
+  capabilities: { provides: [context.read] }
+  context:
+    resources:
+      - { server: knowledge, uri: "kb://granted", output_sensitivity: confidential }
+"#,
+    )
+    .unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let outcome = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .agent(Agent::new(&manifest).skill(ReadsContext {
+            calls: Arc::clone(&calls),
+            output: wired_output,
+        }))
+        .build()
+        .run("context.read", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    (outcome.status, calls.load(Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn a_granted_context_read_dispatches_when_the_wiring_matches_its_grant() {
+    let (status, calls) = granted_context_read(agentplane::core::Sensitivity::Confidential).await;
+    assert!(
+        matches!(status, agentplane::runtime::RunStatus::Succeeded),
+        "a granted read whose wiring matches its grant must dispatch: {status:?}"
+    );
+    assert_eq!(calls, 1);
+}
+
+#[tokio::test]
+async fn a_granted_context_read_with_a_mismatched_ceiling_is_refused() {
+    // The wiring declares a looser ceiling than the reviewer approved:
+    // refused before the read.
+    let (status, calls) = granted_context_read(agentplane::core::Sensitivity::Public).await;
+    assert!(matches!(status, agentplane::runtime::RunStatus::Failed(_)));
+    assert_eq!(calls, 0);
 }
 
 // ── Agents as tools ─────────────────────────────────────────────────────────

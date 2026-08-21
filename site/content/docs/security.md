@@ -741,11 +741,10 @@ the decision. So a `forbid` keyed on a misspelled attribute contributes
 nothing, and whatever `permit` accompanies it would decide. The adapter
 refuses to let that happen: **an `Allow` accompanied by evaluation errors is
 denied**, because the one rule that would have said no may be exactly the one
-that broke. A taint gate in this repository once read `context.args_trust`,
-which the runtime has never sent — under the old behaviour it failed open
-while every test around it passed, which is why the conservative answer is now
-structural. Check a policy against the shape above, or against a real run;
-never against a context assembled to suit the rule.
+that broke. The failure this closes is quiet: a rule reading a context key the
+runtime never sends fails open while every test around it passes. Check a
+policy against the shape above, or against a real run; never against a context
+assembled to suit the rule.
 
 The adapter reports an evaluation *error* distinctly from an ordinary denial,
 in the reason string and as its own `tracing` event, because both reach an
@@ -879,10 +878,16 @@ would make retention depend on replay and retry behavior.
 
 A semantic index is treated as an untrusted derived selector, never as memory
 truth. Its query vector, embedding revision, immutable snapshot, filters,
-scores and exact selections are journaled. The runtime then re-reads each exact
-version from `MemoryStore` and verifies subject, purpose and digest. A poisoned
-or stale ANN index can cause a loud refusal or rank legitimate in-scope records
-badly; it cannot substitute another subject's content or rewrite a version.
+scores, lifecycle cutoff and exact selections are journaled. Live dispatch
+screens every hit against `MemoryStore::current` at the run's journaled clock,
+so an index trailing durable truth — a superseded version after a correction,
+an expired one after its window, an erased one after a retention sweep — drops
+those hits from the selection rather than serving them or failing the query.
+The runtime then re-reads each surviving version from `MemoryStore` and
+verifies subject, purpose and digest. A poisoned index can rank legitimate
+in-scope records badly and an index that contradicts durable truth is a loud
+refusal; it cannot substitute another subject's content, rewrite a version, or
+keep a corrected memory alive past its correction.
 
 `EncryptedMemoryStore` seals each item's content under a fresh data key wrapped
 by a tenant/subject scope. Legal hold is checked before scope destruction;

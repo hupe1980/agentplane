@@ -914,7 +914,7 @@ impl StepCtx<'_> {
             // opening a transaction to discover the caller had no right to it
             // would be a rollback where a refusal would do, and the journaled
             // denial would land after work the run was never allowed to start.
-            self.gate(key, &descriptor, true, None).await?;
+            self.gate(key, &descriptor, true, None, None).await?;
             keyed.push((key, member));
         }
         if keyed.is_empty() {

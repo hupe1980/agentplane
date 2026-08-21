@@ -30,6 +30,444 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.21.0] — 2026-08-21
+
+Five passes. The fifth audits governed memory, semantic retrieval, media
+ingestion and the manifest against the current field — the mid-2026 memory
+frameworks and the memory-poisoning literature — and its finding is one
+defect with three faces: the two retrieval tiers answered lifecycle
+differently. The fourth is a deep audit of the interop layer — MCP, A2A,
+CloudEvents/push, and the model-provider drivers — against the specs as
+released (MCP 2026-07-28, A2A 1.0.1, CloudEvents 1.0, Standard Webhooks 1.0)
+and against the failure modes the wider ecosystem is publicly fighting. Its
+sharpest lesson is structural: nearly every defect sat where one driver or one
+backend deviated from a sibling that got it right, invisible to any test that
+exercises only the sibling. The seam invariants are now spelled once and
+pinned per driver.
+
+### Changed — a semantic selection is screened against durable truth
+
+A semantic index is derived, so between rebuilds it keeps naming versions
+that are no longer current — and each staleness had its own wrong answer. A
+superseded version kept being served after its correction, so the ranked tier
+was the one place a repair did not reach. An expired version was served past
+the disposal date its writer stated, which the deterministic tier already
+refused. And an erased version failed the entire query, so every lawful
+retention sweep was a semantic-search outage lasting until the next index
+rebuild. Live dispatch now screens every hit against the authoritative store
+before the selection is journaled: a hit whose version is not the one a fresh
+recall would see simply leaves the selection. The cutoff rides in the record
+(`SemanticQuery::as_of`, from the run's journaled clock), and the screen is
+`MemoryStore::current` — a new required method, the by-id twin of `recall`'s
+lifecycle rule, which `version` deliberately cannot answer because replay
+needs it to keep serving superseded and expired state. Integrity findings
+stay loud: a moved digest and an out-of-scope hit are refusals on live and
+replay both. The retriever-misconduct refusals (an answer past `limit`, a
+non-finite score) moved into the effect, before the record is written — a
+selection holding a NaN score journals as `null` and could never be read
+back. Custom `MemoryStore` implementations must add `current`; the
+conformance battery pins its semantics on both shipped backends.
+
+### Added — the manifest format ships as a JSON Schema
+
+`Manifest::json_schema()` and `agentplane schema` emit the format as one
+draft-07 JSON Schema document, published at
+`https://hupe1980.github.io/agentplane/agent.schema.json` — so a single
+`# yaml-language-server: $schema=…` modeline gives any editor autocomplete,
+hover documentation and inline unknown-field errors while a manifest is being
+written, instead of at `agentplane validate`. It is generated from the very
+types the parser deserializes into, which is what keeps it honest: the derive
+reads the same serde attributes, so unknown fields, missing fields, wrong
+types and wrong enum spellings fail the schema exactly as they fail the
+parser, and hover prose is the first paragraph of each item's own
+documentation rather than a second copy. The parser stays authoritative — the
+semantic refusals (an unstated budget, a control nothing performs) run only
+there, and the schema's own description says so. Guards pin the published
+file byte-for-byte to the generator, pin parser-acceptance ⇒
+schema-acceptance on a full-featured manifest, and pin that both sides refuse
+the same shape errors.
+
+### Fixed — one formation answer cannot supersede itself
+
+A formation answer proposing the same key twice wrote two versions back to
+back, so the *later* proposal silently superseded the one the declaration's
+first-wins rule prefers. Duplicates are now skipped — first wins, matching
+the truncation rule — and a duplicate does not spend a `max_items` slot,
+because it is not a distinct fact.
+
+### Fixed — every `Content-Encoding` line is checked
+
+The media fetcher read only the first `Content-Encoding` header line, so a
+response carrying `identity` on one line and a real coding on another reached
+the signature check with coded bytes. Every value is checked now; the format
+signatures made the gap mostly theoretical, but a check that reads half the
+header is a check that documents itself wrongly.
+
+### Fixed — a schema no longer fails every tool-calling turn
+
+The tool-calling loop attaches the declared output schema to every model
+turn, and four of five drivers judged a mid-loop turn — a tool call and no
+sibling text — as "the answer is not JSON": a metered failure whose error
+path carries no continuation, so the provider's signed reasoning was dropped
+from the retry and the provider rejected the conversation. The exemption a
+tool-asking turn earns (a schema binds only the final answer) is now spelled
+once in the shared wire helper, and each driver pins it, because the copy
+that drifts is on whichever driver a deployment does not exercise. Bedrock
+already had it right, which is what proved the intent.
+
+### Fixed — Gemini carries the whole transcript, not the latest turn
+
+Gemini's continuation held only the last model turn, so round three of a tool
+loop was sent without round one's signed turn — the model re-asked for the
+same tools or answered with amnesia, silently. The state is now an array of
+contents accumulated exactly as every sibling driver accumulates, and the
+two-round wire test pins the shape signature-for-signature. In the same
+family: an unstored OpenAI request now asks for `reasoning.encrypted_content`
+(without it, stateless multi-turn reasoning fails against the live API while
+every local round trip passes), Anthropic maps `xhigh` instead of refusing an
+effort the provider documents, and `model_context_window_exceeded` /
+`pause_turn` are reported as unfinished answers rather than complete ones.
+
+### Fixed — the bill is the bill
+
+Bedrock reported Converse's cache counters beside `input_tokens` instead of
+folding them in, so the token ceiling read a fraction of the real spend the
+moment caching worked — the exact "bill nobody can reconcile" the usage type
+documents. Both Bedrock paths now share the one cache arithmetic. A Bedrock
+guardrail intervention is a metered refusal on the buffered path as well as
+the streamed one; an SSE decode failure classifies by the same severed-stream
+ladder as a dead connection instead of pinning to `Unaccounted`; a reasoning
+item opening counts as generation evidence, so a stream cut mid-reasoning is
+never "safe to repeat"; and the SSE decoder reassembles codepoints split
+across TLS frames instead of writing two replacement characters into the
+journal.
+
+### Fixed — an A2A message id deduplicates at admission, scoped to its producer
+
+`SendMessage` correlated on the bare `messageId` without an admission key.
+This crate's own client keeps the id stable across retries precisely so a
+peer can deduplicate — and the server did not: an in-doubt retry of a
+blocking send executed twice, and one peer replaying another's id joined the
+victim's case and was handed its case id. Admission is now keyed on the
+authenticated sender joined with the id (the same spelling inbound events
+bless), a retry answers with the run the key already admitted, and an empty
+id is refused. Also under A2A conformance: an unset `historyLength` returns
+the full capped history (the protocol's default; only an explicit `0` means
+none), a `mediaType` on a text or data part is accepted as the label the
+spec says it is, `totalSize` saturates at the wire's `int32`, a retransmit
+of the message that completed a task answers with the task instead of a
+terminal-state error, and the skill-selection convention is a declared card
+extension instead of folklore in an error message.
+
+### Fixed — the MCP context gate refuses for real reasons
+
+The labels-are-history refactor removed the grant ceilings from MCP effect
+descriptors, and the manifest gate kept comparing against them — so every
+manifest-governed prompt and resource read was refused unconditionally, with
+a message about a sensitivity mismatch that did not exist, and no test
+dispatched one to notice. The gate now compares the grant against what the
+wiring itself declares (both directions, since two artifacts stating one
+decision must agree), and the granted-read test would fail on either
+regression. Around the same gate: every MCP call carries a whole-request
+deadline (the transport waits forever, and a wedged server hung the step
+with nothing journaled), a negotiated version outside the known set is
+refused at construction, a task poll names the output ceiling its snapshot
+carries instead of defaulting to `Public`, `tasks/update` authority moved
+into the manifest (`spec.context.task_input`), and `serve` prints each
+server's advertisement drift beside its negotiated version.
+
+### Fixed — a CloudEvent can wake a run, and its identity cannot be forged
+
+The inbound half of the CloudEvents route buffered every conformant event
+forever: nothing mapped an envelope to a correlation key, so acceptance was
+a dead letter with a 200. `subject` — the standard's own "what this event is
+about" — now becomes the correlation key, and nothing else does. The
+"unforgeable" `(source, id)` pair now actually is: control characters are
+refused in the attributes the U+001F-joined dedup identity is built from.
+Structured mode is chosen by one case-insensitive predicate shared between
+parser and route; extensions cannot shadow core attributes or carry
+non-scalar values; duplicated attribute headers are refused; a store outage
+answers 503 so a bus retries instead of dropping.
+
+### Fixed — the push token rides, and rotation is not a flag day
+
+The A2A push token was stored, sealed, redacted — and never sent, so a
+receiver that validated it rejected every delivery while the plane retried
+thirty-two times and parked. It now rides every delivery as
+`x-a2a-notification-token`. Standard Webhooks signing gained the sender half
+of key rotation (`also_signed_with`: one space-separated header element per
+key, so a receiver holding either verifies); both due scans serve
+longest-due first on both backends, closing a starvation-by-name under
+saturation; one registration drains a bounded page per sweep instead of
+holding a fan-out slot for its whole backlog; an operator destination's URL
+is refused at configuration instead of parking one registration per run; and
+`RunCompleted::for_tenant` stamps the `tenantid` extension multi-tenant
+buses need.
+
+Three passes before it. The third is aimed at implementation maturity in the
+tiers no round had named — batch, timers — asking of each store verb the
+honesty questions earlier rounds settled elsewhere: does a write that matched
+nothing say so, does a decoder that cannot read a row refuse, does an absence
+read as an absence. Five defects, every one a store answering something other
+than the truth, and none reachable by a test that only drives the happy path.
+
+### Fixed — one batch runs one frozen plan, enforced where the plan lives
+
+`BatchStore::open` refuses a batch reopened under a different plan digest
+(`StoreError::BatchPlanChanged`, naming both digests), and the new
+`BatchStore::plan_digest` answers what a batch was opened as. The sentence
+"a batch whose plan could change between items would be several acts wearing
+one name" was a comment on a field: `open` was idempotent on the id alone, so
+a resume offering an edited plan silently kept the old row's digest while the
+runner executed the new plan — items 60,001+ settling under a plan the
+batch's own record does not name, invisible to every audit that trusts the
+record. The runner cannot enforce this; by the time an item executes, the
+store's row is the only witness. Same-digest reopen stays an idempotent
+retry.
+
+### Fixed — a mark written to nowhere is a refusal, not a success
+
+`mark_exhausted` on an unknown batch now answers `NotFound` on both backends.
+It is the one bit that lets a census read as *finished* — lost, a batch is
+`Running` forever with no symptom — and both backends reported it written
+while writing nothing: Postgres discarded the row count two functions above
+the `record` implementation whose comment explains why row counts must be
+read, and redb took the `if let Some` arm and fell through. The same class as
+the `release`-that-freed-nothing defect the conformance battery already pins;
+the battery now pins this one too.
+
+### Fixed — a row the store cannot read is damage, not a default
+
+Three decoders answered corruption with an invented value:
+
+* Batch item outcomes (both backends) decoded an unknown outcome string to
+  *no outcome yet* — a damaged row read as an item that never ran, carried by
+  the census as in-flight forever, keeping the batch `Running` over damage
+  nobody is told about. Now `StoreError::Corrupt`, and the census refuses
+  rather than filing the row in a bucket.
+* The redb timer store decoded an unknown phase to `Forward` — with a comment
+  defending totality — while the Postgres twin was already fallible and even
+  carries the mutation anchor for exactly this defect
+  (`ADamagedPhaseColumnDecodesAsForward`). Two implementations of one rule,
+  disagreeing at the boundary nobody probed: a damaged compensating-phase
+  timer would have fed the unwind logic the forward half of the saga. Now
+  both refuse.
+
+### Fixed — a report on an unknown batch is not an empty batch
+
+`Runtime::batch_report` refuses an id no batch was opened under. A census
+cannot tell "no such batch" from "batch with no items yet" — both count zero
+rows — so a mistyped id answered an empty `Running` report: healthy-looking
+work that never starts, watched instead of corrected.
+
+### Changed — breaking
+
+* `StoreError` gains `BatchPlanChanged`. `BatchStore` gains `plan_digest`;
+  implementors must add it, and `open`/`mark_exhausted` gain refusal
+  contracts the conformance battery now enforces.
+* `Runtime::batch_report` returns `NotFound` for unknown ids.
+* No schema changes; the Postgres DDL is untouched this pass.
+
+Two passes. The second is over the oversight surface — the worklist, the one
+tier whose consumer is a person — asking of each declared behaviour what the
+runtime actually does when it fires. One declaration turned out to be a word:
+`on_expiry: escalate` promised to "widen the audience and keep waiting" in the
+manifest reference, the field docs and the state's own name, and its entire
+enforcement was a state flag. Nothing widened. Worse, the flag pointed the
+other way twice over: an escalated task stayed reserved to whoever had sat on
+it, and stayed in the bounded scan that drives expiry — forever, since
+deciding it is exactly what did not happen — so enough escalated rows would
+eventually fill every batch and the `deny`/`proceed` policies of the tasks
+behind them would silently stop firing, plane-wide. Human review is a finite
+resource an escalation policy spends, and a queue an attacker can flood is an
+oversight control an attacker can switch off
+([2606.08919](https://arxiv.org/abs/2606.08919)).
+
+### Fixed — escalation now does what its name has always claimed
+
+The manifest gains `spec.oversight.escalate_to`, `TaskSpec` gains
+`escalate_to(role)`, and `TaskStore` gains one compound verb, `escalate`, that
+does three things in one transaction: the declared roles **join** the
+audience (a union — the original reviewers remain eligible; replacing them
+would be a reassignment wearing a wider name), the stale reservation is
+cleared (the claim belonged to the window that closed, and an escalation that
+keeps it has widened the audience to people who cannot claim the row), and
+the state says what happened. One verb rather than three writes because the
+three must not be separable. Four-eyes survives it: the proposer is barred
+from the wider audience exactly as from the narrow one, and the conformance
+battery holds every backend to that.
+
+The declaration is refused where it cannot mean anything, in both tiers, with
+mirrored rules — which tier an agent was written in must not decide whether
+its oversight declaration is checked. `escalate` with no `escalate_to` is a
+promise with no operand. `escalate_to` beside a policy that never escalates
+is a declaration nothing reads. And `escalate` over an empty audience is
+refused because empty already means *anyone*, which no list can widen — the
+union deliberately leaves an empty audience empty rather than narrowing it,
+and the parser keeps that branch unreachable.
+
+A racing decision beats an escalation: the store's write is guarded on the
+task still being pending, so a reviewer answering in the window between the
+sweep's read and its write wins, and the sweep's escalation is a no-op rather
+than an un-deciding.
+
+### Fixed — an escalated task leaves the overdue scan
+
+`overdue` now returns `open` and `claimed` tasks only, on both backends.
+Escalation is the one expiry disposition that leaves its task pending and
+past due indefinitely, so the scan that kept returning escalated rows was
+accumulating permanent residents at the head of a bounded oldest-first batch
+(512). Once they filled it, the sweep would re-select and no-op the same 512
+rows every tick, report `saturated`, and never reach a younger task again —
+the declared expiry policies of everything behind them disabled by load,
+which no test that watches a single task can see. The sweeper's escalation
+arm now writes the ledger note first and escalates second, because `escalate`
+is the write that removes the task from the driving query — shape 34's rule,
+applied to the loop where it was found to hold only by accident.
+
+### Fixed — the four-eyes operands survive the shared store
+
+The Postgres task columns `candidate_roles` and `excluded_actors` are now
+`TEXT[]`, not comma-joined `TEXT`. A role or actor name is an identifier the
+deployment's authenticator mints — a SPIFFE id, an email, an LDAP DN — and
+this store does not get to constrain its alphabet: joined on a comma, an
+excluded actor named `spiffe://acme/ns,prod/agent` read back as two actors
+named neither, and the person barred from deciding was barred no longer. The
+embedded store round-tripped the same name verbatim, which is the worst
+version of the defect — the two backends disagreed about a security control's
+operand, and which one a deployment ran decided whether dual control held.
+The conformance battery now opens a task whose names carry the old delimiter
+and asserts both halves: verbatim round-trip, and the exclusion still firing.
+
+### Changed — breaking
+
+* `Oversight` gains `escalate_to`; `on_expiry: escalate` now requires it,
+  requires bounded `approvers` (when the block opens approval or call tasks)
+  and bounded triage audiences, and `escalate_to` without `escalate` is
+  refused. Previously-accepted manifests declaring bare `escalate` are now
+  parse errors — deliberately, since what they declared did not exist.
+* `TaskSpec`/`Task` gain `escalate_to`; `StepCtx::task` and
+  `StepCtx::open_task` apply the same refusals as the parser.
+* `TaskStore` gains `escalate(id)`. Implementors must add it; both shipped
+  backends and `SealedTasks` do. `overdue` now excludes `escalated` tasks —
+  a caller that wants every pending-and-late task was reading the wrong verb,
+  because this one has always been the expiry sweep's driving query.
+* Postgres `tasks` DDL: `candidate_roles`/`excluded_actors` become `TEXT[]`,
+  and `escalate_to TEXT[]` is added. Schema edited in place; recreate the
+  store (pre-release, no migration).
+* `OpenTask`'s effect descriptor gains `escalate_to`, so effect keys over
+  task-opening effects change; existing journals replay as divergence
+  (pre-release, recreate).
+
+The first pass is over I13 — *a finding must be findable* — asking of each terminal
+conclusion not whether it is delivered, but **where it is delivered to, and what
+else can take it off that list**. Two answers came back, and neither was a
+missing mechanism. Both were real findings, correctly detected, handed to a
+channel that belonged to something else: one to a case status that closure
+retires, one to the outcome bucket that means *try again later*. Detection
+without delivery is the failure I13 names; these are its subtler form, where
+delivery happens and lands somewhere nobody is looking.
+
+### Fixed — a missed obligation outlives the case that missed it
+
+`CaseStore::breached(limit)` lists obligations in the `breached` state, and
+`GET /obligations` serves them under a new `api:obligation.list` verb.
+
+There was no such query. A breach reached an operator as the escalation it
+produced — a *case status* — and that is why it read as covered: something did
+arrive. But `close` admits a case once no obligation is still **outstanding**,
+and a breached one is not outstanding. So the record of what a matter missed
+left every listing at the moment the matter was filed away, which is the moment
+people stop looking, and `close`'s own comment says as much: *an unmet
+obligation survives closure, because closure is the moment people stop looking.*
+It survived the row and not the surface.
+
+The route is the third door named in a single sentence written on the run
+listing two releases ago — *escalated cases, overdue tasks, breached
+obligations*. Overdue tasks were findable through the worklist; escalated cases
+got a route when that claim was checked; the third name went unread because a
+breach did reach somebody, until the case closed. A survey sentence half-checked
+is worse than one nobody checked, because the half that was fixed is what makes
+the rest read as settled.
+
+`api:obligation.list` is its own verb rather than a widened `api:case.list`, so
+a compliance function can be granted *what did we miss* without also being
+granted the contents of every matter. Deployments enumerating `action::ALL` to
+write rules must grant it; a default-deny engine refuses it otherwise.
+
+### Fixed — the sweeper wrote off an obligation before it escalated the case
+
+`sweep_deadlines` now escalates the case first and marks the obligation
+`Breached` second.
+
+`due` selects obligations that are still `pending` or `warned`, so writing
+`Breached` is the write that removes one from the only pass that looks at it.
+Done first, it turned the escalation that follows into a step with no retry: a
+crash in that window left a breach recorded, a case saying nothing had happened,
+and no later tick able to select the obligation again. One lost finding per
+crash, in the subsystem whose entire purpose is not to lose one.
+
+The dangerous order is the one that reads better — primary fact before derived
+one, cause before consequence. `sweep_tasks` had it right by construction, since
+`overdue` keeps returning a task after it is escalated, and that accident is
+what made the asymmetry visible. The rule is now stated as CONCEPT shape **34**:
+*the write that removes an item from the query driving the loop goes last.* It
+costs repeated work on a retry and nothing else, because every other write in
+these loops is already idempotent — which is what makes them safe on a timer to
+begin with.
+
+The test fails the *second* write and asserts the obligation is still selected
+by `due`. No timing, no race: false in the wrong order, and a store that refused
+everything would fail the positive half beside it.
+
+### Fixed — a rewritten pinned read quarantines the run instead of failing it
+
+New `StepError::Unreproducible`, classified untrustworthy by the executor, with
+`agentplane.run.unreproducible` and a counter beside it.
+
+I1 exempts a read whose answer cannot change from the effect protocol — bytes by
+digest, a memory by id *and* version — on the stated condition that the
+immutability claim is **checked rather than assumed**. The check was there and
+fired correctly. What it produced was `StoreError::Backend(String)` carrying
+`MemoryError::Rewritten`'s message, which made a store contradicting its own
+immutability indistinguishable, to anything but a string match, from a store
+that was briefly unreachable — and left the run `Failed`.
+
+`Failed` is an ordinary outcome here: open, resumable, and not what an operator
+audits. So the one condition meaning *the durable record is not trustworthy* was
+filed in the bucket meaning *try again later*, and `GET /runs?outcome=quarantined`
+— where somebody looks for exactly this — did not list it. The argument against
+it was already written in the codebase, on `Undecidable`: *a distinct variant
+rather than a message, because the executor quarantines on it, and a run's
+disposition must not hinge on the wording of a string.*
+
+**Absence is deliberately not this.** A version that was *forgotten* is an
+erasure somebody asked for and recorded; it still fails the run, because routing
+it here would fill the integrity backlog with lawful decisions. Telling erasure
+from loss is the job `drill` does at the case layer, applied where the read
+happens.
+
+The semantic recall path returned one refusal for two situations — a digest that
+moved and a retriever answering outside the query's scope. They are now separate:
+the first is the authoritative store contradicting itself, the second is the
+index misbehaving while durable truth is intact, and an operator reading the
+merged message would go looking in the wrong system.
+
+### Changed — breaking
+
+* `CaseStore` gains `breached`. Implementors must add it; both shipped backends
+  and `SealedCases` do. Postgres needs no DDL change — the existing
+  `case_deadlines_due` index leads on the two columns it filters.
+* `StepError` gains `Unreproducible`. Exhaustive matches over it must handle the
+  variant; a run that previously concluded `Failed` on a rewritten memory now
+  concludes `Quarantined`.
+* `action::ALL` gains `api:obligation.list`.
+
+Mutation count **527** — nine anchors added across the two passes, each
+verified by `--apply`, including one aimed at the Postgres `overdue` query
+specifically: the redb mutation cannot reach the shared store's copy of the
+rule, and an anchor that kills on one backend reads as coverage of both.
+
 ## [0.20.0] — 2026-08-20
 
 One pass over the receiving edge, from a deployment report: a plane that emits

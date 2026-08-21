@@ -1663,15 +1663,19 @@ async fn case_of_reads_the_binding_off_the_run() {
 
 // ── Strict verification writes nothing to the case layer ────────────────────
 
-/// A case store that counts obligation registrations and delegates the rest.
+/// A case store that counts obligation registrations, can be made to fail an
+/// escalation, and delegates the rest.
 #[derive(Debug)]
-struct CountsRegistrations {
+struct InstrumentedCases {
     inner: Arc<dyn CaseStore>,
     registered: Arc<std::sync::atomic::AtomicUsize>,
+    /// Makes `set_status` fail, standing in for the process dying at that exact
+    /// point in the sweep.
+    escalation_fails: bool,
 }
 
 #[async_trait::async_trait]
-impl CaseStore for CountsRegistrations {
+impl CaseStore for InstrumentedCases {
     async fn correlate(
         &self,
         keys: &[CorrelationKey],
@@ -1748,6 +1752,11 @@ impl CaseStore for CountsRegistrations {
         case: agentplane::core::CaseId,
         status: agentplane::core::CaseStatus,
     ) -> Result<(), agentplane::core::StoreError> {
+        if self.escalation_fails {
+            return Err(agentplane::core::StoreError::Backend(
+                "instrumented failure".to_owned(),
+            ));
+        }
         self.inner.set_status(case, status).await
     }
     async fn close(
@@ -1777,6 +1786,12 @@ impl CaseStore for CountsRegistrations {
         state: agentplane::core::DeadlineState,
     ) -> Result<(), agentplane::core::StoreError> {
         self.inner.set_deadline_state(case, name, state).await
+    }
+    async fn breached(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Deadline>, agentplane::core::StoreError> {
+        self.inner.breached(limit).await
     }
     async fn due(
         &self,
@@ -1813,9 +1828,10 @@ impl CaseStore for CountsRegistrations {
 async fn strict_replay_does_not_re_register_an_obligation() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let cases: Arc<dyn CaseStore> = Arc::new(CountsRegistrations {
+    let cases: Arc<dyn CaseStore> = Arc::new(InstrumentedCases {
         inner: store.clone() as Arc<dyn CaseStore>,
         registered: Arc::clone(&registered),
+        escalation_fails: false,
     });
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(cases)
@@ -1844,5 +1860,118 @@ async fn strict_replay_does_not_re_register_an_obligation() {
         registered.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "strict verification wrote to the case layer it was observing"
+    );
+}
+
+// ── A breach survives the crash that interrupts it ──────────────────────────
+
+/// A sweep interrupted between escalating and breaching leaves the obligation
+/// outstanding, so the next tick makes the decision again.
+///
+/// `due` selects obligations that are still `pending` or `warned`, which makes
+/// writing `Breached` the write that removes one from the only pass that looks
+/// at it. Ordered the other way, a crash in the window between the two writes
+/// is unrecoverable in the strict sense: the obligation is breached, the case
+/// still says nothing happened, and no later tick will ever select it again —
+/// the sweep would have spent its one chance to notice. Escalating twice is a
+/// no-op, so the order that repeats work is the order that is safe.
+///
+/// The failure is injected at `set_status` rather than by killing a process
+/// because that is the write the fix moved. Both halves are asserted: the
+/// interrupted tick must leave the obligation outstanding, and a healthy tick
+/// over the same fixture must actually breach it — a store that refused
+/// everything would satisfy the first half alone.
+#[tokio::test]
+async fn a_sweep_interrupted_before_the_breach_leaves_the_obligation_outstanding() {
+    use agentplane::core::{Deadline, DeadlineState};
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let now = Timestamp::from_unix_timestamp(1_800_000_000).unwrap();
+
+    let open = |cases: &Arc<dyn CaseStore>| {
+        let cases = Arc::clone(cases);
+        async move {
+            let case = cases
+                .correlate_or_open("matter", &[key("matter", "M-91")], now)
+                .await
+                .unwrap()
+                .case_id();
+            cases
+                .register_deadline(&Deadline {
+                    case,
+                    name: "respond-by".to_owned(),
+                    resolved_at: now - std::time::Duration::from_secs(3600),
+                    calendar_digest: Digest::of(b"test-calendar"),
+                    warn_at: None,
+                    state: DeadlineState::Pending,
+                })
+                .await
+                .unwrap();
+            case
+        }
+    };
+
+    let plain = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let case = open(&plain).await;
+
+    let crashing: Arc<dyn CaseStore> = Arc::new(InstrumentedCases {
+        inner: Arc::clone(&store) as Arc<dyn CaseStore>,
+        registered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        escalation_fails: true,
+    });
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&crashing))
+        .build();
+    let interrupted = rt.sweep(now, std::time::Duration::from_mins(5)).await;
+    assert!(
+        interrupted.is_err(),
+        "the escalation failed, so the tick must not report success"
+    );
+
+    let state = plain.deadlines(case).await.unwrap()[0].state;
+    assert_eq!(
+        state,
+        DeadlineState::Pending,
+        "the obligation was written off before the escalation it pays for landed, \
+         so it has left `due` and no tick will look at it again — the breach is \
+         now findable only by somebody who already knows to open this case"
+    );
+    assert!(
+        plain
+            .due(now, 16)
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.case == case),
+        "the interrupted obligation is no longer outstanding, so the sweep has \
+         spent its one chance to notice it"
+    );
+    assert!(
+        plain.breached(16).await.unwrap().is_empty(),
+        "nothing was breached: the tick failed before it earned the right to say so"
+    );
+
+    // The positive half. The same fixture, a store that answers, and the
+    // decision lands — so the assertions above are about the interruption and
+    // not about a plane that cannot breach anything at all.
+    let healthy = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&plain))
+        .build();
+    let report = healthy
+        .sweep(now, std::time::Duration::from_mins(5))
+        .await
+        .unwrap();
+    assert_eq!(report.breached, 1);
+    assert_eq!(
+        plain.deadlines(case).await.unwrap()[0].state,
+        DeadlineState::Breached
+    );
+    let listed = plain.breached(16).await.unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|d| d.case == case && d.name == "respond-by"),
+        "the breach is not listable, so it reaches whoever must answer for it \
+         only if they already suspected it: {listed:?}"
     );
 }

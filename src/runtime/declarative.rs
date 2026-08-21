@@ -125,11 +125,10 @@ impl Declarative {
 
         for _turn in 0..self.max_turns {
             // No `with_output_sensitivity`: the completion's floor derives
-            // from the call's own egress ceiling, which is exactly the level
-            // this loop used to restate by hand from the conversation label —
-            // dispatch refuses a conversation above the ceiling, so the two
-            // spellings could only ever agree, and the derived one cannot be
-            // forgotten at the next call site.
+            // from the call's own egress ceiling. Restating it by hand from
+            // the conversation label could only ever agree — dispatch refuses
+            // a conversation above the ceiling — and the derived spelling
+            // cannot be forgotten at the next call site.
             let outbound = prompt.with_joined_label(&conversation_label);
             let completion = cx
                 .sink_with(&outbound, |value| {
@@ -188,9 +187,9 @@ impl Declarative {
             // failure this runtime exists to make impossible.
             if completion.peek().truncated {
                 let reason = if completion.peek().tool_calls.is_empty() {
-                    "the model ran out of output budget mid-answer, so this is a                      partial answer and not the agent's answer — raise                      `max_output_tokens` for this role, or narrow what the agent                      is asked to produce"
+                    "the model ran out of output budget mid-answer, so this is a partial answer and not the agent's answer — raise `max_output_tokens` for this role, or narrow what the agent is asked to produce"
                 } else {
-                    "the model ran out of output budget while it was still asking                      for tools, so the last call's arguments are whatever survived                      the cut — running them would act on a request the model never                      finished writing. Raise `max_output_tokens` for this role"
+                    "the model ran out of output budget while it was still asking for tools, so the last call's arguments are whatever survived the cut — running them would act on a request the model never finished writing. Raise `max_output_tokens` for this role"
                 };
                 return Ok(Outcome::fail(reason));
             }
@@ -318,7 +317,7 @@ impl Declarative {
                         // pair. Stated rather than unwrapped: a panic here
                         // would be a crash for a wiring mistake.
                         return Err(SkillError::Other(
-                            "a tool grant requires approval but the agent declares no                              oversight policy — there is nobody to ask"
+                            "a tool grant requires approval but the agent declares no oversight policy — there is nobody to ask"
                                 .into(),
                         ));
                     };
@@ -510,7 +509,13 @@ impl Declarative {
             // because widening the audience of an unanswered row is a real
             // thing to want.
             spec.on_expiry = match oversight.on_expiry {
-                crate::core::OnExpiry::Escalate => crate::core::OnExpiry::Escalate,
+                crate::core::OnExpiry::Escalate => {
+                    // The oversight-level escalation audience, applied to the
+                    // triage row too: the parser has already held every triage
+                    // audience to be bounded when escalation is declared.
+                    spec.escalate_to.clone_from(&oversight.escalate_to);
+                    crate::core::OnExpiry::Escalate
+                }
                 _ => crate::core::OnExpiry::Deny,
             };
             cx.open_task(&spec).await?;
@@ -1143,6 +1148,7 @@ struct Proposal {
     approvers: Vec<String>,
     deadline: crate::manifest::OversightDeadline,
     on_expiry: crate::core::OnExpiry,
+    escalate_to: Vec<String>,
     allow_unattended: bool,
     /// Rules that open a task *beside* the answer rather than in front of it.
     triage: Vec<crate::manifest::TriageRule>,
@@ -1160,6 +1166,7 @@ impl Proposal {
                 Expiry::Escalate => crate::core::OnExpiry::Escalate,
                 Expiry::Proceed => crate::core::OnExpiry::Proceed,
             },
+            escalate_to: o.escalate_to.clone(),
             allow_unattended: o.allow_unattended,
             triage: o.triage.clone(),
         }
@@ -1199,6 +1206,7 @@ impl Proposal {
         );
         spec.candidate_roles.clone_from(&self.approvers);
         spec.on_expiry = self.on_expiry;
+        spec.escalate_to.clone_from(&self.escalate_to);
         spec.allow_unattended = self.allow_unattended;
         spec
     }
@@ -1619,9 +1627,6 @@ fn privileged(m: &Manifest) -> Option<ModelRole> {
 /// **`None` means the error is not the model's business and must leave the
 /// loop**, so the executor reaches the verdict it would reach for a
 /// hand-written skill.
-///
-/// This used to be `e.to_string()` for every error, which is two different
-/// mistakes wearing one match arm.
 ///
 /// # A refusal produced here is an oracle
 ///

@@ -64,7 +64,7 @@ pub const API_VERSION: &str = "agentplane.hupe1980.github.io/v1alpha1";
 pub const KIND: &str = "Agent";
 
 /// A parsed, validated agent declaration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Which schema this document claims to be.
@@ -77,7 +77,7 @@ pub struct Manifest {
 }
 
 /// Who this agent is, for the record.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Metadata {
     pub name: String,
@@ -88,7 +88,7 @@ pub struct Metadata {
 }
 
 /// The declaration proper.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Who the agent is told it is.
@@ -180,7 +180,7 @@ pub struct Spec {
 /// other channel belongs where somebody visibly decides to.
 ///
 /// [`StepCtx::semantic_recall`]: crate::runtime::StepCtx::semantic_recall
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Memory {
     /// Read memories into the prompt, before the model is called.
@@ -213,7 +213,7 @@ impl Memory {
 /// **fails the run** at the model call rather than being filtered out — a
 /// silent drop would make the answer depend on a ceiling nothing in the
 /// transcript mentions. Partition with `purpose`, or raise the ceiling.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryRecall {
     /// Which pile to read, with the same three bindings formation writes
@@ -247,23 +247,31 @@ const fn default_recall_limit() -> usize {
     5
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContextGrants {
     #[serde(default)]
     pub prompts: Vec<ContextPrompt>,
     #[serde(default)]
     pub resources: Vec<ContextResource>,
+    /// Servers this agent may answer `tasks/update` input requests on.
+    ///
+    /// An elicitation is a server asking this plane for data — the direction
+    /// an operator most needs to have said yes to — so the authority to answer
+    /// belongs in the reviewed artifact beside prompts and resources, not in
+    /// unreviewable wiring code.
+    #[serde(default)]
+    pub task_input: Vec<ContextTaskInput>,
 }
 
 impl ContextGrants {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.prompts.is_empty() && self.resources.is_empty()
+        self.prompts.is_empty() && self.resources.is_empty() && self.task_input.is_empty()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContextPrompt {
     pub server: String,
@@ -274,7 +282,7 @@ pub struct ContextPrompt {
     pub output_sensitivity: Sensitivity,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContextResource {
     pub server: String,
@@ -283,7 +291,20 @@ pub struct ContextResource {
     pub output_sensitivity: Sensitivity,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One server this agent may send task input responses to.
+///
+/// Per server rather than per task: a task id is minted by the server at
+/// runtime, and an operator cannot review a name that does not exist yet.
+/// Only an input ceiling — `tasks/update` returns nothing to label.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContextTaskInput {
+    pub server: String,
+    #[serde(default = "public_sensitivity")]
+    pub max_input_sensitivity: Sensitivity,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryFormation {
     /// Where the formed memories are filed.
@@ -328,7 +349,7 @@ const fn public_sensitivity() -> crate::core::Sensitivity {
 /// makes the hash mean anything: [`Identity::system_prompt`] is pure and its
 /// layout is pinned by a test, because a template that changed under you would
 /// alter every agent's prompt without altering a single manifest.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {
     /// What the agent is for, in one line.
@@ -391,7 +412,7 @@ impl Identity {
 /// matched or not; the only effect is a row in a worklist. That is *reporting*,
 /// and reporting is the one place a declaration can hold a predicate without
 /// becoming control flow. See [`TriageRule`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Oversight {
     /// What a human decides **before** the run continues.
@@ -405,6 +426,16 @@ pub struct Oversight {
     /// What happens when the window closes.
     #[serde(default)]
     pub on_expiry: Expiry,
+    /// Who is added to the audience when an unanswered task escalates.
+    ///
+    /// Required by `on_expiry: escalate` and refused beside anything else.
+    /// Escalation's one enforceable meaning is *these people can now see it*:
+    /// the runtime widens the task's audience to this list, clears the stale
+    /// reservation, and keeps waiting. A declaration that escalates to nobody
+    /// promises a wider audience the runtime cannot produce, and a list here
+    /// under a policy that never escalates is a declaration nothing reads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escalate_to: Vec<String>,
     /// Explicit consent to act with no human when the window closes.
     ///
     /// Required for [`Expiry::Proceed`] and refused otherwise, so that acting
@@ -438,7 +469,7 @@ pub struct Oversight {
 /// so *five working days* means whatever that domain says it means and this
 /// crate never guesses — which is the same reason the name alone was never
 /// enough.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OversightDeadline {
     /// What the obligation is called on the case.
@@ -474,7 +505,7 @@ impl OversightDeadline {
 /// severity is high" is one step from an `if`, which is where a config format
 /// stops being config. A condition that only *reports* is
 /// [`Oversight::triage`], which is a different thing and says so.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Approval {
     /// Every answer waits for a person.
@@ -521,7 +552,9 @@ pub enum Approval {
 }
 
 /// What happens when the approval window closes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Expiry {
     /// Refuse the answer. The safe default, and the default here.
@@ -546,7 +579,7 @@ pub enum Expiry {
 /// control flow stops being config and becomes a poor programming language.
 /// Where genuine structure is needed it belongs in a plan, which is
 /// contract-validated data.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Execution {
     /// Which built-in behaviour runs this agent.
@@ -572,7 +605,7 @@ const fn default_max_turns() -> u32 {
 /// this crate implements and tests; a config format whose behaviours are
 /// open-ended is one nobody can review, because the reviewer would have to know
 /// what the string does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecutionKind {
     /// One model call, answered in the declared [`Output`] shape.
@@ -663,7 +696,7 @@ impl ExecutionKind {
 /// is that most agents in an arrangement have no authority to hand off at all.
 /// A specialist declaring [`Security::max_delegation_depth`] above zero is
 /// refused, because it is an orchestrator that nobody reviewed as one.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Topology {
     /// How many agents, and therefore how much coordination risk.
@@ -683,7 +716,9 @@ pub struct Topology {
 }
 
 /// How many agents contribute to one task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum TopologyMode {
     /// One agent, one context, many tools. Inter-agent failure is structurally
@@ -695,7 +730,9 @@ pub enum TopologyMode {
 }
 
 /// What an agent is within an arrangement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Role {
     /// Does one thing and hands off to nobody.
@@ -717,7 +754,7 @@ pub enum Role {
 ///
 /// Each is checkable in principle rather than rhetorical, which is the point of
 /// enumerating them instead of taking free text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Justification {
     /// Sub-tasks operate on provably disjoint inputs.
@@ -753,7 +790,7 @@ pub enum Justification {
 /// bounded schema, so the model designated for untrusted contact is the one
 /// that writes durable memory from it. The answer itself stays on the
 /// privileged model.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Models {
     /// The model trusted with tool calls and decisions.
@@ -765,7 +802,7 @@ pub struct Models {
 }
 
 /// One model, named the way a provider names it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ModelRef {
     /// The driver: `anthropic`, `openai`, or whatever an embedder registered.
@@ -811,7 +848,7 @@ fn role(r: &ModelRef) -> crate::model::ModelRole {
 /// [`ModelCall::expecting`](crate::model::ModelCall::expecting) it goes into the
 /// **effect key**, so editing it makes a replay report divergence rather than
 /// quietly reinterpreting last year's stored answer under today's rules.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Output {
     /// A JSON Schema, carried opaquely.
@@ -824,7 +861,7 @@ pub struct Output {
 }
 
 /// The constraints a runtime enforces.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Security {
     /// The highest sensitivity any value may reach an outward sink at. Combined
@@ -870,7 +907,7 @@ pub struct Security {
 /// capability, a `tool://agent` grant, or a peer?) was never pinned. A build
 /// check that every required capability is available on the plane is a
 /// well-formed future control; until it exists, the field does not.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Capabilities {
     #[serde(default)]
@@ -885,7 +922,7 @@ pub struct Capabilities {
 /// not take its first step or perform its first effect of any kind, and
 /// [`validate`](Manifest::validate) refuses it — see
 /// [`max_tokens`](Self::max_tokens).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Budgets {
     /// Plan nodes this run may execute, checked before each one starts.
@@ -936,7 +973,7 @@ pub struct Budgets {
 }
 
 /// One tool this agent may call, and on what terms.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ToolGrant {
     /// Which tool, as `tool://server/name`.
@@ -1005,6 +1042,37 @@ pub struct ToolGrant {
 
 const fn yes() -> bool {
     true
+}
+
+/// Cut every schema description down to its first paragraph.
+///
+/// The prose is single-sourced from the types' own documentation, which is
+/// written for a Rust reader at essay length; a hover box wants the opening
+/// sentence. Rustdoc's `` [`X`] `` link spelling renders literally in an
+/// editor, so it is reduced to plain code formatting on the way.
+fn trim_descriptions(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::String(text)) = object.get_mut("description") {
+                *text = text
+                    .split("\n\n")
+                    .next()
+                    .unwrap_or_default()
+                    .replace("[`", "`")
+                    .replace("`]", "`")
+                    .replace('\n', " ");
+            }
+            for value in object.values_mut() {
+                trim_descriptions(value);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for value in items {
+                trim_descriptions(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Every `tool://server/name` written in a piece of prose.
@@ -1762,6 +1830,44 @@ impl Manifest {
                          value picked off a list",
             });
         }
+        // Escalation must describe something the runtime can do. Its one
+        // enforceable meaning is widening the audience, so the declaration
+        // has to say who is added — and every audience it would widen has to
+        // be bounded, because an empty list already means *anyone* and there
+        // is no wider audience than that. These mirror the coded tier's
+        // refusals in `StepCtx`: which tier an agent was written in must not
+        // decide whether its oversight declaration is checked.
+        if o.on_expiry == Expiry::Escalate {
+            if o.escalate_to.is_empty() {
+                return Err(ManifestError::Unenforceable {
+                    field: "spec.oversight.on_expiry",
+                    detail: "'escalate' promises a wider audience and `escalate_to` names \
+                             nobody — declare the roles the task widens to, or use 'deny'",
+                });
+            }
+            if (o.approval != Approval::None || gates_a_call) && o.approvers.is_empty() {
+                return Err(ManifestError::Unenforceable {
+                    field: "spec.oversight.approvers",
+                    detail: "'escalate' needs a bounded audience to widen, and an empty \
+                             `approvers` already means anyone — name the initial reviewers, \
+                             or use 'deny'",
+                });
+            }
+            if let Some(rule) = o.triage.iter().find(|r| r.audience.is_empty()) {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.oversight.triage: 'escalate' needs a bounded audience to widen, \
+                     and triage rule '{}' declares none — name its audience, or use 'deny'",
+                    rule.name
+                )));
+            }
+        } else if !o.escalate_to.is_empty() {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.oversight.escalate_to",
+                detail: "`escalate_to` names an escalation audience, but `on_expiry` never \
+                         escalates — set `on_expiry: escalate` or drop the list, so the \
+                         declaration and the policy say the same thing",
+            });
+        }
         Ok(())
     }
 
@@ -2203,6 +2309,61 @@ impl Manifest {
         Ok(())
     }
 
+    /// The manifest format, as one JSON Schema document (draft-07).
+    ///
+    /// This is the *shape* of the format, generated from the same types the
+    /// parser deserializes into, so it cannot drift from what `parse` accepts
+    /// structurally — unknown fields, missing required fields, wrong types and
+    /// wrong enum spellings all fail the schema exactly as they fail the
+    /// parser. What it deliberately does **not** carry is the semantic layer:
+    /// every refusal [`validate`](Self::validate) adds on top — an unbounded
+    /// budget, a control nothing performs, an incoherent topology — fires only
+    /// in the parser, which stays authoritative. A document the schema accepts
+    /// is well-shaped, not yet well-formed.
+    ///
+    /// Published at the URL in its own `$id`, which is what an editor's YAML
+    /// language server wants in a modeline:
+    ///
+    /// ```yaml
+    /// # yaml-language-server: $schema=https://hupe1980.github.io/agentplane/agent.schema.json
+    /// ```
+    ///
+    /// Descriptions are the first paragraph of each item's own documentation —
+    /// one source of prose, trimmed for a hover box. `agentplane schema`
+    /// prints this document; a guard test pins the published copy to it.
+    #[must_use]
+    pub fn json_schema() -> serde_json::Value {
+        /// Where the generated schema is served from. In the document itself
+        /// (`$id`), so a copy that escapes the site still names its origin.
+        const SCHEMA_ID: &str = "https://hupe1980.github.io/agentplane/agent.schema.json";
+
+        let generator = schemars::generate::SchemaSettings::draft07().into_generator();
+        let mut value = serde_json::to_value(generator.into_root_schema_for::<Self>())
+            .expect("a schemars-generated schema must serialize to JSON");
+        trim_descriptions(&mut value);
+        let root = value.as_object_mut().expect("a root schema is an object");
+        root.insert(
+            "$id".to_owned(),
+            serde_json::Value::String(SCHEMA_ID.to_owned()),
+        );
+        root.insert(
+            "title".to_owned(),
+            serde_json::Value::String("agentplane Agent manifest".to_owned()),
+        );
+        root.insert(
+            "description".to_owned(),
+            serde_json::Value::String(
+                "The shape of an agentplane Agent manifest. The crate's parser stays \
+                 authoritative: this schema refuses unknown fields, missing fields, and \
+                 wrong types exactly as the parser does, but the parser's semantic \
+                 refusals (an unstated budget, a declared control nothing performs) run \
+                 only there — `agentplane validate` is the full check."
+                    .to_owned(),
+            ),
+        );
+        value
+    }
+
     /// What this declaration is, as a digest.
     ///
     /// Over canonical bytes, so key order and formatting cannot change it: two
@@ -2269,6 +2430,15 @@ impl Manifest {
             .resources
             .iter()
             .find(|grant| grant.server == server && grant.uri == uri)
+    }
+
+    #[must_use]
+    pub fn task_input_grant(&self, server: &str) -> Option<&ContextTaskInput> {
+        self.spec
+            .context
+            .task_input
+            .iter()
+            .find(|grant| grant.server == server)
     }
 
     /// The declared output schema, if there is one.

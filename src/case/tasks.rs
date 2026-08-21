@@ -149,6 +149,26 @@ pub trait TaskStore: Send + Sync + Debug {
 
     async fn set_state(&self, id: TaskId, state: TaskState) -> Result<(), StoreError>;
 
+    /// Widen an unanswered task to its declared escalation audience.
+    ///
+    /// One verb rather than three writes because the three must not be
+    /// separable: [`Task::escalate`] moves the state, clears the reservation
+    /// and widens the audience, and this verb applies all of it in one store
+    /// transaction. Spelled as three `set_*` calls, a crash between them
+    /// leaves a task telling the wider audience it exists while the old
+    /// holder's claim still bars them from taking it.
+    ///
+    /// Escalating a task that is no longer pending is a **no-op returning the
+    /// task as it stands**: the sweep that escalates races the reviewer it is
+    /// escalating past, and the decision winning that race is the outcome
+    /// everybody wanted — resurrecting a completed task into `escalated`
+    /// would un-decide it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when no task has this id.
+    async fn escalate(&self, id: TaskId) -> Result<Task, StoreError>;
+
     /// Open work, highest priority and oldest first.
     async fn queue(&self, roles: &[String], limit: usize) -> Result<Vec<Task>, StoreError>;
 
@@ -161,6 +181,17 @@ pub trait TaskStore: Send + Sync + Debug {
     /// from `pending`: a gauge must not be read from a `limit`-bounded list.
     async fn open_count(&self) -> Result<u64, StoreError>;
 
-    /// Tasks whose window has closed and which nobody answered.
+    /// Tasks whose window has closed and whose expiry policy has not yet fired.
+    ///
+    /// `open` and `claimed` only — **never `escalated`**, although escalated
+    /// tasks are pending and past due. This list drives the sweep that applies
+    /// each task's declared expiry policy, and escalation *is* that policy
+    /// having fired: an escalated task is answered by a person or it is
+    /// answered never, and no further tick has anything to do to it. Included,
+    /// escalated rows would accumulate at the head of a bounded, oldest-first
+    /// scan until one batch is nothing but rows the sweep will no-op, and the
+    /// declared `deny`/`proceed` policies behind them silently stop firing
+    /// plane-wide — an oversight queue that can be flooded is an oversight
+    /// control that can be switched off.
     async fn overdue(&self, now: Timestamp, limit: usize) -> Result<Vec<Task>, StoreError>;
 }

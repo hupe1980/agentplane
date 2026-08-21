@@ -30,13 +30,13 @@ Failover is not a special code path — it is the crash-recovery path. Lease
 expires, another instance claims at `epoch + 1`, resumes via replay. That is the
 payoff of building on replay: HA costs one lease table and an epoch column.
 
-The claim is **initiated by the sweep**, and that sentence used to be missing
-its subject. Fencing makes takeover safe and replay makes it correct, but for a
-release neither made it *happen*: every resume had an event-shaped driver — an
-inbound message, a fired timer, an operator — so a run crashed mid-step with
-none of those pending had no driver at all, appeared in no backlog (it
-concluded nothing, and its wake was already consumed), and waited forever while
-looking exactly like work in progress. The sweep's recovery pass closes that:
+The claim is **initiated by the sweep**, and the subject matters. Fencing makes
+takeover safe and replay makes it correct, but neither makes it *happen*: every
+other resume has an event-shaped driver — an inbound message, a fired timer, an
+operator — so a run crashed mid-step with none of those pending would have no
+driver at all, appear in no backlog (it concluded nothing, and its wake was
+already consumed), and wait forever while looking exactly like work in progress.
+The sweep's recovery pass is what closes that:
 an expired lease that still names an owner is precisely "an instance died
 holding this run", because every clean exit — sealed, failed, suspended —
 releases. See [the sweeper](#the-sweeper).
@@ -136,7 +136,7 @@ the feature.
 Writing it immediately caught a misreading in the battery itself: a *live* lease
 is correctly not stealable — `LeaseHeld`, deliberately distinct from `Fenced`,
 because the two call for opposite responses. A fenced writer must drop the run; a
-writer refused a live lease is not stale and should wait. That distinction is now
+writer refused a live lease is not stale and should wait. That distinction is
 one of the checks.
 
 ### The case layer
@@ -174,10 +174,10 @@ tie-break the store may order them differently between two calls, and a cursor
 landing inside the tie drops or duplicates whichever moved. From a single page
 both look like a healthy listing.
 
-This method used to return *everything*, and had no battery entry — the two
-facts belong together. A signature with no page boundary has no boundary to get
-wrong, so there was nothing to check, and the one caller paid for it by reading
-every run's complete journal on every request.
+The page boundary is also what makes the method checkable: a signature with no
+boundary has no boundary to get wrong, so a battery can pin nothing about it —
+and a listing that returns everything makes its one caller read every run's
+complete journal on every request.
 
 #### A sequential test cannot detect a race
 
@@ -203,7 +203,7 @@ The lesson was paid for once. The PostgreSQL run ceiling shipped with a comment
 claiming its count-and-insert serialised "inside the row lock the write takes" —
 no such lock exists for inserts of different rows, and racing it put eight runs
 through a ceiling of four while every sequential test stayed green. So the
-guards suite now **races every store-side concurrency claim against a real
+guards suite **races every store-side concurrency claim against a real
 PostgreSQL**: quota admission (sixteen racers, four slots), authority draws
 (sixteen racers, a mandate affording three), task claims (sixteen reviewers,
 one holder), timer sweeps (two sweepers partitioning twelve due wake-ups), case
@@ -376,73 +376,54 @@ means deliveries keep dying, which is worth asking why.
 
 ### A finding has to be findable
 
-Every conclusion this runtime reaches is queryable by whoever must clear it:
-escalated cases by status, overdue tasks by role, breached obligations by the
-sweep, dead-lettered events by their own list.
+Every conclusion this runtime reaches is queryable by whoever must clear it,
+without them already knowing which run, case or matter to open. A control that
+notices and does not deliver is closer to none than to half, because it also
+manufactures the belief that somebody was told.
 
-That sentence was written once while it was not yet true of two of its own
-items, which is worth saying because the failure it describes is precisely a
-claim nobody re-reads. A quarantine
-means the recorded history can no longer be trusted, or a mutation is in a state
-nobody can establish — and it produced a run status, an `error!` event and a
-counter. None of those can be asked for, and a run started with `spawn` or over
-A2A's `return_immediately` returns *before* the status exists, so the log line
-was the only trace.
+Each backlog is a question, not an id:
 
 ```sh
-curl -H "$AUTH" 'https://plane/runs?outcome=quarantined'
+curl -H "$AUTH" 'https://plane/runs?outcome=quarantined'   # history you cannot trust
+curl -H "$AUTH" 'https://plane/cases?status=escalated'     # matters somebody must pick up
+curl -H "$AUTH" 'https://plane/obligations'                # windows we missed
+curl -H "$AUTH" 'https://plane/tasks'                      # decisions waiting on me
 ```
 
-Concluded runs are indexed by how they ended. The index is **derived** from
-the `RunSealed` record inside `append`, in the same transaction, so it can be
-rebuilt from the chain and is never an authority. **The last conclusion
-wins**: a failed run moves to `succeeded` when a resume concludes it again,
-so the failed backlog drains. Failure does not seal — a failed or exhausted
-run stays open and resumable; only succeeded, quarantined and cancelled
-freeze the journal and enter the Merkle log.
+All four page the same way: `truncated` says whether there is more, and the
+order puts the item you are most likely to want first — newest for runs and
+cases, longest-overdue for obligations. **Ascending order is not an option** for
+a bounded query: it is a page that stops changing, so a plane whose backlog
+exceeds one page returns the same rows forever and the thing that just happened
+is the one that never appears.
 
-The list comes back **newest first**, and `truncated` says whether there is
-more. That ordering is part of the store contract rather than a detail of the
-index, because the obvious alternative reintroduces the exact failure this
-endpoint exists to remove: a bounded query in ascending order is a page that
-stops changing, so a plane whose backlog already exceeds one page returns the
-same runs forever and the quarantine that just happened is the one that never
-appears. Emitted, indexed, queryable — and still not delivered.
+`/runs` reads an index **derived** from the `RunSealed` record inside `append`,
+in the same transaction, so it rebuilds from the chain and is never an
+authority. **The last conclusion wins** — a failed run moves to `succeeded` when
+a resume concludes it, so the failed backlog drains. Failure does not seal: a
+failed or exhausted run stays open and resumable, and only succeeded,
+quarantined and cancelled freeze the journal.
 
-**Escalated cases were the second exception**, and it survived the fix above by
-being asserted in a comment on it. An escalation is the sweeper saying an
-obligation was missed and somebody was told; "told" meant a status written onto
-the case, and the only way to read it back needed the case id — so the answer
-was available to everyone except the person who had to ask.
+`/cases` defaults to `escalated`. An unrecognised status is a `400` rather than
+a quiet fallback — answering *what is escalated* with a list of healthy cases
+reads as an empty backlog, which is the most reassuring possible way to be
+wrong.
 
-```sh
-curl -H "$AUTH" 'https://plane/cases?status=escalated'
-```
+`/obligations` takes no status. A breach is the only obligation state anybody
+has to be told about; the rest are either still watched by the sweep or already
+answered. It reads the obligation's own row rather than the case's status, so it
+still answers after the matter is closed — closure is when people stop looking,
+which is when the record has to stand on its own.
 
-Same discipline as the run listing: newest first, `truncated` says whether there
-is more, and `status` defaults to the one somebody is looking for. An
-unrecognised status is a `400` rather than a quiet fallback — answering *what is
-escalated* with a list of healthy cases reads as an empty backlog, which is the
-most reassuring possible way to be wrong.
-
-A third gap sat behind both, in the enumeration rather than the routes.
-`api:run.list` — the verb guarding the quarantine listing — was **missing from
-the exported action vocabulary**, so a deployment that wrote its rules by
-enumerating it never granted that verb, and a default-deny engine refused the
-backlog to everybody. The test that should have caught it compared the
-vocabulary against the routes its own walk exercised, and that walk did not call
-`/runs` either: two omissions that cancelled, agreeing forever. Enumerate the
-vocabulary when writing rules, and grant `api:run.list` and `api:case.list`
-explicitly — they are the two read verbs an on-call person needs and two that an
-allowlist built from route names alone will miss. `api:task.takeover` is a third
-to place deliberately: displacing an absent colleague's claim is its own verb
-rather than a widened `api:task.claim`, precisely so a policy set can hand it to
-a queue lead without handing displacement to every reviewer — and a rule set
-that never mentions it has quietly made takeover impossible for everybody.
-
-The general rule is worth stating because it is easy to satisfy accidentally and
-easy to lose: a control that notices and does not deliver is closer to none than
-to half, because it also manufactures the belief that somebody was told.
+**Grant the read verbs explicitly.** `api:run.list`, `api:case.list` and
+`api:obligation.list` are what an on-call person needs, and an allowlist built
+from route names alone will miss them; under a default-deny engine an ungranted
+verb means the backlog is refused to everybody. Enumerate `action::ALL` when
+writing rules rather than reading the route table. `api:obligation.list` is
+separate from `api:case.list` so a compliance function can be given *what did we
+miss* without the contents of every matter, and `api:task.takeover` is separate
+from `api:task.claim` so displacing an absent colleague can go to a queue lead
+without going to every reviewer.
 
 ### Retention for the admission index
 
@@ -1078,6 +1059,7 @@ whether a run id exists by comparing a `400` against a `404`.
 | `POST /tasks/{task}/decide` | Approve or reject, as myself |
 | `GET /cases?status=…` | What is escalated and has not been cleared? Newest first; defaults to `escalated` |
 | `GET /cases/{case}` | What has happened on this matter, and by when must it end? |
+| `GET /obligations` | What did we miss? Longest-overdue first, and it outlives the case's closure |
 | `POST /runs/{run}/cancel` | Stop it — `202`, because the run stops at its next boundary |
 | `POST /events` | This message arrived; wake whoever wanted it |
 
@@ -1086,10 +1068,14 @@ whether a run id exists by comparing a `400` against a `404`.
 mode — structured (`Content-Type: application/cloudevents+json`) or binary
 (`ce-specversion`, `ce-id`, `ce-source`, `ce-type` headers with the data as the
 body) — and anything else is read as this plane's own
-`{id, kind, correlation, payload}`. The `type` is the event kind the policy gate
-is asked about, either way. An envelope the plane has not understood is a `400`,
-never a guess: an unknown `specversion`, a missing `id`/`source`/`type`,
-`data_base64`, or an extension name that is not lowercase alphanumeric.
+`{id, kind, correlation, payload}` — with non-empty `id` and `kind`, for the
+same reasons the CloudEvents shape requires its three. The `type` is the event
+kind the policy gate is asked about, either way. An envelope the plane has not
+understood is a `400`, never a guess: an unknown `specversion`, a missing
+`id`/`source`/`type`, a control character in any of the three, `data_base64`,
+a repeated `ce-` header, or an extension name that is not lowercase
+alphanumeric or that shadows a core attribute. A store outage is a `503`, so
+a bus retries what a `4xx` would make it drop.
 
 The `source` a run is woken under is **the authenticated caller**, never the
 one in the body — otherwise a caller would hold both halves of `(source, id)`
@@ -1099,9 +1085,11 @@ event's id, so a gateway relaying two counterparties that both number their
 messages from one still delivers two events rather than swallowing the second as
 a retry.
 
-Correlation keys have no CloudEvents spelling that is not this plane inventing
-one, so a producer that must correlate posts the native shape, where the keys
-are stated.
+One CloudEvents attribute correlates: `subject`, the standard's own "what
+this event is about", becomes the key `("subject", value)` — a run that
+expects to be woken by a bus correlates on the subject its counterparty will
+name. Extensions deliberately do not; a producer that must correlate on
+richer keys posts the native shape, where they are stated.
 
 Two details carry more weight than the plumbing:
 
@@ -1160,7 +1148,7 @@ Bob to release it, ask again, and are refused for a reason nobody has yet
 mentioned; and meanwhile they have learnt who is reviewing what, from a queue
 they have no standing in.
 
-The order is now part of the `TaskStore` contract, and the conformance battery
+The order is part of the `TaskStore` contract, and the conformance battery
 holds both backends to it:
 
 ```
@@ -1176,8 +1164,29 @@ somebody who did not hold the task returned `Ok(())`. The caller is told the tas
 is free; the holder still has it. That is the exact failure mode the shared
 contract exists to catch — a second backend gets whatever tests its author
 remembered to write, and those are the ones they were already thinking about.
-Releasing now reports `ClaimError::NotHeld`, which is deliberately not
+A release by somebody else reports `ClaimError::NotHeld`, which is deliberately not
 `NotFound`: "the id is wrong" and "it is not yours" call for different responses.
+
+### Escalation widens the audience — and then leaves the expiry scan
+
+When a task's window closes unanswered, the sweep applies the policy the task
+was opened with. `deny` and `proceed` record a decision and resume the run.
+`escalate` does three things in one store transaction: the declared
+`escalate_to` roles **join** the audience (a union — the original reviewers
+remain eligible), the stale claim is cleared so the widened audience can
+actually take the row, and the state moves to `escalated`. Four-eyes survives
+it: whoever proposed the action stays barred, however wide the audience gets.
+The escalated row stays in the ordinary queue, ranked and claimable — that
+queue, filtered by the caller's roles, is where the wider audience meets it.
+
+An escalated task does **not** reappear in the overdue scan, although it is
+still pending and past due. Escalation is the one policy that leaves its task
+in that condition forever — it is answered by a person or answered never — so
+a scan that kept returning escalated rows would accumulate them at the head of
+its bounded, oldest-first batch until the batch held nothing else, at which
+point the `deny` and `proceed` policies of every task behind them would
+silently stop firing. Reviewer attention is a finite resource; a queue that
+can be flooded is an oversight control that can be switched off.
 
 ### The second thing building it found
 
@@ -1217,7 +1226,7 @@ unless it says so, and which infected every future that touched it.
 Nothing in the crate had noticed, because nothing needed to: a single-threaded
 `#[tokio::test]` awaits futures in place. An embedder calling `tokio::spawn`
 would have hit it immediately, as a page of trait error naming a private type
-they cannot see. `tests/guards/layering.rs` now holds it at both ends — a compile-time
+they cannot see. `tests/guards/layering.rs` holds it at both ends — a compile-time
 assertion that every public runtime future is `Send`, and a scan that fails any
 bare `dyn Fn` field in `src/runtime/`.
 

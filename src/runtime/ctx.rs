@@ -32,6 +32,28 @@ use super::metrics;
 use super::telemetry;
 use tracing::Instrument;
 
+/// What the wiring declares about an effect's data ceilings, carried to the
+/// manifest gate beside the descriptor.
+///
+/// A separate value because the descriptor cannot carry it: the descriptor is
+/// the effect key, and a reviewed allowance is not part of what a call asks
+/// for — a catalogue edit re-keying history is the failure that rule prevents.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "manifest"), allow(dead_code))]
+pub(crate) struct DeclaredCeilings {
+    pub max_input: crate::core::Sensitivity,
+    pub output: crate::core::Sensitivity,
+}
+
+impl DeclaredCeilings {
+    pub(crate) fn of<E: Effect + ?Sized>(effect: &E) -> Self {
+        Self {
+            max_input: effect.max_sensitivity(),
+            output: effect.output_sensitivity(),
+        }
+    }
+}
+
 /// The case-facing services a step may reach, when the runtime has them.
 #[derive(Clone)]
 pub(crate) struct CaseContext {
@@ -1038,7 +1060,8 @@ impl<'a> StepCtx<'a> {
             // ceiling exists to bound work, not to strand it half-done. The
             // spend is still billed and journaled, so the overshoot is visible
             // rather than silent.
-            self.gate(key, &descriptor, effect.mutates(), outbound)
+            let ceilings = Some(DeclaredCeilings::of(&effect));
+            self.gate(key, &descriptor, effect.mutates(), outbound, ceilings)
                 .await?;
 
             let backoff = policy.wait_before(self.run, key, attempt, advice.take());
@@ -1387,6 +1410,14 @@ impl<'a> StepCtx<'a> {
 
     /// Everything that can refuse an attempt before it is dispatched.
     ///
+    /// `ceilings` is what the wiring declares about the effect's data limits,
+    /// carried beside the descriptor because the descriptor cannot hold it:
+    /// the descriptor is the effect key, and a reviewed allowance is not part
+    /// of what a call asks for — keying history on a catalogue edit is the
+    /// failure that rule exists to prevent. `None` marks a dispatch path that
+    /// has no ceilings to state (an atomic group member); the manifest arms
+    /// that need them refuse on `None` rather than assume.
+    ///
     /// Authorization before accounting: both refuse before dispatch, but an
     /// unauthorized call should not first consume the run's allowance —
     /// otherwise a denied agent can still exhaust a budget by asking.
@@ -1399,6 +1430,7 @@ impl<'a> StepCtx<'a> {
         descriptor: &EffectDescriptor,
         mutates: bool,
         outbound: Option<&crate::core::Label>,
+        ceilings: Option<DeclaredCeilings>,
     ) -> Result<(), StepError> {
         // A compensating phase, or a group being taken back inside a forward
         // one. Both are undo, and both are exempt for the same reason: refusing
@@ -1410,7 +1442,9 @@ impl<'a> StepCtx<'a> {
         // the agent's own declaration never mentioned should not reach the
         // deployment's policy engine, let alone the world.
         #[cfg(feature = "manifest")]
-        self.declared(key, descriptor).await?;
+        self.declared(key, descriptor, ceilings).await?;
+        #[cfg(not(feature = "manifest"))]
+        let _ = ceilings;
         // The reviewed grant may only tighten. A tool the operator declared
         // mutating gets the cautious treatment even if the catalogue advertises
         // otherwise, because a server's own description of itself is an
@@ -1445,6 +1479,7 @@ impl<'a> StepCtx<'a> {
         &mut self,
         key: EffectKey,
         descriptor: &EffectDescriptor,
+        ceilings: Option<DeclaredCeilings>,
     ) -> Result<(), StepError> {
         let Some(manifest) = self.manifest.as_ref() else {
             return Ok(());
@@ -1456,7 +1491,7 @@ impl<'a> StepCtx<'a> {
                 let model = descriptor.args["model"].as_str().unwrap_or_default();
                 (!manifest.permits_model(provider, model)).then(|| {
                     format!(
-                        "manifest '{}' does not declare the model '{provider}/{model}' —                          a model this agent's declaration never named is a behaviour                          change nobody reviewed",
+                        "manifest '{}' does not declare the model '{provider}/{model}' — a model this agent's declaration never named is a behaviour change nobody reviewed",
                         manifest.metadata.name
                     )
                 })
@@ -1467,7 +1502,7 @@ impl<'a> StepCtx<'a> {
                 let reference = crate::tools::ToolId::new(server, tool).reference();
                 match manifest.tool_grant(&reference) {
                     None => Some(format!(
-                        "manifest '{}' does not grant '{reference}' — a tool the                          agent's declaration never listed is authority nobody granted",
+                        "manifest '{}' does not grant '{reference}' — a tool the agent's declaration never listed is authority nobody granted",
                         manifest.metadata.name
                     )),
                     // Compared canonically. The descriptor sorts on the way
@@ -1489,48 +1524,79 @@ impl<'a> StepCtx<'a> {
                     Some(_) => None,
                 }
             }
+            // The grant's ceilings are compared against what the *effect*
+            // declares, never against the descriptor: the descriptor is the
+            // effect key, and a reviewed allowance is not part of what a call
+            // asks for. The wiring's ceilings arrive beside the descriptor,
+            // and a dispatch that did not supply them is refused rather than
+            // waved through — an MCP context effect with unstated ceilings is
+            // exactly the case this check exists for.
             "mcp.prompt/get" => {
                 let server = descriptor.args["server"].as_str().unwrap_or_default();
                 let name = descriptor.args["name"].as_str().unwrap_or_default();
-                match manifest.prompt_grant(server, name) {
-                    None => Some(format!(
+                match (manifest.prompt_grant(server, name), ceilings) {
+                    (None, _) => Some(format!(
                         "manifest '{}' does not grant MCP prompt '{server}/{name}'",
                         manifest.metadata.name
                     )),
-                    Some(grant)
-                        if descriptor.args.get("max_input_sensitivity")
-                            != serde_json::to_value(grant.max_input_sensitivity)
-                                .ok()
-                                .as_ref()
-                            || descriptor.args.get("output_sensitivity")
-                                != serde_json::to_value(grant.output_sensitivity).ok().as_ref() =>
+                    (Some(_), None) => Some(format!(
+                        "MCP prompt '{server}/{name}' was dispatched without declared ceilings, so the manifest grant cannot be checked",
+                    )),
+                    (Some(grant), Some(wired))
+                        if wired.max_input != grant.max_input_sensitivity
+                            || wired.output != grant.output_sensitivity =>
                     {
                         Some(format!(
-                            "manifest '{}' and the MCP prompt catalogue disagree about sensitivity for '{server}/{name}'",
-                            manifest.metadata.name
+                            "manifest '{}' grants MCP prompt '{server}/{name}' at input {:?} / output {:?}, but the wiring declares input {:?} / output {:?} — the reviewed artifact and the code disagree about a data ceiling",
+                            manifest.metadata.name,
+                            grant.max_input_sensitivity,
+                            grant.output_sensitivity,
+                            wired.max_input,
+                            wired.output,
                         ))
                     }
-                    Some(_) => None,
+                    (Some(_), Some(_)) => None,
                 }
             }
             "mcp.resource/read" => {
                 let server = descriptor.args["server"].as_str().unwrap_or_default();
                 let uri = descriptor.args["uri"].as_str().unwrap_or_default();
-                match manifest.resource_grant(server, uri) {
-                    None => Some(format!(
+                match (manifest.resource_grant(server, uri), ceilings) {
+                    (None, _) => Some(format!(
                         "manifest '{}' does not grant MCP resource '{server}/{uri}'",
                         manifest.metadata.name
                     )),
-                    Some(grant)
-                        if descriptor.args.get("output_sensitivity")
-                            != serde_json::to_value(grant.output_sensitivity).ok().as_ref() =>
-                    {
+                    (Some(_), None) => Some(format!(
+                        "MCP resource '{server}/{uri}' was dispatched without declared ceilings, so the manifest grant cannot be checked",
+                    )),
+                    (Some(grant), Some(wired)) if wired.output != grant.output_sensitivity => {
                         Some(format!(
-                            "manifest '{}' and the MCP resource catalogue disagree about sensitivity for '{server}/{uri}'",
-                            manifest.metadata.name
+                            "manifest '{}' grants MCP resource '{server}/{uri}' at output {:?}, but the wiring declares output {:?} — the reviewed artifact and the code disagree about a data ceiling",
+                            manifest.metadata.name, grant.output_sensitivity, wired.output,
                         ))
                     }
-                    Some(_) => None,
+                    (Some(_), Some(_)) => None,
+                }
+            }
+            "mcp.task/update" => {
+                let server = descriptor.args["server"].as_str().unwrap_or_default();
+                match (manifest.task_input_grant(server), ceilings) {
+                    (None, _) => Some(format!(
+                        "manifest '{}' does not grant task input responses to MCP server '{server}' — an elicitation is a server asking this plane for data, and the manifest never said it may have an answer",
+                        manifest.metadata.name
+                    )),
+                    (Some(_), None) => Some(format!(
+                        "task input for MCP server '{server}' was dispatched without declared ceilings, so the manifest grant cannot be checked",
+                    )),
+                    (Some(grant), Some(wired))
+                        if wired.max_input != grant.max_input_sensitivity =>
+                    {
+                        Some(format!(
+                            "manifest '{}' grants task input to MCP server '{server}' at input {:?}, but the wiring declares input {:?} — the reviewed artifact and the code disagree about a data ceiling",
+                            manifest.metadata.name, grant.max_input_sensitivity, wired.max_input,
+                        ))
+                    }
+                    (Some(_), Some(_)) => None,
                 }
             }
             _ => None,
@@ -1930,7 +1996,7 @@ impl<'a> StepCtx<'a> {
                 if permanent {
                     return Some(StepError::Effect(crate::core::EffectError::Final {
                         detail: format!(
-                            "effect {key} was refused on attempt {attempt}, and the refusal                              is an answer rather than a fault ({message}); no retry would                              change it"
+                            "effect {key} was refused on attempt {attempt}, and the refusal is an answer rather than a fault ({message}); no retry would change it"
                         ),
                         disposition,
                     }));
@@ -2900,6 +2966,53 @@ impl<'a> StepCtx<'a> {
     }
 }
 
+/// The escalation declaration must describe something the store can do.
+///
+/// One implementation serving [`StepCtx::task`] and [`StepCtx::open_task`],
+/// mirroring the manifest parser's rules for `spec.oversight` — the coded tier
+/// and the declared tier must refuse the same shapes, or which tier an agent
+/// was written in decides whether its oversight declaration is checked.
+///
+/// Three shapes are refused:
+///
+/// * `Escalate` naming nobody — "widen the audience" with no audience to add
+///   is a state flag wearing a control's name;
+/// * `Escalate` over an empty `candidate_roles` — empty already means
+///   *anyone*, and `Task::escalate` deliberately will not narrow it, so the
+///   declared widening would do nothing;
+/// * `escalate_to` beside a policy that never escalates — a declaration
+///   nothing reads, which reads in review exactly like one something does.
+fn escalation_names_its_audience(spec: &TaskSpec) -> Result<(), StepError> {
+    let refuse = |detail: &str| {
+        Err(StepError::Effect(crate::core::EffectError::Other(
+            detail.into(),
+        )))
+    };
+    if spec.on_expiry == OnExpiry::Escalate {
+        if spec.escalate_to.is_empty() {
+            return refuse(
+                "OnExpiry::Escalate requires `escalate_to(role)`: widening the audience \
+                 is escalation's one enforceable meaning, so the declaration must say \
+                 who is added",
+            );
+        }
+        if spec.candidate_roles.is_empty() {
+            return refuse(
+                "OnExpiry::Escalate needs a bounded audience: an empty `candidate_roles` \
+                 already means anyone, and there is no wider audience than that — \
+                 name the initial reviewers with `role(..)`, or use `Deny`",
+            );
+        }
+    } else if !spec.escalate_to.is_empty() {
+        return refuse(
+            "`escalate_to` names an escalation audience, but this task never escalates — \
+             set `on_expiry(OnExpiry::Escalate)` or drop the roles, so the declaration \
+             and the policy say the same thing",
+        );
+    }
+    Ok(())
+}
+
 /// The first release mark that covers `path`, would confer trust, and names a
 /// destination other than the sink at hand — the evidence for a refusal that
 /// can say "released, but not for here".
@@ -3204,13 +3317,14 @@ impl StepCtx<'_> {
             // a replay that quietly used the new value would be a different run
             // wearing the old one's journal.
             if item.selection_digest() != pick.digest {
-                return Err(StepError::Store(crate::core::StoreError::Backend(
-                    crate::memory::MemoryError::Rewritten {
+                return Err(StepError::Unreproducible {
+                    what: format!("memory '{}' version {}", pick.id, pick.version),
+                    detail: crate::memory::MemoryError::Rewritten {
                         id: pick.id,
                         version: pick.version,
                     }
                     .to_string(),
-                )));
+                });
             }
 
             let label = item.label();
@@ -3284,10 +3398,13 @@ impl StepCtx<'_> {
     ///
     /// Two journaled effects: the text is embedded, then the vector is ranked.
     /// The retriever returns only immutable `(id, version, digest)` commitments
-    /// and scores — live execution and replay both materialise those exact
-    /// versions from the authoritative [`MemoryStore`] and re-check scope and
-    /// digest before any content is exposed, so an index that has drifted from
-    /// durable truth is a refusal rather than a plausible answer.
+    /// and scores, and the selection is recorded already screened — a hit
+    /// naming a superseded, expired, or erased version leaves it, for the
+    /// reasons on [`SemanticRecall`](crate::runtime::effects::SemanticRecall).
+    /// Live execution and replay then both materialise the surviving versions
+    /// and re-check scope and digest before any content is exposed, so an
+    /// index that *contradicts* durable truth — rather than merely trailing
+    /// it — is a refusal, never a plausible answer.
     ///
     /// The [`SemanticSearch`] states the question; the space it is asked in
     /// comes from the wired embedder and index, which `build` already held to
@@ -3324,6 +3441,7 @@ impl StepCtx<'_> {
             ))
         })?;
         let retriever = Arc::clone(&self.semantic_index()?.retriever);
+        let as_of = self.now().await?;
         let written = text.peek().clone();
         let label = text.label().clone();
         let embedding = self.embed(text, search.max_sensitivity).await?;
@@ -3339,8 +3457,10 @@ impl StepCtx<'_> {
             embedding: embedding.into_unlabelled().vector,
             limit: search.limit,
             max_sensitivity: search.max_sensitivity,
+            as_of,
         };
         let searched = query.clone();
+        let screen = Arc::clone(&memories);
         let arguments = Tainted::with_label(
             serde_json::to_value(&query).expect("SemanticQuery serialization is infallible"),
             label,
@@ -3349,29 +3469,21 @@ impl StepCtx<'_> {
             .sink_with(&arguments, |value| {
                 crate::runtime::effects::SemanticRecall {
                     retriever,
+                    memories: screen,
                     query: searched,
                     arguments: value,
                 }
             })
             .await?
             .into_unlabelled();
-        // Refused rather than truncated: every hit costs an authoritative store
-        // read here, and truncating would leave the selection's membership
-        // decided by the seam's iteration order.
-        if hits.len() > query.limit {
-            return Err(StepError::Store(crate::core::StoreError::Backend(format!(
-                "semantic retriever returned {} hits for a limit of {}",
-                hits.len(),
-                query.limit
-            ))));
-        }
+        // The retriever's misconduct refusals — an answer past the declared
+        // limit, a non-finite score — live in the effect's `perform`, before
+        // the selection is journaled: a record is written once, and one that
+        // held either could not honestly be read back. What runs here is what
+        // must hold on **replay too**: the journaled selection materialises
+        // against durable truth, digest and scope re-checked.
         let mut out = Vec::with_capacity(hits.len());
         for hit in hits {
-            if !hit.score.is_finite() {
-                return Err(StepError::Store(crate::core::StoreError::Backend(
-                    "semantic retriever returned a non-finite score".to_owned(),
-                )));
-            }
             let item = memories
                 .version(&hit.selected.id, hit.selected.version)
                 .await
@@ -3385,17 +3497,34 @@ impl StepCtx<'_> {
                         .to_string(),
                     ))
                 })?;
-            if item.selection_digest() != hit.selected.digest
-                || item.subject != query.subject
+            // Two failures, two systems to go look in. A digest that moved is
+            // the authoritative store contradicting itself; a hit outside the
+            // query's scope is the retriever misbehaving while durable truth is
+            // intact.
+            if item.selection_digest() != hit.selected.digest {
+                return Err(StepError::Unreproducible {
+                    what: format!(
+                        "memory '{}' version {}",
+                        hit.selected.id, hit.selected.version
+                    ),
+                    detail: crate::memory::MemoryError::Rewritten {
+                        id: hit.selected.id,
+                        version: hit.selected.version,
+                    }
+                    .to_string(),
+                });
+            }
+            if item.subject != query.subject
                 || query
                     .purpose
                     .as_ref()
                     .is_some_and(|purpose| purpose != &item.purpose)
             {
-                return Err(StepError::Store(crate::core::StoreError::Backend(
-                    "semantic retriever returned an out-of-scope or changed memory commitment"
-                        .to_owned(),
-                )));
+                return Err(StepError::Store(crate::core::StoreError::Backend(format!(
+                    "semantic retriever returned memory '{}', which is outside the \
+                     scope the query asked for",
+                    hit.selected.id
+                ))));
             }
             let label = item.label();
             out.push((Tainted::with_label(item, label), hit.score));
@@ -3714,10 +3843,22 @@ impl StepCtx<'_> {
         // answer is not worth failing a run that has already paid for it, and
         // which proposals survive is the declaration's order, first wins.
         let mut written = Vec::with_capacity(proposals.len().min(formation.max_items));
-        for proposal in proposals.into_iter().take(formation.max_items) {
+        let mut seen = std::collections::BTreeSet::new();
+        for proposal in proposals {
+            if written.len() == formation.max_items {
+                break;
+            }
             let key = proposal["key"]
                 .as_str()
                 .ok_or_else(|| unusable("a proposal carries no string `key`"))?;
+            // The same first-wins rule the ceiling applies. A key proposed
+            // twice in one answer would otherwise write two versions back to
+            // back, with the *later* proposal silently superseding the one the
+            // declaration's order preferred — and a duplicate is not a
+            // distinct fact, so it does not spend a `max_items` slot either.
+            if !seen.insert(key.to_owned()) {
+                continue;
+            }
             let id = format!(
                 "formed-{}",
                 crate::core::Digest::of(&crate::core::canon::value_bytes(&serde_json::json!({
@@ -3980,16 +4121,17 @@ impl StepCtx<'_> {
     ///
     /// # Why `warn_before` is a `std::time::Duration`
     ///
-    /// Two reasons, and the second is the one that bites. It used to be
-    /// `time::Duration`, which is **signed** — so a negative warning offset
-    /// parsed, compiled, and put `warn_at` *after* the instant it warns about:
-    /// a warning that can only fire once the obligation is already breached.
-    /// A quantity that only makes sense non-negative is an unsigned type here,
-    /// as it is for [`Spend`](crate::core::Spend).
+    /// Two reasons, and the first is the one that bites. `time::Duration` is
+    /// **signed**, so a negative warning offset would parse, compile, and put
+    /// `warn_at` *after* the instant it warns about: a warning that can only
+    /// fire once the obligation is already breached. A quantity that only makes
+    /// sense non-negative is an unsigned type here, as it is for
+    /// [`Spend`](crate::core::Spend).
     ///
     /// And it is the `Duration` a caller already has.
-    /// [`sleep`](Self::sleep) takes the standard one, so the public surface had
-    /// two types spelled `Duration`, only one of which came from a crate this
+    /// [`sleep`](Self::sleep) takes the standard one, so the alternative is a
+    /// public surface with two types spelled `Duration`, only one of which
+    /// comes from a crate this
     /// one re-exports — a reader with the obvious `use std::time::Duration`
     /// met a type error naming a dependency the guides never mentioned.
     pub async fn deadline(
@@ -4116,6 +4258,13 @@ impl StepCtx<'_> {
     /// wait into a silent hang: the subscription stays live, the event arrives
     /// later, and it resumes a run that already decided it was finished.
     pub async fn await_event(&mut self, spec: &AwaitSpec) -> Result<Tainted<Value>, StepError> {
+        // A wait may carry no correlation key: **targeted** delivery
+        // (`Runtime::deliver_to`, which is how A2A task input arrives) finds
+        // the subscription by run id and needs none. What such a wait cannot
+        // be woken by is *broadcast* delivery — `POST /events` matches by
+        // key — so a run waiting on an event from a bus must `.correlate(...)`
+        // with the business key the event will carry, or, for a CloudEvent,
+        // with `("subject", <id>)`.
         let correlation = spec.correlation.clone();
         self.wait_on(
             &spec.kind,
@@ -4153,6 +4302,7 @@ impl StepCtx<'_> {
                     .into(),
             )));
         }
+        escalation_names_its_audience(spec)?;
 
         let due_at = self.deadline_instant(&cx, &spec.deadline).await?;
         // The run's journaled clock, not the obligation's instant.
@@ -4190,6 +4340,7 @@ impl StepCtx<'_> {
                                 kind: spec.kind.clone(),
                                 justification: spec.justification.clone(),
                                 candidate_roles: spec.candidate_roles.clone(),
+                                escalate_to: spec.escalate_to.clone(),
                                 excluded_actors: spec.excluded_actors.clone(),
                                 assignee: None,
                                 priority: spec.priority,
@@ -4262,6 +4413,7 @@ impl StepCtx<'_> {
                     .into(),
             )));
         }
+        escalation_names_its_audience(spec)?;
         let due_at = self.deadline_instant(&cx, &spec.deadline).await?;
         let at = self.now().await?;
         let run = self.run;

@@ -620,6 +620,15 @@ impl OpenAi {
                     .to_owned(),
             });
         }
+        if continuation.is_some() && exchanges.is_empty() {
+            // Silently dropping it would journal an effect key that records a
+            // continuation the wire never carried. OpenAI continuations carry
+            // a model turn only across tool calls.
+            return Err(ModelError::Refused {
+                model: model.clone(),
+                detail: "a continuation without tool exchanges has no request to follow".to_owned(),
+            });
+        }
         let mut body = json!({
             "model": model.model,
             "max_output_tokens": max_output_tokens,
@@ -630,6 +639,15 @@ impl OpenAi {
             // default.
             "store": self.retain_responses,
         });
+        if !self.retain_responses {
+            // Without this, an unstored response returns reasoning items as
+            // bare ids — and the next turn sends ids the provider no longer
+            // resolves, so the stateless multi-turn pattern the continuation
+            // promises fails on the wire. The encrypted payload is what makes
+            // "the model's turn is carried verbatim" true when nothing is
+            // retained provider-side.
+            body["include"] = json!(["reasoning.encrypted_content"]);
+        }
         if let Some(effort) = reasoning_effort {
             body["reasoning"] = json!({ "effort": effort.as_str() });
         }
@@ -637,6 +655,25 @@ impl OpenAi {
             body["instructions"] = system;
         }
         if let Some(schema) = schema {
+            if self.mode_for(model) == SchemaMode::ForcedTool && !tools.is_empty() {
+                // The fallback spends `tools` and `tool_choice` on the
+                // answer's shape; merged with real tools, whichever was
+                // written second would silently replace the first while
+                // `tool_choice` still forced the replaced one — a request
+                // this driver itself constructed invalid.
+                return Err(ModelError::Refused {
+                    model: model.clone(),
+                    detail: format!(
+                        "model '{}' has no native structured output here, so a declared \
+                         response schema is obtained by forcing a synthetic tool — which \
+                         cannot be combined with the {} tool(s) this request declares. \
+                         Use a model with native structured output, or drop the schema \
+                         and validate the answer yourself",
+                        model.model,
+                        tools.len()
+                    ),
+                });
+            }
             Self::apply_schema(&mut body, schema, model, self.mode_for(model))?;
         }
         if self.stream {
@@ -644,14 +681,14 @@ impl OpenAi {
         }
         // **Flat**, which is what Responses takes: `{type, name, description,
         // parameters, strict}`. Chat Completions is the API that nests them
-        // under a `function` object, and this file used to do that — Responses
-        // answers `Missing required parameter: 'tools[0].name'` and the call
-        // never reaches a model.
+        // under a `function` object; sending that shape here answers `Missing
+        // required parameter: 'tools[0].name'` and the call never reaches a
+        // model.
         //
-        // It went unnoticed because a stubbed provider accepts any shape, and
-        // because the forced-tool path a few lines above already had it right:
-        // the file disagreed with itself, and only the half nothing exercised
-        // was wrong. This is what the live tests exist for.
+        // A stubbed provider accepts either shape, so nothing local can tell
+        // them apart — this is what the live tests exist for. Keep it in step
+        // with the forced-tool path a few lines above, which spells the same
+        // rule.
         //
         // `strict` enforces the argument schema *during* generation rather than
         // checking afterwards — worth having, and not a security control: a
@@ -773,9 +810,9 @@ impl OpenAi {
                         .to_owned(),
                 });
             };
-            (raw.to_owned(), structured(schema, raw, model, usage)?)
+            (raw.to_owned(), structured(schema, raw, &[], model, usage)?)
         } else {
-            let parsed_schema = structured(schema, &text, model, usage)?;
+            let parsed_schema = structured(schema, &text, &calls, model, usage)?;
             (text, parsed_schema)
         };
 
@@ -840,24 +877,25 @@ impl OpenAi {
                 Ok(chunk) => chunk,
                 Err(e) => return Err(severed(model, &acc, &e.to_string())),
             };
-            let events = decoder
-                .push(&chunk)
-                .map_err(|error| ModelError::Unaccounted {
-                    model: model.clone(),
-                    detail: error.to_string(),
-                })?;
+            // A decode failure ends the stream exactly as a dead connection
+            // does, and is classified by the same ladder rather than pinned to
+            // one rung.
+            let events = match decoder.push(&chunk) {
+                Ok(events) => events,
+                Err(error) => return Err(severed(model, &acc, &error.to_string())),
+            };
             for event in events {
-                if event.name == "response.output_text.delta"
-                    && let Ok(value) = serde_json::from_str::<Value>(&event.data)
-                    && let Some(delta) = value.get("delta").and_then(Value::as_str)
+                // Fed from the accumulator's own parse, so the live text and
+                // the assembled outcome are one stream by construction.
+                let delta = acc.event(&event.name, &event.data);
+                if let Some(text) = delta
                     && let Some((observer, label)) = observer
                 {
                     observer.event(crate::core::Tainted::with_label(
-                        super::ModelStreamEvent::TextDelta(delta.to_owned()),
+                        super::ModelStreamEvent::TextDelta(text),
                         label.clone(),
                     ));
                 }
-                acc.event(&event.name, &event.data);
             }
             if let Some(message) = acc.error() {
                 // An `error` event inside a 200. If output had already been
@@ -1042,12 +1080,26 @@ mod tests {
             json!(false),
             "omitting `store: false` opts into OpenAI's provider-side retention default"
         );
+        // The half that makes "the model's turn is carried verbatim" true on
+        // the wire: without the `include`, an unstored response returns
+        // reasoning items as bare ids, and the next turn sends ids the
+        // provider no longer resolves — the stateless multi-turn pattern
+        // fails against the live API while every local round trip passes.
+        assert_eq!(
+            private["include"],
+            json!(["reasoning.encrypted_content"]),
+            "an unstored request must ask for the encrypted reasoning payload"
+        );
 
         let retained_driver = driver().retain_responses();
         let retained = retained_driver
             .body(&model, &json!("sensitive"), None, &[], &[])
             .expect("retained body");
         assert_eq!(retained["store"], json!(true));
+        assert!(
+            retained.get("include").is_none(),
+            "a retained response resolves reasoning ids provider-side"
+        );
 
         let private_call = ModelCall::new(
             std::sync::Arc::new(driver()),

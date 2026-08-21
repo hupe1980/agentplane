@@ -606,6 +606,14 @@ impl Gemini {
         model: &ModelId,
     ) -> Result<(), ModelError> {
         if exchanges.is_empty() {
+            if continuation.is_some() {
+                // Silently dropping it would journal an effect key that
+                // records a continuation the wire never carried.
+                return Err(Self::refused(
+                    model,
+                    "a continuation without tool exchanges has no request to follow",
+                ));
+            }
             return Ok(());
         }
         let Some(array) = contents.as_array_mut() else {
@@ -616,7 +624,15 @@ impl Gemini {
         };
 
         match continuation {
-            Some(state) if state.provider == PROVIDER => array.push(state.state.clone()),
+            Some(state) if state.provider == PROVIDER => match state.state.as_array() {
+                Some(turns) => array.extend(turns.iter().cloned()),
+                None => {
+                    return Err(Self::refused(
+                        model,
+                        "the continuation was not a Gemini contents array",
+                    ));
+                }
+            },
             Some(other) => {
                 return Err(Self::refused(
                     model,
@@ -644,9 +660,14 @@ impl Gemini {
             })),
         }
 
-        // Results go back as one user turn of `functionResponse` parts, in the
-        // order the calls were made.
-        array.push(json!({
+        array.push(Self::tool_responses(exchanges));
+        Ok(())
+    }
+
+    /// The results turn: one user content of `functionResponse` parts, in the
+    /// order the calls were made.
+    fn tool_responses(exchanges: &[super::ToolExchange]) -> Value {
+        json!({
             "role": "user",
             "parts": exchanges
                 .iter()
@@ -663,8 +684,32 @@ impl Gemini {
                     json!({ "functionResponse": response })
                 })
                 .collect::<Vec<_>>(),
-        }));
-        Ok(())
+        })
+    }
+
+    /// Extend the provider transcript after a successful tool-calling
+    /// response, exactly as every sibling driver does: prior rounds, then this
+    /// round's results, then the turn just answered. The runtime clears
+    /// `exchanges` each turn and relies on this being the whole history.
+    fn accumulate_continuation(
+        completion: &mut Completion,
+        prior: Option<&super::ProviderContinuation>,
+        exchanges: &[super::ToolExchange],
+    ) {
+        let Some(current) = completion.continuation.as_mut() else {
+            return;
+        };
+        let mut state = prior
+            .and_then(|value| value.state.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if !exchanges.is_empty() {
+            state.push(Self::tool_responses(exchanges));
+        }
+        if let Some(turns) = current.state.as_array() {
+            state.extend(turns.iter().cloned());
+        }
+        current.state = Value::Array(state);
     }
 
     /// Turn a response envelope into a [`Completion`], or say why it is not one.
@@ -749,17 +794,20 @@ impl Gemini {
                 });
             };
             let raw = arguments.to_string();
-            let parsed_schema = structured(schema, &raw, model, usage)?;
+            let parsed_schema = structured(schema, &raw, &[], model, usage)?;
             (raw, parsed_schema)
         } else {
-            let parsed_schema = structured(schema, &text, model, usage)?;
+            let parsed_schema = structured(schema, &text, &calls, model, usage)?;
             (text, parsed_schema)
         };
 
         // The model's own turn, byte for byte, so the next request returns
-        // every signature exactly where it sat.
+        // every signature exactly where it sat. An array of contents, not the
+        // bare turn: the state must carry *every* prior round, or round
+        // three's request forgets round one's signed turn — silently, since
+        // the model simply re-asks with amnesia.
         let continuation = (!calls.is_empty() && content.is_object())
-            .then(|| super::ProviderContinuation::new(PROVIDER, content.clone()));
+            .then(|| super::ProviderContinuation::new(PROVIDER, json!([content.clone()])));
 
         Ok(Completion {
             structured: structured_value,
@@ -856,6 +904,13 @@ impl Gemini {
             }
         }
         if !acc.done() {
+            // A blocked prompt is a refusal with a name, not an outage: the
+            // stream ends without a finish reason, and classifying that as
+            // severed would mark it safe to repeat — a retry loop re-hitting
+            // the same block forever.
+            if acc.prompt_blocked() {
+                return self.interpret(&acc.into_response(), model, schema);
+            }
             return Err(severed(
                 model,
                 &acc,
@@ -1029,11 +1084,23 @@ impl ModelProvider for Gemini {
             return Err(classify_status(model, status.as_u16(), &headers, &text));
         }
 
-        if self.stream {
+        let mut completion = if self.stream {
             self.read_streamed(response, model, request.schema, request.stream)
-                .await
+                .await?
         } else {
-            self.read_buffered(response, model, request.schema).await
+            self.read_buffered(response, model, request.schema).await?
+        };
+        // A buffered call still answers the observer's one guaranteed
+        // question — what did this cost — as every driver does on both paths.
+        if !self.stream
+            && let Some((observer, label)) = request.stream
+        {
+            observer.event(crate::core::Tainted::with_label(
+                super::ModelStreamEvent::Usage(completion.usage),
+                label.clone(),
+            ));
         }
+        Self::accumulate_continuation(&mut completion, request.continuation, request.exchanges);
+        Ok(completion)
     }
 }

@@ -28,6 +28,25 @@ default: omitting the field is a parse error.
 Every manifest on this site is parsed by the crate's own validator in CI, so
 nothing here is a snippet that has never been run.
 
+## Editor validation
+
+The format ships as a [JSON Schema](/agentplane/agent.schema.json), generated
+from the same types the parser deserializes into, so it cannot structurally
+drift from what `parse` accepts. One modeline gives any editor running the
+YAML language server autocomplete, hover documentation and inline errors:
+
+```yaml
+# yaml-language-server: $schema=https://hupe1980.github.io/agentplane/agent.schema.json
+```
+
+`agentplane schema` prints the same document for vendoring or CI linting. The
+schema is the format's **shape** — unknown fields, missing fields, wrong types
+and wrong enum spellings fail it exactly as they fail the parser. The semantic
+refusals documented on this page (an unstated budget, a control nothing
+performs, an incoherent topology) run only in the parser, so a document the
+schema accepts still owes `agentplane validate` a pass before it is a thing to
+deploy.
+
 ## The whole document
 
 ```yaml
@@ -379,15 +398,29 @@ context:
     - server: knowledge
       uri: kb://support/rules
       output_sensitivity: internal
+  task_input:
+    - server: templates
+      max_input_sensitivity: internal
 ```
 
 Prompt arguments are outbound data and `max_input_sensitivity` bounds them.
 `output_sensitivity` raises the returned label when the server may disclose
 classified content; neither field can make server output trusted. Duplicate or
 blank grants are refused. URIs are exact — no wildcard whose interpretation can
-disagree with the MCP server's URI parser. Use
-`McpAccess::from_manifest(server, manifest)` to avoid restating these grants in
-code.
+disagree with the MCP server's URI parser.
+
+`task_input` permits answering a server's outstanding input requests
+(`tasks/update`) — an elicitation is a server asking this plane for data,
+which is the direction an operator most needs to have said yes to. Per server
+rather than per task, because a task id is minted at runtime and nobody can
+review a name that does not exist yet; only an input ceiling, since the update
+returns nothing to label.
+
+Use `McpAccess::from_manifest(server, manifest)` to avoid restating these
+grants in code. The gate compares the grant's ceilings against what the wiring
+declares, so a coded agent whose `McpDataSafety` disagrees with the reviewed
+manifest is refused at dispatch — in both directions, looser and tighter,
+because two artifacts stating one decision must agree.
 
 ## `spec.output`
 
@@ -406,7 +439,8 @@ human is in the loop when none is.
 | `approval` | **required** | `required` gates every answer. `tools-only` gates only the grants that set `requires_approval`, leaving the answer unattended — the shape most deployments want, since gating a tool-calling agent's *answer* is a review that arrives after the tool already ran. Under `tools-only`, **every mutating grant must declare `requires_approval`** — refused at parse otherwise, because a mode that gates tool calls while a call that changes the world needs nobody is a declared control nothing enforces; read-only grants stay ungated. `none` gates nothing and leaves the deciding to `triage`. None is a predicate: *"require approval when severity is high"* changes what the agent **does**, and that is one step from an `if`. |
 | `approvers` | anyone | Roles that may decide. Empty means anyone — worth choosing on purpose rather than by omission. |
 | `deadline` | **required** | The obligation that bounds the wait: `{ name, kind, params }`. The agent **registers** it, which is why the declaration carries more than a name — a file-only agent writes no code, so naming an obligation nothing registers made oversight fail outright. `kind` and `params` go to the deployment's `Calendar` unchanged, so "one working day" means whatever that domain says and this crate never guesses. |
-| `on_expiry` | deny | What happens when the window closes. |
+| `on_expiry` | deny | What happens when the window closes. `deny` refuses the answer. `escalate` widens the audience and keeps waiting: the `escalate_to` roles join the reviewers, the stale claim is cleared, and the task leaves the expiry scan — it is answered by a person or answered never. `proceed` acts unattended. |
+| `escalate_to` | — | Roles added to the audience when a task escalates. **Required by `on_expiry: escalate`** — widening is escalation's one enforceable meaning, so the declaration must say who is added — and refused beside any other policy, where it would be a list nothing reads. `escalate` also requires bounded audiences everywhere it applies: an empty `approvers` or triage `audience` already means *anyone*, which no list can widen. |
 | `allow_unattended` | `false` | Explicit consent required for `on_expiry: proceed`, so acting with no human is a greppable decision somebody made rather than an enum variant they picked off a list. |
 | `triage` | none | Tasks opened **beside** a completed answer. See below. |
 

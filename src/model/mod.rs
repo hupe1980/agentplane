@@ -526,7 +526,7 @@ pub enum ModelError {
     ///
     /// The expensive case. The tokens counted here have been spent whatever
     /// happens next.
-    #[error("'{model}' stopped mid-response after {} token(s): {detail}", usage.input_tokens + usage.output_tokens)]
+    #[error("'{model}' stopped mid-response having billed {} input and {} output token(s): {detail}", usage.input_tokens, usage.output_tokens)]
     Interrupted {
         model: ModelId,
         usage: Usage,
@@ -734,7 +734,7 @@ pub struct Request<'a> {
 ///
 /// Providers and models support different subsets. An explicit unsupported
 /// value is refused before dispatch rather than silently downgraded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReasoningEffort {
     None,
@@ -1121,7 +1121,7 @@ impl ModelCall {
     /// back a level down. So this setter can only *raise* the floor; a value
     /// below the ceiling is kept and simply loses to it at
     /// [`Effect::output_sensitivity`], where the two are joined in one place
-    /// rather than at every call site that used to compensate by hand.
+    /// rather than compensated for by hand at every call site.
     #[must_use]
     pub const fn with_output_sensitivity(mut self, s: Sensitivity) -> Self {
         self.output_sensitivity = s;
@@ -1695,10 +1695,10 @@ mod tests {
     /// Stream delivery never carries less than the terminal completion's floor.
     ///
     /// The terminal answer is floored at the effect boundary — untrusted, so
-    /// `Internal` at least, raised to the declared output sensitivity. The
-    /// stream label used to be *assigned* from the declared value instead,
-    /// so the same bytes left the plane twice: once labelled, once lowered to
-    /// the `Public` default, differing only in whether the caller read them
+    /// `Internal` at least, raised to the declared output sensitivity. A
+    /// stream label *assigned* from the declared value instead lets the same
+    /// bytes leave the plane twice: once labelled, once lowered to the
+    /// `Public` default, differing only in whether the caller read them
     /// live.
     #[tokio::test]
     async fn a_stream_label_never_dips_below_the_terminal_floor() {

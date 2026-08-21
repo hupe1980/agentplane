@@ -30,6 +30,8 @@ mod outbox;
 mod postgres;
 mod push;
 mod quota;
+#[cfg(feature = "manifest")]
+mod schema;
 mod store_contracts;
 mod timestamps;
 mod vault;

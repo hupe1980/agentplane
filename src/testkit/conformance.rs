@@ -143,6 +143,25 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
     assert_eq!(old.content, json!({"value": 1}));
     assert_eq!(old.superseded_at, Some(at(1_760_000_001)));
 
+    // `current` answers the recall question by id: the latest version, never a
+    // superseded one — the semantic tier's screen rides on this distinction.
+    let live = store
+        .current("memory-a", None)
+        .await
+        .expect("current")
+        .expect("a revised memory is still current");
+    assert_eq!(
+        live.version, 2,
+        "current must be the revision, not the v1 it superseded"
+    );
+    assert!(
+        store
+            .current("memory-never-written", None)
+            .await
+            .expect("current of nothing")
+            .is_none()
+    );
+
     // Trust outranks recency, on every backend.
     //
     // Recall truncates, so ordering by recency alone is an eviction an attacker
@@ -447,6 +466,32 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
             .is_some(),
         "hiding an expired current item must not silently break replay"
     );
+    // `current` applies the same inclusive cutoff recall does, and skips the
+    // check entirely when no cutoff is given — the `version`/`current` split
+    // is exactly replay-truth versus recall-truth.
+    assert!(
+        store
+            .current("memory-expiring", Some(at(1_760_000_099)))
+            .await
+            .expect("current before expiry")
+            .is_some()
+    );
+    assert!(
+        store
+            .current("memory-expiring", Some(at(1_760_000_100)))
+            .await
+            .expect("current at expiry")
+            .is_none(),
+        "current must apply the inclusive expiry cutoff"
+    );
+    assert!(
+        store
+            .current("memory-expiring", None)
+            .await
+            .expect("current without cutoff")
+            .is_some(),
+        "no cutoff means no expiry check, exactly as on recall"
+    );
 
     store
         .set_legal_hold("memory-expiring", true)
@@ -487,6 +532,14 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
             .await
             .expect("swept version")
             .is_none()
+    );
+    assert!(
+        store
+            .current("memory-expiring", None)
+            .await
+            .expect("current after sweep")
+            .is_none(),
+        "a swept id has no current version under any cutoff"
     );
 
     // Sliding retention, alone: the window opens at the write. Initialized
@@ -551,6 +604,14 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
             .len(),
         1,
         "a journaled touch did not slide the window"
+    );
+    assert!(
+        store
+            .current("memory-sliding", Some(at(1_760_000_100)))
+            .await
+            .expect("current after the touched window")
+            .is_none(),
+        "current must honour the sliding window exactly as recall does"
     );
     store
         .touch(&["memory-sliding".to_owned()], at(1_760_000_190))
@@ -1223,14 +1284,14 @@ async fn an_admission_key_admits_one_run(fresh: Factory<'_>, r: &mut Report) {
                 r.record(
                     "admission keys",
                     format!(
-                        "the refusal named '{run}' as the key's holder, but {first}                          holds it — a caller sent there reads a run that answers a                          different question"
+                        "the refusal named '{run}' as the key's holder, but {first} holds it — a caller sent there reads a run that answers a different question"
                     ),
                 );
             }
         }
         Ok(_) => r.record(
             "admission keys",
-            "a second run was admitted under a key already issued — an emitter's              redelivery would start a second run, which is the whole failure this              refuses"
+            "a second run was admitted under a key already issued — an emitter's redelivery would start a second run, which is the whole failure this refuses"
                 .to_owned(),
         ),
         Err(e) => r.record(
@@ -1322,7 +1383,7 @@ async fn a_refused_admission_leaves_its_key_free(fresh: Factory<'_>, r: &mut Rep
     if refused.is_ok() {
         r.record(
             "admission keys",
-            "a batch spanning two runs was accepted; the rest of this check              cannot mean anything"
+            "a batch spanning two runs was accepted; the rest of this check cannot mean anything"
                 .to_owned(),
         );
         return;
@@ -1333,7 +1394,7 @@ async fn a_refused_admission_leaves_its_key_free(fresh: Factory<'_>, r: &mut Rep
         Ok(Some(held)) => r.record(
             "admission keys",
             format!(
-                "a refused append left the key held by {held} — the key committed                  without the run it names, so every future retry is answered with a                  run that has no journal"
+                "a refused append left the key held by {held} — the key committed without the run it names, so every future retry is answered with a run that has no journal"
             ),
         ),
         Err(e) => r.record("admission keys", format!("admitted_as failed: {e}")),

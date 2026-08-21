@@ -102,6 +102,17 @@ pub struct AgentExtension {
 pub const EXT_MANIFEST_PROVENANCE: &str =
     "https://hupe1980.github.io/agentplane/a2a/ext/manifest-provenance/v1";
 
+/// The extension that names where skill selection lives on a request.
+///
+/// A2A has no skill-selection field, and inferring one from message content
+/// would put a model reading attacker-controlled text in charge of which
+/// capability executes — so this server reads `message.metadata.skill`, and
+/// a multi-skill agent *requires* it. Undeclared, that convention was
+/// discoverable only from an error message; the card is where a caller
+/// learns it before the first refusal.
+pub const EXT_SKILL_SELECTION: &str =
+    "https://hupe1980.github.io/agentplane/a2a/ext/skill-selection/v1";
+
 /// The extension that carries tools, budget and topology on the extended card.
 pub const EXT_GOVERNANCE: &str = "https://hupe1980.github.io/agentplane/a2a/ext/governance/v1";
 
@@ -326,6 +337,17 @@ impl AgentCard {
                     params: Some(serde_json::json!({
                         "manifestDigest": manifest.digest()?.to_hex(),
                     })),
+                });
+                capabilities.extensions.push(AgentExtension {
+                    uri: EXT_SKILL_SELECTION.to_owned(),
+                    description: Some(
+                        "Skill selection is named, never inferred: set `metadata.skill` \
+                         on the Message to one of this card's skill ids. Required when \
+                         the card lists more than one skill."
+                            .to_owned(),
+                    ),
+                    required: false,
+                    params: Some(serde_json::json!({ "field": "message.metadata.skill" })),
                 });
                 capabilities
             },

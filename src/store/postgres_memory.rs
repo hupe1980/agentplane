@@ -407,6 +407,43 @@ impl MemoryStore for PostgresStore {
             .transpose()
     }
 
+    async fn current(
+        &self,
+        id: &str,
+        as_of: Option<crate::core::Timestamp>,
+    ) -> Result<Option<MemoryItem>, StoreError> {
+        let client = self.pool_ref().get().await.map_err(|error| {
+            StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
+        })?;
+        let tenant = self.tenant_name();
+        // The same effective-expiry rule `recall` applies, restated for one id:
+        // the hard ceiling and the sliding window race to the earlier instant,
+        // and the cutoff is inclusive.
+        client
+            .query_opt(
+                "SELECT item.item FROM memory_items item
+                 LEFT JOIN memory_access_expiry access
+                     ON access.tenant = item.tenant AND access.id = item.id
+                 WHERE item.tenant = $1 AND item.id = $2 AND item.current
+                     AND ($3::BIGINT IS NULL
+                                OR (item.expires_at IS NULL AND access.expires_at IS NULL)
+                                OR LEAST(
+                                        COALESCE(item.expires_at, 9223372036854775807),
+                                        COALESCE(access.expires_at, 9223372036854775807)
+                                ) > $3)",
+                &[
+                    &tenant,
+                    &id,
+                    &as_of.map(crate::core::Timestamp::unix_timestamp),
+                ],
+            )
+            .await
+            .map_err(|error| be(&error))?
+            .as_ref()
+            .map(decode)
+            .transpose()
+    }
+
     async fn subject_ids(&self, subject: &str) -> Result<Vec<String>, StoreError> {
         let client = self.pool_ref().get().await.map_err(|error| {
             StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))

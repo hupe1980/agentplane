@@ -179,7 +179,7 @@ async fn connect() -> McpClient {
         .serve((cr, cw))
         .await
         .expect("client initialises");
-    McpClient::new("tickets", Arc::new(service))
+    McpClient::new("tickets", Arc::new(service)).expect("a known negotiated version")
 }
 
 #[tokio::main]

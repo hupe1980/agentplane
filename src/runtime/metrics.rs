@@ -160,6 +160,16 @@ pub const UNDECIDABLE: Instrument = Instrument {
     description: "Effect outcomes that could not be determined and where guessing was forbidden.",
 };
 
+pub const UNREPRODUCIBLE: Instrument = Instrument {
+    name: "agentplane.runs.unreproducible",
+    kind: Kind::Counter,
+    unit: "1",
+    dimension: None,
+    description: "Runs quarantined because a read they pinned by digest or version \
+                  came back different. Counts runs that noticed, not versions that \
+                  moved: one rewrite can strand every run that read it.",
+};
+
 pub const RECONCILIATIONS: Instrument = Instrument {
     name: "agentplane.effects.reconciled",
     kind: Kind::Counter,
@@ -321,6 +331,7 @@ pub const CATALOGUE: &[Instrument] = &[
     EFFECTS,
     EFFECTS_REPLAYED,
     DIVERGENCES,
+    UNREPRODUCIBLE,
     QUARANTINES,
     UNDECIDABLE,
     RECONCILIATIONS,

@@ -3180,8 +3180,10 @@ async fn gemini_returns_the_models_turn_verbatim_including_its_thought_signature
     assert_eq!(first.tool_calls[0].id, "lookup-0");
 
     let continuation = first.continuation.clone().expect("a continuation");
+    // An array of contents — the state must be able to carry every prior
+    // round, so even the first holds a one-turn transcript.
     assert_eq!(
-        continuation.state["parts"][0]["thoughtSignature"], "SIGNATURE",
+        continuation.state[0]["parts"][0]["thoughtSignature"], "SIGNATURE",
         "the signature was dropped on the way in: {:?}",
         continuation.state
     );
@@ -3702,7 +3704,9 @@ async fn gemini_streams_reassemble_and_keep_the_signature() {
     assert_eq!(completion.usage.output_tokens, 8, "2 answer + 6 thinking");
     assert_eq!(completion.usage.input_tokens, 11);
 
+    // The one-turn transcript array; the turn itself is element 0.
     let state = completion.continuation.expect("a continuation").state;
+    let state = &state[0];
     assert_eq!(state["parts"][0]["text"], "Looking", "{state}");
     // Kept whole rather than merged into the run of text before it: a signature
     // on a text part is destroyed by exactly the merge that is correct for an
@@ -4234,5 +4238,264 @@ async fn an_input_type_reaches_the_wire_and_the_revision() {
     assert_eq!(
         body["input_type"], "query",
         "the asymmetry hint never reached the wire"
+    );
+}
+
+/// A turn that asks for tools is not the final answer, and a schema binds only
+/// the final answer.
+///
+/// The exemption is spelled once, in `wire::structured` — but each driver gets
+/// its own pin because the copy that drifts is the one a deployment does not
+/// exercise, and the failure this prevents is every schema-bearing
+/// tool-calling agent dying on its first tool turn with "the answer is not
+/// JSON". The tool-calling loop attaches the declared output schema to every
+/// turn; mid-loop turns answer with a tool call and no text at all.
+#[tokio::test]
+async fn a_schema_and_a_tool_calling_turn_coexist_on_every_driver() {
+    let sch = schema();
+    let tool = || ToolDeclaration {
+        name: "lookup".to_owned(),
+        description: "Look something up.".to_owned(),
+        parameters: json!({ "type": "object", "properties": {} }),
+    };
+
+    // Anthropic: a `tool_use` block and no sibling text.
+    let (c, _seen) = canned(
+        200,
+        json!({
+            "content": [{ "type": "tool_use", "id": "t1", "name": "lookup", "input": {} }],
+            "usage": { "input_tokens": 4, "output_tokens": 9 },
+            "stop_reason": "tool_use"
+        }),
+    );
+    let url = serve(c).await;
+    let provider = Anthropic::new("k").unwrap().base(url).buffered();
+    let tools = [tool()];
+    let mut request = Request {
+        model: &model(),
+        prompt: &json!("go"),
+        max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+        reasoning_effort: None,
+        schema: Some(&sch),
+        tools: &tools,
+        exchanges: &[],
+        continuation: None,
+        stream: None,
+    };
+    let out = provider.complete(request.clone()).await.expect(
+        "an Anthropic tool-calling turn under a schema must not be judged as a missing answer",
+    );
+    assert_eq!(out.tool_calls.len(), 1);
+    assert!(out.structured.is_none(), "no final answer exists yet");
+
+    // OpenAI Responses: a `function_call` output item and no message.
+    let (c, _seen) = canned(
+        200,
+        json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [{
+                "type": "function_call", "id": "fc_1", "call_id": "c1",
+                "name": "lookup", "arguments": "{}"
+            }],
+            "usage": { "input_tokens": 4, "output_tokens": 9 },
+        }),
+    );
+    let url = serve(c).await;
+    let provider = OpenAi::new("k").unwrap().base(url).buffered();
+    let openai_model = ModelId::new("openai", "gpt-x");
+    request.model = &openai_model;
+    let out = provider.complete(request.clone()).await.expect(
+        "an OpenAI tool-calling turn under a schema must not be judged as a missing answer",
+    );
+    assert_eq!(out.tool_calls.len(), 1);
+    assert!(out.structured.is_none());
+}
+
+/// The same exemption on the remaining two drivers — see the test above.
+#[tokio::test]
+async fn a_schema_and_a_tool_calling_turn_coexist_on_the_compatible_wires() {
+    let sch = schema();
+    let tool = || ToolDeclaration {
+        name: "lookup".to_owned(),
+        description: "Look something up.".to_owned(),
+        parameters: json!({ "type": "object", "properties": {} }),
+    };
+    let tools = [tool()];
+
+    // Chat Completions, native schema mode: a tool_calls delta and null content.
+    let (c, _seen) = canned(
+        200,
+        json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": { "name": "lookup", "arguments": "{}" },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 1 },
+        }),
+    );
+    let url = serve(c).await;
+    let provider = ChatCompletions::new(url)
+        .unwrap()
+        .buffered()
+        .structured_via(SchemaMode::Native);
+    let cc_model = ModelId::new("chat-completions", "m");
+    let mut request = Request {
+        model: &cc_model,
+        prompt: &json!("go"),
+        max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+        reasoning_effort: None,
+        schema: Some(&sch),
+        tools: &tools,
+        exchanges: &[],
+        continuation: None,
+        stream: None,
+    };
+    let out = provider.complete(request.clone()).await.expect(
+        "a chat-completions tool-calling turn under a schema must not be judged as a missing answer",
+    );
+    assert_eq!(out.tool_calls.len(), 1);
+    assert!(out.structured.is_none());
+
+    // Gemini: a functionCall part and no text.
+    let (c, _seen) = canned(
+        200,
+        json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{ "functionCall": { "name": "lookup", "args": {} } }],
+                },
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": { "promptTokenCount": 4, "candidatesTokenCount": 9 },
+        }),
+    );
+    let url = serve(c).await;
+    let provider = Gemini::new("k").unwrap().base(url).buffered();
+    let gemini_model = ModelId::new("gemini", "gemini-3.5-flash");
+    request.model = &gemini_model;
+    let out = provider
+        .complete(request)
+        .await
+        .expect("a Gemini tool-calling turn under a schema must not be judged as a missing answer");
+    assert_eq!(out.tool_calls.len(), 1);
+    assert!(out.structured.is_none());
+}
+
+/// Gemini's continuation carries **every** prior round, not only the latest.
+///
+/// The runtime's tool loop clears `exchanges` each turn and relies on the
+/// driver-accumulated continuation being the whole transcript. A continuation
+/// that held only the last model turn would send round three's request without
+/// round one's signed turn — the model re-asks for the same tools or answers
+/// with amnesia, silently.
+#[tokio::test]
+async fn gemini_two_tool_turns_accumulate_the_transcript_exactly_once() {
+    let asks = |name: &str| {
+        json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": { "name": name, "args": {} },
+                        "thoughtSignature": format!("SIG-{name}"),
+                    }],
+                },
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": { "promptTokenCount": 4, "candidatesTokenCount": 2 },
+        })
+    };
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("start");
+    let tools = [ToolDeclaration {
+        name: "lookup".to_owned(),
+        description: "Look something up.".to_owned(),
+        parameters: json!({ "type": "object", "properties": {} }),
+    }];
+    let exchange = |id: &str| ToolExchange {
+        call: agentplane::model::ToolCall {
+            id: id.to_owned(),
+            name: "lookup".to_owned(),
+            arguments: json!({}),
+        },
+        output: json!({ "n": id }),
+        failed: false,
+    };
+
+    // Turn 1 → the model asks for a tool.
+    let (c, _seen) = canned(200, asks("lookup"));
+    let url = serve(c).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let first = driver
+        .complete(gemini_request(&model, &prompt, &tools, &[], None))
+        .await
+        .unwrap();
+    let state1 = first.continuation.expect("turn 1 continues");
+
+    // Turn 2 → carrying turn 1's result, the model asks again.
+    let (c, seen2, _h) = canned_observed(200, asks("lookup"));
+    let url = serve(c).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let exchanges1 = vec![exchange("lookup-0")];
+    let second = driver
+        .complete(gemini_request(
+            &model,
+            &prompt,
+            &tools,
+            &exchanges1,
+            Some(&state1),
+        ))
+        .await
+        .unwrap();
+    let state2 = second.continuation.expect("turn 2 continues");
+    let sent2 = seen2.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        sent2["contents"].as_array().unwrap().len(),
+        3,
+        "turn 2 sends user, model-1, results-1: {sent2}"
+    );
+
+    // Turn 3 → both prior rounds ride, signatures where they sat.
+    let (c, seen3, _h) = canned_observed(
+        200,
+        json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "done" }] },
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": { "promptTokenCount": 4, "candidatesTokenCount": 1 },
+        }),
+    );
+    let url = serve(c).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let exchanges2 = vec![exchange("lookup-0")];
+    driver
+        .complete(gemini_request(
+            &model,
+            &prompt,
+            &tools,
+            &exchanges2,
+            Some(&state2),
+        ))
+        .await
+        .unwrap();
+    let sent3 = seen3.lock().unwrap().clone().unwrap();
+    let contents = sent3["contents"].as_array().unwrap();
+    assert_eq!(
+        contents.len(),
+        5,
+        "turn 3 sends user, model-1, results-1, model-2, results-2: {sent3}"
+    );
+    assert_eq!(
+        contents[1]["parts"][0]["thoughtSignature"], "SIG-lookup",
+        "round one's signed turn fell out of the transcript: {sent3}"
     );
 }

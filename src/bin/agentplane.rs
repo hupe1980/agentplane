@@ -110,6 +110,8 @@ enum Verb {
     Serve(Box<ServeArgs>),
     /// Check every document in a file, and say what is in it.
     Validate(FileArgs),
+    /// Print the manifest format as a JSON Schema, for editors and CI linters.
+    Schema,
     /// Print the identity a registry pins.
     Digest(FileArgs),
     /// Check a journal's history and print what could not be checked.
@@ -660,6 +662,18 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Verb::Schema => {
+            // The parser stays authoritative: the schema is the format's
+            // *shape*, and the semantic refusals run only in `validate`. The
+            // document says so itself, so a copy pasted into a repo carries
+            // the caveat along.
+            let schema = Manifest::json_schema();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&schema).expect("a generated schema serializes")
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Verb::Digest(a) => {
             let manifests = manifests_at(&a.manifest)?;
             // One document prints the bare digest, so scripts that pin a single
@@ -968,7 +982,8 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
             std::slice::from_ref(manifest),
         )
         .await?;
-        for (name, client) in connect_mcp_servers(&opts.mcp).await? {
+        for (name, client) in connect_mcp_servers(&opts.mcp, std::slice::from_ref(manifest)).await?
+        {
             builder = builder.tool_server(name, client);
         }
         builder = builder
@@ -1121,6 +1136,7 @@ async fn spawn_operator_surface(
 #[cfg(feature = "mcp-stdio")]
 async fn connect_mcp_servers(
     specs: &[String],
+    manifests: &[Manifest],
 ) -> Result<Vec<(String, Arc<dyn agentplane::tools::ToolClient>)>, String> {
     use rmcp::ServiceExt as _;
 
@@ -1151,7 +1167,8 @@ async fn connect_mcp_servers(
             .serve(transport)
             .await
             .map_err(|e| format!("the MCP server `{name}` did not initialise: {e}"))?;
-        let client = agentplane::tools::McpClient::new(name, Arc::new(service));
+        let client = agentplane::tools::McpClient::new(name, Arc::new(service))
+            .map_err(|e| format!("the MCP server `{name}` cannot be used: {e}"))?;
         // The negotiated version, not the offered one. MCP negotiation is a
         // designed downgrade, and a server that answered with an older version
         // still serves `tools/call` — it simply never returns a task, so a
@@ -1160,6 +1177,31 @@ async fn connect_mcp_servers(
         match client.negotiated_version() {
             Some(version) => eprintln!("  mcp: {name} <- {command} (MCP {version})"),
             None => eprintln!("  mcp: {name} <- {command}"),
+        }
+        // What the server advertises, put beside what the operator granted.
+        // The grant rules either way; what the operator is being told is that
+        // the server now *wants* more than they gave it — the first observable
+        // move of a server going bad, or having been swapped. Comparison, not
+        // configuration: a listing failure costs the warning, never the plane.
+        match client.discover().await {
+            Ok(advertised) => {
+                for manifest in manifests {
+                    let mut catalog = agentplane::tools::ToolCatalog::from_manifest(manifest);
+                    for (id, adv) in &advertised {
+                        catalog = catalog.observed(id, *adv);
+                    }
+                    for id in catalog.overclaiming() {
+                        eprintln!(
+                            "  mcp: {name}: warning: `{id}` advertises more safety than \
+                             manifest `{}` grants; the grant still rules",
+                            manifest.metadata.name
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("  mcp: {name}: tools/list failed, advertisements not compared: {e}");
+            }
         }
         wired.push((
             name.to_owned(),
@@ -1179,6 +1221,7 @@ async fn connect_mcp_servers(
 #[allow(clippy::unused_async)]
 async fn connect_mcp_servers(
     specs: &[String],
+    _manifests: &[Manifest],
 ) -> Result<Vec<(String, Arc<dyn agentplane::tools::ToolClient>)>, String> {
     if specs.is_empty() {
         return Ok(Vec::new());
@@ -1267,7 +1310,9 @@ fn spawn_push_worker(worker: agentplane::api::a2a::A2aPushWorker, every: u32) {
                 Ok(report) if report.needs_attention() => {
                     tracing::warn!(?report, "push delivery needs attention");
                 }
-                Ok(report) if report.registrations > 0 => {
+                // On deliveries, not registrations: an idle plane re-reads
+                // its registrations every tick, and that is not a delivery.
+                Ok(report) if report.deliveries > 0 => {
                     tracing::info!(?report, "push delivered");
                 }
                 Ok(_) => {}
@@ -1348,7 +1393,7 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
         };
 
         let mut builder = with_providers(Runtime::builder(Arc::clone(&store)), manifests).await?;
-        for (name, client) in connect_mcp_servers(&opts.mcp).await? {
+        for (name, client) in connect_mcp_servers(&opts.mcp, manifests).await? {
             builder = builder.tool_server(name, client);
         }
         for manifest in manifests {
@@ -1396,7 +1441,7 @@ fn replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, String>
         let store = Arc::new(RedbStore::open(&opts.store).map_err(|e| e.to_string())?);
         let mut builder =
             with_providers(Runtime::builder_on(Arc::clone(&store)), manifests).await?;
-        for (name, client) in connect_mcp_servers(&opts.mcp).await? {
+        for (name, client) in connect_mcp_servers(&opts.mcp, manifests).await? {
             builder = builder.tool_server(name, client);
         }
         for manifest in manifests {

@@ -224,8 +224,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     case_id         TEXT,
     kind            TEXT   NOT NULL,
     justification   TEXT   NOT NULL,
-    candidate_roles TEXT   NOT NULL,
-    excluded_actors TEXT   NOT NULL,
+    -- Arrays, never a delimited string. Role and actor names are the four-eyes
+    -- control's operands and this store does not get to constrain their
+    -- alphabet: an exclusion list stored as 'a,b'-joined text reads an actor
+    -- named 'a,b' back as two actors named neither, and the person barred from
+    -- deciding is barred no longer.
+    candidate_roles TEXT[] NOT NULL,
+    escalate_to     TEXT[] NOT NULL,
+    excluded_actors TEXT[] NOT NULL,
     assignee        TEXT,
     priority        TEXT   NOT NULL,
     state           TEXT   NOT NULL,
@@ -1023,6 +1029,27 @@ impl CaseStore for PostgresStore {
                   ORDER BY resolved_at ASC LIMIT $2",
                 &[
                     &now.unix_timestamp(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        rows.iter().map(deadline_from).collect()
+    }
+
+    async fn breached(&self, limit: usize) -> Result<Vec<Deadline>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // Served by `case_deadlines_due`, whose leading columns are the two this
+        // filters on. No clock: a breach is a recorded state, not a comparison
+        // against now.
+        let rows = client
+            .query(
+                "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state
+                   FROM case_deadlines
+                  WHERE tenant = $2 AND state = 'breached'
+                  ORDER BY resolved_at ASC LIMIT $1",
+                &[
                     &i64::try_from(limit).unwrap_or(i64::MAX),
                     &self.tenant_name(),
                 ],
@@ -1863,9 +1890,9 @@ impl TaskStore for PostgresStore {
         client
             .execute(
                 "INSERT INTO tasks (task_id, run_id, case_id, kind, justification,
-                                    candidate_roles, excluded_actors, assignee, priority,
-                                    state, on_expiry, created_at, due_at, tenant)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                                    candidate_roles, escalate_to, excluded_actors, assignee,
+                                    priority, state, on_expiry, created_at, due_at, tenant)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
                  ON CONFLICT (tenant, task_id) DO NOTHING",
                 &[
                     &task.id.to_hex(),
@@ -1873,8 +1900,9 @@ impl TaskStore for PostgresStore {
                     &task.case.map(|c| c.to_string()),
                     &task.kind,
                     &serde_json::to_string(&task.justification)?,
-                    &task.candidate_roles.join(","),
-                    &task.excluded_actors.join(","),
+                    &task.candidate_roles,
+                    &task.escalate_to,
+                    &task.excluded_actors,
                     &task.assignee,
                     &task.priority.as_str(),
                     &task.state.as_str(),
@@ -2110,6 +2138,44 @@ impl TaskStore for PostgresStore {
         Ok(())
     }
 
+    async fn escalate(&self, id: TaskId) -> Result<Task, StoreError> {
+        // One connection for the whole verb, exactly as `claim` — see `task_on`.
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tenant = self.tenant_name();
+        let Some(task) = task_on(&client, &tenant, id).await? else {
+            return Err(StoreError::NotFound(id.to_string()));
+        };
+        // A decided task stays decided — the sweep that escalates races the
+        // reviewer it is escalating past, and the decision winning that race
+        // is the outcome everybody wanted.
+        if !task.state.is_pending() {
+            return Ok(task);
+        }
+        // `Task::escalate` is the one implementation of what escalating means;
+        // this backend only persists its result. The state predicate is the
+        // same compare-and-swap `claim` carries: a decision landing between
+        // the read above and this write must win, and an unguarded UPDATE
+        // would resurrect it into `escalated`.
+        let mut updated = task;
+        updated.escalate();
+        let n = client
+            .execute(
+                "UPDATE tasks SET state = 'escalated', assignee = NULL, candidate_roles = $2
+                  WHERE task_id = $1 AND tenant = $3
+                    AND state IN ('open','claimed','escalated')",
+                &[&id.to_hex(), &updated.candidate_roles, &tenant],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if n == 0 {
+            // The race fired: somebody decided it. Return what stands.
+            return task_on(&client, &tenant, id)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(id.to_string()));
+        }
+        Ok(updated)
+    }
+
     async fn queue(&self, roles: &[String], limit: usize) -> Result<Vec<Task>, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         // Most urgent first, oldest within a rank — the trait's contract, which
@@ -2177,11 +2243,15 @@ impl TaskStore for PostgresStore {
 
     async fn overdue(&self, now: Timestamp, limit: usize) -> Result<Vec<Task>, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // Not `escalated`, although escalated tasks are pending and past due:
+        // this scan drives the expiry sweep, and escalation is that policy
+        // having fired — see `TaskStore::overdue` for what including them
+        // starves.
         let rows = client
             .query(
                 &format!(
                     "SELECT {TASK_COLS} FROM tasks
-                      WHERE tenant = $3 AND state IN ('open','claimed','escalated')
+                      WHERE tenant = $3 AND state IN ('open','claimed')
                         AND due_at IS NOT NULL AND due_at <= $1
                       ORDER BY due_at ASC LIMIT $2"
                 ),
@@ -2198,27 +2268,18 @@ impl TaskStore for PostgresStore {
 }
 
 const TASK_COLS: &str = "task_id, run_id, case_id, kind, justification, candidate_roles, \
-                         excluded_actors, assignee, priority, state, on_expiry, created_at, due_at";
-
-fn split(s: &str) -> Vec<String> {
-    if s.is_empty() {
-        Vec::new()
-    } else {
-        s.split(',').map(ToOwned::to_owned).collect()
-    }
-}
+                         escalate_to, excluded_actors, assignee, priority, state, on_expiry, \
+                         created_at, due_at";
 
 fn task_from(row: &tokio_postgres::Row) -> Result<Task, StoreError> {
     let id: String = row.get(0);
     let run: String = row.get(1);
     let case: Option<String> = row.get(2);
     let justification: String = row.get(4);
-    let roles: String = row.get(5);
-    let excluded: String = row.get(6);
-    let priority: String = row.get(8);
-    let state: String = row.get(9);
-    let on_expiry: String = row.get(10);
-    let due: Option<i64> = row.get(12);
+    let priority: String = row.get(9);
+    let state: String = row.get(10);
+    let on_expiry: String = row.get(11);
+    let due: Option<i64> = row.get(13);
 
     Ok(Task {
         id: TaskId::parse(&id).map_err(|e| corrupt("bad task id", e))?,
@@ -2229,13 +2290,14 @@ fn task_from(row: &tokio_postgres::Row) -> Result<Task, StoreError> {
             .map_err(|e| corrupt("bad case id", e))?,
         kind: row.get(3),
         justification: serde_json::from_str(&justification)?,
-        candidate_roles: split(&roles),
-        excluded_actors: split(&excluded),
-        assignee: row.get(7),
+        candidate_roles: row.get(5),
+        escalate_to: row.get(6),
+        excluded_actors: row.get(7),
+        assignee: row.get(8),
         priority: priority_from(&priority)?,
         state: task_state_from(&state)?,
         on_expiry: expiry_from(&on_expiry)?,
-        created_at: Timestamp::from_unix_timestamp(row.get::<_, i64>(11))
+        created_at: Timestamp::from_unix_timestamp(row.get::<_, i64>(12))
             .map_err(|e| corrupt("unrepresentable created_at", e))?,
         due_at: due
             .map(Timestamp::from_unix_timestamp)
@@ -2260,18 +2322,55 @@ impl BatchStore for PostgresStore {
             )
             .await
             .map_err(|e| be(&e))?;
+        // Read back what stands: whichever open won the insert, its digest is
+        // the batch's, and a resume offering another one is refused rather
+        // than run — one batch runs one frozen plan, and this row is the only
+        // witness to which.
+        let stored: String = client
+            .query_one(
+                "SELECT plan_digest FROM batches WHERE batch_id = $1 AND tenant = $2",
+                &[&id.to_string(), &self.tenant_name()],
+            )
+            .await
+            .map_err(|e| be(&e))?
+            .get(0);
+        if stored != plan_digest {
+            return Err(StoreError::BatchPlanChanged {
+                batch: id.to_string(),
+                stored,
+                offered: plan_digest.to_owned(),
+            });
+        }
         Ok(())
+    }
+
+    async fn plan_digest(&self, id: BatchId) -> Result<Option<String>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        Ok(client
+            .query_opt(
+                "SELECT plan_digest FROM batches WHERE batch_id = $1 AND tenant = $2",
+                &[&id.to_string(), &self.tenant_name()],
+            )
+            .await
+            .map_err(|e| be(&e))?
+            .map(|r| r.get(0)))
     }
 
     async fn mark_exhausted(&self, id: BatchId) -> Result<(), StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        client
+        let updated = client
             .execute(
                 "UPDATE batches SET exhausted = TRUE WHERE batch_id = $1 AND tenant = $2",
                 &[&id.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
+        // The row count says whether the mark landed — see `record`. This is
+        // the one bit that lets a census read as *finished*, and `Ok` over
+        // nothing is the quietest way to lose it.
+        if updated == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
         Ok(())
     }
 
@@ -2424,7 +2523,10 @@ impl BatchStore for PostgresStore {
                 Some("quarantined") => c.quarantined = n,
                 Some("suspended") => c.suspended = n,
                 Some("exhausted") => c.exhausted = n,
-                _ => c.in_flight = n,
+                // Reserved, no outcome recorded.
+                None => c.in_flight = n,
+                // Damage, not a bucket — see `outcome_from`.
+                Some(other) => return Err(corrupt("unknown item outcome", other)),
             }
             c.spend.tokens += amount_of(tokens);
             c.spend.minor_units += amount_of(minor);
@@ -2453,7 +2555,7 @@ impl BatchStore for PostgresStore {
                 key: key.clone(),
                 run: RunId::parse(&row.get::<_, String>(1))
                     .map_err(|e| corrupt("bad run id", e))?,
-                outcome: outcome_from(row.get::<_, Option<String>>(2), row.get(3)),
+                outcome: outcome_from(row.get::<_, Option<String>>(2), row.get(3))?,
                 spend: Spend {
                     tokens: amount_of(row.get::<_, i64>(4)),
                     minor_units: amount_of(row.get::<_, i64>(5)),
@@ -2464,16 +2566,26 @@ impl BatchStore for PostgresStore {
     }
 }
 
-fn outcome_from(state: Option<String>, detail: Option<String>) -> Option<ItemOutcome> {
+/// `None` means *no outcome yet* — and only that. An outcome string this
+/// store cannot read is damage, not absence: decoded to `None` it would say
+/// the item never ran, and the census would carry the row as in-flight
+/// forever, keeping the batch `Running` over damage nobody is told about.
+fn outcome_from(
+    state: Option<String>,
+    detail: Option<String>,
+) -> Result<Option<ItemOutcome>, StoreError> {
     let d = detail.unwrap_or_default();
-    match state?.as_str() {
-        "succeeded" => Some(ItemOutcome::Succeeded),
-        "failed" => Some(ItemOutcome::Failed(d)),
-        "quarantined" => Some(ItemOutcome::Quarantined(d)),
-        "suspended" => Some(ItemOutcome::Suspended(d)),
-        "exhausted" => Some(ItemOutcome::Exhausted(d)),
-        _ => None,
-    }
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    Ok(Some(match state.as_str() {
+        "succeeded" => ItemOutcome::Succeeded,
+        "failed" => ItemOutcome::Failed(d),
+        "quarantined" => ItemOutcome::Quarantined(d),
+        "suspended" => ItemOutcome::Suspended(d),
+        "exhausted" => ItemOutcome::Exhausted(d),
+        other => return Err(corrupt("unknown item outcome", other)),
+    }))
 }
 
 fn item_from(row: &tokio_postgres::Row, key: &str) -> Result<ItemRecord, StoreError> {
@@ -2481,7 +2593,7 @@ fn item_from(row: &tokio_postgres::Row, key: &str) -> Result<ItemRecord, StoreEr
     Ok(ItemRecord {
         key: key.to_owned(),
         run: RunId::parse(&run).map_err(|e| corrupt("bad run id", e))?,
-        outcome: outcome_from(row.get::<_, Option<String>>(1), row.get(2)),
+        outcome: outcome_from(row.get::<_, Option<String>>(1), row.get(2))?,
         spend: Spend {
             tokens: amount_of(row.get::<_, i64>(3)),
             minor_units: amount_of(row.get::<_, i64>(4)),
@@ -2536,6 +2648,10 @@ mod codec_tests {
             ("phase", phase_from("Compensating").err()),
             ("expiry", expiry_from("escalate_later").err()),
             ("priority", priority_from("normal ").err()),
+            (
+                "item outcome",
+                outcome_from(Some("done".into()), None).err(),
+            ),
         ] {
             assert!(
                 matches!(err, Some(StoreError::Corrupt { .. })),

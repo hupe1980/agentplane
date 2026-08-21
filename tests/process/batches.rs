@@ -658,3 +658,67 @@ async fn an_exhausted_item_is_a_held_pause_not_a_failure() {
 /// Unused import guard: `StoreError` is part of the store contract surface.
 #[allow(dead_code)]
 fn _store_error_is_in_scope(_: StoreError) {}
+
+/// **A batch resumed under an edited plan is refused, naming both digests.**
+///
+/// One batch is one frozen plan — that is what makes its report one act's
+/// record. The store's row is the only witness to which plan that was, so the
+/// refusal lives there: accepted, items from the resume onward would settle
+/// under a plan the batch's own record does not name, and nothing downstream
+/// could ever tell.
+#[tokio::test]
+async fn a_batch_resumed_under_an_edited_plan_is_refused() {
+    let store = db();
+    let world: World = Arc::default();
+    let rt = runtime(&store, &world, vec![]);
+    let id = BatchId::generate();
+
+    rt.run_batch(id, &BatchSpec::new(plan(), Arc::new(Keys::upto(2))))
+        .await
+        .unwrap();
+
+    // Same id, same plan: an idempotent re-drive, not a conflict.
+    rt.run_batch(id, &BatchSpec::new(plan(), Arc::new(Keys::upto(2))))
+        .await
+        .expect("re-driving under the unchanged plan is a resume");
+
+    // The same capability, one more node: a plan that validates against this
+    // runtime and differs only in shape — which is exactly the edit the store
+    // must notice, because the runner cannot.
+    let edited = PlanIR::new(vec![
+        PlanNode::new(0, "settle")
+            .arg("input", ArgSource::run_input())
+            .terminal(),
+        PlanNode::new(1, "settle")
+            .arg("input", ArgSource::run_input())
+            .terminal(),
+    ]);
+    let err = rt
+        .run_batch(id, &BatchSpec::new(edited, Arc::new(Keys::upto(2))))
+        .await
+        .expect_err("an edited plan must not resume somebody else's batch");
+    assert!(
+        err.to_string().contains("one batch runs one frozen plan"),
+        "the refusal names the rule: {err}"
+    );
+}
+
+/// **A report on an unknown batch is a refusal, not an empty `Running`.**
+///
+/// A census cannot tell "no such batch" from "batch with no items yet" — both
+/// count zero rows — so without the existence check a mistyped id reads as a
+/// healthy batch that never starts, and the operator watches it instead of
+/// finding the typo.
+#[tokio::test]
+async fn a_report_on_an_unknown_batch_is_not_an_empty_batch() {
+    let store = db();
+    let world: World = Arc::default();
+    let err = runtime(&store, &world, vec![])
+        .batch_report(BatchId::generate())
+        .await
+        .expect_err("an unknown batch must not report as running");
+    assert!(
+        err.to_string().contains("not found"),
+        "the refusal says what is missing: {err}"
+    );
+}

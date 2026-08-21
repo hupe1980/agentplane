@@ -814,13 +814,14 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
             Some("bob"),
             &json!({ "id": "e", "kind": "k", "correlation": [], "payload": {} }),
         ),
-        // The two listing routes. `/runs` was absent here and `api:run.list`
-        // was absent from `action::ALL`, so the equality below held by leaving
-        // the same verb out of both sides — and a deployment enumerating `ALL`
-        // never wrote a rule for the route that answers *what is quarantined
-        // right now*.
+        // The listing routes — the backlogs, each answering a question whose
+        // asker does not already know the answer. Leaving one out here while
+        // its verb is also missing from `action::ALL` makes the equality below
+        // hold by cancelling omissions, and a deployment enumerating `ALL` then
+        // never writes a rule for it.
         get("/runs", Some("bob")),
         get("/cases", Some("bob")),
+        get("/obligations", Some("bob")),
     ] {
         let uri = req.uri().to_string();
         let (status, body) = send(&router, req).await;
@@ -1436,6 +1437,97 @@ async fn each_tenants_own_policy_engine_decides_its_requests() {
         denies.asked().len(),
         1,
         "globex's engine was asked about a request that was not globex's"
+    );
+}
+
+/// **Which obligations were missed, after the matter is closed.**
+///
+/// Closure is the load-bearing half: a route serving breaches only on open
+/// cases passes a version of this test that stops early, and loses the record
+/// of what a matter missed at the moment the matter is filed away.
+#[tokio::test]
+async fn a_missed_obligation_is_listable_after_its_case_is_closed() {
+    use agentplane::core::{Deadline, DeadlineState, Digest};
+
+    let f = fixture();
+    f.pending_task().await;
+    let cases = Arc::clone(&f.store) as Arc<dyn CaseStore>;
+    let mut found = None;
+    for status in agentplane::core::CaseStatus::ALL {
+        if let Some(c) = cases
+            .by_status(status, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+        {
+            found = Some(c.id);
+            break;
+        }
+    }
+    let case = found.expect("the suspended run opened a case");
+    let router = f.router();
+
+    // A healthy plane reports nothing, and the empty answer is a real answer.
+    let (status, body) = send(&router, get("/obligations", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["obligations"].as_array().map(Vec::len),
+        Some(0),
+        "a plane that missed nothing reported a breach: {body}"
+    );
+    assert_eq!(body["truncated"], false);
+
+    cases
+        .register_deadline(&Deadline {
+            case,
+            name: "respond-by".to_owned(),
+            resolved_at: agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).unwrap(),
+            calendar_digest: Digest::of(b"cal"),
+            warn_at: None,
+            state: DeadlineState::Pending,
+        })
+        .await
+        .expect("register");
+    cases
+        .set_deadline_state(case, "respond-by", DeadlineState::Breached)
+        .await
+        .expect("breach");
+
+    let (status, body) = send(&router, get("/obligations", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["obligations"].as_array().map(Vec::len),
+        Some(1),
+        "the breach is not findable by anyone who does not already know the \
+         case: {body}"
+    );
+    assert_eq!(body["obligations"][0]["name"], "respond-by");
+
+    // The half that matters. Closing the matter must not retire the record of
+    // what it missed. The suspended task bounds its own wait with an
+    // obligation, and that one is still outstanding — cancel it, so the close
+    // below is blocked by nothing except the thing under test.
+    for d in cases.deadlines(case).await.expect("deadlines") {
+        if d.state.is_open() {
+            cases
+                .set_deadline_state(case, &d.name, DeadlineState::Cancelled)
+                .await
+                .expect("cancel");
+        }
+    }
+    cases
+        .close(case)
+        .await
+        .expect("a breached obligation is resolved, so the case closes");
+    let (status, body) = send(&router, get("/obligations", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["obligations"].as_array().map(Vec::len),
+        Some(1),
+        "closing the case took the breach off the surface, so the one query \
+         that answers *what did we miss* goes quiet exactly when the matter \
+         stops being watched: {body}"
     );
 }
 

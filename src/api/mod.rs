@@ -619,6 +619,7 @@ impl Api {
             .route("/tasks/{task}/takeover", post(take_over))
             .route("/tasks/{task}/decide", post(decide))
             .route("/cases", get(cases_by_status))
+            .route("/obligations", get(breached_obligations))
             .route("/cases/{case}", get(case_view))
             .route("/events", post(deliver))
             .with_state(self)
@@ -702,6 +703,10 @@ pub mod action {
     pub const TASK_DECIDE: &str = "api:task.decide";
     pub const CASE_READ: &str = "api:case.read";
     pub const CASE_LIST: &str = "api:case.list";
+    /// Listing obligations that were missed. Its own verb rather than a widened
+    /// `case.list`, because the party who must answer for a breach is a
+    /// compliance function that has no reason to read matter state.
+    pub const OBLIGATION_LIST: &str = "api:obligation.list";
     pub const EVENT_DELIVER: &str = "api:event.deliver";
 
     /// Every action this surface can ask about.
@@ -734,6 +739,7 @@ pub mod action {
         TASK_DECIDE,
         CASE_READ,
         CASE_LIST,
+        OBLIGATION_LIST,
         EVENT_DELIVER,
     ];
 }
@@ -875,23 +881,14 @@ async fn cancel_run(
 
 /// Runs that ended a given way — in practice, *what is quarantined right now*.
 ///
-/// A quarantine is the most serious conclusion this runtime reaches, and until
-/// this route it produced a status, an `error!` event and a counter: nothing an
-/// operator could ask for. A run started with `spawn` returns before the status
-/// exists at all, so for those the log line was the only trace.
+/// A quarantine is the most serious conclusion this runtime reaches, and a
+/// status, an `error!` and a counter are not things an operator can ask for. A
+/// run started with `spawn` returns before its status exists, so for those there
+/// is nothing else to read.
 ///
-/// The sentence that stood here claimed *every other backlog is findable by
-/// whoever must clear it — escalated cases, overdue tasks, breached
-/// obligations*. Overdue tasks were, through the worklist. **Escalated cases
-/// were not**: `CaseStore::by_status` existed and nothing exposed it, so the
-/// answer was available to anyone who already knew the case id — the one group
-/// that did not need to ask. The claim was written on the route that had just
-/// closed exactly this hole one surface over, which is the shape worth
-/// remembering: a statement about the doors you are *not* looking at, made
-/// while looking at this one. [`cases_by_status`] is that door.
-///
-/// A finding nobody can find is one that never reached a human in actionable
-/// form.
+/// One of four backlogs, and each is delivered by its own route because each has
+/// a different party to reach: [`cases_by_status`], [`breached_obligations`],
+/// [`worklist`].
 async fn runs_by_outcome(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -1185,6 +1182,41 @@ struct StatusQuery {
     status: Option<String>,
 }
 
+/// Obligations that were missed, longest-overdue first.
+///
+/// Reads the obligation's own row rather than the status of the case it
+/// escalated, so it still answers after that case is closed — `close` admits a
+/// case once nothing is still *outstanding*, and a breach is not outstanding.
+///
+/// No status parameter: a breach is the only obligation state anyone has to be
+/// told about, the rest being either still watched by the sweep or answered.
+async fn breached_obligations(
+    State(api): State<Api>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let s = api
+        .gate(&headers, action::OBLIGATION_LIST, "breached")
+        .await?;
+    let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
+
+    // One more than the page, for the reason the sibling routes take one more:
+    // a backlog of 140 shown as 100 reads as a backlog of 100.
+    let mut found = cases
+        .breached(api.limit + 1)
+        .await
+        .map_err(|_| store_failed())?;
+    let truncated = found.len() > api.limit;
+    found.truncate(api.limit);
+
+    Ok(Json(json!({
+        "obligations": found
+            .iter()
+            .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
+            .collect::<Vec<_>>(),
+        "truncated": truncated,
+    })))
+}
+
 async fn case_view(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -1302,30 +1334,64 @@ impl DeliverInput {
 /// announces itself with `ce-` headers instead — which is why this takes the
 /// whole header map and not just one value.
 fn parse_delivery(headers: &HeaderMap, body: &[u8]) -> Result<DeliverInput, ApiError> {
+    // The one predicate the CloudEvents parser itself uses. A second
+    // spelling here is free to disagree about which mode a message is in,
+    // and the caller then sees a native-shape "missing field" error for a
+    // conformant CloudEvents post.
     let structured = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .trim_start()
-                .starts_with("application/cloudevents+json")
-        });
+        .is_some_and(crate::core::is_cloudevent_media_type);
     let binary = headers.keys().any(|name| {
         name.as_str()
             .starts_with(crate::core::CLOUDEVENT_HEADER_PREFIX)
     });
     if structured || binary {
-        let pairs: Vec<(&str, &str)> = headers
-            .iter()
-            .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)))
-            .collect();
+        let mut pairs: Vec<(&str, &str)> = Vec::with_capacity(headers.len());
+        for (name, value) in headers {
+            match value.to_str() {
+                Ok(value) => pairs.push((name.as_str(), value)),
+                // Dropped silently, a raw-UTF8 `ce-source` reads as a
+                // *missing* source rather than as the illegal header it is
+                // (the binding says to percent-encode it).
+                Err(_)
+                    if name
+                        .as_str()
+                        .starts_with(crate::core::CLOUDEVENT_HEADER_PREFIX) =>
+                {
+                    return Err(ApiError(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "header '{name}' is not visible ASCII — the CloudEvents HTTP \
+                             binding percent-encodes non-ASCII attribute values"
+                        ),
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
         return CloudEvent::from_http(pairs, body)
             .map(DeliverInput::Cloud)
             .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()));
     }
-    serde_json::from_slice::<DeliverBody>(body)
-        .map(DeliverInput::Native)
-        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))
+    let body = serde_json::from_slice::<DeliverBody>(body)
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
+    // The same non-emptiness the CloudEvents shape enforces: an empty id
+    // collapses every one of a caller's events into one deduplication key,
+    // and an empty kind can never match a waiter.
+    if body.id.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "an event needs a non-empty 'id'".to_owned(),
+        ));
+    }
+    if body.kind.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "an event needs a non-empty 'kind'".to_owned(),
+        ));
+    }
+    Ok(DeliverInput::Native(body))
 }
 
 async fn deliver(
@@ -1350,11 +1416,15 @@ async fn deliver(
     // counterparty's data enters through — see [`peer_source`].
     let event = input.into_event(peer_source(&s.caller.actor));
 
-    let delivery = s
-        .plane
-        .deliver(&event)
-        .await
-        .map_err(|e| ApiError(StatusCode::CONFLICT, e.to_string()))?;
+    // A store outage is the plane's problem, answered 503 so a conformant bus
+    // retries; everything else is a statement about the request, and a 409 a
+    // bus treats as permanent is the honest answer only for those.
+    let delivery = s.plane.deliver(&event).await.map_err(|e| match e {
+        crate::core::RuntimeError::Store(_) => {
+            ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+        }
+        _ => ApiError(StatusCode::CONFLICT, e.to_string()),
+    })?;
 
     // Spelled out rather than `Debug`-formatted: this is a wire contract, and a
     // client keying on it should not break when someone renames a field.

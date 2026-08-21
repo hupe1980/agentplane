@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.20.0"
+version      = "0.21.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -79,6 +79,10 @@ mcp = ["dep:rmcp"]
 # `tokio/process`, which an embedder bringing their own transport should not
 # pay for.
 mcp-stdio = ["mcp", "rmcp/transport-child-process"]
+# Reach an MCP server over streamable HTTP — the transport remote servers
+# speak. Separate for the same reason as `mcp-stdio`: it costs a reqwest
+# stack an embedder bringing their own transport should not pay for.
+mcp-http = ["mcp", "rmcp/transport-streamable-http-client-reqwest"]
 # HTTP surface for operators: worklist, run status, event delivery. `tokio/net`
 # and `rt-multi-thread` are the listener — the base tokio features are short of
 # a server by exactly that.

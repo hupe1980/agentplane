@@ -58,6 +58,107 @@ pub async fn check_cases(store: &Arc<dyn CaseStore>, r: &mut Report) {
     enumeration_pages_without_gap_or_overlap(store, r).await;
     an_imported_case_is_reachable_by_every_read_path(store, r).await;
     concurrent_attaches_all_land_and_land_once(store, r).await;
+    a_breached_obligation_is_listable_and_survives_closure(store, r).await;
+}
+
+/// A missed obligation is findable without knowing which case to open, and
+/// stays findable after that case is closed.
+///
+/// Delivering a breach through the case it escalated is the trap: that is a
+/// status, `close` admits a case once nothing is still *outstanding*, and a
+/// breach is not outstanding — so the last handle on a missed regulatory window
+/// goes exactly when the case stops being watched.
+///
+/// Three halves, because a listing that answered "everything" would satisfy the
+/// first two: the breach must appear, it must still appear after closure, and
+/// an obligation that was *met* must not appear at all.
+async fn a_breached_obligation_is_listable_and_survives_closure(
+    store: &Arc<dyn CaseStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let Ok(opened) = store
+        .correlate_or_open("matter", &keys("BRE-1"), ts(1_000))
+        .await
+    else {
+        return;
+    };
+    let case = opened.case_id();
+    let deadline = |name: &str| crate::core::Deadline {
+        case,
+        name: name.to_owned(),
+        resolved_at: ts(9_000),
+        calendar_digest: crate::core::Digest::of(b"cal"),
+        warn_at: None,
+        state: crate::core::DeadlineState::Pending,
+    };
+    if store.register_deadline(&deadline("missed")).await.is_err()
+        || store.register_deadline(&deadline("kept")).await.is_err()
+    {
+        r.record("breach listing", "register_deadline failed");
+        return;
+    }
+    let _ = store
+        .set_deadline_state(case, "missed", crate::core::DeadlineState::Breached)
+        .await;
+    let _ = store
+        .set_deadline_state(case, "kept", crate::core::DeadlineState::Met)
+        .await;
+
+    let mine = |list: Vec<crate::core::Deadline>| -> Vec<String> {
+        list.into_iter()
+            .filter(|d| d.case == case)
+            .map(|d| d.name)
+            .collect()
+    };
+
+    match store.breached(1_000).await {
+        Ok(list) => {
+            let names = mine(list);
+            if !names.iter().any(|n| n == "missed") {
+                r.record(
+                    "breach listing",
+                    "a breached obligation was not listed, so the only party who \
+                     could find it is one who already knows which case to open",
+                );
+            }
+            if names.iter().any(|n| n == "kept") {
+                r.record(
+                    "breach listing",
+                    "an obligation that was met was listed as breached — the \
+                     listing does not read state, so every finding in it is noise",
+                );
+            }
+        }
+        Err(e) => {
+            r.record("breach listing", format!("breached() failed with {e}"));
+            return;
+        }
+    }
+
+    if store.close(case).await.is_err() {
+        r.record(
+            "breach listing",
+            "a case whose obligations are resolved-or-breached must be closable",
+        );
+        return;
+    }
+    match store.breached(1_000).await {
+        Ok(list) => {
+            if !mine(list).iter().any(|n| n == "missed") {
+                r.record(
+                    "breach listing",
+                    "closing the case took the breach off the list. Closure is \
+                     when people stop looking, which is precisely when the \
+                     record has to outlive the status that produced it",
+                );
+            }
+        }
+        Err(e) => r.record(
+            "breach listing",
+            format!("breached() failed after closure with {e}"),
+        ),
+    }
 }
 
 /// Every mutation of a matter that does not exist says so.
@@ -1018,7 +1119,7 @@ async fn a_satisfied_waiter_does_not_claim_a_second_event(
         r.record(
             "one-shot subscription",
             format!(
-                "a second event was claimed for {} through a subscription its                  first event already satisfied — the second is parked under a                  claim nobody will consume, and a claimed event never                  dead-letters, so it vanishes from every listing",
+                "a second event was claimed for {} through a subscription its first event already satisfied — the second is parked under a claim nobody will consume, and a claimed event never dead-letters, so it vanishes from every listing",
                 matched.run
             ),
         );
@@ -1241,7 +1342,7 @@ async fn a_claimed_event_is_never_retired(store: &Arc<dyn EventStore>, r: &mut R
             if dead.iter().any(|d| d.event.id == "evt-swept") {
                 r.record(
                     "sweep",
-                    "an event that was claimed and delivered was retired as unclaimed.                      The run already resumed on it, so the dead-letter queue is now                      reporting a message that was in fact acted on",
+                    "an event that was claimed and delivered was retired as unclaimed. The run already resumed on it, so the dead-letter queue is now reporting a message that was in fact acted on",
                 );
             }
         }
@@ -1495,6 +1596,10 @@ pub async fn check_tasks(store: &Arc<dyn TaskStore>, r: &mut Report) {
     a_take_over_names_its_holder_and_keeps_the_exclusions(store, r).await;
     an_expired_task_is_not_resurrected_by_a_claim(store, r).await;
     a_state_write_to_a_missing_task_is_not_found(store, r).await;
+    escalation_widens_the_audience_and_frees_the_reservation(store, r).await;
+    an_escalated_task_leaves_the_overdue_scan(store, r).await;
+    a_decided_task_is_not_resurrected_by_escalation(store, r).await;
+    a_role_name_is_stored_verbatim(store, r).await;
 }
 
 /// **A claim racing an expiry cannot resurrect the task.**
@@ -1693,7 +1798,7 @@ async fn the_backlog_counts_work_somebody_is_holding(store: &Arc<dyn TaskStore>,
         r.record(
             "backlog",
             format!(
-                "the backlog moved from {before} to {claimed} when a task was merely                  claimed. A task somebody is holding is still a decision the plane is                  waiting on, so this reports progress that has not happened"
+                "the backlog moved from {before} to {claimed} when a task was merely claimed. A task somebody is holding is still a decision the plane is waiting on, so this reports progress that has not happened"
             ),
         );
     }
@@ -1711,7 +1816,7 @@ async fn the_backlog_counts_work_somebody_is_holding(store: &Arc<dyn TaskStore>,
         r.record(
             "backlog",
             format!(
-                "the backlog went from {claimed} to {done} when a task was completed;                  it must fall by exactly one. A count that never moves is a dashboard                  that cannot show the queue draining"
+                "the backlog went from {claimed} to {done} when a task was completed; it must fall by exactly one. A count that never moves is a dashboard that cannot show the queue draining"
             ),
         );
     }
@@ -1726,6 +1831,7 @@ fn task(id: u8, excluded: Option<&str>) -> Task {
         kind: "approval".into(),
         justification: Justification::new("needs a person", serde_json::json!({})),
         candidate_roles: vec!["ops".into()],
+        escalate_to: Vec::new(),
         assignee: None,
         priority: Priority::Normal,
         state: TaskState::Open,
@@ -1733,6 +1839,240 @@ fn task(id: u8, excluded: Option<&str>) -> Task {
         excluded_actors: excluded.map(|a| vec![a.to_owned()]).unwrap_or_default(),
         created_at: ts(1_000),
         due_at: None,
+    }
+}
+
+/// **Escalation is a widening, not a flag.**
+///
+/// `TaskStore::escalate` must move three facts in one verb: the state says
+/// what happened, the stale reservation is cleared — the claim belonged to
+/// the window that closed, and an escalation that leaves the task assigned
+/// to whoever sat on it has widened the audience to people who cannot claim
+/// the row — and the declared `escalate_to` roles join the audience as a
+/// union, because the original reviewers remain eligible. The four-eyes
+/// exclusion must survive it: the proposer is barred from the wider audience
+/// exactly as from the narrow one.
+async fn escalation_widens_the_audience_and_frees_the_reservation(
+    store: &Arc<dyn TaskStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let mut t = task(60, Some("mallory"));
+    t.on_expiry = OnExpiry::Escalate;
+    t.escalate_to = vec!["ops-lead".into()];
+    if store.open(&t).await.is_err() {
+        r.record("escalation", "open failed");
+        return;
+    }
+    // Claimed and sat on: the shape the sweep escalates past.
+    if store
+        .claim(t.id, "alice", &["ops".to_owned()])
+        .await
+        .is_err()
+    {
+        r.record("escalation", "an eligible actor could not claim");
+        return;
+    }
+    let escalated = match store.escalate(t.id).await {
+        Ok(task) => task,
+        Err(e) => {
+            r.record("escalation", format!("escalate failed: {e}"));
+            return;
+        }
+    };
+    if escalated.state != TaskState::Escalated {
+        r.record("escalation", "the state does not say what happened");
+    }
+    if escalated.assignee.is_some() {
+        r.record(
+            "escalation",
+            "the stale reservation survived — the widened audience is being \
+             shown a task only the absent holder can act on",
+        );
+    }
+    if !escalated.candidate_roles.iter().any(|x| x == "ops-lead") {
+        r.record(
+            "escalation",
+            "the declared escalation audience was not added — the widening \
+             the manifest promised did not happen",
+        );
+    }
+    if !escalated.candidate_roles.iter().any(|x| x == "ops") {
+        r.record(
+            "escalation",
+            "the original audience was dropped — that is a reassignment, not \
+             a widening",
+        );
+    }
+    // The wider audience can act on it now.
+    if store
+        .claim(t.id, "lena", &["ops-lead".to_owned()])
+        .await
+        .is_err()
+    {
+        r.record(
+            "escalation",
+            "a reviewer from the escalation audience could not claim the \
+             escalated task, so the widening exists only as data",
+        );
+    }
+    if store.release(t.id, "lena").await.is_err() {
+        r.record("escalation", "the new holder could not release");
+    }
+    // Four-eyes does not thin because nobody answered.
+    if store
+        .claim(t.id, "mallory", &["ops-lead".to_owned()])
+        .await
+        .is_ok()
+    {
+        r.record(
+            "four-eyes",
+            "the proposer claimed the task after escalation — the exclusion \
+             must survive the audience widening, or escalating a proposal is \
+             how its proposer gets to approve it",
+        );
+    }
+}
+
+/// **An escalated task leaves the overdue scan.**
+///
+/// `overdue` drives the sweep that applies each task's declared expiry
+/// policy, and escalation is that policy having fired. An escalated task is
+/// pending and past due forever — deciding it is exactly what did not happen
+/// — so a scan that keeps returning it fills its bounded, oldest-first batch
+/// with rows the sweep will no-op, and the `deny`/`proceed` tasks queued
+/// behind them silently stop expiring. The positive half is load-bearing: a
+/// scan broken for everybody would also return nothing.
+async fn an_escalated_task_leaves_the_overdue_scan(store: &Arc<dyn TaskStore>, r: &mut Report) {
+    r.checked += 1;
+    let mut escalating = task(61, None);
+    escalating.on_expiry = OnExpiry::Escalate;
+    escalating.escalate_to = vec!["ops-lead".into()];
+    escalating.due_at = Some(ts(2_000));
+    let mut denying = task(62, None);
+    denying.due_at = Some(ts(2_500));
+    if store.open(&escalating).await.is_err() || store.open(&denying).await.is_err() {
+        r.record("escalation", "open failed");
+        return;
+    }
+    let now = ts(3_000);
+    let before = store.overdue(now, 50).await.unwrap_or_default();
+    if !before.iter().any(|x| x.id == escalating.id) {
+        r.record(
+            "escalation",
+            "an open task past its window is missing from the overdue scan",
+        );
+        return;
+    }
+    if store.escalate(escalating.id).await.is_err() {
+        r.record("escalation", "escalate failed");
+        return;
+    }
+    let after = store.overdue(now, 50).await.unwrap_or_default();
+    if after.iter().any(|x| x.id == escalating.id) {
+        r.record(
+            "escalation",
+            "an escalated task is still in the overdue scan. Its expiry \
+             policy has already fired, so every later sweep re-selects and \
+             no-ops it; enough of them fill the bounded batch and the expiry \
+             policies of the tasks behind them never fire at all",
+        );
+    }
+    if !after.iter().any(|x| x.id == denying.id) {
+        r.record(
+            "escalation",
+            "a task still awaiting its expiry policy vanished from the scan",
+        );
+    }
+}
+
+/// **A racing decision beats an escalation.**
+///
+/// The sweep reads `overdue`, then escalates; a reviewer decides in between.
+/// `escalate` keyed on nothing would write `escalated` over `completed`,
+/// un-deciding the answer — the same race `an_expired_task_is_not_resurrected`
+/// pins for the expiry write.
+async fn a_decided_task_is_not_resurrected_by_escalation(
+    store: &Arc<dyn TaskStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let mut t = task(63, None);
+    t.on_expiry = OnExpiry::Escalate;
+    t.escalate_to = vec!["ops-lead".into()];
+    if store.open(&t).await.is_err() {
+        r.record("escalation", "open failed");
+        return;
+    }
+    if store.set_state(t.id, TaskState::Completed).await.is_err() {
+        r.record("escalation", "the fixture could not complete its task");
+        return;
+    }
+    match store.escalate(t.id).await {
+        Ok(after) => {
+            if after.state != TaskState::Completed {
+                r.record(
+                    "escalation",
+                    "escalating a decided task changed its state — the \
+                     decision that won the race was un-decided by the sweep",
+                );
+            }
+        }
+        Err(e) => r.record(
+            "escalation",
+            format!("escalate errored on a decided task: {e}"),
+        ),
+    }
+}
+
+/// **A role or actor name is data, not syntax.**
+///
+/// The store does not get to constrain the alphabet of the four-eyes
+/// control's operands: an exclusion list that round-trips 'a,b' as two
+/// actors named neither has un-barred the person it exists to bar. Both
+/// halves matter — the names come back verbatim, and the exclusion still
+/// fires for the actor as named.
+async fn a_role_name_is_stored_verbatim(store: &Arc<dyn TaskStore>, r: &mut Report) {
+    r.checked += 1;
+    let mut t = task(64, Some("spiffe://acme/ns,prod/agent"));
+    t.candidate_roles = vec!["ops,eu".into()];
+    if store.open(&t).await.is_err() {
+        r.record("tasks", "open failed");
+        return;
+    }
+    let Ok(Some(read)) = store.task(t.id).await else {
+        r.record("tasks", "the task could not be read back");
+        return;
+    };
+    if read.candidate_roles != vec!["ops,eu".to_owned()]
+        || read.excluded_actors != vec!["spiffe://acme/ns,prod/agent".to_owned()]
+    {
+        r.record(
+            "four-eyes",
+            format!(
+                "a name did not round-trip verbatim: roles {:?}, excluded {:?}. \
+                 A delimiter the store chose has split somebody's identifier",
+                read.candidate_roles, read.excluded_actors
+            ),
+        );
+    }
+    if store
+        .claim(t.id, "spiffe://acme/ns,prod/agent", &["ops,eu".to_owned()])
+        .await
+        .is_ok()
+    {
+        r.record(
+            "four-eyes",
+            "the excluded actor claimed the task — the exclusion did not \
+             survive storage of the actor's own name",
+        );
+    }
+    if store
+        .claim(t.id, "someone-else", &["ops,eu".to_owned()])
+        .await
+        .is_err()
+    {
+        r.record("four-eyes", "an eligible actor was refused");
     }
 }
 
@@ -1944,5 +2284,72 @@ pub async fn check_batches(store: &Arc<dyn BatchStore>, r: &mut Report) {
             ),
         ),
         Err(e) => r.record("cursor", format!("cursor failed: {e}")),
+    }
+
+    check_batch_identity(store, id, r).await;
+}
+
+/// One batch runs one frozen plan, and the store's row is the only witness to
+/// which; the same row answers existence, and the exhausted mark must land or
+/// refuse. Split from [`check_batches`] only for length — it continues on the
+/// batch that function opened.
+async fn check_batch_identity(store: &Arc<dyn BatchStore>, id: BatchId, r: &mut Report) {
+    // Reopening under the same digest is an idempotent retry; reopening under
+    // another one must be refused, or items settle under a plan the batch's
+    // record does not name.
+    r.checked += 1;
+    if store.open(id, "digest").await.is_err() {
+        r.record(
+            "batches",
+            "reopening under the same plan digest was refused",
+        );
+    }
+    match store.open(id, "another-digest").await {
+        Err(StoreError::BatchPlanChanged { .. }) => {}
+        Err(e) => r.record(
+            "batches",
+            format!("a plan swap was refused with the wrong error: {e}"),
+        ),
+        Ok(()) => r.record(
+            "batches",
+            "reopening a batch under a different plan digest was accepted — items \
+             from here on would settle under a plan the batch's record does not name",
+        ),
+    }
+    match store.plan_digest(id).await {
+        Ok(Some(d)) if d == "digest" => {}
+        Ok(d) => r.record(
+            "batches",
+            format!("plan_digest answered {d:?} for a batch opened with 'digest'"),
+        ),
+        Err(e) => r.record("batches", format!("plan_digest failed: {e}")),
+    }
+    match store.plan_digest(BatchId::generate()).await {
+        Ok(None) => {}
+        Ok(Some(d)) => r.record(
+            "batches",
+            format!("plan_digest invented '{d}' for a batch that does not exist"),
+        ),
+        Err(e) => r.record(
+            "batches",
+            format!("plan_digest failed on a missing batch: {e}"),
+        ),
+    }
+
+    // The exhausted mark is the one bit that lets a census read as finished;
+    // written to nowhere it is lost with no symptom, so a mark on an unknown
+    // batch must refuse. The positive half: on a real batch it lands.
+    r.checked += 1;
+    if store.mark_exhausted(BatchId::generate()).await.is_ok() {
+        r.record(
+            "batches",
+            "marking an unknown batch exhausted reported success while writing nothing",
+        );
+    }
+    if store.mark_exhausted(id).await.is_err() {
+        r.record("batches", "marking a real batch exhausted failed");
+    }
+    if !store.is_exhausted(id).await.unwrap_or(false) {
+        r.record("batches", "the exhausted mark did not land");
     }
 }

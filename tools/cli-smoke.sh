@@ -16,6 +16,12 @@ YAML=examples/summariser.yaml
 echo "── validate ──"
 "${BIN[@]}" validate "$YAML"
 
+echo "── schema names its published home ──"
+schema="$("${BIN[@]}" schema)"
+echo "$schema" | grep -q '"\$id": "https://hupe1980.github.io/agentplane/agent.schema.json"' || {
+    echo "FAIL: the schema does not carry its published \$id"; exit 1; }
+echo "ok: schema"
+
 echo "── digest is stable ──"
 a="$("${BIN[@]}" digest "$YAML")"
 b="$("${BIN[@]}" digest "$YAML")"

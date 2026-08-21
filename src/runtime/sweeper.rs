@@ -67,15 +67,14 @@ pub(crate) const SWEEP_OUTCOME: &str = "swept";
 /// nothing happened, and a log of nothings is where the somethings hide.
 ///
 /// **Each decision is durable before it is applied** — I2's
-/// announce-before-act, applied to the sweeper itself. The ledger used to
-/// buffer its notes in memory and write them all when the tick ended, which
-/// inverted the invariant precisely where it matters most: the state changes a
-/// sweep applies (a breach, an escalation) are idempotent transitions, so a
-/// crash between applying them and sealing the buffered evidence did not
-/// merely delay the record — it orphaned it *permanently*, because the next
-/// tick found the transition already applied and re-decided nothing. So
-/// `note` appends immediately, before the caller touches state, and `seal`
-/// only closes the run the notes already live in.
+/// announce-before-act, applied to the sweeper itself. A note buffered until
+/// the tick ends inverts that precisely where it matters most: the state
+/// changes a sweep applies (a breach, an escalation) are idempotent
+/// transitions, so a crash between applying one and writing its buffered
+/// evidence orphans the record *permanently* — the next tick finds the
+/// transition already applied and re-decides nothing. So `note` appends
+/// immediately, before the caller touches state, and `seal` only closes the
+/// run the notes already live in.
 struct SweepLedger {
     run: Option<RunId>,
     /// Whether at least one note has durably landed — the difference between
@@ -140,8 +139,8 @@ impl SweepLedger {
     /// it is loud, because a sweep whose evidence is missing is the case this
     /// whole mechanism exists to prevent.
     ///
-    /// The three outcomes are distinct on purpose: a quiet tick and a tick whose
-    /// evidence write *failed* both used to return `None`, so a report could not
+    /// The three outcomes are distinct on purpose: one answer for both a quiet
+    /// tick and a tick whose evidence write *failed* leaves a report unable to
     /// tell "nothing happened" from "something happened and its record did not"
     /// — the exact detection-without-delivery failure I13 rules out, applied to
     /// the one run whose whole purpose is to make the sweeper's decisions
@@ -644,13 +643,13 @@ impl Runtime {
     /// The resumed run reads the timer back like any other completed effect,
     /// so none of the suspension machinery exists twice.
     ///
-    /// One run's failure does not block the runs behind it. The batch used to
-    /// stop at the first error, which handed a single unresumable run a veto
-    /// over every later wake in the tick — and the failed run heals anyway:
-    /// its wake was recorded under a lease this pass acquired and never
-    /// released, so the recovery pass finds it once that lease lapses. The
-    /// failure is counted rather than returned, because a caller that got a
-    /// count and an error would have neither.
+    /// One run's failure does not block the runs behind it: a batch that stops
+    /// at the first error hands a single unresumable run a veto over every
+    /// later wake in the tick — and the failed run heals anyway: its wake was
+    /// recorded under a lease this pass acquired and never released, so the
+    /// recovery pass finds it once that lease lapses. The failure is counted
+    /// rather than returned, because a caller that got a count and an error
+    /// would have neither.
     pub async fn fire_timers(&self, now: Timestamp) -> Result<WokenRuns, RuntimeError> {
         let timers = self.timers().ok_or_else(|| {
             RuntimeError::PlanContract(
@@ -794,10 +793,9 @@ impl Runtime {
                 // the whole deadline machinery exists to produce.
                 //
                 // The notes land **before** the transitions — I2, applied to
-                // the sweeper. The order used to be act-then-buffer, and a
-                // crash between the two orphaned the decision permanently:
-                // the transition is idempotent, so the next tick found it
-                // already applied and wrote nothing, leaving a breached case
+                // the sweeper. Acting first orphans the decision permanently:
+                // the transition is idempotent, so the next tick finds it
+                // already applied and writes nothing, leaving a breached case
                 // with no durable account of who breached it or when. Written
                 // first, a crash leaves a note whose transition the next tick
                 // re-applies — a duplicate decision on the record, which is
@@ -823,12 +821,19 @@ impl Runtime {
                         Some(format!("obligation '{}' was breached", deadline.name)),
                     )
                     .await?;
+                // The de-indexing write goes last. `due` selects obligations
+                // that are still outstanding, so writing `Breached` is what
+                // removes this one from the pass driving it — put anything
+                // after that write and a crash there strands a breach no tick
+                // will select again. Escalating twice is a no-op, so the order
+                // that repeats work is the order that is safe. `sweep_tasks`
+                // follows the same rule.
                 cases
-                    .set_deadline_state(deadline.case, &deadline.name, DeadlineState::Breached)
+                    .set_status(deadline.case, CaseStatus::Escalated)
                     .await
                     .map_err(RuntimeError::from_store)?;
                 cases
-                    .set_status(deadline.case, CaseStatus::Escalated)
+                    .set_deadline_state(deadline.case, &deadline.name, DeadlineState::Breached)
                     .await
                     .map_err(RuntimeError::from_store)?;
                 tracing::error!(
@@ -882,9 +887,12 @@ impl Runtime {
         }
         for task in overdue {
             match task.on_expiry {
-                // Widen the audience and keep waiting. Escalating twice is a
-                // no-op, which is what makes the sweep safe to run on a timer.
-                OnExpiry::Escalate if task.state != TaskState::Escalated => {
+                // Widen the audience, clear the stale reservation, and keep
+                // waiting. `escalate` is the write that removes the task from
+                // `overdue`, so it goes last (the note is already durable) —
+                // a crash between the two re-selects the task next tick and
+                // repeats the note, which is the affordable direction.
+                OnExpiry::Escalate => {
                     ledger
                         .note(
                             self.store(),
@@ -895,12 +903,11 @@ impl Runtime {
                         )
                         .await?;
                     tasks
-                        .set_state(task.id, TaskState::Escalated)
+                        .escalate(task.id)
                         .await
                         .map_err(RuntimeError::from_store)?;
                     report.tasks_escalated += 1;
                 }
-                OnExpiry::Escalate => {}
 
                 // Deny or proceed: both are decisions that were made in advance,
                 // and both resume the run with a recorded answer rather than

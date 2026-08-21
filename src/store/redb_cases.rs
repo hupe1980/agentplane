@@ -1114,6 +1114,36 @@ impl CaseStore for RedbStore {
         .await
     }
 
+    async fn breached(&self, limit: usize) -> Result<Vec<Deadline>, StoreError> {
+        let tenant = self.tenant_name();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let d = r.open_table(DEADLINES).map_err(|e| be(&e))?;
+            let mut out = Vec::new();
+            // The primary, not an index. `DEADLINES_DUE` earns its upkeep by
+            // being scanned every tick; this answers an operator, and a second
+            // copy of the state cannot drift from itself if it does not exist.
+            for e in d
+                .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                .map_err(|e| be(&e))?
+            {
+                let (k, v) = e.map_err(|e| be(&e))?;
+                let (_, case, name) = k.value();
+                let row = v.value();
+                if row.4 == DeadlineState::Breached.as_str() {
+                    out.push(build_deadline(case, name, row)?);
+                }
+            }
+            // Sorted before the limit bites, so a truncated answer is the
+            // longest-overdue obligations and not whichever the key order
+            // reached first.
+            out.sort_by_key(|d| d.resolved_at);
+            out.truncate(limit);
+            Ok(out)
+        })
+        .await
+    }
+
     async fn by_status(&self, status: CaseStatus, limit: usize) -> Result<Vec<Case>, StoreError> {
         let tenant = self.tenant_name();
         let s = status.as_str().to_owned();

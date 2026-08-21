@@ -207,14 +207,15 @@ impl PushStore for RedbStore {
             let Ok(cursors) = r.open_table(PUSH_CURSOR) else {
                 return Ok(Vec::new());
             };
-            let mut out = Vec::new();
+            // Longest-due first, the same order `due_in` serves and the
+            // postgres twin returns. A key-ordered window under persistent
+            // saturation is a ranking by name: a lexically late registration
+            // that is continuously due would never be served at all.
+            let mut due: Vec<(String, String, Cursor)> = Vec::new();
             for entry in cursors
                 .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
                 .map_err(|e| be(&e))?
             {
-                if out.len() >= limit {
-                    break;
-                }
                 let (key, raw) = entry.map_err(|e| be(&e))?;
                 let cursor: Cursor = serde_json::from_str(raw.value())
                     .map_err(|error| StoreError::Backend(error.to_string()))?;
@@ -222,13 +223,19 @@ impl PushStore for RedbStore {
                     continue;
                 }
                 let (_, task, id) = key.value();
+                due.push((task.to_owned(), id.to_owned(), cursor));
+            }
+            due.sort_by_key(|(_, _, cursor)| cursor.next_attempt_at);
+            due.truncate(limit);
+            let mut out = Vec::new();
+            for (task, id, cursor) in due {
                 let Some(value) = configs
-                    .get((tenant.as_str(), task, id))
+                    .get((tenant.as_str(), task.as_str(), id.as_str()))
                     .map_err(|e| be(&e))?
                 else {
                     continue;
                 };
-                out.push(registration_from(task, id, value.value(), cursor)?);
+                out.push(registration_from(&task, &id, value.value(), cursor)?);
             }
             Ok(out)
         })
@@ -259,6 +266,7 @@ impl PushStore for RedbStore {
             // as a lower bound, and the exact foreign backlog is the most
             // honest lower bound a full scan can give.
             let mut batch = DueBatch::default();
+            let mut due: Vec<(String, String, Cursor)> = Vec::new();
             for entry in cursors
                 .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
                 .map_err(|e| be(&e))?
@@ -274,20 +282,24 @@ impl PushStore for RedbStore {
                     batch.unserved = batch.unserved.saturating_add(1);
                     continue;
                 }
-                if batch.rows.len() >= limit {
-                    // Own rows past the window are neither served nor foreign;
-                    // the scan continues only so the foreign count is whole.
-                    continue;
-                }
+                due.push((task.to_owned(), id.to_owned(), cursor));
+            }
+            // Longest-due first, as the postgres twin orders. A key-ordered
+            // window is a ranking by name: under persistent saturation a
+            // lexically early registration that is continuously due re-enters
+            // every window, and a lexically late one is never served at all.
+            due.sort_by_key(|(_, _, cursor)| cursor.next_attempt_at);
+            due.truncate(limit);
+            for (task, id, cursor) in due {
                 let Some(value) = configs
-                    .get((tenant.as_str(), task, id))
+                    .get((tenant.as_str(), task.as_str(), id.as_str()))
                     .map_err(|e| be(&e))?
                 else {
                     continue;
                 };
                 batch
                     .rows
-                    .push(registration_from(task, id, value.value(), cursor)?);
+                    .push(registration_from(&task, &id, value.value(), cursor)?);
             }
             Ok(batch)
         })

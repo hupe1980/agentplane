@@ -119,6 +119,11 @@ pub const QUARANTINED: &str = "agentplane.run.quarantined";
 pub const RUN_FAILED: &str = "agentplane.run.failed";
 /// An outcome could not be determined and guessing was forbidden.
 pub const UNDECIDABLE: &str = "agentplane.effect.undecidable";
+/// A read pinned by digest or version came back different.
+///
+/// Names one run, and says nothing about which *others* read the same version —
+/// only an audit answers that, which is what this event exists to start.
+pub const UNREPRODUCIBLE: &str = "agentplane.run.unreproducible";
 /// A probe was asked whether a call landed.
 pub const RECONCILED: &str = "agentplane.effect.reconciled";
 /// A limit refused an operation before it started.
@@ -148,6 +153,7 @@ pub const LOUD_EVENTS: &[&str] = &[
     NONDETERMINISM,
     QUARANTINED,
     UNDECIDABLE,
+    UNREPRODUCIBLE,
     RECONCILED,
     BUDGET_REFUSED,
     COMPENSATED,

@@ -350,6 +350,12 @@ impl ApiResponse {
 /// Whatever the shape, it is part of the effect key — a changed prompt is a
 /// changed effect.
 fn messages(prompt: &Value) -> Vec<Value> {
+    // An array is the wire's own turn list and passes through verbatim, as
+    // every other driver passes its native transcript — stringified, a whole
+    // conversation would arrive as one quoted user string, silently.
+    if let Value::Array(turns) = prompt {
+        return turns.clone();
+    }
     let mut out = Vec::new();
     if let Some(system) = prompt.get("system").filter(|s| !s.is_null()) {
         let content = match system {
@@ -357,6 +363,12 @@ fn messages(prompt: &Value) -> Vec<Value> {
             other => other.to_string(),
         };
         out.push(json!({ "role": "system", "content": content }));
+    }
+    // `messages` beside `system`: the wire's turn list with the instruction
+    // kept in the one vocabulary every driver shares.
+    if let Some(Value::Array(turns)) = prompt.get("messages") {
+        out.extend(turns.iter().cloned());
+        return out;
     }
     let user = match prompt {
         Value::String(s) => s.clone(),
@@ -460,6 +472,14 @@ impl ChatCompletions {
                 detail: "the continuation was not a chat-completions message array".to_owned(),
             });
         }
+        if continuation.is_some() && exchanges.is_empty() {
+            // Silently dropping it would journal an effect key that records a
+            // continuation the wire never carried.
+            return Err(ModelError::Refused {
+                model: model.clone(),
+                detail: "a continuation without tool exchanges has no request to follow".to_owned(),
+            });
+        }
         let mut msgs = messages(prompt);
         continue_with(&mut msgs, exchanges, continuation);
         let mut body = json!({
@@ -470,6 +490,24 @@ impl ChatCompletions {
             "max_tokens": max_output_tokens,
         });
         if let Some(schema) = schema {
+            if self.mode_for(model) == SchemaMode::ForcedTool && !tools.is_empty() {
+                // The fallback spends `tools` and `tool_choice` on the
+                // answer's shape; merged with real tools, whichever was
+                // written second would silently replace the first while
+                // `tool_choice` still forced the replaced one — a request
+                // this driver itself constructed invalid.
+                return Err(ModelError::Refused {
+                    model: model.clone(),
+                    detail: format!(
+                        "model '{}' obtains a declared response schema by forcing a \
+                         synthetic tool, which cannot be combined with the {} tool(s) \
+                         this request declares. Use a server with native `json_schema` \
+                         support, or drop the schema and validate the answer yourself",
+                        model.model,
+                        tools.len()
+                    ),
+                });
+            }
             match self.mode_for(model) {
                 SchemaMode::Native => {
                     // `strict: true` is what turns the schema from a
@@ -607,10 +645,10 @@ impl ChatCompletions {
                         .to_owned(),
                 });
             };
-            let parsed_schema = structured(schema, &raw, model, usage)?;
+            let parsed_schema = structured(schema, &raw, &[], model, usage)?;
             (raw, parsed_schema)
         } else {
-            let parsed_schema = structured(schema, &text, model, usage)?;
+            let parsed_schema = structured(schema, &text, &calls, model, usage)?;
             (text, parsed_schema)
         };
 
@@ -861,6 +899,16 @@ impl ModelProvider for ChatCompletions {
         } else {
             self.read_buffered(response, model, schema).await?
         };
+        // A buffered call still answers the observer's one guaranteed
+        // question — what did this cost — as every driver does on both paths.
+        if !self.stream
+            && let Some((observer, label)) = stream
+        {
+            observer.event(crate::core::Tainted::with_label(
+                super::ModelStreamEvent::Usage(completion.usage),
+                label.clone(),
+            ));
+        }
         accumulate_continuation(&mut completion, continuation, exchanges);
         Ok(completion)
     }

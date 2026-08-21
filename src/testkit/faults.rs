@@ -298,11 +298,11 @@ impl JournalStore for Faulty {
 
     /// The wrapped store's tenant, passed through undamaged.
     ///
-    /// The default is the default tenant, so a faulty wrapper around a
-    /// tenant-scoped store previously *misreported* who it serves — and the
-    /// runtime builder's startup check, which exists to refuse exactly that
-    /// mismatch, would have refused a correctly-scoped store or admitted a
-    /// wrongly-scoped one depending on which side wore the wrapper.
+    /// Taking the default instead would make a faulty wrapper around a
+    /// tenant-scoped store *misreport* who it serves — and the runtime
+    /// builder's startup check, which exists to refuse exactly that mismatch,
+    /// would refuse a correctly-scoped store or admit a wrongly-scoped one
+    /// depending on which side wore the wrapper.
     fn tenant(&self) -> &str {
         self.inner.tenant()
     }

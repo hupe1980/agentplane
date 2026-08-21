@@ -45,14 +45,21 @@ fn phase_str(p: Phase) -> &'static str {
     }
 }
 
-fn phase_from(s: &str) -> Phase {
-    match s {
+/// A row this store cannot read is not a row with a default value: `phase`
+/// tells a step's forward pass from its compensating one, and an unreadable
+/// value answered `Forward` hands the unwind logic a compensating record
+/// wearing the wrong half of the saga.
+fn phase_from(s: &str) -> Result<Phase, StoreError> {
+    Ok(match s {
+        "forward" => Phase::Forward,
         "compensating" => Phase::Compensating,
-        // An unknown value can only come from a future version. Treating it as
-        // forward keeps the read total rather than failing a wake-up on a
-        // column it does not recognise.
-        _ => Phase::Forward,
-    }
+        other => {
+            return Err(StoreError::Corrupt {
+                seq: 0,
+                detail: format!("unknown timer phase '{other}'"),
+            });
+        }
+    })
 }
 
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
@@ -88,7 +95,7 @@ fn build(
             detail: format!("bad effect key '{effect}': {e}"),
         })?,
         step: crate::core::StepId(step),
-        phase: phase_from(phase),
+        phase: phase_from(phase)?,
         fire_at: Timestamp::from_unix_timestamp(fire_at).map_err(|e| StoreError::Corrupt {
             seq: 0,
             detail: format!("unrepresentable timestamp {fire_at}: {e}"),
@@ -313,5 +320,35 @@ impl RedbStore {
             Ok(n)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    /// Both phases round-trip; the pair cannot drift while this passes.
+    #[test]
+    fn every_written_phase_decodes_to_the_value_that_wrote_it() {
+        for phase in [Phase::Forward, Phase::Compensating] {
+            assert_eq!(phase_from(phase_str(phase)).expect("round trip"), phase);
+        }
+    }
+
+    /// **A phase this store cannot read is damage, not `Forward`.**
+    ///
+    /// The phase tells a step's forward pass from its compensating one, so a
+    /// damaged column answered `Forward` hands the unwind logic a compensating
+    /// record wearing the wrong half of the saga — the same refusal the
+    /// shared-store backend makes, held here so the two cannot disagree at
+    /// the boundary nobody probed.
+    #[test]
+    fn an_unreadable_timer_phase_is_refused_rather_than_defaulted() {
+        for bad in ["", "Forward", "compensating "] {
+            assert!(
+                matches!(phase_from(bad).err(), Some(StoreError::Corrupt { .. })),
+                "phase '{bad}' decoded instead of refusing"
+            );
+        }
     }
 }

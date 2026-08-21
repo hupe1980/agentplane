@@ -14,7 +14,7 @@
 //!
 //! | `ServiceError` | Disposition | Why |
 //! |---|---|---|
-//! | `McpError` (`METHOD_NOT_FOUND`, `INVALID_PARAMS`, parse) | `DidNotHappen` | the server parsed the request and declined it; the tool never ran |
+//! | `McpError` (`METHOD_NOT_FOUND`, `INVALID_PARAMS`, `INVALID_REQUEST`, parse) | `DidNotHappen` | the server judged the request unrunnable and declined it; the tool never ran |
 //! | `McpError` (anything else) | `InDoubt` | the server errored, possibly mid-execution |
 //! | `Timeout` | `InDoubt` | sent, no answer — a timeout is not evidence |
 //! | `Cancelled` | `InDoubt` | *we* gave up; the server may still be running it |
@@ -44,12 +44,13 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CancelTaskParams, ClientInfo, ErrorCode,
     ExtensionCapabilities, GetPromptRequestParams, GetPromptResponse, GetTaskParams,
-    InputResponses, JsonObject, ReadResourceRequestParams, ReadResourceResponse,
+    InputResponses, JsonObject, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
     TASKS_EXTENSION_ID, UpdateTaskParams,
 };
 use rmcp::service::{RoleClient, RunningService, ServiceError};
@@ -157,6 +158,10 @@ impl McpAccess {
                 );
             }
         }
+        if let Some(grant) = manifest.task_input_grant(server) {
+            access =
+                access.task_input(McpDataSafety::public().max_input(grant.max_input_sensitivity));
+        }
         access
     }
 }
@@ -171,6 +176,16 @@ pub struct McpClient {
     server: String,
     service: Arc<RunningService<RoleClient, ClientInfo>>,
     access: McpAccess,
+    /// The whole-request deadline for every call through this client.
+    ///
+    /// The transport itself waits forever: a wedged server — child process
+    /// alive, never answering — would otherwise hang the dispatching step with
+    /// nothing journaled and nothing for the sweeper to sweep. Every other
+    /// dereference in this crate carries a whole-request timeout; this is MCP
+    /// held to the same rule. Expiry is classified through the same table as a
+    /// transport timeout: `InDoubt`, because a deadline is not evidence about
+    /// what the server did.
+    timeout: Duration,
 }
 
 impl McpClient {
@@ -191,30 +206,82 @@ impl McpClient {
         // the negotiated dialect in either direction; the wire test asserts
         // the negotiated string byte-for-byte. What this does NOT do is
         // reject a server that negotiates the connection down to an older
-        // version — rmcp's handshake accepts the server's answer, and a
-        // deployment that must refuse old servers has to check
-        // `peer_info().protocol_version` itself after connecting.
-        info.protocol_version = rmcp::model::ProtocolVersion::V_2026_07_28;
+        // version — rmcp's handshake accepts the server's answer, and
+        // [`new`](Self::new) refuses only a version this host has never heard
+        // of, because an unknown dialect cannot even be downgraded to.
+        info.protocol_version = ProtocolVersion::V_2026_07_28;
+        // The identity a server's logs and allowlists see. rmcp's default
+        // names the SDK it was compiled from, which is the wrong party: the
+        // server is talking to this plane, not to its HTTP library.
+        info.client_info =
+            rmcp::model::Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         let mut extensions = ExtensionCapabilities::new();
         extensions.insert(TASKS_EXTENSION_ID.to_owned(), JsonObject::new());
         info.capabilities.extensions = Some(extensions);
         info
     }
 
+    /// Every protocol revision this host knows how to speak.
+    ///
+    /// Negotiating *down* within this set is the protocol working and stays
+    /// legible through [`negotiated_version`](Self::negotiated_version).
+    /// Negotiating *outside* it is refused at construction: rmcp deserializes
+    /// any string into a version, so without this check a server answering
+    /// `2099-01-01` would proceed on a dialect nobody implements — and the
+    /// spec's own instruction for an unsupported answer is to disconnect.
+    const KNOWN_VERSIONS: [ProtocolVersion; 5] = [
+        ProtocolVersion::V_2024_11_05,
+        ProtocolVersion::V_2025_03_26,
+        ProtocolVersion::V_2025_06_18,
+        ProtocolVersion::V_2025_11_25,
+        ProtocolVersion::V_2026_07_28,
+    ];
+
     /// Wrap an already-initialised rmcp client.
     ///
     /// Taking the running service rather than a connection string keeps every
     /// transport — stdio, a child process, streamable HTTP — a caller's choice.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// If the handshake settled on a protocol version this host does not
+    /// speak. Nothing was called: the refusal exists precisely so that no
+    /// request is ever issued in an unknown dialect.
     pub fn new(
         server: impl Into<String>,
         service: Arc<RunningService<RoleClient, ClientInfo>>,
-    ) -> Self {
-        Self {
-            server: server.into(),
+    ) -> Result<Self, ToolError> {
+        let server = server.into();
+        if let Some(info) = service.peer_info() {
+            let negotiated = &info.protocol_version;
+            if !Self::KNOWN_VERSIONS.contains(negotiated) {
+                return Err(ToolError::Unreachable {
+                    tool: ToolId::new(&server, "initialize"),
+                    detail: format!(
+                        "the server negotiated MCP protocol version '{}', which this \
+                         host does not speak — proceeding would issue requests in a \
+                         dialect nobody here implements",
+                        negotiated.as_str()
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            server,
             service,
             access: McpAccess::default(),
-        }
+            timeout: Self::DEFAULT_TIMEOUT,
+        })
+    }
+
+    /// The default whole-request deadline; see the field's reasoning.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Bound every call through this client by a different deadline.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// The protocol version the handshake actually settled on.
@@ -280,6 +347,7 @@ impl McpClient {
             arguments,
             safety,
             service: Arc::clone(&self.service),
+            timeout: self.timeout,
         })
     }
 
@@ -297,15 +365,28 @@ impl McpClient {
             uri,
             safety,
             service: Arc::clone(&self.service),
+            timeout: self.timeout,
         })
     }
 
     /// Prepare a journaled poll of an MCP task returned by this server.
-    pub fn task(&self, task: McpTask) -> Result<McpTaskPoll, ToolError> {
+    ///
+    /// `output_sensitivity` is the declared ceiling for the snapshot this poll
+    /// returns — pass the originating tool's declared output sensitivity, the
+    /// same value the synchronous `tools/call` answer would have carried. The
+    /// poll cannot derive it: a task handle names a server and an id, not the
+    /// tool whose result it will eventually deliver.
+    pub fn task(
+        &self,
+        task: McpTask,
+        output_sensitivity: Sensitivity,
+    ) -> Result<McpTaskPoll, ToolError> {
         self.check_task_server(&task)?;
         Ok(McpTaskPoll {
             task,
             service: Arc::clone(&self.service),
+            timeout: self.timeout,
+            output_sensitivity,
         })
     }
 
@@ -349,6 +430,7 @@ impl McpClient {
             arguments,
             safety,
             service: Arc::clone(&self.service),
+            timeout: self.timeout,
         })
     }
 
@@ -358,6 +440,7 @@ impl McpClient {
         Ok(McpTaskCancel {
             task,
             service: Arc::clone(&self.service),
+            timeout: self.timeout,
         })
     }
 
@@ -383,9 +466,7 @@ impl McpClient {
     ///
     /// If the server cannot be listed.
     pub async fn discover(&self) -> Result<Vec<(ToolId, Advertised)>, ToolError> {
-        let listed = self
-            .service
-            .list_all_tools()
+        let listed = bounded(self.timeout, self.service.list_all_tools())
             .await
             .map_err(|e| Self::classify(&ToolId::new(&self.server, "tools/list"), &e))?;
 
@@ -415,13 +496,16 @@ impl McpClient {
     fn classify(tool: &ToolId, e: &ServiceError) -> ToolError {
         let detail = e.to_string();
         match e {
-            // The server parsed the request and declined it without running
-            // anything. The only genuinely safe-to-repeat class.
+            // The server judged the request unrunnable — unknown method, bad
+            // params, unparseable frame, or not a valid request object — and
+            // declined it before executing anything. The only genuinely
+            // safe-to-repeat class.
             ServiceError::McpError(err)
                 if matches!(
                     err.code,
                     ErrorCode::METHOD_NOT_FOUND
                         | ErrorCode::INVALID_PARAMS
+                        | ErrorCode::INVALID_REQUEST
                         | ErrorCode::PARSE_ERROR
                 ) =>
             {
@@ -535,6 +619,25 @@ pub struct McpTaskSnapshot {
     pub value: Value,
 }
 
+impl McpTaskSnapshot {
+    /// How many milliseconds from creation the server retains this task, when
+    /// it says. A poll loop that sleeps past it finds the task discarded — and
+    /// the answer to a discarded id is indistinguishable from "never existed",
+    /// so the deadline is worth reading before choosing a cadence.
+    #[must_use]
+    pub fn ttl_ms(&self) -> Option<u64> {
+        self.value.get("ttlMs").and_then(Value::as_u64)
+    }
+
+    /// The polling cadence the server asks for, in milliseconds, when it says.
+    /// Each poll is a journaled effect; a loop that ignores this hammers the
+    /// server and the journal alike.
+    #[must_use]
+    pub fn poll_interval_ms(&self) -> Option<u64> {
+        self.value.get("pollIntervalMs").and_then(Value::as_u64)
+    }
+}
+
 /// One exact, operator-granted `prompts/get` request.
 #[derive(Debug)]
 pub struct McpPrompt {
@@ -543,6 +646,7 @@ pub struct McpPrompt {
     arguments: Value,
     safety: McpDataSafety,
     service: Arc<RunningService<RoleClient, ClientInfo>>,
+    timeout: Duration,
 }
 
 #[async_trait]
@@ -596,7 +700,7 @@ impl Effect for McpPrompt {
         if let Value::Object(arguments) = &self.arguments {
             params = params.with_arguments(arguments.clone());
         }
-        match self.service.get_prompt_once(params).await {
+        match bounded(self.timeout, self.service.get_prompt_once(params)).await {
             Ok(GetPromptResponse::Complete(result)) => serde_json::to_value(result)
                 .map_err(|error| EffectError::Other(error.to_string())),
             Ok(GetPromptResponse::InputRequired(_)) => Err(EffectError::Interrupted {
@@ -620,6 +724,7 @@ pub struct McpResource {
     uri: String,
     safety: McpDataSafety,
     service: Arc<RunningService<RoleClient, ClientInfo>>,
+    timeout: Duration,
 }
 
 #[async_trait]
@@ -655,10 +760,12 @@ impl Effect for McpResource {
     }
 
     async fn perform(&self) -> Result<Value, EffectError> {
-        match self
-            .service
-            .read_resource_once(ReadResourceRequestParams::new(&self.uri))
-            .await
+        match bounded(
+            self.timeout,
+            self.service
+                .read_resource_once(ReadResourceRequestParams::new(&self.uri)),
+        )
+        .await
         {
             Ok(ReadResourceResponse::Complete(result)) => serde_json::to_value(result)
                 .map_err(|error| EffectError::Other(error.to_string())),
@@ -681,6 +788,15 @@ impl Effect for McpResource {
 pub struct McpTaskPoll {
     task: McpTask,
     service: Arc<RunningService<RoleClient, ClientInfo>>,
+    timeout: Duration,
+    /// The ceiling for the snapshot this poll returns.
+    ///
+    /// A task is a tool call answered later: the completed snapshot carries
+    /// the same payload the synchronous path would have returned, so it must
+    /// carry the same declared ceiling. Left to the trait default the payload
+    /// would arrive `Public` — the asynchronous path quietly declassifying
+    /// what the synchronous path protects.
+    output_sensitivity: Sensitivity,
 }
 
 /// Answers outstanding input requests on an MCP task.
@@ -691,6 +807,7 @@ pub struct McpTaskUpdate {
     arguments: Value,
     safety: McpDataSafety,
     service: Arc<RunningService<RoleClient, ClientInfo>>,
+    timeout: Duration,
 }
 
 #[async_trait]
@@ -738,13 +855,15 @@ impl Effect for McpTaskUpdate {
     }
 
     async fn perform(&self) -> Result<(), EffectError> {
-        self.service
-            .update_task(UpdateTaskParams::new(
+        bounded(
+            self.timeout,
+            self.service.update_task(UpdateTaskParams::new(
                 &self.task.id,
                 self.input_responses.clone(),
-            ))
-            .await
-            .map_err(|error| mcp_effect_error(&self.task.server, &self.task.id, &error))
+            )),
+        )
+        .await
+        .map_err(|error| mcp_effect_error(&self.task.server, &self.task.id, &error))
     }
 }
 
@@ -753,6 +872,7 @@ impl Effect for McpTaskUpdate {
 pub struct McpTaskCancel {
     task: McpTask,
     service: Arc<RunningService<RoleClient, ClientInfo>>,
+    timeout: Duration,
 }
 
 #[async_trait]
@@ -778,10 +898,13 @@ impl Effect for McpTaskCancel {
     }
 
     async fn perform(&self) -> Result<(), EffectError> {
-        self.service
-            .cancel_task(CancelTaskParams::new(&self.task.id))
-            .await
-            .map_err(|error| mcp_effect_error(&self.task.server, &self.task.id, &error))
+        bounded(
+            self.timeout,
+            self.service
+                .cancel_task(CancelTaskParams::new(&self.task.id)),
+        )
+        .await
+        .map_err(|error| mcp_effect_error(&self.task.server, &self.task.id, &error))
     }
 }
 
@@ -808,12 +931,17 @@ impl Effect for McpTaskPoll {
         Trust::Untrusted
     }
 
+    fn output_sensitivity(&self) -> Sensitivity {
+        self.output_sensitivity
+    }
+
     async fn perform(&self) -> Result<McpTaskSnapshot, EffectError> {
-        let result = self
-            .service
-            .get_task(GetTaskParams::new(&self.task.id))
-            .await
-            .map_err(|error| mcp_effect_error(&self.task.server, &self.task.id, &error))?;
+        let result = bounded(
+            self.timeout,
+            self.service.get_task(GetTaskParams::new(&self.task.id)),
+        )
+        .await
+        .map_err(|error| mcp_effect_error(&self.task.server, &self.task.id, &error))?;
         let value =
             serde_json::to_value(result).map_err(|error| EffectError::Other(error.to_string()))?;
         let state = McpTaskState::parse(&value).map_err(EffectError::Other)?;
@@ -822,6 +950,20 @@ impl Effect for McpTaskPoll {
             state,
             value,
         })
+    }
+}
+
+/// Run one MCP request under the client's whole-request deadline.
+///
+/// Expiry is synthesized as [`ServiceError::Timeout`] so the classification
+/// table has exactly one row for "sent, no answer", however the waiting ended.
+async fn bounded<T>(
+    timeout: Duration,
+    call: impl std::future::Future<Output = Result<T, ServiceError>> + Send,
+) -> Result<T, ServiceError> {
+    match tokio::time::timeout(timeout, call).await {
+        Ok(result) => result,
+        Err(_) => Err(ServiceError::Timeout { timeout }),
     }
 }
 
@@ -897,9 +1039,7 @@ impl ToolClient for McpClient {
             )));
         }
 
-        let result = match self
-            .service
-            .call_tool_once(params)
+        let result = match bounded(self.timeout, self.service.call_tool_once(params))
             .await
             .map_err(|e| Self::classify(tool, &e))?
         {
@@ -969,10 +1109,20 @@ fn kind_of(v: &Value) -> &'static str {
 }
 
 fn render(result: &rmcp::model::CallToolResult) -> String {
-    result
+    let text = result
         .content
         .iter()
         .filter_map(|c| c.as_text().map(|t| t.text.clone()))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if !text.is_empty() {
+        return text;
+    }
+    // A failing tool whose only explanation lives in `structuredContent` (or
+    // in non-text blocks) would otherwise report an empty string — an error
+    // with nothing after the colon.
+    if let Some(structured) = &result.structured_content {
+        return structured.to_string();
+    }
+    serde_json::to_string(&result.content).unwrap_or_default()
 }

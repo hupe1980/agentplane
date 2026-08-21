@@ -192,7 +192,10 @@ struct EmbeddingsReply {
 #[cfg(feature = "providers")]
 #[derive(serde::Deserialize)]
 struct EmbeddingDatum {
-    embedding: Vec<f32>,
+    /// Raw JSON numbers, not `f32`: serde's float path reads `1e39` as `inf`
+    /// without complaint, and a non-finite component is exactly what
+    /// [`json_f32`] exists to refuse.
+    embedding: Vec<serde_json::Value>,
 }
 
 #[cfg(feature = "providers")]
@@ -268,7 +271,13 @@ impl Embedder for OpenAiEmbedder {
                 "{url}: the embedding is empty, which no index can rank against"
             )));
         }
-        Ok(datum.embedding.clone())
+        let vector: Vec<f32> = datum.embedding.iter().filter_map(json_f32).collect();
+        if vector.len() != datum.embedding.len() {
+            return Err(StoreError::Backend(format!(
+                "{url}: the embedding carries a component that is not a finite number"
+            )));
+        }
+        Ok(vector)
     }
 }
 

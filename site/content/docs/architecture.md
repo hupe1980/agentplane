@@ -488,7 +488,7 @@ footprint bounds the ambient surface, not only members. A skill holding an open
 group must not reach the world through the ordinary effect path — journaled,
 gated and metered like anything else, and no member: no reversal registered, and
 still standing after an unwind that settled `Aborted`, which claims the world was
-taken back whole. A mutating effect dispatched while a group is open is now
+taken back whole. A mutating effect dispatched while a group is open is
 refused unless it is a member's own dispatch. Reads are untouched, because a
 read leaves nothing to take back.
 
@@ -1667,9 +1667,17 @@ Three data paths are built:
   labelled responses and default to operator recovery, and cooperative cancel
   is idempotent but never mistaken for proof that work stopped.
 
-For manifested agents, `spec.context.prompts/resources` is the review artifact
-and `McpAccess::from_manifest` is the deployment catalogue. Server discovery is
-still only a diff: an MCP server cannot grant itself a prompt, resource or tool.
+For manifested agents, `spec.context` — prompts, resources, and `task_input`
+for answering a server's input requests — is the review artifact and
+`McpAccess::from_manifest` is the deployment catalogue; the gate refuses a
+dispatch whose wired ceilings disagree with the grant's, in either direction.
+Server discovery is still only a diff: an MCP server cannot grant itself a
+prompt, resource or tool, and `agentplane serve` prints each server's
+advertisement drift beside its negotiated version. Every call carries a
+whole-request deadline — the transport itself waits forever, and a wedged
+server would otherwise hang a step with nothing journaled — and a negotiated
+version outside the set this host speaks is refused at construction, because
+an unknown dialect cannot even be downgraded to.
 
 **The negotiated protocol version is readable, because a downgrade costs
 silence.** MCP answers an offered version with one the server speaks, and the
@@ -1965,8 +1973,7 @@ does. The standard's own number vectors are in the test suite. One bound is
 enforced at the signature itself: an integer outside ±2⁵³ has no double of its
 own, so a conforming verifier would recompute different bytes than were signed,
 and `signing_input` refuses it naming the path — on both the signing and
-verifying sides. This used to be a guard asserting the card carried no numbers
-at all; implementing the number rules retired it.
+verifying sides.
 
 #### Push: the one URL a caller chooses
 
@@ -2062,8 +2069,10 @@ Artifacts are delivered because A2A defines push and streaming over the same
 union. This makes task-level authorization and the destination host grant
 load-bearing: registering a URL is an explicit authorization to send that
 task's updates there. The opaque A2A `token` is not confused with
-`AuthenticationInfo`; only the latter forms the HTTP `Authorization` header,
-and credentials are never returned or printed.
+`AuthenticationInfo`: only the latter forms the HTTP `Authorization` header,
+while the token rides as its own `x-a2a-notification-token` header for the
+receiver to validate a push's origin with. Credentials are never returned or
+printed.
 
 The IP classification is [`netguard`](#module-layout), shared with governed
 media. Two implementations of one rule diverge, and the one that diverges is
@@ -2096,7 +2105,7 @@ from history rather than resumed from memory.
 
 There is deliberately **no SSE keep-alive**. It was tried: with it the response
 body did not end when the stream did, so the connection outlived the task — the
-exact failure the design is shaped to avoid. An idle stream may now be reaped by
+exact failure the design is shaped to avoid. An idle stream may be reaped by
 an intermediary, which is the better failure, because a client can recover from a
 closed connection and cannot recover from one that never ends.
 
@@ -2112,7 +2121,7 @@ imposing its dependency graph on the HTTP drivers.
 
 They exist partly to prove the seam is right — that a driver can report *what a
 failure consumed* — and partly because the thing a driver must not get wrong is
-not the transport. Three of the four now carry provider-owned continuation
+not the transport. Three of the four carry provider-owned continuation
 state (OpenAI's encrypted reasoning items, Anthropic's signed thinking blocks,
 Gemini's thought signatures), and all three do it the same way: **the provider's
 own turn, verbatim and opaque**. That is a shape rather than three
@@ -2338,9 +2347,18 @@ Core recall intentionally filters by subject/purpose and orders most trusted
 first, then newest. It does not hide semantic/vector search inside
 `MemoryStore`. Embeddings and indexes drift; `SemanticRetriever` is a separately
 journaled effect recording query text/vector, embedding revision, immutable
-index snapshot, filters, scores and exact final commitments. The runtime then
-materializes those exact versions from authoritative memory and re-checks scope
-and digest. The built-in implementation is deterministic exact cosine for tests
+index snapshot, filters, scores, a lifecycle cutoff and exact final
+commitments. A derived index is stale by construction between rebuilds, so
+live dispatch screens every hit against authoritative memory at the run's
+journaled clock before the selection is recorded: a hit naming a superseded,
+expired, or erased version leaves the selection, via `MemoryStore::current` —
+the by-id twin of recall's lifecycle rule. Without the screen, a corrected
+memory keeps being served by the ranked tier until reindex, an expired one is
+served past its stated disposal date, and a lawful retention sweep fails every
+query that ranks a swept item. The runtime then materializes the surviving
+versions from authoritative memory and re-checks scope and digest — an index
+that *contradicts* durable truth, rather than merely trailing it, stays a loud
+refusal. The built-in implementation is deterministic exact cosine for tests
 and small corpora; an external ANN database implements the seam and never
 becomes memory truth.
 
@@ -2401,9 +2419,13 @@ trust label under identical bytes.
 
 Two consequences fall out of recording the selection rather than the content.
 Personal data stays in an erasable store rather than a hash chain that cannot be
-redacted. And a version that was forgotten makes the history that used it
-**unreplayable** — reported loudly, because replaying a different memory would be
-worse than admitting the record is gone.
+redacted. And a version the store can no longer honour makes the history that
+used it **unreplayable**, reported in two ways because they call for two
+responses. *Gone* is a recorded erasure and **fails** the run. *There and
+different* is the store contradicting the immutability its identifiers promise,
+so it **quarantines** the run — an integrity finding belongs beside replay
+divergence, not in the resumable bucket with a store that was briefly
+unreachable.
 
 **Content is versioned and supersedable, never edited in place.** A rewritten
 memory cannot be audited and cannot be repaired: there is no way to ask what the
@@ -2559,7 +2581,7 @@ reaches compensation *without* re-running the forward pass, and the compensating
 effect then read the forward record and reported non-determinism against history
 that was perfectly sound.
 
-The cursor is now keyed by `(step, phase)` — which is what the effect key has
+The cursor is keyed by `(step, phase)` — which is what the effect key has
 always said the identity is. A latent bug that only a new entry point could
 reach.
 
@@ -2573,6 +2595,16 @@ budget, and N unrelated runs leave nobody able to answer "did it finish".
 So a batch owns N runs sharing one frozen plan. Each item gets its own journal,
 its own budget, and its own outcome; the batch holds the cursor, the census, and
 the terminal state.
+
+"One frozen plan" is the store's to enforce, not a convention: the batch row
+records the plan digest it was opened with, and a resume offering a different
+one is refused naming both digests. By the time the runner executes an item,
+that row is the only witness to what the batch was opened as — accepted, items
+from the resume onward would settle under a plan the batch's record does not
+name. The row also answers existence: a report on an unknown batch id is a
+refusal, never an empty `Running` — a census cannot tell a mistyped id from a
+batch with no items yet, and an operator watching a batch that will never
+exist is the quieter of the two mistakes.
 
 ### Partial failure is enforced by the type
 
@@ -2731,7 +2763,7 @@ will happen is not reviewing — and returns only on approval. A refusal names w
 refused and why, since "the agent failed" is not something an operator can act
 on.
 
-Three refusals:
+Four refusals:
 
 * **`oversight` without `execution` is rejected.** A hand-written skill picks its
   own moment to ask, so there is nothing here for the runtime to apply. Allowing
@@ -2740,6 +2772,11 @@ Three refusals:
 * **`on_expiry: proceed` needs `allow_unattended: true`.** The runtime already
   demands that; the file demands it too, so the decision is greppable in the
   document a reviewer reads rather than only in code they do not.
+* **`on_expiry: escalate` needs `escalate_to`, and bounded audiences.** Widening
+  the audience is escalation's one enforceable meaning — the declared roles join
+  the reviewers, the stale claim is cleared — so the declaration must say who is
+  added, and an empty audience is refused because it already means *anyone*,
+  which no list can widen.
 * **An unstated `on_expiry` denies.** The safe direction is the one nobody has to
   remember to choose.
 

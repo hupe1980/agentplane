@@ -611,6 +611,7 @@ async fn one_tenants_tasks_are_not_another_tenants_to_decide() {
         kind: "approval".into(),
         justification: Justification::new("needs a person", serde_json::json!({})),
         candidate_roles: vec!["ops".into()],
+        escalate_to: Vec::new(),
         excluded_actors: Vec::new(),
         assignee: None,
         priority: Priority::Normal,

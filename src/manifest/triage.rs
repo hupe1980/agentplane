@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// One reason to put an answer in front of a person, and who.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TriageRule {
     /// What the task is called, so a worklist can be filtered on it.
@@ -95,7 +95,9 @@ pub struct TriageRule {
 /// owns. Named apart from `core::Priority` because both are reachable from a
 /// glob import, and a type whose two spellings differ only by module is one
 /// somebody writes wrong once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum TriagePriority {
     Low,
@@ -123,7 +125,7 @@ impl From<TriagePriority> for crate::core::Priority {
 /// the flattened [`Predicate`] is an externally tagged enum, so a key that is
 /// not one of the five operators fails to name a variant and the parse is
 /// refused anyway.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Condition {
     /// RFC 6901 pointer into the answer, e.g. `/deadline_status`.
     ///
@@ -143,7 +145,7 @@ pub struct Condition {
 /// negation invites the reviewer to reason about the empty case, and the empty
 /// case here — a field the answer does not carry — is exactly where a
 /// mis-specified alert goes quiet.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Predicate {
     /// Deep JSON equality against a constant.

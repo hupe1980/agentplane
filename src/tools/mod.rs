@@ -45,6 +45,12 @@ pub use mcp::{
     McpAccess, McpClient, McpDataSafety, McpPrompt, McpResource, McpTask, McpTaskCancel,
     McpTaskPoll, McpTaskSnapshot, McpTaskState, McpTaskUpdate,
 };
+/// The MCP SDK this host is built on, re-exported because it is public API:
+/// [`McpClient::new`] takes an rmcp `RunningService`, so a caller wiring a
+/// transport must name rmcp types at exactly the version this crate links —
+/// a direct dependency would have to be re-unified by hand on every upgrade.
+#[cfg(feature = "mcp")]
+pub use rmcp;
 pub use typed::{Tool, ToolBox, ToolFailure};
 
 use std::collections::BTreeMap;

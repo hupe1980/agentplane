@@ -141,7 +141,7 @@ that is about to stop existing, and the held item is destroyed anyway.
 
 `EncryptedMemoryStore` closed that window with a process-local mutex, which is
 correct on a single writer and silently nothing on an active-active plane. The
-lock is now a seam, and the default is honest about being local:
+lock is a seam, and the default is honest about being local:
 
 ```rust
 // Single node: the default. `is_distributed()` answers false.

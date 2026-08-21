@@ -38,19 +38,28 @@ fn outcome_to_row(o: &ItemOutcome) -> (&'static str, String) {
     }
 }
 
-fn outcome_from_row(has: u8, s: &str, detail: &str) -> Option<ItemOutcome> {
+/// `None` means *no outcome yet* — and only that. An outcome string this
+/// store cannot read is damage, not absence: decoded to `None` it would say
+/// the item never ran, the census would carry it as in-flight forever, and
+/// the batch would report `Running` over a row nobody can explain.
+fn outcome_from_row(has: u8, s: &str, detail: &str) -> Result<Option<ItemOutcome>, StoreError> {
     if has != 1 {
-        return None;
+        return Ok(None);
     }
     let d = detail.to_owned();
-    match s {
-        "succeeded" => Some(ItemOutcome::Succeeded),
-        "failed" => Some(ItemOutcome::Failed(d)),
-        "quarantined" => Some(ItemOutcome::Quarantined(d)),
-        "suspended" => Some(ItemOutcome::Suspended(d)),
-        "exhausted" => Some(ItemOutcome::Exhausted(d)),
-        _ => None,
-    }
+    Ok(Some(match s {
+        "succeeded" => ItemOutcome::Succeeded,
+        "failed" => ItemOutcome::Failed(d),
+        "quarantined" => ItemOutcome::Quarantined(d),
+        "suspended" => ItemOutcome::Suspended(d),
+        "exhausted" => ItemOutcome::Exhausted(d),
+        other => {
+            return Err(StoreError::Corrupt {
+                seq: 0,
+                detail: format!("unknown item outcome '{other}'"),
+            });
+        }
+    }))
 }
 
 /// Whether an item still needs work. A suspended item is *not* terminal — it is
@@ -69,16 +78,44 @@ impl BatchStore for RedbStore {
             let w = begin_write(db)?;
             {
                 let mut t = w.open_table(BATCHES).map_err(|e| be(&e))?;
-                if t.get((tenant.as_str(), key.as_str()))
+                let stored = t
+                    .get((tenant.as_str(), key.as_str()))
                     .map_err(|e| be(&e))?
-                    .is_none()
-                {
-                    t.insert((tenant.as_str(), key.as_str()), (digest.as_str(), 0u8))
-                        .map_err(|e| be(&e))?;
+                    .map(|v| v.value().0.to_owned());
+                match stored {
+                    None => {
+                        t.insert((tenant.as_str(), key.as_str()), (digest.as_str(), 0u8))
+                            .map_err(|e| be(&e))?;
+                    }
+                    Some(stored) if stored == digest => {}
+                    // One batch runs one frozen plan; a resume offering an
+                    // edited one is a second act wearing this batch's name.
+                    Some(stored) => {
+                        return Err(StoreError::BatchPlanChanged {
+                            batch: key.clone(),
+                            stored,
+                            offered: digest.clone(),
+                        });
+                    }
                 }
             }
             w.commit().map_err(|e| be(&e))?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn plan_digest(&self, id: BatchId) -> Result<Option<String>, StoreError> {
+        let tenant = self.tenant_name();
+        let key = id.to_string();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(t) = r.open_table(BATCHES) else {
+                return Ok(None);
+            };
+            Ok(t.get((tenant.as_str(), key.as_str()))
+                .map_err(|e| be(&e))?
+                .map(|v| v.value().0.to_owned()))
         })
         .await
     }
@@ -94,10 +131,14 @@ impl BatchStore for RedbStore {
                     .get((tenant.as_str(), key.as_str()))
                     .map_err(|e| be(&e))?
                     .map(|v| v.value().0.to_owned());
-                if let Some(digest) = digest {
-                    t.insert((tenant.as_str(), key.as_str()), (digest.as_str(), 1u8))
-                        .map_err(|e| be(&e))?;
-                }
+                // A mark on an unknown batch is a refusal, not a no-op: this
+                // is the one bit that lets a census read as *finished*, and
+                // `Ok` over nothing is the quietest way to lose it.
+                let Some(digest) = digest else {
+                    return Err(StoreError::NotFound(key.clone()));
+                };
+                t.insert((tenant.as_str(), key.as_str()), (digest.as_str(), 1u8))
+                    .map_err(|e| be(&e))?;
             }
             w.commit().map_err(|e| be(&e))?;
             Ok(())
@@ -167,7 +208,7 @@ impl BatchStore for RedbStore {
                         seq: 0,
                         detail: format!("bad run id '{run_s}': {e}"),
                     })?,
-                    outcome: outcome_from_row(has, &outcome, &detail),
+                    outcome: outcome_from_row(has, &outcome, &detail)?,
                     spend: Spend {
                         tokens,
                         minor_units: minor,
@@ -272,7 +313,14 @@ impl BatchStore for RedbStore {
                         "quarantined" => c.quarantined += 1,
                         "suspended" => c.suspended += 1,
                         "exhausted" => c.exhausted += 1,
-                        _ => c.in_flight += 1,
+                        // Damage, not a bucket: filed as in-flight this row
+                        // would keep the batch `Running` forever, silently.
+                        other => {
+                            return Err(StoreError::Corrupt {
+                                seq: 0,
+                                detail: format!("unknown item outcome '{other}'"),
+                            });
+                        }
                     }
                 } else {
                     // Reserved, no outcome recorded.
@@ -311,7 +359,7 @@ impl BatchStore for RedbStore {
                         seq: 0,
                         detail: format!("bad run id '{run_s}': {e}"),
                     })?,
-                    outcome: outcome_from_row(has, outcome, detail),
+                    outcome: outcome_from_row(has, outcome, detail)?,
                     spend: Spend {
                         tokens,
                         minor_units: minor,
@@ -321,5 +369,50 @@ impl BatchStore for RedbStore {
             Ok(out)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    /// Every outcome this store writes is one it reads back as the same value.
+    #[test]
+    fn every_written_outcome_decodes_to_the_value_that_wrote_it() {
+        for outcome in [
+            ItemOutcome::Succeeded,
+            ItemOutcome::Failed("x".into()),
+            ItemOutcome::Quarantined("x".into()),
+            ItemOutcome::Suspended("x".into()),
+            ItemOutcome::Exhausted("x".into()),
+        ] {
+            let (state, detail) = outcome_to_row(&outcome);
+            assert_eq!(
+                outcome_from_row(1, state, &detail).expect("round trip"),
+                Some(outcome)
+            );
+        }
+        assert_eq!(
+            outcome_from_row(0, "", "").expect("absence is not damage"),
+            None
+        );
+    }
+
+    /// **An outcome this store cannot read is damage, not absence.**
+    ///
+    /// Decoded to `None` it says the item never ran; the census then carries
+    /// the row as in-flight forever and the batch reports `Running` over a
+    /// row nobody can explain — a corrupt store wearing a healthy status.
+    #[test]
+    fn an_unreadable_item_outcome_is_refused_rather_than_defaulted() {
+        for bad in ["", "Succeeded", "done", "succeeded "] {
+            assert!(
+                matches!(
+                    outcome_from_row(1, bad, "").err(),
+                    Some(StoreError::Corrupt { .. })
+                ),
+                "outcome '{bad}' decoded instead of refusing"
+            );
+        }
     }
 }

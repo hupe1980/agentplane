@@ -194,6 +194,20 @@ impl Runtime {
         let store = self
             .batches()
             .ok_or_else(|| RuntimeError::PlanContract("batches need a batch store".into()))?;
+        // Existence first, from the batch's own row. A census cannot answer
+        // it — no such batch and a batch with no items yet both count zero
+        // rows — and answering a mistyped id with an empty `Running` report
+        // sends an operator watching a batch that will never exist.
+        if store
+            .plan_digest(id)
+            .await
+            .map_err(RuntimeError::from_store)?
+            .is_none()
+        {
+            return Err(RuntimeError::from_store(crate::core::StoreError::NotFound(
+                format!("batch {id}"),
+            )));
+        }
         let census = store.census(id).await.map_err(RuntimeError::from_store)?;
         let cursor = store.cursor(id).await.map_err(RuntimeError::from_store)?;
         let exhausted = store

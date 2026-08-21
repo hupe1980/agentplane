@@ -551,7 +551,7 @@ async fn replay_charges_a_failed_completion_the_same_as_the_live_run() {
         .expect("strict replay");
     assert_eq!(
         replayed.status, out.status,
-        "strict replay of a metered failure reached a different verdict than          the run it reproduces"
+        "strict replay of a metered failure reached a different verdict than the run it reproduces"
     );
     assert_eq!(
         provider.calls(),

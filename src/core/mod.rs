@@ -38,6 +38,7 @@ pub use calendar::{Calendar, CalendarError, WallClock};
 pub use cloudevent::{
     CONTENT_TYPE as CLOUDEVENT_CONTENT_TYPE, CloudEvent, CloudEventError,
     HEADER_PREFIX as CLOUDEVENT_HEADER_PREFIX, SPEC_VERSION as CLOUDEVENT_SPEC_VERSION,
+    is_structured_media_type as is_cloudevent_media_type,
 };
 mod quorum;
 pub use quorum::{Outcome as QuorumOutcome, Quorum, QuorumError, Tally, Verdict};

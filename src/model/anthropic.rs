@@ -51,7 +51,9 @@ use crate::core::Secret;
 
 #[cfg(test)]
 use super::ModelCall;
-use super::wire::{RESPOND_TOOL, classify_status, classify_transport, structured};
+use super::wire::{
+    RESPOND_TOOL, classify_status, classify_transport, strict_schema_problem, structured,
+};
 use super::{
     Completion, ModelError, ModelId, ModelProvider, Request, SchemaMode, Usage, anthropic_stream,
     sse,
@@ -568,7 +570,7 @@ fn interpret(
                 detail: "the answer carried no text content".to_owned(),
             });
         }
-        let parsed_schema = structured(schema, &text, model, usage)?;
+        let parsed_schema = structured(schema, &text, &tool_calls, model, usage)?;
         (text, parsed_schema)
     };
 
@@ -583,9 +585,16 @@ fn interpret(
         tool_calls,
         text,
         usage,
-        // `max_tokens` is the provider saying it stopped because it ran out of
-        // room, not because it finished.
-        truncated: stop_reason.as_deref() == Some("max_tokens"),
+        // Every stop reason meaning "not a finished answer": out of room,
+        // out of context window, or a turn the provider paused mid-way.
+        // `pause_turn` resumption is deliberately unsupported — the paused
+        // content would have to be sent back verbatim, which is a
+        // continuation this driver only carries across tool turns — so the
+        // honest report is an unfinished answer, not a complete one.
+        truncated: matches!(
+            stop_reason.as_deref(),
+            Some("max_tokens" | "model_context_window_exceeded" | "pause_turn")
+        ),
         stop_reason,
         continuation,
     })
@@ -642,17 +651,32 @@ impl Anthropic {
                     .to_owned(),
             });
         }
+        if continuation.is_some() && exchanges.is_empty() {
+            // Silently dropping it would journal an effect key that records a
+            // continuation the wire never carried; honouring it would end the
+            // request on an assistant turn, which this provider rejects as
+            // prefill. Neither is a quiet choice to make for the caller.
+            return Err(ModelError::Refused {
+                model: model.clone(),
+                detail: "a continuation without tool exchanges has no request to follow — \
+                         Anthropic continuations carry a model turn only across tool calls"
+                    .to_owned(),
+            });
+        }
         let mut body = json!({
             "model": model.model,
             "max_tokens": max_output_tokens,
             "messages": continue_with(messages(prompt), exchanges, continuation),
         });
         if let Some(effort) = reasoning_effort {
+            // `low` through `max` are the provider's own `output_config.effort`
+            // vocabulary, `xhigh` included. `none` and `minimal` have no
+            // counterpart — adaptive thinking cannot be told not to think —
+            // and answering them with the lowest supported level would be a
+            // declared control made advisory.
             if matches!(
                 effort,
-                super::ReasoningEffort::None
-                    | super::ReasoningEffort::Minimal
-                    | super::ReasoningEffort::XHigh
+                super::ReasoningEffort::None | super::ReasoningEffort::Minimal
             ) {
                 return Err(ModelError::Refused {
                     model: model.clone(),
@@ -676,11 +700,16 @@ impl Anthropic {
                 tools
                     .iter()
                     .map(|t| {
+                        // Strict only where the schema meets the strict
+                        // subset — the same per-tool gate the OpenAI driver
+                        // applies, because the seam promises a caller writes
+                        // one declaration for every provider.
+                        let strict = strict_schema_problem(&t.parameters).is_none();
                         json!({
                             "name": t.name,
                             "description": t.description,
                             "input_schema": t.parameters,
-                            "strict": true,
+                            "strict": strict,
                         })
                     })
                     .collect(),
@@ -718,10 +747,15 @@ impl Anthropic {
                             ),
                         });
                     }
+                    // Strict when the schema qualifies: this is the one tool
+                    // whose arguments become the schema-validated answer, so
+                    // constrained decoding here is worth more than on any
+                    // caller tool.
                     body["tools"] = json!([{
                         "name": RESPOND_TOOL,
                         "description": "Return the answer in the required shape.",
                         "input_schema": schema,
+                        "strict": strict_schema_problem(schema).is_none(),
                     }]);
                     body["tool_choice"] = json!({ "type": "tool", "name": RESPOND_TOOL });
                 }
@@ -800,32 +834,28 @@ impl Anthropic {
                 // an answer half-delivered.
                 Err(e) => return Err(severed(model, &acc, &e.to_string())),
             };
-            let events = decoder
-                .push(&chunk)
-                .map_err(|error| ModelError::Unaccounted {
-                    model: model.clone(),
-                    detail: error.to_string(),
-                })?;
+            // A decode failure ends the stream exactly as a dead connection
+            // does, and is classified by the same ladder: the wire may already
+            // have said what the call cost, and a flat `Unaccounted` here
+            // would discard a bill `message_start` already delivered — or
+            // block a retry that is provably safe when nothing arrived at all.
+            let events = match decoder.push(&chunk) {
+                Ok(events) => events,
+                Err(error) => return Err(severed(model, &acc, &error.to_string())),
+            };
             for event in events {
-                if event.name == "content_block_delta"
-                    && let Ok(value) = serde_json::from_str::<Value>(&event.data)
-                    && value
-                        .get("delta")
-                        .and_then(|delta| delta.get("type"))
-                        .and_then(Value::as_str)
-                        == Some("text_delta")
-                    && let Some(delta) = value
-                        .get("delta")
-                        .and_then(|delta| delta.get("text"))
-                        .and_then(Value::as_str)
+                // The observer is fed from the accumulator's own parse: the
+                // journal's text and the live text are then one stream by
+                // construction, whatever spelling the wire used.
+                let delta = acc.event(&event.name, &event.data);
+                if let Some(text) = delta
                     && let Some((observer, label)) = observer
                 {
                     observer.event(crate::core::Tainted::with_label(
-                        super::ModelStreamEvent::TextDelta(delta.to_owned()),
+                        super::ModelStreamEvent::TextDelta(text),
                         label.clone(),
                     ));
                 }
-                acc.event(&event.name, &event.data);
             }
             // An `error` event inside a 200. Handled as soon as it lands rather
             // than after the loop: the provider may hold the connection open
@@ -1297,16 +1327,42 @@ mod tool_tests {
         let tool = &body["tools"][0];
         assert_eq!(tool["name"], "ledger.read");
         assert_eq!(
-            tool["strict"], true,
-            "strict tool use must enforce the declared input schema during generation: {body}"
+            tool["strict"], false,
+            "this schema has an optional property, which strict mode rejects — an \
+             unconditional `strict: true` made one declaration work on OpenAI and \
+             400 here: {body}"
         );
         assert_eq!(
             tool["input_schema"]["type"], "object",
-            "Anthropic names the argument schema `input_schema`; `parameters` is              OpenAI's spelling and this request would be rejected: {body}"
+            "Anthropic names the argument schema `input_schema`; `parameters` is OpenAI's spelling and this request would be rejected: {body}"
         );
         assert!(
             tool.get("function").is_none(),
             "the OpenAI `function` wrapper must not appear: {body}"
+        );
+
+        // The same declaration inside the strict subset gets the constraint.
+        let body = driver()
+            .body(
+                &ModelId::new("anthropic", "claude-x"),
+                &json!({ "messages": [] }),
+                None,
+                &[ToolDeclaration::new(
+                    "ledger.read",
+                    "Read a ledger entry.",
+                    json!({
+                        "type": "object",
+                        "properties": { "id": { "type": "string" } },
+                        "required": ["id"],
+                        "additionalProperties": false,
+                    }),
+                )],
+                &[],
+            )
+            .expect("a body with tools");
+        assert_eq!(
+            body["tools"][0]["strict"], true,
+            "a strict-subset schema must be enforced during generation: {body}"
         );
     }
 

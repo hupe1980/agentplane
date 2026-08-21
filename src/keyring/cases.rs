@@ -297,6 +297,10 @@ impl CaseStore for SealedCases {
         self.inner.due(now, limit).await
     }
 
+    async fn breached(&self, limit: usize) -> Result<Vec<Deadline>, StoreError> {
+        self.inner.breached(limit).await
+    }
+
     async fn census(&self, now: Timestamp) -> Result<crate::case::CaseCensus, StoreError> {
         self.inner.census(now).await
     }

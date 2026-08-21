@@ -463,9 +463,29 @@ impl Effect for Embed {
 
 /// Semantic ranking is an effect because an index and embedding implementation
 /// can change independently of durable memory truth.
+///
+/// # The journaled selection is the screened one
+///
+/// The index is derived, so it keeps naming versions after they stop being
+/// current truth: a superseded version after a correction, an expired one
+/// after its window, an erased one after a retention sweep. Each is routine —
+/// a derived index is stale by construction between rebuilds — and none may
+/// decide what a model is shown or whether the query answers at all. So live
+/// dispatch screens every hit against the authoritative store at the query's
+/// journaled cutoff and records only the survivors; a hit whose version is no
+/// longer the one a fresh recall would see simply leaves the selection.
+///
+/// What screening deliberately does **not** absorb: a *present* version whose
+/// content or security metadata moved under its digest, and a hit outside the
+/// query's scope. Those are integrity findings about the store and the
+/// retriever respectively, they stay refusals, and they are checked where
+/// replay also runs — in [`StepCtx::semantic_recall`].
+///
+/// [`StepCtx::semantic_recall`]: crate::runtime::StepCtx::semantic_recall
 #[derive(Debug, Clone)]
 pub struct SemanticRecall {
     pub(crate) retriever: std::sync::Arc<dyn crate::memory::SemanticRetriever>,
+    pub(crate) memories: std::sync::Arc<dyn crate::memory::MemoryStore>,
     pub(crate) query: crate::memory::SemanticQuery,
     pub(crate) arguments: serde_json::Value,
 }
@@ -501,10 +521,46 @@ impl Effect for SemanticRecall {
     }
 
     async fn perform(&self) -> Result<Self::Output, EffectError> {
-        self.retriever
+        let hits = self
+            .retriever
             .search(&self.query)
             .await
-            .map_err(|error| EffectError::Other(error.to_string()))
+            .map_err(|error| EffectError::Other(error.to_string()))?;
+        // Refused before any store read: every hit past here costs one, and a
+        // seam answering more than it was asked is misbehaving whatever the
+        // survivors would have been.
+        if hits.len() > self.query.limit {
+            return Err(EffectError::Other(format!(
+                "semantic retriever returned {} hits for a limit of {}",
+                hits.len(),
+                self.query.limit
+            )));
+        }
+        let mut survivors = Vec::with_capacity(hits.len());
+        for hit in hits {
+            // Refused before the selection is recorded, because it could not
+            // be recorded: a non-finite f32 journals as `null` and the record
+            // would fail to read back on replay.
+            if !hit.score.is_finite() {
+                return Err(EffectError::Other(
+                    "semantic retriever returned a non-finite score".to_owned(),
+                ));
+            }
+            let current = self
+                .memories
+                .current(&hit.selected.id, Some(self.query.as_of))
+                .await
+                .map_err(|error| EffectError::Other(error.to_string()))?;
+            // Kept only while the named version is the one a fresh recall at
+            // the cutoff would see. A different current version, an expired
+            // window, and an erased id all mean the index is behind durable
+            // truth, which is its normal state between rebuilds — not a
+            // finding, and not this query's failure.
+            if current.is_some_and(|item| item.version == hit.selected.version) {
+                survivors.push(hit);
+            }
+        }
+        Ok(survivors)
     }
 }
 
@@ -722,10 +778,10 @@ impl Effect for SetCaseStatus {
 
 /// Moving a deadline out of `Pending`, as an effect.
 ///
-/// Same reasoning as [`SetCaseStatus`], plus one of its own: the transition was
-/// previously written to the store and *then* journaled, so a crash in between
-/// left an obligation marked met with nothing saying who met it. Announce
-/// before act is the rule, and it was inverted here.
+/// Same reasoning as [`SetCaseStatus`], plus one of its own: writing the
+/// transition to the store and *then* journaling it leaves a crash in between
+/// holding an obligation marked met with nothing saying who met it. Announce
+/// before act.
 #[derive(Debug, Clone)]
 pub struct TransitionDeadline {
     pub(crate) cases: std::sync::Arc<dyn crate::case::CaseStore>,
@@ -834,6 +890,7 @@ impl Effect for OpenTask {
                 "kind": self.spec.kind,
                 "deadline": self.spec.deadline,
                 "roles": self.spec.candidate_roles,
+                "escalate_to": self.spec.escalate_to,
                 "priority": self.spec.priority.as_str(),
                 // In the key: two findings that differ only in what they say
                 // are two rows, and collapsing them would silently drop one.
@@ -905,6 +962,7 @@ impl Effect for OpenTask {
                 kind: self.spec.kind.clone(),
                 justification: self.spec.justification.clone(),
                 candidate_roles: self.spec.candidate_roles.clone(),
+                escalate_to: self.spec.escalate_to.clone(),
                 excluded_actors: self.spec.excluded_actors.clone(),
                 assignee: None,
                 priority: self.spec.priority,
@@ -1012,13 +1070,12 @@ impl Effect for DrawOnAuthority {
                 },
                 // Answers, not faults: nothing was consumed, and no retry of
                 // the same draw changes a revocation, an expiry, a spent
-                // ceiling or an unknown id. `Other` stood here, and `Other`
-                // reads as **in-doubt** — so a refusal the module docs call
-                // "not retryable, ever" was retried under the full policy,
-                // reported upward as "may well have been applied", and
-                // quarantined any group it was deferred in where the cheap
-                // abort was the truthful settlement. The refusal's own message
-                // still says which of the five it was.
+                // ceiling or an unknown id. `Other` would read as **in-doubt**,
+                // so a refusal the module docs call "not retryable, ever" would
+                // be retried under the full policy, reported upward as "may well
+                // have been applied", and would quarantine any group it was
+                // deferred in where the cheap abort is the truthful settlement.
+                // The refusal's own message says which of the five it was.
                 _ => EffectError::Refused(error.to_string()),
             })
     }

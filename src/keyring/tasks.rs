@@ -162,6 +162,11 @@ impl TaskStore for SealedTasks {
         self.inner.set_state(id, state).await
     }
 
+    async fn escalate(&self, id: TaskId) -> Result<Task, StoreError> {
+        let escalated = self.inner.escalate(id).await?;
+        Ok(self.opened(escalated).await)
+    }
+
     async fn queue(&self, roles: &[String], limit: usize) -> Result<Vec<Task>, StoreError> {
         let tasks = self.inner.queue(roles, limit).await?;
         Ok(self.opened_all(tasks).await)

@@ -15,6 +15,247 @@ property that makes a hard cut acceptable at this stage.
 
 ---
 
+## `MemoryStore` gained `current`, and a semantic selection is screened
+
+**Affected:** custom `MemoryStore` implementations; anything constructing a
+`SemanticQuery` by hand.
+
+```rust
+// new required method — the by-id twin of recall's lifecycle rule
+async fn current(
+    &self,
+    id: &str,
+    as_of: Option<Timestamp>,
+) -> Result<Option<MemoryItem>, StoreError>;
+```
+
+`current` answers what a fresh recall at `as_of` would be allowed to see for
+one id: the latest version, or `None` for a forgotten, swept, or expired
+memory — `version` deliberately cannot say this, because it serves replay and
+must keep answering for superseded and expired state. The conformance battery
+covers the semantics; implement it with the same effective-expiry rule your
+`recall` applies (`min(expires_at, access window)`, inclusive cutoff).
+
+It exists because the semantic tier now screens: a hit naming a version that
+is no longer current leaves the live selection before it is journaled, via
+`current` at the run's clock. Before the screen, a corrected memory kept being
+served by the ranked tier until reindex, an expired one was served past its
+stated disposal date, and one lawfully swept entry failed every query that
+ranked it — routine retention arriving as a semantic-search outage.
+`SemanticQuery` accordingly gained a required `as_of` field (the journaled
+cutoff, set by the runtime); the retriever-misconduct refusals — an answer
+past `limit`, a non-finite score — moved into the effect, before the record is
+written, since a selection holding either could not be read back on replay.
+
+## `McpClient` construction is fallible, calls carry a deadline, and a task poll names its ceiling
+
+**Affected:** anything constructing an `McpClient`; callers of
+`McpClient::task`.
+
+```rust
+// before
+let client = McpClient::new("tickets", Arc::new(service));
+let poll = client.task(task)?;
+
+// after
+let client = McpClient::new("tickets", Arc::new(service))?   // refuses an unknown negotiated version
+    .with_timeout(Duration::from_secs(30));                  // optional; default 60 s
+let poll = client.task(task, Sensitivity::Secret)?;          // the originating tool's output ceiling
+```
+
+`new` refuses a negotiated protocol version outside the set this host speaks —
+rmcp deserializes any string, and proceeding on an unknown dialect issues
+requests in a language whose semantics are a guess. Every call through the
+client carries a whole-request deadline (the transport itself waits forever,
+and a wedged server hung the dispatching step with nothing journaled). And a
+task poll takes the output sensitivity its snapshot must carry: a task is a
+tool call answered later, and a poll that defaulted to `Public` declassified
+the same payload the synchronous path protects. Also additive: `mcp-http`
+compiles rmcp's streamable-HTTP transport, `pub use agentplane::tools::rmcp`
+re-exports the SDK your transport wiring needs, and
+`McpTaskSnapshot::{ttl_ms, poll_interval_ms}` surface the server's retention
+and cadence hints.
+
+## MCP context gates compare the wiring's ceilings, and `tasks/update` needs a manifest grant
+
+**Affected:** coded agents running under a manifest that grants
+`spec.context` prompts or resources; anyone calling `update_task` under a
+manifest.
+
+The manifest gate refuses a prompt or resource dispatch whose wired
+`McpDataSafety` disagrees with the grant's ceilings — in both directions,
+because two artifacts stating one decision must agree. Wirings built with
+`McpAccess::from_manifest` already agree; hand-built ones must match the
+manifest. `tasks/update` is now granted in the manifest too:
+
+```yaml
+context:
+  task_input:
+    - server: templates
+      max_input_sensitivity: internal
+```
+
+Without the grant, a manifest-governed `update_task` is refused — the
+authority to answer a server's questions was previously only expressible in
+code, which is exactly the drift the context grants exist to prevent.
+
+## Gemini continuations are a transcript, not a turn
+
+**Affected:** replays of recorded Gemini tool-calling runs; anything that
+inspects `ProviderContinuation::state` for the `gemini` provider.
+
+The state is an array of `contents` entries carrying **every** prior round —
+model turns and function-response turns — not the latest model turn alone. A
+single-turn state cannot accumulate, so round three's request forgot round
+one's signed turn and the model re-asked with amnesia. Recorded continuations
+in the old shape are refused (`the continuation was not a Gemini contents
+array`); re-run the affected runs rather than migrating journal rows.
+
+## A2A `SendMessage` deduplicates at admission
+
+**Affected:** A2A clients of this server; anything asserting on task history
+defaults.
+
+* A retried `messageId` (same authenticated peer) answers with the task the
+  key already admitted — never a second run. Different peers sharing a
+  `messageId` remain different runs; an empty `messageId` is refused.
+* An unset `historyLength` returns the full history, capped at 128 messages —
+  the protocol's own default. Only an explicit `0` suppresses it.
+* A `mediaType` on a text or data part is accepted as the label the spec says
+  it is; only the file modalities are refused.
+* The A2A push token now rides every delivery as `x-a2a-notification-token`.
+  Receivers that validate it start accepting pushes; nothing else changes.
+
+## CloudEvents refusals tightened, and `subject` wakes runs
+
+**Affected:** producers posting to `POST /events`; consumers of
+`RunCompleted` events; skills waiting on bus-delivered events.
+
+Control characters in `id`/`source`/`type` are refused (the dedup pair is
+joined by one), as are extensions named after core attributes, non-scalar
+extension values, and repeated `ce-` headers. The native shape refuses empty
+`id`/`kind`. A store outage answers 503 so a bus retries; 409 stays the
+answer for semantic refusals only. And an event's `subject` becomes the
+correlation key `("subject", value)` — a run woken by a bus correlates on the
+subject its counterparty will name:
+
+```rust
+cx.await_event(
+    &AwaitSpec::new("payment.settled", "settlement")
+        .correlate(CorrelationKey::new("subject", &order_id)),
+).await?
+```
+
+Outbound, `RunCompleted::for_tenant("acme")` stamps a `tenantid` extension so
+two tenants' completions on one operator bus stay two streams.
+
+## `BatchStore` gained `plan_digest`, and three verbs now refuse
+
+**Affected:** anything implementing `BatchStore`; anything matching on
+`StoreError`; callers of `Runtime::batch_report`.
+
+```rust
+// BatchStore — what this batch was opened as, or None for no such batch
+async fn plan_digest(&self, id: BatchId) -> Result<Option<String>, StoreError>;
+```
+
+No default, and three refusals join the contract, each closing a store answer
+that was quietly wrong:
+
+* `open` refuses a batch reopened under a different plan digest with the new
+  `StoreError::BatchPlanChanged` — one batch runs one frozen plan, and the
+  store's row is the only witness to which. Reopening under the *same* digest
+  stays an idempotent retry.
+* `mark_exhausted` on an unknown batch is `NotFound`, not `Ok` — it is the one
+  bit that lets a census read as finished, and a mark written to nowhere was
+  lost with no symptom.
+* An item outcome or timer phase the store cannot read is `StoreError::Corrupt`,
+  not a default — an unknown outcome used to read as *never ran* and a damaged
+  timer phase as `Forward`, which hands the unwind logic the wrong half of a
+  saga.
+
+`Runtime::batch_report` now returns `NotFound` for an id no batch was opened
+under, instead of an empty `Running` report. If you probed batch existence by
+reporting on it, match on the error rather than the zero counts.
+
+## Escalation must name its audience, and `TaskStore` gained `escalate`
+
+**Affected:** manifests declaring `on_expiry: escalate`; skills building a
+`TaskSpec` with `OnExpiry::Escalate`; anything implementing `TaskStore`; the
+Postgres `tasks` schema.
+
+```yaml
+oversight:
+  approval: required
+  approvers: [support]          # must be bounded when escalating
+  on_expiry: escalate
+  escalate_to: [ops-lead]       # new, and required by `escalate`
+```
+
+`escalate` used to be accepted bare and enforced as a state flag: nothing
+widened, the stale claim survived, and the escalated row stayed in the expiry
+scan forever. Now the declaration must say who is added, every audience it
+widens must be bounded (empty already means *anyone*, which no list can
+widen), and `escalate_to` beside a policy that never escalates is refused as a
+declaration nothing reads. The coded tier mirrors all three:
+`TaskSpec::escalate_to("ops-lead")` beside `.on_expiry(OnExpiry::Escalate)`.
+
+```rust
+// TaskStore — widen an unanswered task to its declared escalation audience
+async fn escalate(&self, id: TaskId) -> Result<Task, StoreError>;
+```
+
+One compound verb — state, reservation and audience move in one transaction;
+call `Task::escalate` for the semantics rather than re-deriving them. No
+default, and note `overdue` now returns `open` and `claimed` tasks only: it is
+the expiry sweep's driving query, and an escalated task's expiry has already
+fired.
+
+The Postgres `tasks` columns `candidate_roles`/`excluded_actors` are now
+`TEXT[]` (a comma-joined actor name split into two names, and the four-eyes
+exclusion did not survive its own storage), plus a new `escalate_to TEXT[]`.
+Recreate the store — pre-alpha, no migration. `Task`/`TaskSpec` gained the
+`escalate_to` field, so struct literals need one more line; the task-opening
+effect's descriptor also carries it, so existing journals replay as
+divergence — recreate those too.
+
+## `CaseStore` gained `breached`, and `StepError` gained `Unreproducible`
+
+**Affected:** anything implementing `CaseStore`; anything matching exhaustively
+on `StepError`; anything sorting runs by outcome.
+
+```rust
+// CaseStore — obligations that were missed, longest-overdue first
+async fn breached(&self, limit: usize) -> Result<Vec<Deadline>, StoreError>;
+```
+
+No default: a store answering `Vec::new()` would report *nothing was missed*,
+which is the most reassuring possible way to be wrong about a regulatory window.
+Both shipped backends implement it and a decorator delegates it. Postgres needs
+no schema change — `case_deadlines_due` already leads on `(tenant, state)`.
+
+It reads the obligation's own row rather than the status of the case it
+escalated, so a breach survives `close`. Over HTTP it is `GET /obligations`
+under a new verb, **`api:obligation.list` — add it to your policy rules**, or a
+default-deny engine refuses the listing to everybody. It is separate from
+`api:case.list` so *what did we miss* can be granted without the contents of
+every matter.
+
+```rust
+// A read pinned by digest or version came back different
+StepError::Unreproducible { what: String, detail: String }
+```
+
+A memory version whose content no longer matches what the journal recorded
+choosing used to fail the run; it now **quarantines** it. Add the variant if you
+match on `StepError`, and expect such a run under `outcome=quarantined` rather
+than `failed` — `failed` is resumable and shares a bucket with a store that was
+briefly unreachable.
+
+A *forgotten* version is unchanged and still fails: erasure is a recorded
+decision, and routing it to quarantine would fill the integrity backlog with
+lawful deletions.
+
 ## `JournalStore` and `CaseStore` each gained a required method
 
 **Affected:** anything implementing either trait — a custom backend, a decorator,

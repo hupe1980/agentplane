@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use agentplane::core::{Disposition, Effect, Recovery};
 use agentplane::tools::{
-    Advertised, McpAccess, McpClient, McpDataSafety, ToolCall, ToolCatalog, ToolClient, ToolId,
-    ToolSafety,
+    Advertised, McpAccess, McpClient, McpDataSafety, ToolCall, ToolCatalog, ToolClient, ToolError,
+    ToolId, ToolSafety,
 };
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -240,14 +240,18 @@ async fn connect() -> McpClient {
         .serve((cr, cw))
         .await
         .expect("client initialises");
-    McpClient::new("ledger", Arc::new(service)).with_access(
-        McpAccess::new()
-            .prompt("summarize", McpDataSafety::public())
-            .prompt("elicit", McpDataSafety::public())
-            .resource("kb://settlement/rules", McpDataSafety::public())
-            .resource("kb://needs/input", McpDataSafety::public())
-            .task_input(McpDataSafety::public().max_input(agentplane::core::Sensitivity::Internal)),
-    )
+    McpClient::new("ledger", Arc::new(service))
+        .expect("a known negotiated version")
+        .with_access(
+            McpAccess::new()
+                .prompt("summarize", McpDataSafety::public())
+                .prompt("elicit", McpDataSafety::public())
+                .resource("kb://settlement/rules", McpDataSafety::public())
+                .resource("kb://needs/input", McpDataSafety::public())
+                .task_input(
+                    McpDataSafety::public().max_input(agentplane::core::Sensitivity::Internal),
+                ),
+        )
 }
 
 /// An elicitation answer needs a grant of its own.
@@ -272,6 +276,7 @@ async fn answering_an_elicitation_needs_its_own_grant() {
         .expect("client initialises");
     // Every other capability granted, and task input deliberately not.
     let ungranted = McpClient::new("ledger", Arc::new(service))
+        .expect("a known negotiated version")
         .with_access(McpAccess::new().prompt("summarize", McpDataSafety::public()));
 
     let task = agentplane::tools::McpTask::from_result(
@@ -381,7 +386,7 @@ async fn the_client_reports_the_version_the_handshake_settled_on() {
         .serve((cr, cw))
         .await
         .expect("an older server is a legal answer, not a failure");
-    let client = McpClient::new("legacy", Arc::new(service));
+    let client = McpClient::new("legacy", Arc::new(service)).expect("a known negotiated version");
 
     assert_eq!(
         client.negotiated_version().as_deref(),
@@ -509,10 +514,21 @@ async fn an_async_tool_returns_a_task_that_can_be_polled_as_an_effect() {
     assert_eq!(task.id(), "job-1");
 
     let poll = client
-        .task(task.clone())
+        .task(task.clone(), agentplane::core::Sensitivity::Public)
         .expect("task belongs to this server");
     assert_eq!(poll.trust(), agentplane::core::Trust::Untrusted);
     assert_eq!(poll.descriptor().kind, "mcp.task/get");
+    // A task is a tool call answered later: the poll's snapshot carries the
+    // ceiling it was constructed with, not the trait's `Public` default — an
+    // asynchronous path that defaulted would quietly declassify what the
+    // synchronous path protects.
+    let sealed_poll = client
+        .task(task.clone(), agentplane::core::Sensitivity::Secret)
+        .expect("task belongs to this server");
+    assert_eq!(
+        sealed_poll.output_sensitivity(),
+        agentplane::core::Sensitivity::Secret
+    );
     let snapshot = poll.perform().await.expect("tasks/get");
     assert_eq!(snapshot.state, agentplane::tools::McpTaskState::Completed);
     assert_eq!(snapshot.value["result"]["content"], "finished");
@@ -735,7 +751,10 @@ async fn watching() -> (McpClient, Watching) {
         .serve((cr, cw))
         .await
         .expect("client handshake");
-    (McpClient::new("ledger", Arc::new(service)), seen)
+    (
+        McpClient::new("ledger", Arc::new(service)).expect("a known negotiated version"),
+        seen,
+    )
 }
 
 fn block(effect_args: &serde_json::Value) -> agentplane::core::Provenance {
@@ -943,5 +962,110 @@ async fn a_router_sends_each_server_to_its_own_transport() {
             Err(agentplane::tools::ToolError::Unreachable { .. })
         ),
         "an unrouted server must not fall through to some other transport"
+    );
+}
+
+/// A version this host has never heard of is refused at construction.
+///
+/// rmcp deserializes any string into a version, so without the check a server
+/// answering a dialect nobody implements proceeds — and every request after
+/// the handshake is issued in a language whose semantics are a guess. The
+/// spec's own instruction for an unsupported answer is to disconnect.
+#[tokio::test]
+async fn an_unknown_negotiated_version_is_refused_at_construction() {
+    let (client_side, server_side) = tokio::io::duplex(8 * 1024);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (r, mut w) = tokio::io::split(server_side);
+        let mut lines = BufReader::new(r).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(request): Result<serde_json::Value, _> = serde_json::from_str(&line) else {
+                continue;
+            };
+            if request["method"] != "initialize" {
+                continue;
+            }
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "protocolVersion": "2099-01-01",
+                    "capabilities": {},
+                    "serverInfo": { "name": "future-server", "version": "0.0.0" },
+                }
+            });
+            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+            let _ = w.flush().await;
+        }
+    });
+
+    let (cr, cw) = tokio::io::split(client_side);
+    let service = McpClient::host_info()
+        .serve((cr, cw))
+        .await
+        .expect("the transport accepts what the host must then judge");
+    let error = McpClient::new("future", Arc::new(service))
+        .expect_err("an unknown dialect must be refused, not proceeded on");
+    assert!(
+        error.to_string().contains("2099-01-01"),
+        "the refusal names the version: {error}"
+    );
+}
+
+/// A wedged server is a timeout, not a hung run.
+///
+/// The transport itself waits forever; the client's whole-request deadline is
+/// what turns a server that never answers into a classified failure — sent,
+/// no answer, in doubt — instead of a step that never completes with nothing
+/// journaled and nothing for the sweeper to sweep.
+#[tokio::test]
+async fn a_wedged_server_is_a_timeout_not_a_hang() {
+    let (client_side, server_side) = tokio::io::duplex(8 * 1024);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (r, mut w) = tokio::io::split(server_side);
+        let mut lines = BufReader::new(r).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(request): Result<serde_json::Value, _> = serde_json::from_str(&line) else {
+                continue;
+            };
+            // Answer the handshake, then go quiet: child alive, never answering.
+            if request["method"] == "initialize" {
+                let reply = json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {
+                        "protocolVersion": "2026-07-28",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "wedged", "version": "0.0.0" },
+                    }
+                });
+                let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                let _ = w.flush().await;
+            }
+        }
+    });
+
+    let (cr, cw) = tokio::io::split(client_side);
+    let service = McpClient::host_info()
+        .serve((cr, cw))
+        .await
+        .expect("handshake completes");
+    let client = McpClient::new("wedged", Arc::new(service))
+        .expect("a known version")
+        .with_timeout(std::time::Duration::from_millis(100));
+
+    let started = std::time::Instant::now();
+    let error = client
+        .discover()
+        .await
+        .expect_err("a server that never answers must not hang the caller");
+    assert!(
+        matches!(error, ToolError::TimedOut { .. }),
+        "a deadline is not evidence about what the server did — in doubt: {error}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the deadline did not bound the wait"
     );
 }

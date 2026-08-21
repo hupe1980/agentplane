@@ -158,12 +158,19 @@ impl Accumulator {
                         "Anthropic streamed a tool_use block without an id or name".to_owned()
                     );
                 }
-                let arguments = serde_json::from_str(&block.json).map_err(|error| {
-                    format!(
-                        "Anthropic tool_use '{}' arguments did not form JSON: {error}",
-                        block.id
-                    )
-                })?;
+                // No argument deltas at all is a zero-argument call, which the
+                // buffered path reads as `{}` — the streaming twin must not
+                // turn the same wire answer into a parse failure.
+                let arguments = if block.json.is_empty() {
+                    serde_json::Value::Object(serde_json::Map::new())
+                } else {
+                    serde_json::from_str(&block.json).map_err(|error| {
+                        format!(
+                            "Anthropic tool_use '{}' arguments did not form JSON: {error}",
+                            block.id
+                        )
+                    })?
+                };
                 Ok(super::ToolCall {
                     id: block.id.clone(),
                     name: block.name.clone(),
@@ -198,12 +205,16 @@ impl Accumulator {
     /// Unknown event types are ignored on purpose: Anthropic's versioning policy
     /// reserves the right to add them, and a driver that rejected an unrecognised
     /// event would break on a provider release that changed nothing it uses.
-    pub fn event(&mut self, name: &str, data: &str) {
+    /// Absorb one SSE event. Returns the visible text this event appended, so
+    /// a live observer is fed from the same parse the answer is assembled
+    /// from — a second, weaker parse at the call site is how an observer and
+    /// the journal end up describing two different streams.
+    pub fn event(&mut self, name: &str, data: &str) -> Option<String> {
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             // A single malformed event must not lose the answer. If it mattered,
             // the absence shows up as missing text or a missing stop reason,
             // both of which the caller already reports.
-            return;
+            return None;
         };
         // The SSE `event:` name and the JSON `type` always agree; prefer the
         // name and fall back, so a stream that omits one still parses.
@@ -257,7 +268,7 @@ impl Accumulator {
                     );
                 }
             }
-            "content_block_delta" => self.delta(&value),
+            "content_block_delta" => return self.delta(&value),
             "message_delta" => {
                 if let Some(reason) = value
                     .get("delta")
@@ -289,17 +300,17 @@ impl Accumulator {
             // `ping`, and whatever ships next.
             _ => {}
         }
+        None
     }
 
-    fn delta(&mut self, value: &Value) {
-        let Some(delta) = value.get("delta") else {
-            return;
-        };
+    fn delta(&mut self, value: &Value) -> Option<String> {
+        let delta = value.get("delta")?;
         match delta.get("type").and_then(Value::as_str) {
             Some("text_delta") => {
                 if let Some(t) = delta.get("text").and_then(Value::as_str) {
                     self.text.push_str(t);
                     self.append_block_string(value, "text", t);
+                    return Some(t.to_owned());
                 }
             }
             Some("input_json_delta") => {
@@ -326,6 +337,7 @@ impl Accumulator {
             }
             _ => {}
         }
+        None
     }
 
     fn append_block_string(&mut self, event: &Value, field: &str, fragment: &str) {

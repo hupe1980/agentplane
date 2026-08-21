@@ -240,7 +240,27 @@ pub struct BatchReport {
 pub trait BatchStore: Send + Sync + Debug {
     /// Register a batch. Idempotent on `id`, so a retried submission does not
     /// fork one act into two.
+    ///
+    /// Idempotent on the id **and held to the digest**: one batch runs one
+    /// frozen plan, and that sentence is this method's to enforce, because the
+    /// runner cannot — by the time it executes an item, the store's row is the
+    /// only witness to what the batch was opened with.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::BatchPlanChanged`] when the batch exists under a
+    /// different `plan_digest`. A resume offering an edited plan must be
+    /// refused here, in the store, or items settle under a plan the batch's
+    /// record does not name.
     async fn open(&self, id: BatchId, plan_digest: &str) -> Result<(), StoreError>;
+
+    /// The plan digest this batch was opened with, or `None` for no such batch.
+    ///
+    /// The existence question, answered from the batch's own row. A census
+    /// cannot answer it — a batch with no items yet and a batch that does not
+    /// exist both count zero rows — and the difference matters to an operator:
+    /// one is work not started, the other is a mistyped id.
+    async fn plan_digest(&self, id: BatchId) -> Result<Option<String>, StoreError>;
 
     /// Record that the source produced its last item.
     ///
@@ -252,6 +272,13 @@ pub trait BatchStore: Send + Sync + Debug {
     ///
     /// Durable rather than in-memory because the distinction has to survive the
     /// process: a resumed batch must know whether it ever reached the end.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when no such batch exists, for the reason
+    /// [`record`](Self::record) refuses an unreserved item: this mark is the
+    /// one bit that lets a census read as *finished*, and reporting it written
+    /// when nothing was is the quietest possible way to lose it.
     async fn mark_exhausted(&self, id: BatchId) -> Result<(), StoreError>;
 
     /// Whether the source has been read to the end.
@@ -273,11 +300,11 @@ pub trait BatchStore: Send + Sync + Debug {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] when the item was never reserved. Both shipped
-    /// backends once returned `Ok` while writing nothing there — a caller told
-    /// *recorded* over an outcome that vanished, which is the same lie a
-    /// release that freed nothing tells, and it is caught by the row count the
-    /// write already produces.
+    /// [`StoreError::NotFound`] when the item was never reserved — a refusal,
+    /// never a silent no-op: `Ok` over a write that matched nothing tells the
+    /// caller *recorded* about an outcome that vanished, the same lie a
+    /// release that freed nothing tells. The row count the write already
+    /// produces is what catches it.
     async fn record(
         &self,
         batch: BatchId,

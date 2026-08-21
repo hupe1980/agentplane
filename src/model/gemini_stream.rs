@@ -61,14 +61,18 @@ impl Accumulator {
     /// provider — it is kept for the continuation and nothing else.
     pub(super) fn push(&mut self, data: &str) -> Option<String> {
         let chunk: Value = serde_json::from_str(data).ok()?;
-        let candidate = chunk.get("candidates")?.get(0)?;
-
+        // Read before requiring a candidate: the chunk that carries only
+        // `promptFeedback` (a blocked prompt) or a trailing `usageMetadata`
+        // has no candidates at all, and bailing on the missing array first
+        // would drop both — a streamed prompt block would read as an outage
+        // to retry forever instead of the refusal the buffered path reports.
         if let Some(usage) = chunk.get("usageMetadata") {
             self.usage = Some(usage.clone());
         }
         if let Some(feedback) = chunk.get("promptFeedback") {
             self.prompt_feedback = Some(feedback.clone());
         }
+        let candidate = chunk.get("candidates")?.get(0)?;
         if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
             self.finish_reason = Some(reason.to_owned());
         }
@@ -122,6 +126,21 @@ impl Accumulator {
         self.generated
     }
 
+    /// Whether the stream said the prompt was blocked before generating.
+    ///
+    /// A blocked prompt arrives as a chunk carrying only `promptFeedback` —
+    /// no candidate, no finish reason — so without this question a block is
+    /// indistinguishable from a severed stream and gets retried as an outage,
+    /// re-hitting the block forever.
+    pub(super) fn prompt_blocked(&self) -> bool {
+        !self.generated
+            && self
+                .prompt_feedback
+                .as_ref()
+                .and_then(|f| f.get("blockReason"))
+                .is_some()
+    }
+
     /// The usage block as last reported, wrapped in the envelope shape the
     /// buffered path's parser reads.
     ///
@@ -145,15 +164,23 @@ impl Accumulator {
 
     /// The envelope a buffered call would have returned.
     pub(super) fn into_response(self) -> Value {
-        let mut response = json!({
-            "candidates": [{
-                "content": {
-                    "role": self.role.unwrap_or_else(|| "model".to_owned()),
-                    "parts": self.parts,
-                },
-                "finishReason": self.finish_reason,
-            }],
-        });
+        // A stream that never opened a candidate — a prompt blocked before
+        // generating sends only `promptFeedback` — must not fabricate one, or
+        // the shared interpreter reads an empty model turn where the buffered
+        // path reads a refusal that names its reason.
+        let mut response = if self.parts.is_empty() && self.finish_reason.is_none() {
+            json!({})
+        } else {
+            json!({
+                "candidates": [{
+                    "content": {
+                        "role": self.role.unwrap_or_else(|| "model".to_owned()),
+                        "parts": self.parts,
+                    },
+                    "finishReason": self.finish_reason,
+                }],
+            })
+        };
         if let Some(usage) = self.usage {
             response["usageMetadata"] = usage;
         }

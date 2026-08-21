@@ -106,6 +106,15 @@ cargo install agentplane --features cli
 agentplane validate summariser.yaml
 agentplane digest   summariser.yaml     # what a registry pins
 agentplane run      summariser.yaml --input '{"ticket": "printer on fire"}'
+agentplane schema                       # the format as a JSON Schema
+```
+
+For editor autocomplete and inline errors while writing the file, put the
+published schema in a modeline — see
+[the manifest reference](@/docs/manifest.md#editor-validation):
+
+```yaml
+# yaml-language-server: $schema=https://hupe1980.github.io/agentplane/agent.schema.json
 ```
 
 `--input -` reads stdin, the convention every pipe-shaped tool honours. A
@@ -321,6 +330,7 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `http` | the operator surface: worklist, decisions, run status |
 | `mcp` | MCP host: governed prompts, resources, tools, and asynchronous Tasks |
 | `mcp-stdio` | reach an MCP server by **running** it — the stdio child process most published servers are. What lets `agentplane run`/`serve` execute a declarative `tool-calling` agent with no Rust |
+| `mcp-http` | reach an MCP server over **streamable HTTP** — the transport remote servers speak |
 | `a2a` | A2A peer transport — calling other agents |
 | `a2a-server` | being called: the public Agent Card and the A2A 1.0 JSON-RPC methods |
 | `push` | Persistent A2A registration cursors, retrying worker API, and SSRF-guarded webhook delivery; `a2a-server` includes it |

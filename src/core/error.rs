@@ -548,6 +548,30 @@ pub enum StepError {
         detail: String,
     },
 
+    /// A read this run pinned no longer returns what it was pinned to.
+    ///
+    /// I1 exempts a read whose answer cannot change from the effect protocol —
+    /// bytes by their own digest, a memory by id *and* version — on the
+    /// condition that the immutability claim is checked rather than assumed.
+    /// This is that check failing: the identifier still resolves, and not to
+    /// what the journal recorded choosing.
+    ///
+    /// Its own variant because the executor quarantines on it, for the reason
+    /// [`Undecidable`](Self::Undecidable) is a variant and not a message: a
+    /// run's disposition may not hinge on the wording of a string. A store that
+    /// cannot be reached fails a run that can be run again; one that answers
+    /// successfully with different content has made every run that read it
+    /// unreproducible, including ones that already finished.
+    ///
+    /// Deliberately **not** raised when the pinned thing is *gone*. Erasure is a
+    /// recorded decision, and routing it here would fill the integrity backlog
+    /// with lawful deletions.
+    #[error(
+        "{what} is no longer what this run pinned it to ({detail}) — the history \
+         cannot be reproduced, so the run is quarantined rather than failed"
+    )]
+    Unreproducible { what: String, detail: String },
+
     /// Surfaced when replay finds the recorded run took a different path.
     #[error("non-determinism at seq {seq}: expected {expected}, recomputed {actual}")]
     NonDeterminism {
@@ -879,6 +903,23 @@ pub enum StoreError {
     /// caller sees it.
     #[error("admission key '{key}' is already held by run {run}")]
     DuplicateAdmission { key: String, run: String },
+
+    /// A batch was reopened under a different plan.
+    ///
+    /// One batch runs one frozen plan: its audit identity is "this act, under
+    /// this plan", and item 60,001 settling under an edited plan would be a
+    /// second act wearing the first one's name. Both digests are named so the
+    /// operator can see which two artifacts disagree; the remedy is a new
+    /// batch, never a widened old one.
+    #[error(
+        "batch {batch} is bound to plan {stored}, and this resume offers {offered} — \
+         one batch runs one frozen plan; start a new batch for a new plan"
+    )]
+    BatchPlanChanged {
+        batch: String,
+        stored: String,
+        offered: String,
+    },
 
     /// A case-state write named a version the case has moved past.
     ///

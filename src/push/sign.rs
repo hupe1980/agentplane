@@ -164,8 +164,12 @@ pub enum WebhookRejected {
 pub const HEADER_ID: &str = "webhook-id";
 /// Unix seconds at which this attempt was made.
 pub const HEADER_TIMESTAMP: &str = "webhook-timestamp";
-/// `v1,<base64>` over `{id}.{timestamp}.{body}`.
+/// `v1,<base64>` over `{id}.{timestamp}.{body}` — one element per configured
+/// key, space-separated.
 pub const HEADER_SIGNATURE: &str = "webhook-signature";
+/// A2A's opaque per-task token, echoed on every delivery for the receiver
+/// that registered it to validate against.
+pub const HEADER_A2A_TOKEN: &str = "x-a2a-notification-token";
 
 /// The prefix Standard Webhooks gives a base64-encoded symmetric key.
 const SYMMETRIC_KEY_PREFIX: &str = "whsec_";
@@ -219,20 +223,32 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 /// receiver refusing everything.
 #[derive(Clone)]
 pub struct BodySigning {
-    key: Vec<u8>,
+    /// Every key a delivery is signed under, in configuration order.
+    ///
+    /// More than one only mid-rotation: Standard Webhooks makes
+    /// `webhook-signature` a space-separated list precisely so a sender can
+    /// sign under the old and the new key at once, and a receiver holding
+    /// either verifies. A sender that can hold only one key turns every
+    /// rotation into a flag day for the one party the mechanism was designed
+    /// to spare.
+    keys: Vec<Vec<u8>>,
 }
 
 impl std::fmt::Debug for BodySigning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BodySigning")
-            .field("key", &"<redacted>")
+            .field("keys", &"<redacted>")
             .finish()
     }
 }
 
 impl Drop for BodySigning {
     fn drop(&mut self) {
-        self.key.iter_mut().for_each(|byte| *byte = 0);
+        for key in &mut self.keys {
+            for byte in key {
+                *byte = 0;
+            }
+        }
     }
 }
 
@@ -268,6 +284,29 @@ impl BodySigning {
     /// [`SigningKeyError`] — a `whsec_` secret that is not base64, or a key
     /// under [`MIN_KEY_BYTES`].
     pub fn try_new(secret: &Secret) -> Result<Self, SigningKeyError> {
+        Ok(Self {
+            keys: vec![Self::key_bytes(secret)?],
+        })
+    }
+
+    /// Sign under `secret` as well — the mid-rotation form.
+    ///
+    /// # Errors
+    ///
+    /// As [`try_new`](Self::try_new).
+    pub fn try_also_with(mut self, secret: &Secret) -> Result<Self, SigningKeyError> {
+        self.keys.push(Self::key_bytes(secret)?);
+        Ok(self)
+    }
+
+    /// [`try_also_with`](Self::try_also_with), panicking on a bad key — for
+    /// configuration written in code, as [`new`](Self::new) is.
+    #[must_use]
+    pub fn also_with(self, secret: &Secret) -> Self {
+        self.try_also_with(secret).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn key_bytes(secret: &Secret) -> Result<Vec<u8>, SigningKeyError> {
         let raw = secret.expose();
         let key = match raw.strip_prefix(SYMMETRIC_KEY_PREFIX) {
             Some(encoded) => base64::engine::general_purpose::STANDARD
@@ -278,14 +317,15 @@ impl BodySigning {
         if key.len() < MIN_KEY_BYTES {
             return Err(SigningKeyError::TooShort { bytes: key.len() });
         }
-        Ok(Self { key })
+        Ok(key)
     }
 
     /// The `webhook-signature` value for one delivery.
     ///
     /// `id` and `at` are inside the signed content, not merely beside it — a
     /// receiver that compares them against the headers is what makes a captured
-    /// POST expire.
+    /// POST expire. One `v1,<b64>` element per configured key, space-separated
+    /// as the spec writes the list.
     pub(super) fn value_for(&self, id: &str, at: u64, body: &[u8]) -> String {
         let mut content = Vec::with_capacity(id.len() + 24 + body.len());
         content.extend_from_slice(id.as_bytes());
@@ -293,11 +333,17 @@ impl BodySigning {
         content.extend_from_slice(at.to_string().as_bytes());
         content.push(b'.');
         content.extend_from_slice(body);
-        let mac = hmac_sha256(&self.key, &content);
-        format!(
-            "v1,{}",
-            base64::engine::general_purpose::STANDARD.encode(mac)
-        )
+        self.keys
+            .iter()
+            .map(|key| {
+                let mac = hmac_sha256(key, &content);
+                format!(
+                    "v1,{}",
+                    base64::engine::general_purpose::STANDARD.encode(mac)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -524,6 +570,33 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// Mid-rotation, one delivery is signed under every configured key.
+    ///
+    /// Standard Webhooks makes `webhook-signature` a space-separated list so
+    /// a receiver holding either the old or the new secret verifies; a sender
+    /// that can hold only one key turns every rotation into a flag day.
+    #[test]
+    fn a_rotating_sender_signs_under_both_keys_in_one_header() {
+        let old = Secret::new("whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD");
+        let new = Secret::new("this-is-a-brand-new-signing-secret");
+        let both = BodySigning::new(&old).also_with(&new);
+        let value = both.value_for("msg_p5jXN8AQM9LWM0D4loKWxJek", 1_614_265_330, b"{}");
+
+        let parts: Vec<&str> = value.split(' ').collect();
+        assert_eq!(parts.len(), 2, "one element per key: {value}");
+        assert_eq!(
+            parts[0],
+            BodySigning::new(&old).value_for("msg_p5jXN8AQM9LWM0D4loKWxJek", 1_614_265_330, b"{}")
+        );
+        assert_eq!(
+            parts[1],
+            BodySigning::new(&new).value_for("msg_p5jXN8AQM9LWM0D4loKWxJek", 1_614_265_330, b"{}")
+        );
+        for part in parts {
+            assert!(part.starts_with("v1,"), "spec spelling per element: {part}");
+        }
+    }
+
     fn signing(secret: &str) -> BodySigning {
         BodySigning::new(&Secret::new(secret))
     }
@@ -705,7 +778,7 @@ mod tests {
                 id: "msg-1".to_owned(),
                 timestamp: AT
             },
-            "the id must come back: it is the receiver's idempotency key, and              handing it over is the point of returning a value at all"
+            "the id must come back: it is the receiver's idempotency key, and handing it over is the point of returning a value at all"
         );
     }
 
@@ -760,7 +833,7 @@ mod tests {
                 verify(&v, &h, BODY, at + 301).unwrap_err(),
                 WebhookRejected::Stale { .. }
             ),
-            "a delivery older than the tolerance is a replay this receiver cannot              tell from the original"
+            "a delivery older than the tolerance is a replay this receiver cannot tell from the original"
         );
         assert!(
             matches!(
@@ -777,7 +850,7 @@ mod tests {
                 at + 3000
             )
             .is_ok(),
-            "a receiver behind a slow queue must be able to widen the window              deliberately rather than discover it at the far end of a backlog"
+            "a receiver behind a slow queue must be able to widen the window deliberately rather than discover it at the far end of a backlog"
         );
     }
 
@@ -849,7 +922,7 @@ mod tests {
         for pair in [format!("{by_old} {by_new}"), format!("{by_new} {by_old}")] {
             assert!(
                 verify(&only_new, &headers("msg-1", AT, &pair), BODY, at).is_ok(),
-                "a receiver holding one key must find its signature anywhere in                  the offered list: {pair}"
+                "a receiver holding one key must find its signature anywhere in the offered list: {pair}"
             );
         }
     }

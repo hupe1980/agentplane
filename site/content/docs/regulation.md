@@ -79,7 +79,7 @@ about you. See [status](@/docs/status.md).
 |---|---|
 | A person can intervene | Durable worklists: a run suspends and waits, costing a row rather than a thread |
 | The right person | Candidate roles, and `excluding` for four eyes — the proposer cannot approve their own action |
-| Not answering is a decision | `OnExpiry` is declared up front — deny, escalate, or proceed — so an unanswered approval applies a stated policy instead of hanging |
+| Not answering is a decision | `OnExpiry` is declared up front — deny, escalate, or proceed — so an unanswered approval applies a stated policy instead of hanging. Escalation must name the roles it widens to, and the runtime widens them, so "a higher instance was involved" is a fact the worklist enforces rather than a label on a row |
 | The ability to **stop** | Cooperative cancellation: the run unwinds what it did as a saga, and the record names who asked |
 | Refusing to guess | A run that cannot account for an outcome is `Quarantined` rather than unwound — reversing everything except the one thing nobody can account for is how a system refunds money nobody took |
 | Declared, not remembered | `spec.oversight` puts approval in the reviewable file (`manifest`), so a declarative agent's answer waits for a person by declaration rather than because a developer coded the call. Declaring it where nothing would apply it is refused, so the file cannot claim a human is in the loop when none is |

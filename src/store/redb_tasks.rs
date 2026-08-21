@@ -73,6 +73,15 @@ fn is_pending(state: &str) -> bool {
     matches!(state, "open" | "claimed" | "escalated")
 }
 
+/// Whether the expiry sweep still owes this task anything.
+///
+/// Narrower than [`is_pending`]: an escalated task is still claimable, but its
+/// expiry policy has already fired — see [`TaskStore::overdue`] for what
+/// keeping it in the scan starves.
+fn awaits_expiry(state: &str) -> bool {
+    matches!(state, "open" | "claimed")
+}
+
 /// Move a task between the derived indexes, in the transaction that writes it.
 fn reindex(
     w: &redb::WriteTransaction,
@@ -117,7 +126,7 @@ fn reindex(
 
     if let Some(due) = was.due_at {
         let mut overdue = w.open_table(OVERDUE).map_err(|e| be(&e))?;
-        match (is_pending(before), is_pending(after)) {
+        match (awaits_expiry(before), awaits_expiry(after)) {
             (true, false) => {
                 overdue.remove((tenant, ts(due), id)).map_err(|e| be(&e))?;
             }
@@ -181,9 +190,10 @@ impl TaskStore for RedbStore {
         let id = task.id.to_hex();
         let encoded = serde_json::to_string(task)?;
         let (rank, created) = (priority_rank(task.priority.as_str()), ts(task.created_at));
-        let (queued, pending) = (
+        let (queued, pending, expirable) = (
             is_queued(task.state.as_str()),
             is_pending(task.state.as_str()),
+            awaits_expiry(task.state.as_str()),
         );
         let due = task.due_at.map(ts);
         let case = task.case.map(|c| c.to_string());
@@ -208,7 +218,7 @@ impl TaskStore for RedbStore {
                                 .map_err(|e| be(&e))?;
                         }
                         if let Some(d) = due
-                            && pending
+                            && expirable
                         {
                             w.open_table(OVERDUE)
                                 .map_err(|e| be(&e))?
@@ -383,6 +393,41 @@ impl TaskStore for RedbStore {
             Ok(out)
         })
         .await?
+    }
+
+    async fn escalate(&self, id: TaskId) -> Result<Task, StoreError> {
+        let tenant = self.tenant_name();
+        let key = id.to_hex();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let out = {
+                let mut tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
+                let Some(task) = load(&tasks, &tenant, &key)? else {
+                    return Err(StoreError::NotFound(id.to_string()));
+                };
+                // A decided task stays decided — the sweep that escalates
+                // races the reviewer it is escalating past, and the decision
+                // winning that race is the outcome everybody wanted.
+                if task.state.is_pending() {
+                    let mut updated = task.clone();
+                    updated.escalate();
+                    tasks
+                        .insert(
+                            (tenant.as_str(), key.as_str()),
+                            serde_json::to_string(&updated)?.as_str(),
+                        )
+                        .map_err(|e| be(&e))?;
+                    drop(tasks);
+                    reindex(&w, &tenant, &key, &task, TaskState::Escalated)?;
+                    updated
+                } else {
+                    task
+                }
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(out)
+        })
+        .await
     }
 
     async fn set_state(&self, id: TaskId, state: TaskState) -> Result<(), StoreError> {

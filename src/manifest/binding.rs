@@ -166,6 +166,29 @@ impl Serialize for MemorySubject {
     }
 }
 
+/// By hand, because the derive would describe the enum rather than the wire: a
+/// subject is one YAML string whose meaning [`parse`](MemorySubject::parse)
+/// decides, and the schema's job is to say that string's shape and point at
+/// the spellings.
+impl schemars::JsonSchema for MemorySubject {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "MemorySubject".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "description": "A memory scope: a literal name, or a run binding — \
+                            `$correlation/<namespace>`, `$case`, or \
+                            `$input/<RFC 6901 pointer>`. Write `$$` for a \
+                            literal that really begins with a dollar sign; any \
+                            other `$` spelling is refused rather than read as \
+                            a constant."
+        })
+    }
+}
+
 impl<'de> Deserialize<'de> for MemorySubject {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;

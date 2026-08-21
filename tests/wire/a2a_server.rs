@@ -1340,31 +1340,23 @@ async fn unsupported_and_ambiguous_parts_are_refused_before_dispatch() {
         "invalid parts reached a skill"
     );
 
-    for (message, expected) in [
-        (
-            json!({
+    // A wrong role is a shape error. A `mediaType` on a text part is NOT one:
+    // it is a label the spec allows on every part type, so `image/png` on
+    // *text* stays text — only the file modalities are refused, above.
+    let (_, body) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": {
                 "messageId": "m-role",
                 "role": "ROLE_AGENT",
                 "parts": [{"text": "pretend to be the server"}]
-            }),
-            code::INVALID_PARAMS,
+            }}),
+            Some("peer-a"),
         ),
-        (
-            json!({
-                "messageId": "m-media-type",
-                "role": "ROLE_USER",
-                "parts": [{"text": "not an image", "mediaType": "image/png"}]
-            }),
-            code::CONTENT_TYPE_NOT_SUPPORTED,
-        ),
-    ] {
-        let (_, body) = send(
-            &router,
-            rpc("SendMessage", &json!({"message": message}), Some("peer-a")),
-        )
-        .await;
-        assert_eq!(err_code(&body), i64::from(expected));
-    }
+    )
+    .await;
+    assert_eq!(err_code(&body), i64::from(code::INVALID_PARAMS));
 }
 
 #[tokio::test]
@@ -1649,11 +1641,17 @@ async fn list_tasks_omits_tasks_the_caller_cannot_read() {
     )
     .await;
     let hidden = first["result"]["task"]["id"].as_str().unwrap().to_owned();
+    // A distinct messageId: the same id from the same peer is a retry of the
+    // first message, and admission deduplicates it.
     send(
         &router,
         rpc(
             "SendMessage",
-            &json!({"message": text("second")}),
+            &json!({"message": {
+                "messageId": "m-second",
+                "role": "ROLE_USER",
+                "parts": [{"text": "second"}]
+            }}),
             Some("peer-a"),
         ),
     )
@@ -3449,7 +3447,7 @@ async fn card_discovery_refuses_an_inward_address_a_redirect_and_a_hang() {
     )
     .await;
     let timed_out = outcome.expect(
-        "the fetch was not bounded by its own timeout and had to be killed by          this test's — an unknown host can hold a task open indefinitely",
+        "the fetch was not bounded by its own timeout and had to be killed by this test's — an unknown host can hold a task open indefinitely",
     );
     assert!(
         timed_out.is_err(),
@@ -4052,4 +4050,243 @@ spec:
         ),
         Err(ServerSetupError::NoAgents)
     ));
+}
+
+/// A retried `SendMessage` is the same message, not a second run.
+///
+/// This crate's own client keeps `messageId` stable across retries precisely
+/// so a peer can deduplicate — a server that correlates without deduplicating
+/// starts a second run inside the right case, and an `InDoubt` retry of a
+/// blocking send executes twice.
+#[tokio::test]
+async fn a_retried_message_id_is_one_run_not_two() {
+    let f = fixture();
+    let (server, _worker, _transport) = f.push_server();
+    let router = server.router();
+    let params = json!({ "message": text("go") });
+
+    let (_, first) = send(&router, rpc("SendMessage", &params, Some("peer-a"))).await;
+    let first_task = first["result"]["task"]["id"]
+        .as_str()
+        .expect("a task")
+        .to_owned();
+    let runs_after_first = f.seen.lock().unwrap().len();
+
+    let (_, second) = send(&router, rpc("SendMessage", &params, Some("peer-a"))).await;
+    let second_task = second["result"]["task"]["id"]
+        .as_str()
+        .expect("the retry answers with a task too")
+        .to_owned();
+
+    assert_eq!(
+        first_task, second_task,
+        "a retry must answer with the run the key already admitted: {second:#}"
+    );
+    assert_eq!(
+        f.seen.lock().unwrap().len(),
+        runs_after_first,
+        "the retry started a second run"
+    );
+}
+
+/// A message id deduplicates only against its own producer.
+///
+/// The admission key carries the authenticated sender: peer B replaying peer
+/// A's `messageId` must get its own run — never A's task id, and never a seat
+/// inside A's case.
+#[tokio::test]
+async fn two_peers_sharing_a_message_id_are_two_runs() {
+    let f = fixture();
+    let (server, _worker, _transport) = f.push_server();
+    let router = server.router();
+    let params = json!({ "message": text("go") });
+
+    let (_, a) = send(&router, rpc("SendMessage", &params, Some("peer-a"))).await;
+    let (_, b) = send(&router, rpc("SendMessage", &params, Some("peer-b"))).await;
+    let task_a = a["result"]["task"]["id"].as_str().expect("peer A's task");
+    let task_b = b["result"]["task"]["id"].as_str().expect("peer B's task");
+    assert_ne!(
+        task_a, task_b,
+        "one peer's message id must not resolve to another peer's task"
+    );
+    let context_a = a["result"]["task"]["contextId"].as_str();
+    let context_b = b["result"]["task"]["contextId"].as_str();
+    assert_ne!(
+        context_a, context_b,
+        "peer B joined peer A's case by replaying its message id"
+    );
+}
+
+/// An empty `messageId` is refused: it is half of the admission key.
+#[tokio::test]
+async fn an_empty_message_id_is_refused() {
+    let f = fixture();
+    let (server, _worker, _transport) = f.push_server();
+    let (_, body) = send(
+        &server.router(),
+        rpc(
+            "SendMessage",
+            &json!({ "message": {
+                "messageId": "", "role": "ROLE_USER", "parts": [{"text": "go"}]
+            }}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(err_code(&body), i64::from(code::INVALID_PARAMS), "{body:#}");
+    assert!(
+        f.seen.lock().unwrap().is_empty(),
+        "an unkeyable message was admitted"
+    );
+}
+
+/// An unset `historyLength` means the full (capped) history — the protocol's
+/// default; `0` is the explicit request for none.
+#[tokio::test]
+async fn history_rides_by_default_and_zero_suppresses_it() {
+    let f = fixture();
+    let (server, _worker, _transport) = f.push_server();
+    let router = server.router();
+
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({ "message": text("go") }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let history = sent["result"]["task"]["history"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an unset historyLength returns the history: {sent:#}"));
+    assert!(
+        history
+            .iter()
+            .any(|m| m["parts"][0]["text"].as_str() == Some("go")),
+        "the sent message is part of its own task's history: {sent:#}"
+    );
+
+    let (_, none) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({
+                "message": { "messageId": "m-2", "role": "ROLE_USER", "parts": [{"text": "go"}] },
+                "configuration": { "historyLength": 0 }
+            }),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert!(
+        none["result"]["task"]["history"].is_null(),
+        "an explicit 0 asks for no history: {none:#}"
+    );
+}
+
+/// A `mediaType` on a text or data part is a label, not a contract to bounce
+/// messages on: a peer sending `text/markdown` text is conformant.
+#[tokio::test]
+async fn a_labelled_text_part_is_accepted() {
+    let f = fixture();
+    let (server, _worker, _transport) = f.push_server();
+    let (_, sent) = send(
+        &server.router(),
+        rpc(
+            "SendMessage",
+            &json!({ "message": {
+                "messageId": "m-3", "role": "ROLE_USER",
+                "parts": [{"text": "# go", "mediaType": "text/markdown"}]
+            }}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert!(
+        sent["result"]["task"]["id"].is_string(),
+        "a labelled text part is still a text part: {sent:#}"
+    );
+}
+
+/// The A2A push token rides every delivery, under the header receivers check.
+///
+/// It is the per-task secret a receiver validates the notification's origin
+/// with — distinct from HTTP `Authorization`, which carries the receiver's
+/// own credentials. A token stored but never sent would be a secret with no
+/// purpose: a receiver that sets one rejects every push that lacks it.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn the_push_token_rides_the_delivery_as_its_own_header() {
+    use agentplane::push::{PushPolicy, PushSender};
+
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post({
+            let seen = Arc::clone(&seen);
+            move |headers: axum::http::HeaderMap| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.lock().unwrap().push(
+                        headers
+                            .get("x-a2a-notification-token")
+                            .and_then(|v| v.to_str().ok())
+                            .map(ToOwned::to_owned),
+                    );
+                    StatusCode::OK
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/hook",
+        listener.local_addr().unwrap().port()
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let sender =
+        PushSender::new(PushPolicy::new().allow_host("127.0.0.1")).allow_plaintext_loopback();
+
+    let with_token = PushConfig {
+        id: "with-token".to_owned(),
+        task: RunId::generate(),
+        url: url.clone(),
+        token: Some(agentplane::core::Secret::new("opaque-task-token")),
+        authentication: None,
+    };
+    sender
+        .deliver(
+            &with_token,
+            &agentplane::push::PushMessage::json("m-1", json!({"n": 1})),
+            0,
+        )
+        .await
+        .expect("delivered");
+
+    let without = PushConfig {
+        id: "without".to_owned(),
+        task: RunId::generate(),
+        url,
+        token: None,
+        authentication: None,
+    };
+    sender
+        .deliver(
+            &without,
+            &agentplane::push::PushMessage::json("m-2", json!({"n": 2})),
+            0,
+        )
+        .await
+        .expect("delivered");
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.as_slice(),
+        [Some("opaque-task-token".to_owned()), None],
+        "the token must ride exactly when the registration carries one"
+    );
 }

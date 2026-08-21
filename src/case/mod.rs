@@ -240,6 +240,16 @@ pub trait CaseStore: Send + Sync + Debug {
     /// deadline is a stored number that nobody reads.
     async fn due(&self, now: Timestamp, limit: usize) -> Result<Vec<Deadline>, StoreError>;
 
+    /// Obligations that were missed, longest-overdue first.
+    ///
+    /// Reads the obligation's own row, which outlives every status its case
+    /// passes through — the escalation a breach causes is retired by
+    /// [`close`](Self::close), and closure is when people stop looking.
+    ///
+    /// Not derivable from [`due`](Self::due), which answers *what still needs
+    /// attention*. A breach is past attention; it needs an account.
+    async fn breached(&self, limit: usize) -> Result<Vec<Deadline>, StoreError>;
+
     /// Cases matching a status, newest first.
     async fn by_status(&self, status: CaseStatus, limit: usize) -> Result<Vec<Case>, StoreError>;
 

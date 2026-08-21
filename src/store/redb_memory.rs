@@ -558,6 +558,59 @@ impl MemoryStore for RedbStore {
         .await
     }
 
+    async fn current(
+        &self,
+        id: &str,
+        as_of: Option<crate::core::Timestamp>,
+    ) -> Result<Option<MemoryItem>, StoreError> {
+        let tenant = self.tenant_name();
+        let id = id.to_owned();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(current) = r.open_table(CURRENT) else {
+                return Ok(None);
+            };
+            let Some(version) = current
+                .get((tenant.as_str(), id.as_str()))
+                .map_err(|e| be(&e))?
+                .map(|v| v.value().3)
+            else {
+                return Ok(None);
+            };
+            let items = r.open_table(ITEMS).map_err(|e| be(&e))?;
+            let Some(row) = items
+                .get((tenant.as_str(), id.as_str(), version))
+                .map_err(|e| be(&e))?
+            else {
+                return Ok(None);
+            };
+            let item: MemoryItem = serde_json::from_str(row.value())
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            let access_expiry = r
+                .open_table(ACCESS_EXPIRY)
+                .ok()
+                .and_then(|table| {
+                    table
+                        .get((tenant.as_str(), id.as_str()))
+                        .ok()
+                        .flatten()
+                        .map(|value| value.value())
+                })
+                .and_then(|value| crate::core::Timestamp::from_unix_timestamp(value).ok());
+            // The same rule `recall` applies: the hard ceiling and the sliding
+            // window race to the earlier instant, and the cutoff is inclusive.
+            let effective = match (item.expires_at, access_expiry) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (left, right) => left.or(right),
+            };
+            if as_of.is_some_and(|at| effective.is_some_and(|expires| expires <= at)) {
+                return Ok(None);
+            }
+            Ok(Some(item))
+        })
+        .await
+    }
+
     async fn derivatives(&self, id: &str) -> Result<Vec<MemoryItem>, StoreError> {
         let tenant = self.tenant_name();
         let source = id.to_owned();

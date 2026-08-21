@@ -102,14 +102,15 @@ impl Accumulator {
         self.error.as_deref()
     }
 
-    /// Absorb one event.
+    /// Absorb one event, returning the visible text it carried — so a live
+    /// observer is fed from the same parse the outcome is read from.
     ///
     /// Unknown types are ignored: `OpenAI` adds event types for new tool
     /// families regularly, and a driver that rejected them would break on a
     /// release that changed nothing it uses.
-    pub fn event(&mut self, name: &str, data: &str) {
+    pub fn event(&mut self, name: &str, data: &str) -> Option<String> {
         let Ok(value) = serde_json::from_str::<Value>(data) else {
-            return;
+            return None;
         };
         let kind = if name.is_empty() {
             value
@@ -139,10 +140,21 @@ impl Accumulator {
             // silent truncation this crate refuses everywhere else; a stream
             // that completes carries the provider's own assembled text in the
             // terminal event, which cannot disagree with its own usage.
-            "response.output_text.delta"
-            | "response.refusal.delta"
+            "response.output_text.delta" => {
+                self.generated = true;
+                return value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+            }
+            // A reasoning item opening (`output_item.added`) is generation
+            // too: with summaries disabled a reasoning model can burn
+            // thousands of billed tokens and emit none of the delta kinds,
+            // and a stream cut there must not read as safe to repeat.
+            "response.refusal.delta"
             | "response.reasoning_summary_text.delta"
-            | "response.function_call_arguments.delta" => self.generated = true,
+            | "response.function_call_arguments.delta"
+            | "response.output_item.added" => self.generated = true,
             "response.completed" => self.finish(&value, Outcome::Completed),
             "response.incomplete" => self.finish(&value, Outcome::Incomplete),
             "response.failed" => self.finish(&value, Outcome::Failed),
@@ -157,6 +169,7 @@ impl Accumulator {
             }
             _ => {}
         }
+        None
     }
 
     fn finish(&mut self, value: &Value, outcome: Outcome) {

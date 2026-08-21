@@ -568,6 +568,13 @@ impl MemoryStore for Counted {
     ) -> Result<Option<MemoryItem>, agentplane::core::StoreError> {
         self.inner.version(id, version).await
     }
+    async fn current(
+        &self,
+        id: &str,
+        as_of: Option<Timestamp>,
+    ) -> Result<Option<MemoryItem>, agentplane::core::StoreError> {
+        self.inner.current(id, as_of).await
+    }
     async fn forget(&self, id: &str) -> Result<(), agentplane::core::StoreError> {
         self.inner.forget(id).await
     }
@@ -638,6 +645,14 @@ impl MemoryStore for RejectsComposedCascade {
         version: u64,
     ) -> Result<Option<MemoryItem>, agentplane::core::StoreError> {
         self.inner.version(id, version).await
+    }
+
+    async fn current(
+        &self,
+        id: &str,
+        as_of: Option<Timestamp>,
+    ) -> Result<Option<MemoryItem>, agentplane::core::StoreError> {
+        self.inner.current(id, as_of).await
     }
 
     async fn forget(&self, id: &str) -> Result<(), agentplane::core::StoreError> {
@@ -1080,6 +1095,151 @@ async fn a_replayed_semantic_recall_does_not_rerank_the_index() {
         searches.load(Ordering::SeqCst),
         1,
         "strict replay re-ran mutable semantic ranking"
+    );
+}
+
+/// Recalls semantically with a wide limit and reports every id served.
+#[derive(Debug)]
+struct SemanticRecallsAll;
+
+#[async_trait::async_trait]
+impl Skill for SemanticRecallsAll {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("semantic-recalls-all").provides("semantic-recalls-all")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let found = cx
+            .semantic_recall(
+                SemanticSearch::about("acct-stale")
+                    .for_purpose("support")
+                    .limit(10)
+                    .max_sensitivity(Sensitivity::Internal),
+                Tainted::trusted("refund".to_owned()),
+            )
+            .await
+            .map_err(SkillError::Step)?;
+        let ids: Vec<String> = found.iter().map(|(m, _)| m.peek().id.clone()).collect();
+        Ok(Outcome::done(Tainted::trusted(json!({ "ids": ids }))))
+    }
+}
+
+/// Seeds one subject with the three stalenesses a derived index accumulates,
+/// returning the exact v1 items an index built before the churn would name:
+/// one still current, one since corrected, one expired, one erased.
+async fn seed_stale_subject(memories: &Arc<dyn MemoryStore>) -> Vec<MemoryItem> {
+    let mut indexed = Vec::new();
+    let keep = async |id: &str, note: &str| {
+        memories
+            .remember(&item(
+                id,
+                "acct-stale",
+                json!({ "note": note }),
+                Trust::Untrusted,
+            ))
+            .await
+            .expect("remember");
+        memories
+            .version(id, 1)
+            .await
+            .expect("read v1")
+            .expect("v1 stored")
+    };
+    // Still current: the one hit that must survive.
+    indexed.push(keep("sem-live", "kept").await);
+    // Corrected: the index still names v1 while v2 is what is believed.
+    indexed.push(keep("sem-corrected", "wrong").await);
+    memories
+        .remember(&item(
+            "sem-corrected",
+            "acct-stale",
+            json!({"note": "fixed"}),
+            Trust::Untrusted,
+        ))
+        .await
+        .expect("v2");
+    // Expired: the writer's disposal date is behind the run's clock.
+    let mut fading = item(
+        "sem-expired",
+        "acct-stale",
+        json!({"note": "old"}),
+        Trust::Untrusted,
+    );
+    fading.expires_at = Some(at(1_760_000_001));
+    memories.remember(&fading).await.expect("expiring");
+    indexed.push(
+        memories
+            .version("sem-expired", 1)
+            .await
+            .expect("read expiring")
+            .expect("expiring stored"),
+    );
+    // Erased: forgotten after the index was built.
+    indexed.push(keep("sem-erased", "gone").await);
+    memories.forget("sem-erased").await.expect("forget");
+    indexed
+}
+
+/// A stale semantic index is screened at the journaled cutoff — not served,
+/// and not fatal.
+///
+/// The index is derived, so between rebuilds it keeps naming versions that are
+/// no longer current truth, and each staleness has its own wrong answer
+/// without the screen: a superseded version is a correction one retrieval tier
+/// honours and the other ignores; an expired version is served past the
+/// disposal date its writer stated; an erased one fails the whole query,
+/// turning every lawful retention sweep into a semantic-search outage that
+/// lasts until the next index rebuild.
+#[tokio::test]
+async fn a_stale_semantic_index_is_screened_not_served_and_not_fatal() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let memories = Arc::clone(&store) as Arc<dyn MemoryStore>;
+    let indexed = seed_stale_subject(&memories).await;
+
+    let vector = |stored: &MemoryItem| SemanticVector {
+        subject: stored.subject.clone(),
+        purpose: stored.purpose.clone(),
+        selected: agentplane::memory::Selected {
+            id: stored.id.clone(),
+            version: stored.version,
+            digest: stored.selection_digest(),
+        },
+        embedding: vec![1.0, 0.0],
+    };
+    let retriever = Arc::new(InMemorySemanticRetriever::new(
+        IndexIdentity {
+            snapshot: "stale-1".to_owned(),
+            query_revision: TEST_REVISION.to_owned(),
+        },
+        indexed.iter().map(vector).collect(),
+    )) as Arc<dyn SemanticRetriever>;
+
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(memories)
+        .semantic_memory(
+            Arc::new(FixedEmbedder(TEST_REVISION)) as Arc<dyn Embedder>,
+            retriever,
+        )
+        .skill(SemanticRecallsAll)
+        .build();
+    let run = rt
+        .run("semantic-recalls-all", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert_eq!(
+        run.status,
+        RunStatus::Succeeded,
+        "a lawfully erased index entry must not fail the query"
+    );
+    assert_eq!(
+        run.output.as_ref().map(|out| out.peek().clone()),
+        Some(json!({ "ids": ["sem-live"] })),
+        "only the still-current version may be served; superseded, expired \
+         and erased hits leave the selection"
     );
 }
 
@@ -2434,4 +2594,164 @@ fn a_local_erasure_lock_beside_a_shared_store_is_refused() {
         .memory(Arc::clone(&plain) as Arc<dyn MemoryStore>)
         .try_build()
         .expect("a store with no lifecycle lock has nothing to coordinate");
+}
+
+// ── A version that moved is an integrity finding, not a failure ─────────────
+
+/// Answers `version` with content that is not what was stored.
+///
+/// Stands in for the one thing the pinned-read exemption in I1 assumes cannot
+/// happen: an id-and-version that resolves, successfully, to something other
+/// than what the journal recorded choosing.
+#[derive(Debug)]
+struct Rewrites {
+    inner: Arc<dyn MemoryStore>,
+    active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl MemoryStore for Rewrites {
+    async fn remember(&self, item: &MemoryItem) -> Result<u64, agentplane::core::StoreError> {
+        self.inner.remember(item).await
+    }
+    async fn recall(
+        &self,
+        query: &Recall,
+    ) -> Result<Vec<MemoryItem>, agentplane::core::StoreError> {
+        self.inner.recall(query).await
+    }
+    async fn subject_ids(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<String>, agentplane::core::StoreError> {
+        self.inner.subject_ids(subject).await
+    }
+    async fn version(
+        &self,
+        id: &str,
+        version: u64,
+    ) -> Result<Option<MemoryItem>, agentplane::core::StoreError> {
+        let found = self.inner.version(id, version).await?;
+        if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(found);
+        }
+        Ok(found.map(|mut item| {
+            item.content = json!({ "note": "not what was written" });
+            item
+        }))
+    }
+    async fn current(
+        &self,
+        id: &str,
+        as_of: Option<Timestamp>,
+    ) -> Result<Option<MemoryItem>, agentplane::core::StoreError> {
+        self.inner.current(id, as_of).await
+    }
+    async fn forget(&self, id: &str) -> Result<(), agentplane::core::StoreError> {
+        self.inner.forget(id).await
+    }
+    async fn forget_subject(&self, subject: &str) -> Result<usize, agentplane::core::StoreError> {
+        self.inner.forget_subject(subject).await
+    }
+    async fn derivatives(&self, id: &str) -> Result<Vec<MemoryItem>, agentplane::core::StoreError> {
+        self.inner.derivatives(id).await
+    }
+    async fn forget_cascading(&self, id: &str) -> Result<usize, agentplane::core::StoreError> {
+        self.inner.forget_cascading(id).await
+    }
+    async fn set_legal_hold(
+        &self,
+        id: &str,
+        held: bool,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.set_legal_hold(id, held).await
+    }
+    async fn legal_hold(&self, id: &str) -> Result<bool, agentplane::core::StoreError> {
+        self.inner.legal_hold(id).await
+    }
+    async fn sweep_expired(&self, at: Timestamp) -> Result<usize, agentplane::core::StoreError> {
+        self.inner.sweep_expired(at).await
+    }
+    async fn touch(
+        &self,
+        ids: &[String],
+        at: Timestamp,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.touch(ids, at).await
+    }
+}
+
+/// A memory that changed under a run **quarantines** it, rather than failing it.
+///
+/// I1 lets a memory be re-materialised outside the effect protocol because an
+/// id *and* a version name something immutable — on the stated condition that
+/// the claim is checked rather than assumed. When that check fires, the store
+/// has answered successfully with content contradicting what the journal
+/// recorded reading, and the run's history no longer describes anything that
+/// can be reproduced.
+///
+/// `Failed` is the wrong conclusion for that, and not by a shade: a failure is
+/// an ordinary outcome here — open, resumable, and sitting in the same bucket as
+/// a store that was briefly unreachable. So the one condition that says *the
+/// durable record is not trustworthy* would be filed under the outcome that
+/// means *try again later*, and `GET /runs?outcome=quarantined`, which is where
+/// an operator looks for exactly this, would not list it.
+///
+/// The positive half runs first: the same fixture, the rewriting switched off,
+/// must succeed. Without it a store that failed every read would satisfy the
+/// assertion below, which would make this a test of the fixture.
+#[tokio::test]
+async fn a_memory_rewritten_under_a_run_quarantines_it() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let memories = Arc::new(Rewrites {
+        inner: Arc::clone(&store) as Arc<dyn MemoryStore>,
+        active: Arc::clone(&active),
+    }) as Arc<dyn MemoryStore>;
+
+    memories
+        .remember(&item(
+            "m-1",
+            "acct-7",
+            json!({ "note": "what was written" }),
+            Trust::Untrusted,
+        ))
+        .await
+        .expect("remember");
+
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(Arc::clone(&memories))
+        .skill(Recalls)
+        .build();
+
+    let honest = rt
+        .run("recalls", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert_eq!(
+        honest.status,
+        RunStatus::Succeeded,
+        "the fixture cannot recall at all, so the assertion below would measure it"
+    );
+
+    active.store(true, std::sync::atomic::Ordering::SeqCst);
+    let out = rt
+        .run("recalls", Tainted::trusted(json!({})))
+        .await
+        .expect("the run concludes");
+
+    match &out.status {
+        RunStatus::Quarantined(why) => {
+            assert!(
+                why.contains("m-1") && why.contains("cannot be reproduced"),
+                "the quarantine does not say which pinned read moved, so an \
+                 operator cannot tell it from any other quarantine: {why}"
+            );
+        }
+        other => panic!(
+            "a store that answered with content contradicting the journal left the \
+             run as {other:?} — an outcome that means *retry me*, in the bucket \
+             nobody audits"
+        ),
+    }
 }

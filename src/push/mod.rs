@@ -58,8 +58,9 @@ mod sign;
 pub use delivery::{DeliveryWorker, Projection, PushSweepReport};
 pub use outbox::{Destination, OPERATOR_PREFIX, Outbox, RunCompleted, is_operator_id};
 pub use sign::{
-    BodySigning, DEFAULT_TOLERANCE, HEADER_ID, HEADER_SIGNATURE, HEADER_TIMESTAMP, MIN_KEY_BYTES,
-    SCHEME, SigningKeyError, VerifiedDelivery, WebhookRejected, WebhookVerifier,
+    BodySigning, DEFAULT_TOLERANCE, HEADER_A2A_TOKEN, HEADER_ID, HEADER_SIGNATURE,
+    HEADER_TIMESTAMP, MIN_KEY_BYTES, SCHEME, SigningKeyError, VerifiedDelivery, WebhookRejected,
+    WebhookVerifier,
 };
 
 /// Which of the two id namespaces a worker serves.
@@ -889,6 +890,16 @@ impl PushSender {
         // set out on `BodySigning`.
         if let Some(signing) = self.signing.get(&config.id) {
             request = request.header(HEADER_SIGNATURE, signing.value_for(&message.id, at, &body));
+        }
+        // A2A's opaque per-task token, echoed so the receiver can validate
+        // the push came from the plane it registered with. It is not HTTP
+        // authentication — that is `authentication` below — and a token stored
+        // but never sent would be a secret with no purpose: a receiver that
+        // sets one rejects every push that lacks it.
+        if let Some(token) = &config.token {
+            let value = reqwest::header::HeaderValue::from_str(token.expose())
+                .map_err(|error| PushError::Malformed(format!("invalid push token: {error}")))?;
+            request = request.header(HEADER_A2A_TOKEN, value);
         }
         let mut request = request.body(body);
         if let Some(authentication) = &config.authentication {

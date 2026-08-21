@@ -1195,8 +1195,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a manifest's unknown fields are ignored rather than refused, so "
         "`max_tokns: 100` reads as no token ceiling at all and the file that "
         "was supposed to make the limit reviewable hides its absence",
-        "#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct Budgets {",
-        "#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]\npub struct Budgets {",
+        "#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]\n#[serde(deny_unknown_fields)]\npub struct Budgets {",
+        "#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]\npub struct Budgets {",
     ),
     "ADeclarativeAgentNeedsNoModelAtParse": (
         "src/manifest/mod.rs",
@@ -1365,8 +1365,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "an effect is dispatched without checking it against the agent's own "
         "manifest, so a reviewer approves one model and the code calls another "
         "with nothing anywhere disagreeing",
-        "        self.declared(key, descriptor).await?;",
-        "        let _ = self.declared(key, descriptor);",
+        "        self.declared(key, descriptor, ceilings).await?;",
+        "        let _ = self.declared(key, descriptor, ceilings);",
     ),
     "CaseStateLaundersTaint": (
         "src/runtime/ctx.rs",
@@ -2300,8 +2300,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "an_event_split_across_chunks_is_reassembled",
         "the decoder drops whatever did not arrive on a line boundary, losing "
         "every event TCP happened to split",
-        "        self.partial.push_str(&String::from_utf8_lossy(chunk));",
-        "        self.partial = String::from_utf8_lossy(chunk).into_owned();",
+        "        self.partial.push_str(&text);",
+        "        self.partial = text;",
     ),
     # The two ways a fake provider makes the suite *worse* than having none. A
     # broken fake does not fail loudly; it makes the tests that depend on it pass
@@ -3063,14 +3063,24 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        (\"system\".to_owned(), input.clone().map(|_| json!(system))),",
     ),
     "ASemanticLimitIsAdvisory": (
-        "src/runtime/ctx.rs",
+        "src/runtime/effects.rs",
         "a_retriever_that_overruns_the_limit_is_refused",
         "a retriever may return more hits than the caller's declared limit, so "
         "the ceiling is advisory: the selection's membership ends up decided by "
         "the seam's iteration order, and every extra hit costs a store read and "
         "a slot in whatever window the caller was sizing",
-        "        if hits.len() > query.limit {",
+        "        if hits.len() > self.query.limit {",
         "        if false {",
+    ),
+    "AStaleSemanticHitIsServed": (
+        "src/runtime/effects.rs",
+        "a_stale_semantic_index_is_screened_not_served_and_not_fatal",
+        "the lifecycle screen keeps every hit the index names, so a superseded "
+        "version is served after its correction, an expired one past its "
+        "stated disposal date, and an erased one fails the whole query — "
+        "routine retention arriving as a semantic-search outage",
+        "            if current.is_some_and(|item| item.version == hit.selected.version) {",
+        "            if true {",
     ),
     "TheEmbeddingSpaceIsNotChecked": (
         "src/runtime/executor.rs",
@@ -3186,8 +3196,37 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "path that *commits* is the only one policy, the manifest and the budget "
         "all miss — and being wrapped in a transaction makes it reliable rather "
         "than authorised",
-        "            self.gate(key, &descriptor, true, None).await?;",
+        "            self.gate(key, &descriptor, true, None, None).await?;",
         "",
+    ),
+    "ARewrittenMemoryIsOnlyAFailure": (
+        "src/runtime/executor.rs",
+        "a_memory_rewritten_under_a_run_quarantines_it",
+        "a run whose pinned read came back different is filed as `Failed` — an "
+        "ordinary, resumable outcome sharing a bucket with a store that was "
+        "briefly unreachable — so the one conclusion meaning *the durable record "
+        "is not trustworthy* never reaches the quarantine backlog",
+        "                        | StepError::Unreproducible { .. }",
+        "",
+    ),
+    "ABreachOutrunsItsEscalation": (
+        "src/runtime/sweeper.rs",
+        "a_sweep_interrupted_before_the_breach_leaves_the_obligation_outstanding",
+        "the obligation is written off before the escalation it pays for lands, "
+        "so a crash in that window leaves a breach `due` will never select again "
+        "and a case that says nothing happened — the sweep spends its one chance "
+        "to notice and reports nothing",
+        "                cases\n                    .set_status(deadline.case, CaseStatus::Escalated)\n                    .await\n                    .map_err(RuntimeError::from_store)?;\n                cases\n                    .set_deadline_state(deadline.case, &deadline.name, DeadlineState::Breached)\n                    .await\n                    .map_err(RuntimeError::from_store)?;",
+        "                cases\n                    .set_deadline_state(deadline.case, &deadline.name, DeadlineState::Breached)\n                    .await\n                    .map_err(RuntimeError::from_store)?;\n                cases\n                    .set_status(deadline.case, CaseStatus::Escalated)\n                    .await\n                    .map_err(RuntimeError::from_store)?;",
+    ),
+    "ABreachedObligationIsNotListed": (
+        "src/store/redb_cases.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "the breach listing answers empty, so a missed obligation is reachable "
+        "only through the case that produced it — and `close` retires that "
+        "handle at the moment people stop looking",
+        "                if row.4 == DeadlineState::Breached.as_str() {",
+        "                if row.4 == DeadlineState::Pending.as_str() {",
     ),
     "ACappedSweepLooksOrdinary": (
         "src/runtime/sweeper.rs",
@@ -4014,8 +4053,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "verifying it accepts any body at all — the header says the payload was "
         "written by a holder of the secret, and it no longer says anything about "
         "the payload",
-        "        let mac = hmac_sha256(&self.key, &content);",
-        "        let mac = hmac_sha256(&self.key, b\"\");",
+        "                let mac = hmac_sha256(key, &content);",
+        "                let mac = hmac_sha256(key, b\"\");",
     ),
     "OneTenantReadsAnothersWebhooks": (
         "src/store/redb_push.rs",
@@ -4276,10 +4315,9 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a message from another agent is admitted as trusted input, so a value "
         "that arrived over the network wears the runtime's own authority and "
         "every protected sink field downstream checks nothing",
-        "    let input = Tainted::from_source(\n"
-        "        message.to_input(),\n"
-        "        SourceId::new(super::peer_source(&caller.actor)),\n"
-        "    );",
+        "    let source = super::peer_source(&caller.actor);\n"
+        "    let input = Tainted::from_source(message.to_input(), SourceId::new(&source));",
+        "    let source = super::peer_source(&caller.actor);\n"
         "    let input = Tainted::trusted(message.to_input());",
     ),
     "TheCardIsNotAtTheWellKnownPath": (
@@ -4406,11 +4444,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "instead of being carried verbatim, so the `thoughtSignature` Gemini 3 "
         "requires back is dropped — a 400 on the second tool turn, and the exact "
         "bug the ecosystem worked around by smuggling signatures into tool-call ids",
-        "            Some(state) if state.provider == PROVIDER => array.push(state.state.clone()),",
-        "            Some(state) if state.provider == PROVIDER => {\n"
-        "                let _ = &state;\n"
-        "                array.push(json!({ \"role\": \"model\", \"parts\": [] }));\n"
-        "            }",
+        "                Some(turns) => array.extend(turns.iter().cloned()),",
+        "                Some(turns) => {\n"
+        "                    let _ = &turns;\n"
+        "                    array.push(json!({ \"role\": \"model\", \"parts\": [] }));\n"
+        "                }",
     ),
     "GeminiThinkingTokensAreFree": (
         "src/model/gemini.rs",
@@ -5548,6 +5586,307 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                         .map_err(|e| be(&e))?;
                 }""",
         """                let _ = &mut admissions;""",
+    ),
+    # ── The oversight surface ───────────────────────────────────────────────
+    "AnEscalatedTaskNeverLeavesTheOverdueScan": (
+        "src/store/redb_tasks.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "the overdue scan keeps returning escalated tasks, whose expiry policy "
+        "has already fired; they accumulate at the head of the bounded "
+        "oldest-first batch until it holds nothing else, and the deny/proceed "
+        "policies of every task behind them silently stop firing",
+        """fn awaits_expiry(state: &str) -> bool {
+    matches!(state, "open" | "claimed")
+}""",
+        """fn awaits_expiry(state: &str) -> bool {
+    is_pending(state)
+}""",
+    ),
+    "PostgresKeepsEscalatedTasksOverdue": (
+        "src/store/postgres_cases.rs",
+        "postgres_satisfies_the_case_layer_contracts",
+        "the shared-store overdue scan keeps returning escalated tasks — the "
+        "same starvation as the embedded store's, on the backend the redb "
+        "mutation cannot reach",
+        """                    "SELECT {TASK_COLS} FROM tasks
+                      WHERE tenant = $3 AND state IN ('open','claimed')
+                        AND due_at IS NOT NULL AND due_at <= $1""",
+        """                    "SELECT {TASK_COLS} FROM tasks
+                      WHERE tenant = $3 AND state IN ('open','claimed','escalated')
+                        AND due_at IS NOT NULL AND due_at <= $1""",
+    ),
+    "EscalationKeepsTheStaleReservation": (
+        "src/core/task.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "escalation leaves the task assigned to whoever sat on it, so the "
+        "widened audience is shown a row only the absent holder can claim",
+        """        self.state = TaskState::Escalated;
+        self.assignee = None;""",
+        """        self.state = TaskState::Escalated;""",
+    ),
+    "EscalationWidensNobody": (
+        "src/core/task.rs",
+        "an_escalating_task_is_escalated_once",
+        "escalation flips the state flag and adds nobody, so the widening the "
+        "manifest promised is back to being a word",
+        """        if !self.candidate_roles.is_empty() {
+            for role in &self.escalate_to {
+                if !self.candidate_roles.contains(role) {
+                    self.candidate_roles.push(role.clone());
+                }
+            }
+        }""",
+        """        let _ = &self.escalate_to;""",
+    ),
+    "AnEscalationNamingNobodyIsAccepted": (
+        "src/runtime/ctx.rs",
+        "an_escalation_naming_nobody_is_refused",
+        "the coded tier accepts OnExpiry::Escalate with no escalation audience, "
+        "so the window closes on a promise the sweep cannot keep",
+        """        if spec.escalate_to.is_empty() {""",
+        """        if false {""",
+    ),
+    "ManifestEscalationNeedsNoAudience": (
+        "src/manifest/mod.rs",
+        "escalation_must_name_its_audience",
+        "the manifest accepts 'escalate' with no escalate_to, so a reviewer "
+        "signs an oversight declaration whose one enforceable meaning is absent",
+        """            if o.escalate_to.is_empty() {""",
+        """            if false {""",
+    ),
+    # ── Batch honesty ───────────────────────────────────────────────────────
+    "ABatchReopensUnderAnEditedPlan": (
+        "src/store/redb_batches.rs",
+        "a_batch_resumed_under_an_edited_plan_is_refused",
+        "a batch reopened under a different plan digest is accepted, so items "
+        "from the resume onward settle under a plan the batch's record does "
+        "not name — several acts wearing one audit identity",
+        """                    // One batch runs one frozen plan; a resume offering an
+                    // edited one is a second act wearing this batch's name.
+                    Some(stored) => {
+                        return Err(StoreError::BatchPlanChanged {
+                            batch: key.clone(),
+                            stored,
+                            offered: digest.clone(),
+                        });
+                    }""",
+        """                    Some(_) => {}""",
+    ),
+    "PostgresBatchReopensUnderAnEditedPlan": (
+        "src/store/postgres_cases.rs",
+        "postgres_satisfies_the_case_layer_contracts",
+        "the shared-store backend accepts a batch reopened under a different "
+        "plan digest — the same plan swap, on the backend the redb mutation "
+        "cannot reach",
+        """        if stored != plan_digest {
+            return Err(StoreError::BatchPlanChanged {""",
+        """        if false {
+            return Err(StoreError::BatchPlanChanged {""",
+    ),
+    "AMarkOnAMissingBatchReportsRecorded": (
+        "src/store/redb_batches.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "marking an unknown batch exhausted reports success while writing "
+        "nothing — the one bit that lets a census read as finished, lost with "
+        "no symptom",
+        """                let Some(digest) = digest else {
+                    return Err(StoreError::NotFound(key.clone()));
+                };""",
+        """                let Some(digest) = digest else {
+                    return Ok(());
+                };""",
+    ),
+    "ADamagedItemOutcomeReadsAsNeverRan": (
+        "src/store/redb_batches.rs",
+        "an_unreadable_item_outcome_is_refused_rather_than_defaulted",
+        "an outcome string the store cannot read decodes as 'no outcome yet', "
+        "so a damaged row reads as an item that never ran and the census "
+        "carries it as in-flight forever",
+        """        "exhausted" => ItemOutcome::Exhausted(d),
+        other => {
+            return Err(StoreError::Corrupt {
+                seq: 0,
+                detail: format!("unknown item outcome '{other}'"),
+            });
+        }
+    }))""",
+        """        "exhausted" => ItemOutcome::Exhausted(d),
+        _ => return Ok(None),
+    }))""",
+    ),
+    "ADamagedTimerPhaseDecodesAsForward": (
+        "src/store/redb_timers.rs",
+        "an_unreadable_timer_phase_is_refused_rather_than_defaulted",
+        "a timer phase the store cannot read decodes to Forward, handing the "
+        "unwind logic a compensating record wearing the wrong half of the "
+        "saga — the refusal the shared-store backend already makes, absent "
+        "from the embedded one",
+        """        other => {
+            return Err(StoreError::Corrupt {
+                seq: 0,
+                detail: format!("unknown timer phase '{other}'"),
+            });
+        }""",
+        """        _ => Phase::Forward,""",
+    ),
+    "AnUnknownBatchReportsAsRunning": (
+        "src/runtime/batch.rs",
+        "a_report_on_an_unknown_batch_is_not_an_empty_batch",
+        "a report on a batch that does not exist answers an empty Running "
+        "batch, so a mistyped id reads as healthy work that never starts",
+        """        if store
+            .plan_digest(id)
+            .await
+            .map_err(RuntimeError::from_store)?
+            .is_none()
+        {""",
+        """        if store
+            .plan_digest(id)
+            .await
+            .map_err(RuntimeError::from_store)?
+            .is_none()
+            && false
+        {""",
+    ),
+    # ── The interop seams (0.21.0 audit round) ─────────────────────────────
+    "ASchemaFailsEveryToolTurn": (
+        "src/model/wire.rs",
+        "a_schema_and_a_tool_calling_turn_coexist_on_every_driver",
+        "the schema exemption for tool-asking turns is gone, so every "
+        "schema-bearing tool-calling agent fails on its first tool turn with "
+        "'the answer is not JSON' — and the error path carries no "
+        "continuation, so the signed reasoning blocks are dropped from the "
+        "retry, which the provider then rejects",
+        """    if !tool_calls.is_empty() {
+        return Ok(None);
+    }""",
+        "",
+    ),
+    "GeminiForgetsPriorRounds": (
+        "src/model/gemini.rs",
+        "gemini_two_tool_turns_accumulate_the_transcript_exactly_once",
+        "the accumulated continuation starts empty each turn instead of from "
+        "the prior state, so round three's request carries only round two — "
+        "round one's signed turn is gone and the model re-asks for the same "
+        "tools with amnesia, silently",
+        """        let mut state = prior
+            .and_then(|value| value.state.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if !exchanges.is_empty() {
+            state.push(Self::tool_responses(exchanges));
+        }""",
+        """        let mut state = Vec::new();
+        let _ = prior;
+        if !exchanges.is_empty() {
+            state.push(Self::tool_responses(exchanges));
+        }""",
+    ),
+    "AnUnstoredResponseLosesItsReasoning": (
+        "src/model/openai.rs",
+        "provider_retention_is_private_by_default_and_replay_visible_when_enabled",
+        "an unstored request no longer asks for the encrypted reasoning "
+        "payload, so reasoning items come back as bare ids the provider will "
+        "not resolve next turn — the stateless multi-turn pattern fails "
+        "against the live API while every local round trip passes",
+        """            body["include"] = json!(["reasoning.encrypted_content"]);""",
+        "",
+    ),
+    "BedrockCacheTokensAreFree": (
+        "src/model/bedrock.rs",
+        "cache_tokens_are_folded_into_the_input_count",
+        "the cache counters are recorded but no longer folded into "
+        "`input_tokens`, so the count under-reports by the whole cached "
+        "prefix and the token ceiling reads a fraction of the real spend — a "
+        "bill nobody can reconcile rather than a failure",
+        """        let usage = output.usage().map_or_else(Usage::default, |usage| {
+            Usage::with_cache_beside_input(
+                u64::try_from(usage.input_tokens()).unwrap_or_default(),""",
+        """        let usage = output.usage().map_or_else(Usage::default, |usage| {
+            Usage::with_cache_beside_input(
+                u64::try_from(usage.input_tokens()).unwrap_or_default() * 0,""",
+    ),
+    "AGuardrailInterventionIsAnAnswer": (
+        "src/model/bedrock.rs",
+        "a_buffered_guardrail_intervention_is_a_refusal_not_an_answer",
+        "the buffered path stops checking the stop reason, so a guardrail "
+        "intervention comes back as a successful completion — the canned "
+        "refusal message wearing an answer, on exactly the path a "
+        "streaming-by-default deployment never exercises",
+        """        if output.stop_reason() == &aws_sdk_bedrockruntime::types::StopReason::GuardrailIntervened {""",
+        """        if output.stop_reason() == &aws_sdk_bedrockruntime::types::StopReason::StopSequence {""",
+    ),
+    "TheAsyncPathDeclassifies": (
+        "src/tools/mcp.rs",
+        "an_async_tool_returns_a_task_that_can_be_polled_as_an_effect",
+        "the task poll's snapshot ignores the ceiling it was constructed "
+        "with and arrives at the trait default, so the asynchronous path "
+        "quietly declassifies the same payload the synchronous tool call "
+        "protects",
+        """        self.output_sensitivity
+    }""",
+        """        let _ = self.output_sensitivity;
+        Sensitivity::Public
+    }""",
+    ),
+    "APushTokenNeverRides": (
+        "src/push/mod.rs",
+        "the_push_token_rides_the_delivery_as_its_own_header",
+        "the A2A per-task token is stored, sealed, redacted — and never "
+        "attached to a delivery, so a receiver that validates it rejects "
+        "every push while this plane retries thirty-two times and parks",
+        """            request = request.header(HEADER_A2A_TOKEN, value);""",
+        """            let _ = value;""",
+    ),
+    "AControlCharacterForgesAPair": (
+        "src/core/cloudevent.rs",
+        "a_control_character_cannot_forge_another_producers_pair",
+        "control characters pass into `source` and `id`, so a producer can "
+        "embed the U+001F joiner and spell another producer's `(source, id)` "
+        "pair — the victim's real event later reads as a duplicate and is "
+        "silently swallowed",
+        """                return Err(CloudEventError::ControlCharacter(name));""",
+        """                let _ = name;""",
+    ),
+    "AMessageIdIsSharedBetweenPeers": (
+        "src/api/a2a.rs",
+        "two_peers_sharing_a_message_id_are_two_runs",
+        "the admission key drops its producer, so one peer replaying "
+        "another's messageId is treated as that peer's retry — it is handed "
+        "the victim's task id and a seat inside the victim's case",
+        """    // a second run inside the right case.
+    let keyed = format!("{source}\\u{1f}{}", message.message_id);""",
+        """    // a second run inside the right case.
+    let _ = source;
+    let keyed = message.message_id.clone();""",
+    ),
+    "HistoryDefaultsToNothing": (
+        "src/api/a2a.rs",
+        "history_rides_by_default_and_zero_suppresses_it",
+        "an unset historyLength reads as zero instead of the protocol's "
+        "full-history default, so a conformant client expecting its "
+        "conversation back gets nothing",
+        """    let limit = history_length.unwrap_or(HISTORY_CAP);""",
+        """    let limit = history_length.unwrap_or(0);""",
+    ),
+    "SseSplitsACodepoint": (
+        "src/model/sse.rs",
+        "a_codepoint_split_across_chunks_survives",
+        "the front half of a codepoint is decoded lossily instead of held "
+        "for the next chunk, so every multi-byte character TCP happens to "
+        "split becomes two replacement chars — silently, because the JSON "
+        "around it still parses",
+        """                    } else {
+                        // The front half of a codepoint. Kept for the next chunk.
+                        self.pending.drain(..valid);
+                        break;
+                    }""",
+        """                    } else {
+                        // The front half of a codepoint. Kept for the next chunk.
+                        text.push('\\u{FFFD}');
+                        self.pending.clear();
+                        break;
+                    }""",
     ),
 }
 

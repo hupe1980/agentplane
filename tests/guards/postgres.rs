@@ -1516,6 +1516,7 @@ async fn postgres_task_claim_admits_exactly_one_reviewer() {
         priority: Priority::Normal,
         state: TaskState::Open,
         on_expiry: OnExpiry::Deny,
+        escalate_to: Vec::new(),
         excluded_actors: Vec::new(),
         created_at: agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("time"),
         due_at: None,

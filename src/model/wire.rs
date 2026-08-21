@@ -106,12 +106,25 @@ pub fn classify_transport(model: &ModelId, e: &reqwest::Error) -> ModelError {
 pub fn structured(
     schema: Option<&serde_json::Value>,
     text: &str,
+    tool_calls: &[super::ToolCall],
     model: &ModelId,
     usage: super::Usage,
 ) -> Result<Option<serde_json::Value>, ModelError> {
     let Some(schema) = schema else {
         return Ok(None);
     };
+    // A turn that asks for tools is not the final answer, and a schema binds
+    // only the final answer — the same exemption `honour_declared_schema`
+    // applies at the effect boundary. Spelled once here rather than once per
+    // driver, because the copy that drifts is on whichever driver a
+    // deployment does not exercise: failing a tool-asking turn does worse
+    // than waste it — the error path carries no continuation, so a provider's
+    // signed reasoning blocks are dropped from the retry, which the provider
+    // then rejects. Emulated forced-tool answers pass an empty slice: there
+    // the tool call *is* the answer, and its arguments must parse.
+    if !tool_calls.is_empty() {
+        return Ok(None);
+    }
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| ModelError::Unusable {
             model: model.clone(),
@@ -393,6 +406,7 @@ mod schema_validation_tests {
                 "required": ["id"]
             })),
             r#"{"id":"abc"}"#,
+            &[],
             &model,
             usage,
         )

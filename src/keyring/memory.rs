@@ -347,6 +347,17 @@ impl MemoryStore for EncryptedMemoryStore {
         }
     }
 
+    async fn current(
+        &self,
+        id: &str,
+        as_of: Option<Timestamp>,
+    ) -> Result<Option<MemoryItem>, StoreError> {
+        match self.inner.current(id, as_of).await? {
+            Some(item) => self.open_item(item).await,
+            None => Ok(None),
+        }
+    }
+
     async fn forget(&self, id: &str) -> Result<(), StoreError> {
         super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
             self.inner.forget(id).await

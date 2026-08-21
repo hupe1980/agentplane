@@ -198,7 +198,16 @@ impl DeliveryWorker {
     /// stall a sweep and small enough that a plane with a large backlog does
     /// not answer a scheduler tick by opening a thousand connections.
     pub const DEFAULT_MAX_IN_FLIGHT: usize = 16;
+}
 
+/// How many journal records one registration drains per turn.
+///
+/// A page, not a ceiling: the cursor advances per delivery and the row stays
+/// due, so a deep backlog finishes over turns instead of holding one of the
+/// sweep's fan-out slots for its whole length.
+const DRAIN_PAGE: usize = 256;
+
+impl DeliveryWorker {
     #[must_use]
     pub fn new(
         journal: Arc<dyn JournalStore>,
@@ -348,10 +357,16 @@ impl DeliveryWorker {
     ) -> Result<Progress, crate::core::StoreError> {
         let mut progress = Progress::default();
         let mut attempts = registration.attempts;
-        let records = self
+        let mut records = self
             .journal
             .read(registration.config.task, registration.next_seq)
             .await?;
+        // Bounded per turn: one registration with a 10k-record backlog would
+        // otherwise hold one of the sweep's fan-out slots for its whole drain,
+        // which is the serialisation problem re-created one slot at a time.
+        // The cursor advances per delivery, the row stays due, and the rest of
+        // the backlog is the next turn's page.
+        records.truncate(DRAIN_PAGE);
         if records.is_empty() && self.cleanup_acknowledged_terminal(&registration).await? {
             progress.completed += 1;
             return Ok(progress);

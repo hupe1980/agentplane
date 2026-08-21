@@ -181,8 +181,11 @@ agentplane serve examples/served.yaml \
   --store ./served.redb
 ```
 
-Add `--operator-addr 127.0.0.1:9090` and the worklist, task decisions and
-`GET /runs?outcome=quarantined` are served too — on their **own** listener, off
+Add `--operator-addr 127.0.0.1:9090` and the operator surface is served too —
+the worklist and task decisions, plus the backlogs an on-call person asks for by
+question rather than by id: what is quarantined, what is escalated, and what
+obligations were missed ([the full table](https://hupe1980.github.io/agentplane/docs/operations/#what-the-endpoints-are-for))
+— on their **own** listener, off
 unless asked for, and separated from the peer surface by *policy* (`peer` reaches
 `a2a:*`, `operator` reaches `api:*`) rather than by the port. A served plane also
 sweeps deadlines, task expiry, dead letters, due timers **and abandoned runs**
@@ -231,7 +234,7 @@ What is deliberately **not** built, and what will move →
 | 🧠 | [Concepts](https://hupe1980.github.io/agentplane/docs/concepts/) — the ideas the rest is built from |
 | 🏗️ | [Architecture](https://hupe1980.github.io/agentplane/docs/architecture/) — how it actually works, mechanism by mechanism |
 | 🍳 | [Cookbook](https://hupe1980.github.io/agentplane/docs/cookbook/) — task-shaped recipes, including wiring an MCP server beside typed tools |
-| 📄 | [Manifest reference](https://hupe1980.github.io/agentplane/docs/manifest/) — every field, what enforces it, and what an absent value means |
+| 📄 | [Manifest reference](https://hupe1980.github.io/agentplane/docs/manifest/) — every field, what enforces it, and what an absent value means; the [published JSON Schema](https://hupe1980.github.io/agentplane/agent.schema.json) gives editors autocomplete and inline errors via one modeline |
 | 🧪 | [Testing agents](https://hupe1980.github.io/agentplane/docs/testing/) — the fake provider, fault injection, and proving a replay actually replayed |
 | 🔐 | [Security model](https://hupe1980.github.io/agentplane/docs/security/) — the trust boundary, and what it does not cover |
 | 🗝️ | [Erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) — erasure that reaches backups, key rotation and revocation, and how tenants are kept apart |

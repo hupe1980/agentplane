@@ -511,11 +511,21 @@ impl Bedrock {
                 .map(|item| Self::message_from_value(model, item))
                 .collect::<Result<Vec<_>, _>>()?,
             Value::String(text) => vec![Self::text_message(ConversationRole::User, text, model)?],
-            other => vec![Self::text_message(
-                ConversationRole::User,
-                &other.to_string(),
-                model,
-            )?],
+            other => {
+                // `system` is an instruction about the content, not content —
+                // it rides in Converse's own system block, and leaving it in
+                // the stringified object would show the instruction to the
+                // model twice, once as text it may quote back.
+                let mut rest = other.clone();
+                if let Some(map) = rest.as_object_mut() {
+                    map.remove("system");
+                }
+                vec![Self::text_message(
+                    ConversationRole::User,
+                    &rest.to_string(),
+                    model,
+                )?]
+            }
         };
 
         if exchanges.is_empty() {
@@ -856,15 +866,31 @@ impl Bedrock {
         mode: SchemaMode,
         output: &aws_sdk_bedrockruntime::operation::converse::ConverseOutput,
     ) -> Result<Completion, ModelError> {
-        let usage = output.usage().map_or_else(Usage::default, |usage| Usage {
-            input_tokens: u64::try_from(usage.input_tokens()).unwrap_or_default(),
-            output_tokens: u64::try_from(usage.output_tokens()).unwrap_or_default(),
-            cache_write_tokens: u64::try_from(usage.cache_write_input_tokens().unwrap_or_default())
-                .unwrap_or_default(),
-            cache_read_tokens: u64::try_from(usage.cache_read_input_tokens().unwrap_or_default())
-                .unwrap_or_default(),
-            minor_units: 0,
+        // Converse reports the cache counters *beside* `inputTokens` — the
+        // Anthropic convention — so the shared fold is what makes
+        // `Usage::input_tokens` mean everything the provider processed here
+        // as on every other driver.
+        let usage = output.usage().map_or_else(Usage::default, |usage| {
+            Usage::with_cache_beside_input(
+                u64::try_from(usage.input_tokens()).unwrap_or_default(),
+                u64::try_from(usage.output_tokens()).unwrap_or_default(),
+                u64::try_from(usage.cache_write_input_tokens().unwrap_or_default())
+                    .unwrap_or_default(),
+                u64::try_from(usage.cache_read_input_tokens().unwrap_or_default())
+                    .unwrap_or_default(),
+            )
         });
+        // Metered and landed: the model was invoked and the assessment was
+        // billed. An intervention is a refusal whichever path carries it —
+        // passed through, it would be the guardrail's canned message wearing
+        // a successful answer.
+        if output.stop_reason() == &aws_sdk_bedrockruntime::types::StopReason::GuardrailIntervened {
+            return Err(ModelError::Unusable {
+                model: model.clone(),
+                usage,
+                detail: "a Bedrock guardrail intervened on this call".to_owned(),
+            });
+        }
         let message = output
             .output()
             .and_then(|value| value.as_message().ok())
@@ -1486,6 +1512,90 @@ fn continuation_message_from_json(value: &Value, model: &ModelId) -> Result<Mess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Converse reports the cache counters **beside** `inputTokens`.
+    ///
+    /// `Usage::input_tokens` means everything the provider processed, cached
+    /// tokens included — copied verbatim, the count under-reports by the whole
+    /// cached prefix and the token ceiling reads a fraction of the real spend,
+    /// surfacing as a bill nobody can reconcile rather than as a failure.
+    #[test]
+    fn cache_tokens_are_folded_into_the_input_count() {
+        let model = ModelId::new("bedrock", "test");
+        let message = Message::builder()
+            .role(ConversationRole::Assistant)
+            .content(ContentBlock::Text("ok".to_owned()))
+            .build()
+            .expect("message");
+        let output = aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
+            .output(aws_sdk_bedrockruntime::types::ConverseOutput::Message(
+                message,
+            ))
+            .stop_reason(aws_sdk_bedrockruntime::types::StopReason::EndTurn)
+            .usage(
+                aws_sdk_bedrockruntime::types::TokenUsage::builder()
+                    .input_tokens(10)
+                    .output_tokens(4)
+                    .total_tokens(14)
+                    .cache_read_input_tokens(90)
+                    .cache_write_input_tokens(6)
+                    .build()
+                    .expect("usage"),
+            )
+            .build()
+            .expect("converse output");
+
+        let completion =
+            Bedrock::interpret(&model, None, SchemaMode::Native, &output).expect("an answer");
+        assert_eq!(
+            completion.usage.input_tokens, 106,
+            "10 uncached + 90 cache-read + 6 cache-write"
+        );
+        assert_eq!(completion.usage.cache_read_tokens, 90);
+        assert_eq!(completion.usage.cache_write_tokens, 6);
+    }
+
+    /// A guardrail intervention is a metered refusal on the buffered path too.
+    ///
+    /// The intervention replaces the content with the guardrail's canned
+    /// message; returned as a completion, that message wears a successful
+    /// answer and the one path a streaming-by-default deployment never
+    /// exercises is the one that lets it through.
+    #[test]
+    fn a_buffered_guardrail_intervention_is_a_refusal_not_an_answer() {
+        let model = ModelId::new("bedrock", "test");
+        let message = Message::builder()
+            .role(ConversationRole::Assistant)
+            .content(ContentBlock::Text(
+                "Sorry, I cannot answer that.".to_owned(),
+            ))
+            .build()
+            .expect("message");
+        let output = aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
+            .output(aws_sdk_bedrockruntime::types::ConverseOutput::Message(
+                message,
+            ))
+            .stop_reason(aws_sdk_bedrockruntime::types::StopReason::GuardrailIntervened)
+            .usage(
+                aws_sdk_bedrockruntime::types::TokenUsage::builder()
+                    .input_tokens(7)
+                    .output_tokens(3)
+                    .total_tokens(10)
+                    .build()
+                    .expect("usage"),
+            )
+            .build()
+            .expect("converse output");
+
+        let error = Bedrock::interpret(&model, None, SchemaMode::Native, &output)
+            .expect_err("an intervention is a refusal, not an answer");
+        match error {
+            ModelError::Unusable { usage, .. } => {
+                assert_eq!(usage.input_tokens, 7, "the assessment was billed");
+            }
+            other => panic!("expected a metered Unusable, got {other:?}"),
+        }
+    }
 
     #[test]
     fn smithy_documents_round_trip_json() {

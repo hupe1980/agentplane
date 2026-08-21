@@ -463,6 +463,16 @@ pub struct SemanticQuery {
     pub limit: usize,
     /// Highest sensitivity this retriever may receive.
     pub max_sensitivity: Sensitivity,
+    /// The lifecycle cutoff this selection was screened at.
+    ///
+    /// A semantic index is derived and therefore stale by construction: it
+    /// keeps naming versions after they are superseded, expire, or are
+    /// erased. Live dispatch screens every hit against the authoritative
+    /// store at this instant — the run's journaled clock, so the cutoff is on
+    /// the record beside the selection it shaped rather than being an ambient
+    /// wall clock two machines disagree about.
+    #[serde(with = "time::serde::rfc3339")]
+    pub as_of: Timestamp,
 }
 
 /// One ranked semantic selection as journaled.
@@ -825,6 +835,30 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// If the store cannot be reached.
     async fn version(&self, id: &str, version: u64) -> Result<Option<MemoryItem>, StoreError>;
 
+    /// The one version of `id` a fresh recall at `as_of` would be allowed to
+    /// see — or `None`, which covers a memory that was never written, was
+    /// forgotten or swept, or whose effective expiry (`min(expires_at, access
+    /// window)`) has passed the cutoff. `None` for `as_of` skips the expiry
+    /// check, exactly as it does on [`recall`](Self::recall).
+    ///
+    /// The by-id twin of [`recall`](Self::recall)'s lifecycle rule, and a
+    /// question [`version`](Self::version) deliberately cannot answer:
+    /// `version` serves replay, which must keep reading superseded and
+    /// expired state, so nothing built on it can tell *still current* from
+    /// *still stored*. The semantic tier's lifecycle screen is the consumer —
+    /// see [`SemanticRecall`](crate::runtime::effects::SemanticRecall) for
+    /// why a stale hit leaves the selection rather than being served or
+    /// failing the query.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn current(
+        &self,
+        id: &str,
+        as_of: Option<Timestamp>,
+    ) -> Result<Option<MemoryItem>, StoreError>;
+
     /// Forget a memory and every version of it.
     ///
     /// Selective by construction: one id, not a purge. A repair that can only
@@ -1022,6 +1056,7 @@ mod semantic_tests {
             index: retriever.index(),
             limit: 2,
             max_sensitivity: Sensitivity::Internal,
+            as_of: Timestamp::UNIX_EPOCH,
         };
         let hits = retriever.search(&query).await.expect("semantic search");
         assert_eq!(

@@ -173,6 +173,25 @@ impl Destination {
         Ok(self)
     }
 
+    /// Sign every delivery under this secret **as well** — the mid-rotation
+    /// form. The receiver holding either key verifies, so the old secret can
+    /// be retired at the receiver's pace instead of on a flag day.
+    ///
+    /// # Panics
+    ///
+    /// As [`signed_with`](Self::signed_with); and if no primary secret was
+    /// configured first, because "also" without a first key is a wiring
+    /// mistake worth naming at configuration.
+    #[must_use]
+    pub fn also_signed_with(mut self, secret: &crate::core::Secret) -> Self {
+        let signing = self
+            .signing
+            .take()
+            .expect("also_signed_with needs signed_with first: there is no primary key");
+        self.signing = Some(signing.also_with(secret));
+        self
+    }
+
     /// The stored registration id for this destination.
     #[must_use]
     pub fn registration_id(&self) -> String {
@@ -235,6 +254,15 @@ impl Outbox {
                  one cursor, so one's acknowledgement would discard the other's \
                  backlog",
                 destination.name
+            );
+            // At configuration, like every other config error: a typo'd URL
+            // otherwise surfaces per admitted run at first sweep, as one
+            // permanently parked registration per run.
+            assert!(
+                reqwest::Url::parse(&destination.url).is_ok(),
+                "outbox destination '{}' has an unparseable URL '{}'",
+                destination.name,
+                destination.url
             );
         }
         Self {
@@ -347,6 +375,7 @@ impl Outbox {
 pub struct RunCompleted {
     source: String,
     event_type: String,
+    tenant: Option<String>,
 }
 
 impl RunCompleted {
@@ -356,7 +385,19 @@ impl RunCompleted {
         Self {
             source: source.into(),
             event_type: "io.agentplane.run.completed".to_owned(),
+            tenant: None,
         }
+    }
+
+    /// Stamp every event with a `tenantid` extension.
+    ///
+    /// For a multi-tenant plane posting to one operator bus: without it, two
+    /// tenants' completions are indistinguishable envelopes, and the inbound
+    /// side of this crate already binds tenants on exactly this extension.
+    #[must_use]
+    pub fn for_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
     }
 
     /// Override the `CloudEvents` `type`.
@@ -379,10 +420,16 @@ impl Projection for RunCompleted {
             return Ok(Vec::new());
         };
         let run = record.body.run.to_string();
-        let event = CloudEvent::new(&self.source, &run, &self.event_type)
+        let mut event = CloudEvent::new(&self.source, &run, &self.event_type)
             // The three required attributes were checked when the source was
             // configured and the type is a constant; a run id is never empty.
-            .map_err(|error| StoreError::Backend(error.to_string()))?
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        if let Some(tenant) = &self.tenant {
+            event = event
+                .with_extension("tenantid", serde_json::Value::String(tenant.clone()))
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+        }
+        let event = event
             // What the event is *about* within this producer. `source` names
             // the deployment and `id` is the deduplication half; without a
             // subject a receiver filtering by run has to open the data.

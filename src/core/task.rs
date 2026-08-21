@@ -143,6 +143,10 @@ pub enum OnExpiry {
     /// Refuse the proposed action. The safe default.
     Deny,
     /// Widen the audience and keep waiting.
+    ///
+    /// Requires [`TaskSpec::escalate_to`] to name who is added: a promise to
+    /// widen an audience with nobody to widen it to is a state flag wearing a
+    /// control's name.
     Escalate,
     /// Proceed unattended.
     ///
@@ -217,6 +221,13 @@ pub struct TaskSpec {
     /// The obligation that bounds this wait, by name.
     pub deadline: String,
     pub on_expiry: OnExpiry,
+    /// Roles added to the audience when the task escalates.
+    ///
+    /// Required by [`OnExpiry::Escalate`] and refused beside anything else:
+    /// escalation's one enforceable meaning is *these people can now see it*,
+    /// so the declaration must say who they are, and naming them under a
+    /// policy that never escalates is a declaration nothing reads.
+    pub escalate_to: Vec<String>,
     /// Actors who may **not** decide this — the four-eyes control.
     ///
     /// Whoever proposed an action does not get to approve it. Without this,
@@ -239,6 +250,7 @@ impl TaskSpec {
             priority: Priority::Normal,
             deadline: deadline.into(),
             on_expiry: OnExpiry::Deny,
+            escalate_to: Vec::new(),
             excluded_actors: Vec::new(),
             allow_unattended: false,
         }
@@ -269,6 +281,13 @@ impl TaskSpec {
         self
     }
 
+    /// Name a role added to the audience when the task escalates.
+    #[must_use]
+    pub fn escalate_to(mut self, r: impl Into<String>) -> Self {
+        self.escalate_to.push(r.into());
+        self
+    }
+
     /// Consent to acting unattended when the window passes.
     ///
     /// Separate from `on_expiry` on purpose: `OnExpiry::Proceed` without this is
@@ -296,6 +315,9 @@ pub struct Task {
     pub priority: Priority,
     pub state: TaskState,
     pub on_expiry: OnExpiry,
+    /// Roles [`escalate`](Self::escalate) adds to the audience.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escalate_to: Vec<String>,
     pub excluded_actors: Vec<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: Timestamp,
@@ -315,6 +337,42 @@ impl Task {
             return false;
         }
         self.candidate_roles.is_empty() || self.candidate_roles.iter().any(|r| roles.contains(r))
+    }
+
+    /// Apply this task's declared escalation to its own fields.
+    ///
+    /// The one implementation of what escalating *means*, called by every
+    /// [`TaskStore::escalate`](crate::case::TaskStore::escalate) backend so the
+    /// semantics cannot drift per store. Three fields move together:
+    ///
+    /// * the state becomes [`TaskState::Escalated`], so listings say what
+    ///   happened;
+    /// * the reservation is cleared — the claim belonged to the window that
+    ///   closed, and an escalation that leaves the task assigned to whoever sat
+    ///   on it has widened the audience to people who cannot claim the row;
+    /// * the audience is **widened** by [`escalate_to`](Self::escalate_to) —
+    ///   a union, because the original reviewers remain eligible; replacing
+    ///   them would make an escalation a reassignment wearing a wider name.
+    ///
+    /// An empty audience stays empty: it already means *anyone*, and adding
+    /// roles to it would narrow the widest audience there is. The parser and
+    /// [`StepCtx`](crate::runtime::StepCtx) refuse that combination at
+    /// declaration, but the semantics must not depend on a parser upstream —
+    /// a store contract enforced only by its callers is a request.
+    ///
+    /// What deliberately does not move: `excluded_actors`. Four-eyes does not
+    /// thin because nobody answered — the proposer is barred from the wider
+    /// audience exactly as from the narrow one.
+    pub fn escalate(&mut self) {
+        self.state = TaskState::Escalated;
+        self.assignee = None;
+        if !self.candidate_roles.is_empty() {
+            for role in &self.escalate_to {
+                if !self.candidate_roles.contains(role) {
+                    self.candidate_roles.push(role.clone());
+                }
+            }
+        }
     }
 }
 

@@ -94,9 +94,8 @@ pub enum BuildError {
     ///
     /// Refused at build because it is knowable at build: the manifest says the
     /// agent runs a tool loop, and the plane says nothing reaches a tool server.
-    /// It used to be a **per-run** failure — the plane assembled cleanly and
-    /// then every single run failed with the same message, which is a wiring
-    /// mistake reported once per request instead of once. The one shape that is
+    /// Deferring it to the run would report a wiring mistake once per request
+    /// instead of once, on a plane that assembled cleanly. The one shape that is
     /// legitimately catalogue-free is an agent whose grants are *all*
     /// `tool://agent/…`: those dispatch through `commission` and their
     /// catalogue is derived from the declaration.

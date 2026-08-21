@@ -77,6 +77,29 @@ pub enum CloudEventError {
          with case-insensitive keys cannot arrive as a different event"
     )]
     BadExtensionName(String),
+    #[error(
+        "extension attribute '{0}' names a core attribute — an extension that \
+         shadows 'id' or 'source' would let the serializer emit an envelope \
+         whose identity is the extension's value"
+    )]
+    ReservedExtensionName(String),
+    #[error(
+        "extension attribute '{0}' carries a JSON {1}, which the CloudEvents \
+         type system has no extension type for — send a string, number, or \
+         boolean, or put structure in 'data'"
+    )]
+    BadExtensionValue(String, &'static str),
+    #[error(
+        "'{0}' contains a control character — the deduplication identity is \
+         'source' and 'id' joined by one, so a value that embeds it could \
+         spell another producer's pair"
+    )]
+    ControlCharacter(&'static str),
+    #[error(
+        "header '{0}' appears more than once — two values for one attribute \
+         are two different events wearing one envelope"
+    )]
+    DuplicateHeader(String),
     #[error("'time' is not an RFC 3339 timestamp: {0}")]
     BadTime(String),
     #[error(
@@ -151,13 +174,54 @@ impl CloudEvent {
         if self.event_type.is_empty() {
             return Err(CloudEventError::MissingAttribute("type"));
         }
-        for name in self.extensions.keys() {
+        // Control characters are refused because one of them is load-bearing:
+        // the buffered id is `source` and `id` joined by U+001F, and the pair
+        // is unforgeable only while neither half can contain the separator.
+        // The whole C0 range goes with it — no attribute value has a use for
+        // one, and refusing narrowly would leave the next joiner exposed.
+        for (name, value) in [
+            ("id", &self.id),
+            ("source", &self.source),
+            ("type", &self.event_type),
+        ] {
+            if value.chars().any(char::is_control) {
+                return Err(CloudEventError::ControlCharacter(name));
+            }
+        }
+        for (name, value) in &self.extensions {
             if name.is_empty()
                 || !name
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
             {
                 return Err(CloudEventError::BadExtensionName(name.clone()));
+            }
+            if matches!(
+                name.as_str(),
+                "specversion"
+                    | "id"
+                    | "source"
+                    | "type"
+                    | "subject"
+                    | "time"
+                    | "datacontenttype"
+                    | "dataschema"
+                    | "data"
+                    | "data_base64"
+            ) {
+                return Err(CloudEventError::ReservedExtensionName(name.clone()));
+            }
+            match value {
+                Value::String(_) | Value::Bool(_) | Value::Number(_) => {}
+                Value::Null => {
+                    return Err(CloudEventError::BadExtensionValue(name.clone(), "null"));
+                }
+                Value::Array(_) => {
+                    return Err(CloudEventError::BadExtensionValue(name.clone(), "array"));
+                }
+                Value::Object(_) => {
+                    return Err(CloudEventError::BadExtensionValue(name.clone(), "object"));
+                }
             }
         }
         Ok(self)
@@ -256,12 +320,23 @@ impl CloudEvent {
     /// producers' events from collapsing two of them into one.
     #[must_use]
     pub fn into_inbound(self, transport_source: impl Into<String>) -> InboundEvent {
-        InboundEvent::new(
+        let mut event = InboundEvent::new(
             transport_source,
             self.origin_id(),
-            self.event_type,
+            self.event_type.clone(),
             self.data.unwrap_or(Value::Null),
-        )
+        );
+        // `subject` is the standard's own "what this event is about", and it
+        // is the **only** attribute that becomes a correlation key: without
+        // one, a conformant CloudEvent could be accepted, buffered, and never
+        // wake anything — a dead letter with a 200. Extensions deliberately
+        // stay out of correlation (an extension convention would be invented
+        // here and cited as the spec); a run that wants to be woken by a
+        // CloudEvent correlates on `("subject", <business id>)`.
+        if let Some(subject) = self.subject {
+            event = event.correlate(crate::core::CorrelationKey::new("subject", subject));
+        }
+        event
     }
 
     /// Parse a structured-mode body.
@@ -299,12 +374,21 @@ impl CloudEvent {
             if name == "content-type" {
                 content_type = Some(value.to_owned());
             } else if let Some(attribute) = name.strip_prefix(HEADER_PREFIX) {
-                attributes.insert(attribute.to_owned(), percent_decode(value)?);
+                // Refused rather than last-wins: two values for one attribute
+                // are two different events wearing one envelope, and silently
+                // keeping whichever the iterator yielded last decides between
+                // them by header order.
+                if attributes
+                    .insert(attribute.to_owned(), percent_decode(value)?)
+                    .is_some()
+                {
+                    return Err(CloudEventError::DuplicateHeader(name));
+                }
             }
         }
         if content_type
             .as_deref()
-            .is_some_and(|value| media_type_of(value) == "application/cloudevents+json")
+            .is_some_and(is_structured_media_type)
         {
             return Self::from_json(body);
         }
@@ -327,11 +411,9 @@ impl CloudEvent {
             // `datacontenttype` rides on `Content-Type` in binary mode, and a
             // body that is not JSON cannot become a JSON payload without being
             // retyped.
-            let media = content_type.map_or("application/json", media_type_of);
-            if !is_json_media_type(media) {
-                return Err(CloudEventError::UnsupportedDataContentType(
-                    media.to_owned(),
-                ));
+            let media = content_type.map_or_else(|| "application/json".to_owned(), media_type_of);
+            if !is_json_media_type(&media) {
+                return Err(CloudEventError::UnsupportedDataContentType(media));
             }
             Some(
                 serde_json::from_slice(body)
@@ -363,7 +445,7 @@ impl CloudEvent {
             event_type: take("type").unwrap_or_default(),
             subject: take("subject"),
             time,
-            datacontenttype: content_type.map(|value| media_type_of(value).to_owned()),
+            datacontenttype: content_type.map(media_type_of),
             dataschema: take("dataschema"),
             extensions,
             data,
@@ -488,14 +570,26 @@ fn parse_time(raw: &str) -> Result<Timestamp, CloudEventError> {
         .map_err(|error| CloudEventError::BadTime(format!("{raw}: {error}")))
 }
 
-/// The media type without its parameters, lowercased.
-fn media_type_of(header: &str) -> &str {
+/// The media type without its parameters, lowercased — RFC 9110 makes media
+/// types case-insensitive, and matched case-sensitively a conformant
+/// `Application/CloudEvents+JSON` post falls through to binary mode.
+fn media_type_of(header: &str) -> String {
     header
         .split(';')
         .next()
         .unwrap_or(header)
         .trim()
-        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+/// Whether a `Content-Type` selects `CloudEvents` structured mode.
+///
+/// The one predicate for that question, shared with the HTTP route, because
+/// two spellings of it are free to choose different modes for the same
+/// message.
+#[must_use]
+pub fn is_structured_media_type(header: &str) -> bool {
+    media_type_of(header) == "application/cloudevents+json"
 }
 
 /// Whether a media type carries JSON, including the `+json` structured suffix
@@ -540,6 +634,107 @@ fn percent_decode(value: &str) -> Result<String, CloudEventError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pair separator cannot be smuggled inside either half.
+    ///
+    /// The buffered id is `source` and `id` joined by U+001F, and the pair is
+    /// unforgeable only while neither half can contain the separator: two
+    /// producers behind one relay must never collide, and `("a\u{1f}b", "c")`
+    /// spelling the same bytes as `("a", "b\u{1f}c")` would let one producer
+    /// pre-empt another's future event as an apparent duplicate.
+    #[test]
+    fn a_control_character_cannot_forge_another_producers_pair() {
+        for (source, id) in [("a\u{1f}b", "c"), ("a", "b\u{1f}c"), ("a\nb", "c")] {
+            let error = CloudEvent::new(id, source, "t").expect_err("a forgeable pair");
+            assert!(
+                matches!(error, CloudEventError::ControlCharacter(_)),
+                "{source:?}/{id:?} was accepted: {error}"
+            );
+        }
+    }
+
+    /// An extension cannot wear a core attribute's name.
+    #[test]
+    fn an_extension_cannot_shadow_a_core_attribute() {
+        let event = CloudEvent::new("1", "urn:a", "t").expect("event");
+        let error = event
+            .with_extension("id", serde_json::Value::String("other".to_owned()))
+            .expect_err("a shadowing extension");
+        assert!(matches!(error, CloudEventError::ReservedExtensionName(_)));
+    }
+
+    /// Extension values are the `CloudEvents` type system's, not arbitrary JSON.
+    #[test]
+    fn a_structured_extension_value_must_be_a_scalar() {
+        let error = structured(&json!({
+            "specversion": "1.0", "id": "1", "source": "urn:a", "type": "t",
+            "tenantid": { "nested": true },
+        }))
+        .expect_err("an object extension");
+        assert!(
+            matches!(error, CloudEventError::BadExtensionValue(..)),
+            "{error}"
+        );
+    }
+
+    /// Media types are case-insensitive, and both mode predicates agree.
+    #[test]
+    fn structured_mode_is_chosen_case_insensitively() {
+        let body = json!({ "specversion": "1.0", "id": "1", "source": "urn:a", "type": "t" });
+        let event = CloudEvent::from_http(
+            [(
+                "content-type",
+                "Application/CloudEvents+JSON; charset=utf-8",
+            )],
+            body.to_string().as_bytes(),
+        )
+        .expect("structured mode despite capitalization");
+        assert_eq!(event.id(), "1");
+        assert!(is_structured_media_type("APPLICATION/CLOUDEVENTS+JSON"));
+        assert!(!is_structured_media_type("application/cloudevents+jsonx"));
+    }
+
+    /// A repeated attribute header is two events wearing one envelope.
+    #[test]
+    fn a_duplicated_attribute_header_is_refused() {
+        let error = CloudEvent::from_http(
+            [
+                ("ce-specversion", "1.0"),
+                ("ce-id", "1"),
+                ("ce-id", "2"),
+                ("ce-source", "urn:a"),
+                ("ce-type", "t"),
+            ],
+            b"",
+        )
+        .expect_err("two ids");
+        assert!(
+            matches!(error, CloudEventError::DuplicateHeader(_)),
+            "{error}"
+        );
+    }
+
+    /// `subject` is the one attribute that can wake a run.
+    ///
+    /// Without it a conformant `CloudEvent` is accepted, buffered, and never
+    /// wakes anything — a dead letter with a 200. A run that wants to be woken
+    /// by a `CloudEvent` correlates on `("subject", <business id>)`.
+    #[test]
+    fn the_subject_becomes_the_correlation_key_and_nothing_else_does() {
+        let with = CloudEvent::new("1", "urn:a", "t")
+            .expect("event")
+            .with_subject("order-9")
+            .into_inbound("peer:bus");
+        assert_eq!(
+            with.correlation,
+            vec![crate::core::CorrelationKey::new("subject", "order-9")]
+        );
+
+        let without = CloudEvent::new("1", "urn:a", "t")
+            .expect("event")
+            .into_inbound("peer:bus");
+        assert!(without.correlation.is_empty());
+    }
     use serde_json::json;
 
     fn structured(body: &serde_json::Value) -> Result<CloudEvent, CloudEventError> {

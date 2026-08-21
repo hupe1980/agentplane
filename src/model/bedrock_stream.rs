@@ -135,18 +135,17 @@ impl Accumulator {
                 self.stop_reason = Some(event.stop_reason().clone());
             }
             ConverseStreamOutput::Metadata(event) => {
-                self.usage = event.usage().map(|usage| Usage {
-                    input_tokens: u64::try_from(usage.input_tokens()).unwrap_or_default(),
-                    output_tokens: u64::try_from(usage.output_tokens()).unwrap_or_default(),
-                    cache_write_tokens: u64::try_from(
-                        usage.cache_write_input_tokens().unwrap_or_default(),
+                // The same beside-the-input fold as the buffered path — the
+                // cache counters are not inside `inputTokens` on this wire.
+                self.usage = event.usage().map(|usage| {
+                    Usage::with_cache_beside_input(
+                        u64::try_from(usage.input_tokens()).unwrap_or_default(),
+                        u64::try_from(usage.output_tokens()).unwrap_or_default(),
+                        u64::try_from(usage.cache_write_input_tokens().unwrap_or_default())
+                            .unwrap_or_default(),
+                        u64::try_from(usage.cache_read_input_tokens().unwrap_or_default())
+                            .unwrap_or_default(),
                     )
-                    .unwrap_or_default(),
-                    cache_read_tokens: u64::try_from(
-                        usage.cache_read_input_tokens().unwrap_or_default(),
-                    )
-                    .unwrap_or_default(),
-                    minor_units: 0,
                 });
             }
             _ => {}
@@ -159,8 +158,14 @@ impl Accumulator {
             .map(|block| match block {
                 Block::Text(text) => Ok(ContentBlock::Text(text)),
                 Block::Tool { id, name, input } => {
-                    let input = serde_json::from_str(&input)
-                        .map_err(|error| format!("streamed tool input was not JSON: {error}"))?;
+                    // No input deltas is a zero-argument call, which the
+                    // buffered path reads as `{}` — not a parse failure.
+                    let input = if input.is_empty() {
+                        serde_json::Value::Object(serde_json::Map::new())
+                    } else {
+                        serde_json::from_str(&input)
+                            .map_err(|error| format!("streamed tool input was not JSON: {error}"))?
+                    };
                     Ok(ContentBlock::ToolUse(
                         ToolUseBlock::builder()
                             .tool_use_id(id)

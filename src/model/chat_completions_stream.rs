@@ -30,6 +30,13 @@ pub struct Accumulator {
     /// severed-stream mapping turns on.
     generated: bool,
     done: bool,
+    /// Message-level keys this accumulator does not itself understand, kept
+    /// for the reason [`PartialCall::extra`] keeps its own: the extension is
+    /// what the next request has to return, and `reasoning_content` on
+    /// DeepSeek-style wires lives here. String values arrive as fragments and
+    /// are concatenated, as `content` is; anything else is a complete value
+    /// where the last writer wins.
+    extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Default)]
@@ -115,6 +122,23 @@ impl Accumulator {
             }
             self.generated = true;
         }
+        for (key, value) in delta.as_object().into_iter().flatten() {
+            if matches!(key.as_str(), "role" | "content" | "refusal" | "tool_calls")
+                || value.is_null()
+            {
+                continue;
+            }
+            // An extension delta is generation: DeepSeek-style
+            // `reasoning_content` is billed output, and a stream cut during it
+            // must not read as safe to repeat.
+            self.generated = true;
+            match (self.extra.get_mut(key), value.as_str()) {
+                (Some(Value::String(existing)), Some(fragment)) => existing.push_str(fragment),
+                _ => {
+                    self.extra.insert(key.clone(), value.clone());
+                }
+            }
+        }
         let text = delta.get("content").and_then(Value::as_str)?;
         if text.is_empty() {
             return None;
@@ -140,27 +164,34 @@ impl Accumulator {
     /// so the driver reuses one parser and one interpretation for both paths.
     #[must_use]
     pub fn into_response(self) -> Value {
+        let mut message = json!({
+            "content": self.content,
+            "refusal": if self.refusal.is_empty() { Value::Null } else { Value::String(self.refusal) },
+            "tool_calls": self.calls.into_values().map(|c| {
+                let mut call = json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments },
+                });
+                // Re-attached at the top level, where the server put
+                // them, so the envelope this produces is the one a
+                // buffered call returns — which is what lets the driver
+                // keep one parser and one interpretation for both paths.
+                if let Some(object) = call.as_object_mut() {
+                    object.extend(c.extra);
+                }
+                call
+            }).collect::<Vec<_>>(),
+        });
+        // Message-level extensions, re-attached where the server put them —
+        // the continuation carries this message verbatim, and an extension
+        // dropped only on the streaming path is the worst version of the bug.
+        if let Some(object) = message.as_object_mut() {
+            object.extend(self.extra);
+        }
         json!({
             "choices": [{
-                "message": {
-                    "content": self.content,
-                    "refusal": if self.refusal.is_empty() { Value::Null } else { Value::String(self.refusal) },
-                    "tool_calls": self.calls.into_values().map(|c| {
-                        let mut call = json!({
-                            "id": c.id,
-                            "type": "function",
-                            "function": { "name": c.name, "arguments": c.arguments },
-                        });
-                        // Re-attached at the top level, where the server put
-                        // them, so the envelope this produces is the one a
-                        // buffered call returns — which is what lets the driver
-                        // keep one parser and one interpretation for both paths.
-                        if let Some(object) = call.as_object_mut() {
-                            object.extend(c.extra);
-                        }
-                        call
-                    }).collect::<Vec<_>>(),
-                },
+                "message": message,
                 "finish_reason": self.finish_reason,
             }],
             "usage": self.usage,

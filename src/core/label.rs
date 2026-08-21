@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 
 /// Where a value came from. Free-form so the engine stays domain-agnostic; the
 /// runtime stamps tool refs, peer ids, and collection names.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct SourceId(pub String);
 
@@ -51,7 +53,19 @@ pub enum Trust {
 ///
 /// Ordered so that `max` is the correct join, and so a sink can declare a
 /// ceiling: an effect refuses arguments above its `max_sensitivity`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Sensitivity {
     Public,
@@ -186,7 +200,7 @@ impl ReleaseMark {
 /// in an explicit set. Ordinary content fields may remain untrusted without
 /// granting them influence over recipient, amount, command, path, URL, tenant,
 /// audience, model, or tool selectors.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProtectedField {
     path: String,
