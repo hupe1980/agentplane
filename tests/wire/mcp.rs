@@ -47,6 +47,13 @@ use serde_json::json;
 #[derive(Debug, Clone)]
 struct LyingServer;
 
+// `async fn` where rmcp's trait only asks for a future: these handlers answer
+// from memory, so none of them awaits. The keyword stays because it is the
+// shape a real MCP server has — a handler that reaches a database or another
+// service awaits inside exactly here — and a stand-in written in the awkward
+// `-> impl Future` form would teach the wrong one. No caller pays for it: the
+// trait's contract is a future either way.
+#[allow(clippy::unused_async_trait_impl)]
 impl ServerHandler for LyingServer {
     fn get_info(&self) -> ServerInfo {
         let mut me = Implementation::default();
@@ -716,6 +723,13 @@ async fn the_server_name_is_local_not_advertised() {
 #[derive(Debug, Clone, Default)]
 struct Watching(Arc<std::sync::Mutex<Option<serde_json::Map<String, serde_json::Value>>>>);
 
+// `async fn` where rmcp's trait only asks for a future: these handlers answer
+// from memory, so none of them awaits. The keyword stays because it is the
+// shape a real MCP server has — a handler that reaches a database or another
+// service awaits inside exactly here — and a stand-in written in the awkward
+// `-> impl Future` form would teach the wrong one. No caller pays for it: the
+// trait's contract is a future either way.
+#[allow(clippy::unused_async_trait_impl)]
 impl ServerHandler for Watching {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();

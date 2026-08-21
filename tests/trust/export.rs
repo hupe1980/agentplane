@@ -2039,9 +2039,7 @@ fn deleted_tail(text: &str, victim: &str, genuine: &agentplane::journal::Checkpo
     // A record line is the one with no `kind`: header, run, case and trailer
     // lines all name themselves and records do not.
     let is_record = |l: &str| {
-        serde_json::from_str::<serde_json::Value>(l)
-            .ok()
-            .is_some_and(|v| v.get("kind").is_none())
+        serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| v.get("kind").is_none())
     };
     let dropped = text.lines().filter(|l| is_record(l)).count()
         - kept.iter().filter(|l| is_record(l)).count();

@@ -68,6 +68,7 @@
 use base64::Engine as _;
 use hmac::{KeyInit, Mac, SimpleHmac};
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::core::Secret;
 
@@ -231,7 +232,12 @@ pub struct BodySigning {
     /// either verifies. A sender that can hold only one key turns every
     /// rotation into a flag day for the one party the mechanism was designed
     /// to spare.
-    keys: Vec<Vec<u8>>,
+    ///
+    /// [`Zeroizing`] rather than a wipe written by hand: a plain store loop
+    /// into a buffer that is about to be freed is a dead store the optimizer
+    /// may delete, so the hand-written version is a control that compiles and
+    /// might never run. Same reason [`Secret`] and the key ring use it.
+    keys: Vec<Zeroizing<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for BodySigning {
@@ -239,16 +245,6 @@ impl std::fmt::Debug for BodySigning {
         f.debug_struct("BodySigning")
             .field("keys", &"<redacted>")
             .finish()
-    }
-}
-
-impl Drop for BodySigning {
-    fn drop(&mut self) {
-        for key in &mut self.keys {
-            for byte in key {
-                *byte = 0;
-            }
-        }
     }
 }
 
@@ -306,14 +302,14 @@ impl BodySigning {
         self.try_also_with(secret).unwrap_or_else(|e| panic!("{e}"))
     }
 
-    fn key_bytes(secret: &Secret) -> Result<Vec<u8>, SigningKeyError> {
+    fn key_bytes(secret: &Secret) -> Result<Zeroizing<Vec<u8>>, SigningKeyError> {
         let raw = secret.expose();
-        let key = match raw.strip_prefix(SYMMETRIC_KEY_PREFIX) {
+        let key = Zeroizing::new(match raw.strip_prefix(SYMMETRIC_KEY_PREFIX) {
             Some(encoded) => base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(|_| SigningKeyError::NotBase64)?,
             None => raw.as_bytes().to_vec(),
-        };
+        });
         if key.len() < MIN_KEY_BYTES {
             return Err(SigningKeyError::TooShort { bytes: key.len() });
         }

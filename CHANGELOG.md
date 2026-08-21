@@ -95,6 +95,18 @@ first-wins rule prefers. Duplicates are now skipped — first wins, matching
 the truncation rule — and a duplicate does not spend a `max_items` slot,
 because it is not a distinct fact.
 
+### Fixed — a wipe the optimizer was allowed to delete
+
+`BodySigning` zeroed its push signing keys on drop with a hand-written store
+loop. A plain write into a buffer that is about to be freed is a dead store
+the compiler may remove, so the wipe was a control that compiled, read as
+protection in review, and might never have executed — the keys stay in freed
+heap either way. It now holds `Zeroizing<Vec<u8>>`, which is the mechanism
+the rest of the crate already uses for secrets (`Secret`, `DataKey`) and the
+reason that crate exists: volatile writes the optimizer may not elide. The
+hand-written `Drop` is gone rather than corrected, because the type that
+zeroizes is the one that cannot be forgotten at the next field.
+
 ### Fixed — every `Content-Encoding` line is checked
 
 The media fetcher read only the first `Content-Encoding` header line, so a

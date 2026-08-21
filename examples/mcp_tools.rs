@@ -109,6 +109,13 @@ impl Tool for ReadBalance {
 #[derive(Debug, Clone)]
 struct TicketServer;
 
+// `async fn` where rmcp's trait only asks for a future: these handlers answer
+// from memory, so none of them awaits. The keyword stays because it is the
+// shape a real MCP server has — a handler that reaches a database or another
+// service awaits inside exactly here — and a stand-in written in the awkward
+// `-> impl Future` form would teach the wrong one. No caller pays for it: the
+// trait's contract is a future either way.
+#[allow(clippy::unused_async_trait_impl)]
 impl ServerHandler for TicketServer {
     fn get_info(&self) -> ServerInfo {
         let mut me = Implementation::default();
