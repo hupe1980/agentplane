@@ -32,6 +32,13 @@ still *kills*: a mutation whose test was rewritten around it passes quietly, and
 a guarantee that stopped being checked looks exactly like one that is. The
 feature set comes from the test's own `cfg` gates rather than a second list, so
 there is nothing to keep in step.
+
+`--check` reads only the *find* half, so it cannot see a *replace* half that
+stopped compiling. A replacement calling a function whose signature has since
+gained a parameter is an ERROR the moment it runs and invisible until then —
+which means green anchors in `just ci`, and the failure only in the sweep,
+which `ci` does not run. After changing any signature, grep this table for the
+function's name and `--verify` what it finds.
 """
 
 from __future__ import annotations
@@ -398,7 +405,9 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "strict_replay_never_asks_the_policy_engine",
         "policy is re-evaluated while replaying a recorded run",
         "            if self.mode.is_replaying() {",
-        "            self.gate(key, &descriptor, effect.mutates(), outbound).await?;\n            if self.mode.is_replaying() {",
+        "            self.gate(key, &descriptor, effect.mutates(), outbound, "
+        "Some(DeclaredCeilings::of(&effect)))\n                .await?;\n"
+        "            if self.mode.is_replaying() {",
     ),
     "DenialNotJournaled": (
         "src/runtime/ctx.rs",
