@@ -70,14 +70,39 @@ impl SigningWitness {
         TrustedWitness::ed25519(&self.name, self.key.verifying_key().to_bytes())
     }
 
-    /// The signature line for whatever note the request carried.
+    /// The witness's four-byte key id, computed from the spec's words rather
+    /// than by calling the crate's own helper. A fake that imports the
+    /// implementation's functions to build its answers can only ever confirm
+    /// the implementation — the fake this replaced derived its id through the
+    /// crate and signed the bytes the crate verified, so the pair agreed with
+    /// each other and with no witness that exists.
+    fn key_id(&self) -> [u8; 4] {
+        use sha2::{Digest as _, Sha256};
+        let mut h = Sha256::new();
+        h.update(self.name.as_bytes());
+        h.update([0x0A]);
+        // `tlog-cosignature`: 0x04 is the Ed25519 cosignature algorithm.
+        h.update([0x04]);
+        h.update(self.key.verifying_key().to_bytes());
+        let full = h.finalize();
+        [full[0], full[1], full[2], full[3]]
+    }
+
+    /// The signature line for whatever note the request carried, built as the
+    /// specification describes a witness building one: the note body without
+    /// its signature lines, under the `cosignature/v1` header and a `time`
+    /// line, with the timestamp leading the payload big-endian.
     fn cosign_line(&self, request: &str) -> String {
         use ed25519_dalek::Signer as _;
+        const TIME: u64 = 1_679_315_147;
         let note = request.split_once("\n\n").map_or(request, |(_, note)| note);
-        let signature = self.key.sign(note.as_bytes());
-        let id =
-            agentplane::journal::key_id(&self.name, 0x01, &self.key.verifying_key().to_bytes());
-        let mut payload = id.to_vec();
+        let text = note
+            .split_once("\n\n")
+            .map_or_else(|| note.to_owned(), |(text, _)| format!("{text}\n"));
+        let message = format!("cosignature/v1\ntime {TIME}\n{text}");
+        let signature = self.key.sign(message.as_bytes());
+        let mut payload = self.key_id().to_vec();
+        payload.extend_from_slice(&TIME.to_be_bytes());
         payload.extend_from_slice(&signature.to_bytes());
         // A line from someone else comes first, because `tlog-witness` allows a
         // 200 to carry one *or more* signatures and a client that reads only
@@ -85,7 +110,7 @@ impl SigningWitness {
         // reordering its own reply.
         format!(
             "\u{2014} other-witness {}\n\u{2014} {} {}\n",
-            base64_standard(&[0x5Au8; 68]),
+            base64_standard(&[0x5Au8; 76]),
             self.name,
             base64_standard(&payload)
         )
@@ -492,10 +517,12 @@ async fn a_cosignature_is_counted_only_if_it_verifies() {
         "a line claiming a trusted witness's name under a different key was counted"
     );
 
-    // 3. A well-formed line from the right key whose signature is over nothing.
+    // 3. A well-formed line from the right key whose signature is over
+    //    nothing: a plausible timestamp, sixty-four zero bytes of signature.
     //    This is the canned fixture this file used to accept.
     let id = real.trusted().note_key_id();
     let mut payload = id.to_vec();
+    payload.extend_from_slice(&1_679_315_147u64.to_be_bytes());
     payload.extend_from_slice(&[0u8; 64]);
     let (url, _) = server(
         200,
@@ -546,6 +573,31 @@ async fn a_cosignature_is_counted_only_if_it_verifies() {
     assert!(
         w.cosign(&cp, 0, &[]).await.is_err(),
         "a genuine signature over a different checkpoint was replayed onto this one"
+    );
+
+    // 5. A real signature from the trusted key over the bare note text —
+    //    the shape of a *log's own* signature, without `cosignature/v1`'s
+    //    domain separation. Counting it would let anyone who can obtain a
+    //    log-style signature from the witness key pass it off as an
+    //    observation of growth, which is the confusion the header exists to
+    //    rule out.
+    let bare = {
+        use ed25519_dalek::Signer as _;
+        let mut payload = id.to_vec();
+        payload.extend_from_slice(&1_679_315_147u64.to_be_bytes());
+        payload.extend_from_slice(real.key.sign(cp.to_note().as_bytes()).to_bytes().as_slice());
+        payload
+    };
+    let (url, _) = server(
+        200,
+        &format!("\u{2014} witness-1 {}\n", base64_standard(&bare)),
+    )
+    .await;
+    let w = HttpWitness::new(&url, log_sig(), vec![real.trusted()]).unwrap();
+    assert!(
+        w.cosign(&cp, 0, &[]).await.is_err(),
+        "a signature over the bare note — the log's own claim-shape — was counted as \
+         a witness's cosignature"
     );
 }
 

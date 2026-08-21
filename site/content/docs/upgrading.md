@@ -15,7 +15,49 @@ property that makes a hard cut acceptable at this stage.
 
 ---
 
-## `MemoryStore` gained `current`, and a semantic selection is screened
+## A witness cosignature is the C2SP `cosignature/v1` construction
+
+**Affected:** custom `Witness` implementations; anything re-verifying a
+recorded `Cosignature::signature` out of band. Operators registering witness
+keys change nothing — `TrustedWitness::ed25519` takes the same key bytes and
+derives the id itself.
+
+`Cosignature::signature` is now the `cosignature/v1` payload on every
+producer: an eight-byte big-endian timestamp, then the Ed25519 signature over
+`cosignature/v1\ntime <t>\n` followed by the note body (signature lines
+excluded). `HttpWitness` verifies exactly that, with trusted-key ids derived
+under the cosignature algorithm byte (`0x04`) — which is what real witnesses
+send, and what the previous reading (a bare signature over the submitted
+note, ids under `0x01`) could never match. A custom `Witness` returns the
+timestamped payload; a verifier reconstructs the message above. `MemoryWitness`
+uses timestamp zero: an in-process witness has no clock of record.
+
+## A refused decision keeps the claim protocol's class
+
+**Affected:** embedders matching `RuntimeError::PolicyDenied` around
+`Runtime::decide_task`; HTTP clients keying on the decide and cancel routes'
+status codes.
+
+```rust
+// before
+Err(RuntimeError::PolicyDenied(_)) => explain_refusal(),
+
+// after — the claim protocol's own refusal, with the store's own words
+Err(RuntimeError::TaskClaim(claim)) => explain_refusal(&claim),
+```
+
+`decide_task` no longer wraps claim refusals as policy denials — no policy
+fired, and the wrap flattened "does not exist", "not yours to decide" and
+"held by Bob" into one class. `RuntimeError::TaskClaim(ClaimError)` is
+transparent, so displayed messages are unchanged; `matches!` arms are what
+move. Over HTTP, `POST /tasks/{id}/decide` now answers like `claim`: 403 for
+ineligibility, **404 for an id that names nothing** (was 403), 409 for
+contention, 500 for an outage. `POST /runs/{id}/cancel` likewise answers 404
+for an unknown run and 500 for a store outage (both were 409). `ClaimError`
+lives in `core` beside `Task`; the `agentplane::case::ClaimError` path
+re-exports it, so imports hold.
+
+
 
 **Affected:** custom `MemoryStore` implementations; anything constructing a
 `SemanticQuery` by hand.

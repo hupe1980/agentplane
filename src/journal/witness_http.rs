@@ -37,7 +37,9 @@ use crate::core::Digest;
 use super::Checkpoint;
 use super::note::b64;
 use super::note::{NoteSignature, SignedNote};
-use super::witness::{Cosignature, Witness, WitnessError};
+use super::witness::{
+    Cosignature, Witness, WitnessError, cosignature_message, cosignature_payload,
+};
 
 /// A witness this deployment is willing to believe.
 ///
@@ -57,11 +59,15 @@ impl TrustedWitness {
     #[must_use]
     pub fn ed25519(name: impl Into<String>, public_key: [u8; 32]) -> Self {
         let name = name.into();
-        // `0x01` is `signed-note`'s Ed25519 signature type, and the id is
-        // derived here rather than accepted from a caller: an id supplied
-        // beside a key is a second copy of one fact, and the copy that is
-        // wrong is the one nothing checks.
-        let note_key_id = super::note::key_id(&name, 0x01, &public_key);
+        // `0x04` is `tlog-cosignature`'s algorithm byte for an Ed25519
+        // **cosignature** — not `0x01`, which names a plain `signed-note`
+        // signature. A witness only ever signs the timestamped cosignature
+        // construction, so an id derived with `0x01` matches no line a
+        // conforming witness sends, and every real cosignature is skipped as
+        // an unknown key. The id is derived here rather than accepted from a
+        // caller: an id supplied beside a key is a second copy of one fact,
+        // and the copy that is wrong is the one nothing checks.
+        let note_key_id = super::note::key_id(&name, 0x04, &public_key);
         Self {
             name,
             public_key,
@@ -325,8 +331,14 @@ impl Witness for HttpWitness {
 /// A line is accepted only when its name **and** its four-byte key id match a
 /// trusted key — `signed-note`'s rule, and it is a conjunction for a reason: a
 /// server that may choose the name it sends can otherwise wear any identity
-/// the operator registered. The signature is then verified over the exact note
-/// text that was submitted, which is what a cosignature is a statement about.
+/// the operator registered. The signature is then verified as a
+/// `cosignature/v1` statement about the note text that was submitted: the
+/// payload's own timestamp goes into [`cosignature_message`] beside the note
+/// body, and the signature must cover exactly that. The timestamp is the
+/// witness's claim about when it observed the log, protected by the witness's
+/// own signature and carried verbatim — this client does not judge it against
+/// a local clock, because a submitter's clock is no authority on a party whose
+/// whole purpose is independence.
 fn verify_cosignature(
     body: &str,
     origin: &str,
@@ -350,6 +362,16 @@ fn verify_cosignature(
         )));
     }
 
+    // What a cosignature covers is the note *body*, not the submitted wire
+    // form: `signed-note`'s boundary rule keeps signature lines — the log's
+    // own, and any other witness's — out of every signature's input, or two
+    // witnesses could never sign one checkpoint without each invalidating the
+    // other.
+    let note_text = submitted_note.split_once("\n\n").map_or_else(
+        || submitted_note.to_owned(),
+        |(text, _)| format!("{text}\n"),
+    );
+
     for line in &note.signatures {
         let Some(key) = trusted
             .iter()
@@ -360,13 +382,14 @@ fn verify_cosignature(
         let Ok(verifying) = VerifyingKey::from_bytes(&key.public_key) else {
             continue;
         };
-        let Ok(signature) = Signature::from_slice(&line.signature) else {
+        let Some((timestamp, sig)) = cosignature_payload(&line.signature) else {
             continue;
         };
-        if verifying
-            .verify(submitted_note.as_bytes(), &signature)
-            .is_ok()
-        {
+        let Ok(signature) = Signature::from_slice(sig) else {
+            continue;
+        };
+        let message = cosignature_message(timestamp, &note_text);
+        if verifying.verify(message.as_bytes(), &signature).is_ok() {
             return Ok(Cosignature {
                 key_id: key.name.clone(),
                 note_key_id: key.note_key_id,
@@ -384,4 +407,59 @@ fn verify_cosignature(
          verified against a trusted key over the checkpoint that was submitted",
         note.signatures.len()
     )))
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    /// The checkpoint note from `tlog-cosignature`'s worked example, and the
+    /// witness line published beside it.
+    const EXAMPLE_NOTE: &str =
+        "example.com/behind-the-sofa\n20852163\nCsUYapGGPo4dkMgIAUqom/Xajj7h2fB2MPA3j2jxq2I=\n";
+    const EXAMPLE_LINE_PAYLOAD: &str = "jWbPPwAAAABkGFDLEZMHwSRaJNiIDoe9DYn/zXcrtPHeolMI5OWXEhZCB9dlrDJsX3b2oyin1nPZqhf5nNo0xUe+mbIUBkBIfZ+qnA==";
+
+    /// **The signed message and the payload layout, against the spec's own
+    /// example — not against a round trip.** A round trip proves the verifier
+    /// agrees with this crate's signer, which it would even if both were
+    /// wrong; only published bytes break that tie.
+    #[test]
+    fn the_spec_worked_example_is_reproduced() {
+        assert_eq!(
+            cosignature_message(1_679_315_147, EXAMPLE_NOTE),
+            "cosignature/v1\ntime 1679315147\n\
+             example.com/behind-the-sofa\n20852163\n\
+             CsUYapGGPo4dkMgIAUqom/Xajj7h2fB2MPA3j2jxq2I=\n",
+            "the message is two newline-terminated lines followed by the note \
+             body, signature lines excluded"
+        );
+
+        let payload = super::super::note::unb64(EXAMPLE_LINE_PAYLOAD)
+            .expect("the spec's example line is valid base64");
+        // A note line's payload is `key_id ‖ timestamped_signature`.
+        assert_eq!(payload.len(), 4 + 8 + 64);
+        assert_eq!(
+            payload[..4],
+            [0x8d, 0x66, 0xcf, 0x3f],
+            "the four-byte key id of the example witness"
+        );
+        let (timestamp, sig) =
+            cosignature_payload(&payload[4..]).expect("eight bytes of timestamp, then a signature");
+        assert_eq!(
+            timestamp, 1_679_315_147,
+            "the timestamp is big-endian and sits before the signature"
+        );
+        assert_eq!(sig.len(), 64);
+    }
+
+    /// A payload of the wrong length is not a cosignature — in particular, a
+    /// bare 64-byte signature must not be read as one with no timestamp, which
+    /// would verify it over a message nobody signed.
+    #[test]
+    fn a_payload_without_a_timestamp_is_not_a_cosignature() {
+        assert!(cosignature_payload(&[0u8; 64]).is_none());
+        assert!(cosignature_payload(&[0u8; 73]).is_none());
+        assert!(cosignature_payload(&[]).is_none());
+        assert!(cosignature_payload(&[0u8; 72]).is_some());
+    }
 }

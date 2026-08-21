@@ -192,6 +192,28 @@ impl Destination {
         self
     }
 
+    /// [`also_signed_with`](Self::also_signed_with), reporting rather than
+    /// aborting — [`try_signed_with`](Self::try_signed_with)'s argument, with
+    /// the same force: both secrets come from the same file, at the same
+    /// moment, inside the same builder.
+    ///
+    /// # Errors
+    ///
+    /// [`SigningKeyError`](super::SigningKeyError) — a bad key, or
+    /// [`NoPrimary`](super::SigningKeyError::NoPrimary) when no primary secret
+    /// is configured.
+    pub fn try_also_signed_with(
+        mut self,
+        secret: &crate::core::Secret,
+    ) -> Result<Self, super::SigningKeyError> {
+        let signing = self
+            .signing
+            .take()
+            .ok_or(super::SigningKeyError::NoPrimary)?;
+        self.signing = Some(signing.try_also_with(secret)?);
+        Ok(self)
+    }
+
     /// The stored registration id for this destination.
     #[must_use]
     pub fn registration_id(&self) -> String {
@@ -411,10 +433,13 @@ impl RunCompleted {
 #[async_trait]
 impl Projection for RunCompleted {
     async fn messages(&self, record: &Record) -> Result<Vec<PushMessage>, StoreError> {
+        // Every field named, no `..` — the payload-sealing list's rule, held
+        // here for the same reason: a field added to `RunSealed` must ask
+        // this projection deliver-or-not at the build, not default to silence.
         let RecordKind::RunSealed {
             outcome,
+            reason,
             chain_head,
-            ..
         } = record.kind()
         else {
             return Ok(Vec::new());
@@ -429,19 +454,29 @@ impl Projection for RunCompleted {
                 .with_extension("tenantid", serde_json::Value::String(tenant.clone()))
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
         }
+        let mut data = json!({
+            "run": run,
+            "case": record.body.case.map(|case| case.to_string()),
+            "outcome": outcome,
+            // The chain head the conclusion was drawn over, so a receiver
+            // can ask this plane to prove the run it was told about.
+            "chain_head": chain_head.to_hex(),
+        });
+        // Absent for a success, as the record spells it — a `null` here would
+        // read as a failure with no explanation. The reason is sealed at rest
+        // because it quotes what a provider or tool refused; it rides here
+        // because this projection serves the operator namespace, the audience
+        // the journal handle opens the seal for. The caller-facing A2A stream
+        // deliberately does not carry it.
+        if let Some(reason) = reason {
+            data["reason"] = json!(reason);
+        }
         let event = event
             // What the event is *about* within this producer. `source` names
             // the deployment and `id` is the deduplication half; without a
             // subject a receiver filtering by run has to open the data.
             .with_subject(&run)
-            .with_data(json!({
-                "run": run,
-                "case": record.body.case.map(|case| case.to_string()),
-                "outcome": outcome,
-                // The chain head the conclusion was drawn over, so a receiver
-                // can ask this plane to prove the run it was told about.
-                "chain_head": chain_head.to_hex(),
-            }));
+            .with_data(data);
         Ok(vec![PushMessage::cloudevent(&event)])
     }
 

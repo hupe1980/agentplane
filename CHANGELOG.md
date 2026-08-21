@@ -30,6 +30,104 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.22.0] — 2026-08-21
+
+An audit of the evidence-and-authority tier: the witness client, and the
+operator API's refusal classification. Its central finding is one this
+project's own catalogue predicted — a test double written from the same
+misreading as the code — found where it costs the most: the one subsystem
+whose entire value is that somebody *else* can check it.
+
+### Fixed — a witness cosignature is now the one real witnesses produce
+
+`HttpWitness` could never have verified a cosignature from an actual C2SP
+witness — omniwitness, ArmoredWitness, the network the module exists to
+reach. Three misreadings compounded: the trusted-key id was derived with
+`signed-note`'s plain-signature algorithm byte (`0x01`) instead of
+`tlog-cosignature`'s (`0x04`), so every real witness's line was skipped as an
+unknown key; the payload was read as a bare 64-byte signature, where the spec
+leads it with an eight-byte big-endian timestamp; and the signed message was
+taken to be the submitted note verbatim, where the spec specifies
+`cosignature/v1`, a `time` line, then the note body with signature lines
+excluded. Nothing failed, because the test's fake witness *imported the
+crate's own key-id helper and signed the crate's own message construction* —
+a signer/verifier pair that round-trips cleanly through a shared mistake and
+agrees with no witness that exists.
+
+The verification now implements the spec, and is pinned two ways a shared
+misreading cannot survive: the message construction and payload layout are
+asserted against `tlog-cosignature`'s published worked example — literal
+bytes, not a round trip — and the test fake derives its key id and message
+from the spec's words with its own SHA-256, so the fake and the crate can
+disagree again. `MemoryWitness` produces the same payload shape (timestamp
+zero, stating that an in-process witness has no clock of record), so
+`Cosignature::signature` means one thing regardless of which witness produced
+it. A signature over the bare note — the shape of a *log's own* claim about
+itself — is refused by construction, which is the whole point of the domain
+separation: without it, the log vouching for itself and somebody else
+watching it grow are interchangeable bytes.
+
+The catalogue gains the sharpened tell: a test double that builds its answers
+by calling the implementation's helpers can only ever confirm the
+implementation. A double derives its bytes from the spec's words; a wire
+format is additionally pinned to a published vector.
+
+### Changed — a refusal keeps its class across every surface
+
+Deciding a task claimed first and wrapped every claim refusal — four-eyes
+exclusion, wrong role, a holder, an id naming nothing — into a policy denial.
+The words survived; the class did not. In process, a mistyped task id read as
+"policy denied", which no policy did; over HTTP it surfaced as 403, the
+permanent answer for the transient mistake. `RuntimeError` now carries
+`TaskClaim(ClaimError)` (transparent, so refusals keep the store's own
+words), `decide_task` passes the claim protocol's refusals through, and the
+HTTP surface answers a decide exactly as it answers a claim, from the same
+classification function: 403 for ineligibility, 404 for an id that names
+nothing, 409 for contention, 500 for an outage. `ClaimError` moved to `core`
+beside `Task` to carry that (still re-exported from `case`, so existing
+imports hold).
+
+Cancelling a run had the sibling defect with one status: every refusal was
+409. A mistyped run id told the operator "somebody else got there first" and
+sent them to read an intervention that does not exist; a store outage taught
+a retrying client that a retryable failure is permanent. Unknown ids are 404
+and outages 500, as the delivery and claim routes already answered.
+
+### Changed — a conclusion's reason reaches whoever the conclusion reaches
+
+Reported from the field, and the report's own diagnosis was right: `RunSealed`
+carries a `reason` so that *why* a run failed outlives the process that wrote
+it — and the two surfaces that deliver conclusions both destructured it away
+behind a `..`, the exact shape the payload-sealing list already refuses for
+this record. A receiver of `io.agentplane.run.completed` got `outcome:
+"failed"` and nothing else; `GET /runs/{run}` answered the same. Both now
+carry `reason`, absent (not null) for a success, and both destructure every
+field of the seal so the next field added must ask deliver-or-not at the
+build. The reason rides only to audiences the seal opens for — the operator
+event namespace and the operator API; the caller-facing A2A stream
+deliberately does not carry it, because a counterparty is told the outcome,
+not the plane's internals.
+
+### Added — `Destination::try_also_signed_with`
+
+The rotation half of push signing now pairs like the primary half:
+`also_signed_with` panics, `try_also_signed_with` reports — with
+`SigningKeyError::NoPrimary` for a rotation secret configured before any
+primary, a refusal the panic previously made unreachable only if the caller
+hand-checked the precondition first, which is the check written twice. Both
+secrets come from the same file at the same moment inside the same builder,
+so both belong on that builder's error path, naming the destination.
+
+### Changed — case-history truncation is a fact, not an inference
+
+The case view fetched exactly its history bound and reported `truncated` when
+the result filled it — the inference every list route on the same surface
+already refuses, stated in a comment three routes away. A matter with exactly
+the bound's worth of records read as cut off. The view now asks for one more
+than the bound, like its siblings; `Api::history_limit` makes the bound
+configurable (its own knob, not `limit` — widening a list page should not
+silently deepen every case view), with the default unchanged at 200.
+
 ## [0.21.0] — 2026-08-21
 
 Five passes. The fifth audits governed memory, semantic retrieval, media

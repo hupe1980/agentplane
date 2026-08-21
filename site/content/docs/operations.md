@@ -1050,7 +1050,7 @@ whether a run id exists by comparing a `400` against a `404`.
 | Route | The question it answers |
 |---|---|
 | `GET /runs?outcome=…` | What ended this way and has not been cleared? Newest first; defaults to `quarantined` |
-| `GET /runs/{run}` | What is this run doing, and **why is it not finishing**? |
+| `GET /runs/{run}` | What is this run doing — **why is it not finishing**, or why did it end? |
 | `GET /tasks` | What is waiting for me? |
 | `GET /tasks/{task}` | What is this proposal, and may I decide it? |
 | `POST /tasks/{task}/claim` | This one is mine — don't let a colleague duplicate it |
@@ -1157,6 +1157,13 @@ NotFound → Excluded → WrongRole → NotPending → AlreadyClaimed
 
 The permanent refusal wins over the transient one, because the transient one
 hides it.
+
+The same classification rides every verb that can refuse, not only `claim`:
+an id that names nothing is a `404` wherever it appears — claim, decide,
+cancel — and a store outage is a `500`, never a `409`. A conflict tells its
+reader somebody else got there first; answered to a typo it sends an operator
+hunting for an interventionist who does not exist, and answered to an outage
+it teaches a client that a retryable failure is permanent.
 
 The same battery run then caught a second defect, in Postgres only: `release`
 had the right `WHERE` clause and **discarded the row count**, so a release by

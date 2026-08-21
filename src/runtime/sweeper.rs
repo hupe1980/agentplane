@@ -978,16 +978,11 @@ impl Runtime {
             .tasks()
             .ok_or_else(|| RuntimeError::PlanContract("this runtime has no task store".into()))?;
 
-        // The refusal's reason is preserved rather than flattened: "you proposed
-        // this action" and "you hold the wrong role" call for different fixes,
-        // and an operator staring at a generic denial cannot tell them apart.
-        tasks.claim(id, &decision.actor, roles).await.map_err(|e| {
-            RuntimeError::PolicyDenied(crate::core::PolicyError::Denied {
-                principal: decision.actor.clone(),
-                action: "task/decide".into(),
-                resource: format!("{id}: {e}"),
-            })
-        })?;
+        // The claim protocol's refusals surface as
+        // [`RuntimeError::TaskClaim`], exactly as the claim verb reports them.
+        // Wrapped as a policy denial they would claim a rule fired when none
+        // did, and collapse three different answers into one class.
+        tasks.claim(id, &decision.actor, roles).await?;
 
         let delivery = self.answer_task(id, decision).await?;
         tasks

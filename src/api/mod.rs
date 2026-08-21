@@ -288,6 +288,13 @@ pub struct RunView {
     /// for a counterparty, or page somebody.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_for: Option<String>,
+    /// Why it ended the way it did, when the ending has a why.
+    ///
+    /// The sealed twin of `waiting_for`, absent for a success. Without it a
+    /// failed run answers with the word "failed" and sends the reader into
+    /// the journal for the one sentence the seal already records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub sealed: bool,
     /// Who asked for this run to stop, if anyone has.
     ///
@@ -550,6 +557,8 @@ pub struct Api {
     auth: Arc<dyn Authenticator>,
     /// How many worklist items one request may return.
     limit: usize,
+    /// How much of a matter's history one case view returns.
+    history: usize,
 }
 
 impl std::fmt::Debug for Api {
@@ -557,6 +566,7 @@ impl std::fmt::Debug for Api {
         f.debug_struct("Api")
             .field("tenants", &self.planes.tenants().collect::<Vec<_>>())
             .field("limit", &self.limit)
+            .field("history", &self.history)
             .finish_non_exhaustive()
     }
 }
@@ -564,6 +574,14 @@ impl std::fmt::Debug for Api {
 impl Api {
     /// Default worklist page size.
     pub const DEFAULT_LIMIT: usize = 100;
+
+    /// Default bound on how much of a matter's history one case view returns.
+    ///
+    /// Bounded because a case can run for months and an operator page is not a
+    /// bulk export. The response says when it truncated, because a shortened
+    /// list is shaped exactly like a complete one and a reader who cannot tell
+    /// will read absence as evidence.
+    pub const DEFAULT_HISTORY_LIMIT: usize = 200;
 
     /// Build the surface over one plane, or several.
     ///
@@ -593,12 +611,25 @@ impl Api {
             planes,
             auth,
             limit: Self::DEFAULT_LIMIT,
+            history: Self::DEFAULT_HISTORY_LIMIT,
         })
     }
 
     #[must_use]
     pub const fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// How much of a matter's history one case view returns.
+    ///
+    /// Its own knob rather than [`limit`](Self::limit), because the two bound
+    /// different readings: a list page is scanned, a history is followed — and
+    /// an operator who widens the worklist page should not silently deepen
+    /// every case view with it.
+    #[must_use]
+    pub const fn history_limit(mut self, limit: usize) -> Self {
+        self.history = limit;
         self
     }
 
@@ -714,19 +745,13 @@ pub mod action {
     /// Exists so a deployment can enumerate what it must write rules for, and so
     /// a test can assert the route table and this list agree.
     ///
-    /// **`RUN_LIST` was missing from this list**, and the omission is worth
-    /// keeping in view because of where it landed. A deployment writes its rules
-    /// by enumerating this, and its engine denies by default — so the verb it
-    /// never saw is the one nobody grants, and the route behind
-    /// `api:run.list` is *what is quarantined right now*. The backlog added
-    /// specifically so a quarantine reaches somebody was, for any operator who
-    /// trusted this list, refused to everybody.
-    ///
-    /// The test meant to catch it agreed with the bug: it compares this list
-    /// against the verbs the gate-denial walk actually asked, and that walk did
-    /// not call `/runs` either. Two omissions that cancel, which is a test
-    /// written from the same misreading as the code — it passes forever and
-    /// makes the wrong contract look pinned. The walk now covers every route.
+    /// Completeness here is load-bearing, not documentation: a deployment
+    /// writes its rules by enumerating this list against a deny-by-default
+    /// engine, so a verb omitted from it is a route refused to everybody —
+    /// and the routes behind these verbs are the backlogs somebody must be
+    /// able to clear. The gate-denial walk in `tests/wire/api.rs` therefore
+    /// covers **every** route, not a sample: a sampled walk compared against
+    /// this list can omit the same verb from both sides and pass.
     pub const ALL: &[&str] = &[
         RUN_READ,
         RUN_LIST,
@@ -813,12 +838,17 @@ async fn run_view(
     // appears anywhere. A run that waited for an event, got it, and carried on
     // has a `RunSuspended` in its history and is not suspended now; scanning for
     // one would report every resumed run as stuck forever.
-    let (status, waiting_for, sealed) = match last.kind() {
-        RecordKind::RunSuspended { reason } => {
-            ("suspended".to_owned(), Some(reason.to_string()), false)
-        }
-        RecordKind::RunSealed { outcome, .. } => (outcome.clone(), None, true),
-        _ => ("running".to_owned(), None, false),
+    let (status, waiting_for, reason, sealed) = match last.kind() {
+        RecordKind::RunSuspended { reason } => (
+            "suspended".to_owned(),
+            Some(reason.to_string()),
+            None,
+            false,
+        ),
+        RecordKind::RunSealed {
+            outcome, reason, ..
+        } => (outcome.clone(), None, reason.clone(), true),
+        _ => ("running".to_owned(), None, None, false),
     };
 
     let case = records
@@ -836,6 +866,7 @@ async fn run_view(
         run: id.to_string(),
         status,
         waiting_for,
+        reason,
         sealed,
         cancellation_requested_by,
         records: records.len() as u64,
@@ -861,11 +892,23 @@ async fn cancel_run(
 
     // The actor is the authenticated caller; `CancelRequest` has no field for
     // one. Same rule as deciding a task.
+    //
+    // Classified, not collapsed. A mistyped run id is a 404, a store outage a
+    // 500 — answering either as 409 tells the operator "somebody else got
+    // there first", which sends them to read a record that does not exist, or
+    // teaches them a retryable outage is permanent. 409 is kept for what it
+    // means: the run's state refuses the request.
     let fresh = s
         .plane
         .request_cancel(id, &s.caller.actor, &body.reason)
         .await
-        .map_err(|e| ApiError(StatusCode::CONFLICT, e.to_string()))?;
+        .map_err(|e| match e {
+            crate::core::RuntimeError::Store(crate::core::StoreError::NotFound(_)) => {
+                not_found("run")
+            }
+            crate::core::RuntimeError::Store(_) => store_failed(),
+            other => ApiError(StatusCode::CONFLICT, other.to_string()),
+        })?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -1105,12 +1148,18 @@ async fn decide(
         .decide_task(id, &decision, &s.caller.roles)
         .await
         .map_err(|e| match e {
-            // A refused claim is a 403 with the store's own reason: "you
-            // proposed this action" and "you hold the wrong role" call for
-            // different fixes.
+            // The same classification the claim route answers with, from the
+            // same function: an ineligible decider is a 403 with the store's
+            // own reason, an unknown task a 404, contention a 409, and a store
+            // outage a 500 — not one status a client cannot act on.
+            crate::core::RuntimeError::TaskClaim(claim) => claim_refused(&claim),
             crate::core::RuntimeError::PolicyDenied(_) => {
                 ApiError(StatusCode::FORBIDDEN, e.to_string())
             }
+            // An outage while recording the answer, after the claim held. Not
+            // a 409: a conflict tells the decider their verdict lost a race,
+            // and this one was simply not written yet.
+            crate::core::RuntimeError::Store(_) => store_failed(),
             other => ApiError(StatusCode::CONFLICT, other.to_string()),
         })?;
 
@@ -1119,14 +1168,6 @@ async fn decide(
         "approved": decision.approved,
     })))
 }
-
-/// How much of a matter's history one view returns.
-///
-/// Bounded because a case can run for months and an operator page is not a
-/// bulk export. The response says when it truncated, because a shortened list
-/// is shaped exactly like a complete one and a reader who cannot tell will read
-/// absence as evidence.
-const CASE_HISTORY_LIMIT: usize = 200;
 
 /// Cases in a given state — in practice, *what is escalated right now*.
 ///
@@ -1240,12 +1281,17 @@ async fn case_view(
     // A scan over the matter rather than a walk over its runs, because a sweep
     // belongs to no case and its record would otherwise be unreachable from
     // the very case it escalated.
-    let history = s
+    // One more than the page, exactly as the list routes ask: truncation is a
+    // fact about the history, not an inference from a full page — a matter
+    // with exactly the limit's worth of records is complete, not cut off.
+    let mut history = s
         .plane
         .journal()
-        .case_history(id, CASE_HISTORY_LIMIT)
+        .case_history(id, api.history + 1)
         .await
         .map_err(|_| store_failed())?;
+    let history_truncated = history.len() > api.history;
+    history.truncate(api.history);
 
     Ok(Json(json!({
         "case": serde_json::to_value(&found).unwrap_or(Value::Null),
@@ -1263,7 +1309,7 @@ async fn case_view(
             .collect::<Vec<_>>(),
         // Said out loud: a truncated history is shaped exactly like a complete
         // one, and a reader who cannot tell will read absence as evidence.
-        "history_truncated": history.len() >= CASE_HISTORY_LIMIT,
+        "history_truncated": history_truncated,
     })))
 }
 

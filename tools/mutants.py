@@ -871,6 +871,54 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "            decidable_by_you: task.may_decide(&caller.actor, &caller.roles),",
         "            decidable_by_you: true,",
     ),
+    "AMistypedRunReadsAsAConflict": (
+        "src/api/mod.rs",
+        "a_mistyped_id_is_a_404_not_a_conflict",
+        "cancelling a run id that names nothing answers 409 instead of 404, so "
+        "an operator with a typo is told somebody else got there first and goes "
+        "hunting for an interventionist who does not exist",
+        """            crate::core::RuntimeError::Store(crate::core::StoreError::NotFound(_)) => {
+                not_found("run")
+            }""",
+        """            crate::core::RuntimeError::Store(crate::core::StoreError::NotFound(e)) => {
+                ApiError(StatusCode::CONFLICT, e)
+            }""",
+    ),
+    "ADecideRefusalLosesItsClass": (
+        "src/runtime/sweeper.rs",
+        "a_mistyped_id_is_a_404_not_a_conflict",
+        "the decide path flattens the claim protocol's refusals into a policy "
+        "denial, so a task id that names nothing reads as 'you are not "
+        "allowed' — the permanent answer for the transient mistake — and no "
+        "surface downstream can tell a typo from a four-eyes exclusion",
+        """        tasks.claim(id, &decision.actor, roles).await?;""",
+        """        tasks.claim(id, &decision.actor, roles).await.map_err(|e| {
+            RuntimeError::PolicyDenied(crate::core::PolicyError::Denied {
+                principal: decision.actor.clone(),
+                action: "task/decide".into(),
+                resource: format!("{id}: {e}"),
+            })
+        })?;""",
+    ),
+    "ACaseHistoryPageCannotSeePastItself": (
+        "src/api/mod.rs",
+        "a_case_history_of_exactly_the_limit_is_not_called_truncated",
+        "the case view fetches exactly the limit instead of one more, so "
+        "truncation is inferred from a full page and a matter one record past "
+        "the limit reads as complete — records fell off the end and the "
+        "response swears nothing did",
+        """        .case_history(id, api.history + 1)""",
+        """        .case_history(id, api.history)""",
+    ),
+    "ACompleteCaseHistoryReadsAsTruncated": (
+        "src/api/mod.rs",
+        "a_case_history_of_exactly_the_limit_is_not_called_truncated",
+        "a history of exactly the limit is reported truncated, so a complete "
+        "record reads as a shortened one and whoever is reconstructing the "
+        "matter goes looking for records that do not exist",
+        """    let history_truncated = history.len() > api.history;""",
+        """    let history_truncated = history.len() >= api.history;""",
+    ),
     # ── Attestation ─────────────────────────────────────────────────────────
     "AnAuditNeverSaysWhatAuthorized": (
         "src/audit.rs",
@@ -3882,6 +3930,58 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        let exhausted = attempts.saturating_add(1) >= self.max_attempts;\n        if failure.permanent || exhausted {",
         "        let exhausted = attempts.saturating_add(1) >= self.max_attempts;\n        if exhausted {",
     ),
+    "AFailureReasonIsDroppedAtTheBusDoor": (
+        "src/push/outbox.rs",
+        "a_failed_runs_event_carries_the_reason_the_seal_records",
+        "the completion event drops the seal's reason, so a receiver of "
+        "io.agentplane.run.completed gets the word 'failed' and nothing else — "
+        "the state the field exists to end, one delivery further out",
+        """        if let Some(reason) = reason {
+            data["reason"] = json!(reason);
+        }""",
+        """        let _ = reason;""",
+    ),
+    "ASuccessCarriesANullReason": (
+        "src/push/outbox.rs",
+        "a_cloudevents_delivery_announces_its_media_type_and_its_identity",
+        "every completion event carries a reason key, null on success — so a "
+        "receiver keying on the field's presence reads every success as a "
+        "failure that had no explanation",
+        """        if let Some(reason) = reason {
+            data["reason"] = json!(reason);
+        }""",
+        """        data["reason"] = json!(reason);""",
+    ),
+    "ARotationSecretNeedsNoPrimary": (
+        "src/push/outbox.rs",
+        "a_rotation_secret_is_refused_without_a_panic_in_reach",
+        "a rotation secret with no primary configured is accepted as the "
+        "primary instead of refused, so which key every receiver must hold is "
+        "decided by whichever half of the configuration loaded first",
+        """        let signing = self
+            .signing
+            .take()
+            .ok_or(super::SigningKeyError::NoPrimary)?;
+        self.signing = Some(signing.try_also_with(secret)?);""",
+        """        let signing = match self.signing.take() {
+            Some(signing) => signing.try_also_with(secret)?,
+            None => BodySigning::try_new(secret)?,
+        };
+        self.signing = Some(signing);""",
+    ),
+    "AFailureReasonIsDroppedAtTheOperatorView": (
+        "src/api/mod.rs",
+        "a_failed_runs_view_carries_the_reason_the_seal_records",
+        "the run view drops the seal's reason, so an operator asking what "
+        "happened is answered 'failed' and sent into the journal for the one "
+        "sentence the record already carries",
+        """        RecordKind::RunSealed {
+            outcome, reason, ..
+        } => (outcome.clone(), None, reason.clone(), true),""",
+        """        RecordKind::RunSealed {
+            outcome, reason: _, ..
+        } => (outcome.clone(), None, None, true),""",
+    ),
     "APushDeliveryAnnouncesOneMediaType": (
         "src/push/mod.rs",
         "a_cloudevents_delivery_announces_its_media_type_and_its_identity",
@@ -4748,13 +4848,43 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     "ACheckpointIsSignedOverItsHash": (
         "src/journal/witness.rs",
-        "a_cosignature_verifies_as_pure_ed25519_over_the_note_text",
-        "a checkpoint is signed over SHA-256 of its note rather than over the "
-        "note text, which is what C2SP `signed-note` specifies — sixty-four "
-        "bytes of the right algorithm under the right key that verify against "
-        "no witness, no auditor and no tool outside this crate",
-        """            .sign(note.as_bytes())""",
-        """            .sign(crate::core::Digest::of(note.as_bytes()).as_bytes())""",
+        "a_cosignature_verifies_as_cosignature_v1_over_the_note_text",
+        "a cosignature is produced over SHA-256 of its message rather than "
+        "over the message text — sixty-four bytes of the right algorithm "
+        "under the right key that verify against no witness, no auditor and "
+        "no tool outside this crate",
+        """            .sign(message.as_bytes())""",
+        """            .sign(crate::core::Digest::of(message.as_bytes()).as_bytes())""",
+    ),
+    "ACosignatureSignsTheBareNote": (
+        "src/journal/witness.rs",
+        "a_cosignature_verifies_as_cosignature_v1_over_the_note_text",
+        "the cosignature/v1 header and timestamp line are dropped from the "
+        "signed message, leaving a signature over the bare note text — the "
+        "shape of a log's *own* signature, so the log's claim about itself "
+        "and a witness's observation of it become interchangeable, which is "
+        "the confusion the domain separation exists to rule out",
+        r'''pub(crate) fn cosignature_message(timestamp: u64, note_text: &str) -> String {
+    format!("cosignature/v1\ntime {timestamp}\n{note_text}")
+}''',
+        r'''pub(crate) fn cosignature_message(timestamp: u64, note_text: &str) -> String {
+    let _ = timestamp;
+    note_text.to_owned()
+}''',
+    ),
+    "ABareSignatureIsReadAsATimestampedOne": (
+        "src/journal/witness.rs",
+        "a_payload_without_a_timestamp_is_not_a_cosignature",
+        "a 64-byte payload is read as a cosignature with no timestamp instead "
+        "of being refused, so a bare signature — which covers a message nobody "
+        "constructed — reaches the verifier, and the payload layout the spec "
+        "publishes stops being enforced",
+        """    if blob.len() != 8 + 64 {
+        return None;
+    }""",
+        """    if blob.len() != 8 + 64 && blob.len() != 64 {
+        return None;
+    }""",
     ),
     "ACosignatureIsNotVerified": (
         "src/journal/witness_http.rs",
@@ -4763,10 +4893,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "answering with a well-formed base64 string is counted toward a "
         "quorum — and every guarantee resting on 'an independent party saw "
         "this log' becomes a guarantee about string formatting",
-        """        if verifying
-            .verify(submitted_note.as_bytes(), &signature)
-            .is_ok()
-        {""",
+        """        if verifying.verify(message.as_bytes(), &signature).is_ok() {""",
         """        if true {""",
     ),
     "ACosignatureIsMatchedOnNameAlone": (
@@ -4787,6 +4914,17 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a real one behind an unknown key's line is discarded",
         """    for line in &note.signatures {""",
         """    for line in note.signatures.iter().take(1) {""",
+    ),
+    "AWitnessKeyIdNamesAPlainSignature": (
+        "src/journal/witness_http.rs",
+        "a_cosignature_is_counted_only_if_it_verifies",
+        "a trusted witness key id is derived with 0x01 — signed-note's plain "
+        "Ed25519 type — instead of 0x04, tlog-cosignature's algorithm byte, so "
+        "the id matches no line a conforming witness sends and every real "
+        "cosignature is skipped as an unknown key: a client that can only ever "
+        "verify a fake",
+        """        let note_key_id = super::note::key_id(&name, 0x04, &public_key);""",
+        """        let note_key_id = super::note::key_id(&name, 0x01, &public_key);""",
     ),
     "AWitnessClientNeedsNoKeys": (
         "src/journal/witness_http.rs",

@@ -1952,7 +1952,9 @@ simply omits it.
 a malformed `whsec_` secret. Use `try_signed_with` when the secret is read from
 configuration inside your own builder — a mistyped environment variable then
 joins your exit code and your log line instead of aborting the process before it
-reaches either.
+reaches either. The rotation half pairs the same way: `also_signed_with`
+panics, `try_also_signed_with` reports — including a rotation secret configured
+with no primary, which is refused as the wiring mistake it is.
 
 ## 🔎 Verify a webhook you receive
 

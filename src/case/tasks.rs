@@ -6,38 +6,7 @@ use async_trait::async_trait;
 
 use crate::core::{CaseId, StoreError, Task, TaskId, TaskState, Timestamp};
 
-/// Why a claim was refused.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum ClaimError {
-    #[error("task {0} does not exist")]
-    NotFound(TaskId),
-
-    #[error("task {task} is already {state:?}")]
-    NotPending { task: TaskId, state: TaskState },
-
-    #[error("task {task} is held by '{holder}'")]
-    AlreadyClaimed { task: TaskId, holder: String },
-
-    /// The four-eyes control: whoever proposed an action does not approve it.
-    #[error("'{actor}' proposed this action and may not also decide it")]
-    Excluded { actor: String },
-
-    #[error("'{actor}' holds none of the roles this task requires")]
-    WrongRole { actor: String },
-
-    /// A release from somebody who is not the holder.
-    ///
-    /// Distinct from [`NotFound`](ClaimError::NotFound) because the two call for
-    /// opposite responses: a task that does not exist means the id is wrong, and
-    /// a task held by someone else means the release did nothing — which is the
-    /// answer a caller must not receive as success.
-    #[error("task {task} is not held by '{actor}'")]
-    NotHeld { task: TaskId, actor: String },
-
-    #[error(transparent)]
-    Store(#[from] StoreError),
-}
+pub use crate::core::ClaimError;
 
 /// Pending human work.
 #[async_trait]

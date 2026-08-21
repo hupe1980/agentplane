@@ -101,9 +101,51 @@ pub struct Cosignature {
     /// type did — left the name as the only identity, and a name is whatever
     /// the answering server typed.
     pub note_key_id: [u8; 4],
-    /// Over the checkpoint's canonical note text, not over its fields — so a
-    /// verifier checks exactly the bytes an operator can hand it.
+    /// The `cosignature/v1` payload, exactly as a note line carries it: an
+    /// eight-byte big-endian timestamp, then the signature over
+    /// `cosignature/v1\ntime <t>\n` followed by the note body — never a bare
+    /// signature over the note text.
+    ///
+    /// One layout for every producer, because this field is what an auditor
+    /// re-verifies: two witness implementations disagreeing about what these
+    /// bytes mean would hand the auditor a payload it can only check by
+    /// knowing which implementation produced it, which is the drift this type
+    /// exists to rule out.
     pub signature: Vec<u8>,
+}
+
+/// The message a cosignature signs, as C2SP `tlog-cosignature` states it: a
+/// domain-separation header, the witness's own timestamp line, then the whole
+/// note body — including its final newline, and **not** including any
+/// signature lines, which is `signed-note`'s boundary rule.
+///
+/// The header is what keeps a cosignature from being mistaken for a log's own
+/// note signature: the two cover different bytes under the same algorithm and
+/// the same key length, so only the domain separation tells them apart.
+#[must_use]
+pub(crate) fn cosignature_message(timestamp: u64, note_text: &str) -> String {
+    format!("cosignature/v1\ntime {timestamp}\n{note_text}")
+}
+
+/// Split a `cosignature/v1` payload into its halves: an eight-byte big-endian
+/// timestamp, then the 64-byte Ed25519 signature.
+///
+/// A payload of any other length is not one, and `None` — never a guess — is
+/// the answer: reading a 64-byte blob as "a signature with no timestamp" would
+/// verify it over a message the witness did not sign, and reading a longer one
+/// from the front would silently discard trailing bytes a verifier is being
+/// asked to vouch for.
+// Gated on the feature that consumes it — the HTTP client is the only reader
+// of foreign payloads; producers in this file only build them.
+#[cfg(feature = "witness-http")]
+#[must_use]
+pub(crate) fn cosignature_payload(blob: &[u8]) -> Option<(u64, &[u8])> {
+    if blob.len() != 8 + 64 {
+        return None;
+    }
+    let (stamp, signature) = blob.split_at(8);
+    let timestamp = u64::from_be_bytes(stamp.try_into().expect("eight bytes"));
+    Some((timestamp, signature))
 }
 
 /// Something that will vouch for having seen a log grow.
@@ -429,10 +471,13 @@ impl Witness for MemoryWitness {
             );
         }
 
-        // Signed over the note text — the artifact that actually leaves the
-        // operator's control — so a verifier checks the bytes it was handed
-        // rather than a re-serialization it has to trust.
-        let note = checkpoint.to_note();
+        // Signed over the `cosignature/v1` message — the same construction a
+        // remote witness signs — so every `Cosignature` this crate produces
+        // means one thing and an auditor verifies both kinds with one rule.
+        // The timestamp is zero because this witness has no clock of record:
+        // an in-process observation carries no independent time claim, and
+        // zero states that rather than dressing an ambient clock up as one.
+        let message = cosignature_message(0, &checkpoint.to_note());
         // Awaited, because this signer is permitted to be a KMS or an HSM —
         // which is where the trust anchor's key belongs. A failure here is
         // reported, never swallowed: a cosignature that silently did not happen
@@ -440,7 +485,7 @@ impl Witness for MemoryWitness {
         // asked, and the second is the thing witnessing exists to rule out.
         let signature = self
             .signer
-            .sign(note.as_bytes())
+            .sign(message.as_bytes())
             .await
             .map_err(|e| match e {
                 SignError::Unavailable(d) => WitnessError::Unavailable(d),
@@ -448,6 +493,9 @@ impl Witness for MemoryWitness {
                     WitnessError::Unavailable(format!("key '{key_id}' refused: {detail}"))
                 }
             })?;
+        let mut payload = Vec::with_capacity(8 + signature.len());
+        payload.extend_from_slice(&0u64.to_be_bytes());
+        payload.extend_from_slice(&signature);
         Ok(Cosignature {
             key_id: self.signer.key_id(),
             // The in-process witness signs through the `Signer` seam, which
@@ -456,7 +504,7 @@ impl Witness for MemoryWitness {
             // note line" rather than inventing four bytes that would match
             // nothing a verifier could check.
             note_key_id: [0; 4],
-            signature,
+            signature: payload,
         })
     }
 }

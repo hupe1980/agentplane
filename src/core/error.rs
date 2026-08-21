@@ -101,6 +101,19 @@ pub enum RuntimeError {
     #[error("policy denied: {0}")]
     PolicyDenied(#[from] PolicyError),
 
+    /// The worklist's own protocol refused a claim or a decision.
+    ///
+    /// Its own variant rather than a [`PolicyDenied`](Self::PolicyDenied),
+    /// because no policy fired: the refusal is the claim protocol's — four-eyes
+    /// exclusion, a missing role, a task somebody else holds, an id that names
+    /// nothing. Transparent, so the refusal keeps the store's own words; typed,
+    /// so a surface can answer honestly — "does not exist", "not yours to
+    /// decide" and "held by Bob" call for three different responses, and a
+    /// class that flattens them teaches a caller to retry the permanent and
+    /// abandon the transient.
+    #[error(transparent)]
+    TaskClaim(#[from] crate::core::ClaimError),
+
     #[error("plan contract violation: {0}")]
     PlanContract(String),
 

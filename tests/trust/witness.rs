@@ -643,25 +643,26 @@ async fn a_stale_witness_is_healed_with_a_proof_from_its_cursor() {
     assert!(!outcome.needs_attention());
 }
 
-/// **A cosignature covers the note text, and a real verifier can check it.**
+/// **A cosignature is the timestamped `cosignature/v1` statement, and a real
+/// verifier can check it.**
 ///
-/// The one property no other test in this file touched: *which bytes* the
-/// signature is over. Every test here asked whether a cosignature came back,
-/// and a cosignature over the wrong message comes back just as readily —
+/// The one property most tests in this file cannot touch: *which bytes* the
+/// signature is over. A test that asks whether a cosignature came back is
+/// answered just as readily by a signature over the wrong message —
 /// sixty-four bytes, the right algorithm, the right key, verifying nowhere.
-///
-/// It was wrong. `CheckpointSigner::sign` took a `Digest`, so this witness
-/// signed `SHA-256(note)` while [`HttpWitness`] — the client in this same
-/// crate, speaking the same format — verifies over the note text. The two
-/// could not check each other, and neither could any `signed-note` tool
-/// outside the crate. Nothing failed, because nothing verified.
+/// C2SP `tlog-cosignature` names the message: `cosignature/v1`, a `time`
+/// line, then the note body — never the bare note text, which is what a
+/// *log's own* signature covers. The domain separation is the whole
+/// difference between "this log claims this history" and "somebody else
+/// watched it grow", and a witness whose signature drops it has made the
+/// first claim while being recorded as the second.
 ///
 /// So this checks against `ed25519_dalek` directly rather than against
 /// anything in this crate: a verifier written here would inherit whatever
-/// mistake the signer makes, which is exactly how the last one survived.
+/// mistake the signer makes, and only an outside authority breaks that tie.
 #[tokio::test]
 #[cfg(feature = "signing")]
-async fn a_cosignature_verifies_as_pure_ed25519_over_the_note_text() {
+async fn a_cosignature_verifies_as_cosignature_v1_over_the_note_text() {
     use agentplane::policy::Ed25519Signer;
     use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 
@@ -671,29 +672,41 @@ async fn a_cosignature_verifies_as_pure_ed25519_over_the_note_text() {
 
     let (_, cp) = log(4);
     let co = w.cosign(&cp, 0, &[]).await.expect("a first checkpoint");
-    let signature =
-        Signature::from_slice(&co.signature).expect("a cosignature is sixty-four bytes");
+
+    // The payload is the timestamp, then the signature. The in-process
+    // witness has no clock of record, and zero states that.
+    assert_eq!(co.signature.len(), 8 + 64, "timestamp, then signature");
+    let (stamp, sig) = co.signature.split_at(8);
+    let timestamp = u64::from_be_bytes(stamp.try_into().expect("eight bytes"));
+    assert_eq!(
+        timestamp, 0,
+        "an in-process witness claims no observation time"
+    );
+    let signature = Signature::from_slice(sig).expect("a sixty-four byte signature");
 
     let note = cp.to_note();
+    let message = format!("cosignature/v1\ntime {timestamp}\n{note}");
     public
-        .verify(note.as_bytes(), &signature)
-        .expect("the cosignature must verify over the note text, as signed-note specifies");
+        .verify(message.as_bytes(), &signature)
+        .expect("the cosignature must verify over the cosignature/v1 message");
 
-    // The negative half names the specific mistake this replaced, so a future
-    // change back to hashing first fails here rather than in a foreign tool.
+    // The negative half names the near-miss: a signature over the bare note
+    // text is a *log* signature's shape, and counting one as a cosignature
+    // would let the log vouch for itself.
     assert!(
-        public
-            .verify(Digest::of(note.as_bytes()).as_bytes(), &signature)
-            .is_err(),
-        "the signature covers SHA-256(note) rather than the note — 64 bytes that verify \
-         against no witness, no auditor and no signed-note implementation"
+        public.verify(note.as_bytes(), &signature).is_err(),
+        "the signature covers the bare note text — the log's own claim, not a \
+         witness's observation of it"
     );
 
     // And it is a statement about *this* checkpoint, not about checkpoints.
     let (_, other) = log(5);
     assert!(
         public
-            .verify(other.to_note().as_bytes(), &signature)
+            .verify(
+                format!("cosignature/v1\ntime {timestamp}\n{}", other.to_note()).as_bytes(),
+                &signature
+            )
             .is_err(),
         "a cosignature that verifies over a different checkpoint is not evidence of \
          anything"

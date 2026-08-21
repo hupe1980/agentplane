@@ -104,6 +104,17 @@ pub enum SigningKeyError {
          that reads exactly like one that means something"
     )]
     TooShort { bytes: usize },
+
+    /// A rotation secret with no primary to rotate from.
+    ///
+    /// Refused rather than promoted: a rotation secret signing alone would let
+    /// load order decide which key every receiver has to hold.
+    #[error(
+        "a rotation secret was configured before any primary — sign with the \
+         primary first; 'also' without a first key is a wiring mistake worth \
+         naming where it is written"
+    )]
+    NoPrimary,
 }
 
 /// Why a delivery was not accepted.

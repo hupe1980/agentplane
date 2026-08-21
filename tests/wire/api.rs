@@ -975,6 +975,53 @@ async fn a_resumed_run_is_not_still_reported_as_suspended() {
     assert_eq!(body["sealed"], true, "{body}");
 }
 
+/// A failed run's view says why, and a successful one carries no reason.
+///
+/// The sealed twin of `waiting_for`: "failed" alone sends an operator into
+/// the journal for the one sentence the seal already records. The absence
+/// half matters equally — a success with a `reason` key would read as a
+/// failure with no explanation.
+#[tokio::test]
+async fn a_failed_runs_view_carries_the_reason_the_seal_records() {
+    #[derive(Debug)]
+    struct Refuses;
+
+    #[async_trait::async_trait]
+    impl Skill for Refuses {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("refuses").provides("demo.refusal")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            Ok(Outcome::fail(
+                "the counterparty ledger refused the transfer",
+            ))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .skill(Refuses)
+        .build();
+    let out = rt
+        .run("demo.refusal", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    let router = Api::new(rt, Arc::new(HeaderAuth)).unwrap().router();
+
+    let (status, body) = send(&router, get(&format!("/runs/{}", out.run_id), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(
+        body["reason"], "the counterparty ledger refused the transfer",
+        "the view must say what the seal says: {body}"
+    );
+}
+
 /// An unknown run is a 404, and a malformed one a 400 — after the gate.
 #[tokio::test]
 async fn an_unknown_run_is_not_confused_with_a_malformed_one() {
@@ -990,6 +1037,94 @@ async fn an_unknown_run_is_not_confused_with_a_malformed_one() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A mistyped id is a 404, a state refusal a 409 — never one status for both.
+///
+/// The cancel and decide routes classify what the runtime refused: an id that
+/// names nothing sends the operator to check their copy-paste, a conflict
+/// sends them to read who got there first. Answered as one status, the
+/// operator with a typo goes hunting for a record that does not exist.
+#[tokio::test]
+async fn a_mistyped_id_is_a_404_not_a_conflict() {
+    let f = fixture();
+    let router = f.router();
+
+    // A well-formed run id that names nothing.
+    let (status, body) = send(
+        &router,
+        post(
+            "/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/cancel",
+            Some("bob"),
+            &json!({ "reason": "mistyped" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // A well-formed task id that names nothing. The decide route answers with
+    // the claim protocol's own classification — the same one the claim route
+    // uses — so an unknown task is not dressed up as an eligibility refusal.
+    let missing = "0".repeat(64);
+    let (status, body) = send(
+        &router,
+        post(
+            &format!("/tasks/{missing}/decide"),
+            Some("bob"),
+            &json!({ "approved": true, "reason": "sure" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// The case history's truncation flag is a fact, not an inference from a full
+/// page: a matter with exactly the limit's worth of records is complete, and
+/// one past it is cut — the same one-more-than-the-page rule every list route
+/// here follows.
+#[tokio::test]
+async fn a_case_history_of_exactly_the_limit_is_not_called_truncated() {
+    let f = fixture();
+    let task = f.pending_task().await;
+    let case = (f.store.clone() as Arc<dyn TaskStore>)
+        .task(agentplane::core::TaskId::parse(&task).unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .case
+        .expect("the run was opened in a case");
+
+    // However many records this matter actually has, ask for exactly that many.
+    let full = (f.store.clone() as Arc<dyn JournalStore>)
+        .case_history(case, 1000)
+        .await
+        .unwrap()
+        .len();
+    assert!(full > 1, "the fixture's case must have some history");
+
+    let at_limit = Api::new(f.rt.clone(), Arc::new(HeaderAuth))
+        .unwrap()
+        .history_limit(full)
+        .router();
+    let (status, body) = send(&at_limit, get(&format!("/cases/{case}"), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["history"].as_array().unwrap().len(), full);
+    assert_eq!(
+        body["history_truncated"], false,
+        "a history of exactly the limit is complete, not cut off: {body}"
+    );
+
+    let past_limit = Api::new(f.rt.clone(), Arc::new(HeaderAuth))
+        .unwrap()
+        .history_limit(full - 1)
+        .router();
+    let (status, body) = send(&past_limit, get(&format!("/cases/{case}"), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["history"].as_array().unwrap().len(), full - 1);
+    assert_eq!(
+        body["history_truncated"], true,
+        "a history one past the limit was shortened, and the response must say so: {body}"
+    );
 }
 
 /// The case view carries the deadlines, because "when does this stop being my

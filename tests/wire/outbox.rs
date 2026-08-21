@@ -323,6 +323,11 @@ async fn a_cloudevents_delivery_announces_its_media_type_and_its_identity() {
     );
     // `subject` is what a receiver filters on without opening `data`.
     assert_eq!(event["subject"], event["data"]["run"]);
+    assert!(
+        event["data"].get("reason").is_none(),
+        "a success has no reason, and a null key would make every success \
+         read as a failure with no explanation: {event}"
+    );
 }
 
 /// The negative half: no key, no header.
@@ -349,4 +354,117 @@ async fn an_unsigned_destination_carries_no_signature_header() {
     // The delivery itself still happened, so "no header" is not "no POST".
     let event: Value = serde_json::from_slice(&received.body).expect("the body is the CloudEvent");
     assert_eq!(event["type"], json!("io.agentplane.run.completed"));
+}
+
+/// A failure's event says why, and a success's carries no `reason` key.
+///
+/// The receiver of `io.agentplane.run.completed` is whoever answers for the
+/// failure, and the reason is the only actionable part — the seal records it
+/// precisely so it outlives the process that wrote it, and a completion event
+/// without it hands the receiver the word "failed" one delivery further out.
+/// Absence on success is asserted too: a `null` would make every success
+/// carry a field whose only reading is "the failure had no explanation".
+#[tokio::test]
+async fn a_failed_runs_event_carries_the_reason_the_seal_records() {
+    #[derive(Debug)]
+    struct Refuses;
+
+    #[async_trait::async_trait]
+    impl Skill for Refuses {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("refuses").provides("answer")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            Ok(Outcome::fail(
+                "the counterparty ledger refused the transfer",
+            ))
+        }
+    }
+
+    let (url, seen) = receiver().await;
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let outbox = Arc::new(Outbox::new(
+        Arc::clone(&store) as Arc<dyn PushStore>,
+        vec![Destination::new("bus", url)],
+    ));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Refuses)
+        .outbox(Arc::clone(&outbox))
+        .try_build()
+        .expect("a coherent plane");
+    rt.run("answer", Tainted::trusted(json!({})))
+        .await
+        .expect("a failed run still concludes");
+
+    let worker = DeliveryWorker::new(
+        Arc::clone(rt.journal()),
+        Arc::clone(&store) as Arc<dyn PushStore>,
+        Arc::new(PushSender::for_operator_destinations(outbox.destinations()))
+            as Arc<dyn PushTransport>,
+        Arc::new(RunCompleted::new("urn:mako:agentd")),
+    );
+    worker.run_once(SWEPT_AT, 10).await.expect("a sweep");
+
+    let received = seen.lock().unwrap()[0].clone();
+    let event: Value = serde_json::from_slice(&received.body).expect("the body is the CloudEvent");
+    assert_eq!(event["data"]["outcome"], json!("failed"));
+    assert_eq!(
+        event["data"]["reason"],
+        json!("the counterparty ledger refused the transfer"),
+        "the delivered event must say what the record says: {event}"
+    );
+}
+
+/// The rotation half of signing is configurable without a panic in reach.
+///
+/// Both secrets come from the same file, read at the same moment, inside the
+/// same builder — so both misconfigurations belong on that builder's error
+/// path, naming the destination, rather than aborting from underneath it. The
+/// missing-primary refusal is its own variant: "also" without a first key is
+/// a wiring mistake, not a bad byte.
+#[tokio::test]
+async fn a_rotation_secret_is_refused_without_a_panic_in_reach() {
+    use agentplane::push::SigningKeyError;
+
+    let (url, _seen) = receiver().await;
+
+    // No primary: refused, not aborted.
+    let err = Destination::new("bus", url.clone())
+        .try_also_signed_with(&Secret::new("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"))
+        .expect_err("'also' with no first key is a wiring mistake");
+    assert!(matches!(err, SigningKeyError::NoPrimary), "got: {err}");
+
+    // A bad rotation key after a good primary: the same refusal the primary's
+    // own try_ form gives.
+    let err = Destination::new("bus", url.clone())
+        .try_signed_with(&Secret::new("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"))
+        .expect("a sound primary")
+        .try_also_signed_with(&Secret::new("whsec_not-base64!"))
+        .expect_err("a rotation secret whose prefix and bytes disagree");
+    assert!(matches!(err, SigningKeyError::NotBase64), "got: {err}");
+
+    // The sound path signs under both keys, so a receiver holding either
+    // verifies — checked on the wire, where the signature actually is.
+    let old = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+    let new = "whsec_wpZ0rboM3Wt2WRb0nb5kUmLAYHkPvwUV";
+    let (url, seen) = receiver().await;
+    let destination = Destination::new("bus", url)
+        .try_signed_with(&Secret::new(old))
+        .expect("a sound primary")
+        .try_also_signed_with(&Secret::new(new))
+        .expect("a sound rotation secret");
+    let received = deliver(destination, &seen).await;
+    let id = received.headers["webhook-id"].to_str().unwrap();
+    let signature = received.headers["webhook-signature"].to_str().unwrap();
+    for secret in [old, new] {
+        let expected = expected_signature(&key_of(secret), id, SWEPT_AT, &received.body);
+        assert!(
+            signature.split(' ').any(|part| part == expected),
+            "a receiver holding '{secret}' cannot verify: {signature}"
+        );
+    }
 }

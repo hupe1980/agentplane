@@ -789,10 +789,16 @@ Rust struct.
   `TrustedWitness` keys a deployment accepts and refuses to build without at
   least one. Each signature line on a `200` is matched to a trusted key by
   **name and four-byte note key id** — `signed-note`'s conjunction, because a
-  name is whatever the answering server typed — and then checked as pure
-  Ed25519 over the exact note text that was submitted. A quorum is otherwise a
-  count of HTTP status codes, and every guarantee resting on *an independent
-  party observed this log* would be a guarantee about string formatting.
+  name is whatever the answering server typed — then checked as a C2SP
+  `cosignature/v1` statement: a big-endian timestamp leads the payload, and
+  the signature covers the `cosignature/v1` header, the `time` line, then the
+  note body that was submitted. The header is what separates a witness's
+  observation from a log's own note signature — same algorithm, same key
+  length, different claim. The construction is pinned to the spec's published
+  example rather than to a round trip, since a signer and verifier written
+  from one misreading round-trip cleanly. A quorum is otherwise a count of
+  HTTP status codes, and every guarantee resting on *an independent party
+  observed this log* would be a guarantee about string formatting.
 Both backends maintain the log, and both keep their gaps. redb advances a
 counter row inside the sealing transaction; Postgres uses a **sequence**, because
 several instances seal concurrently there — that is the topology it exists for —
