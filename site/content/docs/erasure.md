@@ -371,10 +371,18 @@ quietly incomplete:
 - An erased read reports **expired**, never missing and never corrupt. Those
   three send an operator to three different places, and only one is an incident.
 
-A blob stays addressed by the digest of its **plaintext**, so every digest
+A blob stays *identified* by the digest of its **plaintext**, so every digest
 already written to a journal keeps meaning what it meant, and the digest is the
 envelope's associated data — ciphertext moved to another address fails to
-authenticate rather than opening as somebody else's payload.
+authenticate rather than opening as somebody else's payload. The **storage
+address** underneath is derived from the erasure scope *and* that digest
+(`blob::unit_address`), and the distinction carries an erasure guarantee of
+its own: identical bytes in two cases are one digest but **two objects**, so
+one case's tombstones cannot destroy another case's copy of the same document
+— and neither can its key destruction, because each case's copy is sealed
+under its own scope. Deduplication ends at the erasure-unit boundary on
+purpose; a copy shared across two units would be one that one unit's erasure
+either destroys wrongly or provably fails to reach.
 
 The erasure unit is the **case**, on both sides, because the case is already the
 retention unit — bytes are linked to their case when they are written, and a
@@ -486,7 +494,10 @@ standard form, an empty document, a common attachment — land on one object whe
 the path has no tenant in it. Expiring it to discharge one tenant's request then
 destroys the other tenant's data *and reports both requests satisfied*: the
 request nobody made is marked done, and the data that should have survived is
-gone. Encryption does not fix that half; only the path does.
+gone. Encryption does not fix that half; only the path does. The same argument
+holds at the unit erasure actually names: the **erasure unit** leads the
+storage address too (`blob::unit_address`), so one matter's erasure cannot
+destroy another matter's copy of the same bytes.
 
 **The plane and its stores must agree, and `try_build` checks.** The tenant
 scopes the plane's data keys; each store handle is scoped separately, so the two

@@ -812,6 +812,154 @@ async fn an_exhausted_run_resumes_under_a_raised_ceiling_and_not_under_the_same_
     );
 }
 
+// ── An effect ceiling un-pauses like a step ceiling ─────────────────────────
+
+/// One journaled call against nothing, counted.
+#[derive(Debug)]
+struct Ping {
+    i: usize,
+    performed: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Effect for Ping {
+    type Output = Value;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new("demo.ping", json!({ "i": self.i }))
+    }
+
+    fn retry(&self) -> RetryPolicy {
+        RetryPolicy::never()
+    }
+
+    async fn perform(&self) -> Result<Value, EffectError> {
+        self.performed.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "i": self.i }))
+    }
+}
+
+/// Performs three journaled effects in one step.
+#[derive(Debug)]
+struct ThreeCalls {
+    performed: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Skill for ThreeCalls {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("three-calls").provides("demo.three")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        for i in 0..3 {
+            cx.effect(Ping {
+                i,
+                performed: Arc::clone(&self.performed),
+            })
+            .await?;
+        }
+        Ok(Outcome::done(Tainted::trusted(json!("pinged"))))
+    }
+}
+
+fn three_calls_plane(
+    store: &Arc<RedbStore>,
+    budget: Budget,
+    performed: &Arc<AtomicUsize>,
+) -> Arc<Runtime> {
+    Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .budget(budget)
+        .skill(ThreeCalls {
+            performed: Arc::clone(performed),
+        })
+        .build()
+}
+
+/// The exhaustion protocol at the *effect* ceiling: pause, re-refuse,
+/// re-admit, verify.
+///
+/// The step-level twin of this rule was fixed first, and this tier silently
+/// kept the old behaviour — the recorded `BudgetRefused` under the effect's
+/// key replayed verbatim forever, so a run exhausted by `max_effects` stayed
+/// exhausted under a ceiling that now admits it, while a run exhausted by
+/// `max_steps` resumed. Two implementations of one rule, diverging at the
+/// boundary nobody probed.
+#[tokio::test]
+async fn an_effect_limited_run_resumes_under_a_raised_ceiling_and_not_under_the_same_one() {
+    let store = store();
+    let performed = Arc::new(AtomicUsize::new(0));
+
+    // Two effects of budget for a three-effect step.
+    let capped = three_calls_plane(&store, Budget::default().effects(2), &performed);
+    let out = capped
+        .run("demo.three", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Exhausted(_)),
+        "got {:?}",
+        out.status
+    );
+    assert_eq!(performed.load(Ordering::SeqCst), 2);
+
+    // Resumed without a raise: the ledger in force still refuses, the run
+    // concludes exhausted again, and the standing refusal is not duplicated.
+    let again = capped.replay(out.run_id, Mode::Resume).await.unwrap();
+    assert!(
+        matches!(again.status, RunStatus::Exhausted(_)),
+        "an unchanged ceiling admitted the effect it refused: {:?}",
+        again.status
+    );
+    assert_eq!(performed.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        kind_count(&store, out.run_id, "BudgetRefused", None).await,
+        1,
+        "re-concluding exhausted must consume the standing refusal, not stack \
+         another"
+    );
+
+    // Raised and resumed: the refused effect is re-admitted against the ledger
+    // now in force, the re-admission goes on the record beside the refusal it
+    // supersedes, and the run finishes.
+    let raised = three_calls_plane(&store, Budget::default().effects(5), &performed);
+    let resumed = raised.replay(out.run_id, Mode::Resume).await.unwrap();
+    assert_eq!(
+        resumed.status,
+        RunStatus::Succeeded,
+        "a raised ceiling must un-pause an effect-limited run"
+    );
+    assert_eq!(
+        performed.load(Ordering::SeqCst),
+        3,
+        "the first two effects replay; only the refused one dispatches"
+    );
+    assert_eq!(
+        kind_count(&store, out.run_id, "BudgetReadmitted", None).await,
+        1,
+        "the re-admission is a decision, and decisions go on the record"
+    );
+
+    // The resumed history is coherent under strict verification: the refusal
+    // is superseded by the recorded re-admission, so refusal-then-continuation
+    // reads as a decision somebody made rather than as divergence.
+    let strict = raised.replay(out.run_id, Mode::Strict).await.unwrap();
+    assert_eq!(
+        strict.status,
+        RunStatus::Succeeded,
+        "strict replay of a readmitted history stopped at the superseded refusal"
+    );
+    assert_eq!(
+        performed.load(Ordering::SeqCst),
+        3,
+        "verification performs nothing"
+    );
+}
+
 // ── A compensated run is not resumable ──────────────────────────────────────
 
 #[derive(Debug)]

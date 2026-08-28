@@ -84,4 +84,4 @@ pub use skill::{AgentRef, Capability, Compensation, Outcome, Skill, SkillDescrip
 pub use task::{
     ClaimError, Decision, Justification, OnExpiry, Priority, Task, TaskId, TaskSpec, TaskState,
 };
-pub use tenant::{TenantError, TenantId};
+pub use tenant::{TenantError, TenantId, erasure_scope};

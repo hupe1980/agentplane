@@ -587,11 +587,16 @@ fn drill_verb(opts: &DrillArgs) -> Result<ExitCode, String> {
         // that is the wiring, whole. Blobs and keys are not in it, and the
         // report says so instead of this verb pretending otherwise.
         let cases: Arc<dyn agentplane::case::CaseStore> = redb;
+        // The tenant scopes blob addresses and key scopes, and this verb has
+        // neither store to reach — the default is inert here, and a future
+        // flag that wires blobs must add `--tenant` beside it.
+        let tenant = agentplane::core::TenantId::default();
         let stores = agentplane::drill::Stores {
             cases: &cases,
             blobs: None,
             #[cfg(feature = "keyring")]
             keys: None,
+            tenant: &tenant,
         };
         let report = agentplane::drill::drill(&stores)
             .await

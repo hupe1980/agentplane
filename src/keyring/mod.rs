@@ -291,9 +291,14 @@ pub trait KeyRing: Send + Sync + Debug {
 ///
 /// [`TenantId`](crate::core::TenantId) refuses `/`, which is what stops a tenant
 /// named `acme/prod` from colliding with tenant `acme`, unit `prod`.
+///
+/// The implementation is [`crate::core::erasure_scope`], because the blob
+/// layer consumes the same string as the unit that leads a storage address —
+/// and the key a scope destroys and the addresses it expires must name one
+/// unit, not two spellings of one.
 #[must_use]
 pub fn scope(tenant: &crate::core::TenantId, unit: &str) -> String {
-    format!("{tenant}/{unit}")
+    crate::core::erasure_scope(tenant, unit)
 }
 
 /// Refuse a sealing scope that is not the scope the wrapped store writes under.

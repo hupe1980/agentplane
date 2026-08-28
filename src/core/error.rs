@@ -561,6 +561,31 @@ pub enum StepError {
         detail: String,
     },
 
+    /// The effect's outcome is known to this process and could not be recorded.
+    ///
+    /// The call already returned when the journal refused the terminal record,
+    /// so the journal holds an announcement with no outcome — an orphan a
+    /// resume resolves by the declared recovery, exactly as it would after a
+    /// crash. What this variant preserves is the knowledge the crash case does
+    /// not have: *this* pass saw the answer, and `disposition` says whether
+    /// the call reached the world.
+    ///
+    /// A distinct variant rather than a [`Store`](Self::Store) error because a
+    /// consumer deciding what the failure permits branches on exactly that
+    /// knowledge: an effect group asked to abort may claim *taken back whole*
+    /// only over members that provably did not externalise, and a store error
+    /// raised after the call landed is not that — flattening the two would
+    /// make the cheap abort available over a send that already went out.
+    #[error(
+        "effect {key} completed ({disposition:?}) but its outcome could not be recorded: {detail}"
+    )]
+    Unrecorded {
+        key: EffectKey,
+        /// What the call did to the world, as this process observed it.
+        disposition: crate::core::Disposition,
+        detail: String,
+    },
+
     /// A read this run pinned no longer returns what it was pinned to.
     ///
     /// I1 exempts a read whose answer cannot change from the effect protocol —

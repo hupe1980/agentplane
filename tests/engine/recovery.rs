@@ -1322,6 +1322,104 @@ async fn the_sweep_recovers_a_run_its_owner_died_holding() {
     assert_eq!(again.recovery_failures, 0);
 }
 
+/// **A takeover whose note cannot be written is a takeover not taken.**
+///
+/// The sweeper's rule — the note is durable before the state it describes —
+/// bites hardest here, because recovery is the one pass whose act removes the
+/// item from the driving query permanently: a resume that concludes releases
+/// the lease, so no later tick re-selects the run, and a note written *after*
+/// the act would be lost forever by a crash between the two. Who fenced whom
+/// must be answerable from the journal, so the order is note, then takeover —
+/// and a note that cannot land skips the takeover, which a later tick retries.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_takeover_whose_note_cannot_be_written_is_not_taken() {
+    use agentplane::testkit::{Fault, Faulty, Schedule};
+    use std::time::Duration;
+
+    let inner = Arc::new(RedbStore::open_in_memory().unwrap());
+    let faulty = Arc::new(Faulty::new(
+        inner.clone() as Arc<dyn JournalStore>,
+        Schedule::healthy().on_kind("Swept", Fault::FailedClean),
+    ));
+    let crash_at = Arc::new(AtomicUsize::new(0));
+    let calls = tally();
+    // Two instances over one store: one whose evidence writes fail, one
+    // healthy — the shape of a store hiccup that clears before the next tick.
+    let rt_faulty = Runtime::builder(faulty as Arc<dyn JournalStore>)
+        .skill(pipeline(&crash_at, &calls))
+        .build();
+    let rt_clean = Runtime::builder(inner.clone())
+        .skill(pipeline(&crash_at, &calls))
+        .build();
+
+    let first = rt_clean
+        .run("pipeline", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(matches!(first.status, RunStatus::Failed(_)));
+    (inner.clone() as Arc<dyn JournalStore>)
+        .acquire(first.run_id, "dead-instance", Duration::from_secs(2))
+        .await
+        .unwrap();
+    crash_at.store(NO_CRASH, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let before = calls[1].load(Ordering::SeqCst);
+
+    // The note fails, so the decision is not taken: no resume, and the run
+    // stays selected for the tick that can write its account.
+    let swept = rt_faulty
+        .sweep(sweep_now(), Duration::from_secs(3600))
+        .await;
+    assert!(
+        swept.is_err(),
+        "a sweep whose evidence write failed reported success"
+    );
+    assert_eq!(
+        calls[1].load(Ordering::SeqCst),
+        before,
+        "the takeover went ahead without its note — a fenced, resumed run \
+         whose account no journal carries"
+    );
+    assert_eq!(
+        (inner.clone() as Arc<dyn JournalStore>)
+            .abandoned_runs(10)
+            .await
+            .unwrap(),
+        vec![first.run_id],
+        "the un-noted run must stay selected for the next tick"
+    );
+
+    // The healthy instance's tick writes the note and takes the run over.
+    let report = rt_clean
+        .sweep(sweep_now(), Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!(report.runs_recovered, 1);
+    let record = report.record.expect("the takeover is on the record");
+    let noted = (inner.clone() as Arc<dyn JournalStore>)
+        .read(record, 1)
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| {
+            matches!(
+                r.kind(),
+                agentplane::journal::RecordKind::Swept { subject, .. }
+                    if *subject == first.run_id.to_string()
+            )
+        });
+    assert!(noted, "the sweep's run does not name the run it took over");
+    assert!(
+        (inner.clone() as Arc<dyn JournalStore>)
+            .runs_by_outcome("succeeded", 10)
+            .await
+            .unwrap()
+            .contains(&first.run_id),
+        "the retried takeover resumed the run to its conclusion"
+    );
+}
+
 /// A lease with nothing under it — admission died between acquiring and its
 /// first append — is cleared rather than retried forever.
 #[tokio::test]

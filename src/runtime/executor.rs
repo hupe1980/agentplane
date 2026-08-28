@@ -705,6 +705,7 @@ impl Runtime {
             blobs: self.blobs(),
             #[cfg(feature = "keyring")]
             keys: self.keyring.as_ref(),
+            tenant: &self.tenant,
         };
         crate::drill::drill(&stores)
             .await
@@ -3109,6 +3110,19 @@ impl Runtime {
         if next.derived_from != Some(cx.current.digest()) {
             return Err(RunStatus::Failed(
                 "the successor plan does not name its predecessor — use `PlanIR::succeed_with`, or the audit trail has a hole where the lineage should be"
+                    .into(),
+            ));
+        }
+
+        // The third leg of the lineage `succeed_with` sets. A successor with
+        // no reason would freeze into the journal as a plan that replaced
+        // another with nothing on the record saying why — the half of an
+        // incident (*what changed the run's mind*) that versioned replanning
+        // exists to keep.
+        if next.reason.as_deref().is_none_or(str::is_empty) {
+            return Err(RunStatus::Failed(
+                "the successor plan carries no reason — use `PlanIR::succeed_with`, or the \
+                 journal freezes a plan that replaced another with nothing saying why"
                     .into(),
             ));
         }

@@ -132,6 +132,22 @@ impl Default for TenantId {
     }
 }
 
+/// The name of one erasure unit: a case, a run, a memory subject, a named
+/// retention policy — always under its tenant.
+///
+/// One implementation, consumed by the key ring (as the scope a data key is
+/// wrapped under) and by the blob layer (as the unit that leads a storage
+/// address), because the two must agree byte for byte: the whole guarantee is
+/// that destroying a scope's key and expiring a scope's blobs reach exactly
+/// the same unit, and two spellings of the joiner would make them reach two.
+///
+/// The `/` cannot be forged into a tenant name — [`TenantId`] refuses it — so
+/// `acme` + `prod/case-1` and a tenant named `acme/prod` cannot collide.
+#[must_use]
+pub fn erasure_scope(tenant: &TenantId, unit: &str) -> String {
+    format!("{tenant}/{unit}")
+}
+
 impl fmt::Display for TenantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)

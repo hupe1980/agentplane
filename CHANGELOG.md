@@ -30,6 +30,166 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.23.0] — 2026-08-27
+
+Two audit rounds. The first walked the transactional tier: effect groups, the
+atomic-member replay path, exhaustion at the effect ceiling, and replanning
+lineage — findings that share one shape the catalogue already names, a rule
+enforced in one place and silently absent from its twin, plus one distinction
+that existed nowhere at all: whether a store failure happened before or after
+a call reached the world. The second walked the recovery-and-resources tier —
+the blob store's erasure semantics, the drill's reading path, and the
+sweeper's takeover evidence — and found the tenant-isolation argument
+unapplied at the unit erasure actually names.
+
+### Fixed — the erasure unit leads the blob's storage address
+
+Content addressing gave identical bytes one storage key, and the erasure unit
+is the case — so two cases of one tenant holding the same document held **one
+object**. One case's erasure tombstoned the other's data while discharging
+the first's request, and the drill read the survivor's loss as *erased by
+design*, the one verdict built not to page. Sealed deployments had a second
+face of it: the later case's write re-sealed the shared object under its own
+scope, so either case's key destruction stranded the other. This is the §9.1
+blob-path argument — "tenant leads the path, so one tenant's erasure cannot
+destroy another's" — that was never applied one level down, at the unit
+erasure actually names.
+
+The storage key is now `blob::unit_address(scope, digest)` — a
+domain-separated hash of the erasure scope and the content digest — for
+sealed and unsealed deployments alike (`blob::ScopedBlobs`, composed under
+`EncryptedBlobs`). Journals keep committing to the content digest, which
+still identifies and verifies the bytes; identical bytes in two cases are two
+objects, and one case's tombstones and key destruction reach exactly its own
+copies. Deduplication ends at the erasure-unit boundary on purpose. The scope
+string moved to one implementation (`core::erasure_scope`) consumed by the
+key ring and the blob layer both, because a scope that destroyed keys under
+one spelling and expired blobs under another would report one erasure and
+perform two half-erasures. **Breaking**: objects stored by earlier builds sit
+at bare content addresses nothing reads any more — recreate the store, per
+the pre-freeze rule. `blob::erase_case` now takes the tenant unconditionally.
+
+### Fixed — the drill reads through the handle the plane wrote through
+
+`Runtime::drill` handed the drill the bare blob store, which it read at bare
+content digests. On a sealed deployment every intact artifact therefore
+reported as **corrupt** — the only verdict that pages, raised for every
+healthy blob, which is how the real alarm stops being believed. Nothing
+caught it because the drill's fixture wrote plaintext blobs beside sealed
+case state — a deployment shape no ring produces. The drill now derives each
+case's own handle (unit-scoped address, sealing envelope when a ring is
+supplied) from the bare store, `drill::Stores` carries the tenant those
+scopes are derived under, and the fixture writes the way `store_blob` does.
+A retired-floor or destroyed-key answer on a blob now reaches the report
+through the same three-way classification sealed case state gets.
+
+### Fixed — a takeover's note lands before the takeover
+
+The recovery pass resumed an abandoned run and then wrote the `run_recovered`
+note into the sweep's evidence run — act before note, against the sweeper's
+own rule, and recovery is the one pass where that order loses the record
+permanently rather than briefly: a resume that concludes releases the lease
+and leaves the recovery queue, so a crash between the resume and the note
+left a fenced, resumed run whose takeover no journal accounts for, with no
+tick ever re-selecting it. The note now lands first — a note that cannot be
+written skips the takeover for a tick that can write it — and carries the
+lapse and the takeover, not the outcome, which the recovered run's own
+journal already answers.
+
+### Fixed — a landed call whose record was refused is no longer "did not happen"
+
+When an effect's `perform` returned and the journal then refused the terminal
+append, the error surfaced as a bare store failure — the same type a
+pre-dispatch failure produces. The effect-group abort classified it as *never
+dispatched*, took the cheap abort, and settled `Aborted` ("taken back whole")
+over a send that had already gone out; the orphaned announcement was then
+re-performed by the next resume, around members the abort had reversed. The
+classification now happens at the one place that knows the answer:
+`perform_once` returns the new `StepError::Unrecorded { key, disposition,
+detail }`, carrying what this process observed the call do, and both
+consumers of "may this failure have externalised" — the group's cheap abort
+and the executor's abandoned-group settlement — branch on it. A landed send
+with a lost record now quarantines its group; the general path is unchanged
+(the run fails open, and the resume resolves the orphan by its declared
+recovery, exactly as after a crash).
+
+### Fixed — a resumed atomic member consumes its recorded refusal
+
+`§4.3`'s rule — a gate must not re-decide a dispatch history already settled —
+was enforced on the ordinary dispatch loop and not on the atomic-member path,
+which consumed the recorded `PolicyDenied`/`BudgetRefused` from the cursor and
+then ran the gate *fresh*. A resume under a gate whose answer had changed
+dispatched — and committed, in a new transaction — a member the recorded run
+was refused, appending a second history under the same key. The path now
+routes replayed refusals through the same implementation the ordinary loop
+uses; a record an atomic member cannot have written (a `Failed`, an orphan —
+its records commit with its transaction) quarantines as divergence instead of
+being consumed and ignored.
+
+### Fixed — a raised ceiling un-pauses an effect-limited run
+
+"Exhaustion is a pause" was true at the step ceiling and false at the effect
+ceiling: `max_steps` refusals were re-asked against the ledger in force on
+resume (journaling `BudgetReadmitted`), while a `BudgetRefused` recorded under
+an effect key replayed verbatim forever — so a run exhausted by `max_effects`
+stayed exhausted under a budget that now admits it. The effect tier now
+follows the same protocol through one shared implementation: strict replay
+consumes the refusal verbatim; a resume re-asks the ledger, re-concludes
+without stacking a second refusal when the answer is still no, and journals
+`BudgetReadmitted` under the effect's key when it is yes. The replay cursor
+learned the supersession, so a readmitted history strict-verifies as
+refusal-then-continuation rather than stopping at a verdict the run's own
+later records overturn. Policy denials deliberately stay verbatim on both
+paths: a budget is raised, a policy is argued with, and resume admission
+already pins the exact bundle.
+
+The boundary of the rule is the history frontier, and the condition is
+`writes_enabled` — a re-admission is a write, and bookkeeping writes begin
+where history ends. A refusal *inside* the replayed prefix was already
+answered by the run itself: a group's deferred member refused by the ceiling
+is followed on the record by the abort's reversals and settlement, and
+re-admitting it mid-prefix would dispatch the send into recorded history —
+divergence and a quarantine manufactured out of an operator's raise. Such a
+refusal re-raises verbatim and the resume re-reaches the recorded abort.
+
+### Fixed — an unsettled group under a seal is an audit finding
+
+The design claimed "a group neither taken nor taken back is a query", and no
+such query existed — the shape the catalogue files as a survey sentence
+nobody checked. The honest delivery story is now stated and enforced: an
+unsettled group can only be left by a crash or a store failure, both of which
+put its run in a backlog that is already drained (failed, abandoned,
+quarantined), and the resume settles it. The one state no resume repairs — a
+**sealed** conclusion over an opened, never-settled group — is a new
+`agentplane audit` finding (`Finding::GroupUnsettled`), because nothing may
+resume a sealed run and whether its members were taken or taken back is then
+permanently undecided. An open run's unsettled group deliberately does not
+flag: alarming on the ordinary crash shape teaches the reader the finding is
+weather.
+
+### Fixed — a successor plan must say why it exists
+
+`PlanIR::succeed_with` sets version, parent and reason together, and the
+runtime checked two of the three: a `Replanner` returning `reason: None`
+froze a plan into the journal as having replaced another with nothing on the
+record saying why. Rejected now, beside the lineage check. **Breaking** for a
+`Replanner` that built successors by hand without a reason — return
+`succeed_with(..)`'s result, or set `reason`.
+
+### Changed — design notes
+
+External research this round corroborated rather than moved the design, and
+is cited in the architecture notes: two further groups converged on
+staged-then-committed tool effects (Cordon; the ACID reframing), which is the
+deferred-member class; a negative result showed provenance-*weighted*
+retrieval ranking has no usable operating point, which is the experimental
+case for hard labels over score terms; and AWS shipped history-keyed Cedar
+clauses (Dogwood) with exactly the two costs the design records for
+history-keyed policy — analyzability loss and a trusted-event-source
+requirement. An IETF draft now specifies per-agent Merkle-checkpointed,
+witness-countersigned records — the witness architecture arriving as a
+proposed standard; tracked, not adopted.
+
 ## [0.22.0] — 2026-08-21
 
 An audit of the evidence-and-authority tier: the witness client, and the

@@ -185,6 +185,23 @@ impl StepCursor {
                     },
                 ));
             }
+            // A re-admission supersedes the refusal it was journaled beside: a
+            // resume asked the ledger then in force and was answered yes, so a
+            // later replay must read refusal-then-continuation as a decision on
+            // the record — serving the stale refusal would stop a strict pass
+            // at a verdict the run's own later records show being overturned.
+            // Step-level re-admissions carry no effect key and never reach this
+            // fold; the records both stay in the chain, superseded rather than
+            // erased.
+            RecordKind::BudgetReadmitted { .. } => {
+                if let Some(pos) = self
+                    .effects
+                    .iter()
+                    .rposition(|(k, _, r)| *k == key && matches!(r, EffectReplay::Refused { .. }))
+                {
+                    self.effects.remove(pos);
+                }
+            }
             RecordKind::PolicyDenied {
                 reason,
                 action,

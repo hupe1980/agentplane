@@ -534,6 +534,26 @@ impl Runtime {
             report.saturated.recovery = true;
         }
         for run in stranded {
+            // The note lands **before** the takeover — the ledger's rule,
+            // and this pass is where getting it backwards loses the record
+            // permanently rather than briefly: a resume that concludes
+            // releases the lease, the run leaves the driving query, and no
+            // later tick can re-select it to write the account. The note
+            // carries the lapse and the takeover attempt, deliberately not
+            // the outcome — the recovered run's own journal answers that.
+            ledger
+                .note(
+                    self.store(),
+                    None,
+                    run.to_string(),
+                    SweptAction::RunRecovered,
+                    Some(
+                        "its owner's lease lapsed without release; taking the run \
+                         over and resuming it"
+                            .to_owned(),
+                    ),
+                )
+                .await?;
             match self.replay(run, Mode::Resume).await {
                 Ok(outcome) => {
                     // A resume that concluded released its lease on the way
@@ -553,35 +573,25 @@ impl Runtime {
                         outcome = %status,
                     );
                     self.meter().count(metrics::RUNS_RECOVERED, &status);
-                    ledger
-                        .note(
-                            self.store(),
-                            None,
-                            run.to_string(),
-                            SweptAction::RunRecovered,
-                            Some(format!(
-                                "taken over after its owner's lease lapsed without \
-                                 release; resumed to '{status}'"
-                            )),
-                        )
-                        .await?;
                     report.runs_recovered += 1;
                 }
                 // Someone else holds it live: a second instance's recovery —
                 // or the owner back from a stall, about to be fenced. Either
                 // way it is being handled, and counting it as a failure would
                 // page an operator about a race the design already settles.
+                // The note above stands, and honestly: this instance observed
+                // the lapse and moved to take the run over; the run's own
+                // journal shows who won.
                 Err(RuntimeError::Store(StoreError::LeaseHeld { .. })) => {}
                 // A lease over an **empty** journal: admission acquired and
                 // died before its first append landed. There is no run — the
                 // atomic admission batch never committed, so nothing was
                 // declared, authorized or performed. Clearing the lease is the
                 // whole recovery; leaving this to the failure arm below would
-                // retry a resume that cannot exist, every tick, forever.
+                // retry a resume that cannot exist, every tick, forever. The
+                // explanation is its own note, written before the clear it
+                // describes.
                 Err(RuntimeError::Store(StoreError::NotFound(_))) => {
-                    if let Ok(lease) = self.store().acquire(run, self.owner_id(), LEASE_TTL).await {
-                        let _ = self.store().release_lease(run, lease.epoch).await;
-                    }
                     ledger
                         .note(
                             self.store(),
@@ -596,6 +606,9 @@ impl Runtime {
                             ),
                         )
                         .await?;
+                    if let Ok(lease) = self.store().acquire(run, self.owner_id(), LEASE_TTL).await {
+                        let _ = self.store().release_lease(run, lease.epoch).await;
+                    }
                     report.runs_recovered += 1;
                 }
                 Err(error) => {

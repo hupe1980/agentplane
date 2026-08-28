@@ -606,9 +606,20 @@ fn no_group() -> StepError {
 /// body) and still take the cheap abort — the group rule that an abort is
 /// available only while nothing has externalised, violated for the one member
 /// whose failure carries the strongest evidence that it did.
+///
+/// `Unrecorded` is the same question asked one layer later: the call returned
+/// and the journal refused the terminal record. The store error alone cannot
+/// say whether dispatch had happened, which is why `perform_once` classifies
+/// at the site that knows — flattened into the catch-all below, a deferred
+/// send whose `EffectDone` append fails would take the cheap abort, the
+/// journal would claim *taken back whole* over an email already delivered,
+/// and the orphaned announcement would be re-performed by the next resume.
 pub(crate) fn may_have_externalised(e: &StepError) -> bool {
     match e {
         StepError::Undecidable { .. } => true,
+        StepError::Unrecorded { disposition, .. } => {
+            *disposition != crate::core::Disposition::DidNotHappen
+        }
         StepError::Effect(inner) => inner.disposition() != crate::core::Disposition::DidNotHappen,
         // Anything else is a pre-dispatch refusal (a gate, a budget, a footprint
         // check) — the member never left the process, so the cheap abort stands.
@@ -860,9 +871,11 @@ impl crate::journal::AtomicWork for GroupCommit {
         // about work that had not been attempted yet.
         //
         // A crash between the transaction and the settlement therefore leaves
-        // an opened group with no settlement beside it — which is exactly the
-        // query an operator runs, and a resumed run re-walks the members from
-        // history and settles.
+        // an opened group with no settlement beside it. That state is healed
+        // rather than hunted: the crashed run lands in a backlog the sweep
+        // already drains, and the resume re-walks the members from history and
+        // settles. The one state no resume repairs — a *sealed* run holding an
+        // unsettled group — is an `audit` finding.
         Ok(appends)
     }
 }
@@ -896,10 +909,45 @@ impl StepCtx<'_> {
                 // before the frontier it commits with.
                 match self.cursor_next(key)? {
                     Some(crate::journal::EffectReplay::Done { .. }) => continue,
-                    Some(_) | None if self.is_strict() => {
+                    // The same rule as the ordinary dispatch loop, through the
+                    // same implementation: a gate must not re-decide a dispatch
+                    // history already settled, so strict re-raises the verdict,
+                    // a resume consumes a policy denial verbatim, and a budget
+                    // refusal is re-asked against the ledger now in force — a
+                    // re-admitted member falls through and dispatches live
+                    // below. Ignoring the record here would consume it and
+                    // then run the gate fresh, so a resume could dispatch a
+                    // member the recorded run was refused.
+                    Some(
+                        refusal @ (crate::journal::EffectReplay::Refused { .. }
+                        | crate::journal::EffectReplay::Denied { .. }),
+                    ) => {
+                        self.replayed_refusal(key, refusal).await?;
+                    }
+                    // An atomic member's records commit with its transaction,
+                    // so the only things history can hold under its key are
+                    // the pair and a gate refusal. A failure or an orphaned
+                    // announcement means the recorded run dispatched this call
+                    // through a different protocol class than this build does
+                    // — divergence the ordered key comparison cannot see,
+                    // because the key matches.
+                    Some(other) => {
+                        return Err(StepError::GroupUnsettled {
+                            group: group.to_owned(),
+                            detail: format!(
+                                "atomic member '{}' replays {other:?}, which an atomic \
+                                 member cannot have written — its records commit with \
+                                 its transaction, so the recorded run dispatched this \
+                                 call through a different protocol class than this \
+                                 build does",
+                                descriptor.kind
+                            ),
+                        });
+                    }
+                    None if self.is_strict() => {
                         return Err(StepError::ReplayOverrun { actual: key });
                     }
-                    _ => {}
+                    None => {}
                 }
             }
             // Gated **before** the transaction opens, and one member at a

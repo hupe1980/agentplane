@@ -199,19 +199,27 @@ async fn a_repeated_expiry_keeps_the_first_tombstone() {
 /// the bytes are written — a digest cannot be reversed to find its case, and
 /// nothing can reconstruct it afterwards.
 ///
-/// The second case is the point of the test: erasing one matter must not touch
-/// another's, and a scope bug would be invisible in a fixture with only one.
+/// The second case is the point of the test, and the **shared bytes** are the
+/// point of the second case. Content addressing gives identical bytes one
+/// digest, so with the bare digest as the storage key two matters holding the
+/// same document hold one object — and erasing either destroys the other's
+/// copy while the drill reads the loss as *erased by design*, the one verdict
+/// that pages nobody. The erasure unit therefore leads the storage address:
+/// same bytes in two matters are two objects, and one matter's tombstones
+/// cannot reach the other's. A fixture whose cases share no bytes cannot see
+/// any of that.
 #[cfg(feature = "redb")]
 #[tokio::test]
 async fn erasing_a_case_leaves_other_cases_alone() {
-    use agentplane::blob::erase_case;
+    use agentplane::blob::{ScopedBlobs, erase_case};
     use agentplane::case::CaseStore;
-    use agentplane::core::CorrelationKey;
+    use agentplane::core::{CorrelationKey, erasure_scope};
     use agentplane::store::RedbStore;
 
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
     let cases: Arc<dyn CaseStore> = Arc::clone(&store) as Arc<dyn CaseStore>;
-    let blobs = MemoryBlobs::new();
+    let blobs: Arc<dyn BlobStore> = Arc::new(MemoryBlobs::new());
+    let tenant = agentplane::core::TenantId::default();
 
     let mine = cases
         .correlate_or_open("matter", &[CorrelationKey::new("ns", "SUBJECT-1")], ts(10))
@@ -224,29 +232,36 @@ async fn erasing_a_case_leaves_other_cases_alone() {
         .expect("open")
         .case_id();
 
-    let a = blobs
-        .put("subject one, document a".as_bytes())
-        .await
-        .expect("put");
-    let b = blobs
+    // Each case writes through its own unit-scoped handle, exactly as
+    // `StepCtx::store_blob` does.
+    let mine_blobs = ScopedBlobs::new(
+        Arc::clone(&blobs),
+        erasure_scope(&tenant, &mine.to_string()),
+    );
+    let their_blobs = ScopedBlobs::new(
+        Arc::clone(&blobs),
+        erasure_scope(&tenant, &theirs.to_string()),
+    );
+
+    let shared = "the same PDF, fetched in both matters".as_bytes();
+    let a = mine_blobs.put(shared).await.expect("put");
+    let b = mine_blobs
         .put("subject one, document b".as_bytes())
         .await
         .expect("put");
-    let other = blobs
-        .put("subject two, untouched".as_bytes())
-        .await
-        .expect("put");
+    // The other matter holds the identical bytes: one digest, two objects.
+    let other = their_blobs.put(shared).await.expect("put");
+    assert_eq!(a, other, "identical bytes carry one content digest");
     cases.link_blob(mine, a, ts(11)).await.expect("link");
     cases.link_blob(mine, b, ts(12)).await.expect("link");
     cases.link_blob(theirs, other, ts(11)).await.expect("link");
 
     let n = erase_case(
-        &blobs,
+        blobs.as_ref(),
         cases.as_ref(),
         #[cfg(feature = "keyring")]
         None,
-        #[cfg(feature = "keyring")]
-        &agentplane::core::TenantId::default(),
+        &tenant,
         mine,
         ts(500),
         "art-17 request",
@@ -256,19 +271,29 @@ async fn erasing_a_case_leaves_other_cases_alone() {
     assert_eq!(n, 2, "both of this case's blobs should have been expired");
 
     for (label, digest) in [("a", a), ("b", b)] {
-        match blobs.get(digest).await {
-            Err(BlobError::Expired { reason, at, .. }) => {
+        match mine_blobs.get(digest).await {
+            Err(BlobError::Expired { reason, at, digest }) => {
                 assert_eq!(at, 500);
                 assert!(reason.contains("art-17"), "blob {label} lost its reason");
+                assert!(
+                    digest.contains(&a.to_hex()) || digest.contains(&b.to_hex()),
+                    "the tombstone names a derived address, not the content \
+                     digest a reader can find in a journal: {digest}"
+                );
             }
             other => panic!("blob {label} was not expired: {other:?}"),
         }
     }
 
+    // The identical bytes in the other matter survive: one matter's erasure
+    // reaches every one of its own copies and nothing else's.
     assert_eq!(
-        blobs.get(other).await.expect("the other case is untouched"),
-        "subject two, untouched".as_bytes(),
-        "erasing one case reached into another"
+        their_blobs
+            .get(other)
+            .await
+            .expect("the other case's identical bytes are untouched"),
+        shared,
+        "erasing one case destroyed another case's copy of the same bytes"
     );
 }
 

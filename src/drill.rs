@@ -93,10 +93,20 @@ pub struct Stores<'a> {
     /// The case layer to walk. Required — it is the thing being drilled.
     pub cases: &'a Arc<dyn CaseStore>,
     /// Where the bytes behind each case's blob digests should be.
+    ///
+    /// The **bare** store, exactly as the builder was given it. The drill
+    /// derives each case's own handle from it — the unit-scoped address, and
+    /// the sealing envelope when a ring is supplied — because that is the
+    /// handle the plane wrote through, and reading through anything else
+    /// holds the references against a store the deployment does not use.
     pub blobs: Option<&'a Arc<dyn BlobStore>>,
-    /// The ring that should still open sealed case state.
+    /// The ring that should still open sealed case state — and sealed blobs.
     #[cfg(feature = "keyring")]
     pub keys: Option<&'a Arc<dyn crate::keyring::KeyRing>>,
+    /// Whose cases these are. Blob addresses and key scopes are derived under
+    /// the tenant, so a drill that assumed one would silently check another
+    /// tenant's addresses and find every blob missing.
+    pub tenant: &'a crate::core::TenantId,
 }
 
 /// Walk every case and hold its references against the live stores.
@@ -127,7 +137,8 @@ pub async fn drill(stores: &Stores<'_>) -> Result<DrillReport, StoreError> {
     if stores.keys.is_none() {
         report.not_checked.push(
             "sealed-state keys — no key ring was supplied, so whether sealed case state \
-             still opens was not established"
+             still opens was not established; if this deployment seals its blobs, their \
+             envelopes cannot be opened either and will report below as corrupt"
                 .to_owned(),
         );
     }
@@ -147,7 +158,27 @@ pub async fn drill(stores: &Stores<'_>) -> Result<DrillReport, StoreError> {
         for case in page {
             report.cases += 1;
             if let Some(blobs) = stores.blobs {
-                check_blobs(&mut report, stores.cases, blobs.as_ref(), case.id).await?;
+                // This case's own handle, exactly as `Stores::blobs`
+                // requires — reading the bare store at bare content digests
+                // would report a sealed deployment's every intact envelope
+                // as corrupt, the one verdict that pages.
+                let scope = crate::core::erasure_scope(stores.tenant, &case.id.to_string());
+                let scoped: Arc<dyn BlobStore> = Arc::new(crate::blob::ScopedBlobs::new(
+                    Arc::clone(blobs),
+                    scope.clone(),
+                ));
+                #[cfg(feature = "keyring")]
+                let handle: Arc<dyn BlobStore> = match stores.keys {
+                    Some(keys) => Arc::new(crate::keyring::EncryptedBlobs::new(
+                        scoped,
+                        Arc::clone(keys),
+                        scope,
+                    )),
+                    None => scoped,
+                };
+                #[cfg(not(feature = "keyring"))]
+                let handle: Arc<dyn BlobStore> = scoped;
+                check_blobs(&mut report, stores.cases, handle.as_ref(), case.id).await?;
             }
             #[cfg(feature = "keyring")]
             if let Some(keys) = stores.keys {

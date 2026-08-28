@@ -742,6 +742,136 @@ async fn a_sealing_record_claiming_a_foreign_head_is_a_finding() {
     );
 }
 
+/// Append one hand-built run: admission, then `body`, sealed or left open.
+///
+/// Hand-built because the shipped executor cannot produce the state under
+/// test — that is the point: the audit runs against stores it did not write.
+async fn run_holding(
+    s: &Arc<dyn JournalStore>,
+    body: Vec<agentplane::journal::RecordKind>,
+    seal: bool,
+) -> agentplane::core::RunId {
+    use agentplane::core::Label;
+    use agentplane::journal::{Append, RecordKind};
+
+    let run = agentplane::core::RunId::generate();
+    let lease = s
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .unwrap();
+    let mut records = vec![Append::new(
+        run,
+        RecordKind::RunAdmitted {
+            capability: "demo".into(),
+            governed_by: None,
+            input_label: Label::trusted(),
+            input: json!({}),
+            policy_bundle: None,
+            canon: agentplane::core::canon::VERSION,
+            idempotency_key: None,
+        },
+    )];
+    records.extend(body.into_iter().map(|k| Append::new(run, k)));
+    s.append(lease.epoch, records).await.unwrap();
+    if seal {
+        let head = s.head(run).await.unwrap();
+        s.append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunSealed {
+                    outcome: "succeeded".into(),
+                    chain_head: head.hash,
+                    reason: None,
+                },
+            )],
+        )
+        .await
+        .unwrap();
+        s.seal(run, lease.epoch, "succeeded").await.unwrap();
+    }
+    run
+}
+
+/// A sealed conclusion over an undecided transactional unit is a finding.
+///
+/// `GroupOpened`/`GroupSettled` bracket effects that take together or not at
+/// all. In an **open** run an unsettled group is the ordinary crash shape —
+/// the resume re-walks the members and settles, and the run sits in a
+/// findable backlog until it does — so that half must *not* flag, or the
+/// finding reads as weather. A **sealed** run is the state no honest writer
+/// produces: nothing may resume it, so whether the members were taken or
+/// taken back is permanently unanswerable, and an audit that verified the
+/// chain around that silence was checking the envelope and not the letter.
+#[tokio::test]
+async fn a_sealed_run_with_an_unsettled_group_is_a_finding() {
+    use agentplane::core::GroupOutcome;
+    use agentplane::journal::RecordKind;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let s = store.clone() as Arc<dyn JournalStore>;
+    let opened = || RecordKind::GroupOpened {
+        group: "checkout".into(),
+        resources: vec!["inventory".into()],
+    };
+
+    // Sealed with the group left open: the finding. Open with the group left
+    // open: the crash shape a resume repairs. Sealed with the group settled:
+    // the ordinary ending.
+    let sealed = run_holding(&s, vec![opened()], true).await;
+    let open = run_holding(&s, vec![opened()], false).await;
+    let settled = run_holding(
+        &s,
+        vec![
+            opened(),
+            RecordKind::GroupSettled {
+                group: "checkout".into(),
+                outcome: GroupOutcome::Committed,
+                detail: None,
+            },
+        ],
+        true,
+    )
+    .await;
+
+    let report = agentplane::audit::audit(
+        &s,
+        &[sealed, open, settled],
+        &agentplane::audit::Evidence::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        report.findings.iter().any(|f| matches!(
+            f,
+            agentplane::audit::Finding::GroupUnsettled { run, group }
+                if *run == sealed && group == "checkout"
+        )),
+        "a sealed run with an undecided group audited as: {:?}",
+        report.findings
+    );
+    assert!(
+        !report.sound.contains(&sealed),
+        "the run carrying the finding was also listed sound"
+    );
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .filter(|f| matches!(f, agentplane::audit::Finding::GroupUnsettled { .. }))
+            .count(),
+        1,
+        "the open run's crash shape or the settled group was flagged too: {:?}",
+        report.findings
+    );
+    assert!(
+        report.sound.contains(&open) && report.sound.contains(&settled),
+        "the two healthy shapes must stay sound: {:?}",
+        report.sound
+    );
+}
+
 /// **The point of the whole mechanism, from the auditor's side.**
 ///
 /// Without a checkpoint from outside, an audit of a store somebody deleted a run

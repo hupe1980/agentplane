@@ -395,42 +395,46 @@ async fn a_key_ring_outage_is_not_reported_as_an_erasure() {
 /// because it is already the retention unit: bytes are linked to their case at
 /// write time, and a second, differently shaped unit for keys would let the two
 /// disagree about what an erasure covered.
+/// A skill that stores one secret blob through the governed path.
 #[cfg(all(feature = "redb", feature = "keyring"))]
-#[tokio::test]
-async fn erasing_a_case_destroys_its_key_and_the_backup_with_it() {
-    use agentplane::core::{CorrelationKey, Outcome, Skill, SkillDescriptor, SkillError, Tainted};
-    use agentplane::runtime::{Runtime, StepCtx};
-    use serde_json::{Value, json};
+#[derive(Debug)]
+struct Keeps;
 
-    #[derive(Debug)]
-    struct Keeps;
-
-    #[async_trait::async_trait]
-    impl Skill for Keeps {
-        fn descriptor(&self) -> SkillDescriptor {
-            SkillDescriptor::new("keeps").provides("records.keep")
-        }
-        async fn invoke(
-            &self,
-            cx: &mut StepCtx<'_>,
-            _input: Tainted<Value>,
-        ) -> Result<Outcome, SkillError> {
-            let digest = cx.store_blob(SECRET).await?;
-            Ok(Outcome::done(Tainted::trusted(json!(digest.to_hex()))))
-        }
+#[cfg(all(feature = "redb", feature = "keyring"))]
+#[async_trait::async_trait]
+impl agentplane::core::Skill for Keeps {
+    fn descriptor(&self) -> agentplane::core::SkillDescriptor {
+        agentplane::core::SkillDescriptor::new("keeps").provides("records.keep")
     }
+    async fn invoke(
+        &self,
+        cx: &mut agentplane::runtime::StepCtx<'_>,
+        _input: agentplane::core::Tainted<serde_json::Value>,
+    ) -> Result<agentplane::core::Outcome, agentplane::core::SkillError> {
+        let digest = cx.store_blob(SECRET).await?;
+        Ok(agentplane::core::Outcome::done(
+            agentplane::core::Tainted::trusted(serde_json::json!(digest.to_hex())),
+        ))
+    }
+}
+
+/// Run [`Keeps`] on a sealed plane and hand back the case it opened.
+#[cfg(all(feature = "redb", feature = "keyring"))]
+async fn sealed_case_with_blob(
+    disk: &Arc<MemoryBlobs>,
+    ring: &Arc<MemoryKeyRing>,
+) -> (Arc<agentplane::store::RedbStore>, agentplane::core::CaseId) {
+    use agentplane::core::{CorrelationKey, Tainted};
+    use agentplane::runtime::Runtime;
+    use serde_json::json;
 
     let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
-    let disk = Arc::new(MemoryBlobs::new());
-    let ring = Arc::new(MemoryKeyRing::new());
-
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>)
         .cases(Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>)
-        .blobs(Arc::clone(&disk) as Arc<dyn BlobStore>)
-        .keyring(Arc::clone(&ring) as Arc<dyn KeyRing>)
+        .blobs(Arc::clone(disk) as Arc<dyn BlobStore>)
+        .keyring(Arc::clone(ring) as Arc<dyn KeyRing>)
         .skill(Keeps)
         .build();
-
     let out = rt
         .run_correlated(
             "records.keep",
@@ -445,24 +449,44 @@ async fn erasing_a_case_destroys_its_key_and_the_backup_with_it() {
         "the run did not succeed: {:?}",
         out.status
     );
-    let digest = agentplane::core::Digest::of(SECRET);
-
-    // What reached the disk is sealed, and the case can read it back.
-    let backup = disk.get_raw(digest).await.expect("raw bytes");
-    assert_ne!(backup, SECRET, "the run wrote its payload in the clear");
-
-    let case_id = agentplane::case::CaseStore::correlate(
+    let case = agentplane::case::CaseStore::correlate(
         store.as_ref(),
         &[CorrelationKey::new("claim", "CLM-1")],
     )
     .await
     .expect("correlate")
     .expect("the run opened a case");
+    (store, case)
+}
+
+#[cfg(all(feature = "redb", feature = "keyring"))]
+#[tokio::test]
+async fn erasing_a_case_destroys_its_key_and_the_backup_with_it() {
+    let disk = Arc::new(MemoryBlobs::new());
+    let ring = Arc::new(MemoryKeyRing::new());
+    let (store, case_id) = sealed_case_with_blob(&disk, &ring).await;
+    let digest = agentplane::core::Digest::of(SECRET);
     let tenant = agentplane::core::TenantId::default();
+    let scope = agentplane::keyring::scope(&tenant, &case_id.to_string());
+
+    // What reached the disk is sealed, lives at the case's own unit address —
+    // never at the bare content digest, which two cases could share — and the
+    // case can read it back through its own handle.
+    let address = agentplane::blob::unit_address(&scope, digest);
+    let backup = disk.get_raw(address).await.expect("raw bytes");
+    assert_ne!(backup, SECRET, "the run wrote its payload in the clear");
+    assert!(
+        matches!(disk.get_raw(digest).await, Err(BlobError::NotFound(_))),
+        "the bytes were filed at the bare content digest, outside the case's          erasure unit"
+    );
+
     let sealed_view = EncryptedBlobs::new(
-        Arc::clone(&disk) as Arc<dyn BlobStore>,
+        Arc::new(agentplane::blob::ScopedBlobs::new(
+            Arc::clone(&disk) as Arc<dyn BlobStore>,
+            scope.clone(),
+        )),
         Arc::clone(&ring) as Arc<dyn KeyRing>,
-        agentplane::keyring::scope(&tenant, &case_id.to_string()),
+        scope.clone(),
     );
     assert_eq!(
         sealed_view.get(digest).await.expect("read back"),
@@ -497,13 +521,17 @@ async fn erasing_a_case_destroys_its_key_and_the_backup_with_it() {
          live store and nothing else"
     );
 
-    // The backup, restored somewhere else entirely.
+    // The backup, restored somewhere else entirely — at the same unit
+    // address a backup of the object store would carry.
     let elsewhere = Arc::new(MemoryBlobs::new());
-    elsewhere.put_at(digest, &backup).await.expect("restore");
+    elsewhere.put_at(address, &backup).await.expect("restore");
     let restored = EncryptedBlobs::new(
-        Arc::clone(&elsewhere) as Arc<dyn BlobStore>,
+        Arc::new(agentplane::blob::ScopedBlobs::new(
+            Arc::clone(&elsewhere) as Arc<dyn BlobStore>,
+            scope.clone(),
+        )),
         Arc::clone(&ring) as Arc<dyn KeyRing>,
-        agentplane::keyring::scope(&tenant, &case_id.to_string()),
+        scope,
     );
     assert!(
         matches!(restored.get(digest).await, Err(BlobError::Expired { .. })),

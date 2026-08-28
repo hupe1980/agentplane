@@ -41,6 +41,9 @@ pub use opendal_store::OpenDalBlobs;
 mod memory;
 pub use memory::MemoryBlobs;
 
+mod scoped;
+pub use scoped::{ScopedBlobs, unit_address};
+
 /// What can go wrong reaching content-addressed storage.
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
@@ -202,6 +205,11 @@ pub trait BlobStore: Send + Sync + Debug {
 /// later read says *expired, on this date, for this reason* rather than
 /// *missing*, and the journal still proves what happened.
 ///
+/// `tenant` derives the addresses to tombstone: blobs live at
+/// [`unit_address`]`(erasure_scope(tenant, case), digest)`, so this erasure
+/// reaches exactly this case's copies — [`ScopedBlobs`] carries the argument
+/// for why the erasure unit leads the address.
+///
 /// Returns how many blobs were expired. Zero is an ordinary answer: a case that
 /// stored nothing has nothing to forget, and reporting that as an error would
 /// make the caller special-case the common path.
@@ -217,7 +225,7 @@ pub async fn erase_case(
     blobs: &dyn BlobStore,
     cases: &dyn crate::case::CaseStore,
     #[cfg(feature = "keyring")] keyring: Option<&dyn crate::keyring::KeyRing>,
-    #[cfg(feature = "keyring")] tenant: &crate::core::TenantId,
+    tenant: &crate::core::TenantId,
     case: crate::core::CaseId,
     at: crate::core::Timestamp,
     reason: &str,
@@ -226,9 +234,12 @@ pub async fn erase_case(
         .blobs_of(case)
         .await
         .map_err(|e| BlobError::Backend(e.to_string()))?;
+    let scope = crate::core::erasure_scope(tenant, &case.to_string());
     let mut n = 0;
     for digest in digests {
-        blobs.expire(digest, at, reason).await?;
+        blobs
+            .expire(unit_address(&scope, digest), at, reason)
+            .await?;
         n += 1;
     }
 
@@ -245,13 +256,9 @@ pub async fn erase_case(
     // above only cover the live store.
     #[cfg(feature = "keyring")]
     if let Some(keys) = keyring {
-        keys.destroy(
-            &crate::keyring::scope(tenant, &case.to_string()),
-            at,
-            reason,
-        )
-        .await
-        .map_err(|e| BlobError::Backend(e.to_string()))?;
+        keys.destroy(&scope, at, reason)
+            .await
+            .map_err(|e| BlobError::Backend(e.to_string()))?;
     }
     Ok(n)
 }

@@ -11,11 +11,11 @@
 
 use std::sync::Arc;
 
-use agentplane::blob::{BlobStore, MemoryBlobs};
+use agentplane::blob::{BlobStore, MemoryBlobs, ScopedBlobs, unit_address};
 use agentplane::case::CaseStore;
-use agentplane::core::{CaseVersion, CorrelationKey, Digest, TenantId, Timestamp};
+use agentplane::core::{CaseVersion, CorrelationKey, Digest, TenantId, Timestamp, erasure_scope};
 use agentplane::drill::{Stores, drill};
-use agentplane::keyring::{KeyRing, SealedCases};
+use agentplane::keyring::{EncryptedBlobs, KeyRing, SealedCases};
 use agentplane::store::RedbStore;
 use agentplane::testkit::MemoryKeyRing;
 use serde_json::json;
@@ -27,12 +27,28 @@ fn ts(secs: i64) -> Timestamp {
 struct Fixture {
     cases: Arc<dyn CaseStore>,
     blobs: Arc<dyn BlobStore>,
+    /// The bare store underneath, concretely, for planting tampered bytes at
+    /// the address a case's write actually landed at.
+    raw: Arc<MemoryBlobs>,
     keys: Arc<dyn KeyRing>,
     /// The same ring, concretely, for the operator actions only a real key
     /// service exposes — moving a decryption floor under an envelope that is
     /// already sealed.
     ring: Arc<MemoryKeyRing>,
     tenant: TenantId,
+}
+
+impl Fixture {
+    /// The handle a run of `case` writes blobs through: unit-scoped addresses,
+    /// sealed under the case's key — exactly what `StepCtx::store_blob` builds.
+    fn case_blobs(&self, case: agentplane::core::CaseId) -> Arc<dyn BlobStore> {
+        let scope = erasure_scope(&self.tenant, &case.to_string());
+        Arc::new(EncryptedBlobs::new(
+            Arc::new(ScopedBlobs::new(Arc::clone(&self.blobs), scope.clone())),
+            Arc::clone(&self.keys),
+            scope,
+        ))
+    }
 }
 
 fn fixture() -> Fixture {
@@ -44,9 +60,11 @@ fn fixture() -> Fixture {
         Arc::clone(&ring) as Arc<dyn KeyRing>,
         tenant.clone(),
     );
+    let raw = Arc::new(MemoryBlobs::new());
     Fixture {
         cases: sealed as Arc<dyn CaseStore>,
-        blobs: Arc::new(MemoryBlobs::new()) as Arc<dyn BlobStore>,
+        blobs: Arc::clone(&raw) as Arc<dyn BlobStore>,
+        raw,
         keys: Arc::clone(&ring) as Arc<dyn KeyRing>,
         ring,
         tenant,
@@ -54,6 +72,11 @@ fn fixture() -> Fixture {
 }
 
 /// Open a case with sealed state and one stored, linked artifact.
+///
+/// The artifact is written the way a ring deployment writes one — through the
+/// case's unit-scoped, sealing handle — because a fixture that wrote plaintext
+/// at bare content addresses would be drilling a store no sealed plane
+/// produces, and the pass would be green over the wrong deployment shape.
 async fn matter(f: &Fixture, key: &str, bytes: &[u8]) -> agentplane::core::CaseId {
     let case = f
         .cases
@@ -65,7 +88,7 @@ async fn matter(f: &Fixture, key: &str, bytes: &[u8]) -> agentplane::core::CaseI
         .put_state(case, CaseVersion::INITIAL, json!({ "about": key }))
         .await
         .expect("sealed state");
-    let digest = f.blobs.put(bytes).await.expect("stored");
+    let digest = f.case_blobs(case).put(bytes).await.expect("stored");
     f.cases
         .link_blob(case, digest, ts(1_001))
         .await
@@ -112,6 +135,7 @@ async fn the_drill_tells_erasure_from_loss() {
         cases: &f.cases,
         blobs: Some(&f.blobs),
         keys: Some(&f.keys),
+        tenant: &f.tenant,
     })
     .await
     .expect("drill");
@@ -156,22 +180,27 @@ async fn altered_bytes_are_a_finding_not_a_presence() {
         .await
         .expect("open")
         .case_id();
-    // Planted at an address the bytes do not hash to — what tampering in the
-    // backing store looks like from here.
-    let claimed = Digest::of(b"what was written");
-    f.blobs
-        .put_at(claimed, b"what is there now")
+    // Written properly, then altered in the backing store — what tampering
+    // looks like from here. The alteration lands at the address the case's
+    // write actually used, because that is the object the drill will read.
+    let claimed = f
+        .case_blobs(case)
+        .put(b"what was written")
         .await
-        .expect("planted");
+        .expect("stored");
     f.cases
         .link_blob(case, claimed, ts(1_001))
         .await
         .expect("linked");
+    let address = unit_address(&erasure_scope(&f.tenant, &case.to_string()), claimed);
+    f.raw
+        .tamper_for_test(address, b"what is there now".to_vec());
 
     let report = drill(&Stores {
         cases: &f.cases,
         blobs: Some(&f.blobs),
         keys: Some(&f.keys),
+        tenant: &f.tenant,
     })
     .await
     .expect("drill");
@@ -201,6 +230,7 @@ async fn missing_stores_are_unchecked_not_passed() {
         cases: &f.cases,
         blobs: None,
         keys: None,
+        tenant: &f.tenant,
     })
     .await
     .expect("drill");
@@ -269,10 +299,12 @@ async fn a_ring_with_nothing_sealed_is_unestablished_coverage() {
         .expect("state");
     let keys = Arc::new(MemoryKeyRing::new()) as Arc<dyn KeyRing>;
 
+    let tenant = TenantId::default();
     let report = drill(&Stores {
         cases: &cases,
         blobs: None,
         keys: Some(&keys),
+        tenant: &tenant,
     })
     .await
     .expect("drill");
@@ -300,6 +332,7 @@ async fn a_ring_with_nothing_sealed_is_unestablished_coverage() {
         cases: &f.cases,
         blobs: Some(&f.blobs),
         keys: Some(&f.keys),
+        tenant: &f.tenant,
     })
     .await
     .expect("drill");
@@ -345,6 +378,7 @@ async fn a_retired_key_version_is_not_reported_as_loss_or_as_erasure() {
         cases: &f.cases,
         blobs: Some(&f.blobs),
         keys: Some(&f.keys),
+        tenant: &f.tenant,
     })
     .await
     .expect("drill");
@@ -381,6 +415,7 @@ async fn a_retired_key_version_is_not_reported_as_loss_or_as_erasure() {
         cases: &f.cases,
         blobs: Some(&f.blobs),
         keys: Some(&f.keys),
+        tenant: &f.tenant,
     })
     .await
     .expect("drill");

@@ -2502,3 +2502,307 @@ async fn two_settlements_of_one_name_both_record_and_neither_repeats() {
         2
     );
 }
+
+// ── A record the journal refused, after the call went out ───────────────────
+
+/// A group holding one irreversible send and nothing else.
+#[cfg(feature = "testkit")]
+#[derive(Debug)]
+struct SendOnly {
+    world: Arc<World>,
+}
+
+#[cfg(feature = "testkit")]
+#[async_trait::async_trait]
+impl Skill for SendOnly {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("send-only").provides("send.only")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let mut g = cx
+            .group("send", ["notify"])
+            .await
+            .map_err(SkillError::Step)?;
+        g.deferred("notify", Call::new("mail.send", "sent", &self.world))
+            .map_err(SkillError::Step)?;
+        g.commit(&[]).await.map_err(SkillError::Step)?;
+        Ok(Outcome::done(Tainted::trusted(json!("sent"))))
+    }
+}
+
+/// A send whose terminal record could not be written is not reported taken back.
+///
+/// The deferred member performs — the mail goes out — and the journal then
+/// refuses the `EffectDone` append. The store error alone cannot say whether
+/// dispatch had happened, so the classification is made where the answer is
+/// known: `perform_once` reports *landed but unrecorded*, and the cheap
+/// abort's claim of "taken back whole" is off the table. Flattened into an
+/// ordinary store error, the same failure read as pre-dispatch, the group
+/// settled `Aborted` over an email already delivered, and the orphaned
+/// announcement was re-performed by the next resume.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_send_whose_outcome_could_not_be_recorded_is_not_reported_taken_back() {
+    use agentplane::testkit::{Fault, Faulty, Schedule};
+
+    let world = World::new();
+    let inner = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let store = Arc::new(Faulty::new(
+        inner as Arc<dyn JournalStore>,
+        Schedule::healthy().on_kind("EffectDone", Fault::FailedClean),
+    ));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendOnly {
+            world: Arc::clone(&world),
+        })
+        .build();
+
+    let out = rt
+        .run("send.only", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+
+    assert_eq!(
+        world.entries(),
+        vec!["sent"],
+        "the premise of this test is that the send went out, exactly once"
+    );
+    let RunStatus::Quarantined(why) = &out.status else {
+        panic!(
+            "a landed send whose record was refused settled as {:?} — if that \
+             is Failed, the journal claims 'taken back whole' over a mail \
+             already delivered",
+            out.status
+        );
+    };
+    assert!(
+        why.contains("could not be recorded"),
+        "quarantined for a reason other than the lost record: {why}"
+    );
+    let settled: Vec<String> = store
+        .read(out.run_id, 1)
+        .await
+        .expect("records")
+        .iter()
+        .filter_map(|r| match r.kind() {
+            agentplane::journal::RecordKind::GroupSettled { outcome, .. } => {
+                Some(outcome.as_str().to_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        settled,
+        vec!["quarantined".to_owned()],
+        "the settlement contradicts the world: the send stands"
+    );
+}
+
+// ── A refusal inside the prefix is history, not a frontier ──────────────────
+
+/// One reversible hold, one deferred send, commit.
+#[derive(Debug)]
+struct HoldThenSend {
+    world: Arc<World>,
+}
+
+#[async_trait::async_trait]
+impl Skill for HoldThenSend {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("hold-then-send").provides("hold.then.send")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let w = &self.world;
+        let mut g = cx
+            .group("checkout", ["inventory", "notify"])
+            .await
+            .map_err(SkillError::Step)?;
+        g.reversible("inventory", Call::new("stock.hold", "held", w), |_| {
+            Call::new("stock.release", "released", w)
+        })
+        .await
+        .map_err(SkillError::Step)?;
+        g.deferred("notify", Call::new("mail.send", "sent", w))
+            .map_err(SkillError::Step)?;
+        g.commit(&[]).await.map_err(SkillError::Step)?;
+        Ok(Outcome::done(Tainted::trusted(json!("sent"))))
+    }
+}
+
+/// A budget refusal *inside* the replayed prefix stays a refusal, whatever the
+/// ceiling now says.
+///
+/// A raised ceiling un-pauses a run whose refusal is the history frontier —
+/// the last thing the run did. A refusal a group abort already answered is
+/// different: the record continues past it, through the reversals and the
+/// `Aborted` settlement, so re-admitting it mid-prefix would dispatch the
+/// member where history holds the abort's reversals — divergence and a
+/// quarantine manufactured out of an operator's raise. The resume must
+/// re-reach the recorded abort instead, byte for byte.
+#[tokio::test]
+async fn a_refusal_a_group_abort_already_answered_is_not_readmitted() {
+    let world = World::new();
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let build = |budget: agentplane::core::Budget| {
+        Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+            .budget(budget)
+            .skill(HoldThenSend {
+                world: Arc::clone(&world),
+            })
+            .build()
+    };
+
+    // One effect of budget: the hold lands, the deferred send is refused, the
+    // group aborts and the hold is released (reversals are gate-exempt).
+    let capped = build(agentplane::core::Budget::default().effects(1));
+    let out = capped
+        .run("hold.then.send", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "the premise is a refused deferred member and a clean abort: {:?}",
+        out.status
+    );
+    assert_eq!(world.entries(), vec!["held", "released"]);
+
+    // Raised and resumed: the refusal is inside the prefix — the abort's
+    // reversals and settlement follow it — so the resume re-reaches the same
+    // conclusion rather than dispatching the send into recorded history.
+    let raised = build(agentplane::core::Budget::default().effects(10));
+    let again = raised
+        .replay(out.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .expect("resume");
+    assert!(
+        matches!(again.status, RunStatus::Failed(_)),
+        "a raised ceiling re-admitted a refusal the group abort had already \
+         answered — the resume diverged from its own history: {:?}",
+        again.status
+    );
+    assert!(
+        !world.did("sent"),
+        "the resume dispatched the send an aborted group never ran: {:?}",
+        world.entries()
+    );
+    assert_eq!(
+        world.entries(),
+        vec!["held", "released"],
+        "the resume re-performed a member or a reversal"
+    );
+    assert_eq!(
+        group_kind_count(&store, out.run_id, "GroupSettled").await,
+        1,
+        "the resume must consume the recorded settlement, appending none"
+    );
+    assert_eq!(
+        group_kind_count(&store, out.run_id, "BudgetReadmitted").await,
+        0,
+        "a mid-prefix refusal must not be re-admitted"
+    );
+}
+
+// ── A recorded refusal is consumed, never re-decided ────────────────────────
+
+/// Denies one resource until told otherwise, under one unchanging bundle.
+///
+/// The flip models the drift the replay rule exists to rule out: something about the
+/// gate's answer changes between the live run and its resume, while the
+/// journaled bundle identity — which resume admission checks — stays the same.
+#[cfg(feature = "testkit")]
+#[derive(Debug)]
+struct RelentsLater {
+    relented: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "testkit")]
+impl agentplane::core::PolicyEngine for RelentsLater {
+    fn authorize(
+        &self,
+        r: &agentplane::core::PolicyRequest<'_>,
+    ) -> agentplane::core::PolicyDecision {
+        if r.resource == "ledger.post" && !self.relented.load(Ordering::SeqCst) {
+            agentplane::core::PolicyDecision::deny("this agent may not post to the ledger")
+        } else {
+            agentplane::core::PolicyDecision::Permit
+        }
+    }
+    fn bundle(&self) -> agentplane::core::PolicyBundleIdentity {
+        agentplane::core::PolicyBundleIdentity::new(
+            agentplane::core::Digest::of(b"relents-later"),
+            "agentplane-test/policy-v1",
+        )
+    }
+}
+
+/// A resumed atomic member consumes its recorded denial rather than re-deciding.
+///
+/// A gate must not re-decide a dispatch history already settled: the
+/// verdict is in the journal as the refusal's own record, and replay consumes
+/// it. The atomic-member path once consumed the record and then ran the gate
+/// fresh, so a resume under a gate that had since relented dispatched — and
+/// committed — a member the recorded run was refused, appending a second
+/// history under the same key.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_resumed_atomic_member_consumes_its_recorded_denial() {
+    let engine = Arc::new(RelentsLater {
+        relented: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (store, _redb) = staged();
+    let world = World::new();
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(Arc::clone(&engine) as Arc<dyn agentplane::core::PolicyEngine>)
+        .skill(Books {
+            world: Arc::clone(&world),
+            refuses: false,
+        })
+        .build();
+
+    let out = rt
+        .run("books", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(
+        matches!(&out.status, RunStatus::Failed(why) if why.contains("may not post")),
+        "the premise of this test is a recorded denial: {:?}",
+        out.status
+    );
+    assert!(store.applied().is_empty());
+    let before = world.entries();
+
+    // The gate relents; the bundle identity resume admission checks does not.
+    engine.relented.store(true, Ordering::SeqCst);
+    let again = rt
+        .replay(out.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .expect("resume");
+
+    assert!(
+        store.applied().is_empty(),
+        "the resume re-decided a recorded denial and committed the member the \
+         recorded run was refused: {:?}",
+        store.applied()
+    );
+    assert!(
+        matches!(&again.status, RunStatus::Failed(why) if why.contains("may not post")),
+        "the resume reached a different conclusion than the history it \
+         replayed: {:?}",
+        again.status
+    );
+    assert_eq!(
+        world.entries(),
+        before,
+        "the resume performed a member or a reversal a second time"
+    );
+}

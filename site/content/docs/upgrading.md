@@ -15,6 +15,65 @@ property that makes a hard cut acceptable at this stage.
 
 ---
 
+## Blob storage addresses are scoped by the erasure unit
+
+**Affected:** every existing blob store (recreate it); callers of
+`blob::erase_case`; `drill::Stores` literals; anything reading a blob store
+directly rather than through `cx.blobs()`.
+
+The storage key is `blob::unit_address(scope, digest)` — a domain-separated
+hash of the erasure scope and the content digest — not the bare content
+digest, for sealed and unsealed deployments alike. Identical bytes in two
+cases are two objects, so one case's tombstones and key destruction reach
+exactly its own copies; with the bare digest they reached the other case's
+too, and the drill read that loss as *erased by design*. Journals are
+untouched: records commit to the content digest, which still identifies and
+verifies the bytes.
+
+Objects written by earlier builds sit at addresses nothing reads any more —
+recreate the store, per the pre-freeze rule. `blob::erase_case` takes the
+tenant unconditionally now (it derives the addresses to tombstone), and
+`drill::Stores` gained a `tenant` field for the same reason. A reader that
+held the bare store goes through `blob::ScopedBlobs::new(store,
+core::erasure_scope(&tenant, &case.to_string()))` — or better, through
+`cx.blobs()`, which builds the right handle either way. `keyring::scope` and
+`core::erasure_scope` are one function; both spellings resolve to it.
+
+## A raised ceiling un-pauses effect-limited runs, and groups quarantine on a lost record
+
+**Affected:** embedders reading raw journals; `Replanner` implementations;
+nobody's `match` arms — `StepError` is `#[non_exhaustive]`.
+
+Three replay-semantics changes in one release, all settlements of a rule that
+held on one path and not its twin:
+
+- A `BudgetRefused` recorded under an **effect** key is re-asked against the
+  ledger in force when a resume meets it at the history frontier, exactly as
+  a step-level refusal is; the re-admission is journaled as
+  `BudgetReadmitted` under the same effect key, which supersedes the refusal
+  on replay. A refusal *inside* the replayed prefix — one a group abort
+  already answered — still re-raises verbatim.
+- An effect whose `perform` returned but whose terminal record could not be
+  written fails as `StepError::Unrecorded { key, disposition, detail }`
+  rather than a bare store error. An effect group holding such a member
+  settles **quarantined**, never `Aborted` — the send went out, so "taken
+  back whole" would be false. The general path is unchanged: the run fails
+  open and the resume resolves the orphan by its declared recovery.
+- A resumed atomic member consumes its recorded gate refusal instead of
+  re-deciding it, and `agentplane audit` reports a **sealed** run holding an
+  opened, never-settled group as `Finding::GroupUnsettled`.
+
+## A replan successor must say why it exists
+
+**Affected:** `Replanner` implementations that build successors by hand.
+
+A successor with `reason: None` is refused beside the lineage check —
+version, parent and reason travel together, and a plan frozen as having
+replaced another with nothing on the record saying why loses the half of an
+incident versioned replanning exists to keep. Return
+`current.succeed_with(nodes, reason)`'s result unmodified and nothing
+changes.
+
 ## A witness cosignature is the C2SP `cosignature/v1` construction
 
 **Affected:** custom `Witness` implementations; anything re-verifying a

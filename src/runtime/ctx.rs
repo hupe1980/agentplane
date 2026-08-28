@@ -991,7 +991,10 @@ impl<'a> StepCtx<'a> {
                     Some(
                         refusal @ (EffectReplay::Refused { .. } | EffectReplay::Denied { .. }),
                     ) => {
-                        return Err(recorded_refusal(refusal));
+                        // Re-admitted refusals fall through to a live dispatch
+                        // of the same key; everything else re-raises inside.
+                        self.replayed_refusal(key, refusal).await?;
+                        continue;
                     }
                     Some(EffectReplay::Failed {
                         error,
@@ -1239,6 +1242,61 @@ impl<'a> StepCtx<'a> {
                 detail: "started before a crash and never completed".into(),
             }),
         }
+    }
+
+    /// Decide what a replayed refusal means in this pass.
+    ///
+    /// `Err` re-raises the recorded verdict; `Ok(())` means a budget refusal
+    /// was superseded by a re-admission this pass just journaled, and the
+    /// caller dispatches the same key live. One implementation for the
+    /// ordinary dispatch loop and the atomic-member path, because it is one
+    /// rule — and the step-level twin lives in `admit_ready`, so the two
+    /// tiers must move together: an effect tier that replayed its refusal
+    /// verbatim would leave a run exhausted by `max_effects` paused forever
+    /// under a ceiling that now admits it, while its step-limited sibling
+    /// resumes.
+    ///
+    /// The asymmetry between the two refusal kinds is deliberate. A budget is
+    /// raised, so a resume re-asks the ledger now in force — still refused
+    /// consumes the standing record and re-concludes without stacking a
+    /// second, admitted journals `BudgetReadmitted` beside the refusal it
+    /// supersedes. A policy denial is argued with, not raised: resume already
+    /// requires the exact bundle recorded at admission, so the verdict is
+    /// consumed rather than re-decided — a gate must not re-decide a dispatch
+    /// history already settled.
+    pub(crate) async fn replayed_refusal(
+        &mut self,
+        key: EffectKey,
+        refusal: EffectReplay,
+    ) -> Result<(), StepError> {
+        let EffectReplay::Refused { limit, used } = refusal else {
+            return Err(recorded_refusal(refusal));
+        };
+        // Re-askable only at the history frontier, and the condition is
+        // deliberately `writes_enabled`: a re-admission is a write, and
+        // bookkeeping writes begin where history ends. A refusal *inside* the
+        // replayed prefix was already answered by the run itself — the group
+        // abort that follows one is history — so re-admitting it mid-prefix
+        // would dispatch where the record holds the abort's reversals,
+        // manufacturing divergence out of a raise. Strict is covered by the
+        // same condition: verification writes nothing and consults no ledger.
+        if !self.writes_enabled() {
+            return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
+        }
+        // Scoped so the guard is gone before the await below.
+        let verdict = self.ledger.lock().expect("budget mutex").admit_effect();
+        if verdict.is_err() {
+            // The ledger now in force still refuses: the run concludes
+            // exhausted again, and the standing refusal already says so — no
+            // second record.
+            return Err(StepError::Budget(crate::core::BudgetExceeded::Recorded {
+                limit,
+                used,
+            }));
+        }
+        self.append_effect(key, RecordKind::BudgetReadmitted { limit })
+            .await?;
+        Ok(())
     }
 
     /// Ask the provider whether a call landed, and journal the answer.
@@ -2882,23 +2940,43 @@ impl<'a> StepCtx<'a> {
             .await?;
         }
 
+        // Past this point the call has returned, so a failure to *record* what
+        // it did is not a store error like any other: the announcement is
+        // durable, the terminal record is not, and this process — unlike the
+        // resume that will find the orphan — knows what actually happened.
+        // That knowledge travels as `StepError::Unrecorded` rather than being
+        // flattened into `Store`, because a consumer deciding what the failure
+        // permits (an effect group's cheap abort claims *taken back whole*)
+        // branches on whether the call reached the world.
         match effect.perform().await {
             Ok(output) => {
-                let json = serde_json::to_value(&output)?;
+                let unrecorded = |key, detail: String| StepError::Unrecorded {
+                    key,
+                    disposition: crate::core::Disposition::Landed,
+                    detail,
+                };
+                let json = match serde_json::to_value(&output) {
+                    Ok(json) => json,
+                    Err(e) => return Err(unrecorded(key, e.to_string())),
+                };
                 let spend = effect.spend(&output);
                 self.bill_live(spend);
-                self.append_effect(
-                    key,
-                    RecordKind::EffectDone {
-                        output: json,
-                        // Not an inbound event: only an awaited delivery has a
-                        // sender to record.
-                        source: None,
-                        spend,
-                        declared: crate::core::DeclaredOutput::of(effect),
-                    },
-                )
-                .await?;
+                if let Err(e) = self
+                    .append_effect(
+                        key,
+                        RecordKind::EffectDone {
+                            output: json,
+                            // Not an inbound event: only an awaited delivery has
+                            // a sender to record.
+                            source: None,
+                            spend,
+                            declared: crate::core::DeclaredOutput::of(effect),
+                        },
+                    )
+                    .await
+                {
+                    return Err(unrecorded(key, e.to_string()));
+                }
                 Ok(Ok(output))
             }
             Err(e) => {
@@ -2912,18 +2990,26 @@ impl<'a> StepCtx<'a> {
                 // is what every later decision reads — the retry taken now, and
                 // an operator's judgement afterwards. Messages get reworded;
                 // this is a fact about the run.
-                self.append_effect(
-                    key,
-                    RecordKind::EffectFailed {
-                        error: e.to_string(),
-                        spend,
+                if let Err(append_failed) = self
+                    .append_effect(
+                        key,
+                        RecordKind::EffectFailed {
+                            error: e.to_string(),
+                            spend,
+                            disposition: e.disposition(),
+                            // An answer, not a fault — recorded so the replayed
+                            // retry decision stops where the live one did.
+                            permanent: matches!(e, crate::core::EffectError::Refused(_)),
+                        },
+                    )
+                    .await
+                {
+                    return Err(StepError::Unrecorded {
+                        key,
                         disposition: e.disposition(),
-                        // An answer, not a fault — recorded so the replayed
-                        // retry decision stops where the live one did.
-                        permanent: matches!(e, crate::core::EffectError::Refused(_)),
-                    },
-                )
-                .await?;
+                        detail: format!("{e}; and recording that failure failed: {append_failed}"),
+                    });
+                }
                 Ok(Err(e))
             }
         }
@@ -3924,39 +4010,54 @@ impl StepCtx<'_> {
             ))
         })?;
 
+        // The tenant prefixes every scope. Without it two tenants sharing a
+        // key ring or a bucket collide the moment they use the same case or
+        // retention name — and the collision is invisible until one tenant's
+        // erasure destroys the other's key. `TenantId` refuses `/` for exactly
+        // this reason, so the prefix cannot be forged by naming a tenant
+        // `acme/prod`.
+        let unit = match scope {
+            Some(s) => Some(s.to_owned()),
+            None => self.case.as_ref().map(|c| c.case_id.to_string()),
+        };
+
+        // The erasure unit leads the storage address, sealed or not — the
+        // same bytes in two units are two objects, so one unit's erasure
+        // reaches only its own copies. `blob::ScopedBlobs` carries the
+        // argument.
+        let scoped = |u: &str| -> Arc<dyn crate::blob::BlobStore> {
+            Arc::new(crate::blob::ScopedBlobs::new(
+                blobs.clone(),
+                crate::core::erasure_scope(&self.tenant, u),
+            ))
+        };
+
         #[cfg(feature = "keyring")]
         if let Some(keys) = self.keyring.clone() {
-            // The tenant prefixes every scope. Without it two tenants sharing a
-            // key ring collide the moment they use the same case or retention
-            // name — and the collision is invisible until one tenant's erasure
-            // destroys the other's key. `TenantId` refuses `/` for exactly this
-            // reason, so the prefix cannot be forged by naming a tenant
-            // `acme/prod`.
-            let unit = match scope {
-                Some(s) => s.to_owned(),
-                None => self
-                    .case
-                    .as_ref()
-                    .ok_or_else(|| {
-                        StepError::Store(crate::core::StoreError::Backend(
-                            "a key ring is configured but this run belongs to no case and no \
-                             other erasure unit was named, so there is nothing to scope its data \
-                             key to. Bind the run to a case, name an external retention policy, \
-                             or drop the key ring — storing these bytes in the clear would leave \
-                             an erasure that silently does not reach them"
-                                .to_owned(),
-                        ))
-                    })?
-                    .case_id
-                    .to_string(),
-            };
-            let scope = crate::keyring::scope(&self.tenant, &unit);
+            let unit = unit.ok_or_else(|| {
+                StepError::Store(crate::core::StoreError::Backend(
+                    "a key ring is configured but this run belongs to no case and no \
+                     other erasure unit was named, so there is nothing to scope its data \
+                     key to. Bind the run to a case, name an external retention policy, \
+                     or drop the key ring — storing these bytes in the clear would leave \
+                     an erasure that silently does not reach them"
+                        .to_owned(),
+                ))
+            })?;
+            let scope = crate::core::erasure_scope(&self.tenant, &unit);
             return Ok(Arc::new(crate::keyring::EncryptedBlobs::new(
-                blobs, keys, scope,
+                scoped(&unit),
+                keys,
+                scope,
             )));
         }
-        let _ = scope;
-        Ok(blobs)
+        // Unsealed: address by unit when the run has one. A caseless run with
+        // no named scope keeps the bare handle — it links no blobs through the
+        // case layer, so there is no erasure unit for an address to belong to.
+        Ok(match unit {
+            Some(u) => scoped(&u),
+            None => blobs,
+        })
     }
 
     /// Store bytes in the blob store and record that this case produced them.

@@ -232,6 +232,24 @@ pub enum Finding {
     )]
     SealClaim { run: RunId },
 
+    /// A sealed conclusion over an undecided transactional unit.
+    ///
+    /// `GroupOpened`/`GroupSettled` bracket several effects that take together
+    /// or not at all, and the settlement is the most consequential thing a
+    /// group does. A run still open with a group unsettled is the ordinary
+    /// crash shape — the resume re-walks the members and settles, and the run
+    /// itself sits in a findable backlog until it does. A **sealed** run is
+    /// the state no honest writer produces: nothing may resume it, so nothing
+    /// will ever settle the group, and whether its members were taken or taken
+    /// back is permanently unanswerable from a history that claims to be
+    /// complete.
+    #[error(
+        "run {run} is sealed but group '{group}' was opened and never settled — \
+         nothing may resume a sealed run, so whether the group's members were \
+         taken or taken back is permanently undecided"
+    )]
+    GroupUnsettled { run: RunId, group: String },
+
     /// The one that needs an outside artifact.
     #[error(
         "the log cannot prove it only grew since the checkpoint of size {old_size} — \
@@ -318,17 +336,8 @@ async fn placement(
         // the run's own records rather than assumed. An **open** run — failed,
         // exhausted, still executing — was never in the log; reporting it as a
         // defect would flag every healthy resumable run and teach the reader
-        // to skim past the flag that matters. The outcome list is the
-        // library's own, not a re-spelling of it.
-        let sealed_conclusion = records
-            .iter()
-            .rev()
-            .find_map(|r| match r.kind() {
-                crate::journal::RecordKind::RunSealed { outcome, .. } => Some(outcome.as_str()),
-                _ => None,
-            })
-            .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o));
-        return Ok(if sealed_conclusion {
+        // to skim past the flag that matters.
+        return Ok(if has_sealing_conclusion(records) {
             Placement::NotInLog
         } else {
             Placement::Open
@@ -365,6 +374,65 @@ async fn placement(
     } else {
         Placement::BadInclusion
     })
+}
+
+/// Whether the run's last conclusion is one nothing may resume.
+///
+/// The outcome list is the library's own ([`crate::runtime::SEALED_OUTCOMES`]),
+/// not a re-spelling of it: two copies of *which conclusions close* is the
+/// duplicate-rule shape, and the copy in an offline checker is the one that
+/// drifts.
+fn has_sealing_conclusion(records: &[Record]) -> bool {
+    records
+        .iter()
+        .rev()
+        .find_map(|r| match r.kind() {
+            crate::journal::RecordKind::RunSealed { outcome, .. } => Some(outcome.as_str()),
+            _ => None,
+        })
+        .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o))
+}
+
+/// Groups opened and never settled, in the order opened.
+///
+/// Counted per writing step, phase and name — two *distinct* groups may
+/// legitimately share a name within one step (opened, settled, opened again),
+/// so each settlement excuses exactly one opening, which is the same
+/// arithmetic the executor's own resume bookkeeping uses.
+fn unsettled_groups(records: &[Record]) -> Vec<String> {
+    use std::collections::BTreeMap;
+    type Key<'a> = (Option<crate::core::StepId>, crate::core::Phase, &'a str);
+    let mut open: BTreeMap<Key<'_>, u64> = BTreeMap::new();
+    let mut order: Vec<Key<'_>> = Vec::new();
+    for r in records {
+        match r.kind() {
+            crate::journal::RecordKind::GroupOpened { group, .. } => {
+                let key = (r.body.step, r.body.phase, group.as_str());
+                *open.entry(key).or_insert(0) += 1;
+                order.push(key);
+            }
+            crate::journal::RecordKind::GroupSettled { group, .. } => {
+                if let Some(n) = open.get_mut(&(r.body.step, r.body.phase, group.as_str())) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Whatever count a settlement did not excuse is unsettled. Leftovers are
+    // attributed newest-first, because a settlement pairs with the most recent
+    // opening of its name still standing.
+    let mut out = Vec::new();
+    for key in order.into_iter().rev() {
+        if let Some(n) = open.get_mut(&key)
+            && *n > 0
+        {
+            *n -= 1;
+            out.push(key.2.to_owned());
+        }
+    }
+    out.reverse();
+    out
 }
 
 /// Every label-raising decision in one run's history.
@@ -594,6 +662,21 @@ pub async fn audit(
         if !seal_claim_holds(&records) {
             findings.push(Finding::SealClaim { run });
             continue;
+        }
+
+        // Only under a sealing conclusion — an open run's unsettled group
+        // is the crash shape a resume repairs, and flagging it would teach
+        // the reader this finding is weather. `Finding::GroupUnsettled`
+        // carries the argument.
+        if has_sealing_conclusion(&records) {
+            let mut undecided = false;
+            for group in unsettled_groups(&records) {
+                undecided = true;
+                findings.push(Finding::GroupUnsettled { run, group });
+            }
+            if undecided {
+                continue;
+            }
         }
 
         // Collected after the chain verified, so a reader is never shown a

@@ -88,8 +88,21 @@ struct Fallback {
     calls: Arc<AtomicUsize>,
     /// Return a successor that forgets to name its predecessor.
     forget_lineage: bool,
+    /// Return a successor that carries no reason.
+    forget_reason: bool,
     /// Decline instead of producing one.
     decline: bool,
+}
+
+impl Fallback {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            forget_lineage: false,
+            forget_reason: false,
+            decline: false,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -113,6 +126,11 @@ impl Replanner for Fallback {
         ];
         if self.forget_lineage {
             return Ok(PlanIR::new(nodes));
+        }
+        if self.forget_reason {
+            let mut next = current.succeed_with(nodes, reason);
+            next.reason = None;
+            return Ok(next);
         }
         Ok(current.succeed_with(nodes, reason))
     }
@@ -149,11 +167,7 @@ fn plan() -> PlanIR {
 }
 
 fn planner() -> Fallback {
-    Fallback {
-        calls: Arc::new(AtomicUsize::new(0)),
-        forget_lineage: false,
-        decline: false,
-    }
+    Fallback::new()
 }
 
 // ── The happy path ──────────────────────────────────────────────────────────
@@ -231,8 +245,7 @@ async fn replanning_is_refused_once_untrusted_data_is_in_working_memory() {
         .budget(Budget::default().replans(5))
         .replanner(Arc::new(Fallback {
             calls: Arc::clone(&calls),
-            forget_lineage: false,
-            decline: false,
+            ..Fallback::new()
         }))
         .skill(AsksToReplan {
             name: "fetch",
@@ -360,9 +373,8 @@ async fn asking_to_replan_without_a_planner_names_the_missing_piece() {
 async fn a_planner_that_declines_stops_the_run_with_its_reason() {
     let f = fixture(
         Fallback {
-            calls: Arc::new(AtomicUsize::new(0)),
-            forget_lineage: false,
             decline: true,
+            ..Fallback::new()
         },
         false,
         Budget::default().replans(2),
@@ -384,9 +396,8 @@ async fn a_planner_that_declines_stops_the_run_with_its_reason() {
 async fn a_successor_without_lineage_is_rejected() {
     let f = fixture(
         Fallback {
-            calls: Arc::new(AtomicUsize::new(0)),
             forget_lineage: true,
-            decline: false,
+            ..Fallback::new()
         },
         false,
         Budget::default().replans(2),
@@ -398,6 +409,33 @@ async fn a_successor_without_lineage_is_rejected() {
             .unwrap();
     match &out.status {
         RunStatus::Failed(m) => assert!(m.contains("predecessor"), "got: {m}"),
+        other => panic!("expected rejection, got {other:?}"),
+    }
+}
+
+/// A successor that carries no reason is rejected — the third leg of the
+/// lineage `succeed_with` sets.
+///
+/// Version, parent and reason travel together: a plan frozen into the journal
+/// as having replaced another with nothing on the record saying *why* loses
+/// the half of an incident that versioned replanning exists to keep.
+#[tokio::test]
+async fn a_successor_without_a_reason_is_rejected() {
+    let f = fixture(
+        Fallback {
+            forget_reason: true,
+            ..Fallback::new()
+        },
+        false,
+        Budget::default().replans(2),
+    );
+
+    let out =
+        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    match &out.status {
+        RunStatus::Failed(m) => assert!(m.contains("no reason"), "got: {m}"),
         other => panic!("expected rejection, got {other:?}"),
     }
 }

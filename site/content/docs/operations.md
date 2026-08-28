@@ -360,6 +360,11 @@ Three details are worth knowing at 3 a.m.:
 Each takeover is written into the sweep's own sealed run as `run_recovered`,
 because a takeover fences the previous owner and *who fenced whom, and why*
 must be answerable from the journal rather than inferred from an epoch gap.
+The note lands **before** the resume: a concluded resume releases the lease
+and leaves the recovery queue, so an account written afterwards would be the
+one write a crash could lose with no retry ever selecting the run again. A
+note that cannot be written skips the takeover for a tick that can write it,
+and the outcome stays out of the note — the run's own journal answers it.
 
 One state recovers to nothing, deliberately: a lease over an **empty** journal
 means admission acquired and died before its first append landed. No run
@@ -482,9 +487,13 @@ blob bytes behind the exported digests are present, and whether sealed state's
 keys still unwrap.
 
 Those two are `Runtime::drill`'s job, run with the stores the plane actually
-runs with: every case's blob digests read and re-hashed (`get`, never `has` —
-presence without integrity passes over altered bytes), and sealed state proven
-to open with the plaintext dropped on the spot. The report's verdict is
+runs with: every case's blob digests read **through that case's own handle** —
+the unit-scoped address the plane wrote to, opened through the sealing
+envelope when a ring is wired — then re-hashed (`get`, never `has` — presence
+without integrity passes over altered bytes), and sealed state proven to open
+with the plaintext dropped on the spot. Reading any other way would hold the
+references against a store the deployment does not use: on a sealed plane,
+every intact envelope would report as corrupt, the one verdict that pages. The report's verdict is
 three-way, and the middle answer is the one worth trusting the tooling for:
 **intact**, **erased by design** — a tombstone or a destroyed key is retention
 reporting itself, counted and never a finding — and **lost**, which is the only
@@ -528,6 +537,12 @@ no Merkle leaf, so it is checked on chain and signatures and the report says in
 `not_checked` that nothing pins its tail until it seals. The finding is the
 opposite case — a run whose own records carry a *sealing* conclusion, in a log
 that holds no leaf for it. That is history the log no longer commits to.
+
+A sealed run is also held to its own transactional brackets: a `GroupOpened`
+with no `GroupSettled` under a sealing conclusion is a finding. In an open run
+that shape is the ordinary crash the resume repairs; under a seal nothing may
+resume, so whether the group's members were taken or taken back is permanently
+undecided — a state no honest writer produces.
 
 For a sealed run, the log's leaf is held to the **verified chain's own head**,
 before the tree math and independent of any checkpoint race. A truncated but

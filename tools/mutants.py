@@ -776,6 +776,55 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         .await?;""",
         "",
     ),
+    "AnEffectRefusalReplaysVerbatimOnResume": (
+        "src/runtime/ctx.rs",
+        "an_effect_limited_run_resumes_under_a_raised_ceiling_and_not_under_the_same_one",
+        "a recorded effect-level budget refusal is re-raised verbatim on resume "
+        "instead of being re-asked against the ledger now in force, so a run "
+        "exhausted by max_effects stays exhausted under a ceiling that now "
+        "admits it — the step-level twin resumes, this tier never does",
+        """        if !self.writes_enabled() {
+            return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
+        }""",
+        """        if true {
+            return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
+        }""",
+    ),
+    "AMidPrefixRefusalIsReadmitted": (
+        "src/runtime/ctx.rs",
+        "a_refusal_a_group_abort_already_answered_is_not_readmitted",
+        "a budget refusal inside the replayed prefix — one a group abort "
+        "already answered, with the reversals and settlement recorded after "
+        "it — is re-admitted under a raised ceiling, dispatching the member "
+        "where history holds the abort: divergence and a quarantine "
+        "manufactured out of an operator's raise",
+        """        if !self.writes_enabled() {
+            return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
+        }
+        // Scoped so the guard is gone before the await below.""",
+        """        if self.mode == Mode::Strict {
+            return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
+        }
+        // Scoped so the guard is gone before the await below.""",
+    ),
+    "AReadmittedRefusalStillStopsAStrictReplay": (
+        "src/journal/replay.rs",
+        "an_effect_limited_run_resumes_under_a_raised_ceiling_and_not_under_the_same_one",
+        "a recorded re-admission no longer supersedes the refusal beside it, so "
+        "a strict replay of the resumed history stops at the stale refusal and "
+        "reports Exhausted about a run whose own later records show it "
+        "finishing — refusal-then-continuation read as divergence",
+        """            RecordKind::BudgetReadmitted { .. } => {
+                if let Some(pos) = self
+                    .effects
+                    .iter()
+                    .rposition(|(k, _, r)| *k == key && matches!(r, EffectReplay::Refused { .. }))
+                {
+                    self.effects.remove(pos);
+                }
+            }""",
+        """            RecordKind::BudgetReadmitted { .. } => {}""",
+    ),
     # ── Replanning ──────────────────────────────────────────────────────────
     "ReplanOnUntrusted": (
         "src/runtime/executor.rs",
@@ -790,6 +839,55 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a successor plan reuses a completed step's id for different work",
         "                    \"the successor plan reuses step {step} — which already ran \\",
         "                    \"UNREACHABLE {step} \\",
+    ),
+    "ASuccessorWithoutAReasonIsFrozen": (
+        "src/runtime/executor.rs",
+        "a_successor_without_a_reason_is_rejected",
+        "a successor carrying no reason is frozen into the journal — a plan "
+        "that replaced another with nothing on the record saying why, losing "
+        "the half of an incident versioned replanning exists to keep",
+        "        if next.reason.as_deref().is_none_or(str::is_empty) {",
+        "        if next.reason.as_deref().is_none_or(str::is_empty) && false {",
+    ),
+    # ── Blob erasure units ──────────────────────────────────────────────────
+    "AnErasureUnitDoesNotLeadTheAddress": (
+        "src/blob/scoped.rs",
+        "erasing_a_case_leaves_other_cases_alone",
+        "the storage address drops the erasure unit, so two cases of one "
+        "tenant holding identical bytes hold one object — and one case's "
+        "erasure tombstones the other's data while the drill reads the loss "
+        "as erased by design, the verdict that pages nobody",
+        """    bytes.extend_from_slice(&(scope.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(scope.as_bytes());""",
+        """    let _ = scope;""",
+    ),
+    "AnErasureExpiresTheBareDigest": (
+        "src/blob/mod.rs",
+        "erasing_a_case_leaves_other_cases_alone",
+        "case erasure tombstones the bare content digest instead of the "
+        "case's own unit address, so the tombstones land where nothing was "
+        "written — the erasure reports success and this case's copies stay "
+        "readable",
+        """        blobs
+            .expire(unit_address(&scope, digest), at, reason)
+            .await?;""",
+        """        blobs.expire(digest, at, reason).await?;""",
+    ),
+    "TheDrillReadsBesideTheDeployment": (
+        "src/drill.rs",
+        "the_drill_tells_erasure_from_loss",
+        "the drill reads the bare store at bare content digests instead of "
+        "the per-case handle the plane wrote through, so on a sealed "
+        "deployment every intact artifact reports as missing or corrupt — "
+        "false alarms that teach operators the real one is noise",
+        """                let scope = crate::core::erasure_scope(stores.tenant, &case.id.to_string());
+                let scoped: Arc<dyn BlobStore> = Arc::new(crate::blob::ScopedBlobs::new(
+                    Arc::clone(blobs),
+                    scope.clone(),
+                ));""",
+        """                let scope = crate::core::erasure_scope(stores.tenant, &case.id.to_string());
+                let _ = &scope;
+                let scoped: Arc<dyn BlobStore> = Arc::clone(blobs);""",
     ),
     # ── HTTP surface ────────────────────────────────────────────────────────
     #
@@ -944,8 +1042,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "treated as sealed, so every healthy resumable run audits as an "
         "integrity finding: a false alarm on every pass, which is how the true "
         "alarm stops being believed",
-        """            .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o));""",
-        """            .is_some();""",
+        """        .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o))""",
+        """        .is_some()""",
     ),
     "AMissingLeafAuditsAsSound": (
         "src/audit.rs",
@@ -953,8 +1051,32 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a run whose own records carry a sealing conclusion but which the log "
         "holds no leaf for is reported sound — history the log no longer "
         "commits to, waved through by the audit that exists to name it",
-        """            .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o));""",
-        """            .is_some_and(|_| false);""",
+        """        .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o))""",
+        """        .is_some_and(|_| false)""",
+    ),
+    "AGroupUnsettledUnderASealIsNotAFinding": (
+        "src/audit.rs",
+        "a_sealed_run_with_an_unsettled_group_is_a_finding",
+        "a sealed run holding an opened, never-settled group audits as sound — "
+        "nothing may resume it, so whether the members were taken or taken "
+        "back is permanently undecided, under a conclusion that claims the "
+        "history is complete",
+        """        if has_sealing_conclusion(&records) {
+            let mut undecided = false;""",
+        """        if has_sealing_conclusion(&records) && records.is_empty() {
+            let mut undecided = false;""",
+    ),
+    "AnOpenRunsCrashShapeFlagsAsAFinding": (
+        "src/audit.rs",
+        "a_sealed_run_with_an_unsettled_group_is_a_finding",
+        "an open run's unsettled group — the ordinary crash shape a resume "
+        "repairs — is flagged beside the sealed one, a false alarm on every "
+        "healthy resumable run, which is how the true alarm stops being "
+        "believed",
+        """        if has_sealing_conclusion(&records) {
+            let mut undecided = false;""",
+        """        if !records.is_empty() {
+            let mut undecided = false;""",
     ),
     "TheAuditIgnoresThePriorCheckpoint": (
         "src/audit.rs",
@@ -1652,12 +1774,12 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the live run stops after one attempt while a strict replay — which "
         "recomputes the retry decision from history — expects the retry the "
         "live run never made and reports divergence over a faithful history",
-        """                        // An answer, not a fault — recorded so the replayed
-                        // retry decision stops where the live one did.
-                        permanent: matches!(e, crate::core::EffectError::Refused(_)),""",
-        """                        // An answer, not a fault — recorded so the replayed
-                        // retry decision stops where the live one did.
-                        permanent: false,""",
+        """                            // An answer, not a fault — recorded so the replayed
+                            // retry decision stops where the live one did.
+                            permanent: matches!(e, crate::core::EffectError::Refused(_)),""",
+        """                            // An answer, not a fault — recorded so the replayed
+                            // retry decision stops where the live one did.
+                            permanent: false,""",
     ),
     "ATransientTimeoutIsAJudgement": (
         "src/model/wire.rs",
@@ -2599,10 +2721,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     # ── Tenant isolation ────────────────────────────────────────────────────
     "TenantsShareAKeyScope": (
-        "src/keyring/mod.rs",
+        "src/core/tenant.rs",
         "erasing_one_tenants_key_leaves_another_tenant_readable",
-        "the key scope drops the tenant, so two tenants using one case name "
-        "share a key and either can erase the other's data",
+        "the erasure scope drops the tenant, so two tenants using one case "
+        "name share a key scope and a blob address, and either can erase the "
+        "other's data",
         "    format!(\"{tenant}/{unit}\")",
         "    let _ = tenant;\n    unit.to_owned()",
     ),
@@ -2894,6 +3017,18 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                }",
         "",
     ),
+    "ANoteFailureDoesNotStopTheTakeover": (
+        "src/runtime/sweeper.rs",
+        "a_takeover_whose_note_cannot_be_written_is_not_taken",
+        "a takeover note that cannot be written no longer stops the takeover, "
+        "so the sweep fences and resumes a run whose account no journal "
+        "carries — and the resume releases the lease, so no later tick can "
+        "re-select the run and write it",
+        """                .await?;
+            match self.replay(run, Mode::Resume).await {""",
+        """                .await.ok();
+            match self.replay(run, Mode::Resume).await {""",
+    ),
     # ── Transactional effect groups ─────────────────────────────────────────
     "AGroupCommitsByBeingForgotten": (
         "src/runtime/executor.rs",
@@ -2954,6 +3089,56 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "from declaring a reversal while leaving something standing",
         "        if effect.mutates() {",
         "        if false {",
+    ),
+    "AnUnrecordedOutcomeTakesTheCheapAbort": (
+        "src/runtime/group.rs",
+        "a_send_whose_outcome_could_not_be_recorded_is_not_reported_taken_back",
+        "a member that landed but whose terminal record was refused reads as "
+        "never dispatched, so the group settles Aborted — the journal claiming "
+        "taken back whole over a send already delivered, whose orphaned "
+        "announcement the next resume re-performs",
+        """        StepError::Unrecorded { disposition, .. } => {
+            *disposition != crate::core::Disposition::DidNotHappen
+        }""",
+        """        StepError::Unrecorded { .. } => false,""",
+    ),
+    "ALandedCallIsRecordedAsNotHappened": (
+        "src/runtime/ctx.rs",
+        "a_send_whose_outcome_could_not_be_recorded_is_not_reported_taken_back",
+        "a call that returned successfully before its record was refused is "
+        "classified as never having happened, so everything that branches on "
+        "whether it reached the world — the group's cheap abort first — acts "
+        "on a fabrication",
+        """                let unrecorded = |key, detail: String| StepError::Unrecorded {
+                    key,
+                    disposition: crate::core::Disposition::Landed,
+                    detail,
+                };""",
+        """                let unrecorded = |key, detail: String| StepError::Unrecorded {
+                    key,
+                    disposition: crate::core::Disposition::DidNotHappen,
+                    detail,
+                };""",
+    ),
+    "ARecordedDenialIsReDecidedOnResume": (
+        "src/runtime/group.rs",
+        "a_resumed_atomic_member_consumes_its_recorded_denial",
+        "the atomic-member path consumes a recorded gate refusal and then runs "
+        "the gate fresh, so a resume under a gate that has since relented "
+        "dispatches — and commits — a member the recorded run was refused, "
+        "appending a second history under the same key",
+        """                    Some(
+                        refusal @ (crate::journal::EffectReplay::Refused { .. }
+                        | crate::journal::EffectReplay::Denied { .. }),
+                    ) => {
+                        self.replayed_refusal(key, refusal).await?;
+                    }""",
+        """                    Some(
+                        refusal @ (crate::journal::EffectReplay::Refused { .. }
+                        | crate::journal::EffectReplay::Denied { .. }),
+                    ) => {
+                        let _ = refusal;
+                    }""",
     ),
     "AGuardrailIsNotEffectIdentity": (
         "src/model/bedrock.rs",

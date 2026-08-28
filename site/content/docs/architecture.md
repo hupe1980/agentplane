@@ -515,9 +515,14 @@ it — so a group in doubt is reported unsettled and the run is quarantined. A
 reversal that fails stops the unwind for the same reason a failed compensation
 does: continuing would undo members *around* one now in an unknown state.
 
-A group is bracketed in the journal by `GroupOpened` and `GroupSettled`, so an
-opened group with no settlement beside it is a query rather than a grep — the
-work that was neither taken nor taken back.
+A group is bracketed in the journal by `GroupOpened` and `GroupSettled`, and an
+opened group with no settlement beside it is delivered through the run that
+owns it: only a crash or a store failure can leave one, both of which put the
+run in a backlog somebody already drains (failed, abandoned, quarantined), and
+the resume that clears the backlog re-walks the members and settles. The state
+no resume can repair — a **sealed** conclusion over an unsettled group — is an
+`agentplane audit` finding, because nothing may resume a sealed run and
+whether its members were taken or taken back is then permanently undecided.
 
 ### The model, and what it proves
 
@@ -972,8 +977,11 @@ from — a router, a rules table, a model call — is a deployment decision.
 `derived_from: v1`, and both stay in the journal. What the run *intended* before
 it changed its mind is usually the interesting part of an incident, and it is
 structurally absent from any system that edits a plan in place. A successor that
-does not name its predecessor is rejected: an audit trail with a hole where the
-lineage should be is not an audit trail.
+does not name its predecessor is rejected, and so is one that carries no
+`reason`: a plan frozen as having replaced another with nothing on the record
+saying why is an audit trail with a hole where the lineage should be.
+`PlanIR::succeed_with` sets all three legs — version, parent, reason —
+together.
 
 **Refused once untrusted data is in working memory.** This is the sharp one. The
 frozen plan is an authorization graph compiled from trusted input only. A replan
@@ -1281,8 +1289,16 @@ effect completes → Effect::spend(&output) → journaled in EffectDone
 replay reads the recorded figure ────────────→ same verdict, same point
 ```
 
-A run that exhausted its budget replays as exhausted **even under a larger
-limit**, because the stopping point is recorded rather than recomputed.
+A run that exhausted its budget **verifies** as exhausted even under a larger
+limit — a strict replay's stopping point is recorded, not recomputed. A
+**resume** is the path a raised ceiling changes, and it changes it at both
+tiers: a run refused at the step ceiling and one refused at an effect ceiling
+are each re-asked against the ledger now in force, journaled as
+`BudgetReadmitted` beside the refusal it supersedes (see
+[Exhaustion is not failure](#exhaustion-is-not-failure)). Only a refusal at
+the **history frontier** is re-asked — one the run itself already answered,
+such as a group member's refusal followed by the abort's reversals, replays
+verbatim, because re-admitting it would dispatch into recorded history.
 
 ### What can be limited
 
