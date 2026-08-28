@@ -1,7 +1,7 @@
 +++
 title = "Upgrading"
 description = "What breaks between pre-alpha releases, why, and the shortest correct fix for each."
-weight = 11
+weight = 13
 +++
 
 Pre-alpha means hard cuts rather than deprecation cycles, and a manifest or a
@@ -14,6 +14,85 @@ refusal. None of them changes what a running agent does silently, which is the
 property that makes a hard cut acceptable at this stage.
 
 ---
+
+## An approval's amendment now dispatches
+
+**Affected:** integrators whose reviewers attach an `amendment` to an
+approving `Decision` on a call-approval task.
+
+The field was recorded and silently ignored: the reviewer answered "approved,
+with these arguments" and the model's original arguments ran anyway — a
+declared answer the runtime did not apply, on the one surface whose point is
+that a person's answer governs. On an approved call task the amendment now
+**is** the call: it must fit the tool's declared argument schema, it
+dispatches in the model's place, and it carries the reviewer's own label —
+trusted, provenance `task:agent.approve_call`, the original arguments'
+sensitivity. Every sink gate judges it like any other value, so a
+source-constrained field admits it only where `allowed_sources` lists that
+channel. Reviewers who attached amendments as commentary should move the
+commentary to `reason`; an amendment on a *rejection* remains recorded
+advice and dispatches nothing.
+
+## Release marks moved off `Label` onto the tainted value
+
+**Affected:** code reading `label().releases`; anything deserializing stored
+`Tainted` values or `Released` journal records written by earlier builds.
+
+A destination-scoped release mark covers exactly the value a release was
+granted over, while a label joins into every value derived from it — keeping
+marks inside `Label` made "a join must drop or rebase marks" a rule every
+call site had to remember, and one forgotten union would extend a grant to
+data nobody priced. Marks now live on `Tainted` itself and move only through
+the operations that can prove value lineage (projection, assembly,
+transform). Read them with `Tainted::release_marks()`; `Label` is now a pure
+provenance/trust/sensitivity lattice, and a label joined anywhere carries no
+release. The `Released` journal record consequently records the decision and
+the *prior* labels only — the resulting marks are determined by the
+recorded `release`, and a second spelling of that fact could drift from the
+rule that derives it.
+
+## An instruction role inside a prompt's turn list is refused
+
+**Affected:** prompts that place `{"role": "system", ...}` (or `"developer"`)
+elements inside a `messages`/`input` array or a top-level array prompt.
+
+This seam has one instruction slot — the top-level `system` key, which is a
+protected field an untrusted value cannot fill. Providers now also accept
+instruction roles inside the turn list, which would make every turn a second
+slot no protected field covers: an untrusted value shaped as a system-role
+turn would be obeyed as a directive while the gate saw ordinary content. Any
+model call whose turn list carries a `system`- or `developer`-role element is
+now refused before dispatch, in every driver and at the effect boundary. The
+fix is to move the instruction into the top-level `system` key; the drivers
+render it into each wire's own spelling. Content that merely *contains* a
+`role` field — an object the model is asked to reason about — is untouched,
+because the scan covers only the direct elements of the turn positions.
+
+## Outbound A2A refuses plaintext, and back-pressure needs its marker
+
+**Affected:** `A2aClient` endpoints and `CardClient` URLs using `http://`;
+anything relying on a bare `-32029` being classified as a refusal; peers
+served by a multi-skill agentplane plane.
+
+Three behaviour cuts on the A2A surface, each a refusal at the seam it
+guards:
+
+- **`http://` endpoints and card URLs are refused.** The peer call carries
+  the run's payload and a bearer credential, and the card fetch decides where
+  that call goes; both are now HTTPS-only, exactly as push webhooks always
+  were. Loopback *names* in a `testkit` build stay usable for tests. The fix
+  is TLS on the receiving side; there is no production opt-out.
+- **The client names its capability in `message.metadata.skill`.** A
+  multi-skill plane dispatches on that field, so a peer built on an earlier
+  client could reach only single-skill planes. Nothing to change on your
+  side — but a foreign server that treated unknown metadata keys as an error
+  (the spec says they are opaque) would now see one more.
+- **A bare `-32029` no longer classifies as back-pressure.** The refusal is
+  identified by the `google.rpc.ErrorInfo` pair
+  (`agentplane.hupe1980.github.io` / `QUOTA_EXHAUSTED`) the server now sends
+  beside the code; an unmarked `-32029` from a foreign server is an unknown
+  fault and lands in doubt. If you wrote a receiver that emits `-32029` to
+  ask agentplane callers to back off, attach the same `ErrorInfo` pair.
 
 ## Blob storage addresses are scoped by the erasure unit
 

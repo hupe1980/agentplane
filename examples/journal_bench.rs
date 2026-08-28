@@ -35,8 +35,8 @@
 // part of any run's determinism — nothing here is replayed, and the numbers are
 // the point. That is a different exception from the runtime's own driver layer,
 // which reads a clock and journals what it read; here there is no journal record
-// to name, because the reading is the output. The gate firing on this file the
-// moment it was added is the gate working.
+// to name, because the reading is the output. That the gate fires on this file
+// at all is the gate working.
 #![allow(clippy::disallowed_methods)]
 // Effect counts are small and exact; the division is for a human-readable rate.
 #![allow(clippy::cast_precision_loss)]

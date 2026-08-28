@@ -372,6 +372,9 @@ pub struct BedrockEmbedder {
 impl BedrockEmbedder {
     /// Load the standard AWS credential chain for this region.
     ///
+    /// The same chain [`Bedrock::from_env`](super::bedrock::Bedrock::from_env)
+    /// documents, Bedrock API keys included — they cover `InvokeModel`.
+    ///
     /// # Errors
     ///
     /// If the region is blank.
@@ -698,8 +701,8 @@ impl Embedder for GeminiEmbedder {
         if self.dimensions.is_some() {
             let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
             // Refused rather than skipped. A zero-magnitude vector has no
-            // direction, so cosine against it is `0/0` — and the guard that
-            // used to *skip* normalisation here handed one straight back, to
+            // direction, so cosine against it is `0/0` — and a guard that
+            // merely skipped normalisation would hand one straight back, to
             // fail several layers away as "the retriever returned a non-finite
             // score", naming the retriever for the driver's answer. Refusing
             // also makes the guard falsifiable: skipping is indistinguishable

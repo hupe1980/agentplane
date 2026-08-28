@@ -47,6 +47,22 @@ use serde_json::Value;
 /// before we do.
 pub const PROTOCOL_VERSION: &str = "1.0";
 
+/// The `google.rpc.ErrorInfo` domain under which this plane defines its own
+/// error reasons on the A2A surface.
+///
+/// One definition read by both halves, because the pair `(domain, reason)` is
+/// what makes a server-defined error *identifiable*: the numeric code alone
+/// sits in the range JSON-RPC gives implementations and A2A 1.0 reserves for
+/// its own table, so two parties can hold the same number for different
+/// facts. A domain this project controls cannot collide with either.
+pub const ERROR_DOMAIN: &str = "agentplane.hupe1980.github.io";
+
+/// The reason token a full quota answers with, inside [`ERROR_DOMAIN`].
+///
+/// The A2A client refuses-and-backs-off only on this exact pair, so the token
+/// is protocol surface, not a message string.
+pub const QUOTA_EXHAUSTED_REASON: &str = "QUOTA_EXHAUSTED";
+
 /// Parse an A2A protocol version into the `Major.Minor` pair used for
 /// negotiation.
 ///
@@ -403,6 +419,26 @@ pub trait PeerClient: Send + Sync + Debug {
             detail: "this peer transport does not support task lookup".to_owned(),
         })
     }
+
+    /// Ask the peer to stop one previously accepted remote task.
+    ///
+    /// Cooperative, exactly as this plane's own server implements it: the
+    /// answer means the request was durably recorded, and the task stops at
+    /// its next step boundary — polling is how the eventual state is
+    /// observed. The same default refusal as [`get_task`](Self::get_task),
+    /// for the same reason.
+    async fn cancel_task(
+        &self,
+        peer: &PeerId,
+        task_id: &str,
+        credential: Option<&PeerCredential>,
+    ) -> Result<Value, PeerError> {
+        let _ = (task_id, credential);
+        Err(PeerError::Refused {
+            peer: peer.clone(),
+            detail: "this peer transport does not support task cancellation".to_owned(),
+        })
+    }
 }
 
 /// A stable handle returned by a remote peer.
@@ -579,6 +615,128 @@ impl Effect for PeerTaskCall {
         let value = self
             .client
             .get_task(&self.task.peer, &self.task.id, self.credential.as_ref())
+            .await
+            .map_err(|error| {
+                let detail = error.to_string();
+                match error.disposition() {
+                    Disposition::DidNotHappen => EffectError::Rejected(detail),
+                    Disposition::InDoubt => EffectError::Interrupted {
+                        driver: self.task.peer.to_string(),
+                        detail,
+                    },
+                    Disposition::Landed => EffectError::Performed(detail),
+                }
+            })?;
+        let state = PeerTaskState::parse(&self.task.peer, &value).map_err(|error| {
+            EffectError::Interrupted {
+                driver: self.task.peer.to_string(),
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(PeerTaskSnapshot {
+            task: self.task.clone(),
+            state,
+            value,
+        })
+    }
+}
+
+/// A journaled, cooperative cancellation of a remote task.
+///
+/// The A2A twin of [`McpTaskCancel`](crate::tools::McpTaskCancel), and it
+/// exists for the same lifecycle reason: a run that commissioned work at a
+/// peer and is itself cancelled or unwound must be able to tell the peer to
+/// stop, or the cancellation ends at this plane's edge while the peer keeps
+/// spending on an answer nobody will read.
+///
+/// # What the answer means
+///
+/// Acceptance of intent, never completion: this plane's own server records
+/// the request durably and the run stops at its next step boundary, so the
+/// snapshot that comes back is typically still `Working`. Polling through
+/// [`PeerTaskCall`] is how the eventual `Canceled` is observed. A task that
+/// already finished is *refused* by the far side (A2A's `TaskNotCancelable`,
+/// `-32002`) — a clean, pre-action decline, which is why retrying this
+/// effect is safe: a repeat of a cancel that landed meets that refusal
+/// rather than a second effect.
+#[derive(Debug)]
+pub struct PeerTaskCancel {
+    task: PeerTask,
+    grant: PeerGrant,
+    credential: Option<PeerCredential>,
+    client: Arc<dyn PeerClient>,
+}
+
+impl PeerTaskCancel {
+    /// Prepare a cancellation under the same peer grant and audience-bound
+    /// credential as the call that created the task.
+    ///
+    /// # Errors
+    ///
+    /// As [`PeerTaskCall::prepare`].
+    pub fn prepare(
+        registry: &PeerRegistry,
+        client: Arc<dyn PeerClient>,
+        task: PeerTask,
+    ) -> Result<Self, PeerError> {
+        let Some(grant) = registry.grant(&task.peer).cloned() else {
+            return Err(PeerError::Unknown {
+                peer: task.peer.clone(),
+            });
+        };
+        let credential = registry.credential_for(&task.peer)?.cloned();
+        Ok(Self {
+            task,
+            grant,
+            credential,
+            client,
+        })
+    }
+}
+
+#[async_trait]
+impl Effect for PeerTaskCancel {
+    type Output = PeerTaskSnapshot;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "a2a.task/cancel",
+            serde_json::json!({
+                "peer": self.task.peer.0,
+                "task_id": self.task.id,
+                "context_id": self.task.context_id,
+            }),
+        )
+    }
+
+    /// Asking a peer to stop is asking it to change what happens.
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    /// Retry is safe despite mutating: the far side answers a repeat of a
+    /// cancel that landed with a clean refusal (`TaskNotCancelable`), never
+    /// with a second act — the type-level statement of the module docs.
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    fn retry(&self) -> RetryPolicy {
+        self.grant.retry
+    }
+
+    fn output_sensitivity(&self) -> Sensitivity {
+        self.grant.output_sensitivity
+    }
+
+    fn trust(&self) -> Trust {
+        Trust::Untrusted
+    }
+
+    async fn perform(&self) -> Result<Self::Output, EffectError> {
+        let value = self
+            .client
+            .cancel_task(&self.task.peer, &self.task.id, self.credential.as_ref())
             .await
             .map_err(|error| {
                 let detail = error.to_string();

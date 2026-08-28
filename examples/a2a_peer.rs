@@ -81,7 +81,8 @@ struct Checks(Arc<Mutex<Vec<Seen>>>);
 #[async_trait::async_trait]
 impl Skill for Checks {
     fn descriptor(&self) -> SkillDescriptor {
-        SkillDescriptor::new("settlement.check").provides("settlement.check")
+        // A skill that declares nothing answers its own name.
+        SkillDescriptor::new("settlement.check")
     }
 
     async fn invoke(

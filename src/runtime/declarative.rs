@@ -297,7 +297,7 @@ impl Declarative {
                 // Untrusted either way, so the grant's protected fields
                 // and the sink's ceiling decide, exactly as they would
                 // for a skill that called the tool itself.
-                let args = crate::core::Tainted::with_label(
+                let mut args = crate::core::Tainted::with_label(
                     asked.arguments.clone(),
                     completion.label().clone(),
                 );
@@ -338,6 +338,19 @@ impl Declarative {
                         ));
                         continue;
                     }
+                    // What dispatches is what the approval authorized — the
+                    // reviewer's amendment when there is one. The exchange the
+                    // model reads back keeps its own request verbatim (some
+                    // wire continuations bind the original call), so the tool's
+                    // result is where a substitution becomes visible to it;
+                    // the journal carries both sides either way.
+                    args = match approved_arguments(&decision, &declaration.parameters, args) {
+                        Ok(args) => args,
+                        Err(detail) => {
+                            exchanges.push(crate::model::ToolExchange::failed(asked, detail));
+                            continue;
+                        }
+                    };
                 }
 
                 // An agent consulted as a tool dispatches through `commission`,
@@ -798,7 +811,7 @@ impl Declarative {
                         )));
                     };
                     let args = step.args.clone().unwrap_or_default();
-                    let assembled = match assemble_arguments(
+                    let mut assembled = match assemble_arguments(
                         &Value::Object(args),
                         &plan_label,
                         &input,
@@ -839,6 +852,19 @@ impl Declarative {
                                 decision.actor, decision.reason
                             )));
                         }
+                        // As in the loop: the approval's amendment is the
+                        // call. Here there is no next turn to report a
+                        // malformed one to, so it fails the step.
+                        assembled =
+                            match approved_arguments(&decision, &declaration.parameters, assembled)
+                            {
+                                Ok(assembled) => assembled,
+                                Err(detail) => {
+                                    return Ok(Outcome::fail(format!(
+                                        "plan step {index}: {detail}"
+                                    )));
+                                }
+                            };
                     }
 
                     // Dispatch takes the same two paths the loop takes, and
@@ -1192,7 +1218,7 @@ impl Proposal {
     /// prevent, reintroduced in the sentence the reviewer actually reads.
     fn approve_call(&self, reference: &str, arguments: &Value) -> crate::core::TaskSpec {
         self.task(
-            "agent.approve_call",
+            APPROVE_CALL_KIND,
             format!("approve this agent's call to {reference}"),
             json!({ "tool": reference, "arguments": arguments }),
         )
@@ -1210,6 +1236,63 @@ impl Proposal {
         spec.allow_unattended = self.allow_unattended;
         spec
     }
+}
+
+/// The task kind under which a tool call waits for a person.
+///
+/// One constant, because it is also the amendment channel's provenance root:
+/// arguments a reviewer substitutes arrive at every gate carrying
+/// `task:agent.approve_call`, and an `allowed_sources` rule that should admit
+/// them must name exactly that source. Two spellings of the kind would let
+/// the task queue and the provenance drift apart.
+pub(crate) const APPROVE_CALL_KIND: &str = "agent.approve_call";
+
+/// The arguments an approval actually authorized.
+///
+/// A [`Decision`](crate::core::Decision) carries an `amendment`, and on an
+/// approved call it is not advice — it **is** the call: the reviewer looked
+/// at the exact tool and arguments, and answered with the arguments that may
+/// run. Dispatching the model's original while recording the reviewer's
+/// would be a declared answer nothing applies.
+///
+/// The substitute is a different *value* with a different *author*, which is
+/// what its label says:
+///
+/// * **trusted** — the decision channel is authenticated, actor-attributed,
+///   and bound to this one call; that is the authority basis run input and
+///   `release` already rest on, not the ambient human free text this design
+///   keeps untrusted (the reviewer's `reason` stays out of the loop for
+///   exactly that reason);
+/// * **provenance `task:agent.approve_call`** alone — the model's value is
+///   gone, and a source-constrained field admits the substitute only where
+///   the operator listed the decision channel;
+/// * **the original arguments' sensitivity** — the reviewer wrote the value
+///   having seen them, so an edit can never declassify what it replaces.
+///
+/// Every sink gate then runs on the substitute exactly as it would on any
+/// value: the schema is checked here, menus, ceilings and field rules at
+/// dispatch. Approval still releases nothing — an *un*-amended approval
+/// changes no label at all.
+///
+/// A rejection's amendment is recorded advice ("no, and here is what would
+/// pass"); it dispatches nothing.
+fn approved_arguments(
+    decision: &crate::core::Decision,
+    parameters: &Value,
+    original: Tainted<Value>,
+) -> Result<Tainted<Value>, String> {
+    if decision.amendment.is_null() {
+        return Ok(original);
+    }
+    crate::model::validate_schema(parameters, &decision.amendment).map_err(|detail| {
+        format!("the reviewer's amendment does not fit the tool's declared arguments: {detail}")
+    })?;
+    let mut label = crate::core::Label::trusted();
+    label.provenance.insert(crate::core::SourceId::new(format!(
+        "task:{APPROVE_CALL_KIND}"
+    )));
+    label.sensitivity = original.label().sensitivity;
+    Ok(Tainted::with_label(decision.amendment.clone(), label))
 }
 
 /// The fixed instruction a `parse` step's model receives.

@@ -785,6 +785,19 @@ pub enum PolicyError {
         actual_source: String,
     },
 
+    /// A protected field carries a value outside its declared set.
+    ///
+    /// The message names the constraint and deliberately not the value: the
+    /// value is untrusted-influenced by construction, and echoing it hands an
+    /// injected payload a path into logs and refusal channels. The manifest
+    /// is where a reader sees what is permitted.
+    #[error(
+        "protected field '{path}' of sink '{sink}' carries a value outside the \
+         declared set — the manifest enumerates what may stand in this field, \
+         and this value is not one of them"
+    )]
+    ProtectedFieldValue { sink: String, path: String },
+
     /// A protected field exceeds its own sensitivity ceiling.
     #[error(
         "protected field '{path}' sensitivity {actual:?} exceeds sink '{sink}' field ceiling {ceiling:?}"
@@ -970,6 +983,20 @@ pub enum StoreError {
         expected: u64,
         current: u64,
     },
+
+    /// Closure was refused because the case still owes obligations.
+    ///
+    /// A business refusal, not a store fault, and the type is what keeps the
+    /// two apart: closure is the moment people stop looking, so an unmet
+    /// deadline must survive it — while a store that is merely unreachable
+    /// must not read as the rule firing, or an outage becomes indistinguishable
+    /// from enforcement. The remedy is the caller's: meet or cancel the
+    /// obligations, then close.
+    #[error(
+        "case {case} still has {outstanding} open obligation(s); closure is \
+         when people stop looking, so meet or cancel them before closing"
+    )]
+    ObligationsOutstanding { case: String, outstanding: usize },
 
     /// The writer did not present the current lease epoch. A stale writer has
     /// been taken over; a future epoch was never acquired. Neither owns the run,

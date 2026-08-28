@@ -91,6 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         first.output.as_ref().unwrap().peek()["remaining"],
         json!(20_000)
     );
+    println!("1. issued          → mandate-42: 50000 minor units against 'approval:SET-42'");
+    println!("   first run drew  → 30000, remaining 20000");
 
     let second = runtime
         .run(
@@ -102,6 +104,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         second.output.as_ref().unwrap().peek()["remaining"],
         json!(5_000)
     );
+    println!("   second run drew → 15000, remaining 5000 — one envelope across separate runs,");
+    println!("                     which is the thing a per-run budget cannot hold");
 
     // 2. Over the ceiling is `Exhausted`, and a refused draw consumes nothing —
     //    otherwise a caller probing the remainder would drain it.
@@ -115,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_str()
         .unwrap();
     assert!(message.contains("does not replenish"), "got: {message}");
+    println!("\n2. 10000 refused   → {message}");
     assert_eq!(
         store
             .state(&AuthorityId::new("mandate-42"))
@@ -124,10 +129,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Spend::money(5_000),
         "a refusal must not consume"
     );
+    println!(
+        "   remaining       → still 5000: a refused draw consumes nothing, so probing cannot drain"
+    );
 
-    // 3. Revocation is a different answer from exhaustion, and the difference is
-    //    operational: `Exhausted` may reasonably be followed by asking for less,
-    //    and against a revoked authority that is a loop.
+    revocation(&runtime, &store).await?;
+    Ok(())
+}
+
+/// 3–4. Revocation is a different answer from exhaustion, and the terms survive.
+///
+/// The difference is operational: `Exhausted` may reasonably be followed by
+/// asking for less, and against a revoked authority that is a loop.
+async fn revocation(
+    runtime: &Runtime,
+    store: &Arc<RedbStore>,
+) -> Result<(), Box<dyn std::error::Error>> {
     store
         .revoke(
             &AuthorityId::new("mandate-42"),
@@ -146,6 +163,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_str()
         .unwrap();
     assert!(message.contains("was revoked"), "got: {message}");
+    println!("\n3. after revocation → {message}");
+    println!("   a different answer from exhaustion: asking for less is pointless now");
 
     // The terms survive revocation. An authority that vanished would take with
     // it the record of what the draws already taken were authorized *by*, which
@@ -171,11 +190,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(matches!(err, AuthorityError::AlreadyIssued(_)));
 
     println!(
-        "{} drawn over {} runs against '{}', then revoked: {}",
+        "\n4. the terms survive → {} drawn over {} draws against '{}'; revoked: \"{}\"",
         state.drawn.minor_units,
         state.draws,
         state.authority.basis,
         state.revoked.expect("revoked").reason,
     );
+    println!("   and the id cannot be reissued under the draws already taken");
     Ok(())
 }

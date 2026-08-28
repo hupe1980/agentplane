@@ -312,6 +312,16 @@ impl std::fmt::Debug for Bedrock {
 impl Bedrock {
     /// Load the standard AWS credential chain for this region.
     ///
+    /// The chain covers every way Bedrock authenticates: static keys and
+    /// profiles, `credential_process`, IAM Identity Center SSO, assume-role
+    /// and web-identity (IRSA), container and `IMDSv2` instance roles, and
+    /// `aws login` console-session profiles. A Bedrock API key in
+    /// `AWS_BEARER_TOKEN_BEDROCK` is honoured too, and **overrides** `SigV4`
+    /// for the whole client; the SDK reads it from the environment only,
+    /// never from a profile. For a key supplied programmatically, build the
+    /// client with `Config::builder().bearer_token(..)` and hand it to
+    /// [`from_client`](Self::from_client).
+    ///
     /// # Errors
     ///
     /// If the region is blank, or the client it builds carries none.
@@ -891,6 +901,28 @@ impl Bedrock {
                 detail: "a Bedrock guardrail intervened on this call".to_owned(),
             });
         }
+        // The provider's own verdict that this turn is not usable output.
+        // Converse stops with these when the model emitted something it could
+        // not parse into its message shape — a tool call included — and what
+        // reaches the content blocks is whatever fragment survived. Passing
+        // that fragment through would hand a caller's tool loop a call the
+        // provider itself has disowned, plausible-looking arguments and all.
+        // Metered, because the tokens were generated and billed either way.
+        if matches!(
+            output.stop_reason(),
+            aws_sdk_bedrockruntime::types::StopReason::MalformedModelOutput
+                | aws_sdk_bedrockruntime::types::StopReason::MalformedToolUse
+        ) {
+            return Err(ModelError::Unusable {
+                model: model.clone(),
+                usage,
+                detail: format!(
+                    "Bedrock stopped with '{}': the provider could not parse what the \
+                     model emitted, so no fragment of it is a usable answer",
+                    output.stop_reason().as_str()
+                ),
+            });
+        }
         let message = output
             .output()
             .and_then(|value| value.as_message().ok())
@@ -1038,6 +1070,7 @@ impl ModelProvider for Bedrock {
             stream,
         } = request;
         super::refuse_provider_side_media(prompt, model)?;
+        super::refuse_in_thread_instructions(prompt, model)?;
         let reasoning_config = self.reasoning_config(model, reasoning_effort)?;
         let max_tokens = i32::try_from(max_output_tokens)
             .map_err(|_| Self::refused(model, "max_output_tokens exceeds Bedrock's i32 limit"))?;
@@ -1597,6 +1630,47 @@ mod tests {
         }
     }
 
+    /// A tool call the provider disowned never reaches the caller's tool loop.
+    ///
+    /// `malformed_tool_use` means Converse could not parse what the model
+    /// emitted; what survives in the content blocks is a fragment. A driver
+    /// that returns it hands the runtime a plausible-looking call the provider
+    /// itself refused to stand behind — and the failure is metered, because
+    /// the tokens were generated whatever shape they arrived in.
+    #[test]
+    fn a_malformed_tool_use_stop_is_unusable_not_an_answer() {
+        let model = ModelId::new("bedrock", "test");
+        let message = Message::builder()
+            .role(ConversationRole::Assistant)
+            .content(ContentBlock::Text("{\"partial\": ".to_owned()))
+            .build()
+            .expect("message");
+        let output = aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
+            .output(aws_sdk_bedrockruntime::types::ConverseOutput::Message(
+                message,
+            ))
+            .stop_reason(aws_sdk_bedrockruntime::types::StopReason::MalformedToolUse)
+            .usage(
+                aws_sdk_bedrockruntime::types::TokenUsage::builder()
+                    .input_tokens(7)
+                    .output_tokens(3)
+                    .total_tokens(10)
+                    .build()
+                    .expect("usage"),
+            )
+            .build()
+            .expect("converse output");
+
+        let error = Bedrock::interpret(&model, None, SchemaMode::Native, &output)
+            .expect_err("a disowned turn is not an answer");
+        match error {
+            ModelError::Unusable { usage, .. } => {
+                assert_eq!(usage.output_tokens, 3, "the generation was billed");
+            }
+            other => panic!("expected a metered Unusable, got {other:?}"),
+        }
+    }
+
     #[test]
     fn smithy_documents_round_trip_json() {
         let value = json!({"s": "x", "n": -2, "u": 3, "f": 1.5, "a": [true, null]});
@@ -1918,11 +1992,10 @@ mod tests {
 
     /// **An undeclared dialect still refuses, and the message says what to do.**
     ///
-    /// The blanket refusal is the pre-existing behaviour and must survive:
     /// Converse is one envelope over families that spell reasoning differently
-    /// or not at all, so a driver with no declared dialect has nothing to derive
-    /// and guessing is the failure. What changed is only that there is now a way
-    /// to answer it, and the message names that way.
+    /// or not at all, so a driver with no declared dialect has nothing to
+    /// derive and guessing is the failure. The refusal must also *teach*:
+    /// its message names `.reasoning(..)`, the one call that answers it.
     #[test]
     fn an_undeclared_dialect_refuses_rather_than_guessing() {
         let plain = stub_driver();

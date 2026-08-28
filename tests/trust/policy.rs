@@ -489,7 +489,9 @@ async fn the_admission_record_names_the_policy_set() {
     let admitted = records
         .iter()
         .find_map(|r| match r.kind() {
-            RecordKind::RunAdmitted { policy_bundle, .. } => Some(policy_bundle.clone()),
+            RecordKind::RunAdmitted { policy_bundle, .. } => {
+                Some(policy_bundle.as_deref().cloned())
+            }
             _ => None,
         })
         .expect("RunAdmitted");
@@ -580,7 +582,7 @@ async fn an_open_run_refuses_to_resume_under_a_different_policy_bundle() {
                         governed_by: None,
                         input: json!({}),
                         input_label: agentplane::core::Label::trusted(),
-                        policy_bundle: Some(admitted),
+                        policy_bundle: Some(Box::new(admitted)),
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,
                     },

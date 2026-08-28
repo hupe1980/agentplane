@@ -77,8 +77,12 @@ pub enum RecordKind {
         /// a name and version identify a file that may since have been edited,
         /// and only the digest pins what it actually said — including the system
         /// prompt, which is inside it.
+        ///
+        /// Boxed for the enum's sake, invisibly to the wire: this variant is
+        /// one of the largest in the journal's vocabulary, and every record
+        /// in every run pays its size in memory whether admitted or not.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        governed_by: Option<AgentIdentity>,
+        governed_by: Option<Box<AgentIdentity>>,
         input: Value,
         /// What the input's label was at admission.
         ///
@@ -97,8 +101,10 @@ pub enum RecordKind {
         /// from the journal years later rather than from someone's memory of how
         /// the deployment was wired. Journaled once here rather than per
         /// decision: this is an audit question, not a replay one.
+        ///
+        /// Boxed as `governed_by` is, for the same reason.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        policy_bundle: Option<PolicyBundleIdentity>,
+        policy_bundle: Option<Box<PolicyBundleIdentity>>,
         /// Which canonicalization rule produced this run's derived digests.
         ///
         /// Journaled once, here, because it is a property of the whole run and
@@ -454,14 +460,14 @@ pub enum RecordKind {
 
     /// Policy approved a typed label improvement. The record binds the decision
     /// to the exact value digest and prior whole/field labels; the value remains
-    /// inside the information-flow lattice.
+    /// inside the information-flow lattice. The marks the release attaches are
+    /// not restated here — they are determined by `release`, and a second
+    /// spelling of one decision is free to drift from the rule that derives it.
     Released {
         releaser: String,
         release: crate::core::Release,
         label: Label,
         field_labels: BTreeMap<String, Label>,
-        result_label: Label,
-        result_field_labels: BTreeMap<String, Label>,
         value: Digest,
     },
 

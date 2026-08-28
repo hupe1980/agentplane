@@ -2597,6 +2597,24 @@ impl<'a> StepCtx<'a> {
                     .into());
                 }
             }
+            // The content discipline: the value itself must be one of the
+            // declared set, whatever its labels say. Exact structural
+            // equality — a near miss is a refusal, never a correction — and
+            // conjoined with the label rules above rather than substituting
+            // for them, so a source-bound field with a value set refuses an
+            // allowed source answering something nobody enumerated.
+            if !field.allowed_values().is_empty()
+                && !args
+                    .peek()
+                    .pointer(path)
+                    .is_some_and(|actual| field.allowed_values().contains(actual))
+            {
+                return Err(PolicyError::ProtectedFieldValue {
+                    sink: sink_name,
+                    path: path.to_owned(),
+                }
+                .into());
+            }
             if let Some(field_ceiling) = field.sensitivity_ceiling()
                 && field_label.sensitivity > field_ceiling
             {
@@ -2647,19 +2665,15 @@ impl<'a> StepCtx<'a> {
         let released = value
             .apply_release(&release)
             .ok_or(PolicyError::UntrackedReleaseField)?;
-        let result_label = released.label().clone();
-        let result_field_labels = released
-            .field_labels()
-            .map(|(path, label)| (path.to_owned(), label.clone()))
-            .collect::<BTreeMap<_, _>>();
+        // The record carries the decision and the prior labels only; the
+        // marks it attaches are determined by `release` — see
+        // `RecordKind::Released` for why they are not restated.
         let descriptor = EffectDescriptor::new(
             crate::core::ACTION_RELEASE,
             serde_json::json!({
                 "release": &release,
                 "label": &label,
                 "field_labels": &field_labels,
-                "result_label": &result_label,
-                "result_field_labels": &result_field_labels,
                 "value": value_digest,
             }),
         );
@@ -2697,8 +2711,6 @@ impl<'a> StepCtx<'a> {
                 release,
                 label,
                 field_labels,
-                result_label,
-                result_field_labels,
                 value: value_digest,
             },
         )
@@ -3111,7 +3123,7 @@ fn misdirected_release<'a>(
     sink_id: &str,
     path: &str,
 ) -> Option<&'a crate::core::ReleaseMark> {
-    args.label().releases.iter().find(|mark| {
+    args.release_marks().iter().find(|mark| {
         mark.destination() != sink_id && mark.covers(path) && mark.scope().improves_trust()
     })
 }

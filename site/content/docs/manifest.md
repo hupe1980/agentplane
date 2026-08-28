@@ -1,7 +1,7 @@
 +++
 title = "Manifest reference"
 description = "Every field an agent declaration may carry, what enforces it, and what an absent value means."
-weight = 4
+weight = 5
 aliases = ["/reference/manifest/", "/docs/reference/manifest/"]
 +++
 
@@ -344,7 +344,7 @@ sub-run's reported spend is billed to the run that ordered it.
 | `max_sensitivity` | `public` | The highest sensitivity this tool may be *sent*. |
 | `description` | **required** | What the model is told. Required for a `tool-calling` agent. In the digest, because text that steers tool selection belongs where the system prompt does. |
 | `arguments` | derived | JSON Schema. Omit it for a typed `Tool`: the schema comes from the Rust argument type, and stating it twice is refused because a second copy can only drift. |
-| `requires_approval` | `false` | A person approves **this call**, seeing the exact tool and arguments, before it is dispatched. Needs `spec.oversight` (which supplies approvers, the obligation bounding the wait, and what happens when it closes) and `execution.kind: tool-calling`; refused without either. |
+| `requires_approval` | `false` | A person approves **this call**, seeing the exact tool and arguments, before it is dispatched. A decision's `amendment` is the call: an approving reviewer's substitute arguments dispatch in the model's place, schema-checked and judged by every sink gate as the reviewer's own trusted value (provenance `task:agent.approve_call`). Needs `spec.oversight` (which supplies approvers, the obligation bounding the wait, and what happens when it closes) and a declarative kind that calls tools — `tool-calling` or `planned`; refused without either. |
 | `protected_fields` | none | See below. |
 
 ### `protected_fields`
@@ -362,6 +362,8 @@ tools:
         require_trusted: true            # untrusted data may never select this
       - path: /amount
         allowed_sources: ["operator:treasury"]   # only these provenances
+      - path: /category
+        one_of: [refund, adjustment]     # only these exact values
       - path: /memo
         max_sensitivity: internal        # this field's own ceiling
 ```
@@ -371,14 +373,26 @@ a mutating tool with **no** protected fields refuses untrusted arguments
 outright, and declaring which fields a model may influence is how you permit the
 useful part without permitting the dangerous part.
 
-On a mutating grant, **at least one protected field must carry a trust or
-source rule** — `require_trusted: true`, or `allowed_sources` naming where the
-value must come from. A grant whose every entry carries only a sensitivity
-ceiling is refused at parse: declaring protected fields is what lifts the
-whole-object taint gate, and a ceiling bounds how *secret* an argument may be,
-not who authored it — so the model's own untrusted completion would fill every
-authority-bearing field unconstrained. A source rule names the **concrete**
-source an effect's output carries: `tool://server/name`, `model:{provider}/{model}`,
+`one_of` is the content discipline — the select-from-a-menu pattern made
+declarative. Every entry was reviewed, so an untrusted influence choosing
+*among* them discloses only which approved option was chosen; matching is
+exact structural equality, never a near miss corrected. It layers over the
+other rules rather than substituting for them: a field with both a source
+rule and a menu refuses an allowed source answering something nobody
+enumerated. What the manifest deliberately cannot express is anything richer —
+a pattern or format admits values nobody enumerated, and a judgment about one
+specific value belongs in a coded skill's `release`, which carries basis and
+evidence per instance.
+
+On a mutating grant, **at least one protected field must carry a trust,
+source, or value rule** — `require_trusted: true`, `allowed_sources` naming
+where the value must come from, or `one_of` enumerating what may stand in it.
+A grant whose every entry carries only a sensitivity ceiling is refused at
+parse: declaring protected fields is what lifts the whole-object taint gate,
+and a ceiling bounds how *secret* an argument may be, not who authored it —
+so the model's own untrusted completion would fill every authority-bearing
+field unconstrained. A source rule names the **concrete** source an effect's
+output carries: `tool://server/name`, `model:{provider}/{model}`,
 `agent/{capability}`, or an operator identity of your own.
 
 ## `spec.context`

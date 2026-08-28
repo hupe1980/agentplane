@@ -93,7 +93,8 @@ struct TckAgent;
 #[async_trait::async_trait]
 impl Skill for TckAgent {
     fn descriptor(&self) -> SkillDescriptor {
-        SkillDescriptor::new("tck.echo").provides("tck.echo")
+        // A skill that declares nothing answers its own name.
+        SkillDescriptor::new("tck.echo")
     }
 
     async fn invoke(

@@ -455,9 +455,15 @@ async fn a_case_with_an_open_obligation_refuses_to_close() {
         .unwrap()
         .unwrap();
     let err = store.close(case_id).await.unwrap_err();
+    // The variant, not a substring: the refusal is a business rule, and a
+    // `Backend` string here would make a store outage indistinguishable from
+    // the rule firing.
     assert!(
-        err.to_string().contains("open deadline"),
-        "closing must name the obligation that blocks it, got: {err}"
+        matches!(
+            err,
+            agentplane::core::StoreError::ObligationsOutstanding { outstanding: 1, .. }
+        ),
+        "closing must refuse as ObligationsOutstanding naming the count, got: {err}"
     );
 }
 

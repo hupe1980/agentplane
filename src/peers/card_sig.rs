@@ -196,7 +196,15 @@ impl AgentCard {
     ///
     /// If the card cannot be canonicalized.
     pub fn sign(&mut self, signer: &dyn CardSigner) -> Result<(), CardSignatureError> {
-        let protected = serde_json::json!({ "alg": ALG, "kid": signer.key_id().as_str() });
+        // `typ: "JOSE"` is the spec's SHOULD for a detached card signature,
+        // and it is for the *other* side: a conforming JWS library uses it to
+        // pick the serialization it is looking at. This crate's own verifier
+        // reads only `alg` and `kid`.
+        let protected = serde_json::json!({
+            "alg": ALG,
+            "kid": signer.key_id().as_str(),
+            "typ": "JOSE",
+        });
         // Canonical bytes for the header too. A verifier uses the base64 string
         // exactly as it arrives, so this is not required for interop — but it
         // makes signing the same card twice produce the same header, which it

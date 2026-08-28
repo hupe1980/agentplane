@@ -798,16 +798,24 @@ async fn closing_via_set_status_also_releases_the_keys(store: &Arc<dyn CaseStore
         r.record("closure", "register_deadline failed");
         return;
     }
-    if store
+    match store
         .set_status(case, crate::core::CaseStatus::Closed)
         .await
-        .is_ok()
     {
-        r.record(
+        Ok(()) => r.record(
             "closure",
             "set_status(Closed) closed a case with a pending obligation. The agent \
              path must refuse it exactly as close does",
-        );
+        ),
+        Err(crate::core::StoreError::ObligationsOutstanding { .. }) => {}
+        Err(other) => r.record(
+            "closure",
+            format!(
+                "set_status(Closed) over an open obligation must refuse as \
+                 `ObligationsOutstanding`, not as `{other}` — same rule, same \
+                 spelling, on the path agents actually take"
+            ),
+        ),
     }
     let _ = store
         .set_deadline_state(case, "ack", crate::core::DeadlineState::Met)
@@ -864,12 +872,32 @@ async fn an_unmet_obligation_blocks_closure(store: &Arc<dyn CaseStore>, r: &mut 
         r.record("closure", "register_deadline failed");
         return;
     }
-    if store.close(case).await.is_ok() {
-        r.record(
+    match store.close(case).await {
+        Ok(()) => r.record(
             "closure",
             "a case with a pending obligation was closed. Closure is when people \
              stop looking, so an unmet deadline must survive it",
-        );
+        ),
+        // The shape of the refusal is part of the contract: a business rule
+        // reported as a backend fault is indistinguishable from an outage, so
+        // a store that is merely down would read as enforcing the rule.
+        Err(crate::core::StoreError::ObligationsOutstanding { outstanding, .. }) => {
+            if outstanding == 0 {
+                r.record(
+                    "closure",
+                    "the refusal counted zero outstanding obligations while refusing \
+                     over one",
+                );
+            }
+        }
+        Err(other) => r.record(
+            "closure",
+            format!(
+                "an open obligation must refuse closure as \
+                 `ObligationsOutstanding`, not as `{other}` — a business refusal \
+                 wearing a fault's type makes an outage read as enforcement"
+            ),
+        ),
     }
     let _ = store
         .set_deadline_state(case, "ack", crate::core::DeadlineState::Met)

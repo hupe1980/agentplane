@@ -373,6 +373,15 @@ impl ApiResponse {
     fn text(&self) -> String {
         self.output
             .iter()
+            // A `phase: "commentary"` message is the model narrating on its
+            // way to the answer — typically the preamble beside a tool call.
+            // Concatenated into `text` it pollutes the answer, and on a
+            // schema-bearing final turn it breaks the JSON parse of an
+            // otherwise valid answer. Absent `phase` means the final answer,
+            // which is what every model before the field emitted. The
+            // commentary itself is not lost: the continuation carries the
+            // output items verbatim, and a live observer streams the deltas.
+            .filter(|item| item.get("phase").and_then(Value::as_str) != Some("commentary"))
             .filter_map(|item| item.get("content").and_then(Value::as_array))
             .flatten()
             .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
@@ -990,6 +999,7 @@ impl ModelProvider for OpenAi {
         } = request;
 
         super::refuse_provider_side_media(prompt, model)?;
+        super::refuse_in_thread_instructions(prompt, model)?;
 
         self.check_egress(model)?;
 
@@ -1430,6 +1440,33 @@ mod continuation_tests {
             call["arguments"].is_string(),
             "Responses carries arguments as a JSON string, unlike Anthropic's \
              object: {body}"
+        );
+    }
+
+    /// Commentary narration never joins the answer's text.
+    ///
+    /// Responses marks the model's on-the-way narration `phase:
+    /// "commentary"`; the final answer arrives unmarked or as
+    /// `final_answer`. Concatenating both pollutes `Completion::text`, and
+    /// on a schema-bearing turn the preamble breaks the JSON parse of an
+    /// otherwise valid answer. The narration is not lost — the continuation
+    /// carries every output item verbatim.
+    #[test]
+    fn commentary_phase_text_stays_out_of_the_answer() {
+        let parsed: ApiResponse = serde_json::from_value(json!({
+            "status": "completed",
+            "output": [
+                { "type": "message", "role": "assistant", "phase": "commentary",
+                  "content": [{ "type": "output_text", "text": "Let me check the ledger. " }] },
+                { "type": "message", "role": "assistant", "phase": "final_answer",
+                  "content": [{ "type": "output_text", "text": "{\"balance\":42}" }] },
+            ],
+        }))
+        .expect("parse");
+        assert_eq!(
+            parsed.text(),
+            "{\"balance\":42}",
+            "commentary narration joined the final answer"
         );
     }
 

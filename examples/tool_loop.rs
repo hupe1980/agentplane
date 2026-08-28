@@ -287,8 +287,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let (rt, _) = plane(&provider);
 
-    let out = rt.run("ledger.ask", ask("loop")).await?;
+    // Printed before the run: the reads below are *this* scenario's turns, and
+    // a header printed after them would file them under the previous one.
     println!("\n4. the model never stops asking");
+    let out = rt.run("ledger.ask", ask("loop")).await?;
     match &out.status {
         RunStatus::Failed(why) => println!("   → {why}"),
         other => panic!("an unbounded loop was allowed to finish: {other:?}"),

@@ -1,7 +1,7 @@
 +++
 title = "Erasure and keys"
 description = "Cryptographic erasure that reaches backups, envelope encryption, key rotation and revocation, and the tenancy boundary."
-weight = 7
+weight = 9
 +++
 
 An erasure obligation is discharged by making data unreadable **everywhere**,

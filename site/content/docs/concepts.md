@@ -1,7 +1,7 @@
 +++
 title = "Concepts"
 description = "Runs and cases, effects and dispositions, labels and typed release — the vocabulary everything else is built from."
-weight = 2
+weight = 3
 +++
 
 The vocabulary. Nine ideas, then the two surfaces you program against —
@@ -275,10 +275,12 @@ lookup" is unsatisfiable when every granted tool answers under one family
 name, because the rule then admits whichever tool an injected prompt reached
 first.
 
-`cx.release` is the only way to improve a label. Its typed request names the
-trust and/or sensitivity dimension, exact fields, destination, basis and
-evidence; policy authorizes `data:release`; the journal records the decision.
-The returned value remains labeled and keeps its provenance.
+`cx.release` is the only way to improve a label, and the improvement is
+honoured only at the destination it names. Its typed request names the trust
+and/or sensitivity dimension, exact fields, destination, basis and evidence;
+policy authorizes `data:release`; the journal records the decision. The
+returned value remains labeled, keeps its provenance, and arrives at every
+other sink exactly as untrusted as before.
 
 ## 9. 📐 The plan is an authorization graph
 
@@ -412,7 +414,7 @@ discovering one call at a time.
 | `sink_with(&value, build)` | an outbound effect **with** its labelled arguments, built from them in one motion — the primary dispatch shape, and the only path that can carry protected fields |
 | `sink(e, &value)` | the same gate, for an effect built elsewhere or one that binds its outbound value internally |
 | `complete(&prompt)`, `complete_with(&prompt, tune)` | a completion on the governing manifest's own model, through the plane's registered driver — no provider `Arc` in the skill |
-| `release(request)` | typed, policy-authorized improvement of a label |
+| `release(request)` | typed, policy-authorized improvement of a label, honoured only at its named destination |
 | `deadline`, `meet_deadline`, `cancel_deadline` | obligations |
 | `sleep(d)`, `await_event(&spec)`, `task(&spec)` | durable suspension — a waiting run is a row, not a thread |
 | `case_state()`, `put_case_state(v, s)`, `set_case_status(s)` | shared state across runs, version-checked |

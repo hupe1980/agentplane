@@ -837,10 +837,10 @@ impl CaseStore for RedbStore {
                     n
                 };
                 if outstanding > 0 {
-                    return Err(StoreError::Backend(format!(
-                        "case {case} has {outstanding} open deadline(s); \
-                         resolve or cancel them before closing"
-                    )));
+                    return Err(StoreError::ObligationsOutstanding {
+                        case: case.to_string(),
+                        outstanding,
+                    });
                 }
 
                 let mut cases = w.open_table(CASES).map_err(|e| be(&e))?;

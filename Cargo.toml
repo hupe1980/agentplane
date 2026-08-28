@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.23.0"
+version      = "0.24.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -205,7 +205,14 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # `default-https-client` selects the maintained `rustls-aws-lc` stack. A TLS
 # client must not be whatever a transitive default picks; `just audit` keeps it
 # honest.
-aws-config = { version = "1.10.1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"], optional = true }
+# aws-config's default feature set restated explicitly, plus
+# `credentials-login`, so a changed default cannot arrive or vanish
+# unreviewed. The gated credential providers: `sso` (IAM Identity Center
+# profiles), `credentials-process` (external helpers), `credentials-login`
+# (`aws login` console-session profiles — a `login_session` profile fails to
+# resolve without it). STS assume-role, web identity, IMDS/ECS roles and the
+# `AWS_BEARER_TOKEN_BEDROCK` API-key path are not feature-gated.
+aws-config = { version = "1.11.0", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "credentials-login", "behavior-version-latest"], optional = true }
 aws-sdk-bedrockruntime = { version = "1.139.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"], optional = true }
 aws-smithy-types = { version = "1.6.1", optional = true }
 
@@ -275,6 +282,13 @@ required-features = ["redb"]
 name              = "tool_loop"
 required-features = ["redb", "testkit", "manifest"]
 
+# A person approves the exact tool call — `requires_approval` end to end:
+# suspend, worklist, approve or refuse, and a strict replay that re-opens
+# nothing.
+[[example]]
+name              = "approved_call"
+required-features = ["redb", "testkit", "manifest"]
+
 [[example]]
 name              = "planned_run"
 required-features = ["redb", "testkit", "manifest"]
@@ -301,6 +315,25 @@ required-features = ["redb"]
 
 [[example]]
 name              = "memory_run"
+required-features = ["redb"]
+
+# Exhaustion is a pause with a protocol: refused, resumed under the same
+# ceiling (still refused, not duplicated), readmitted under a raise, verified.
+[[example]]
+name              = "budget_pause"
+required-features = ["redb"]
+
+# Two brakes: cancel one run (it unwinds, and the journal names who asked) and
+# the store-backed emergency stop that halts new admissions on every instance.
+[[example]]
+name              = "operator_stop"
+required-features = ["redb"]
+
+# An instance dies mid-run; the survivor's sweep finds the lapsed lease, takes
+# the run over with fencing, and finishes it — no stage repeated. ~3s: a real
+# lease has to lapse.
+[[example]]
+name              = "recovered_run"
 required-features = ["redb"]
 
 # Needs `testkit` for the fake provider. Deliberately: an example that called a

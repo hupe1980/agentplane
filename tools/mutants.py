@@ -182,6 +182,28 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
             return Ok(());
         }""",
     ),
+    "AReviewersAmendmentIsAdvisory": (
+        "src/runtime/declarative.rs",
+        "a_reviewers_amendment_is_the_call_that_runs",
+        "the loop records the reviewer's amendment and dispatches the model's "
+        "original arguments anyway — a declared answer the runtime silently "
+        "ignores, on the one surface whose point is that a person's answer "
+        "governs",
+        "                    args = match approved_arguments(&decision, &declaration.parameters, args) {\n"
+        "                        Ok(args) => args,",
+        "                    args = match Ok::<_, String>(args) {\n"
+        "                        Ok(args) => args,",
+    ),
+    "AnAmendmentIsAsUntrustedAsTheValueItReplaces": (
+        "src/runtime/declarative.rs",
+        "a_reviewers_amendment_is_the_call_that_runs",
+        "a reviewer's substitute arguments inherit the model completion's "
+        "label, so the authenticated decision channel confers nothing and "
+        "every field rule that demands a trusted author still refuses the "
+        "value a person wrote",
+        "    let mut label = crate::core::Label::trusted();",
+        "    let mut label = original.label().clone();",
+    ),
     "RefusalsTeachTheModel": (
         "src/runtime/declarative.rs",
         "a_refusal_tells_the_model_nothing_it_can_differentiate",
@@ -1314,9 +1336,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "an Anthropic image/document URL crosses the model boundary, letting the "
         "provider fetch bytes the plane never governed or recorded",
         """        super::refuse_provider_side_media(prompt, model)?;
+        super::refuse_in_thread_instructions(prompt, model)?;
 
         // Before the request is built: a refused destination must cost nothing""",
         """        let _ = (prompt, model);
+        super::refuse_in_thread_instructions(prompt, model)?;
 
         // Before the request is built: a refused destination must cost nothing""",
     ),
@@ -1326,9 +1350,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "an OpenAI image/file URL crosses the model boundary, letting the provider "
         "fetch bytes the plane never governed or recorded",
         """        super::refuse_provider_side_media(prompt, model)?;
+        super::refuse_in_thread_instructions(prompt, model)?;
 
         self.check_egress(model)?;""",
         """        let _ = (prompt, model);
+        super::refuse_in_thread_instructions(prompt, model)?;
 
         self.check_egress(model)?;""",
     ),
@@ -1351,6 +1377,35 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "sibling quietly does not",
         """                  WHERE case_id = $1 AND tenant = $2 ORDER BY written_at, digest",""",
         """                  WHERE (case_id = $1 OR TRUE) AND tenant = $2 ORDER BY written_at, digest",""",
+    ),
+    "AClosureRefusalWearsAFaultsType": (
+        "src/store/redb_cases.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "the open-obligation refusal is reported as a generic backend fault, so "
+        "a store outage is indistinguishable from the rule firing — and the "
+        "operator surface files a business refusal as an internal error",
+        "                    return Err(StoreError::ObligationsOutstanding {\n"
+        "                        case: case.to_string(),\n"
+        "                        outstanding,\n"
+        "                    });",
+        "                    return Err(StoreError::Backend(format!(\n"
+        "                        \"case {case} has {outstanding} open deadline(s)\"\n"
+        "                    )));",
+    ),
+    "APostgresClosureRefusalWearsAFaultsType": (
+        "src/store/postgres_cases.rs",
+        "postgres_satisfies_the_case_layer_contracts",
+        "the open-obligation refusal is reported as a generic backend fault on "
+        "this backend alone — the two stores then disagree about what kind of "
+        "answer one rule gives, which is the asymmetry the battery exists to "
+        "refuse",
+        "            return Err(StoreError::ObligationsOutstanding {\n"
+        "                case: case.to_string(),\n"
+        "                outstanding: usize::try_from(open).unwrap_or(usize::MAX),\n"
+        "            });",
+        "            return Err(StoreError::Backend(format!(\n"
+        "                \"case {case} has {open} unmet obligation(s)\"\n"
+        "            )));",
     ),
     "ErasureIsNotScopedToTheCase": (
         "src/store/redb_cases.rs",
@@ -2610,12 +2665,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         """        return Err(ModelError::Unusable {
             model: model.clone(),
             usage,
-            detail: "the model declined to answer".to_owned(),
-        });""",
+            detail,
+        });
+    }""",
         """        return Err(ModelError::Refused {
             model: model.clone(),
-            detail: "the model declined to answer".to_owned(),
-        });""",
+            detail,
+        });
+    }""",
     ),
     # ── One plane, several agents ───────────────────────────────────────────
     "AToolLoopWithNothingToReachBuilds": (
@@ -3728,6 +3785,19 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "declared control the marks exist to enforce",
         "            if mark.destination() == destination && mark.covers(path) {",
         "            if mark.covers(path) {",
+    ),
+    "ADependencyJoinCarriesAReleaseAcrossValues": (
+        "src/core/label.rs",
+        "a_dependency_join_drops_release_marks",
+        "a release mark survives the join that mixes an untrusted dependency "
+        "into the value, so a sink honours a grant that was priced against "
+        "the bare value and not against the history now folded into it",
+        "            label: self.label.join(other),\n"
+        "            fields: self.fields.clone(),\n"
+        "            releases: BTreeSet::new(),",
+        "            label: self.label.join(other),\n"
+        "            fields: self.fields.clone(),\n"
+        "            releases: self.releases.clone(),",
     ),
     "AReleaseValidatorThatAcceptsAnything": (
         "src/core/label.rs",
@@ -6231,6 +6301,162 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                         self.pending.clear();
                         break;
                     }""",
+    ),
+    "AClientNeverNamesItsSkill": (
+        "src/peers/a2a.rs",
+        "this_planes_client_names_its_skill_on_a_multi_skill_plane",
+        "the client's capability never reaches `message.metadata.skill`, so a "
+        "named-dispatch server — this crate's own among them — refuses every "
+        "call to a multi-skill plane as ambiguous, while the single-skill "
+        "fallback keeps every other test green",
+        """                "metadata": {
+                    "skill": capability,
+                    EXTENSION_URI: Value::Object(governance),
+                }""",
+        """                "metadata": {
+                    EXTENSION_URI: Value::Object(governance),
+                }""",
+    ),
+    "ALegacyResourceNotFoundIsInDoubt": (
+        "src/tools/mcp.rs",
+        "a_legacy_resource_not_found_is_a_refusal_not_an_unknown_outcome",
+        "an older server's -32002 falls to the in-doubt arm, so a read of a "
+        "resource that does not exist is retried under policy forever "
+        "instead of refused as the judgement it is",
+        """                        | ErrorCode::PARSE_ERROR
+                        | ErrorCode::RESOURCE_NOT_FOUND""",
+        """                        | ErrorCode::PARSE_ERROR""",
+    ),
+    "AQuotaRefusalCarriesNoIdentity": (
+        "src/api/a2a.rs",
+        "a_full_quota_is_back_pressure_with_no_arithmetic_in_the_answer",
+        "the quota refusal loses its ErrorInfo pair, leaving only a numeral "
+        "in space A2A reserves — this crate's own client then classifies its "
+        "own back-pressure as an unknown fault and escalates instead of "
+        "coming back",
+        """            code::QUOTA_EXHAUSTED => Some((SELF_DOMAIN, QUOTA_EXHAUSTED_REASON)),""",
+        """            code::QUOTA_EXHAUSTED => None,""",
+    ),
+    "AForeignNumeralIsBelieved": (
+        "src/peers/a2a.rs",
+        "back_pressure_is_identified_by_its_error_info_not_its_numeral",
+        "a bare -32029 from any server classifies as a clean refusal, so a "
+        "foreign implementation-defined fault — possibly raised mid-execution "
+        "— licenses resending a mutating call",
+        """        -32029 if e.names_reason(super::ERROR_DOMAIN, super::QUOTA_EXHAUSTED_REASON) => {""",
+        """        -32029 => {""",
+    ),
+    "ADisownedTurnIsAnAnswer": (
+        "src/model/bedrock.rs",
+        "a_malformed_tool_use_stop_is_unusable_not_an_answer",
+        "a `malformed_tool_use` stop passes through as a completion, handing "
+        "the caller's tool loop a fragment the provider itself disowned",
+        """            aws_sdk_bedrockruntime::types::StopReason::MalformedModelOutput
+                | aws_sdk_bedrockruntime::types::StopReason::MalformedToolUse""",
+        """            aws_sdk_bedrockruntime::types::StopReason::MalformedModelOutput""",
+    ),
+    "GeminiDiscardsBodyAdvice": (
+        "src/model/gemini.rs",
+        "gemini_retry_advice_in_the_body_reaches_the_driver",
+        "the RetryInfo window inside Google's 429 body is dropped, so the "
+        "default policy spends every attempt in milliseconds against a window "
+        "measured in tens of seconds and reports the provider down",
+        """            retry_after: retry_info_seconds(body),""",
+        """            retry_after: {
+                let _ = body;
+                None
+            },""",
+    ),
+    "APlaintextPeerIsSpoken": (
+        "src/peers/a2a.rs",
+        "a_plaintext_peer_endpoint_and_card_url_are_refused",
+        "a plaintext peer endpoint is connected to, so the run's payload and "
+        "a bearer credential cross the network in cleartext for every "
+        "on-path observer",
+        """        if parsed.scheme() != "https"
+            && !(self.loopback_allowed()
+                && crate::netguard::is_loopback_name(&host.to_ascii_lowercase()))
+        {
+            return Err(PeerError::Refused {""",
+        """        if parsed.scheme() == "gopher"
+            && !(self.loopback_allowed()
+                && crate::netguard::is_loopback_name(&host.to_ascii_lowercase()))
+        {
+            return Err(PeerError::Refused {""",
+    ),
+    "APlaintextCardIsFetched": (
+        "src/peers/discovery.rs",
+        "a_plaintext_peer_endpoint_and_card_url_are_refused",
+        "a plaintext card URL is fetched, so the interface URL that steers "
+        "the credential-bearing call that follows is whatever the network "
+        "says it is",
+        """        if parsed.scheme() != "https"
+            && !(self.loopback_allowed()
+                && crate::netguard::is_loopback_name(&host.to_ascii_lowercase()))
+        {
+            return Err(DiscoveryError::Refused(format!(""",
+        """        if parsed.scheme() == "gopher"
+            && !(self.loopback_allowed()
+                && crate::netguard::is_loopback_name(&host.to_ascii_lowercase()))
+        {
+            return Err(DiscoveryError::Refused(format!(""",
+    ),
+    "AnInThreadInstructionIsObeyed": (
+        "src/model/mod.rs",
+        "an_instruction_role_inside_the_turn_list_is_refused",
+        "a system-role message inside the turn list reaches the provider, so "
+        "an untrusted value shaped as a turn is obeyed as a directive without "
+        "ever passing the trust check the one real instruction slot gets",
+        """            Some("system") => Some("system"),""",
+        """            Some("system") => None,""",
+    ),
+    "CommentaryJoinsTheAnswer": (
+        "src/model/openai.rs",
+        "commentary_phase_text_stays_out_of_the_answer",
+        "commentary-phase narration is concatenated into Completion::text, "
+        "polluting the answer and breaking the JSON parse of a schema-bearing "
+        "final turn",
+        """            .filter(|item| item.get("phase").and_then(Value::as_str) != Some("commentary"))""",
+        """            .filter(|_| true)""",
+    ),
+    "ACancelIsSilentlyARead": (
+        "src/peers/a2a.rs",
+        "this_planes_client_cancels_a_task_on_this_planes_server",
+        "the cancel body carries GetTask, so the acknowledgement validates, "
+        "the effect reports success — and the peer keeps running work the "
+        "caller believes it stopped",
+        """            "method": "CancelTask",""",
+        """            "method": "GetTask",""",
+    ),
+    "AMenuDoesNotCountAsAuthority": (
+        "src/manifest/mod.rs",
+        "a_sensitivity_only_protected_field_does_not_lift_the_mutating_gate",
+        "the mutating-grant authority check ignores value menus, so the "
+        "flagship declarative select-from-a-menu configuration is refused at "
+        "parse and every menu-bound agent is pushed back into code",
+        """                        && f.allowed_values().is_empty()""",
+        """                        && true""",
+    ),
+    "AValueMenuApprovesEverything": (
+        "src/runtime/ctx.rs",
+        "a_value_outside_the_declared_set_is_refused_before_the_tool",
+        "the declared value set is consulted and every value passes it, so a "
+        "field that reads as menu-bound accepts whatever an injected prompt "
+        "chose — the select-from-a-menu discipline reduced to decoration",
+        """                    .is_some_and(|actual| field.allowed_values().contains(actual))""",
+        """                    .is_some_and(|actual| {
+                        let _ = actual;
+                        true
+                    })""",
+    ),
+    "ARefusalLosesItsGrounds": (
+        "src/model/anthropic.rs",
+        "a_refusals_stated_grounds_reach_the_error",
+        "the provider's stop_details are dropped from a refusal, so a "
+        "decline arrives as one bare sentence and the operator diffs prompts "
+        "against a black box",
+        """            for key in ["category", "explanation"] {""",
+        """            for key in ["never-populated"] {""",
     ),
 }
 

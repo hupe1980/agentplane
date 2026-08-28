@@ -27,7 +27,7 @@ the pipeline is right and you find out late; the justfile exists so they cannot.
 | `just anchors` | milliseconds | constantly — after any refactor |
 | `just test` | seconds | while working |
 | `just audit` | seconds | before pushing; part of `just ci` |
-| `just ci` | ~2 minutes | before pushing |
+| `just ci` | ~5 minutes | before pushing |
 | `just mutants` | ~25 minutes | before a release, or after touching a guarantee |
 | `just specs` | ~2 minutes | after changing the effect protocol, sagas, fencing, or authorization |
 

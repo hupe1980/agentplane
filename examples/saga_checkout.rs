@@ -92,7 +92,9 @@ impl SagaStep {
 #[async_trait::async_trait]
 impl Skill for SagaStep {
     fn descriptor(&self) -> SkillDescriptor {
-        SkillDescriptor::new(self.capability).provides(self.capability)
+        // A skill that declares nothing answers its own name, and here the
+        // name *is* the capability the plan asks for.
+        SkillDescriptor::new(self.capability)
     }
 
     fn compensation(&self) -> Compensation {

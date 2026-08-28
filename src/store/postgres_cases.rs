@@ -917,9 +917,10 @@ impl CaseStore for PostgresStore {
             .map_err(|e| be(&e))?
             .get(0);
         if open > 0 {
-            return Err(StoreError::Backend(format!(
-                "case {case} has {open} unmet obligation(s) and cannot be closed"
-            )));
+            return Err(StoreError::ObligationsOutstanding {
+                case: case.to_string(),
+                outstanding: usize::try_from(open).unwrap_or(usize::MAX),
+            });
         }
 
         // The row count is read: closing a case that does not exist reported

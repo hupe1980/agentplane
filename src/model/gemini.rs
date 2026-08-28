@@ -1035,6 +1035,52 @@ fn severed(model: &ModelId, acc: &gemini_stream::Accumulator, detail: &str) -> M
     }
 }
 
+/// Fill a rate limit's window from the body's `google.rpc.RetryInfo`.
+///
+/// The shared classifier reads `Retry-After`, which is the one header every
+/// other wire this crate meets uses — and the one this provider does not
+/// send. Google names its window *inside* the 429 body, as a `RetryInfo`
+/// detail carrying a proto `Duration` (`"40s"`). Discarded, the default
+/// policy spends its attempts in milliseconds against a window measured in
+/// tens of seconds and reports the provider down — the exact defect the
+/// `retry_after` plumbing exists to prevent. Any other classification passes
+/// through untouched, and a window the header already named is not replaced.
+fn with_retry_info(error: ModelError, body: &str) -> ModelError {
+    match error {
+        ModelError::RateLimited {
+            model,
+            detail,
+            retry_after: None,
+        } => ModelError::RateLimited {
+            model,
+            detail,
+            retry_after: retry_info_seconds(body),
+        },
+        other => other,
+    }
+}
+
+/// The `RetryInfo` detail's delay, in whole seconds.
+///
+/// Whole seconds only, floor of a fractional value, zero reads as no advice —
+/// the same conservatisms `core::retry_after_seconds` applies to the header
+/// form. The ceiling on believing it (`max_advice`) stays where it always
+/// was, in the retry policy.
+fn retry_info_seconds(body: &str) -> Option<u64> {
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    let details = parsed.get("error")?.get("details")?.as_array()?;
+    let delay = details
+        .iter()
+        .find(|d| {
+            d.get("@type").and_then(Value::as_str)
+                == Some("type.googleapis.com/google.rpc.RetryInfo")
+        })?
+        .get("retryDelay")?
+        .as_str()?;
+    let seconds: u64 = delay.strip_suffix('s')?.split('.').next()?.parse().ok()?;
+    (seconds > 0).then_some(seconds)
+}
+
 #[async_trait]
 impl ModelProvider for Gemini {
     fn request_profile(&self, model: &ModelId) -> Value {
@@ -1060,6 +1106,7 @@ impl ModelProvider for Gemini {
     async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
         let model = request.model;
         super::refuse_provider_side_media(request.prompt, model)?;
+        super::refuse_in_thread_instructions(request.prompt, model)?;
         self.check_egress(model)?;
 
         let body = self.body(model, &request)?;
@@ -1081,7 +1128,10 @@ impl ModelProvider for Gemini {
         if !status.is_success() {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(classify_status(model, status.as_u16(), &headers, &text));
+            return Err(with_retry_info(
+                classify_status(model, status.as_u16(), &headers, &text),
+                &text,
+            ));
         }
 
         let mut completion = if self.stream {

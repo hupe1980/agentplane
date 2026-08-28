@@ -239,7 +239,20 @@ impl A2aClient {
                 "messageId": message_id,
                 "parts": [{ "data": payload, "mediaType": "application/json" }],
                 "extensions": [EXTENSION_URI],
-                "metadata": { EXTENSION_URI: Value::Object(governance) }
+                // `skill` is where dispatch is *named*. A2A has no
+                // skill-selection field of its own, so a receiver that refuses
+                // to infer the capability from untrusted text — this crate's
+                // own server among them — reads `message.metadata.skill` and
+                // advertises exactly that convention on its card. A client
+                // that carries the capability only inside its own extension
+                // metadata can address nothing on a multi-skill plane, and the
+                // single-skill fallback hides that from every test that does
+                // not serve two. A receiver that infers instead simply
+                // ignores the key — metadata is opaque to the protocol.
+                "metadata": {
+                    "skill": capability,
+                    EXTENSION_URI: Value::Object(governance),
+                }
             }),
         );
 
@@ -259,6 +272,18 @@ impl A2aClient {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "GetTask",
+            "params": Value::Object(params),
+        })
+    }
+
+    fn cancel_task_body(task_id: &str, tenant: Option<&str>) -> Value {
+        let mut params = serde_json::Map::new();
+        insert_tenant(&mut params, tenant);
+        params.insert("id".into(), json!(task_id));
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "CancelTask",
             "params": Value::Object(params),
         })
     }
@@ -362,6 +387,27 @@ impl A2aClient {
                 detail: "the peer endpoint names no host".to_owned(),
             })?
             .to_owned();
+        // The same rule a push webhook is held to, because the exposure is the
+        // same shape pointed the other way: this request carries the run's
+        // payload and, when one is held, a bearer credential — and both would
+        // cross the network in cleartext for every on-path observer. The card
+        // an endpoint came from is untrusted input, so the scheme is not a
+        // choice the far side gets to make. The exception is the testkit
+        // loopback build, keyed on the *name* — a host that merely resolves
+        // inward stays refused.
+        if parsed.scheme() != "https"
+            && !(self.loopback_allowed()
+                && crate::netguard::is_loopback_name(&host.to_ascii_lowercase()))
+        {
+            return Err(PeerError::Refused {
+                peer: peer.clone(),
+                detail: format!(
+                    "the peer endpoint '{}' is not https — a bearer credential and the \
+                     run's payload must not cross the network in cleartext",
+                    self.endpoint.url
+                ),
+            });
+        }
         if let Some(egress) = &self.egress
             && let Err(error) = egress.permits(Some(host.as_str()))
         {
@@ -437,6 +483,31 @@ impl A2aClient {
 struct RpcError {
     code: i64,
     message: String,
+    /// A2A 1.0 carries machine-readable detail here as a list of
+    /// `google.rpc.ErrorInfo` objects. Read for exactly one thing: the
+    /// `(domain, reason)` pair that identifies a server-defined refusal —
+    /// see [`RpcError::names_reason`].
+    #[serde(default)]
+    data: Option<Value>,
+}
+
+impl RpcError {
+    /// Whether this error carries a `google.rpc.ErrorInfo` naming exactly
+    /// this `(domain, reason)`.
+    ///
+    /// The pair, never the numeric code alone: a server-defined code sits in
+    /// the band JSON-RPC gives every implementation — and A2A 1.0 reserves
+    /// for its own table — so two parties can hold one numeral for different
+    /// facts. A domain the emitting project controls cannot collide.
+    fn names_reason(&self, domain: &str, reason: &str) -> bool {
+        let Some(entries) = self.data.as_ref().and_then(Value::as_array) else {
+            return false;
+        };
+        entries.iter().any(|entry| {
+            entry.get("domain").and_then(Value::as_str) == Some(domain)
+                && entry.get("reason").and_then(Value::as_str) == Some(reason)
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -473,16 +544,21 @@ fn classify_rpc(peer: &PeerId, e: &RpcError) -> PeerError {
             peer: peer.clone(),
             detail: format!("{detail} — the peer did not say whether it acted"),
         },
-        // This runtime's own server-defined back-pressure code: the quota was
-        // checked before admission, so nothing was performed and the honest
-        // reading is a refusal that will pass — retry later, do not abandon.
-        // A foreign server reusing -32029 for something else loses nothing:
-        // the request was refused either way, and refusal is the conservative
-        // class for a pre-admission answer.
-        -32029 => PeerError::Refused {
-            peer: peer.clone(),
-            detail: format!("{detail} — the peer is at a ceiling; come back"),
-        },
+        // This runtime's own back-pressure refusal: the quota was checked
+        // before admission, so nothing was performed and the honest reading
+        // is a refusal that will pass — retry later, do not abandon. The
+        // guard is the `ErrorInfo` pair, not the numeral: `-32029` sits in
+        // the band JSON-RPC gives every implementation and A2A 1.0 reserves
+        // for its own future table, so a foreign server's `-32029` proves
+        // nothing about whether work happened — unmarked, it falls through
+        // to the unknown-fault arm below, where a mutating call is *not*
+        // resent on somebody else's ambiguous numeral.
+        -32029 if e.names_reason(super::ERROR_DOMAIN, super::QUOTA_EXHAUSTED_REASON) => {
+            PeerError::Refused {
+                peer: peer.clone(),
+                detail: format!("{detail} — the peer is at a ceiling; come back"),
+            }
+        }
         // `-32603 Internal error` and anything unrecognised. The request
         // arrived; whether the peer acted is exactly what it is not saying.
         // Calling this a refusal is how a half-finished transfer is sent again
@@ -667,6 +743,38 @@ impl PeerClient for A2aClient {
             return Err(invalid_response(
                 peer,
                 "GetTask result is not the requested Task object",
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn cancel_task(
+        &self,
+        peer: &PeerId,
+        task_id: &str,
+        credential: Option<&PeerCredential>,
+    ) -> Result<Value, PeerError> {
+        let result = self
+            .rpc(
+                peer,
+                &Self::cancel_task_body(task_id, self.endpoint.tenant.as_deref()),
+                credential,
+            )
+            .await?;
+        // The same Task-shape validation as `get_task`: A2A answers a cancel
+        // with the task itself, and the id check keeps a confused server from
+        // acknowledging somebody else's task as this one stopped.
+        if !result.is_object()
+            || result.get("id").and_then(Value::as_str) != Some(task_id)
+            || result
+                .get("status")
+                .and_then(|status| status.get("state"))
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            return Err(invalid_response(
+                peer,
+                "CancelTask result is not the requested Task object",
             ));
         }
         Ok(result)

@@ -1,7 +1,7 @@
 +++
 title = "Status"
 description = "What is pre-alpha, what to pin, what is deliberately not built, and how to check."
-weight = 10
+weight = 12
 +++
 
 `agentplane` is published on crates.io and pre-alpha. This page answers three questions an
@@ -80,7 +80,7 @@ MUTANTS_SHARD=2/6 just mutants           # one slice, for a machine that is not 
 The mutation sweep is the one that matters most: it breaks each guarantee on
 purpose and requires the test *written for it* to fail. A capability that could
 be deleted without a test noticing is caught by that sweep, not by review — which
-is also why this page no longer asserts a list of them. An inventory is a claim a
+is why this page asserts no inventory of them. An inventory is a claim a
 reader has to trust; a sweep is one they can run.
 
 `--verify` is the same check for a single guarantee, and it exists because the

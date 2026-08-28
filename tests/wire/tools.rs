@@ -777,6 +777,127 @@ async fn untrusted_data_from_an_allowed_source_may_select_a_protected_argument()
     assert_eq!(client.calls.lock().unwrap().as_slice(), ["ledger/transfer"]);
 }
 
+/// An untrusted value outside a field's declared set never reaches the tool.
+///
+/// The content discipline: the manifest enumerates what may stand in the
+/// field, and a value the list does not carry is refused whatever chose it.
+/// The match is exact — a near miss is a refusal, never a correction — and
+/// the tool must not have been called, because a refusal after dispatch is
+/// no gate at all.
+#[tokio::test]
+async fn a_value_outside_the_declared_set_is_refused_before_the_tool() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let catalog = ToolCatalog::new().allow(
+        transfer(),
+        ToolSafety::default()
+            .max_sensitivity(Sensitivity::Secret)
+            .protect(ProtectedField::one_of(
+                "/recipient",
+                [json!("ops-account"), json!("audit-account")],
+            )),
+    );
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsStructured {
+            catalog,
+            client: Arc::clone(&client),
+            recipient_label: Label::untrusted(SourceId::new("model.complete")),
+        })
+        .build()
+        .run("structured", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+    assert!(client.calls.lock().unwrap().is_empty());
+}
+
+/// An untrusted choice **among** the declared values goes through.
+///
+/// The positive half, and the reason the discipline exists: this is the
+/// select-from-a-menu pattern made declarative. Every entry was reviewed, so
+/// an untrusted influence choosing which of them stands here discloses only
+/// the choice — a bounded release the reviewer priced when writing the list.
+/// Without this half, a mutation that refuses every valued field passes the
+/// refusal test above perfectly.
+#[tokio::test]
+async fn an_untrusted_choice_among_declared_values_may_select_a_protected_argument() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let catalog = ToolCatalog::new().allow(
+        transfer(),
+        ToolSafety::default()
+            .max_sensitivity(Sensitivity::Secret)
+            .protect(ProtectedField::one_of(
+                "/recipient",
+                // "treasury" is what the skill sends; the second entry keeps
+                // this a genuine menu rather than an equality in costume.
+                [json!("treasury"), json!("ops-account")],
+            )),
+    );
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsStructured {
+            catalog,
+            client: Arc::clone(&client),
+            recipient_label: Label::untrusted(SourceId::new("model.complete")),
+        })
+        .build()
+        .run("structured", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "an untrusted value drawn from the declared set was refused, so the \
+         menu behaves as though the field required trust: {:?}",
+        out.status
+    );
+    assert_eq!(client.calls.lock().unwrap().as_slice(), ["ledger/transfer"]);
+}
+
+/// A value set layers over a source rule; it does not substitute for it.
+///
+/// The declared value arrives from a source the field does not allow, and the
+/// call is refused: the disciplines are conjoined. A menu that overrode the
+/// provenance rule would let any tool in the plane launder an approved value
+/// into a field that names who may supply it.
+#[tokio::test]
+async fn a_declared_value_from_a_disallowed_source_is_still_refused() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let catalog = ToolCatalog::new().allow(
+        transfer(),
+        ToolSafety::default()
+            .max_sensitivity(Sensitivity::Secret)
+            .protect(
+                ProtectedField::from_sources("/recipient", [SourceId::new("run.input")])
+                    .restricted_to([json!("treasury")]),
+            ),
+    );
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsStructured {
+            catalog,
+            client: Arc::clone(&client),
+            recipient_label: Label::untrusted(SourceId::new("model.complete")),
+        })
+        .build()
+        .run("structured", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "an in-set value from a disallowed source went through — the value \
+         discipline substituted for the provenance one: {:?}",
+        out.status
+    );
+    assert!(client.calls.lock().unwrap().is_empty());
+}
+
 /// Reads a value through one tool, then pays through another, carrying the
 /// lookup's own label onto the transfer's `/recipient`.
 ///

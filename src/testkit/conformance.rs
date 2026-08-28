@@ -2554,12 +2554,13 @@ async fn a_rejected_batch_writes_nothing(fresh: Factory<'_>, r: &mut Report) {
 
 /// A quarantined run is findable by the person who has to deal with it.
 ///
-/// The most serious conclusion this runtime reaches used to produce a status, a
-/// log line and a counter — none of which can be queried, and a run started with
-/// `spawn` returns before the status exists. Every other backlog is findable by
-/// whoever must clear it; this one was not, which is the shape production
-/// studies of agent runtimes report as the most common failure: not an
-/// undetected fault, but a detected one whose signal never reaches a human.
+/// Without this, the most serious conclusion this runtime reaches would
+/// produce only a status, a log line and a counter — none of which can be
+/// queried, and a run started with `spawn` returns before the status exists.
+/// Every other backlog is findable by whoever must clear it, and this is the
+/// shape production studies of agent runtimes report as the most common
+/// failure: not an undetected fault, but a detected one whose signal never
+/// reaches a human.
 ///
 /// Both directions, because either alone passes for the wrong reason: a scan
 /// returning nothing satisfies "no other outcome", and one returning everything

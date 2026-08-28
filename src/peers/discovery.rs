@@ -18,8 +18,8 @@
 //! A card URL is frequently the first attacker-influenced string a deployment
 //! handles — it arrives in a config, a registry entry, or a message — and "just
 //! fetch it" is how a plane is made to probe its own network. So discovery is
-//! held to the same four controls as governed media and push delivery, which
-//! are the crate's other two URL dereferences:
+//! held to the same controls as governed media and push delivery, which
+//! are the crate's other URL dereferences:
 //!
 //! * an [`Egress`](crate::core::Egress) host allowlist, deny-by-default once
 //!   set;
@@ -28,10 +28,13 @@
 //!   how a rebinding attack passes a check and then connects somewhere else;
 //! * **no redirects**, because a check on the URL a caller supplied says
 //!   nothing about the third host an allowed one forwards to;
+//! * **HTTPS only**, loopback names in a testkit build excepted — a plaintext
+//!   card is whatever the network says it is, and the interface URL inside it
+//!   steers the credential-bearing call that follows;
 //! * a whole-request timeout, so a card server that never finishes answering
 //!   does not hold a task open.
 //!
-//! The allowlist is optional and the other three are not. That asymmetry is
+//! The allowlist is optional and the others are not. That asymmetry is
 //! deliberate: an allowlist is a deployment's statement about who it talks to
 //! and cannot be guessed on its behalf, while a plane fetching its own metadata
 //! service is wrong in every deployment. `netguard` documents itself as the
@@ -243,6 +246,24 @@ impl CardClient {
                 detail: "the card URL names no host".to_owned(),
             })?
             .to_owned();
+
+        // A card fetched over plaintext is a card any on-path party wrote:
+        // the interface URL inside it is where the next request carries the
+        // run's payload and a credential, so tampering here launders itself
+        // into the call that follows. Signature verification is opt-in, and a
+        // control that only exists when a deployment remembered to configure
+        // it is not the baseline. Loopback by *name* is the one testkit
+        // exception, exactly as on the call path.
+        if parsed.scheme() != "https"
+            && !(self.loopback_allowed()
+                && crate::netguard::is_loopback_name(&host.to_ascii_lowercase()))
+        {
+            return Err(DiscoveryError::Refused(format!(
+                "the card URL '{url}' is not https — a plaintext card is whatever \
+                 the network says it is, and its interface URL steers the calls \
+                 that follow"
+            )));
+        }
 
         if let Some(egress) = &self.egress {
             // Before the request is built, so a refused host is never resolved

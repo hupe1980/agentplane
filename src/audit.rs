@@ -475,8 +475,8 @@ fn warrant_in(run: RunId, records: &[Record]) -> Option<Warrant> {
             ..
         } => Some(Warrant {
             run,
-            declaration: governed_by.clone(),
-            policy: policy_bundle.clone(),
+            declaration: governed_by.as_deref().cloned(),
+            policy: policy_bundle.as_deref().cloned(),
         }),
         _ => None,
     })

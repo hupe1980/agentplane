@@ -850,6 +850,7 @@ impl ModelProvider for ChatCompletions {
         } = request;
 
         super::refuse_provider_side_media(prompt, model)?;
+        super::refuse_in_thread_instructions(prompt, model)?;
 
         // No model-family-neutral spelling exists on this wire. Refused
         // rather than dropped: a declared control that silently does nothing

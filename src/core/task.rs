@@ -424,7 +424,10 @@ pub struct Decision {
     /// not an approval.
     pub actor: String,
     pub reason: String,
-    /// Anything the decision adds — an amended amount, a chosen option.
+    /// Anything the decision adds — and on an approved call task, the call:
+    /// the declarative tiers dispatch an approving reviewer's amendment in
+    /// place of the model's arguments, schema-checked and labelled as the
+    /// reviewer's own trusted value. On a rejection it is recorded advice.
     #[serde(default)]
     pub amendment: Value,
 }

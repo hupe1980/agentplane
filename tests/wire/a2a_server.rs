@@ -2413,6 +2413,18 @@ async fn a_full_quota_is_back_pressure_with_no_arithmetic_in_the_answer() {
         !message.contains(|c: char| c.is_ascii_digit()),
         "the quota's counters leaked to an external caller: {message}"
     );
+    // The pair, not the numeral, is the identity: -32029 sits in space A2A
+    // 1.0 reserves for its own future errors, so a client backs off only on
+    // an ErrorInfo under this plane's own domain — raw strings here, so the
+    // pin does not share the constants it exists to check.
+    assert_eq!(
+        body["error"]["data"][0]["domain"], "agentplane.hupe1980.github.io",
+        "the back-pressure refusal carries no identifying domain: {body:#}"
+    );
+    assert_eq!(
+        body["error"]["data"][0]["reason"], "QUOTA_EXHAUSTED",
+        "the back-pressure refusal carries no reason token: {body:#}"
+    );
 
     // The positive half: the identical request against the identical fixture
     // shape minus the quota completes, so the refusal above is the ceiling
@@ -2499,6 +2511,155 @@ async fn this_planes_client_can_call_this_planes_server() {
     assert!(
         sources.iter().any(|s| s.contains("acme-peer")),
         "the bearer identity did not become the message's provenance: {sources:?}"
+    );
+}
+
+/// This plane's client can tell this plane's server to stop a task.
+///
+/// The lifecycle half the client was missing: it could create work at a peer
+/// and poll it, and a run that was itself cancelled had no way to propagate
+/// the stop — the cancellation ended at this plane's edge while the peer
+/// kept spending on an answer nobody would read. `CancelTask` is cooperative
+/// on both ends: the answer records intent, and the eventual `CANCELED` is
+/// observed by polling.
+#[cfg(feature = "a2a")]
+#[tokio::test]
+async fn this_planes_client_cancels_a_task_on_this_planes_server() {
+    use agentplane::core::{Delegation, Principal, Scope};
+    use agentplane::peers::a2a::{A2aClient, Endpoint};
+    use agentplane::peers::{
+        PeerClient, PeerCredential, PeerGrant, PeerId, PeerRegistry, PeerTask, PeerTaskCancel,
+        PeerTaskState,
+    };
+
+    let f = continuation_fixture();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = f.router();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let peer = PeerId::new("self");
+    let chain = Delegation::root(Principal::new("user:operator", Scope::root()));
+    let client = Arc::new(
+        A2aClient::new(Endpoint::new(format!("http://{addr}/a2a")))
+            .unwrap()
+            .allow_loopback(),
+    );
+    let credential = PeerCredential::for_audience(peer.clone(), "acme-peer");
+
+    // A task that suspends waiting for input — genuinely in flight, so a
+    // cancel has something to stop.
+    let answer = client
+        .send(
+            &peer,
+            "settlement.check",
+            &json!({"amount": 10}),
+            &chain,
+            Some(&credential),
+            None,
+        )
+        .await
+        .expect("the suspending call was refused");
+    let task = PeerTask::from_response(peer.clone(), &answer)
+        .expect("valid response")
+        .expect("a task came back");
+
+    // Through the effect, not only the raw transport: the registry supplies
+    // the grant and the audience-bound credential exactly as the originating
+    // call's did.
+    let registry = PeerRegistry::new().allow(
+        peer.clone(),
+        PeerGrant::new(Scope::root()).with_credential(&peer, credential.clone()),
+    );
+    let cancel = PeerTaskCancel::prepare(
+        &registry,
+        Arc::clone(&client) as Arc<dyn agentplane::peers::PeerClient>,
+        task.clone(),
+    )
+    .expect("a registered peer");
+    let snapshot = agentplane::core::Effect::perform(&cancel)
+        .await
+        .expect("the cancel was refused");
+    assert_eq!(snapshot.task.id, task.id);
+
+    // Cooperative means eventually: the server drives the suspended run to
+    // its unwind, so within a moment the polled state is CANCELED.
+    let mut cancelled = snapshot.state == PeerTaskState::Canceled;
+    for _ in 0..20 {
+        if cancelled {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let polled = client
+            .get_task(&peer, &task.id, Some(&credential))
+            .await
+            .expect("GetTask after cancel");
+        cancelled = polled["status"]["state"] == "TASK_STATE_CANCELED";
+    }
+    assert!(
+        cancelled,
+        "the cancel was acknowledged and the task never stopped"
+    );
+
+    // A cancel of a task that already finished is a clean refusal, not a
+    // second act — which is what makes retrying the effect safe.
+    let repeat = client.cancel_task(&peer, &task.id, Some(&credential)).await;
+    assert!(
+        matches!(&repeat, Err(agentplane::peers::PeerError::Refused { .. })),
+        "a repeat cancel of a finished task must be a clean refusal: {repeat:?}"
+    );
+}
+
+/// This plane's client can name a capability on a plane that serves several.
+///
+/// Dispatch is named, never inferred — and the name travels in
+/// `message.metadata.skill`, which is the field this server reads and the
+/// card advertises. The client used to carry the capability only inside its
+/// governance extension, where the server deliberately does not look for a
+/// dispatch decision; every round-trip test ran against a single-skill plane,
+/// whose fallback dispatches without a name, so the first two-skill deployment
+/// was where the crate's own halves stopped understanding each other.
+#[cfg(feature = "a2a")]
+#[tokio::test]
+async fn this_planes_client_names_its_skill_on_a_multi_skill_plane() {
+    use agentplane::core::{Delegation, Principal, Scope};
+    use agentplane::peers::a2a::{A2aClient, Endpoint};
+    use agentplane::peers::{PeerClient, PeerCredential, PeerId};
+
+    let f = fixture_from(TWO_SKILLS, Arc::new(Recording::default()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = f.router();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let peer = PeerId::new("self");
+    let chain = Delegation::root(Principal::new("user:operator", Scope::root()));
+    let client = A2aClient::new(Endpoint::new(format!("http://{addr}/a2a")))
+        .unwrap()
+        .allow_loopback();
+    let credential = PeerCredential::for_audience(peer.clone(), "acme-peer");
+
+    client
+        .send(
+            &peer,
+            "settlement.reverse",
+            &json!({"amount": 10}),
+            &chain,
+            Some(&credential),
+            None,
+        )
+        .await
+        .expect("a named capability on a two-skill plane was refused as ambiguous");
+
+    let seen = f.seen.lock().unwrap();
+    let (_, _, input) = seen.first().expect("no skill ran");
+    assert_eq!(
+        input["$a2a_message"]["metadata"]["skill"], "settlement.reverse",
+        "the capability the caller named is not the one that dispatched"
     );
 }
 
@@ -3379,7 +3540,7 @@ async fn card_discovery_refuses_an_inward_address_a_redirect_and_a_hang() {
     //    the only lock, and it is the one that stands between a hostile card URL
     //    and the cloud metadata service.
     let refused = CardClient::new()
-        .discover("http://169.254.169.254")
+        .discover("https://169.254.169.254")
         .await
         .expect_err("the link-local metadata address was fetched");
     assert!(
@@ -3455,6 +3616,55 @@ async fn card_discovery_refuses_an_inward_address_a_redirect_and_a_hang() {
     );
 }
 
+/// **A plaintext endpoint is refused before anything is sent — on both legs.**
+///
+/// The peer call carries the run's payload and a bearer credential; the card
+/// fetch decides where that call will go. Push already refuses a plaintext
+/// webhook for the same reason, and a rule enforced on one outbound leg and
+/// not its siblings is the divergence every audited defect in this layer sat
+/// on. The scheme comes from a card — untrusted input — so it is not the far
+/// side's choice to make; only the testkit loopback build may speak
+/// plaintext, keyed on the name.
+#[tokio::test]
+async fn a_plaintext_peer_endpoint_and_card_url_are_refused() {
+    use agentplane::core::{Delegation, Principal, Scope};
+    use agentplane::peers::a2a::{A2aClient, Endpoint};
+    use agentplane::peers::{CardClient, DiscoveryError, PeerClient, PeerId};
+
+    let client = A2aClient::new(Endpoint::new("http://peer.example/a2a")).expect("client");
+    let chain = Delegation::root(Principal::new("user:owner", Scope::root()));
+    let error = client
+        .send(
+            &PeerId::new("plaintext"),
+            "audit.check",
+            &json!({}),
+            &chain,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a plaintext endpoint was called");
+    assert!(
+        matches!(&error, agentplane::peers::PeerError::Refused { detail, .. }
+            if detail.contains("not https")),
+        "a plaintext peer endpoint was not refused as such: {error:?}"
+    );
+    assert_eq!(
+        error.disposition(),
+        agentplane::core::Disposition::DidNotHappen,
+        "a scheme refusal happens before the request exists"
+    );
+
+    let refused = CardClient::new()
+        .fetch("http://peer.example/.well-known/agent-card.json")
+        .await
+        .expect_err("a plaintext card URL was fetched");
+    assert!(
+        matches!(&refused, DiscoveryError::Refused(m) if m.contains("not https")),
+        "a plaintext card URL was not refused as such: {refused:?}"
+    );
+}
+
 /// **A card names an address, and the call that follows checks it.**
 ///
 /// Discovery being guarded is only half. `AgentCard::endpoint` takes the URL
@@ -3474,7 +3684,7 @@ async fn a_peer_endpoint_that_resolves_inward_is_refused_before_the_request() {
     use agentplane::peers::a2a::{A2aClient, Endpoint};
     use agentplane::peers::{PeerClient, PeerId};
 
-    let client = A2aClient::new(Endpoint::new("http://169.254.169.254/a2a")).expect("client");
+    let client = A2aClient::new(Endpoint::new("https://169.254.169.254/a2a")).expect("client");
     let chain = Delegation::root(Principal::new("user:owner", Scope::root()));
     let error = client
         .send(

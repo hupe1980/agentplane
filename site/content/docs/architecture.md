@@ -1,7 +1,7 @@
 +++
 title = "Architecture"
 description = "How the journal, effect protocol, replay, sagas and the Merkle log actually work — mechanism by mechanism."
-weight = 5
+weight = 6
 +++
 
 How the runtime works, and why each piece is shaped the way it is.
@@ -1044,10 +1044,15 @@ Two schema constraints carry the correctness:
 Every record of a case-bound run carries its case id, so "show me everything
 about this matter" is one indexed range scan instead of a join across runs.
 
-**Closing is guarded.** A case with an unmet obligation refuses to close. That
-is the check that stops a missed regulatory window from vanishing behind a tidy
-status. Closing releases the correlation keys, so a genuinely new matter about
-the same entity opens a fresh case rather than reanimating a concluded one.
+**Closing is guarded.** A case with an unmet obligation refuses to close — as
+the typed `ObligationsOutstanding` refusal, never a backend fault, so a store
+that is merely unreachable cannot read as the rule firing. That is the check
+that stops a missed regulatory window from vanishing behind a tidy status.
+Closing releases the correlation keys, so a genuinely new matter about the
+same entity opens a fresh case rather than reanimating a concluded one. Both
+halves hold on the agent path too: `set_status(Closed)` routes through the
+same closure, and the conformance battery pins the refusal's type on every
+backend.
 
 ### Why a case rather than one long-lived run
 
@@ -1741,8 +1746,12 @@ loopback literal or `localhost`, never one that merely resolved there. The serve
 `GetTask`, `ListTasks`, streaming/subscription, cancellation, durable push, and
 extended cards. A returned Task becomes a typed `PeerTask`; `PeerTaskCall` polls
 it as an untrusted journaled effect under the same peer grant and
-audience-bound credential. Strict replay reads the recorded snapshot and never
-polls again. Subscription remains a server-side journal view rather than a
+audience-bound credential, and `PeerTaskCancel` asks the peer to stop it — a
+run that commissioned remote work and is itself cancelled propagates the stop
+instead of leaving the peer spending on an answer nobody will read. The cancel
+is cooperative and safely retryable: a repeat of one that landed meets the
+protocol's `TaskNotCancelable` refusal, never a second act. Strict replay
+reads the recorded snapshot and never polls again. Subscription remains a server-side journal view rather than a
 second client event channel; outbound callers use explicit polling or an
 application webhook mapped into the existing inbound-event boundary.
 
@@ -1931,7 +1940,10 @@ the protocol assumes the agent works out what is being asked. This plane will
 not. The skill comes from `message.metadata.skill`, matched against the card's
 advertised ids; with exactly one skill there is nothing to infer, and with
 several and none named the call is refused. Choosing what to run by reading
-untrusted prose would let the sender pick the capability.
+untrusted prose would let the sender pick the capability. The convention binds
+both halves: this plane's own client writes its capability into that same
+field, and the card declares it as an extension so a foreign caller learns
+the rule before the first refusal rather than from it.
 
 **A peer's message is untrusted.** It is admitted as `Tainted` with provenance
 `peer:<caller>` — never as trusted input — so a protected sink field can name
@@ -1952,6 +1964,21 @@ internal error reads as a transient fault, and the caller retries a decision
 that will never change. The decline says only that it was declined: the
 runtime's own denial names the action and resource the gate keyed on, which is
 enough to map this plane's authorization vocabulary by probing it.
+
+Back-pressure — a full quota refusing admission — answers with a
+server-defined code (`-32029`) **and** a `google.rpc.ErrorInfo` under this
+project's own domain, and the pair is the identity: JSON-RPC gives
+implementations `-32000..-32099` while A2A 1.0 reserves `-32001..-32099` for
+its own table, so the numeral alone can mean something else to somebody
+standards-compliant. The client backs off only on the marked pair; a bare
+`-32029` from a foreign server is an unknown fault and stays in doubt. The
+message beside the code is one fixed sentence with no numbers in it — the
+quota's counters are the operator's to read, not a prober's.
+
+Outbound, both legs refuse plaintext: the peer call carries the run's payload
+and a bearer credential, and the card fetch decides where that call will go,
+so neither speaks `http` to anything but a testkit loopback name — the same
+rule push delivery applies to webhook URLs.
 
 Push is advertised exactly when its durable worker is wired. Streaming is
 advertised true because status and artifact events exist; `SubscribeToTask`

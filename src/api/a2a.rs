@@ -110,16 +110,25 @@ pub mod code {
     /// work was admitted.
     ///
     /// Not in A2A 1.0's error table — the spec defines only permanent
-    /// missing-capability codes in `-32001..-32009` and offers no transient or
-    /// back-pressure signal at all. Reaching into the table anyway would be
-    /// worse than inventing a code: `-32004 UnsupportedOperationError` for a
-    /// full quota teaches a compliant caller that the *operation does not exist
+    /// missing-capability codes and assigns back-pressure no code at all; its
+    /// own guidance stops at "return appropriate error responses when rate
+    /// limits are exceeded". Reaching into the table anyway would be worse
+    /// than inventing a code: `-32004 UnsupportedOperationError` for a full
+    /// quota teaches a compliant caller that the *operation does not exist
     /// here* — the correct response to which is to abandon, never to retry —
     /// when the truthful answer is "not right now". So the code is drawn from
-    /// JSON-RPC's server-defined
-    /// range (`-32000..-32099`), outside the spec's table so no compliant
-    /// client can mistake it for a defined permanent condition, and shared
-    /// with no other refusal this server emits so it stays unambiguous.
+    /// JSON-RPC's implementation-defined server-error range.
+    ///
+    /// The **number is not the identity**. A2A 1.0 reserves `-32001..-32099`
+    /// for its own errors, the same band JSON-RPC gives implementations, so a
+    /// future spec revision could assign this numeral a meaning of its own.
+    /// What makes the refusal identifiable is the `google.rpc.ErrorInfo`
+    /// beside it — [`ERROR_DOMAIN`](crate::peers::ERROR_DOMAIN) +
+    /// [`QUOTA_EXHAUSTED_REASON`](crate::peers::QUOTA_EXHAUSTED_REASON), a
+    /// domain this project controls — and that pair is what this crate's own
+    /// client keys its refuse-and-come-back classification on. A bare
+    /// `-32029` from a foreign server proves nothing and is classified as an
+    /// unknown fault.
     ///
     /// What this code does NOT carry is the quota arithmetic: declines on this
     /// surface are deliberately uniform, and counters or limits in the message
@@ -803,7 +812,7 @@ impl RpcError {
 
     /// The machine-readable reason A2A 1.0's error-handling rules require
     /// beside an A2A-specific code, as a `google.rpc.ErrorInfo` in
-    /// `error.data`.
+    /// `error.data` — `(domain, reason)`.
     ///
     /// Derived from the code rather than declared per call site, because the
     /// two are one fact: the spec's table maps each code to exactly one reason
@@ -812,19 +821,31 @@ impl RpcError {
     /// spec assigns them none — so they return `None` and the error omits
     /// `data` rather than inventing a token.
     ///
+    /// The spec's codes carry the spec's domain. [`code::QUOTA_EXHAUSTED`]
+    /// carries this plane's own — [`ERROR_DOMAIN`](crate::peers::ERROR_DOMAIN)
+    /// — and that domain is load-bearing rather than decorative: the numeric
+    /// code sits in space A2A 1.0 reserves for its own future errors, so the
+    /// code alone is not proof of what it means. The `(domain, reason)` pair
+    /// is, and it is what this crate's client keys its back-off
+    /// classification on.
+    ///
     /// This adds no information a prober does not already have: the reason is
     /// a restatement of the code in the same response. The uniform-refusal
     /// rule governs what a *model* is told; this is the protocol channel to an
     /// authenticated peer.
-    const fn reason(&self) -> Option<&'static str> {
+    const fn reason(&self) -> Option<(&'static str, &'static str)> {
+        const A2A: &str = "a2a-protocol.org";
+        const SELF_DOMAIN: &str = crate::peers::ERROR_DOMAIN;
+        const QUOTA_EXHAUSTED_REASON: &str = crate::peers::QUOTA_EXHAUSTED_REASON;
         match self.code {
-            code::TASK_NOT_FOUND => Some("TASK_NOT_FOUND"),
-            code::TASK_NOT_CANCELABLE => Some("TASK_NOT_CANCELABLE"),
-            code::PUSH_NOT_SUPPORTED => Some("PUSH_NOTIFICATION_NOT_SUPPORTED"),
-            code::UNSUPPORTED_OPERATION => Some("UNSUPPORTED_OPERATION"),
-            code::CONTENT_TYPE_NOT_SUPPORTED => Some("CONTENT_TYPE_NOT_SUPPORTED"),
-            code::EXTENDED_CARD_NOT_CONFIGURED => Some("EXTENDED_AGENT_CARD_NOT_CONFIGURED"),
-            code::VERSION_NOT_SUPPORTED => Some("VERSION_NOT_SUPPORTED"),
+            code::TASK_NOT_FOUND => Some((A2A, "TASK_NOT_FOUND")),
+            code::TASK_NOT_CANCELABLE => Some((A2A, "TASK_NOT_CANCELABLE")),
+            code::PUSH_NOT_SUPPORTED => Some((A2A, "PUSH_NOTIFICATION_NOT_SUPPORTED")),
+            code::UNSUPPORTED_OPERATION => Some((A2A, "UNSUPPORTED_OPERATION")),
+            code::CONTENT_TYPE_NOT_SUPPORTED => Some((A2A, "CONTENT_TYPE_NOT_SUPPORTED")),
+            code::EXTENDED_CARD_NOT_CONFIGURED => Some((A2A, "EXTENDED_AGENT_CARD_NOT_CONFIGURED")),
+            code::VERSION_NOT_SUPPORTED => Some((A2A, "VERSION_NOT_SUPPORTED")),
+            code::QUOTA_EXHAUSTED => Some((SELF_DOMAIN, QUOTA_EXHAUSTED_REASON)),
             _ => None,
         }
     }
@@ -833,12 +854,12 @@ impl RpcError {
     /// applies.
     fn body(&self) -> Value {
         match self.reason() {
-            Some(reason) => json!({
+            Some((domain, reason)) => json!({
                 "code": self.code,
                 "message": self.message,
                 "data": [{
                     "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                    "domain": "a2a-protocol.org",
+                    "domain": domain,
                     "reason": reason,
                 }],
             }),

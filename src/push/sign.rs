@@ -181,6 +181,15 @@ pub const HEADER_TIMESTAMP: &str = "webhook-timestamp";
 pub const HEADER_SIGNATURE: &str = "webhook-signature";
 /// A2A's opaque per-task token, echoed on every delivery for the receiver
 /// that registered it to validate against.
+///
+/// The spelling is the **reference SDK's**, not the specification's: A2A 1.0
+/// kept the `token` field on the push configuration and dropped the 0.3-era
+/// header definition without naming a replacement, so the spec leaves the
+/// token with no defined carriage at all. The maintained `a2a-python` sender
+/// still emits exactly this header, which makes it the one spelling a
+/// receiver built on the official SDKs actually checks — and a token that
+/// never rides is a secret with no purpose. Distinct from
+/// `AuthenticationInfo`, which alone forms the `Authorization` header.
 pub const HEADER_A2A_TOKEN: &str = "x-a2a-notification-token";
 
 /// The prefix Standard Webhooks gives a base64-encoded symmetric key.

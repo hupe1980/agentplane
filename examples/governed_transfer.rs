@@ -11,13 +11,12 @@
 //!
 //! # The reach a coded skill has is the reach its manifest declared
 //!
-//! This example used to hand-build a `ToolCatalog` inside the skill and call
-//! `ToolCall::prepare` against it, which is what a reader copies. Nothing bound
-//! that catalogue to the declaration governing the skill, so the reach it
-//! granted was whatever the code said — and it could be *laxer* than the
-//! manifest, which is the dangerous direction: a `read_only` entry for a tool
-//! the manifest calls mutating exempts it from the whole-value taint gate and
-//! makes a timed-out payment retryable.
+//! A skill that hand-built a `ToolCatalog` and called `ToolCall::prepare`
+//! against it would work — and nothing would bind that catalogue to the
+//! declaration governing the skill, so the reach it granted would be whatever
+//! the code said. Laxer than the manifest is the dangerous direction: a
+//! `read_only` entry for a tool the manifest calls mutating exempts it from
+//! the whole-value taint gate and makes a timed-out payment retryable.
 //!
 //! So the catalogue comes from the manifest — `ToolCatalog::from_manifest`,
 //! stated once — and the skill dispatches through `cx.call_tool`, which uses the
@@ -83,7 +82,7 @@ impl ToolClient for Ledger {
 /// No catalogue, no client, no `Arc<dyn ToolClient>`.
 ///
 /// The skill holds nothing that could disagree with the declaration governing
-/// it. That is the whole difference from the earlier version of this file.
+/// it — which is the module doc's point, made structural.
 #[derive(Debug)]
 struct Transfer;
 

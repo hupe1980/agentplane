@@ -148,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         learned.output.as_ref().map(|o| o.peek().clone()),
         Some(json!(["Customer prefers German"]))
     );
+    println!("1. remembered      → \"Customer prefers German\"");
 
     let recalled = runtime
         .run(
@@ -158,6 +159,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
         recalled.output.map(|o| o.peek().clone()),
         learned.output.map(|o| o.peek().clone())
+    );
+    println!(
+        "2. recalled        → the same answer, on a later run, through the journaled recall effect"
     );
 
     let stored: MemoryItem = store
@@ -171,7 +175,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .provenance
             .contains(&SourceId::new("user:customer-7"))
     );
+    println!(
+        "   its label      → untrusted, provenance {:?} — storage promoted nothing",
+        stored
+            .label()
+            .provenance
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
 
+    semantic_recall(&store, &stored).await?;
+
+    store.set_legal_hold("team-support-language", true).await?;
+    let after_expiry = Timestamp::from_unix_timestamp(4_102_444_801)?;
+    let swept = store.sweep_expired(after_expiry).await?;
+    println!(
+        "4. legal hold      → a sweep past the expiry date removed {swept} — a hold outranks the calendar"
+    );
+    assert_eq!(swept, 0);
+    store.set_legal_hold("team-support-language", false).await?;
+    let swept = store.sweep_expired(after_expiry).await?;
+    println!(
+        "   hold released  → the same sweep removed {swept} — expiry is enforced, not advisory"
+    );
+    assert_eq!(swept, 1);
+    Ok(())
+}
+
+/// A second plane, wired for semantic recall over the memory the first wrote.
+async fn semantic_recall(
+    store: &Arc<RedbStore>,
+    stored: &MemoryItem,
+) -> Result<(), Box<dyn std::error::Error>> {
     let retriever = Arc::new(InMemorySemanticRetriever::new(
         IndexIdentity {
             snapshot: "example-snapshot-1".to_owned(),
@@ -202,16 +238,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ranked.output.map(|o| o.peek().clone()),
         Some(json!("Customer prefers German"))
     );
-
-    store.set_legal_hold("team-support-language", true).await?;
-    let after_expiry = Timestamp::from_unix_timestamp(4_102_444_801)?;
-    assert_eq!(store.sweep_expired(after_expiry).await?, 0);
-    store.set_legal_hold("team-support-language", false).await?;
-    assert_eq!(store.sweep_expired(after_expiry).await?, 1);
-
     println!(
-        "remembered, semantically recalled, held, and expired: {}",
-        stored.content
+        "3. semantic        → \"preferred language\" ranked it first, in the embedding space the wiring pinned"
     );
     Ok(())
 }

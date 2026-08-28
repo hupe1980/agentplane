@@ -1910,10 +1910,10 @@ impl Runtime {
     ) -> RecordKind {
         RecordKind::RunAdmitted {
             capability: capability.to_owned(),
-            governed_by,
+            governed_by: governed_by.map(Box::new),
             input: input.peek().clone(),
             input_label: input.label().clone(),
-            policy_bundle: self.policy.as_ref().map(|p| p.bundle()),
+            policy_bundle: self.policy.as_ref().map(|p| Box::new(p.bundle())),
             canon: crate::core::canon::VERSION,
             idempotency_key,
         }
@@ -2296,7 +2296,9 @@ impl Runtime {
         let recorded = records
             .iter()
             .find_map(|record| match record.kind() {
-                RecordKind::RunAdmitted { policy_bundle, .. } => Some(policy_bundle.clone()),
+                RecordKind::RunAdmitted { policy_bundle, .. } => {
+                    Some(policy_bundle.as_deref().cloned())
+                }
                 _ => None,
             })
             .ok_or_else(|| {

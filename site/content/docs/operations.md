@@ -1,7 +1,7 @@
 +++
 title = "Operations"
 description = "Deploying, high availability, retention, observability, and a runbook for every state a run can get stuck in."
-weight = 8
+weight = 10
 +++
 
 Running this for real: topologies, the store contract, the background sweep,
@@ -337,7 +337,9 @@ one precise question: which leases expired while still naming an owner. That is
 the set of runs somebody was executing when their process stopped, and the
 sweep resumes each one: takeover bumps the epoch, the store fences the dead
 owner's next append, and replay reads completed effects back rather than
-redoing them.
+redoing them. `cargo run --example recovered_run` walks the whole thing on two
+in-process instances: one dies mid-run, the other's sweep finds it by its
+lapsed lease and finishes it, no stage repeated.
 
 Three details are worth knowing at 3 a.m.:
 
@@ -931,6 +933,14 @@ reading the body's actor, since there is nothing to read.
 believes they decided as Alice, the journal says Bob, and the disagreement
 surfaces at an audit months later. A `422` says so at the first call instead.
 
+`amendment` is not a note. On an approved call task it **is the call**: the
+runtime dispatches the reviewer's arguments in place of the model's, labelled
+as the reviewer's — trusted, provenance `task:agent.approve_call`, the
+original arguments' sensitivity — and every sink gate judges them like any
+other value. An amendment that does not fit the tool's declared argument
+schema dispatches nothing. On a rejection it stays what it reads as: recorded
+advice ("no, and here is what would pass").
+
 ### Two gates, and the surface will not start without the second
 
 Authentication says *who*; it does not say *what they may do*. An operator
@@ -1043,6 +1053,25 @@ than admits — a ceiling that yields when its accounting is down is one an
 attacker removes by taking the accounting down. And concurrency is tracked as a
 *set of runs*, not a counter, so a process that dies mid-run strands a slot an
 operator can name and release, rather than a number nobody can audit.
+
+### The emergency stop
+
+Beside the ceilings sits a switch that is deliberately not one:
+`Runtime::set_halt(Some(reason))` stops a tenant from **starting new work**,
+across every instance, because the flag lives in the quota store rather than
+in the process — a stop that only stops the instance it was thrown on is the
+in-process-counter failure arriving during an incident. The refusal is its own
+error carrying the operator's reason, never a ceiling: a ceiling says *not
+right now* and invites the retry somebody pulling this switch is trying to
+stop.
+
+What it does **not** stop, deliberately: runs already executing, and suspended
+runs resuming. Those are existing work, and refusing to let them continue
+would strand them mid-saga with reversals unrun — turning one incident into
+two. Work in flight is stopped by *cancelling* it (`request_cancel`), which
+unwinds what it did and records who asked. `cargo run --example operator_stop`
+runs both brakes side by side, which is the clearest statement of the
+difference.
 
 ### One surface, many tenants
 

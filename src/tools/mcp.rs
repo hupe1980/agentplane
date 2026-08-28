@@ -14,7 +14,7 @@
 //!
 //! | `ServiceError` | Disposition | Why |
 //! |---|---|---|
-//! | `McpError` (`METHOD_NOT_FOUND`, `INVALID_PARAMS`, `INVALID_REQUEST`, parse) | `DidNotHappen` | the server judged the request unrunnable and declined it; the tool never ran |
+//! | `McpError` (`METHOD_NOT_FOUND`, `INVALID_PARAMS`, `INVALID_REQUEST`, parse, legacy `RESOURCE_NOT_FOUND`) | `DidNotHappen` | the server judged the request unrunnable and declined it; the tool never ran |
 //! | `McpError` (anything else) | `InDoubt` | the server errored, possibly mid-execution |
 //! | `Timeout` | `InDoubt` | sent, no answer — a timeout is not evidence |
 //! | `Cancelled` | `InDoubt` | *we* gave up; the server may still be running it |
@@ -499,7 +499,13 @@ impl McpClient {
             // The server judged the request unrunnable — unknown method, bad
             // params, unparseable frame, or not a valid request object — and
             // declined it before executing anything. The only genuinely
-            // safe-to-repeat class.
+            // safe-to-repeat class. `RESOURCE_NOT_FOUND` (`-32002`) belongs
+            // here because negotiation downgrades: 2026-07-28 folded it into
+            // `INVALID_PARAMS`, but a server on an earlier revision still
+            // answers a `resources/read` for a URI it does not have with the
+            // old code, and the spec tells clients to keep accepting it. Left
+            // in the fall-through it reads as *outcome unknown* and a read of
+            // a resource that does not exist is retried forever.
             ServiceError::McpError(err)
                 if matches!(
                     err.code,
@@ -507,6 +513,7 @@ impl McpClient {
                         | ErrorCode::INVALID_PARAMS
                         | ErrorCode::INVALID_REQUEST
                         | ErrorCode::PARSE_ERROR
+                        | ErrorCode::RESOURCE_NOT_FOUND
                 ) =>
             {
                 ToolError::Refused {
@@ -1125,4 +1132,33 @@ fn render(result: &rmcp::model::CallToolResult) -> String {
         return structured.to_string();
     }
     serde_json::to_string(&result.content).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+    use crate::core::Disposition;
+
+    /// A legacy server's `-32002` is a judgement, not an unknown outcome.
+    ///
+    /// The current revision folded resource-not-found into `INVALID_PARAMS`,
+    /// but negotiation downgrades by design and an older server still answers
+    /// with the old code — which the spec tells clients to keep accepting. In
+    /// the in-doubt fall-through, a read of a resource that does not exist
+    /// classifies as *may have executed* and is retried under policy forever;
+    /// nothing ran, and the honest class is a refusal.
+    #[test]
+    fn a_legacy_resource_not_found_is_a_refusal_not_an_unknown_outcome() {
+        let tool = ToolId::new("kb", "resource/read");
+        let error = ServiceError::McpError(rmcp::model::ErrorData::resource_not_found(
+            "no such resource",
+            None,
+        ));
+        let classified = McpClient::classify(&tool, &error);
+        assert!(
+            matches!(classified, ToolError::Refused { .. }),
+            "-32002 classified as: {classified}"
+        );
+        assert_eq!(classified.disposition(), Disposition::DidNotHappen);
+    }
 }

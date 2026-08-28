@@ -98,7 +98,8 @@ struct Answers {
 #[async_trait::async_trait]
 impl Skill for Answers {
     fn descriptor(&self) -> SkillDescriptor {
-        SkillDescriptor::new("desk.answer").provides("desk.answer")
+        // A skill that declares nothing answers its own name.
+        SkillDescriptor::new("desk.answer")
     }
 
     async fn invoke(

@@ -481,11 +481,11 @@ mod tests {
     /// **A declared schema binds the fake exactly as it binds a real driver.**
     ///
     /// This is the one way a stub can be worse than useless: not by failing a
-    /// test that should pass, but by *passing* one that no provider could. The
-    /// fake used to record `output.schema` and ignore it, so a run scripted with
-    /// `will_say("...")` against a schema-declaring agent completed and yielded
-    /// `Null` — while every real driver answers `Unusable`, because the answer
-    /// is not JSON. An adopter lost an afternoon to it before we did.
+    /// test that should pass, but by *passing* one that no provider could. A
+    /// fake that recorded `output.schema` and ignored it would let a run
+    /// scripted with `will_say("...")` against a schema-declaring agent
+    /// complete and yield `Null` — while every real driver answers `Unusable`,
+    /// because the answer is not JSON.
     ///
     /// Both halves are asserted. The refusal, because that is the behaviour that
     /// was missing; and the acceptance, because a fake that refused *every*

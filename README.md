@@ -60,15 +60,25 @@ cargo run --example governed_transfer --features manifest
 cargo run --example saga_checkout      # reverse compensation, replay-safe unwind
 cargo run --example effect_group       # calls that take together, or not at all
 cargo run --example memory_run         # private/team memory, provenance, recall
+cargo run --example budget_pause       # a ceiling pauses the run; a raise
+                                        # resumes it, on the record, nothing repeated
+cargo run --example operator_stop      # cancel a run and it unwinds; halt a
+                                        # tenant and nothing new starts
+cargo run --example recovered_run      # an instance dies mid-run; the survivor's
+                                        # sweep finds it and finishes it
 cargo run --example bedrock_live --features bedrock
                                         # env-gated Amazon Bedrock Converse call
 cargo run --example openai_live --features providers
                                         # env-gated OpenAI Responses call
 cargo run --example tool_loop --features redb,testkit,manifest
                                         # a model choosing tools, and four refusals
+cargo run --example approved_call --features redb,testkit,manifest
+                                        # a person approves the exact call —
+                                        # suspend, worklist, approve or refuse
 cargo run --example planned_run --features redb,testkit,manifest
                                         # plan once, execute without the model —
-                                        # a prompt injection with no reader
+                                        # a prompt injection with no reader, and
+                                        # an invented recipient refused
 cargo run --example sealed_run --features redb,testkit,keyring
                                         # erase a case: every copy unreadable,
                                         # and the chain still verifies
@@ -211,7 +221,7 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | 🏷️ | **Field-level information flow** — exact outbound arguments are bound to hierarchical provenance; recipient, amount, path, URL and other authority-bearing fields can require trusted or named sources while ordinary content remains untrusted |
 | 💸 | **Budgets that bind** — a failed model call is billed for what it burned, because the provider bills for it too |
 | 🧬 | **Effects that take together, or not at all** — a group declares the resources it touches and refuses any member outside them. Each reversible member records the concrete call that undoes it, built from what that call *actually returned* rather than reconstructed later from state that has moved — the gap a per-step saga leaves, since `compensate` is handed the output of a step that failed and therefore has none. `commit` is the frontier: invariants are checked there because it is the last instant at which failing them is free, and only then are **deferred** members released. That is what makes an irreversible send safe — an aborted group never sends it, which beats sending and apologising. Doubt reverses nothing |
-| 👤 | **Human oversight on the *call*, not a summary of it** — `requires_approval: true` on a tool grant opens a task carrying the exact tool and arguments about to be dispatched, and nothing happens until somebody approves. Gating the agent's answer instead is a review that arrives after the money moved. Durable worklists, four-eyes, declared expiry behaviour, and an operator who can *stop* a run and have it unwind |
+| 👤 | **Human oversight on the *call*, not a summary of it** — `requires_approval: true` on a tool grant opens a task carrying the exact tool and arguments about to be dispatched, and nothing happens until somebody approves. A reviewer may also answer *with* the arguments — an approval's amendment dispatches in the model's place, as the reviewer's own trusted value. Gating the agent's answer instead is a review that arrives after the money moved. Durable worklists, four-eyes, declared expiry behaviour, and an operator who can *stop* a run and have it unwind |
 | 🔑 | **Erasure that reaches the backups** — deleting clears the live store; the backup taken an hour earlier still has everything, and backups are offsite and often immutable *by design*. So payload bytes are sealed under a per-case data key wrapped by a key the crate never holds: erasing a case **destroys the key**, and every copy becomes unreadable at once — including the ones nobody can reach. Sealed bytes are rotation-immutable, because the chain commits to them, so the erasure scope *is* the rotation unit. **And the journal too**: `SealedJournal::wrap(store, keys, tenant)` seals run input, prompts and tool-call arguments, effect outputs, failure messages, notes and frozen plans under the same per-case scope. Only the *payload* is sealed, so exactly-once and every index keep working with no key; and the chain commits to the **ciphertext**, so an auditor holding no keys still verifies the history of a run whose data is gone → [erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) |
 | 📄 | **An agent that is only a file** — `agentplane run agent.yaml`. No Rust, no `main`, no skill. The digest covers the agent *in its entirety* rather than only its boundary, **and** the run is journaled and deterministically replayable. Declarative formats give you the first; durable platforms give you the second; the pairing is what makes the evidence about something you can actually read |
 
@@ -231,6 +241,7 @@ What is deliberately **not** built, and what will move →
 | | |
 |---|---|
 | 🚀 | [Getting started](https://hupe1980.github.io/agentplane/docs/getting-started/) — first run, first skill, first replay |
+| 🐣 | [Your first agent](https://hupe1980.github.io/agentplane/docs/first-agent/) — a step-by-step tutorial: one agent, from an empty file to a durable, tool-using, pinnable declaration, no Rust required |
 | 🧠 | [Concepts](https://hupe1980.github.io/agentplane/docs/concepts/) — the ideas the rest is built from |
 | 🏗️ | [Architecture](https://hupe1980.github.io/agentplane/docs/architecture/) — how it actually works, mechanism by mechanism |
 | 🍳 | [Cookbook](https://hupe1980.github.io/agentplane/docs/cookbook/) — task-shaped recipes, including wiring an MCP server beside typed tools |

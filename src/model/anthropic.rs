@@ -265,6 +265,9 @@ struct ApiResponse {
     usage: Option<ApiUsage>,
     #[serde(default)]
     stop_reason: Option<String>,
+    /// The provider's stated grounds for the stop — populated on a refusal.
+    #[serde(default)]
+    stop_details: Option<Value>,
 }
 
 impl ApiResponse {
@@ -484,6 +487,8 @@ struct Assembled {
     tool_calls: Vec<super::ToolCall>,
     usage: Usage,
     stop_reason: Option<String>,
+    /// The provider's `stop_details`, when the wire carried one.
+    stop_details: Option<Value>,
     /// Exact provider-native assistant blocks for a subsequent tool turn.
     continuation: Value,
 }
@@ -506,6 +511,7 @@ fn interpret(
         tool_calls,
         usage,
         stop_reason,
+        stop_details,
         continuation,
     } = assembled;
     // It generated and then declined. Metered, because generation happened —
@@ -522,10 +528,23 @@ fn interpret(
     // If a declined turn ever needs to be carried forward, the error type
     // itself must grow a continuation slot; this driver cannot smuggle one.
     if stop_reason.as_deref() == Some("refusal") {
+        // `stop_details` is the provider naming its grounds — populated on a
+        // refusal and nowhere else. Carried into the error because a decline
+        // with no stated reason leaves an operator diffing prompts against a
+        // black box; absent, the bare sentence stands rather than a guess.
+        let mut detail = "the model declined to answer".to_owned();
+        if let Some(details) = &stop_details {
+            use std::fmt::Write as _;
+            for key in ["category", "explanation"] {
+                if let Some(value) = details.get(key).and_then(Value::as_str) {
+                    let _ = write!(detail, " ({key}: {value})");
+                }
+            }
+        }
         return Err(ModelError::Unusable {
             model: model.clone(),
             usage,
-            detail: "the model declined to answer".to_owned(),
+            detail,
         });
     }
 
@@ -801,6 +820,7 @@ impl Anthropic {
                 tool_calls,
                 usage,
                 stop_reason: parsed.stop_reason.clone(),
+                stop_details: parsed.stop_details.clone(),
                 continuation: Value::Array(parsed.content.clone()),
             },
         )
@@ -894,6 +914,7 @@ impl Anthropic {
                 tool_calls,
                 usage,
                 stop_reason: acc.stop_reason().map(ToOwned::to_owned),
+                stop_details: acc.stop_details().cloned(),
                 continuation: acc.continuation_content(),
             },
         )?;
@@ -1001,6 +1022,7 @@ impl ModelProvider for Anthropic {
         } = request;
 
         super::refuse_provider_side_media(prompt, model)?;
+        super::refuse_in_thread_instructions(prompt, model)?;
 
         // Before the request is built: a refused destination must cost nothing
         // and reach nothing.
@@ -1225,6 +1247,7 @@ mod tests {
                 }],
                 usage: Usage::default(),
                 stop_reason: Some("tool_use".to_owned()),
+                stop_details: None,
                 continuation: content.clone(),
             },
         )
@@ -1239,6 +1262,43 @@ mod tests {
             json!([{ "role": "assistant", "content": content }]),
             "the continuation must carry the provider turn verbatim, thinking \
              blocks and signature included"
+        );
+    }
+
+    /// A refusal's stated grounds reach the error an operator reads.
+    ///
+    /// The provider populates `stop_details` on a refusal and nowhere else;
+    /// dropped, a decline arrives as one bare sentence and the operator is
+    /// left diffing prompts against a black box. Absent details keep the bare
+    /// sentence — nothing is invented.
+    #[test]
+    fn a_refusals_stated_grounds_reach_the_error() {
+        let error = interpret(
+            &ModelId::new("anthropic", "claude-x"),
+            None,
+            false,
+            Assembled {
+                text: String::new(),
+                forced: None,
+                tool_calls: Vec::new(),
+                usage: Usage::default(),
+                stop_reason: Some("refusal".to_owned()),
+                stop_details: Some(json!({
+                    "type": "refusal",
+                    "category": "safety",
+                    "explanation": "the request asked for something the model declines",
+                })),
+                continuation: json!([]),
+            },
+        )
+        .expect_err("a refusal is not an answer");
+        let ModelError::Unusable { detail, .. } = &error else {
+            panic!("wrong classification: {error}");
+        };
+        assert!(
+            detail.contains("category: safety")
+                && detail.contains("explanation: the request asked"),
+            "the provider named its grounds and the driver dropped them: {detail}"
         );
     }
 
@@ -1260,6 +1320,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: Usage::default(),
                 stop_reason: Some("end_turn".to_owned()),
+                stop_details: None,
                 continuation: json!([]),
             },
         )

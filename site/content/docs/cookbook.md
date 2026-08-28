@@ -1,7 +1,7 @@
 +++
 title = "Cookbook"
 description = "Task-shaped recipes: build an agent, keep large bytes out of the chain, require a human, undo work when a later step fails."
-weight = 3
+weight = 4
 +++
 
 Task-shaped recipes. Each one states the trap it avoids, because most of these
@@ -346,12 +346,25 @@ spec:
   oversight:
     approval: required
     approvers: [role:compliance-officer]
-    deadline: klaerung        # your Calendar decides what that means
+    # The obligation bounding the wait; your Calendar decides what `kind` means.
+    deadline: { name: klaerung, kind: working-days, params: { n: 2 } }
     on_expiry: deny           # the default; `proceed` needs allow_unattended
 ```
 
 The agent opens a task carrying **its answer** as the proposal — not a
 description of it — and returns only on approval. Needs a case and `.tasks(store)`.
+
+For a tool-calling agent, gate the **call** instead: `approval: tools-only`
+with `requires_approval: true` on the grants a person must see opens the task
+*before* dispatch, carrying the exact tool and arguments — gating the answer
+there is a review that arrives after the money moved. A reviewer may also
+answer *with* the arguments: an approval's `amendment` dispatches in the
+model's place as the reviewer's own trusted value (provenance
+`task:agent.approve_call`, which a source-bound field must list before it
+stands there).
+`cargo run --example approved_call --features redb,testkit,manifest` runs the
+whole shape: suspend, worklist, approve, refuse or amend, and a strict replay
+that re-opens nothing.
 
 **The trap: expecting `kind` to grow keywords.** It is a closed enum —
 `completion`, `tool-calling`, `planned` — and each is a behaviour the runtime
@@ -818,6 +831,36 @@ Policy evaluates `data:release`; the journal records releaser, prior label,
 scope, field, destination, basis and evidence. Provenance is retained, unrelated
 fields are unchanged, and the result remains `Tainted<Value>`. Run the complete
 success/refusal/release trail with `cargo run --example governed_transfer`.
+
+## 🎛️ Let an untrusted choice pick from a menu — no code, no release
+
+When every acceptable value is known at review time, no release is needed at
+all: enumerate them, and an untrusted influence may choose *among* them and
+nothing else. This is the select-from-a-menu pattern from the
+prompt-injection-defense literature, and it is fully declarative — a manifest
+alone expresses it:
+
+```yaml
+tools:
+  - ref: "tool://ledger/transfer"
+    mutates: true
+    description: "Move funds between internal accounts."
+    protected_fields:
+      - path: /recipient
+        one_of: [ops-account, audit-account]   # reviewed; the model chooses which
+      - path: /amount
+        allowed_sources: ["run.input"]
+```
+
+The match is exact structural equality — a near miss is a refusal, never a
+correction — and the menu layers over any source rule on the same field
+rather than replacing it. Write a menu only when every entry is acceptable
+whichever one is chosen: which entry stands is exactly what an injected
+prompt gets to pick. For a value no list can enumerate — a recipient parsed
+out of a document, say — bind the field's provenance to a coded validator
+instead (`allowed_sources: ["tool://agent/validate.recipient"]`) and let that
+specialist canonicalise, check, and `release` with evidence: the manifest
+declares the bounds, code makes the judgment.
 
 ## 🔔 Wire durable A2A push
 
@@ -1547,9 +1590,19 @@ The planner answers with steps like
 `{ "tool": "crm__lookup", "args": { "id": "$input/customer" } }` and
 `{ "tool": "mail__send", "args": { "to": "$step0/email" } }` — the references
 are resolved by the runtime, labels intact. A `parse` step hands a prior
-output to the quarantined model under a bounded schema. Run
-`cargo run --example planned_run --features redb,testkit,manifest` to watch a
-prompt injection arrive in a tool output and find no reader.
+output to the quarantined model under a bounded schema.
+
+Freezing control flow is half the defence; the grant carries the other half.
+Because a reference arrives at the sink with the provenance of the value it
+names, a rule like *the recipient must be what the CRM returned* is genuinely
+enforceable — declare the mailer `mutates: true` with
+`protected_fields: [{ path: /to, allowed_sources: ["tool://crm/lookup"] }]`,
+and a recipient the planner writes as a literal is refused at the sink: a
+model completion is not among the allowed sources, however well-shaped the
+string. Run
+`cargo run --example planned_run --features redb,testkit,manifest` to watch
+both: a prompt injection arrive in a tool output and find no reader, and a
+planner-invented recipient stop at the field rule.
 
 **The trap:** planning over untrusted input. It is refused outright — the
 planner reads the input to write the plan, so hand hostile content to a tool
@@ -2553,6 +2606,14 @@ let provider: Arc<dyn ModelProvider> = Arc::new(
     agentplane::model::bedrock::Bedrock::from_env("eu-west-1").await?
 );
 ```
+
+The chain covers every way Bedrock authenticates — static keys, profiles,
+`credential_process`, IAM Identity Center SSO, assume-role and web identity
+(IRSA), container and IMDSv2 instance roles, and `aws login` console-session
+profiles. A Bedrock API key exported as `AWS_BEARER_TOKEN_BEDROCK` is
+honoured too and overrides SigV4; the SDK reads it from the environment only,
+so a key from a secret store goes through
+`Config::builder().bearer_token(..)` and `Bedrock::from_client` instead.
 
 The driver supports Converse text, tools/results, usage, truncation, native JSON
 Schema output with forced-tool fallback and exact reasoning-content

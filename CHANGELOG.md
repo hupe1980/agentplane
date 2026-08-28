@@ -30,6 +30,464 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.24.0] — 2026-08-28
+
+An audit round over the examples and the developer surface — a runnable
+example is a claim the crate makes about itself, and one was making a false
+one — followed by a deep pass over the interop tier: the model-provider seam,
+MCP, and A2A, checked against the released specs and the ecosystem's
+reference implementations. A further pass audited the information-flow core
+itself — trust, taint, and typed release — against CaMeL, FIDES, and the
+2026 attack literature.
+
+### Changed — **breaking**: release marks ride the value, never the label
+
+The information-flow audit's one structural finding. A destination-scoped
+release mark covers exactly the value a release was granted over; a label
+joins into every value derived from it. Storing marks *inside* `Label` made
+"a join must drop or rebase marks" a convention each call site had to
+remember — `zip`, `object` and `array` remembered, and the site that folds
+conversation history into an outbound value did not, unioning marks granted
+over other values. No reachable path could exploit it today (every effect
+boundary rebuilds labels fresh, and memory items rebuild theirs from stored
+trust and provenance), but an invariant held by call-site memory is the
+defect this crate refuses everywhere else, so it is now held by the type:
+`Label` is a pure provenance/trust/sensitivity join-semilattice, marks live
+on `Tainted` (read them with `release_marks()`), and only the operations
+that can prove value lineage — projection, assembly, transform — move one.
+A bare label, read from anything and joined anywhere, structurally cannot
+transport a release; a mutation reintroducing the carry is pinned
+(`ADependencyJoinCarriesAReleaseAcrossValues`). The `Released` journal
+record consequently drops `result_label`/`result_field_labels`: the marks a
+release attaches are fully determined by the recorded `release`, and a
+second spelling of one decision is free to drift from the rule that derives
+it.
+
+The join laws themselves are now a checked model rather than three sampled
+assertions: the label domain is finite, so idempotence, commutativity,
+associativity, identity and the upper-bound property are verified by
+exhaustive quantification over the whole domain, and the mark algebra by
+its round-trip law (rebased into an assembly, projected back out, the
+original mark returns). This discharges the algebraic half of the required
+field-level information-flow model in-tree; the sink-gate protocol under
+concurrent replay stays on the formal-model list, where a state-space
+search actually earns its cost.
+
+### Added — a decision's amendment is the call, not advice
+
+The information-flow audit's second find, and an I12 violation hiding on the
+oversight surface: `Decision::amendment` flowed from the HTTP decide endpoint
+into the stored decision, was documented on the operations page — and nothing
+in the runtime ever read it. A reviewer answering "approved, with these
+arguments" was recorded as if their answer governed while the model's
+original arguments ran.
+
+On an approved call task the amendment now **is** the call, in both
+declarative tiers. The substitute is a different value with a different
+author, and its label says so: **trusted** — the decision channel is
+authenticated, actor-attributed and bound to one call, the authority basis
+run input and `release` already rest on, while the reviewer's free-text
+`reason` stays untrusted and out of the model's context — with provenance
+`task:agent.approve_call` alone and the original arguments' sensitivity, so
+an edit can never declassify what the reviewer was shown. Every gate then
+runs on the substitute: the tool's declared schema at the decision, menus,
+ceilings and field rules at dispatch. Two consequences are pinned by tests
+rather than prose: an approval *without* an amendment still releases nothing
+(the model's arguments keep the model's label, so a field demanding a
+trusted author refuses a waved-through value), and a source-constrained
+field admits a reviewer's value only where the operator listed
+`task:agent.approve_call` in `allowed_sources` — the feature is a channel
+the disciplines judge, not a bypass around them. Mutation anchors
+`AReviewersAmendmentIsAdvisory` and
+`AnAmendmentIsAsUntrustedAsTheValueItReplaces` hold both halves.
+
+This is the approve-with-edit gesture the framework survey found in every
+strong oversight API (LangChain's `edit` decision, Pydantic AI's
+`ToolApproved(override_args=…)`, Microsoft's approval responses) — landed
+here with the two properties none of them state: a label that records whose
+value ran, and field disciplines that still judge it. The residue is the one
+every human-in-the-loop control carries: a reviewer can be talked into
+typing the attacker's value, and the journal's actor attribution is the
+accountability for that, not a prevention.
+
+### Audited — the taint/release design against CaMeL, FIDES, and the field
+
+Research round with three sweeps (CaMeL mechanics and follow-ups, competitor
+frameworks, fresh arXiv), every ID verified against its abstract page. The
+verdict validated the design rather than moving it, and the near-misses are
+now stated in CONCEPT rather than implied:
+
+- **The two-point trust lattice is the field's own operating point.** CaMeL
+  stores no trust bit at all — "trusted" is a per-sink judgment over a
+  provenance *set*, which is exactly `allowed_sources` over `provenance`;
+  the `Trusted`/`Untrusted` bit is the Biba low-water-mark summary kept
+  beside the set, not instead of it. FIDES proves its guarantees at binary
+  integrity. The 2026 negative result on *soft* provenance (weights strong
+  enough to resist poison also suppress legitimate evidence) stays the case
+  for hard labels.
+- **Journaled, evidence-bearing declassification has no counterpart in
+  CaMeL** — its policies allow or deny and leave no record of who decided
+  what on what basis. The typed release is ahead of, not behind, the
+  reference design.
+- **Explicit secrecy is now the *named* operating point** (CONCEPT §6.3):
+  labels enforce integrity non-interference at sinks and confidentiality
+  over explicit flows; the implicit flow through trusted code's own
+  branching (and through which tool a model asks for) is FIDES's published
+  trade-off, adopted with its name. CaMeL's strict mode — control-dependency
+  taint — is recorded as rejected: it is an interpreter's discipline, and
+  skills here are native code over straight-line declarative plans.
+- **Readers-set confidentiality** (CaMeL's second capability axis) is
+  recorded as rejected with its expiry condition: sink ceilings plus
+  destination-scoped releases express audience at the sink, per decision,
+  on the record; an audience set on *sources* becomes worth adopting only
+  when connectors supply per-value ACLs.
+- **The uniform refusal sentence turned out to be an answer, not a
+  courtesy**: the new causality-laundering attack class (denial-feedback
+  leakage, 2604.04035) is closed by construction because every policy
+  refusal reaches a model as one constant sentence — the remaining
+  refused/succeeded bit is CaMeL's own documented side channel, carried as
+  stated residue.
+- New corroborations cited: SPA (plan-first dual-lattice IFC with labelled
+  cross-query artifacts — independent convergence on this design's
+  coordinates), the Framing Gap (payload-blind mechanisms — closed
+  destination lists, planner/reader splits — are what hold at 0% while
+  every recognising defense fails), label-assignment attacks (the stamping
+  boundary is the TCB, the reason no wire format here deserializes a
+  caller-supplied label), and memory control-flow steering (the channel
+  `planned` refuses structurally).
+- **No shipping framework has comparable taint tracking.** The survey
+  (LangGraph, Strands, Pydantic AI, OpenAI Agents SDK, ADK, Microsoft Agent
+  Framework, LlamaFirewall, Invariant, NeMo, rig) found per-call filtering,
+  classifiers and approval hooks — value-level provenance across steps
+  exists only in research artifacts (Microsoft's Dromedary, marked not for
+  production). DX patterns worth weighing later were catalogued:
+  approve-with-edit (a human substituting a trusted value), conditional
+  approval decided on argument values, and MCP elicitation as a wire
+  carrier for value menus.
+
+### Added — `one_of`: the declarative fragment of release
+
+The question this answers: should `cx.release` — today a coded-skill API —
+also be expressible in the manifest, so declarative agents get the CaMeL
+pattern? The research (classical declassification theory, CaMeL and its
+design-patterns follow-up, FIDES, CXI, APPA, and the policy-compiler line)
+converges on a two-layer split no surveyed system deviates from:
+declarations name the *bounds*; a trusted per-instance act picks the value.
+A standing manifest `release:` verb would be a self-authorized
+declassification whose predicate an attacker-chosen value can satisfy — the
+active attacker then decides what is disclosed, the exact failure robust
+declassification names, and the classical laundering results show declared
+predicates compose across invocations into total disclosure. So release
+stays coded, evidence-bearing, policy-judged per instance.
+
+What *is* sound as a standing declaration is the fragment where review
+semantics are total: a closed value set, every entry approved by the
+reviewer, so an untrusted influence choosing among them discloses only the
+choice. `ProtectedField` gained exactly that — `one_of`, a fourth discipline
+beside trust, provenance and sensitivity, conjoined with them rather than
+substituting (an allowed source answering an unlisted value is refused).
+Matching is exact structural equality; a menu counts as an authority rule
+for the mutating-grant check, so a menu-only grant is the flagship
+declarative select-from-a-menu configuration; the menu is digest-covered and
+flows into the published JSON schema. Deliberately inexpressible: patterns
+and formats (a regex admits a language nobody enumerated), and numeric
+ranges — not for soundness but because JSON number equality across integer
+and double representations is the ±2⁵³ hazard the card-signing work already
+met. The residual is stated where operators read: the attacker picks
+*which* entry, so a menu belongs only where every entry is acceptable
+whichever is chosen. For values no list can hold, the two-layer form is
+already expressible end to end — bind the field's `allowed_sources` to a
+coded validator agent and let it canonicalise, validate and release.
+
+### Fixed — Bedrock authenticates every way Bedrock authenticates
+
+An audit of the driver against AWS's full auth surface found one gap:
+`aws-config` is depended on with `default-features = false` (the default set
+drags the legacy TLS stack), and the hand-picked feature list predated the
+`aws login` console-session flow — so a `login_session` profile failed to
+resolve with a `MissingFeature` error while every other chain member worked.
+The `credentials-login` feature is now enabled; the rest of the surface was
+verified already covered: SSO and `credential_process` (features this crate
+enables explicitly), assume-role, web identity, container and IMDSv2 roles
+(never feature-gated), and Bedrock API keys — the SDK reads
+`AWS_BEARER_TOKEN_BEDROCK` on the `Client::new(&sdk_config)` path both
+`from_env` constructors use, switching the client to HTTP bearer auth. The
+driver docs now state the coverage, including the two nuances worth knowing:
+the env key overrides SigV4 for the whole client, and the SDK reads it from
+the environment only — a programmatic key goes through
+`Config::builder().bearer_token(..)` and `from_client`. Out of scope by
+design: the Anthropic-native and OpenAI-compatible Bedrock routes (different
+endpoints entirely — this driver is the Converse API) and bidirectional
+streaming (SigV4-only, unused here).
+
+### Fixed — the instruction slot is singular by enforcement
+
+Every driver accepts a `messages`/`input` turn list and passes it to the wire
+verbatim, and providers now accept instruction roles *inside* that list —
+`system` on every chat wire, `developer` on OpenAI's, mid-thread `system` on
+current Anthropic models. That made each turn a potential second instruction
+slot: the one real slot, the top-level `system` key, is a protected field an
+untrusted value cannot fill, while a `{"role": "system", ...}` element placed
+as a turn would be obeyed as a directive with the gate seeing ordinary
+content. Refused now, before dispatch, at the effect boundary and in every
+driver — the same double enforcement provider-side media URLs get, because
+the `ModelProvider` trait is public and a custom driver deserves the same
+floor. The scan is deliberately shallow (only the direct elements of the
+conversation positions a driver hands to the wire), so data that merely
+contains a `role` field stays data.
+
+### Added — `PeerTaskCancel`: the client half of the A2A task lifecycle
+
+The client could create work at a peer (`SendMessage`) and poll it
+(`GetTask`), and a run that was itself cancelled had no way to propagate the
+stop — the cancellation ended at this plane's edge while the peer kept
+spending on an answer nobody would read. `A2aClient` now speaks `CancelTask`,
+`PeerClient` grew the verb (default refusal, like task lookup), and
+`PeerTaskCancel` is the journaled effect, prepared under the same grant and
+audience-bound credential as the call that created the task. It mutates and
+still declares `Recovery::Retry`, and the license for that pairing is the
+protocol's own construction: a repeat of a cancel that landed meets
+`TaskNotCancelable`, a clean pre-action refusal, never a second act. The
+MCP side has had this symmetry (`McpTaskCancel`) all along; the wire test
+drives the full loop — create a suspending task through this plane's own
+server, cancel it through the effect, observe `CANCELED` by polling, and
+confirm the repeat is refused.
+
+### Fixed — OpenAI commentary narration stays out of the answer
+
+Responses now marks the model's on-the-way narration `phase: "commentary"`
+(typically the preamble beside a tool call). Concatenated into
+`Completion::text` it polluted the answer, and on a schema-bearing final turn
+the preamble broke the JSON parse of an otherwise valid answer — a metered
+`Unusable` for a completion the provider delivered intact. Commentary is now
+excluded from the canonical text on both the buffered and streaming paths
+(they share the one parser), and nothing is lost: the continuation carries
+every output item verbatim, and a live observer still streams the deltas.
+
+### Fixed — the A2A client can name a skill on a multi-skill plane
+
+This crate's own server dispatches on `message.metadata.skill` — named,
+never inferred, and advertised on the card as a declared extension — while
+its own client carried the capability only inside its governance extension
+metadata, where the server deliberately does not look for a dispatch
+decision. Every self round-trip test ran against a single-skill plane, whose
+fallback dispatches without a name, so the two halves agreed everywhere
+except the first two-skill deployment, which refused its own sibling as
+ambiguous. The client now writes the capability into the field its server
+reads; a receiver that infers ignores the key, because message metadata is
+opaque to the protocol. The test that pins it runs the client against a
+two-skill plane, where no fallback can mask the miss.
+
+### Changed — A2A back-pressure is identified by a pair, not a numeral
+
+External research this round surfaced that A2A 1.0 reserves
+`-32001..-32099` — the same band JSON-RPC gives implementations — so the
+server-defined `-32029` this plane answers a full quota with could later be
+assigned a spec meaning of its own. The number was never the right identity:
+the server now attaches a `google.rpc.ErrorInfo` under this project's own
+domain (`agentplane.hupe1980.github.io` / `QUOTA_EXHAUSTED`), and the client
+refuses-and-backs-off only on that pair. The sharper half is what the client
+stops doing: a bare `-32029` from a foreign server is an
+implementation-defined fault that may have been raised mid-execution, and
+classifying it as a clean refusal licensed resending a mutating call on
+somebody else's ambiguous numeral. Unmarked, it now lands in doubt.
+
+### Changed — outbound A2A refuses plaintext on both legs
+
+Push delivery has refused non-HTTPS webhooks from the start; the peer call
+and the card fetch — the legs that carry the run's payload, a bearer
+credential, and the address the next call will trust — did not, which is the
+audited pattern of this layer: a rule enforced where it was first written
+and not on its siblings. Both now refuse `http://` outright, with loopback
+*names* in a `testkit` build as the one exception. A scheme that arrives
+inside a discovered card is untrusted input, so it is not the far side's
+choice to make.
+
+### Fixed — provider drivers stop discarding what the provider said
+
+Three per-driver corollaries of the failure-mapping rule, each found by
+checking the drivers against the providers' current wire contracts:
+
+- **Gemini's retry window reaches the retry loop.** Google names its 429
+  window inside the body as a `google.rpc.RetryInfo` duration, not in a
+  `Retry-After` header — read only from the header, the advice was discarded
+  and the default policy spent every attempt in milliseconds against a
+  window measured in tens of seconds, then reported the provider down. Whole
+  seconds only, zero and fractions read as no advice, and the `max_advice`
+  ceiling still bounds it.
+- **Bedrock's `malformed_model_output`/`malformed_tool_use` stops are
+  metered `Unusable`, not answers.** Converse emits them when it could not
+  parse what the model produced; what survives in the content blocks is a
+  fragment, and passing it through handed the caller's tool loop a
+  plausible-looking call the provider itself disowned.
+- **An Anthropic refusal carries its stated grounds.** The API populates
+  `stop_details` (category, explanation) on a refusal and nowhere else;
+  dropped, a decline arrived as one bare sentence and the operator was left
+  diffing prompts against a black box.
+
+MCP gained the mirror-image courtesy: negotiation downgrades by design, and
+an older server still answers a `resources/read` for a missing URI with the
+legacy `-32002` — which the current spec tells clients to keep accepting. It
+classified as *outcome unknown* and was retried under policy forever;
+nothing ran, and it now classifies as the refusal it is. Card signatures
+additionally carry the spec's `typ: "JOSE"` protected-header field for
+third-party JWS verifiers, and the push token header's provenance is now
+stated honestly in its docs: the spelling is the reference SDK's, because
+A2A 1.0 dropped the 0.3-era header definition without naming a replacement.
+
+The external sweep otherwise validated the layer against the released specs:
+MCP 2026-07-28 remains current (stateless core, `server/discover`, MRTR,
+tasks as the official `io.modelcontextprotocol/tasks` extension with exactly
+the get/update/cancel client verbs this host implements), A2A 1.0.1 remains
+the newest release (now governed under the Linux Foundation's Agentic AI
+Foundation), and the framework survey (Strands, LangGraph, Pydantic-AI,
+OpenAI Agents SDK, ADK, Vercel AI SDK, rig/swiftide/genai) confirmed the
+seam decisions other stacks bled on reactively: opaque provider-tagged
+continuations for signed reasoning, MCP session lifetime as an explicit
+axis, static tool surfaces over runtime discovery, and no sampling
+parameters in the portable request — both Anthropic and Google removed or
+deprecated exactly the knobs this seam never carried.
+
+External research on the examples half of the round confirmed the
+`planned` kind's shape against its newest successor (NOVA,
+[arXiv:2601.09923](https://arxiv.org/abs/2601.09923), which freezes a
+*branching* plan for computer-use agents and names value-steering as the
+residual attack — exactly the half this crate answers with provenance rules
+on protected sink fields).
+
+### Fixed — `planned_run` no longer dodges the gate it exists to demonstrate
+
+The example's mailer was declared `mutates: false` and its catalogue was
+hand-built in Rust, laxer than nothing — the two moves `governed_transfer`'s
+own commentary calls the dangerous direction. A mailer that sends is a
+mutating sink: calling it read-only exempted its arguments from the taint
+gate the example claims to showcase, and made a timed-out send *retryable* —
+the one condition under which this runtime does something twice. The example
+now declares what is true: `mutates: true`, `/to` restricted by
+`allowed_sources: ["tool://crm/lookup"]`, and the catalogue derived from the
+manifest with `ToolCatalog::from_manifest`. That turns the module's central
+sentence — *the recipient must be the address the lookup actually returned* —
+from an observation into an enforcement, and the example proves it both ways:
+the reference-built plan passes because its provenance **is** the CRM, and a
+third scenario runs the plan a hijacked or hallucinating planner would write,
+a literal recipient, refused at the sink with
+`protected field '/to' … derives from undeclared source 'model:fake/planner-1'`.
+The schema admits the string; the provenance rule does not admit its author.
+
+### Added — `approved_call`: the oversight headline, runnable
+
+`requires_approval` — a person sees the exact tool and the exact arguments
+before dispatch — was a README headline row with tests and no example. New
+`examples/approved_call.rs` runs the whole shape offline: the model asks to
+move money, the run suspends (a row, not a thread), the worklist task carries
+`tool://ledger/transfer` and the verbatim arguments, approval releases
+exactly that call, refusal goes back to the model as a failed call without
+the reviewer's words, and a strict replay reassembles the approved run —
+human decision included — opening no task and moving no money. The manifest
+pairs the gate with `/recipient: allowed_sources: [model:fake/teller-1]`,
+which is the reviewed sentence "the model may author this field" — two
+independent controls, both in the file.
+
+### Added — three examples for the claims only the test suite could vouch for
+
+The second pass of the round asked which *headline* sentences had no runnable
+demonstration, and three did. The 2026 convergence is "kill the worker, resume
+from the last completed step", and server-backed engines demonstrate that
+half; what the surveyed frameworks do not demonstrate is a takeover that is
+itself sealed evidence in an embedded runtime, a budget pause that resumes
+into a *recorded* re-admission, or a stop that undoes what the run already
+did:
+
+- **`recovered_run`** — "recovery is *initiated*, not merely possible", run on
+  two in-process instances. Instance A performs stage one and is aborted
+  mid-run; for one lease TTL the dead look exactly like the busy; then
+  `abandoned_runs` names the stranded run and instance B's ordinary `sweep`
+  takes it over — fenced, journaled in the sweep's own sealed run, and
+  finished with no stage repeated. The one deliberately un-demonstrated case
+  is written into the fixture's comment: a death *between an effect's
+  announcement and its record* is the unknown-outcome case and quarantines
+  instead.
+- **`budget_pause`** — exhaustion as a pause with a protocol, at the effect
+  ceiling: the third posting never starts; resuming under the same ceiling
+  re-refuses without stacking a second refusal; a plane built with the raised
+  ceiling re-admits (`BudgetReadmitted` beside the old refusal), performs the
+  third posting once, and the whole history verifies strictly. The industry
+  pattern this answers — kill the runaway agent — converts a cost control
+  into lost work; this one converts it into a decision on the record.
+- **`operator_stop`** — the two brakes, in one file because their difference
+  is the lesson: cancelling a run *undoes what it did* (the hold is released,
+  the journal names who asked and why, a second asker does not displace the
+  first, and the conclusion is `Cancelled`, not `Failed`), while the
+  store-backed halt stops **new admissions only**, on every instance sharing
+  the store, with the operator's reason in the refusal — existing work keeps
+  its right to finish or be cancelled properly, because stranding a saga
+  mid-unwind turns an incident into a second one.
+
+### Fixed — refusing to close a case is a business answer, not a store fault
+
+Found by *reading the examples' output*, which is what this round was for:
+`clearing_case` printed its close-refusal as `refused: backend: case … has 2
+open deadline(s)` — the `Backend` variant, which means *the storage engine
+failed*. Both backends did this, with two different message spellings, and the
+consequences compound: the operator API maps `Store(_)` to 500, so a case that
+lawfully refuses closure would report as an internal error; and the
+conformance battery only checked that `close` *errs*, so a store that was
+merely unreachable read as enforcing the rule. New
+`StoreError::ObligationsOutstanding { case, outstanding }` carries the rule in
+one spelling for both backends; the battery now pins the refusal's **type** on
+`close` and on the agent path (`set_status(Closed)`) both — an outage can no
+longer impersonate enforcement. Two mutation anchors
+(`AClosureRefusalWearsAFaultsType`, per backend) `--verify` KILLED; mutation
+count **572**.
+
+### Changed — example output reads as narration, everywhere
+
+Running every example and reading the output as a newcomer found three that
+did not hold up: `tool_loop`'s bounded-loop scenario printed its four tool
+reads above its own header (filed visually under the previous scenario — the
+header now prints before the run); and `memory_run` and `standing_authority`
+compressed five demonstrations each into one summary line, leaving the
+provenance label, the hold-beats-calendar sweep, the refusal-consumes-nothing
+check and the revocation/exhaustion distinction all invisible outside their
+assertions. Both now narrate section by section like the rest of the fleet —
+including the honest, unabridged refusal text a skill actually receives.
+`openai_live` was run against the real API in the same pass: schema-shaped
+answer, 94 tokens, strict replay with zero further calls.
+
+### Fixed — a getting-started snippet that could not parse
+
+The cookbook's oversight recipe wrote `deadline: klaerung` where the format
+is a `{ name, kind, params }` object — outside the docs guard's reach because
+the fragment carries no `apiVersion`, so nothing compiled it. The snippet now
+parses, and the same section gains the per-call form (`approval: tools-only`
++ `requires_approval`) with a pointer at the new example.
+
+### Added — a step-by-step tutorial, verified against the real binary
+
+The docs had a how-to collection, a reference, explanations and a fast tour —
+and no learning-oriented tutorial, the page every comparable runtime leads
+with. [Your first agent](https://hupe1980.github.io/agentplane/docs/first-agent/)
+builds one support-triage agent from an empty file to a durable, tool-using,
+pinnable declaration, no Rust required. Its method is the format's own:
+**start too small and let the refusals teach** — every error message on the
+page is captured from the shipped CLI, not paraphrased, and every full
+manifest checkpoint is parsed by the docs guard in CI (invalid teaching
+states appear only as fragments, which the guard checks for YAML
+well-formedness — the same split the guard already enforces everywhere).
+The page is deliberately honest where the offline story thins: the
+deterministic fake has no judgement, so the tool step proves wiring and
+grants and points at `tool_loop` — or a live model — for choice.
+
+### Changed — the example index answers every question the fleet can
+
+The getting-started "pick the example for your question" table stopped
+growing when the fleet did not: `tool_loop`, `planned_run`, `sealed_run`,
+`effect_group`, `memory_run`, `mcp_tools` and `standing_authority` were
+runnable answers no page pointed at. Every offline example has its row now. Four examples also
+dropped a redundant `.provides(name)` where the capability *is* the skill's
+name — the default the getting-started page teaches, taught back by the
+examples instead of contradicted.
+
 ## [0.23.0] — 2026-08-27
 
 Two audit rounds. The first walked the transactional tier: effect groups, the

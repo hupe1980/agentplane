@@ -1,7 +1,7 @@
 +++
 title = "Security model"
 description = "The trust boundary, information-flow labels, delegation and egress — with an explicit account of what is not covered."
-weight = 6
+weight = 8
 +++
 
 What this runtime defends, how, and — the part most security documents omit —
@@ -76,12 +76,21 @@ let released = cx.release(
 ```
 
 The runtime validates the field scope, authorizes `data:release`, and journals
-the releaser, value digest, prior and resulting whole/field labels, basis,
-destination, fields and evidence. It returns a still-labeled value. A trust
-release retains provenance and sensitivity; a field release leaves every other
-field unchanged. The decision has an ordered effect key, so changing its scope,
+the releaser, value digest, prior whole/field labels, basis, destination,
+fields and evidence. It returns a still-labeled value. A trust release retains
+provenance and sensitivity; a field release leaves every other field
+unchanged. The decision has an ordered effect key, so changing its scope,
 evidence, value or label semantics is replay divergence. Strict replay reads
 the recorded decision and never re-opens policy.
+
+A release is **for a destination, not for storage**: it attaches a mark
+honoured only by the gates judging the exact sink it names, so a value
+released for `tool://ledger/transfer` arrives at every other sink — and in
+every join, memory write, or plain `label()` read — exactly as untrusted as
+before. The mark rides the labeled value itself, never the label: projection
+and `Tainted::object`/`array` assembly carry it under the right pointer, any
+transform or mix that breaks value lineage drops it, and a bare label joined
+anywhere structurally cannot smuggle a release onto data it never covered.
 
 ### Judging a step more than once
 
@@ -297,6 +306,21 @@ trust and/or sensitivity dimensions, for the whole value or explicitly tracked
 fields. It never removes provenance and never returns a bare value. A selected
 field release is refused if the value no longer has field precision — policy
 cannot authorize evidence the runtime cannot substantiate.
+
+Release is deliberately **not declarative**. A release names its basis and
+evidence per instance and is judged by policy per instance; a standing rule in
+a manifest would be a self-authorized declassification whose predicate an
+attacker-chosen value can satisfy — the active attacker then decides what is
+disclosed, which is the failure robust declassification names. What the
+manifest carries instead is the one fragment that is sound as a standing
+declaration: a protected field's `one_of` value menu, where every admissible
+value was itself reviewed, so an untrusted influence chooses among approved
+options and discloses only the choice. The residual is stated, not hidden:
+the attacker picks *which* menu entry — write a menu only when every entry is
+acceptable whichever one is chosen. For a value no menu can enumerate, the
+two-layer form applies: bind the sink field's `allowed_sources` to a coded
+validator agent, and let that specialist canonicalise, validate and `release`
+with evidence.
 
 ## Delegation
 
@@ -839,6 +863,18 @@ reasons *about* rather than an order it reasons *under*. The prompt has to be
 built with `Tainted::object`, because `map` cannot prove how a closure reshaped a
 value and conservatively taints the whole result — instruction included.
 
+And the slot is singular by enforcement, not convention. Providers accept
+instruction roles *inside* the turn list too — `system` on every chat wire,
+`developer` on OpenAI's, mid-thread `system` on current Anthropic models —
+which would make each turn a second instruction slot no protected field
+covers: an untrusted value shaped as `{"role": "system", ...}` and placed as
+a turn would be obeyed as a directive while the gate saw ordinary content. A
+`system`- or `developer`-role element in a turn list is therefore refused
+before dispatch, at the effect boundary and in every driver. The scan is
+shallow on purpose: only the direct elements of the conversation positions a
+driver hands to the wire, because data the model reasons about may
+legitimately contain a `role` field, and inside content it instructs nobody.
+
 The residual is unchanged and worth stating: this does not stop a model being
 *persuaded* by content in `messages`. It stops the persuasion from arriving with
 the authority of the task itself, and everything downstream — untrusted output,
@@ -968,6 +1004,15 @@ persisted with bounded backoff, and a projection failure is retried rather than
 silently acknowledging a terminal task without its artifact. Operators must
 schedule the worker returned by the server; only that wired deployment
 advertises push.
+
+### A peer endpoint and a card URL refuse plaintext
+
+The outbound A2A call carries the run's payload and, when one is held, a
+bearer credential; the card fetch decides where that call will go, and its
+URL is routinely attacker-influenced. Both legs therefore refuse anything but
+HTTPS — the same rule the push webhook applies — with loopback *names* in a
+testkit build as the one exception. The scheme arrives inside a discovered
+card, which is untrusted input, so it is not the far side's choice to make.
 
 ### A peer's message is untrusted, and names its sender
 
@@ -1306,6 +1351,24 @@ four thousand records it will touch. Producing that preview needs the tool itsel
 to support a dry run, and nothing here requires or checks for one. Where an
 approver must see consequences rather than instructions, the tool has to compute
 them.
+
+**A decision's amendment is the call, not advice.** A reviewer who approves
+with an `amendment` has answered with the arguments that may run, and the
+runtime dispatches exactly those. The substitute is a different value with a
+different author, and its label says so: trusted — the decision channel is
+authenticated, actor-attributed and bound to this one call, the same
+authority basis run input rests on, while the reviewer's free-text *reason*
+stays out of the model's context — with provenance `task:agent.approve_call`
+alone and the original arguments' sensitivity, so an edit can never
+declassify what it replaces. Every gate still runs on it: the amendment must
+fit the tool's declared schema, and menus, ceilings and field rules judge it
+at dispatch — a source-constrained field admits a reviewer's value only where
+`allowed_sources` lists `task:agent.approve_call`. An approval *without* an
+amendment changes nothing: the model's arguments keep the model's label, and
+a field demanding a trusted author refuses them, waved through or not. What
+remains is the residue every human-in-the-loop control carries: a reviewer
+can be talked into typing the attacker's value, and the journal's actor
+attribution is the accountability for that, not a prevention.
 
 **Remote media URLs.** The model effect and both built-in drivers still refuse
 provider-native image/document URL blocks before dispatch. Otherwise the model

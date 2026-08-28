@@ -313,6 +313,77 @@ async fn an_invalid_agent_response_is_in_doubt() {
     assert!(matches!(err, PeerError::InvalidResponse { .. }), "{err}");
 }
 
+/// Back-pressure is identified by its `ErrorInfo` pair, never by the numeral.
+///
+/// `-32029` sits in the band JSON-RPC gives every implementation and A2A 1.0
+/// reserves for its own future table, so the code alone proves nothing about
+/// whether work happened. This plane's server marks its quota refusal with a
+/// `google.rpc.ErrorInfo` under a domain the project controls; the client
+/// refuses-and-backs-off on that pair, and classifies a bare `-32029` from a
+/// foreign server as the unknown fault it is — resending a mutating call on
+/// somebody else's ambiguous numeral is how a transfer lands twice.
+#[tokio::test]
+async fn back_pressure_is_identified_by_its_error_info_not_its_numeral() {
+    let marked = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+            "code": -32029,
+            "message": "this agent cannot take the request on right now; retry later",
+            "data": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "domain": "agentplane.hupe1980.github.io",
+                "reason": "QUOTA_EXHAUSTED",
+            }],
+        }
+    });
+    let (c, _) = canned(200, marked);
+    let url = serve(c).await;
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
+    let err = client
+        .send(
+            &PeerId::new("peer"),
+            "audit.check",
+            &json!({}),
+            &chain(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.disposition(),
+        Disposition::DidNotHappen,
+        "the marked quota refusal is pre-admission and safe to come back to: {err}"
+    );
+    assert!(matches!(err, PeerError::Refused { .. }), "{err}");
+
+    let bare = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": { "code": -32029, "message": "server error" }
+    });
+    let (c, _) = canned(200, bare);
+    let url = serve(c).await;
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
+    let err = client
+        .send(
+            &PeerId::new("peer"),
+            "audit.check",
+            &json!({}),
+            &chain(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.disposition(),
+        Disposition::InDoubt,
+        "a foreign server's bare -32029 is an unknown fault, not a licence to resend: {err}"
+    );
+}
+
 /// An internal error is **not** a refusal.
 ///
 /// The expensive row in the table. `-32603` can be raised after the peer has
@@ -3316,6 +3387,79 @@ async fn gemini_asks_for_a_native_response_schema() {
         "application/json"
     );
     assert_eq!(body["generationConfig"]["responseJsonSchema"], schema);
+}
+
+/// Google's retry window rides in the 429 body, and it reaches the retry loop.
+///
+/// This provider does not send `Retry-After`; its advice is a
+/// `google.rpc.RetryInfo` detail inside the error body. Read only from the
+/// header, the window is discarded and the default policy spends every
+/// permitted attempt in milliseconds against a window measured in tens of
+/// seconds — the same discarded-advice defect the `retry_after` plumbing
+/// exists to prevent, on the one wire that spells it differently.
+#[tokio::test]
+async fn gemini_retry_advice_in_the_body_reaches_the_driver() {
+    let (served, _seen) = canned(
+        429,
+        json!({
+            "error": {
+                "code": 429,
+                "message": "Resource has been exhausted",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    { "@type": "type.googleapis.com/google.rpc.Help", "links": [] },
+                    { "@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "40s" },
+                ],
+            }
+        }),
+    );
+    let url = serve(served).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+
+    let err = driver
+        .complete(gemini_request(&model, &json!("hello"), &[], &[], None))
+        .await
+        .unwrap_err();
+    let ModelError::RateLimited { retry_after, .. } = &err else {
+        panic!("HTTP 429 was not read as rate limiting: {err}");
+    };
+    assert_eq!(
+        *retry_after,
+        Some(40),
+        "the provider named its window inside the body and the driver dropped it"
+    );
+
+    // A window nobody named stays absent rather than invented — a fractional
+    // sub-second delay floors to zero, which is no advice at all.
+    let (served, _seen) = canned(
+        429,
+        json!({
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    { "@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "0.5s" },
+                ],
+            }
+        }),
+    );
+    let url = serve(served).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let err = driver
+        .complete(gemini_request(&model, &json!("hello"), &[], &[], None))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ModelError::RateLimited {
+                retry_after: None,
+                ..
+            }
+        ),
+        "a sub-second delay is not advice this crate can act on: {err}"
+    );
 }
 
 /// A stop that is not an answer is metered, because deciding cost money.

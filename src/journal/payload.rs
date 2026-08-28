@@ -244,8 +244,6 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             release: _,
             label: _,
             field_labels: _,
-            result_label: _,
-            result_field_labels: _,
             value: _,
         }
         | K::RunCancelled {

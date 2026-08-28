@@ -222,6 +222,57 @@ fn protected_tool_fields_are_strict_and_digest_covered() {
     ));
 }
 
+/// The declarative select-from-a-menu constraint parses, binds, and refuses
+/// its degenerate forms at parse time.
+///
+/// `one_of` is the content discipline: the field may carry only a value the
+/// reviewer enumerated, so an untrusted influence chooses among approved
+/// options and nothing else. A repeated entry is one decision written twice
+/// and refused; an empty list would permit nothing while reading as
+/// configured, and falls to the constrains-nothing rule.
+#[test]
+fn a_protected_field_value_menu_is_declarative_and_strict() {
+    let menued = GOOD.replace(
+        "      max_sensitivity: internal",
+        "      max_sensitivity: internal\n      protected_fields:\n        - path: /recipient\n          one_of: [ops-account, audit-account]",
+    );
+    let manifest = Manifest::parse(&menued).expect("a value menu parses");
+    let field = &manifest.spec.tools[0].protected_fields[0];
+    assert_eq!(
+        field.allowed_values(),
+        [
+            serde_json::json!("ops-account"),
+            serde_json::json!("audit-account")
+        ],
+        "the menu did not survive parsing, so the gate would have nothing to hold"
+    );
+    // The menu is authority and must be digest-covered: editing it is a
+    // different declaration.
+    assert_ne!(
+        manifest.digest().unwrap(),
+        Manifest::parse(&menued.replace("audit-account", "attacker-account"))
+            .unwrap()
+            .digest()
+            .unwrap(),
+        "two different menus share one digest, so a review pins nothing"
+    );
+
+    let repeated = menued.replace(
+        "one_of: [ops-account, audit-account]",
+        "one_of: [ops-account, ops-account]",
+    );
+    assert!(matches!(
+        Manifest::parse(&repeated),
+        Err(ManifestError::Syntax(_))
+    ));
+
+    let empty = menued.replace("one_of: [ops-account, audit-account]", "one_of: []");
+    assert!(matches!(
+        Manifest::parse(&empty),
+        Err(ManifestError::Syntax(_))
+    ));
+}
+
 /// A manifest's ceilings reach the runtime it configures.
 ///
 /// The point of declaring a budget in a reviewable file is that it binds. A
@@ -5332,6 +5383,15 @@ spec:
         "        - path: /account\n          allowed_sources: [crm]\n          max_sensitivity: internal",
     ))
     .expect("a source-constrained field carries authority and is accepted");
+
+    // A value menu carries authority too — content no author can widen. This
+    // is the declarative select-from-a-menu configuration, and refusing it
+    // would push every menu-bound agent back into code for a rule the
+    // manifest can hold.
+    Manifest::parse(&agent(
+        "        - path: /account\n          one_of: [ops-account, audit-account]",
+    ))
+    .expect("a menu-constrained field carries authority and is accepted");
 }
 
 /// Oversight on a plane that cannot ask anybody is refused at build.

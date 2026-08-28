@@ -1570,13 +1570,17 @@ impl Manifest {
             // completion is happily below any ceiling — so a grant whose only
             // rules are ceilings lifts the gate while constraining nobody,
             // and the recipient, amount and command fields dispatch exactly
-            // as the model wrote them. Authority needs a provenance rule.
+            // as the model wrote them. Authority needs a provenance rule or a
+            // value menu: `one_of` counts, because a field that can carry
+            // only reviewer-enumerated values is constrained in *content*,
+            // which no author — the model included — can widen.
             if grant.mutates
                 && !grant.protected_fields.is_empty()
-                && grant
-                    .protected_fields
-                    .iter()
-                    .all(|f| !f.requires_trusted() && f.allowed_sources().is_empty())
+                && grant.protected_fields.iter().all(|f| {
+                    !f.requires_trusted()
+                        && f.allowed_sources().is_empty()
+                        && f.allowed_values().is_empty()
+                })
             {
                 return Err(ManifestError::Syntax(format!(
                     "spec.tools: '{}' declares `mutates: true` and every \
@@ -1586,10 +1590,10 @@ impl Manifest {
                      bounds how secret an argument may be — not who authored \
                      it — so the model's own untrusted completion would fill \
                      every authority-bearing field unconstrained. At least one \
-                     protected field must carry a trust or source rule: \
-                     `require_trusted: true`, or `allowed_sources` naming \
-                     where the value must come from (a ceiling may sit beside \
-                     either)",
+                     protected field must carry a trust, source, or value \
+                     rule: `require_trusted: true`, `allowed_sources` naming \
+                     where the value must come from, or `one_of` enumerating \
+                     what may stand in it (a ceiling may sit beside any)",
                     grant.reference
                 )));
             }

@@ -696,7 +696,7 @@ async fn cedar_governs_a_run_and_the_digest_lands_in_the_journal() {
         .iter()
         .find_map(|r| match r.kind() {
             agentplane::journal::RecordKind::RunAdmitted { policy_bundle, .. } => {
-                Some(policy_bundle.clone())
+                Some(policy_bundle.as_deref().cloned())
             }
             _ => None,
         })

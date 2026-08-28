@@ -77,7 +77,10 @@ stale between a bump and a publish.
 ## An agent with no Rust
 
 If the agent is a prompt, a model and a result shape, it needs no program at all
-— a file and a key are the whole thing:
+— a file and a key are the whole thing. (Prefer to build this up one command at
+a time, with each refusal explained as you hit it? That is
+[your first agent](@/docs/first-agent.md), the step-by-step tutorial; this
+section is the condensed version.)
 
 ```yaml
 # summariser.yaml
@@ -295,7 +298,8 @@ is refused, exhausted or failed exits non-zero, because whoever scripts this
 needs the shell's own answer to "did it work".
 
 Keys come from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-`GEMINI_API_KEY` — or `GOOGLE_API_KEY`), never from the file; Bedrock uses `AWS_REGION` and AWS's standard credential chain,
+`GEMINI_API_KEY` — or `GOOGLE_API_KEY`), never from the file; Bedrock uses `AWS_REGION` and AWS's standard credential chain
+(SSO, roles and `aws login` sessions included) or a Bedrock API key in `AWS_BEARER_TOKEN_BEDROCK`,
 and a local or Hugging Face model is `provider: chat-completions` with
 `CHAT_COMPLETIONS_BASE_URL` pointing at any OpenAI-compatible server — Ollama,
 TGI, vLLM, llama.cpp, or `https://router.huggingface.co/v1` with
@@ -569,13 +573,24 @@ Pick the example for the question you have; none needs credentials or network:
 | Question | Example |
 |---|---|
 | Does replay or crash recovery repeat calls? | `durable_pipeline` |
+| Who resumes a run whose *process* died holding it? | `recovered_run` |
+| What happens when a run hits its budget — and who un-pauses it? | `budget_pause` |
+| Can an operator stop a run and have it undone — or stop a whole tenant? | `operator_stop` |
 | How do long-lived cases, early events and human work fit? | `clearing_case` |
 | How are plans validated and provenance propagated? | `plan_graph` |
 | Can untrusted content accompany a trusted tool selector safely? | `governed_transfer` |
 | What happens after the third system in a transactionless workflow fails? | `saga_checkout` |
+| Can several calls take together, or not at all — including an email? | `effect_group` |
+| What stops a model that chooses its own tools? | `tool_loop` |
+| How does a person approve the exact call before it happens? | `approved_call` |
+| Can a prompt injection arrive and find no reader? | `planned_run` |
 | Does a replay call the model or spend again? | `model_run` |
 | How do governed media capabilities materialize without entering the journal? | `media_run` |
 | Can prompt, model, schema and ceilings be one digest-covered file? | `manifest_run` |
+| How does an MCP server sit beside a typed Rust tool? | `mcp_tools` |
+| How does an agent remember across runs without a storage backdoor? | `memory_run` |
+| Can one customer's approved budget span several runs, then be revoked? | `standing_authority` |
+| What does erasing a case actually erase — and what still verifies? | `sealed_run` |
 | How are separate agents and handoffs bounded? | `blog_room` |
 | What does another organisation's agent see when it calls this one? | `a2a_peer` |
 | How do live tokens coexist with a journal that must replay exactly? | `streaming_run` |
@@ -610,7 +625,9 @@ bound the run. This is a journaled **pause**, not a transient provider failure
 and not a fault: the run did what it was told, and what it was told included a
 ceiling, so its completed work stands. Raise the reviewed ceiling and resume —
 the recorded refusal is re-evaluated against the current ledger — or cancel,
-which unwinds.
+which unwinds. `cargo run --example budget_pause` runs the whole protocol:
+pause, re-refusal under the same ceiling, re-admission under a raise, strict
+verification.
 
 **A run that never finishes** — it is probably suspended waiting for an event,
 a timer, or a human. `GET /runs/{id}` reports *why* it is not finishing rather

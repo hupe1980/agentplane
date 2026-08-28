@@ -696,16 +696,15 @@ async fn release_is_journaled_with_its_evidence() {
         RecordKind::Released {
             release,
             label,
-            result_label,
             value,
             ..
         } => {
             release.basis().contains("operator approved")
-                && label.is_untrusted()
-                // A release attaches a destination-scoped mark; the base
+                // The record carries the decision and the prior label; the
+                // mark it attaches is derivable from `release`, and the base
                 // label stays untrusted everywhere but the named sink.
-                && result_label.is_untrusted()
-                && !result_label.releases.is_empty()
+                && release.destination() == "run.output"
+                && label.is_untrusted()
                 && *value
                     == agentplane::core::Digest::of(
                         &serde_json::to_vec(&json!("s")).expect("serialize fixture"),

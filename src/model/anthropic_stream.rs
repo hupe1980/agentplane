@@ -69,6 +69,8 @@ pub struct Accumulator {
     /// is true, the call generated and must be billed.
     started: bool,
     stop_reason: Option<String>,
+    /// The provider's stated grounds for the stop, populated on a refusal.
+    stop_details: Option<Value>,
     /// Whether `message_stop` arrived — i.e. whether this is a whole answer.
     complete: bool,
     /// An `error` event delivered inside a 200 response.
@@ -125,6 +127,12 @@ impl Accumulator {
     #[must_use]
     pub fn stop_reason(&self) -> Option<&str> {
         self.stop_reason.as_deref()
+    }
+
+    /// The provider's `stop_details`, when the wire carried one.
+    #[must_use]
+    pub fn stop_details(&self) -> Option<&Value> {
+        self.stop_details.as_ref()
     }
 
     #[must_use]
@@ -276,6 +284,13 @@ impl Accumulator {
                     .and_then(Value::as_str)
                 {
                     self.stop_reason = Some(reason.to_owned());
+                }
+                if let Some(details) = value
+                    .get("delta")
+                    .and_then(|d| d.get("stop_details"))
+                    .filter(|d| !d.is_null())
+                {
+                    self.stop_details = Some(details.clone());
                 }
                 if let Some(u) = value.get("usage") {
                     self.absorb_usage(u);

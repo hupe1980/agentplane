@@ -1246,6 +1246,368 @@ spec:
     );
 }
 
+/// One approval plane, parameterized by the protected-field rule under test.
+///
+/// The scripted model always proposes the same transfer; what varies across
+/// the amendment tests below is only the discipline on `/recipient` and the
+/// decision a reviewer answers with — so a difference in outcome is
+/// attributable to exactly those two.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+fn approval_plane<T: agentplane::tools::Tool>(
+    protected: &str,
+) -> (
+    Arc<Runtime>,
+    Arc<RedbStore>,
+    Arc<agentplane::testkit::FakeProvider>,
+) {
+    use agentplane::runtime::Agent;
+    use agentplane::tools::ToolBox;
+
+    let manifest = agentplane::manifest::Manifest::parse(&format!(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: teller, version: "1.0.0" }}
+spec:
+  capabilities: {{ provides: [desk.pay] }}
+  models: {{ privileged: {{ provider: fake, model: m-1 }} }}
+  execution: {{ kind: tool-calling, max_turns: 4 }}
+  security: {{ max_sensitivity_egress: internal }}
+  oversight:
+    approval: tools-only
+    deadline: {{ name: payment-review, kind: hours, params: {{ n: 4 }} }}
+  tools:
+    - ref: tool://ledger/transfer
+      mutates: true
+      description: Move funds between accounts.
+      requires_approval: true
+      max_sensitivity: internal
+      protected_fields:
+{protected}
+  budgets: {{}}
+"#
+    ))
+    .expect("manifest");
+
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_call_tool(
+        "call_1",
+        "ledger__transfer",
+        json!({ "recipient": "AC-9", "amount": 250_000 }),
+    );
+    provider.will_say("done");
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .events(Arc::clone(&store) as Arc<dyn EventStore>)
+        .tasks(Arc::clone(&store) as Arc<dyn TaskStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .toolbox(ToolBox::new().with::<T>())
+        .build();
+    (rt, store, provider)
+}
+
+/// Approval binds to the call; it does not relabel the call's arguments.
+///
+/// The field demands a trusted author and the model is not one — so a person
+/// merely waving the call through must leave it exactly as refusable as it
+/// was. Anything else would make every approval a whole-value release nobody
+/// recorded.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn an_approval_alone_does_not_make_the_arguments_trusted() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use agentplane::tools::{Tool, ToolFailure};
+
+    static POSTED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Move funds between accounts.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct Transfer {
+        /// Where the money goes.
+        recipient: String,
+        /// How much, in minor units.
+        amount: i64,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Transfer {
+        const SERVER: &'static str = "ledger";
+        const NAME: &'static str = "transfer";
+        async fn call(self) -> Result<Value, ToolFailure> {
+            POSTED.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "moved": self.amount, "to": self.recipient }))
+        }
+    }
+
+    let (rt, store, _provider) =
+        approval_plane::<Transfer>("        - path: /recipient\n          require_trusted: true");
+
+    let run = rt
+        .run_correlated(
+            "desk.pay",
+            Tainted::trusted(json!({ "q": "pay AC-9" })),
+            "payment",
+            &[key("AMEND-A")],
+        )
+        .await
+        .expect("the run suspends on the approval");
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    rt.decide_task(
+        task.id,
+        &Decision::approve("dana", "looks fine to me"),
+        &officer(),
+    )
+    .await
+    .expect("the approval is recorded and the run resumes");
+
+    let done = rt
+        .recorded_outcome(run.run_id)
+        .await
+        .unwrap()
+        .expect("the run concluded");
+    assert_eq!(done.status, RunStatus::Succeeded);
+    assert_eq!(
+        POSTED.load(Ordering::SeqCst),
+        0,
+        "an approval with no amendment relabelled the model's arguments, so a \
+         value a person merely waved through reached a field that demands a \
+         trusted author"
+    );
+}
+
+/// A reviewer's amendment is the call that runs — trusted, and on the record.
+///
+/// The same fixture refuses the model's own value (the test above), so the
+/// transfer landing at all is attributable to the amendment's authorship: a
+/// person wrote these arguments into an authenticated decision bound to this
+/// one call. Strict replay then reassembles the run — decision, substitution
+/// and dispatch — without moving money again.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_reviewers_amendment_is_the_call_that_runs() {
+    use std::sync::Mutex;
+
+    use agentplane::tools::{Tool, ToolFailure};
+
+    static SENT: Mutex<Vec<(String, i64)>> = Mutex::new(Vec::new());
+
+    /// Move funds between accounts.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct Transfer {
+        /// Where the money goes.
+        recipient: String,
+        /// How much, in minor units.
+        amount: i64,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Transfer {
+        const SERVER: &'static str = "ledger";
+        const NAME: &'static str = "transfer";
+        async fn call(self) -> Result<Value, ToolFailure> {
+            SENT.lock().unwrap().push((self.recipient, self.amount));
+            Ok(json!({ "moved": self.amount }))
+        }
+    }
+
+    let (rt, store, _provider) =
+        approval_plane::<Transfer>("        - path: /recipient\n          require_trusted: true");
+
+    let run = rt
+        .run_correlated(
+            "desk.pay",
+            Tainted::trusted(json!({ "q": "pay AC-9" })),
+            "payment",
+            &[key("AMEND-B")],
+        )
+        .await
+        .expect("the run suspends on the approval");
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    rt.decide_task(
+        task.id,
+        &Decision::approve("dana", "use the settlement account, and cap it")
+            .amend(json!({ "recipient": "AC-7", "amount": 100_000 })),
+        &officer(),
+    )
+    .await
+    .expect("the amended approval is recorded and the run resumes");
+
+    let done = rt
+        .recorded_outcome(run.run_id)
+        .await
+        .unwrap()
+        .expect("the run concluded");
+    assert_eq!(done.status, RunStatus::Succeeded);
+    assert_eq!(
+        SENT.lock().unwrap().clone(),
+        vec![("AC-7".to_owned(), 100_000)],
+        "the dispatched call does not carry the reviewer's arguments — the \
+         amendment was recorded as if it governed and the model's value ran"
+    );
+
+    let replayed = rt
+        .replay(run.run_id, agentplane::runtime::Mode::Strict)
+        .await
+        .expect("strict replay");
+    assert_eq!(replayed.status, RunStatus::Succeeded);
+    assert_eq!(
+        SENT.lock().unwrap().len(),
+        1,
+        "strict replay dispatched the amended call a second time"
+    );
+}
+
+/// An amendment outside the tool's declared shape never dispatches.
+///
+/// The reviewer's channel is trusted, not schema-exempt: arguments only a
+/// person could have written still have to be arguments the tool declares.
+/// The refusal is reported to the model as an ordinary failed call — in the
+/// runtime's words, never the reviewer's.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_malformed_amendment_never_dispatches() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use agentplane::tools::{Tool, ToolFailure};
+
+    static POSTED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Move funds between accounts.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct Transfer {
+        /// Where the money goes.
+        recipient: String,
+        /// How much, in minor units.
+        amount: i64,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Transfer {
+        const SERVER: &'static str = "ledger";
+        const NAME: &'static str = "transfer";
+        async fn call(self) -> Result<Value, ToolFailure> {
+            POSTED.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "moved": self.amount, "to": self.recipient }))
+        }
+    }
+
+    let (rt, store, _provider) =
+        approval_plane::<Transfer>("        - path: /recipient\n          require_trusted: true");
+
+    let run = rt
+        .run_correlated(
+            "desk.pay",
+            Tainted::trusted(json!({ "q": "pay AC-9" })),
+            "payment",
+            &[key("AMEND-C")],
+        )
+        .await
+        .expect("the run suspends on the approval");
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    rt.decide_task(
+        task.id,
+        &Decision::approve("dana", "typo in a hurry")
+            .amend(json!({ "recipient": 7, "amount": "lots" })),
+        &officer(),
+    )
+    .await
+    .expect("the decision is recorded and the run resumes");
+
+    let done = rt
+        .recorded_outcome(run.run_id)
+        .await
+        .unwrap()
+        .expect("the run concluded");
+    assert_eq!(done.status, RunStatus::Succeeded);
+    assert_eq!(
+        POSTED.load(Ordering::SeqCst),
+        0,
+        "an amendment that does not fit the tool's declared arguments was \
+         dispatched anyway"
+    );
+}
+
+/// A source-bound field judges the amendment's channel like any other source.
+///
+/// `require_trusted` accepts any trusted author, a reviewer included; a
+/// source rule names the exact mechanisms a value may come from, and the
+/// decision channel is admitted only where the operator listed
+/// `task:agent.approve_call`. An amendment sailing past a source rule the
+/// operator never widened would be the blanket bypass this feature must not
+/// be.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn an_amendment_is_still_source_checked() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use agentplane::tools::{Tool, ToolFailure};
+
+    static POSTED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Move funds between accounts.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct Transfer {
+        /// Where the money goes.
+        recipient: String,
+        /// How much, in minor units.
+        amount: i64,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Transfer {
+        const SERVER: &'static str = "ledger";
+        const NAME: &'static str = "transfer";
+        async fn call(self) -> Result<Value, ToolFailure> {
+            POSTED.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "moved": self.amount, "to": self.recipient }))
+        }
+    }
+
+    let (rt, store, _provider) = approval_plane::<Transfer>(
+        "        - path: /recipient\n          allowed_sources: [model:fake/m-1]\n          max_sensitivity: internal",
+    );
+
+    let run = rt
+        .run_correlated(
+            "desk.pay",
+            Tainted::trusted(json!({ "q": "pay AC-9" })),
+            "payment",
+            &[key("AMEND-D")],
+        )
+        .await
+        .expect("the run suspends on the approval");
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    rt.decide_task(
+        task.id,
+        &Decision::approve("dana", "use the settlement account")
+            .amend(json!({ "recipient": "AC-7", "amount": 100_000 })),
+        &officer(),
+    )
+    .await
+    .expect("the decision is recorded and the run resumes");
+
+    let done = rt
+        .recorded_outcome(run.run_id)
+        .await
+        .unwrap()
+        .expect("the run concluded");
+    assert_eq!(done.status, RunStatus::Succeeded);
+    assert_eq!(
+        POSTED.load(Ordering::SeqCst),
+        0,
+        "an amendment bypassed a source-bound field — the decision channel \
+         must be listed in allowed_sources before a reviewer's value may \
+         stand there"
+    );
+}
+
 /// **`requires_approval` is unreachable from a hand-written skill, and four
 /// separate refusals are what make it so.**
 ///
