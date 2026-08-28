@@ -42,6 +42,17 @@ the blob store's erasure semantics, the drill's reading path, and the
 sweeper's takeover evidence — and found the tenant-isolation argument
 unapplied at the unit erasure actually names.
 
+### Changed — the case-store contract pins blob-list scoping in both directions
+
+**Affects anyone implementing `CaseStore` against their own backend.** The
+conformance battery asserted only that a case's blob list *contains* its own
+artifact — one-sided, and satisfied exactly by a `blobs_of` that returns every
+case's blobs. It now also asserts the other case's artifact is **absent**, on
+both shipped backends and yours: the list is what an erasure request walks, so
+one that answers across matters erases data nobody named and reports more
+discharged than the case ever held. A store that scopes its reads already
+passes; one that does not now fails the battery instead of failing an erasure.
+
 ### Fixed — the erasure unit leads the blob's storage address
 
 Content addressing gave identical bytes one storage key, and the erasure unit

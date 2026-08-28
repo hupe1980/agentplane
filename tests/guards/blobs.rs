@@ -252,9 +252,22 @@ async fn erasing_a_case_leaves_other_cases_alone() {
     // The other matter holds the identical bytes: one digest, two objects.
     let other = their_blobs.put(shared).await.expect("put");
     assert_eq!(a, other, "identical bytes carry one content digest");
+    // And bytes of its own. Both halves are needed: the shared digest is what
+    // a scoped *address* protects, and this distinct one is what a scoped
+    // `blobs_of` protects — a list that answered with every case's artifacts
+    // would be invisible against the shared digest alone, because the extra
+    // entry is one the erasing case already holds.
+    let only_theirs = their_blobs
+        .put("subject two, their own document".as_bytes())
+        .await
+        .expect("put");
     cases.link_blob(mine, a, ts(11)).await.expect("link");
     cases.link_blob(mine, b, ts(12)).await.expect("link");
     cases.link_blob(theirs, other, ts(11)).await.expect("link");
+    cases
+        .link_blob(theirs, only_theirs, ts(12))
+        .await
+        .expect("link");
 
     let n = erase_case(
         blobs.as_ref(),
@@ -268,7 +281,11 @@ async fn erasing_a_case_leaves_other_cases_alone() {
     )
     .await
     .expect("erase");
-    assert_eq!(n, 2, "both of this case's blobs should have been expired");
+    assert_eq!(
+        n, 2,
+        "the erasure walked a list that is not this case's own — it expired \
+         {n} artifacts where the matter holds two"
+    );
 
     for (label, digest) in [("a", a), ("b", b)] {
         match mine_blobs.get(digest).await {
@@ -285,8 +302,8 @@ async fn erasing_a_case_leaves_other_cases_alone() {
         }
     }
 
-    // The identical bytes in the other matter survive: one matter's erasure
-    // reaches every one of its own copies and nothing else's.
+    // Both of the other matter's artifacts survive: its copy of the shared
+    // bytes, and its own.
     assert_eq!(
         their_blobs
             .get(other)
@@ -294,6 +311,10 @@ async fn erasing_a_case_leaves_other_cases_alone() {
             .expect("the other case's identical bytes are untouched"),
         shared,
         "erasing one case destroyed another case's copy of the same bytes"
+    );
+    assert!(
+        their_blobs.get(only_theirs).await.is_ok(),
+        "erasing one case reached an artifact only the other matter holds"
     );
 }
 

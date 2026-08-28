@@ -1340,6 +1340,18 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                if !merkle::verify_consistency(old, &old_root, new, &checkpoint.root, proof) {",
         "                if false {",
     ),
+    "PostgresBlobListsIgnoreTheCase": (
+        "src/store/postgres_cases.rs",
+        "postgres_satisfies_the_case_layer_contracts",
+        "the blob list a case answers with drops its own case predicate, so an "
+        "erasure request walks every matter's artifacts — tombstones written "
+        "across matters, and a count reporting more discharged than the case "
+        "ever held. The redb twin of this had an anchor and this backend had "
+        "none, which is the asymmetry that lets one store enforce a rule its "
+        "sibling quietly does not",
+        """                  WHERE case_id = $1 AND tenant = $2 ORDER BY written_at, digest",""",
+        """                  WHERE (case_id = $1 OR TRUE) AND tenant = $2 ORDER BY written_at, digest",""",
+    ),
     "ErasureIsNotScopedToTheCase": (
         "src/store/redb_cases.rs",
         "erasing_a_case_leaves_other_cases_alone",

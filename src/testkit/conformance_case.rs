@@ -22,9 +22,9 @@ use std::sync::Arc;
 use crate::batch::{BatchStore, ItemOutcome};
 use crate::case::{CaseStore, ClaimError, EventStore, TargetedDelivery, TaskStore, TimerStore};
 use crate::core::{
-    BatchId, CaseId, CaseVersion, CorrelationKey, EffectKey, InboundEvent, Justification, OnExpiry,
-    Phase, Priority, RunId, Spend, StepId, StoreError, Subscription, Task, TaskId, TaskState,
-    Timestamp,
+    BatchId, CaseId, CaseVersion, CorrelationKey, Digest, EffectKey, InboundEvent, Justification,
+    OnExpiry, Phase, Priority, RunId, Spend, StepId, StoreError, Subscription, Task, TaskId,
+    TaskState, Timestamp,
 };
 
 pub use super::conformance::Report;
@@ -59,6 +59,69 @@ pub async fn check_cases(store: &Arc<dyn CaseStore>, r: &mut Report) {
     an_imported_case_is_reachable_by_every_read_path(store, r).await;
     concurrent_attaches_all_land_and_land_once(store, r).await;
     a_breached_obligation_is_listable_and_survives_closure(store, r).await;
+    a_cases_blob_list_holds_only_its_own(store, r).await;
+}
+
+/// A case's blob list is its own, and the negative half is the load-bearing one.
+///
+/// `blobs_of` is the list an erasure request walks, so a list that answers with
+/// another matter's artifacts erases data nobody asked about — tombstones
+/// written across matters, and a count that reports more discharged than the
+/// case ever held. Asserting only that the case's own digest is *present* is
+/// one-sided: a `blobs_of` that returned every case's blobs satisfies it
+/// exactly, which is how a de-scoped read passed a battery that had checked it.
+async fn a_cases_blob_list_holds_only_its_own(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let (Ok(mine), Ok(theirs)) = (
+        store
+            .correlate_or_open("blob-scope", &keys("C-BLOBS-MINE"), ts(1_000))
+            .await,
+        store
+            .correlate_or_open("blob-scope", &keys("C-BLOBS-THEIRS"), ts(1_000))
+            .await,
+    ) else {
+        r.record("blobs", "the fixture cases did not open");
+        return;
+    };
+    let (mine, theirs) = (mine.case_id(), theirs.case_id());
+
+    let ours = Digest::of(b"conformance: this matter's artifact");
+    let other = Digest::of(b"conformance: another matter's artifact");
+    if let Err(e) = store.link_blob(mine, ours, ts(1_001)).await {
+        r.record("blobs", format!("linking this case's artifact failed: {e}"));
+        return;
+    }
+    if let Err(e) = store.link_blob(theirs, other, ts(1_001)).await {
+        r.record(
+            "blobs",
+            format!("linking the other case's artifact failed: {e}"),
+        );
+        return;
+    }
+
+    match store.blobs_of(mine).await {
+        Ok(list) => {
+            if !list.contains(&ours) {
+                r.record(
+                    "blobs",
+                    "a case's own artifact is missing from its blob list — erasure \
+                     cannot find the bytes from the matter that names them",
+                );
+            }
+            if list.contains(&other) {
+                r.record(
+                    "blobs",
+                    "a case's blob list carries another case's artifact — an erasure \
+                     request for one matter reaches a matter nobody named, and reports \
+                     more artifacts discharged than the case ever held",
+                );
+            }
+        }
+        Err(e) => r.record(
+            "blobs",
+            format!("a case's blob list could not be read: {e}"),
+        ),
+    }
 }
 
 /// A missed obligation is findable without knowing which case to open, and
@@ -339,7 +402,7 @@ async fn an_imported_case_is_reachable_by_every_read_path(
     store: &Arc<dyn CaseStore>,
     r: &mut Report,
 ) {
-    use crate::core::{Case, CaseStatus, CaseVersion, Deadline, DeadlineState, Digest};
+    use crate::core::{Case, CaseStatus, CaseVersion, Deadline, DeadlineState};
     r.checked += 1;
 
     let id = crate::core::CaseId::generate();
