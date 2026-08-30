@@ -512,8 +512,8 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|error| be(&error))?;
         // The sliding-retention row goes with the memory it describes. Left
-        // behind it is residue about an erased id; every erasure path removes
-        // it, where this backend used to leave it to the expiry sweep alone.
+        // behind it is residue about an erased id, so every erasure path
+        // removes it rather than leaving it to the expiry sweep.
         tx.execute(
             "DELETE FROM memory_access_expiry WHERE tenant = $1 AND id = $2",
             &[&tenant, &id],

@@ -339,7 +339,7 @@ sub-run's reported spend is billed to the run that ordered it.
 
 | Field | Default | Notes |
 |---|---|---|
-| `ref` | **required** | `tool://server/name`. Transport-neutral: which transport reaches `server` is a deployment decision made by `ToolRouter`, so one manifest runs against an in-process double in a test and a real MCP server in production. |
+| `ref` | **required** | `tool://server/name`. Transport-neutral: what `server` is — an MCP connection, tools compiled into the binary, `agent` for an agent on this plane, or the id of a registered A2A peer — is a deployment decision made at build, so one manifest runs against an in-process double in a test and a real server in production. A peer grant dispatches through `StepCtx::call_peer`: a delegating hop that extends the run's chain, counts against `max_delegation_depth`, and is held to this grant's fields and ceiling. |
 | `mutates` | `true` | Whether calling it changes the world. The cautious default. |
 | `max_sensitivity` | `public` | The highest sensitivity this tool may be *sent*. |
 | `description` | **required** | What the model is told. Required for a `tool-calling` agent. In the digest, because text that steers tool selection belongs where the system prompt does. |

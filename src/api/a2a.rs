@@ -1703,7 +1703,7 @@ async fn stream_method(
             // for at that point.
             let source = super::peer_source(&caller.actor);
             let input = Tainted::from_source(message.to_input(), SourceId::new(&source));
-            match spawn_a2a(&server, &skill, input, &message, &source).await {
+            match spawn_a2a(&server, &skill, input, &message, &caller).await {
                 Ok(run) => {
                     if let Some(push) = params.configuration.as_ref().and_then(|configuration| {
                         configuration.task_push_notification_config.as_ref()
@@ -1712,7 +1712,10 @@ async fn stream_method(
                     }
                     run
                 }
-                Err(crate::core::RuntimeError::PolicyDenied(_)) => {
+                Err(
+                    crate::core::RuntimeError::PolicyDenied(_)
+                    | crate::core::RuntimeError::Delegation(_),
+                ) => {
                     return Err(RpcError::new(
                         code::UNSUPPORTED_OPERATION,
                         "this agent declined the request",
@@ -2081,7 +2084,7 @@ async fn send_message(
         .as_ref()
         .is_some_and(|c| c.return_immediately)
     {
-        return match spawn_a2a(server, &skill, input, &message, &source).await {
+        return match spawn_a2a(server, &skill, input, &message, &caller).await {
             Ok(run) => {
                 if let Some(push) = &inline_push {
                     register_push(server, push, run, 1).await?;
@@ -2091,9 +2094,10 @@ async fn send_message(
                     "task": task_of(run, TaskState::Working, "accepted", case)
                 }))
             }
-            Err(crate::core::RuntimeError::PolicyDenied(_)) => {
-                Ok(json!({ "message": declined(&skill) }))
-            }
+            Err(
+                crate::core::RuntimeError::PolicyDenied(_)
+                | crate::core::RuntimeError::Delegation(_),
+            ) => Ok(json!({ "message": declined(&skill) })),
             Err(crate::core::RuntimeError::QuotaExceeded(_)) => Err(RpcError::new(
                 code::QUOTA_EXHAUSTED,
                 QUOTA_EXHAUSTED_MESSAGE,
@@ -2105,7 +2109,7 @@ async fn send_message(
         };
     }
 
-    let admission = match run_a2a(server, &skill, input, &message, &source).await {
+    let admission = match run_a2a(server, &skill, input, &message, &caller).await {
         Ok(admission) => admission,
         // A policy denial is the agent *declining*, not the agent breaking.
         // Reported as `-32603 Internal error` it reads as "this server is
@@ -2115,7 +2119,9 @@ async fn send_message(
         // Answered as a `Message` rather than a rejected `Task` because no task
         // exists: nothing was admitted, so there is no id to poll and no
         // history to fetch. A2A's response is a oneof for exactly this.
-        Err(crate::core::RuntimeError::PolicyDenied(_)) => {
+        Err(
+            crate::core::RuntimeError::PolicyDenied(_) | crate::core::RuntimeError::Delegation(_),
+        ) => {
             return Ok(json!({ "message": declined(&skill) }));
         }
         // Back-pressure, not a fault. `-32603` reads as "the far side is
@@ -2207,39 +2213,11 @@ async fn run_a2a(
     skill: &str,
     input: Tainted<Value>,
     message: &A2aMessage,
-    source: &str,
+    caller: &Caller,
 ) -> Result<crate::runtime::Admission, crate::core::RuntimeError> {
-    // The key carries its producer, in the spelling `InboundEvent::dedup_key`
-    // blesses: a bare `messageId` would let two counterparties swallow each
-    // other's messages as apparent retries — or *join* each other's cases,
-    // since correlation matches any open case in the tenant. And it is an
-    // **admission** key, not only a correlation key: this crate's own client
-    // keeps `messageId` stable across retries precisely so a peer can
-    // deduplicate, and a server that correlates without deduplicating starts
-    // a second run inside the right case.
-    let keyed = format!("{source}\u{1f}{}", message.message_id);
-    if let Some(context) = message.context_id.as_deref() {
-        let case = crate::core::CaseId::parse(context).map_err(|_| {
-            crate::core::RuntimeError::PlanContract("contextId is not a case issued here".into())
-        })?;
-        return server
-            .runtime
-            .run_in_case_once(skill, input, case, &keyed)
-            .await;
-    }
-    // Always correlated: `A2aServer::new` refuses a runtime without a case
-    // layer, so every task gets a real, continuable context — the contextId
-    // returned is one a client can send back, not a string that satisfies a
-    // schema and continues nothing.
     server
         .runtime
-        .run_correlated_once(
-            skill,
-            input,
-            "a2a.context",
-            &[crate::core::CorrelationKey::new("a2a-message", &keyed)],
-            &keyed,
-        )
+        .run_under(skill, input, run_terms(message, caller)?)
         .await
 }
 
@@ -2248,33 +2226,62 @@ async fn spawn_a2a(
     skill: &str,
     input: Tainted<Value>,
     message: &A2aMessage,
-    source: &str,
+    caller: &Caller,
 ) -> Result<RunId, crate::core::RuntimeError> {
-    // Producer-scoped and deduplicating, for the reasons `run_a2a` states. A
-    // duplicate answers with the run the key already admitted, which is
+    // Producer-scoped and deduplicating, for the reasons `run_terms` states.
+    // A duplicate answers with the run the key already admitted, which is
     // exactly what a retrying caller needs back.
-    let keyed = format!("{source}\u{1f}{}", message.message_id);
-    if let Some(context) = message.context_id.as_deref() {
-        let case = crate::core::CaseId::parse(context).map_err(|_| {
-            crate::core::RuntimeError::PlanContract("contextId is not a case issued here".into())
-        })?;
-        return Ok(server
-            .runtime
-            .spawn_in_case_once(skill, input, case, &keyed)
-            .await?
-            .run);
-    }
     Ok(server
         .runtime
-        .spawn_correlated_once(
-            skill,
-            input,
-            "a2a.context",
-            &[crate::core::CorrelationKey::new("a2a-message", &keyed)],
-            &keyed,
-        )
+        .spawn_under(skill, input, run_terms(message, caller)?)
         .await?
         .run)
+}
+
+/// The terms every A2A admission runs under: keyed by the producer-scoped
+/// message id, inside the case the caller named or a fresh one, and **acting
+/// as the caller** where the credential carried a chain.
+///
+/// The key carries its producer, in the spelling `InboundEvent::dedup_key`
+/// blesses: a bare `messageId` would let two counterparties swallow each
+/// other's messages as apparent retries — or *join* each other's cases, since
+/// correlation matches any open case in the tenant. And it is an **admission**
+/// key, not only a correlation key: this crate's own client keeps `messageId`
+/// stable across retries precisely so a peer can deduplicate, and a server
+/// that correlates without deduplicating starts a second run inside the right
+/// case.
+///
+/// The chain is the caller's, never the plane's: a plane that admitted every
+/// peer's run under its own chain would answer "on whose behalf" with the same
+/// name for all of them, and act for a caller whose credential permits less.
+fn run_terms(
+    message: &A2aMessage,
+    caller: &Caller,
+) -> Result<crate::runtime::RunTerms, crate::core::RuntimeError> {
+    let source = super::peer_source(&caller.actor);
+    let keyed = format!("{source}\u{1f}{}", message.message_id);
+    let mut terms = crate::runtime::RunTerms::default().once(&keyed);
+    if let Some(chain) = caller.acting_as.as_ref() {
+        terms = terms.acting_as(chain.clone());
+    }
+    Ok(match message.context_id.as_deref() {
+        Some(context) => {
+            let case = crate::core::CaseId::parse(context).map_err(|_| {
+                crate::core::RuntimeError::PlanContract(
+                    "contextId is not a case issued here".into(),
+                )
+            })?;
+            terms.in_case(case)
+        }
+        // Always correlated: `A2aServer::new` refuses a runtime without a case
+        // layer, so every task gets a real, continuable context — the
+        // contextId returned is one a client can send back, not a string that
+        // satisfies a schema and continues nothing.
+        None => terms.correlated(
+            "a2a.context",
+            &[crate::core::CorrelationKey::new("a2a-message", &keyed)],
+        ),
+    })
 }
 
 async fn task_context(server: &A2aServer, run: RunId) -> Result<Option<String>, RpcError> {

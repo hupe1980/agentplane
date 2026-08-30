@@ -30,6 +30,142 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.25.0] — 2026-08-30
+
+An audit round over the identity tier, asking of I6 — *audience-bound,
+time-bounded, depth-bounded, monotonically attenuating; ambient credentials
+prohibited* — which of its five clauses the code actually enforced. Two of
+them, and the fifth was violated by the served surface.
+
+### Changed — **breaking**: a served run acts as its caller, never as the plane
+
+The A2A server admitted every peer's run under the chain the plane was built
+with (`RuntimeBuilder::acting_as`). The message named the peer, the sink
+labels named the peer, and the `IdentityBound` record named the plane's
+operator — for every caller. That is an ambient credential by I6's own
+definition, and the confused deputy the field now audits shipping frameworks
+for: a peer whose own credential permits `billing.*` was gated by a chain
+holding everything. A chain is now **per run**. `Caller` carries
+`acting_as`, produced by the `Authenticator` like the actor and the tenant
+(never from a body — the governance extension's chain remains a claim), and
+the server threads it into admission through the new `RunTerms::acting_as`,
+where it is what the plan is checked against, what the policy context
+carries, and what the journal records. The plane's own chain covers exactly
+the runs the embedder starts in-process; a caller presenting no chain still
+acts under it. For `agentplane serve`, a token-file entry with `scope`
+becomes that caller's chain, rooted at the actor and bound to the entry's
+tenant. Pinned by `AServedRunActsAsThePlane` and the two orderings of
+"caller's chain over the plane's" at the gate and at the record.
+
+The chain then has to reach the *steps*, and it did not: `StepCtx` carried
+the plane's chain into every `effect:perform` and `release` policy request
+and into `commission`'s depth, so a run admitted for a caller was judged
+per effect as the operator — and a *resumed* run of any kind acted under
+whatever chain the plane was configured with at resume time rather than the
+one its journal records. Both are now the run's: live from admission, on
+replay from `IdentityBound` (re-checked structurally, never re-verified),
+pinned by `AStepActsAsThePlane` and `AResumedRunActsAsThePlane`. And it
+travels across `cx.commission`: a sub-run is admitted under the orderer's
+chain plus one link naming the commissioned agent (`agent/<capability>`,
+scope, expiry and audience inherited), the in-plane twin of the extra link a
+peer call already sends outward — the sibling divergence this crate's
+audits keep finding, closed on the hand-off that has no network to notice
+it. `ACommissionDropsTheChain` pins it.
+
+The outbound leg had the mirror-image gap: `PeerCall::prepare` takes the
+caller's chain, and a skill had no way to read the run's — `StepCtx` exposed
+no accessor — so the only chain a peer call could carry was one the skill
+held ambiently. `StepCtx::acting_as()` returns the chain the run was admitted
+under, and the peers module now says that is the one to extend.
+
+`RunTerms` is public and is the general form of the fourteen `run_*`/`spawn_*`
+methods — `in_case`, `correlated`, `once`, `acting_as`, composed —
+consumed by `run_under`, `spawn_under` and `run_plan_under`. The named
+methods stay as the conveniences they were; the axes multiply, and a method
+per combination would not.
+
+### Added — audience and validity attenuate, and bind at admission
+
+`Principal` carried an id and a scope. I6 requires four bounds; the type
+enforced two (scope, depth). `Principal::audience` and `Principal::not_after`
+are the other two, and they attenuate exactly as scope does — a delegate may
+not outlive its delegator (`ValidityWidened`) or name a plane the chain was
+not issued for (`AudienceWidened`), checked at every hop and therefore at
+every deserialization. The clocked half lives in one place:
+`Delegation::admissible(plane, at)` runs at admission and nowhere else,
+refusing `Expired` and `WrongAudience` as `RuntimeError::Delegation` — its
+own variant, because "obtain a fresh credential" and "this rule says no"
+call for different responses. Replay never asks it: a run admitted under a
+live chain is history, and the recorded chain is re-checked structurally
+only. Both bounds are enforced where declared and only there — a chain
+naming neither acts anywhere, indefinitely — so a credential that carries
+them is held to them and one that does not is not silently widened into a
+wildcard. Anchors `ValidityCanWiden`, `AudienceCanWiden`,
+`AnExpiredChainIsAdmitted`, `AChainForAnotherPlaneIsAdmitted`,
+`NoAdmissionBoundsCheck`.
+
+### Added — peers are wired on the plane, not carried by a skill
+
+The outbound A2A path was a complete effect surface with no way in: no
+builder method wired a registry or client, no `StepCtx` method reached one,
+no manifest grant could name a peer, and no CLI flag could point at one — a
+skill had to construct `PeerCall::prepare(&registry, client, &chain, ..)`
+from state it carried itself, chain included. `RuntimeBuilder::peers(registry,
+client)` wires them once; `StepCtx::call_peer(peer, capability, &payload)`
+extends the run's chain by one link and dispatches through the sink gate;
+`peer_task` and `cancel_peer_task` cover the task lifecycle. A manifest grants
+a peer's capability as `tool://<peer>/<capability>` — the peer's registry id
+is its server name, so the reviewed document reads as it does for any tool,
+and the four things a server name can be (a transport, typed tools, `agent`,
+a peer) are settled at build with a name that could be two of them refused.
+The grant governs the hop: `PeerCall::governed_by` takes its protected
+fields, ceiling and `mutates`, the answer is labelled with the grant's
+reference so a source rule can name it, and a governed skill calling a peer
+its manifest never listed is refused like an ungranted tool. Build refuses a
+grant outside the peer's registry scope and a peer grant on a specialist; a
+capability outside the grant is `PeerError::NotGranted` and never leaves.
+`PeerRouter` reaches several peers by id, and `agentplane run|serve|replay
+--peer NAME=URL` wires one with its token read from
+`AGENTPLANE_PEER_TOKEN_<NAME>` (the `:full` image now carries `a2a`).
+Eight anchors, `APeerCallSkipsTheGrantScope` through
+`APeerNamedLikeAToolServerBuilds`; the `peer_call` example runs both planes
+in one process.
+
+### Audited — the identity tier against the field
+
+Two arXiv results were read against the design and cited (IDs verified
+against their abstract pages). *Authorization Propagation in Multi-Agent AI
+Systems* ([2605.05440](https://arxiv.org/abs/2605.05440)) arrives at an
+append-only, per-hop attenuating token chain binding identity, authority
+and audience — the shape `Delegation` already was on two of three axes, and
+now is on all three; its token-as-wire-format half is deliberately left to
+the authenticator. *Capability Gates Are Not Authorization*
+([2606.28679](https://arxiv.org/abs/2606.28679)) audits shipping frameworks
+and finds every one gates capabilities and none re-authorizes a call against
+the *caller's* authority — the confused deputy, which is precisely what a
+served plane binding its own chain to every peer's run was, and which no
+fixture could see because every fixture's chain was wider than every plan.
+
+The platforms were checked for the same question. LangGraph Platform's
+custom auth yields an identity plus permissions and scopes *resources* to
+their owner through metadata filters — who may read this thread — with no
+authority carried into what the run does. Amazon Bedrock AgentCore Identity
+is the nearest thing to an identity tier: workload identities, a token vault
+that hands an agent user-delegated OAuth tokens, per-request signature,
+expiry and scope validation, and an impersonation flow with an audit log.
+What neither carries is an attenuating chain *across* hops with the owner
+still named at the bottom — AgentCore's agent holds the user's token and
+acts as the user; a sub-agent it calls holds its own. That hop is where this
+runtime's `commission` and peer-call links now keep the owner, expiry and
+audience, and it is the distinction the changes above exist to hold.
+
+### Removed — `DelegationScheme`
+
+A public seam with no caller: the runtime never invoked it, so implementing
+it verified nothing (shape 29). The seam that turns a credential into a chain
+is the `Authenticator`, which already produces every other fact about a
+caller and now produces this one.
+
 ## [0.24.0] — 2026-08-28
 
 An audit round over the examples and the developer surface — a runnable

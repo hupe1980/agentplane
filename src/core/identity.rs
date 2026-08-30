@@ -19,14 +19,40 @@
 //! would mean a rewrite when they settle. What the runtime actually *depends on*
 //! is one property they all provide:
 //!
-//! > **Scope is monotonically non-increasing.** A delegate can never hold more
-//! > authority than its delegator.
+//! > **Authority is monotonically non-increasing.** A delegate can never hold
+//! > more than its delegator — not a wider scope, not a later expiry, not
+//! > another audience.
 //!
-//! That is what [`Delegation::delegate`] enforces, and it is enforced at
-//! construction rather than checked in review — a widened scope is not
-//! representable, so there is no code path that has to remember to look. The
-//! credential format sits behind [`DelegationScheme`]; swapping JWT for
-//! something else is a driver change, not a redesign.
+//! That is what [`Delegation::delegate`] enforces, over all three axes, and it
+//! is enforced at construction rather than checked in review — a widened link
+//! is not representable, so there is no code path that has to remember to
+//! look. The credential format is the authenticator's business: whatever
+//! parses a bearer token, a JWT or a signed gateway header hands the runtime a
+//! [`Delegation`], and the chain's own constructors guarantee the property
+//! however it was obtained.
+//!
+//! # Three bounds, and where each is checked
+//!
+//! * **Scope** — what the chain may do. Structural: checked at every hop and
+//!   again at admission against the plan, which is the authorization graph.
+//! * **Validity** — until when. [`Principal::not_after`] attenuates like
+//!   scope (a delegate may not outlive its delegator), and the *effective*
+//!   instant is compared against the admission clock once, by
+//!   [`Delegation::admissible`]. Never re-checked on replay: see below.
+//! * **Audience** — for which plane. [`Principal::audience`] names the tenant
+//!   a link is spendable at; a chain naming one is refused by every other
+//!   plane, so a credential minted for `acme` cannot be presented to `globex`
+//!   and act there. A chain naming none is admitted anywhere — absence is
+//!   absence, not a wildcard somebody chose, and a deployment that needs the
+//!   bound sets it in the token or the credential it issues.
+//!
+//! A chain is **per request, never per plane.** The plane's own chain
+//! (`RuntimeBuilder::acting_as`) is the identity a run acts under when the
+//! embedder starts it in-process; a served surface admits each run under the
+//! chain its authenticated caller presented (`RunTerms::acting_as`), because a
+//! plane that bound its own chain to every peer's run would be an ambient
+//! credential — every caller acting as the owner, and "on whose behalf"
+//! answered with the same name for all of them.
 //!
 //! # Verified once, then journaled
 //!
@@ -42,11 +68,10 @@
 //! governed the run, and it stays true regardless of what has since expired.
 
 use std::collections::BTreeSet;
-use std::fmt::Debug;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::Capability;
+use crate::core::{Capability, Timestamp, format_timestamp};
 
 /// What a principal is allowed to do.
 ///
@@ -169,6 +194,12 @@ fn covers(a: &str, b: &str) -> bool {
 }
 
 /// One link in a delegation chain.
+///
+/// Three bounds ride on a link, and every one of them attenuates through
+/// [`Delegation::delegate`]: a delegate's scope is inside its delegator's, its
+/// expiry is no later, and its audience is the same one or none. The two
+/// optional bounds are **absent, never null**, on the wire — a chain written
+/// before they existed reads back as one that declares neither.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Principal {
     /// Workload or human identity. A SPIFFE ID in practice, but opaque here —
@@ -176,6 +207,27 @@ pub struct Principal {
     pub id: String,
     /// What this link may do. Never wider than its delegator's.
     pub scope: Scope,
+    /// The plane this link is spendable at, as a tenant name.
+    ///
+    /// A credential minted for one plane and presented to another is the
+    /// replay every audience claim exists to stop, so a chain naming an
+    /// audience is admitted only by the plane it names. `None` inherits the
+    /// delegator's; a chain in which nobody names one is admitted anywhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    /// The instant after which this link no longer authorizes anything.
+    ///
+    /// Compared against the admission clock exactly once, at admission — a run
+    /// admitted under a live chain stays a valid run after the chain expires,
+    /// which is why replay reads the chain back instead of re-judging it.
+    /// `None` inherits the delegator's, and a chain in which nobody names one
+    /// never expires by itself.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub not_after: Option<Timestamp>,
 }
 
 impl Principal {
@@ -183,7 +235,23 @@ impl Principal {
         Self {
             id: id.into(),
             scope,
+            audience: None,
+            not_after: None,
         }
+    }
+
+    /// Bind this link to one plane.
+    #[must_use]
+    pub fn for_audience(mut self, audience: impl Into<String>) -> Self {
+        self.audience = Some(audience.into());
+        self
+    }
+
+    /// Bound this link in time.
+    #[must_use]
+    pub const fn until(mut self, not_after: Timestamp) -> Self {
+        self.not_after = Some(not_after);
+        self
     }
 }
 
@@ -204,6 +272,38 @@ pub enum DelegationError {
         widened: String,
     },
 
+    /// The delegate would outlive its delegator.
+    ///
+    /// The same rule as scope, on the time axis: a link that expires later
+    /// than the one above it holds authority its delegator will no longer
+    /// have, which is how a short-lived credential buys a long-lived one.
+    #[error(
+        "'{to}' would stay valid until {delegate_until}, later than its delegator '{from}' \
+         ({delegator_until}) — delegation may only narrow"
+    )]
+    ValidityWidened {
+        from: String,
+        to: String,
+        delegator_until: String,
+        delegate_until: String,
+    },
+
+    /// The delegate names a plane its delegator was not issued for.
+    ///
+    /// An audience is a bound on *where* a chain may be spent. A delegate
+    /// naming a different one would carry its delegator's authority to a plane
+    /// the delegator never held it at.
+    #[error(
+        "'{to}' names audience '{delegate_audience}' but its delegator '{from}' is bound to \
+         '{delegator_audience}' — delegation may only narrow"
+    )]
+    AudienceWidened {
+        from: String,
+        to: String,
+        delegator_audience: String,
+        delegate_audience: String,
+    },
+
     /// The chain is longer than the manifest allows.
     ///
     /// A depth cap is not about scope; it bounds how far a request can travel
@@ -214,6 +314,34 @@ pub enum DelegationError {
     /// A chain arrived with no links, or with no owner at its root.
     #[error("delegation chain is empty: there is no principal to act as")]
     Empty,
+
+    /// The chain's validity ended before this run was admitted.
+    ///
+    /// A refusal at admission only — never on replay, where the recorded chain
+    /// is history rather than a credential being presented.
+    #[error(
+        "delegation to '{subject}' expired at {not_after}; this admission is at {at} — \
+         obtain a fresh credential rather than retrying"
+    )]
+    Expired {
+        subject: String,
+        not_after: String,
+        at: String,
+    },
+
+    /// The chain was issued for another plane.
+    ///
+    /// Nothing about the chain is wrong; it is being spent where it must not
+    /// be. The presented credential names an audience, and this is not it.
+    #[error(
+        "delegation to '{subject}' is bound to audience '{audience}' and cannot act on \
+         plane '{plane}'"
+    )]
+    WrongAudience {
+        subject: String,
+        audience: String,
+        plane: String,
+    },
 }
 
 /// A verified chain from a human owner down to the acting workload.
@@ -228,9 +356,9 @@ pub enum DelegationError {
 ///
 /// `#[serde(try_from)]` rather than a derived `Deserialize`, which would reach
 /// the fields directly and *be* the `new(links)` this type refuses to offer.
-/// The claim above is what the rest of the crate spends: [`DelegationScheme`]
-/// is a public seam whose implementations parse credentials, and a chain also
-/// arrives from a journal record and from a peer. A derive would let any of
+/// The claim above is what the rest of the crate spends: an authenticator
+/// parses credentials into chains, and a chain also arrives from a journal
+/// record and from a peer. A derive would let any of
 /// them assert a chain that widens at a hop — [`I6`] inverted, through the one
 /// door nobody reads as a door.
 ///
@@ -297,11 +425,19 @@ impl Delegation {
 
     /// Extend the chain, narrowing authority.
     ///
+    /// Narrowing is checked on every axis a link carries: the delegate's scope
+    /// must be inside the delegator's, its expiry no later than the chain's
+    /// effective one, and its audience either unset or the chain's own. A
+    /// delegate that sets a bound the chain had not set is narrowing, which
+    /// is always permitted.
+    ///
     /// # Errors
     ///
     /// [`DelegationError::ScopeWidened`] if the delegate asks for anything the
-    /// delegator does not hold, and [`DelegationError::TooDeep`] past
-    /// [`MAX_DELEGATION_DEPTH`].
+    /// delegator does not hold, [`DelegationError::ValidityWidened`] if it
+    /// would outlive the chain, [`DelegationError::AudienceWidened`] if it
+    /// names a plane the chain is not bound to, and
+    /// [`DelegationError::TooDeep`] past [`MAX_DELEGATION_DEPTH`].
     pub fn delegate(&self, to: Principal) -> Result<Self, DelegationError> {
         let from = self.subject();
         if !from.scope.contains(&to.scope) {
@@ -315,6 +451,27 @@ impl Delegation {
                 from: from.id.clone(),
                 to: to.id,
                 widened,
+            });
+        }
+        if let (Some(delegator_until), Some(delegate_until)) = (self.not_after(), to.not_after)
+            && delegate_until > delegator_until
+        {
+            return Err(DelegationError::ValidityWidened {
+                from: from.id.clone(),
+                to: to.id,
+                delegator_until: format_timestamp(delegator_until),
+                delegate_until: format_timestamp(delegate_until),
+            });
+        }
+        if let (Some(delegator_audience), Some(delegate_audience)) =
+            (self.audience(), to.audience.as_deref())
+            && delegate_audience != delegator_audience
+        {
+            return Err(DelegationError::AudienceWidened {
+                from: from.id.clone(),
+                to: to.id,
+                delegator_audience: delegator_audience.to_owned(),
+                delegate_audience: delegate_audience.to_owned(),
             });
         }
         if self.depth() + 1 > MAX_DELEGATION_DEPTH {
@@ -363,6 +520,61 @@ impl Delegation {
         std::iter::once(&self.root).chain(self.rest.iter())
     }
 
+    /// The instant the chain stops authorizing anything, if any link set one.
+    ///
+    /// The earliest across the chain — which, by construction, is the
+    /// innermost link that names one, since a delegate may not outlive its
+    /// delegator. Computed as the minimum anyway, so the answer does not
+    /// depend on the attenuation check having run.
+    #[must_use]
+    pub fn not_after(&self) -> Option<Timestamp> {
+        self.links().filter_map(|link| link.not_after).min()
+    }
+
+    /// The plane this chain is spendable at, if any link bound one.
+    ///
+    /// Every link that names an audience names the same one — that is what
+    /// [`delegate`](Self::delegate) enforces — so the first is the answer.
+    #[must_use]
+    pub fn audience(&self) -> Option<&str> {
+        self.links().find_map(|link| link.audience.as_deref())
+    }
+
+    /// Whether this chain may act on `plane` at `at`.
+    ///
+    /// The one clocked check, and it belongs to admission alone: a run
+    /// admitted under a live chain is governed by it for good, and replay
+    /// reads the recorded chain back rather than asking this again. Both
+    /// bounds are enforced only where a link declared them — a chain naming
+    /// no audience acts anywhere, one naming no expiry never lapses.
+    ///
+    /// # Errors
+    ///
+    /// [`DelegationError::Expired`] once the chain's effective `not_after`
+    /// has passed, and [`DelegationError::WrongAudience`] when the chain is
+    /// bound to a plane other than this one.
+    pub fn admissible(&self, plane: &str, at: Timestamp) -> Result<(), DelegationError> {
+        if let Some(not_after) = self.not_after()
+            && at >= not_after
+        {
+            return Err(DelegationError::Expired {
+                subject: self.subject().id.clone(),
+                not_after: format_timestamp(not_after),
+                at: format_timestamp(at),
+            });
+        }
+        if let Some(audience) = self.audience()
+            && audience != plane
+        {
+            return Err(DelegationError::WrongAudience {
+                subject: self.subject().id.clone(),
+                audience: audience.to_owned(),
+                plane: plane.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Rebuild a chain read back from the journal, re-checking it.
     ///
     /// Replay must not re-verify *credentials* — they expire, and a run older
@@ -373,7 +585,8 @@ impl Delegation {
     ///
     /// # Errors
     ///
-    /// If the recorded chain is empty, too deep, or widens at any hop.
+    /// If the recorded chain is empty, too deep, or widens at any hop — in
+    /// scope, validity or audience.
     pub fn rehydrate(links: Vec<Principal>) -> Result<Self, DelegationError> {
         let mut it = links.into_iter();
         let root = it.next().ok_or(DelegationError::Empty)?;
@@ -401,20 +614,4 @@ impl Delegation {
             "scope": self.effective_scope().patterns().collect::<Vec<_>>(),
         })
     }
-}
-
-/// Verifies a credential and produces the chain it asserts.
-///
-/// Behind a trait because AIP, WIMSE and the OAuth agent drafts are all still
-/// Internet-Drafts: the credential format will change, and when it does this is
-/// a driver swap rather than a redesign. What the runtime depends on is the
-/// [`Delegation`] that comes out, whose attenuation is guaranteed by its own
-/// constructors regardless of how it was obtained.
-pub trait DelegationScheme: Send + Sync + Debug {
-    /// Verify a presented credential.
-    ///
-    /// # Errors
-    ///
-    /// If the credential does not verify, or asserts a chain that widens.
-    fn verify(&self, credential: &str) -> Result<Delegation, DelegationError>;
 }

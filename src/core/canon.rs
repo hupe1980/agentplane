@@ -20,10 +20,10 @@
 //! Two runs performing the same call would derive different keys — replay
 //! divergence at best, and a second real payment at worst.
 //!
-//! A guard caught it, which is why the invariant is no longer left to a feature
-//! flag a stranger controls. Canonical form is produced here, explicitly: object
-//! keys are sorted at serialization time, so the output is identical whether
-//! `Map` is ordered or not.
+//! So the invariant is not left to a feature flag a stranger controls.
+//! Canonical form is produced here, explicitly: object keys are sorted at
+//! serialization time, so the output is identical whether `Map` is ordered or
+//! not.
 //!
 //! # Keys sort by UTF-16 code unit, per RFC 8785
 //!

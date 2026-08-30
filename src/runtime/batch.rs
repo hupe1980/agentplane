@@ -166,7 +166,7 @@ impl Runtime {
                 // before the run starts, so a retry replays that journal rather
                 // than admitting again. Two mechanisms for one invariant would
                 // be two places to disagree.
-                super::executor::Terms::default(),
+                super::executor::RunTerms::default(),
             )
             .await
         };

@@ -383,6 +383,28 @@ impl Declarative {
                     continue;
                 }
 
+                // A registered peer dispatches through the peer wiring: a
+                // delegating hop that extends the run's chain, counts against
+                // the delegation ceiling, and is held to this grant's fields
+                // and ceiling at the sink. After the approval gate, for the
+                // same reason a consultation is.
+                if let Some(peer) = cx.peer_named(&id.server) {
+                    match cx.call_peer(&peer, &id.tool, &args).await {
+                        Ok(answer) => {
+                            conversation_label = conversation_label.join(answer.label());
+                            exchanges
+                                .push(crate::model::ToolExchange::ok(asked, answer.peek().clone()));
+                        }
+                        Err(e) => match model_facing(&e) {
+                            Some(detail) => {
+                                exchanges.push(crate::model::ToolExchange::failed(asked, detail));
+                            }
+                            None => return Err(e.into()),
+                        },
+                    }
+                    continue;
+                }
+
                 let dispatched = cx
                     .sink_with(&args, |value| {
                         crate::tools::ToolCall::prepare(&catalog, Arc::clone(&client), id, value)
@@ -872,6 +894,8 @@ impl Declarative {
                     // verdict, exactly as for a hand-written skill.
                     let out = if id.server == crate::tools::AGENT_SERVER {
                         cx.commission(&id.tool, assembled).await?
+                    } else if let Some(peer) = cx.peer_named(&id.server) {
+                        cx.call_peer(&peer, &id.tool, &assembled).await?
                     } else {
                         cx.sink_with(&assembled, |value| {
                             crate::tools::ToolCall::prepare(catalog, Arc::clone(client), id, value)

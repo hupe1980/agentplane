@@ -17,11 +17,21 @@
 //!
 //! # What it is, stated narrowly
 //!
-//! A **shared-secret lookup**. A token in the file names an actor, its roles and
-//! its tenant; a request presenting that token is that caller. It is not a JWT
-//! verifier, not OIDC, and it does not expire anything. Those belong in a
-//! deployment's own `Authenticator`, which remains the supported path and is one
-//! trait away.
+//! A **shared-secret lookup**. A token in the file names an actor, its roles,
+//! its tenant and — when the operator writes one — the chain it acts under; a
+//! request presenting that token is that caller. It is not a JWT verifier and
+//! not OIDC. Those belong in a deployment's own `Authenticator`, which remains
+//! the supported path and is one trait away.
+//!
+//! # A token may carry a chain
+//!
+//! `scope` and `not_after` turn an entry into a one-link [`Delegation`] rooted
+//! at the actor, with the entry's tenant as its audience — this file belongs
+//! to one plane, so a token copied to another must not spend there. Every run
+//! the caller starts is admitted under that chain and journaled as its
+//! `IdentityBound`: the record says *this peer, for this*. An entry declaring
+//! neither carries no chain, and its runs act under whatever the plane was
+//! built with.
 //!
 //! What it is *not* is the thing that grants authority. A caller's roles are an
 //! input to the policy engine, which is what decides. An authenticator that
@@ -49,7 +59,7 @@ use std::collections::HashSet;
 use axum::http::HeaderMap;
 
 use super::{AuthError, Authenticator, Caller};
-use crate::core::{Secret, TenantId};
+use crate::core::{Delegation, Principal, Scope, Secret, TenantId, Timestamp};
 
 /// Bearer tokens, each naming exactly one caller.
 #[derive(Debug)]
@@ -94,6 +104,12 @@ pub enum TokenFileError {
 
     #[error("entry {index} names an invalid tenant: {detail}")]
     Tenant { index: usize, detail: String },
+
+    #[error(
+        "entry {index} declares an empty scope, which permits nothing — a caller who may \
+         start no run is a caller the file should not list"
+    )]
+    EmptyScope { index: usize },
 }
 
 impl TokenAuthenticator {
@@ -118,13 +134,28 @@ impl TokenAuthenticator {
             if !seen.insert(entry.token.clone()) {
                 return Err(TokenFileError::DuplicateToken);
             }
-            let mut caller = Caller::new(entry.actor, entry.roles);
-            if let Some(tenant) = entry.tenant {
-                let tenant = TenantId::new(tenant).map_err(|e| TokenFileError::Tenant {
+            let tenant = match entry.tenant {
+                Some(tenant) => TenantId::new(tenant).map_err(|e| TokenFileError::Tenant {
                     index,
                     detail: e.to_string(),
-                })?;
-                caller = caller.in_tenant(tenant);
+                })?,
+                None => TenantId::default(),
+            };
+            let mut caller =
+                Caller::new(entry.actor.clone(), entry.roles).in_tenant(tenant.clone());
+            if entry.scope.is_some() || entry.not_after.is_some() {
+                let scope = match entry.scope {
+                    Some(patterns) if patterns.is_empty() => {
+                        return Err(TokenFileError::EmptyScope { index });
+                    }
+                    Some(patterns) => Scope::of(patterns),
+                    None => Scope::root(),
+                };
+                let mut link = Principal::new(entry.actor, scope).for_audience(tenant.as_str());
+                if let Some(not_after) = entry.not_after {
+                    link = link.until(not_after);
+                }
+                caller = caller.acting_as(Delegation::root(link));
             }
             built.push((Secret::new(entry.token), caller));
         }
@@ -137,7 +168,9 @@ impl TokenAuthenticator {
     /// - token: "a-long-random-string"
     ///   actor: peer-a
     ///   roles: [peer]
-    ///   tenant: acme        # optional; the default tenant when absent
+    ///   tenant: acme                      # optional; the default tenant when absent
+    ///   scope: [support.*]                # optional; with `not_after`, the caller's chain
+    ///   not_after: 2027-01-01T00:00:00Z   # optional; refused at admission once passed
     /// ```
     ///
     /// # Errors
@@ -169,6 +202,17 @@ pub struct TokenEntry {
     /// Whose data this caller may reach. The default tenant when absent.
     #[serde(default)]
     pub tenant: Option<String>,
+    /// What runs this caller may start, as capability patterns
+    /// (`support.*`, `support.summarise`). Declaring it gives the caller a
+    /// chain; every run it starts is admitted under that chain and refused
+    /// outside it. Empty is refused at load. Absent with `not_after` absent
+    /// means no chain at all.
+    #[serde(default)]
+    pub scope: Option<Vec<String>>,
+    /// When this caller's chain stops admitting runs, RFC 3339. Checked at
+    /// admission, so a run admitted before the instant finishes under it.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub not_after: Option<Timestamp>,
 }
 
 #[async_trait::async_trait]
@@ -255,6 +299,62 @@ mod scheme_tests {
             ),
             "the token was matched case-insensitively, which silently shrinks \
              the space an attacker has to search"
+        );
+    }
+
+    /// A `scope` turns the entry into the caller's chain: rooted at the actor,
+    /// bound to the entry's tenant, expiring when the entry says.
+    #[tokio::test]
+    async fn a_scoped_entry_is_the_callers_chain() {
+        let auth = TokenAuthenticator::from_yaml(
+            "- token: t\n  actor: peer-a\n  roles: [peer]\n  tenant: acme\n  \
+             scope: [support.*]\n  not_after: 2027-01-01T00:00:00Z\n\
+             - token: u\n  actor: peer-b\n  roles: [peer]\n",
+        )
+        .expect("two callers");
+        let scoped = auth.authenticate(&presenting("Bearer t")).await.unwrap();
+        let chain = scoped.acting_as.expect("a scoped entry carries a chain");
+        assert_eq!(chain.subject().id, "peer-a");
+        assert_eq!(chain.depth(), 0, "rooted at the actor");
+        assert!(
+            chain
+                .effective_scope()
+                .permits(&crate::core::Capability::new("support.x"))
+        );
+        assert!(
+            !chain
+                .effective_scope()
+                .permits(&crate::core::Capability::new("billing.x"))
+        );
+        assert_eq!(
+            chain.audience(),
+            Some("acme"),
+            "the audience is the entry's tenant, so the token is not spendable on another plane"
+        );
+        assert_eq!(
+            chain.not_after().map(time::OffsetDateTime::unix_timestamp),
+            Some(1_798_761_600),
+            "2027-01-01T00:00:00Z"
+        );
+
+        let bare = auth.authenticate(&presenting("Bearer u")).await.unwrap();
+        assert!(
+            bare.acting_as.is_none(),
+            "an entry declaring neither bound carries no chain, so its runs act \
+             under whatever the plane was built with"
+        );
+    }
+
+    /// An empty scope permits nothing and is refused at load, where the
+    /// operator is; accepted, every run the caller started would be refused
+    /// at admission with the token file reading as fine.
+    #[test]
+    fn an_empty_scope_is_refused_at_load() {
+        let err = TokenAuthenticator::from_yaml("- token: t\n  actor: peer-a\n  scope: []\n")
+            .expect_err("permits nothing");
+        assert!(
+            matches!(err, TokenFileError::EmptyScope { index: 0 }),
+            "{err:?}"
         );
     }
 

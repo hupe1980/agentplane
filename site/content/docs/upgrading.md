@@ -15,6 +15,33 @@ property that makes a hard cut acceptable at this stage.
 
 ---
 
+## A served run acts as its caller; `DelegationScheme` is gone
+
+**Affected:** deployments serving A2A with `RuntimeBuilder::acting_as` set;
+anyone implementing `DelegationScheme`; hand-written `Principal` literals.
+
+Runs the A2A server admits were bound to the *plane's* chain, whoever asked —
+the journal named the operator on every peer's run, and a peer with narrower
+authority acted with the plane's. A served run now acts under the chain its
+authenticated caller presented: `Caller::acting_as`, set by your
+`Authenticator` (or by `scope`/`not_after` on a token-file entry), reaches
+admission as `RunTerms::acting_as`, gates the plan, and is what `IdentityBound`
+records. A caller presenting no chain acts under the plane's, as before.
+
+`DelegationScheme` had no caller in the runtime and is removed; the seam that
+turns a credential into a chain is the `Authenticator`. `Principal` gained two
+optional bounds, `audience` and `not_after`, so a struct literal needs them (use
+`Principal::new(..).for_audience(..).until(..)`); chains written without them
+read back unchanged.
+
+```text
+delegation to 'peer-a' expired at 2026-01-01T00:00:00Z; this admission is at
+2026-08-30T10:00:00Z — obtain a fresh credential rather than retrying
+```
+
+A chain naming an audience is refused by every plane but the tenant it names; one
+that has expired is refused at admission and nowhere else.
+
 ## An approval's amendment now dispatches
 
 **Affected:** integrators whose reviewers attach an `amendment` to an

@@ -253,7 +253,10 @@ Four things are refused rather than defaulted, and each refusal is the design:
   same behaviour, and only one of them looks governed.
 - **`--tokens`** — bearer tokens naming callers. A server that authenticates
   nobody has no actor to record a decision against; an unknown credential is
-  refused rather than becoming an anonymous caller.
+  refused rather than becoming an anonymous caller. An entry may carry a
+  `scope` (and a `not_after`), which becomes that caller's own delegation
+  chain: every run it starts is admitted under it and recorded as acting for
+  the caller, not for the plane.
 - **`--store`** — a served task's id is a promise it can be fetched again, and
   an in-memory journal breaks that promise at the next restart. `run` may
   journal to memory because it exits with its answer.
@@ -593,6 +596,7 @@ Pick the example for the question you have; none needs credentials or network:
 | What does erasing a case actually erase — and what still verifies? | `sealed_run` |
 | How are separate agents and handoffs bounded? | `blog_room` |
 | What does another organisation's agent see when it calls this one? | `a2a_peer` |
+| How does an agent call another *plane's* agent, and whose chain does the peer see? | `peer_call` |
 | How do live tokens coexist with a journal that must replay exactly? | `streaming_run` |
 
 | | |

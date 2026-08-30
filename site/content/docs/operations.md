@@ -893,9 +893,14 @@ worklist, task decisions and `GET /runs?outcome=quarantined` on its **own**
 listener, so a network policy can treat the two audiences differently.
 `--policy` names the Cedar policy set and has no default, because a permissive
 engine and no engine are the same behaviour and only one of them looks
-governed; `--tokens` names the bearer tokens of the callers this plane accepts.
-`--sweep-every` sets how often deadlines, task expiry, dead letters and due
-timers are swept, and `0` runs the sweep from your own scheduler instead.
+governed; `--tokens` names the bearer tokens of the callers this plane accepts,
+each optionally carrying the `scope` and `not_after` of the chain that caller's
+runs act under.
+`--peer NAME=URL` wires an A2A peer the manifest grants under `tool://NAME/…`,
+with its bearer token read from `AGENTPLANE_PEER_TOKEN_<NAME>` rather than
+the command line (needs the `a2a` feature). `--sweep-every` sets how often
+deadlines, task expiry, dead letters and due timers are swept, and `0` runs
+the sweep from your own scheduler instead.
 `--push-host` permits A2A push notifications to that exact host and is
 repeatable — without one, push is not wired and the Agent Card advertises it as
 absent rather than claiming a capability nothing serves. Every flag but

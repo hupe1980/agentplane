@@ -18,6 +18,13 @@
 //!   made. The chain that governed the run is what the journal holds.
 //! * **An out-of-scope plan never starts.** The plan is the authorization graph,
 //!   so authority is checked against it before anything runs.
+//! * **Validity and audience attenuate like scope, and bind at admission.** A
+//!   delegate may not outlive its delegator or name another plane; an expired
+//!   chain, or one issued for another plane, is refused before the run exists
+//!   — and never re-judged afterwards.
+//! * **The chain is per run, not per plane.** Terms carrying a chain admit the
+//!   run under *that* chain: it is what the plan is checked against and what
+//!   the journal names, so a served surface's runs act as their callers.
 
 #![cfg(feature = "redb")]
 #![allow(clippy::disallowed_methods)]
@@ -26,11 +33,11 @@ use std::sync::{Arc, Mutex};
 
 use agentplane::core::{
     Capability, Delegation, DelegationError, Effect, EffectDescriptor, EffectError,
-    MAX_DELEGATION_DEPTH, Outcome, PlanIR, PlanNode, Principal, Recovery, RetryPolicy, Scope,
-    Skill, SkillDescriptor, SkillError, Tainted,
+    MAX_DELEGATION_DEPTH, Outcome, PlanIR, PlanNode, Principal, Recovery, RetryPolicy,
+    RuntimeError, Scope, Skill, SkillDescriptor, SkillError, Tainted, TenantId, Timestamp,
 };
 use agentplane::journal::{JournalStore, RecordKind};
-use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{Mode, RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -546,5 +553,458 @@ async fn the_policy_request_carries_the_owner_and_the_depth() {
         seen.iter().any(|c| c["delegation_depth"] == 1),
         "and a depth cap is expressible in Cedar only if depth is in the \
          context: {seen:?}"
+    );
+}
+
+// ── Validity and audience ───────────────────────────────────────────────────
+
+fn at(unix: i64) -> Timestamp {
+    Timestamp::from_unix_timestamp(unix).expect("a representable instant")
+}
+
+/// A delegate that expires later than its delegator holds authority the
+/// delegator will no longer have — the scope rule on the time axis.
+#[test]
+fn a_delegate_cannot_outlive_its_delegator() {
+    let chain = owner()
+        .delegate(Principal::new("agent:a", Scope::of(["audit.*"])).until(at(1_000)))
+        .unwrap();
+    let err = chain
+        .delegate(Principal::new("agent:b", Scope::of(["audit.check"])).until(at(2_000)))
+        .expect_err("a later expiry is a widening");
+    assert!(
+        matches!(err, DelegationError::ValidityWidened { .. }),
+        "the refusal must be typed as a validity widening, not a generic one: {err:?}"
+    );
+    assert!(err.to_string().contains("may only narrow"), "{err}");
+
+    // Earlier, equal and unset all narrow.
+    for later in [None, Some(at(500)), Some(at(1_000))] {
+        let mut link = Principal::new("agent:b", Scope::of(["audit.check"]));
+        if let Some(t) = later {
+            link = link.until(t);
+        }
+        let ok = chain
+            .delegate(link)
+            .expect("narrowing validity is permitted");
+        assert_eq!(ok.not_after(), Some(later.unwrap_or(at(1_000))));
+    }
+    // A chain in which nobody set a bound has none, and a later link may set
+    // one — that is narrowing from unbounded.
+    assert_eq!(owner().not_after(), None);
+    let bounded = owner()
+        .delegate(Principal::new("agent:a", Scope::of(["audit.*"])).until(at(9)))
+        .unwrap();
+    assert_eq!(bounded.not_after(), Some(at(9)));
+}
+
+/// A delegate may not carry the chain to a plane its delegator was not
+/// issued for.
+#[test]
+fn a_delegate_cannot_change_its_delegators_audience() {
+    let chain = owner()
+        .delegate(Principal::new("agent:a", Scope::of(["audit.*"])).for_audience("acme"))
+        .unwrap();
+    let err = chain
+        .delegate(Principal::new("agent:b", Scope::of(["audit.check"])).for_audience("globex"))
+        .expect_err("another audience is a widening");
+    assert!(
+        matches!(err, DelegationError::AudienceWidened { .. }),
+        "{err:?}"
+    );
+    // The same audience, or none, narrows.
+    assert_eq!(
+        chain
+            .delegate(Principal::new("agent:b", Scope::of(["audit.check"])).for_audience("acme"))
+            .unwrap()
+            .audience(),
+        Some("acme")
+    );
+    assert_eq!(
+        chain
+            .delegate(Principal::new("agent:b", Scope::of(["audit.check"])))
+            .unwrap()
+            .audience(),
+        Some("acme"),
+        "an unset audience inherits rather than clears"
+    );
+}
+
+/// Both new bounds are re-checked on the way back from storage, exactly as
+/// scope is: a journal record or a credential is a construction path too.
+#[test]
+fn a_deserialized_chain_cannot_widen_validity_or_audience() {
+    let outlives = json!({"links": [
+        {"id": "user:hupe", "scope": ["*"], "not_after": "2030-01-01T00:00:00Z"},
+        {"id": "agent:x",   "scope": ["*"], "not_after": "2031-01-01T00:00:00Z"}
+    ]});
+    let err = serde_json::from_value::<Delegation>(outlives).expect_err("outlives its delegator");
+    assert!(err.to_string().contains("may only narrow"), "{err}");
+
+    let elsewhere = json!({"links": [
+        {"id": "user:hupe", "scope": ["*"], "audience": "acme"},
+        {"id": "agent:x",   "scope": ["*"], "audience": "globex"}
+    ]});
+    let err = serde_json::from_value::<Delegation>(elsewhere).expect_err("names another plane");
+    assert!(err.to_string().contains("may only narrow"), "{err}");
+
+    // A chain written before the bounds existed reads back as declaring
+    // neither, and one that declares them round-trips without a null.
+    let bare: Delegation =
+        serde_json::from_value(json!({"links": [{"id": "user:hupe", "scope": ["*"]}]}))
+            .expect("absent bounds are absent");
+    assert_eq!((bare.not_after(), bare.audience()), (None, None));
+    let wire = serde_json::to_value(&bare).unwrap();
+    assert_eq!(
+        wire["links"][0].as_object().unwrap().len(),
+        2,
+        "unset bounds must not be written as nulls: {wire}"
+    );
+}
+
+/// The one clocked check, and it refuses before the run exists.
+#[tokio::test]
+async fn an_expired_chain_is_refused_at_admission() {
+    let store = db();
+    let world: World = Arc::default();
+    let expired = owner()
+        .delegate(Principal::new("agent:auditor", Scope::of(["audit.*"])).until(at(1_000_000)))
+        .unwrap();
+
+    let err = runtime(&store, &world, Some(expired))
+        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
+        .await
+        .expect_err("a chain past its validity admits nothing");
+    assert!(
+        matches!(
+            err,
+            RuntimeError::Delegation(DelegationError::Expired { .. })
+        ),
+        "typed as an expired delegation, so a caller knows to fetch a fresh \
+         credential rather than retry: {err:?}"
+    );
+    assert!(world.lock().unwrap().is_empty(), "nothing ran");
+    assert!(
+        store.recent_runs(None, 10).await.unwrap().is_empty(),
+        "a refused admission leaves no run behind"
+    );
+}
+
+/// A credential minted for another plane is refused here, however valid.
+#[tokio::test]
+async fn a_chain_bound_to_another_plane_is_refused_at_admission() {
+    let store = db();
+    let world: World = Arc::default();
+    let elsewhere = owner()
+        .delegate(Principal::new("agent:auditor", Scope::of(["audit.*"])).for_audience("globex"))
+        .unwrap();
+
+    let err = runtime(&store, &world, Some(elsewhere))
+        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
+        .await
+        .expect_err("the plane is not the audience");
+    assert!(
+        matches!(
+            err,
+            RuntimeError::Delegation(DelegationError::WrongAudience { .. })
+        ),
+        "{err:?}"
+    );
+    assert!(world.lock().unwrap().is_empty());
+
+    // The same chain bound to *this* plane is admitted — the refusal above is
+    // the audience rule, not the fixture being unrunnable.
+    let here = owner()
+        .delegate(
+            Principal::new("agent:auditor", Scope::of(["audit.*"])).for_audience(TenantId::DEFAULT),
+        )
+        .unwrap();
+    let out = runtime(&store, &world, Some(here))
+        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
+        .await
+        .expect("bound to this plane");
+    assert!(matches!(out.status, RunStatus::Succeeded));
+}
+
+/// Terms carrying a chain admit the run under that chain — gate and record
+/// both — and the plane's own chain does not reach the run.
+#[tokio::test]
+async fn a_run_acts_under_the_terms_chain_not_the_planes() {
+    let store = db();
+    let world: World = Arc::default();
+    // The plane holds everything; only the caller's chain can refuse.
+    let rt = runtime(&store, &world, Some(owner()));
+    let alice = Delegation::root(Principal::new("user:alice", Scope::of(["audit.*"])));
+
+    let err = rt
+        .run_plan_under(
+            plan("billing.transfer"),
+            Tainted::trusted(json!({})),
+            RunTerms::default().acting_as(alice.clone()),
+        )
+        .await
+        .expect_err("outside the caller's scope, inside the plane's");
+    assert!(err.to_string().contains("billing.transfer"), "{err}");
+    assert!(world.lock().unwrap().is_empty());
+
+    let out = rt
+        .run_plan_under(
+            plan("audit.check"),
+            Tainted::trusted(json!({})),
+            RunTerms::default().acting_as(alice),
+        )
+        .await
+        .expect("inside the caller's scope");
+    let records = store.read(out.run_id, 1).await.unwrap();
+    let bound = records
+        .iter()
+        .find_map(|r| match r.kind() {
+            RecordKind::IdentityBound { chain } => Some(chain.clone()),
+            _ => None,
+        })
+        .expect("the chain must be on the record");
+    assert_eq!(bound.len(), 1, "{bound:?}");
+    assert_eq!(
+        bound[0].id, "user:alice",
+        "the journal must name the caller, not the plane: {bound:?}"
+    );
+}
+
+/// Every step of a run acts under the chain the run was admitted with — in
+/// the policy context live, and read back from `IdentityBound` on replay —
+/// never under whatever chain the plane happens to be configured with now.
+#[tokio::test]
+async fn a_steps_policy_context_names_the_runs_chain_live_and_on_replay() {
+    use agentplane::core::{
+        Digest, PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest,
+    };
+
+    #[derive(Debug, Default)]
+    struct Capturing(Mutex<Vec<(String, Value)>>);
+
+    impl PolicyEngine for Capturing {
+        fn authorize(&self, r: &PolicyRequest<'_>) -> PolicyDecision {
+            self.0
+                .lock()
+                .unwrap()
+                .push((r.action.to_owned(), r.context.clone()));
+            PolicyDecision::Permit
+        }
+        fn bundle(&self) -> PolicyBundleIdentity {
+            PolicyBundleIdentity::new(
+                Digest::of(b"capturing"),
+                "agentplane-test/identity-policy-v1",
+            )
+        }
+    }
+
+    fn subjects_of(engine: &Capturing) -> Vec<String> {
+        engine
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(action, _)| action == "effect:perform")
+            .map(|(_, cx)| cx["subject"].as_str().unwrap_or("<none>").to_owned())
+            .collect()
+    }
+
+    let store = db();
+    let world: World = Arc::default();
+    let plane_chain = owner()
+        .delegate(Principal::new("agent:plane", Scope::of(["audit.*"])))
+        .unwrap();
+    let alice = Delegation::root(Principal::new("user:alice", Scope::of(["audit.*"])));
+
+    let live = Arc::new(Capturing::default());
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .owner("identity")
+        .acting_as(plane_chain.clone())
+        .policy(live.clone())
+        .skill(Checker {
+            name: "audit.check",
+            world: Arc::clone(&world),
+        })
+        .build()
+        .run_plan_under(
+            plan("audit.check"),
+            Tainted::trusted(json!({})),
+            RunTerms::default().acting_as(alice),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        subjects_of(&live),
+        vec!["user:alice"],
+        "the effect gate was asked about the plane's chain, not the run's"
+    );
+
+    // Strict replay on a plane configured with a *different* chain: the
+    // context still names the recorded one.
+    let replayed = Arc::new(Capturing::default());
+    Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .owner("identity")
+        .acting_as(plane_chain)
+        .policy(replayed.clone())
+        .skill(Checker {
+            name: "audit.check",
+            world: Arc::default(),
+        })
+        .build()
+        .replay(out.run_id, Mode::Strict)
+        .await
+        .expect("a recorded run replays");
+    // Replay re-opens no historical gate, so no `effect:perform` request is
+    // expected at all — what must not happen is a request naming the plane.
+    assert!(
+        !subjects_of(&replayed).iter().any(|s| s == "agent:plane"),
+        "a replayed step asked the policy about the plane's chain: {:?}",
+        subjects_of(&replayed)
+    );
+}
+
+#[derive(Debug)]
+struct Orderer {
+    world: World,
+}
+
+#[async_trait::async_trait]
+impl Skill for Orderer {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("audit.order").provides("audit.order")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        self.world.lock().unwrap().push("ordered".into());
+        let answer = cx.commission("audit.check", input).await?;
+        Ok(Outcome::done(answer))
+    }
+}
+
+/// A commissioned sub-run acts under the orderer's chain plus one link naming
+/// the commissioned agent — the in-plane twin of the peer-call rule — so its
+/// journal answers "on whose behalf" with the same owner.
+#[tokio::test]
+async fn a_commissioned_run_acts_under_the_orderers_chain_plus_one_link() {
+    let store = db();
+    let world: World = Arc::default();
+    let alice = Delegation::root(Principal::new("user:alice", Scope::of(["audit.*"])));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .owner("identity")
+        // The plane's own chain is deliberately different, so a sub-run
+        // admitted under it would be visible.
+        .acting_as(owner())
+        .skill(Orderer {
+            world: Arc::clone(&world),
+        })
+        .skill(Checker {
+            name: "audit.check",
+            world: Arc::clone(&world),
+        })
+        .build();
+
+    let out = rt
+        .run_plan_under(
+            plan("audit.order"),
+            Tainted::trusted(json!({})),
+            RunTerms::default().acting_as(alice),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
+
+    let chains: Vec<Vec<String>> = {
+        let mut found = Vec::new();
+        for (run, _) in store.recent_runs(None, 10).await.unwrap() {
+            let records = store.read(run, 1).await.unwrap();
+            if let Some(chain) = records.iter().find_map(|r| match r.kind() {
+                RecordKind::IdentityBound { chain } => Some(chain.clone()),
+                _ => None,
+            }) {
+                found.push(chain.into_iter().map(|p| p.id).collect());
+            }
+        }
+        found.sort();
+        found
+    };
+    assert_eq!(
+        chains,
+        vec![
+            vec!["user:alice".to_owned()],
+            vec!["user:alice".to_owned(), "agent/audit.check".to_owned()],
+        ],
+        "the sub-run must act under the orderer's chain extended by the \
+         commissioned agent, not under the plane's: {chains:?}"
+    );
+}
+
+#[derive(Debug)]
+struct WhoAmI;
+
+#[async_trait::async_trait]
+impl Skill for WhoAmI {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("audit.whoami").provides("audit.whoami")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _i: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let subject = cx.acting_as().map(|chain| chain.subject().id.clone());
+        Ok(Outcome::done(Tainted::trusted(
+            json!({ "subject": subject }),
+        )))
+    }
+}
+
+/// A step reads the chain its run was admitted under — the one to extend
+/// toward a peer — and a replay reads the same chain back from the journal,
+/// not from the plane it happens to be replayed on.
+#[tokio::test]
+async fn a_replayed_step_reads_the_recorded_chain_not_the_configured_one() {
+    let store = db();
+    let alice = Delegation::root(Principal::new("user:alice", Scope::of(["audit.*"])));
+    let plane = |chain: Delegation| {
+        Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .owner("identity")
+            .acting_as(chain)
+            .skill(WhoAmI)
+            .build()
+    };
+
+    let out = plane(owner())
+        .run_plan_under(
+            plan("audit.whoami"),
+            Tainted::trusted(json!({})),
+            RunTerms::default().acting_as(alice),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out.output.as_ref().map(|o| o.peek()["subject"].clone()),
+        Some(json!("user:alice")),
+        "the step saw the plane's chain, not the run's: {out:?}"
+    );
+
+    // Replayed on a plane whose configured chain names somebody else.
+    let other = owner()
+        .delegate(Principal::new("agent:other", Scope::of(["audit.*"])))
+        .unwrap();
+    let replayed = plane(other)
+        .replay(out.run_id, Mode::Strict)
+        .await
+        .expect("a recorded run replays");
+    assert_eq!(
+        replayed
+            .output
+            .as_ref()
+            .map(|o| o.peek()["subject"].clone()),
+        Some(json!("user:alice")),
+        "a replayed step acted under the plane's current chain instead of the \
+         recorded one: {replayed:?}"
     );
 }

@@ -90,6 +90,47 @@ pub enum BuildError {
     )]
     ReservedToolServer,
 
+    /// One name is both a registered peer and a wired tool server.
+    ///
+    /// A grant `tool://<name>/<capability>` would then dispatch to whichever
+    /// the runtime checked first — a peer hop that extends the chain and
+    /// counts against the delegation ceiling, or a tool call that does neither
+    /// — and nothing in the reviewed document would say which.
+    #[error(
+        "'{server}' is registered as a peer and wired as a tool server; a grant \
+         `tool://{server}/…` cannot mean both a delegating hop and a tool call — \
+         rename one of them"
+    )]
+    PeerIsAlsoAToolServer { server: String },
+
+    /// A manifest grants a peer a capability the registry never gave it.
+    ///
+    /// The chain the peer receives permits exactly the registry's scope, so
+    /// the call would be refused at the peer's admission on every run — a
+    /// grant that reads as a capability and cannot fire.
+    #[error(
+        "agent '{agent}' grants `tool://{peer}/{capability}`, but the peer registry's \
+         scope for '{peer}' does not permit '{capability}' — widen the registry grant \
+         or drop the manifest grant"
+    )]
+    PeerGrantOutsideScope {
+        agent: String,
+        peer: String,
+        capability: String,
+    },
+
+    /// A specialist grants a peer, which is a hop it may never take.
+    ///
+    /// Calling a peer is delegation: the chain grows by a link and the
+    /// delegation ceiling sees it. A `specialist` has a ceiling of zero, so
+    /// the grant would be refused at dispatch on every run.
+    #[error(
+        "agent '{agent}' grants `tool://{peer}/…` while declaring itself a specialist \
+         (delegation depth 0) — consulting a peer is delegation; declare \
+         `topology.role: orchestrator` or drop the grant"
+    )]
+    PeerGrantOnASpecialist { agent: String, peer: String },
+
     /// A declarative agent needs a tool catalogue and the plane has none.
     ///
     /// Refused at build because it is knowable at build: the manifest says the
@@ -97,15 +138,17 @@ pub enum BuildError {
     /// Deferring it to the run would report a wiring mistake once per request
     /// instead of once, on a plane that assembled cleanly. The one shape that is
     /// legitimately catalogue-free is an agent whose grants are *all*
-    /// `tool://agent/…`: those dispatch through `commission` and their
-    /// catalogue is derived from the declaration.
+    /// `tool://agent/…` or `tool://<peer>/…` for a registered peer: those
+    /// dispatch through `commission` and the peer wiring, and their catalogue
+    /// is derived from the declaration.
     #[error(
         "agent '{agent}' declares `execution.kind: {kind}` with {grants}, but this \
          plane has no tool catalogue, so every run would fail identically. Wire one \
          with `RuntimeBuilder::toolbox(..)` — which derives it from this very \
          declaration — or state it with `.tools(catalog, client)`. Grants of the \
-         form `tool://agent/<capability>` need neither, because they dispatch \
-         through `commission` rather than a transport"
+         form `tool://agent/<capability>`, or naming a peer registered with \
+         `RuntimeBuilder::peers(..)`, need neither, because they dispatch through \
+         `commission` and the peer wiring rather than a tool transport"
     )]
     DeclarativeToolsUnreachable {
         agent: String,

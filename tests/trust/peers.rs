@@ -19,19 +19,24 @@
 use std::sync::{Arc, Mutex};
 
 use agentplane::core::{
-    Delegation, DelegationError, Disposition, Effect, MAX_DELEGATION_DEPTH, Principal, Recovery,
-    Scope, Trust,
+    Delegation, DelegationError, Disposition, Effect, MAX_DELEGATION_DEPTH, Outcome, Principal,
+    Recovery, Scope, Skill, SkillDescriptor, SkillError, Tainted, Trust,
 };
+use agentplane::journal::JournalStore;
 use agentplane::peers::{
-    PeerCall, PeerClient, PeerCredential, PeerError, PeerGrant, PeerId, PeerRegistry, PeerTask,
-    PeerTaskCall,
+    PeerCall, PeerClient, PeerCredential, PeerError, PeerGrant, PeerId, PeerRegistry, PeerRouter,
+    PeerTask, PeerTaskCall,
 };
+use agentplane::runtime::{Mode, RunStatus, RunTerms, Runtime, StepCtx};
+use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 /// Records what it was handed, so the tests can assert on what would go out.
 #[derive(Debug, Default)]
 struct Spy {
     sent: Mutex<Vec<(String, Option<String>, usize)>>,
+    /// The link ids of every chain that went out, owner first.
+    chains: Mutex<Vec<Vec<String>>>,
     task_reads: Mutex<Vec<(String, String, Option<String>)>>,
     answer: Mutex<Option<PeerError>>,
 }
@@ -52,6 +57,10 @@ impl PeerClient for Spy {
             credential.map(|c| c.expose().to_owned()),
             acting_as.depth(),
         ));
+        self.chains
+            .lock()
+            .unwrap()
+            .push(acting_as.links().map(|p| p.id.clone()).collect());
         match self.answer.lock().unwrap().take() {
             Some(e) => Err(e),
             None => Ok(json!({ "reviewed": true })),
@@ -249,11 +258,9 @@ fn a_grant_wider_than_the_caller_is_refused() {
 
     assert!(
         matches!(
-            err,
-            PeerError::Delegation {
-                source: DelegationError::ScopeWidened { .. },
-                ..
-            }
+            &err,
+            PeerError::Delegation { source, .. }
+                if matches!(**source, DelegationError::ScopeWidened { .. })
         ),
         "got {err:?}"
     );
@@ -278,11 +285,9 @@ fn a_hop_beyond_the_delegation_cap_is_refused() {
         .expect_err("past the cap");
     assert!(
         matches!(
-            err,
-            PeerError::Delegation {
-                source: DelegationError::TooDeep { .. },
-                ..
-            }
+            &err,
+            PeerError::Delegation { source, .. }
+                if matches!(**source, DelegationError::TooDeep { .. })
         ),
         "a request must not wander arbitrarily far from the human who authorised \
          it: {err:?}"
@@ -436,11 +441,8 @@ fn the_peer_is_part_of_the_effect_identity() {
 
 // ── Credentials never reach the journal ─────────────────────────────────────
 
-use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted, Timestamp};
-use agentplane::journal::JournalStore;
+use agentplane::core::Timestamp;
 use agentplane::peers::{Cached, CredentialError, CredentialSource, Fixed, TokenExchange};
-use agentplane::runtime::{RunStatus, Runtime, StepCtx};
-use agentplane::store::RedbStore;
 use std::time::Duration;
 
 fn ts(secs: i64) -> Timestamp {
@@ -514,7 +516,10 @@ impl Skill for Calls {
         )
         .map_err(|e| SkillError::Other(e.to_string()))?;
 
-        let out = cx.effect(call).await?;
+        // The payload is what reaches the peer, so it is bound at the sink.
+        let out = cx
+            .sink(call, &Tainted::trusted(json!({ "invoice": "INV-1" })))
+            .await?;
         Ok(Outcome::done(out))
     }
 }
@@ -743,4 +748,484 @@ fn a_credential_without_an_expiry_is_usable() {
         "inventing an expiry would either reject working credentials or invent a \
          guarantee the issuer never made"
     );
+}
+
+// ── The grant is a ceiling on what may be asked ─────────────────────────────
+
+/// A capability the registry never granted the peer never leaves: the peer's
+/// admission would refuse it anyway, and a round trip that ends in the far
+/// side's journal as *their* decline is the wrong place for this plane's
+/// misconfiguration to surface.
+#[test]
+fn a_capability_outside_the_peers_grant_never_leaves() {
+    let spy = Arc::new(Spy::default());
+    let registry = PeerRegistry::new().allow(reviewer(), PeerGrant::new(Scope::of(["audit.*"])));
+    let err = PeerCall::prepare(
+        &registry,
+        Arc::clone(&spy) as Arc<dyn PeerClient>,
+        &auditor(),
+        reviewer(),
+        "billing.transfer",
+        json!({}),
+    )
+    .expect_err("outside the grant");
+    assert!(
+        matches!(&err, PeerError::NotGranted { capability, .. } if capability == "billing.transfer"),
+        "{err:?}"
+    );
+    assert_eq!(err.disposition(), Disposition::DidNotHappen);
+    assert!(spy.sent.lock().unwrap().is_empty(), "nothing may have left");
+
+    // Inside the grant, the same call is prepared — the refusal above is the
+    // scope rule and not the fixture.
+    PeerCall::prepare(
+        &registry,
+        spy as Arc<dyn PeerClient>,
+        &auditor(),
+        reviewer(),
+        "audit.check",
+        json!({}),
+    )
+    .expect("inside the grant");
+}
+
+/// A router reaches exactly the peers it routes; an unrouted peer is a
+/// refusal that never left, not a guess at the nearest endpoint.
+#[tokio::test]
+async fn a_peer_router_reaches_only_the_peers_it_routes() {
+    let spy = Arc::new(Spy::default());
+    let router = PeerRouter::new().peer(reviewer(), Arc::clone(&spy) as Arc<dyn PeerClient>);
+    router
+        .send(
+            &reviewer(),
+            "audit.check",
+            &json!({}),
+            &auditor(),
+            None,
+            None,
+        )
+        .await
+        .expect("routed");
+    let err = router
+        .send(
+            &settlement(),
+            "audit.check",
+            &json!({}),
+            &auditor(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("not routed");
+    assert!(
+        matches!(err, PeerError::Unreachable { .. }),
+        "an unrouted peer must read as unreachable, not as a fault: {err:?}"
+    );
+    assert_eq!(err.disposition(), Disposition::DidNotHappen);
+    assert_eq!(
+        spy.sent.lock().unwrap().len(),
+        1,
+        "only the routed call arrived"
+    );
+}
+
+// ── Reached from a run ───────────────────────────────────────────────────────
+
+/// A skill that consults the reviewer through the plane's own wiring.
+#[derive(Debug)]
+struct AsksReviewer;
+
+#[async_trait::async_trait]
+impl Skill for AsksReviewer {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("audit.review").provides("audit.review")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let answer = cx.call_peer(&reviewer(), "audit.check", &input).await?;
+        Ok(Outcome::done(answer))
+    }
+}
+
+fn store() -> Arc<dyn JournalStore> {
+    Arc::new(RedbStore::open_in_memory().unwrap())
+}
+
+/// The chain a peer receives is the **run's**, one link longer — the caller's
+/// chain on a served plane, never one the skill holds — and a strict replay
+/// reads the answer back without a request leaving.
+#[tokio::test]
+async fn a_skill_calls_a_peer_under_the_runs_chain_and_replay_calls_nobody() {
+    let spy = Arc::new(Spy::default());
+    let registry = PeerRegistry::new().allow(reviewer(), PeerGrant::new(Scope::of(["audit.*"])));
+    let rt = Runtime::builder(store())
+        .owner("peers")
+        // The plane's own chain is somebody else, so a hop that used it
+        // instead of the run's is visible.
+        .acting_as(owner())
+        .peers(registry, Arc::clone(&spy) as Arc<dyn PeerClient>)
+        .skill(AsksReviewer)
+        .build();
+    let alice = Delegation::root(Principal::new("user:alice", Scope::of(["audit.*"])));
+
+    let out = rt
+        .run_under(
+            "audit.review",
+            Tainted::trusted(json!({ "invoice": "INV-9" })),
+            RunTerms::default().acting_as(alice),
+        )
+        .await
+        .expect("admitted")
+        .outcome()
+        .cloned()
+        .expect("fresh");
+    assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
+    assert_eq!(
+        spy.chains.lock().unwrap().as_slice(),
+        &[vec!["user:alice".to_owned(), "reviewer.example".to_owned()]],
+        "the peer must receive the run's chain plus one link naming it"
+    );
+    let answer = out.output.as_ref().expect("an answer");
+    assert!(
+        format!("{:?}", answer.label()).contains("tool://reviewer.example/audit.check"),
+        "the answer's provenance must name this peer, so a source rule can: {:?}",
+        answer.label()
+    );
+
+    let replayed = rt.replay(out.run_id, Mode::Strict).await.expect("replays");
+    assert!(
+        matches!(replayed.status, RunStatus::Succeeded),
+        "{replayed:?}"
+    );
+    assert_eq!(
+        spy.sent.lock().unwrap().len(),
+        1,
+        "a strict replay sent a request to the peer"
+    );
+}
+
+/// A run acting under no chain has nothing to extend toward a peer, and is
+/// refused rather than sent out as nobody.
+#[tokio::test]
+async fn a_peer_call_without_a_chain_is_refused() {
+    let spy = Arc::new(Spy::default());
+    let registry = PeerRegistry::new().allow(reviewer(), PeerGrant::new(Scope::of(["audit.*"])));
+    let rt = Runtime::builder(store())
+        .owner("peers")
+        .peers(registry, Arc::clone(&spy) as Arc<dyn PeerClient>)
+        .skill(AsksReviewer)
+        .build();
+    let out = rt
+        .run("audit.review", Tainted::trusted(json!({})))
+        .await
+        .expect("admitted");
+    assert!(
+        matches!(&out.status, RunStatus::Failed(reason) if reason.contains("acts under no chain")),
+        "{out:?}"
+    );
+    assert!(spy.sent.lock().unwrap().is_empty(), "nothing may have left");
+}
+
+// ── Declared in a manifest ──────────────────────────────────────────────────
+
+#[cfg(feature = "manifest")]
+mod declared {
+    use super::*;
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::{Agent, BuildError};
+
+    const ASKS_REVIEWER: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: desk, version: "1.0.0" }
+spec:
+  identity:
+    role: "Consult the reviewer, then answer."
+  topology:
+    mode: collaborative
+    role: orchestrator
+    reason: distinct-authority
+  security:
+    max_delegation_depth: 1
+    max_sensitivity_egress: internal
+  capabilities: { provides: [desk.answer] }
+  models: { privileged: { provider: fake, model: desk-1 } }
+  tools:
+    - ref: tool://reviewer/audit.check
+      mutates: false
+      max_sensitivity: internal
+      description: Ask the reviewer to check an invoice.
+      arguments:
+        type: object
+        properties:
+          invoice: { type: string }
+        required: [invoice]
+  execution: { kind: tool-calling, max_turns: 4 }
+  budgets: {}
+"#;
+
+    /// A chain whose scope covers the desk's own capability and the hop —
+    /// rooted at the desk's owner, so the one hop the manifest permits
+    /// (`max_delegation_depth: 1`) is the peer.
+    fn desk() -> Delegation {
+        Delegation::root(Principal::new(
+            "user:desk",
+            Scope::of(["desk.*", "audit.*"]),
+        ))
+    }
+
+    fn desk_plane(
+        manifest: &Manifest,
+        spy: &Arc<Spy>,
+        chain: Delegation,
+    ) -> (Arc<Runtime>, Arc<agentplane::testkit::FakeProvider>) {
+        let provider = agentplane::testkit::FakeProvider::new();
+        // The wiring's own ceiling admits the model's arguments, so what
+        // refuses a call below is the manifest grant and nothing else.
+        let mut grant = PeerGrant::new(Scope::of(["audit.*"])).read_only();
+        grant.max_sensitivity = agentplane::core::Sensitivity::Internal;
+        let registry = PeerRegistry::new().allow(PeerId::new("reviewer"), grant);
+        let rt = Runtime::builder(store())
+            .owner("peers")
+            .acting_as(chain)
+            .provider(
+                "fake",
+                Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+            )
+            .peers(registry, Arc::clone(spy) as Arc<dyn PeerClient>)
+            .agent(Agent::new(manifest))
+            .build();
+        (rt, provider)
+    }
+
+    /// A manifest grant naming a registered peer dispatches to it — no toolbox,
+    /// no transport — and the hop rides the run's chain like a coded one.
+    #[tokio::test]
+    async fn a_declared_peer_grant_dispatches_to_the_peer_and_replay_calls_nobody() {
+        let manifest = Manifest::parse(ASKS_REVIEWER).expect("parses");
+        let spy = Arc::new(Spy::default());
+        let (rt, provider) = desk_plane(&manifest, &spy, desk());
+        provider.will_call_tool(
+            "call_1",
+            "reviewer__audit-check",
+            json!({ "invoice": "INV-9" }),
+        );
+        provider.will_say("The reviewer approved INV-9.");
+
+        let out = rt
+            .run(
+                "desk.answer",
+                Tainted::trusted(json!({ "invoice": "INV-9" })),
+            )
+            .await
+            .expect("run");
+        assert!(
+            matches!(out.status, RunStatus::Succeeded),
+            "{:?}",
+            out.status
+        );
+        assert_eq!(
+            spy.chains.lock().unwrap().as_slice(),
+            &[vec!["user:desk".to_owned(), "reviewer".to_owned()]],
+            "the declared hop must extend the run's chain by the peer; the model was told {:?}",
+            provider
+                .asked()
+                .get(1)
+                .map(|a| a.exchanges[0].output.clone())
+        );
+        let asked = provider.asked();
+        assert_eq!(asked.len(), 2);
+        assert!(
+            asked[1].exchanges[0]
+                .output
+                .to_string()
+                .contains("reviewed"),
+            "the peer's answer did not reach the next turn: {:?}",
+            asked[1].exchanges[0].output
+        );
+
+        let replayed = rt.replay(out.run_id, Mode::Strict).await.expect("replay");
+        assert!(
+            matches!(replayed.status, RunStatus::Succeeded),
+            "{replayed:?}"
+        );
+        assert_eq!(
+            spy.sent.lock().unwrap().len(),
+            1,
+            "strict replay called the peer"
+        );
+        assert_eq!(provider.asked().len(), 2, "strict replay called the model");
+    }
+
+    /// The grant's own fields govern the hop: a protected field the model's
+    /// untrusted completion cannot satisfy refuses the call at the sink, and
+    /// nothing reaches the peer.
+    #[tokio::test]
+    async fn a_declared_peer_grants_protected_fields_govern_the_hop() {
+        let guarded = ASKS_REVIEWER.replace(
+            "      mutates: false\n",
+            "      mutates: true\n      protected_fields: [{ path: /invoice, require_trusted: true }]\n",
+        );
+        let manifest = Manifest::parse(&guarded).expect("parses");
+        let spy = Arc::new(Spy::default());
+        let (rt, provider) = desk_plane(&manifest, &spy, desk());
+        provider.will_call_tool(
+            "call_1",
+            "reviewer__audit-check",
+            json!({ "invoice": "INV-9" }),
+        );
+        provider.will_say("I could not reach the reviewer.");
+
+        let out = rt
+            .run(
+                "desk.answer",
+                Tainted::trusted(json!({ "invoice": "INV-9" })),
+            )
+            .await
+            .expect("run");
+        assert!(
+            matches!(out.status, RunStatus::Succeeded),
+            "{:?}",
+            out.status
+        );
+        assert!(
+            spy.sent.lock().unwrap().is_empty(),
+            "a model-chosen value reached a protected field on a peer hop"
+        );
+        let asked = provider.asked();
+        assert!(
+            asked[1].exchanges[0]
+                .output
+                .to_string()
+                .contains(agentplane::core::REFUSED),
+            "the model was not told the call was refused: {:?}",
+            asked[1].exchanges[0].output
+        );
+    }
+
+    const CODED_DESK: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: desk, version: "1.0.0" }
+spec:
+  identity:
+    role: "A coded desk that grants no peer."
+  topology:
+    mode: collaborative
+    role: orchestrator
+    reason: distinct-authority
+  security:
+    max_delegation_depth: 1
+  capabilities: { provides: [audit.review] }
+  budgets: {}
+"#;
+
+    /// A governed skill reaches a peer only through a grant its manifest
+    /// carries, exactly as it reaches a tool: the registry is wiring, and a
+    /// hop the reviewed document never listed is authority nobody granted.
+    #[tokio::test]
+    async fn a_governed_skill_cannot_call_a_peer_its_manifest_never_granted() {
+        let manifest = Manifest::parse(CODED_DESK).expect("parses");
+        let spy = Arc::new(Spy::default());
+        let registry =
+            PeerRegistry::new().allow(reviewer(), PeerGrant::new(Scope::of(["audit.*"])));
+        let rt = Runtime::builder(store())
+            .owner("peers")
+            .acting_as(desk())
+            .peers(registry, Arc::clone(&spy) as Arc<dyn PeerClient>)
+            .agent(Agent::new(&manifest).skill(AsksReviewer))
+            .build();
+        let out = rt
+            .run(
+                "audit.review",
+                Tainted::trusted(json!({ "invoice": "INV-9" })),
+            )
+            .await
+            .expect("admitted");
+        assert!(
+            matches!(&out.status, RunStatus::Failed(reason) if reason.contains("does not grant")),
+            "{out:?}"
+        );
+        assert!(spy.sent.lock().unwrap().is_empty(), "nothing may have left");
+    }
+
+    /// The three wiring mistakes a peer grant can carry are refused at build.
+    #[tokio::test]
+    async fn a_peer_grant_the_plane_cannot_honour_refuses_the_build() {
+        let manifest = Manifest::parse(ASKS_REVIEWER).expect("parses");
+        let spy = Arc::new(Spy::default());
+        let provider = agentplane::testkit::FakeProvider::new();
+        let plane = |registry: PeerRegistry| {
+            Runtime::builder(store())
+                .owner("peers")
+                .acting_as(desk())
+                .provider(
+                    "fake",
+                    Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+                )
+                .peers(registry, Arc::clone(&spy) as Arc<dyn PeerClient>)
+        };
+
+        // The registry never granted the capability the manifest asks for.
+        let err = plane(PeerRegistry::new().allow(
+            PeerId::new("reviewer"),
+            PeerGrant::new(Scope::of(["billing.*"])),
+        ))
+        .agent(Agent::new(&manifest))
+        .try_build()
+        .expect_err("outside the registry scope");
+        assert!(
+            matches!(&err, BuildError::PeerGrantOutsideScope { peer, capability, .. }
+                if peer == "reviewer" && capability == "audit.check"),
+            "{err}"
+        );
+
+        // The peer's name is also a wired tool server.
+        let err = plane(PeerRegistry::new().allow(
+            PeerId::new("reviewer"),
+            PeerGrant::new(Scope::of(["audit.*"])),
+        ))
+        .tool_server(
+            "reviewer",
+            Arc::new(agentplane::tools::ToolRouter::new())
+                as Arc<dyn agentplane::tools::ToolClient>,
+        )
+        .agent(Agent::new(&manifest))
+        .try_build()
+        .expect_err("one name, two meanings");
+        assert!(
+            matches!(&err, BuildError::PeerIsAlsoAToolServer { server } if server == "reviewer"),
+            "{err}"
+        );
+
+        // A specialist may not delegate, and a peer hop is delegation.
+        let specialist = ASKS_REVIEWER
+            .replace("role: orchestrator", "role: specialist")
+            .replace("    max_delegation_depth: 1\n", "");
+        let specialist = Manifest::parse(&specialist).expect("parses");
+        let err = plane(PeerRegistry::new().allow(
+            PeerId::new("reviewer"),
+            PeerGrant::new(Scope::of(["audit.*"])),
+        ))
+        .agent(Agent::new(&specialist))
+        .try_build()
+        .expect_err("a specialist granting a peer");
+        assert!(
+            matches!(&err, BuildError::PeerGrantOnASpecialist { peer, .. } if peer == "reviewer"),
+            "{err}"
+        );
+
+        // The baseline builds, so the refusals above are the rules and not the
+        // fixture.
+        plane(PeerRegistry::new().allow(
+            PeerId::new("reviewer"),
+            PeerGrant::new(Scope::of(["audit.*"])),
+        ))
+        .agent(Agent::new(&manifest))
+        .try_build()
+        .expect("a coherent peer grant builds");
+    }
 }

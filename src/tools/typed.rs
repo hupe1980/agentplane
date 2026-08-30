@@ -341,11 +341,12 @@ impl ToolBox {
     /// Neither is caught by the dispatch gates: those refuse a *call*, and by
     /// then the disagreement has already shaped what the model was offered.
     ///
-    /// `remote_servers` names the tool servers reached by some *other*
-    /// transport on the same plane. A grant on one of those is somebody else's
-    /// to implement, so this box neither claims it nor reports it missing —
-    /// without that, a plane could never mix typed tools with an MCP server,
-    /// because every MCP grant read as "granted but nothing implements it".
+    /// `remote_servers` names the servers reached by some *other* path on the
+    /// same plane — a tool transport, or a registered peer. A grant on one of
+    /// those is somebody else's to implement, so this box neither claims it
+    /// nor reports it missing — without that, a plane could never mix typed
+    /// tools with an MCP server, because every MCP grant read as "granted but
+    /// nothing implements it".
     ///
     /// # Errors
     ///

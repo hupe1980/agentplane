@@ -62,7 +62,7 @@ const JOURNAL_BY_CASE: TableDefinition<(&str, &str, &str, u64), ()> =
     TableDefinition::new("journal_by_case");
 
 /// `(run_id, effect_key) -> seq`. Exactly-once. Only `EffectStarted` is written
-/// here, which is the `WHERE` clause of the partial index this replaces.
+/// here — the `WHERE` clause the shared-store backend's partial index spells.
 const EFFECT_ONCE: TableDefinition<(&str, &str), u64> = TableDefinition::new("effect_once");
 
 /// `run_id -> (owner, epoch, expires_at)`.
@@ -622,9 +622,9 @@ fn now_secs() -> u64 {
 /// A lease expiry instant from a TTL, refusing what whole seconds cannot hold.
 ///
 /// Lease timing here has whole-second granularity, so a TTL below one second is
-/// **refused rather than clamped**. The clamp this replaces turned "expire
-/// immediately" into "hold for a second" without telling anyone — a contract
-/// the runtime relies on, enforced only upstream. Nothing legitimate reaches
+/// **refused rather than clamped**. A clamp would turn "expire immediately"
+/// into "hold for a second" without telling anyone — a contract the runtime
+/// relies on, enforced only upstream. Nothing legitimate reaches
 /// this refusal: the runtime builder already refuses any TTL below its own
 /// two-second minimum at `build()` time. This is the *store's* boundary
 /// enforcement, for every other embedder of the trait — they get the same

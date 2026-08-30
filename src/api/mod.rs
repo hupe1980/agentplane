@@ -151,6 +151,18 @@ pub struct Caller {
     /// of a single-tenant deployment: one real tenant rather than an absence, so
     /// the single-tenant path is the same code as the multi-tenant one.
     pub tenant: TenantId,
+    /// On whose behalf this caller acts, when the credential says.
+    ///
+    /// Derived by the [`Authenticator`] like everything else here — a chain
+    /// the body claimed would be a caller naming its own authority. Every run
+    /// this caller starts is admitted under it: checked against the plan,
+    /// held to its audience and validity, journaled as the run's
+    /// `IdentityBound`. `None` means the credential carried no chain, and
+    /// the run acts under the plane's own ([`RuntimeBuilder::acting_as`]) —
+    /// or under none.
+    ///
+    /// [`RuntimeBuilder::acting_as`]: crate::runtime::RuntimeBuilder::acting_as
+    pub acting_as: Option<crate::core::Delegation>,
 }
 
 impl Caller {
@@ -160,6 +172,7 @@ impl Caller {
             actor: actor.into(),
             roles,
             tenant: TenantId::default(),
+            acting_as: None,
         }
     }
 
@@ -167,6 +180,13 @@ impl Caller {
     #[must_use]
     pub fn in_tenant(mut self, tenant: TenantId) -> Self {
         self.tenant = tenant;
+        self
+    }
+
+    /// A caller whose credential carried a delegation chain.
+    #[must_use]
+    pub fn acting_as(mut self, chain: crate::core::Delegation) -> Self {
+        self.acting_as = Some(chain);
         self
     }
 }

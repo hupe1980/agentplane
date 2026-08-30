@@ -164,12 +164,11 @@ impl CardCapabilities {
 
 /// How a peer can reach this agent — A2A's `AgentInterface`.
 ///
-/// All four fields are the spec's, spelled the spec's way. An earlier version of
-/// this type called the binding `transport` and omitted the version, which
-/// serialized to a card a conforming 1.0 client cannot read: `protocolVersion`
-/// is required, and a field named `transport` is not one it looks at. A card is
-/// the one artifact whose whole job is being parsed by software nobody here
-/// wrote, so drift in it is not cosmetic.
+/// All four fields are the spec's, spelled the spec's way: `protocolVersion`
+/// is required and the binding is `protocolBinding`, and a card carrying a
+/// field a conforming 1.0 client does not look at is a card it cannot read. A
+/// card is the one artifact whose whole job is being parsed by software nobody
+/// here wrote, so drift in it is not cosmetic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CardInterface {
@@ -199,9 +198,9 @@ pub struct HttpAuthSecurityScheme {
 
 /// One A2A security scheme.
 ///
-/// This release exposes the scheme the shipped client already uses: HTTP
-/// bearer authentication. More variants belong here only when a transport can
-/// actually acquire and send them.
+/// Only the scheme the shipped client can send: HTTP bearer authentication.
+/// More variants belong here only when a transport can actually acquire and
+/// send them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CardSecurityScheme {

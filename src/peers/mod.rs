@@ -24,6 +24,9 @@
 //! more link. [`Delegation::delegate`] already refuses to widen and caps depth,
 //! so a hop cannot hand a peer more authority than the caller holds, and a
 //! request cannot wander arbitrarily far from the human who authorised it.
+//! "Our chain" is the **run's** — `StepCtx::acting_as`, which on a served
+//! plane is the caller's — never one a skill holds for itself, because a
+//! chain held by the skill is the same owner on every call whoever asked.
 //!
 //! The registry decides what each peer is *granted*, and that is an operator's
 //! declaration. It is not taken from the peer's agent card, for exactly the
@@ -116,8 +119,9 @@ pub use credentials::{Cached, CredentialError, CredentialSource, Fixed, TokenExc
 use std::time::Duration;
 
 use crate::core::{
-    Delegation, DelegationError, Disposition, Effect, EffectDescriptor, EffectError, Principal,
-    Recovery, RetryPolicy, Scope, Secret, Sensitivity, Timestamp, Trust,
+    Capability, Delegation, DelegationError, Disposition, Effect, EffectDescriptor, EffectError,
+    Principal, ProtectedField, Recovery, RetryPolicy, Scope, Secret, Sensitivity, SourceId,
+    Timestamp, Trust,
 };
 
 /// Another agent, addressed by the name this plane knows it by.
@@ -314,8 +318,10 @@ pub enum PeerError {
     #[error("delegating to '{peer}' is refused: {source}")]
     Delegation {
         peer: PeerId,
+        /// Boxed: the refusal names both links' bounds, and every peer
+        /// call's `Result` would otherwise carry that width on its happy path.
         #[source]
-        source: DelegationError,
+        source: Box<DelegationError>,
     },
 
     /// The credential on hand is for someone else.
@@ -324,6 +330,19 @@ pub enum PeerError {
          presenting it would let '{peer}' replay it at '{held_for}'"
     )]
     WrongAudience { peer: PeerId, held_for: PeerId },
+
+    /// The capability asked for is outside what this peer is granted.
+    ///
+    /// The peer would refuse it at admission — the chain it receives permits
+    /// only the grant's scope — but a call that cannot succeed should not
+    /// leave: it costs a round trip, lands in the peer's journal as a refused
+    /// admission, and reads to the operator as the peer declining rather than
+    /// as this plane never having granted it.
+    #[error(
+        "peer '{peer}' is not granted '{capability}'; the registry's scope for it is the \
+         ceiling on what this plane may ask it to do"
+    )]
+    NotGranted { peer: PeerId, capability: String },
 
     /// The call never left.
     #[error("could not reach '{peer}': {detail}")]
@@ -373,6 +392,7 @@ impl PeerError {
             Self::Unknown { .. }
             | Self::Delegation { .. }
             | Self::WrongAudience { .. }
+            | Self::NotGranted { .. }
             | Self::Unreachable { .. }
             | Self::Refused { .. } => Disposition::DidNotHappen,
             Self::TimedOut { .. } | Self::InDoubt { .. } | Self::InvalidResponse { .. } => {
@@ -438,6 +458,96 @@ pub trait PeerClient: Send + Sync + Debug {
             peer: peer.clone(),
             detail: "this peer transport does not support task cancellation".to_owned(),
         })
+    }
+}
+
+/// One client per peer, resolved by the name a grant carries.
+///
+/// The peers' twin of `ToolRouter`, for the same reason: a single transport
+/// handed every peer id would have to hold one endpoint, and a plane that
+/// consults two peers has two. A peer nobody routed is unreachable — a
+/// refusal that never leaves — rather than a guess at the nearest endpoint.
+#[derive(Debug, Default)]
+pub struct PeerRouter {
+    routes: BTreeMap<PeerId, Arc<dyn PeerClient>>,
+}
+
+impl PeerRouter {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reach one peer through one client.
+    ///
+    /// # Panics
+    ///
+    /// If the peer is already routed: silently replacing would make
+    /// registration order decide which endpoint a call reaches.
+    #[must_use]
+    pub fn peer(mut self, peer: PeerId, client: Arc<dyn PeerClient>) -> Self {
+        assert!(
+            !self.routes.contains_key(&peer),
+            "peer '{peer}' is routed twice — one of the two endpoints would silently \
+             never be called"
+        );
+        self.routes.insert(peer, client);
+        self
+    }
+
+    /// The peers this router can reach.
+    pub fn peers(&self) -> impl Iterator<Item = &PeerId> {
+        self.routes.keys()
+    }
+
+    fn route(&self, peer: &PeerId) -> Result<&Arc<dyn PeerClient>, PeerError> {
+        self.routes.get(peer).ok_or_else(|| PeerError::Unreachable {
+            peer: peer.clone(),
+            detail: format!(
+                "no transport is wired for this peer; this plane routes {:?}",
+                self.routes
+                    .keys()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            ),
+        })
+    }
+}
+
+#[async_trait]
+impl PeerClient for PeerRouter {
+    async fn send(
+        &self,
+        peer: &PeerId,
+        capability: &str,
+        payload: &Value,
+        acting_as: &Delegation,
+        credential: Option<&PeerCredential>,
+        provenance: Option<&crate::core::Provenance>,
+    ) -> Result<Value, PeerError> {
+        self.route(peer)?
+            .send(peer, capability, payload, acting_as, credential, provenance)
+            .await
+    }
+
+    async fn get_task(
+        &self,
+        peer: &PeerId,
+        task_id: &str,
+        credential: Option<&PeerCredential>,
+    ) -> Result<Value, PeerError> {
+        self.route(peer)?.get_task(peer, task_id, credential).await
+    }
+
+    async fn cancel_task(
+        &self,
+        peer: &PeerId,
+        task_id: &str,
+        credential: Option<&PeerCredential>,
+    ) -> Result<Value, PeerError> {
+        self.route(peer)?
+            .cancel_task(peer, task_id, credential)
+            .await
     }
 }
 
@@ -786,6 +896,11 @@ impl PeerRegistry {
         self.peers.get(peer)
     }
 
+    /// Every peer this registry names.
+    pub fn peers(&self) -> impl Iterator<Item = &PeerId> {
+        self.peers.keys()
+    }
+
     /// The credential for this peer, if one is held *and* bound to it.
     ///
     /// The audience check is here rather than at the call site so that no code
@@ -824,6 +939,10 @@ pub struct PeerCall {
     /// Who is calling, sealed for this hop. Set by the runtime via
     /// [`Effect::attach`](crate::core::Effect::attach).
     provenance: Option<crate::core::Provenance>,
+    /// Authority-bearing payload fields and their source rules, from the
+    /// manifest grant that governs this call — see
+    /// [`governed_by`](Self::governed_by). Empty for a call nothing governs.
+    protected: Vec<ProtectedField>,
 }
 
 impl PeerCall {
@@ -895,6 +1014,14 @@ impl PeerCall {
         let Some(grant) = registry.grant(&peer) else {
             return Err(PeerError::Unknown { peer });
         };
+        let capability = capability.into();
+        // Refused here rather than by the peer: the chain it would receive
+        // permits exactly `grant.scope`, so a capability outside it is a call
+        // the far side's admission gate refuses after a round trip, journaled
+        // there as *their* decline.
+        if !grant.scope.permits(&Capability::new(capability.as_str())) {
+            return Err(PeerError::NotGranted { peer, capability });
+        }
 
         // The grant is a ceiling. What the peer actually receives is bounded by
         // what *we* hold, which is what `delegate` enforces — a grant wider than
@@ -904,19 +1031,38 @@ impl PeerCall {
             .delegate(Principal::new(peer.to_string(), grant.scope.clone()))
             .map_err(|source| PeerError::Delegation {
                 peer: peer.clone(),
-                source,
+                source: Box::new(source),
             })?;
 
         Ok(Self {
             provenance: None,
             grant: grant.clone(),
-            capability: capability.into(),
+            capability,
             payload,
             acting_as,
             credential,
             peer,
             client,
+            protected: Vec::new(),
         })
+    }
+
+    /// Hold this call to a manifest grant's declaration.
+    ///
+    /// A registry entry is operator *wiring* — where the peer is, what it is
+    /// granted, which credential reaches it. The reviewed `tool://<peer>/<capability>`
+    /// grant in the calling agent's manifest is what says how the call may be
+    /// *used*, and it governs the same way it governs a tool: its protected
+    /// fields are checked at the sink, its ceiling bounds what may be sent, and
+    /// its `mutates` can only make the call more cautious than the wiring did.
+    #[must_use]
+    pub fn governed_by(mut self, safety: &crate::tools::ToolSafety) -> Self {
+        self.grant.mutates |= safety.mutates;
+        self.grant.max_sensitivity = safety.max_sensitivity;
+        self.grant.output_sensitivity =
+            self.grant.output_sensitivity.max(safety.output_sensitivity);
+        self.protected.clone_from(&safety.protected_fields);
+        self
     }
 
     /// The chain the peer will act under.
@@ -959,6 +1105,29 @@ impl Effect for PeerCall {
 
     fn delegation_depth(&self) -> Option<usize> {
         Some(self.acting_as.depth())
+    }
+
+    /// The payload is what reaches the peer, so it is what the sink gate
+    /// judges — the whole-value taint rule for a mutating grant, and the
+    /// per-field rules a manifest declares.
+    fn sink_arguments(&self) -> Option<&Value> {
+        Some(&self.payload)
+    }
+
+    fn protected_fields(&self) -> &[ProtectedField] {
+        &self.protected
+    }
+
+    /// The reference a manifest grants this call under, so a source rule can
+    /// name *this* peer's answer — `tool://reviewer/audit.check` — rather than
+    /// whichever peer an injected prompt reached first.
+    fn source(&self) -> SourceId {
+        SourceId::new(format!(
+            "{}{}/{}",
+            crate::tools::TOOL_SCHEME,
+            self.peer,
+            self.capability
+        ))
     }
 
     fn output_sensitivity(&self) -> Sensitivity {

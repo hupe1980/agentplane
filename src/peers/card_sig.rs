@@ -34,9 +34,8 @@
 //! conforming verifier against bytes it rounded — the worst kind of mismatch,
 //! because each side is correct under its own reading. [`signing_input`]
 //! refuses the range instead of hoping, on both the signing and verifying
-//! paths, which retires the guard that used to assert the card carried no
-//! numbers at all. I-JSON draws interoperability at the same line, so a value
-//! that big belongs in a string.
+//! paths. I-JSON draws interoperability at the same line, so a value that big
+//! belongs in a string.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;

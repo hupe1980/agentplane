@@ -263,6 +263,26 @@ pub(crate) fn sorted_fields(fields: &[ProtectedField]) -> Vec<ProtectedField> {
 }
 
 impl ToolSafety {
+    /// The safety a manifest grant declares.
+    ///
+    /// The fields a manifest does not carry — retry, recovery, output
+    /// sensitivity — take their cautious defaults, which is where a
+    /// hand-written safety starts too. One derivation, shared by the derived
+    /// catalogue and by a peer call held to its grant, so the two cannot read
+    /// one declaration differently.
+    #[cfg(feature = "manifest")]
+    #[must_use]
+    pub fn from_grant(grant: &crate::manifest::ToolGrant) -> Self {
+        Self {
+            mutates: grant.mutates,
+            protected_fields: grant.protected_fields.clone(),
+            max_sensitivity: grant
+                .max_sensitivity
+                .unwrap_or(Self::default().max_sensitivity),
+            ..Self::default()
+        }
+    }
+
     /// A tool that only reads.
     ///
     /// Named for what the operator is asserting, not for what a server claimed.
@@ -468,17 +488,7 @@ impl ToolCatalog {
                 // nobody wrote down.
                 continue;
             };
-            let safety = ToolSafety {
-                mutates: grant.mutates,
-                protected_fields: grant.protected_fields.clone(),
-                // The fields a manifest does not carry take their cautious
-                // defaults, which is where a hand-written safety starts too.
-                max_sensitivity: grant
-                    .max_sensitivity
-                    .unwrap_or(ToolSafety::default().max_sensitivity),
-                ..ToolSafety::default()
-            };
-            catalog = catalog.allow(id.clone(), safety);
+            catalog = catalog.allow(id.clone(), ToolSafety::from_grant(grant));
             if grant.description.is_some() || grant.arguments.is_some() {
                 catalog = catalog.declare(
                     id,

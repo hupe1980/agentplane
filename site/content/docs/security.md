@@ -232,16 +232,17 @@ refusal to replan on untrusted data — all at once, and silently.
 guarantee downstream of the label would rest on the skill author wrapping the
 result correctly — and `Tainted::trusted(..)` is the easy thing to write.
 
-That has a consequence worth being blunt about: **the refusal to replan on
-untrusted data was implemented, tested, and unfalsifiable.** Deleting it would
-have failed no test, because the fixtures laundered the taint before it reached
-the check. Moving the label from the call site to the effect is what made the
-existing guarantee real; `tests/trust/boundary.rs` now asserts it against a fixture
-that forwards a tool result, and the refusal fires.
+That has a consequence worth being blunt about: **a guarantee that rests on
+a fixture wrapping results honestly is unfalsifiable.** The refusal to replan
+on untrusted data could be implemented, tested and deletable without a test
+failing, as long as the fixtures laundered the taint before it reached the
+check. With the label on the effect, no fixture can; `tests/trust/boundary.rs`
+asserts the refusal against a fixture that forwards a tool result, and it
+fires.
 
-The fixtures had to become honest in the process. A step that writes to a ledger
-now returns *that it wrote*, not the ledger's response — which is the real
-pattern anyway: data may set parameters, not choose control flow.
+The fixtures are held to the same rule: a step that writes to a ledger returns
+*that it wrote*, not the ledger's response — which is the real pattern anyway:
+data may set parameters, not choose control flow.
 
 ### Quarantining a parse
 
@@ -359,12 +360,58 @@ The encoding is where the bug lives:
 * **An exact grant never becomes a family.** `audit.check` does not contain
   `audit.check.*`.
 
+### Three bounds, all attenuating
+
+A link carries its scope and, optionally, an audience (`Principal::for_audience`)
+and an expiry (`Principal::until`). `delegate` narrows on every axis: a delegate
+may not hold a wider scope, may not outlive its delegator, and may not name a
+plane the chain was not issued for. Setting a bound the chain had not set is
+narrowing and always allowed; the effective values are the innermost ones
+(`Delegation::not_after`, `Delegation::audience`).
+
+* **Audience** is a tenant name. A chain naming one is admitted only by the plane
+  whose tenant it is — a credential minted for `acme` presented to `globex` is
+  refused as `WrongAudience`, however valid it otherwise is.
+* **Validity** is checked once, at admission, against the admission clock
+  (`Expired`), and never again: a run admitted under a live chain stays governed
+  by it, and replay reads the recorded chain back rather than re-judging it.
+* A chain naming neither is admitted anywhere, indefinitely. Absence is absence,
+  not a wildcard somebody chose; a deployment that needs the bound writes it into
+  the credential it issues — or, for `agentplane serve`, into the token file.
+
 ### The plan is where authority is checked
 
 The plan is already the authorization graph, so a plan naming a capability
 outside the chain's scope never starts — rather than failing at whichever step
 happens to reach it first. The refusal depends only on the frozen plan and the
 recorded chain, both of which are journaled, so it is deterministic.
+
+### The chain is per run, never per plane
+
+`RuntimeBuilder::acting_as` is the chain the plane's *own* runs act under — the
+ones an embedder starts in-process. A served surface admits each run under the
+chain its **authenticated caller** presented: `Caller::acting_as`, produced by
+the `Authenticator` like the actor and the tenant, becomes `RunTerms::acting_as`
+at admission, and the run's `IdentityBound` names the caller. A plane that bound
+its own chain to every peer's run would be an ambient credential — every caller
+acting as the operator, "on whose behalf" answered with the same name for all of
+them, and a peer whose credential permits less acting with more.
+
+For `agentplane serve`, a token-file entry with `scope` (and optionally
+`not_after`) is that caller's chain: rooted at the actor, bound to the entry's
+tenant as its audience. An embedder with its own front door does the same
+through `Runtime::run_under` / `spawn_under` with `RunTerms::acting_as`.
+
+The chain the run was admitted under is the one every step acts under: it is
+what `effect:perform` and `release` requests carry as `owner`/`subject`, and a
+replay reads it back from `IdentityBound` rather than from the plane's current
+configuration. It also travels across every hand-off: `cx.commission` admits its
+sub-run under the orderer's chain plus one link naming the commissioned agent
+(`agent/<capability>`, the orderer's effective scope, its expiry and audience
+inherited), and `cx.call_peer` sends the peer the same chain plus one link
+naming the peer, narrowed to the registry's grant — so a room's every journal,
+on this plane or another, answers "on whose behalf" with the same owner, and a
+chain with no room for another hop refuses at the hand-off.
 
 ### Verified once, journaled, re-checked on the way back
 
@@ -376,10 +423,11 @@ Credentials expire. Two tempting answers are both wrong:
   the path nobody thinks of as an authorization boundary.
 
 So the credential is verified once at admission, the resulting chain is recorded
-at `IdentityBound`, and `rehydrate` re-checks the **structural** property on the
-way back in. That costs nothing and is timeless, unlike a signature. It runs the
-same predicate the constructor does, deliberately: two definitions of "valid
-chain" is how the storage path drifts from the construction path.
+at `IdentityBound`, and `rehydrate` re-checks the **structural** property — scope,
+validity and audience attenuation, depth — on the way back in. That costs nothing
+and is timeless, unlike a signature or an expiry. It runs the same predicate the
+constructor does, deliberately: two definitions of "valid chain" is how the
+storage path drifts from the construction path.
 
 `spec/Delegation.tla` models building, storing, *tampering*, and loading, and its
 mutants are the two failures above.

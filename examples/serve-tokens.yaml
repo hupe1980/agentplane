@@ -7,10 +7,17 @@
 # API ones, so neither token can do the other's work even if it reaches the
 # other's port.
 #
+# `scope` is a grant, and it is the caller's own: every run peer-a starts is
+# admitted under a chain rooted at `peer-a` with exactly this authority, and
+# the journal names peer-a — not this plane — as who the run acted for. A
+# `not_after` beside it would expire the chain at admission. Leave both out
+# and the caller has no chain of its own.
+#
 # Obviously demo values. A real deployment mounts this as a secret.
 - token: "a-long-random-string"
   actor: peer-a
   roles: [peer]
+  scope: [support.*]
 
 - token: "another-long-random-string"
   actor: ops-alice

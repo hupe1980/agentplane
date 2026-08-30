@@ -66,9 +66,7 @@ pub use id::{
     BatchId, CaseId, Digest, EffectKey, Epoch, Phase, RunId, Seq, StepId, Timestamp,
     format_timestamp,
 };
-pub use identity::{
-    Delegation, DelegationError, DelegationScheme, MAX_DELEGATION_DEPTH, Principal, Scope,
-};
+pub use identity::{Delegation, DelegationError, MAX_DELEGATION_DEPTH, Principal, Scope};
 pub use label::{
     Label, ProtectedField, Release, ReleaseMark, ReleaseScope, Sensitivity, SourceId, Tainted,
     Trust,

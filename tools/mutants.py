@@ -450,7 +450,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/executor.rs",
         "a_plan_outside_the_chain_s_authority_never_starts",
         "a plan naming a capability outside the chain's scope runs anyway",
-        "        self.authorize_scope(&plan)?;\n",
+        "        self.authorize_scope(&plan, chain)?;\n",
         "",
     ),
     "DelegationCanWiden": (
@@ -459,6 +459,101 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a delegate is granted authority its delegator does not hold",
         "        if !from.scope.contains(&to.scope) {",
         "        if false {",
+    ),
+    "ValidityCanWiden": (
+        "src/core/identity.rs",
+        "a_delegate_cannot_outlive_its_delegator",
+        "a delegate outlives its delegator, so a short-lived credential buys a "
+        "long-lived one",
+        "            && delegate_until > delegator_until\n",
+        "            && false\n",
+    ),
+    "AudienceCanWiden": (
+        "src/core/identity.rs",
+        "a_delegate_cannot_change_its_delegators_audience",
+        "a delegate carries its delegator's authority to a plane the delegator "
+        "was never issued for",
+        "            && delegate_audience != delegator_audience\n",
+        "            && false\n",
+    ),
+    "AnExpiredChainIsAdmitted": (
+        "src/core/identity.rs",
+        "an_expired_chain_is_refused_at_admission",
+        "a chain past its validity still admits runs — the time bound is a note",
+        "            && at >= not_after\n",
+        "            && false\n",
+    ),
+    "AChainForAnotherPlaneIsAdmitted": (
+        "src/core/identity.rs",
+        "a_chain_bound_to_another_plane_is_refused_at_admission",
+        "a credential minted for another plane is spendable here — the audience "
+        "bound is a note",
+        "            && audience != plane\n",
+        "            && false\n",
+    ),
+    "NoAdmissionBoundsCheck": (
+        "src/runtime/executor.rs",
+        "an_expired_chain_is_refused_at_admission",
+        "admission checks the chain's scope and never its validity or audience",
+        "        chain.admissible(self.tenant.as_str(), now_for_admission())?;\n",
+        "",
+    ),
+    # The plane's chain reaching a run whose terms carried the caller's: every
+    # served run would act as the owner, and the journal would say so.
+    "ThePlanesChainOutranksTheCallers": (
+        "src/runtime/executor.rs",
+        "a_run_acts_under_the_terms_chain_not_the_planes",
+        "the plane's own chain gates a run whose terms carried the caller's",
+        "        let chain = terms.acting_as.as_ref().or(self.identity.as_ref());",
+        "        let chain = self.identity.as_ref().or(terms.acting_as.as_ref());",
+    ),
+    "ThePlanesChainIsRecordedForTheCaller": (
+        "src/runtime/executor.rs",
+        "a_run_acts_under_the_terms_chain_not_the_planes",
+        "the journal names the plane's chain on a run admitted for a caller",
+        "        let chain = acting_as.as_ref().or(self.identity.as_ref());",
+        "        let chain = self.identity.as_ref().or(acting_as.as_ref());",
+    ),
+    "AStepActsAsThePlane": (
+        "src/runtime/executor.rs",
+        "a_steps_policy_context_names_the_runs_chain_live_and_on_replay",
+        "every step's policy context carries the plane's chain rather than the "
+        "run's, so a served run's effects are judged as the operator's",
+        "                identity: identity.cloned(),\n                agent: agent.to_owned(),",
+        "                identity: self.identity.clone(),\n                agent: agent.to_owned(),",
+    ),
+    "AResumedRunActsAsThePlane": (
+        "src/runtime/executor.rs",
+        "a_replayed_step_reads_the_recorded_chain_not_the_configured_one",
+        "a replayed run acts under the chain the plane is configured with now "
+        "instead of the one its journal records",
+        "                identity: recorded_chain(&records)?,",
+        "                identity: self.identity.clone(),",
+    ),
+    "AStepHidesItsChain": (
+        "src/runtime/ctx.rs",
+        "a_replayed_step_reads_the_recorded_chain_not_the_configured_one",
+        "a skill cannot read the chain its run acts under, so the only chain it "
+        "can extend toward a peer is one it holds ambiently",
+        "    pub fn acting_as(&self) -> Option<&crate::core::Delegation> {\n        self.identity.as_ref()",
+        "    pub fn acting_as(&self) -> Option<&crate::core::Delegation> {\n        None",
+    ),
+    "ACommissionDropsTheChain": (
+        "src/runtime/ctx.rs",
+        "a_commissioned_run_acts_under_the_orderers_chain_plus_one_link",
+        "a commissioned sub-run is admitted under the plane's chain, so the "
+        "orderer's owner, expiry and audience stop at the hand-off",
+        "            terms = terms.acting_as(chain.clone());",
+        "            let _ = chain;",
+    ),
+    "AServedRunActsAsThePlane": (
+        "src/api/a2a.rs",
+        "a_served_run_acts_as_its_caller_not_as_the_plane",
+        "the A2A server admits every peer's run under the plane's own chain — an "
+        "ambient credential with the caller's name on the message and the "
+        "owner's on the record",
+        "        terms = terms.acting_as(chain.clone());",
+        "        let _ = chain;",
     ),
     "ScopePrefixMatch": (
         "src/core/identity.rs",
@@ -596,6 +691,68 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     # A hop that does not attenuate hands the peer the caller's own authority,
     # and stops capping how far a request can travel from the human who
     # authorised it.
+    "APeerCallSkipsTheGrantScope": (
+        "src/peers/mod.rs",
+        "a_capability_outside_the_peers_grant_never_leaves",
+        "a call for a capability the registry never granted the peer leaves "
+        "anyway, to be refused by the peer's admission after a round trip",
+        "        if !grant.scope.permits(&Capability::new(capability.as_str())) {",
+        "        if false {",
+    ),
+    "APeerRouterDialsAnyPeer": (
+        "src/peers/mod.rs",
+        "a_peer_router_reaches_only_the_peers_it_routes",
+        "an unrouted peer is sent to whichever endpoint the router holds first",
+        "        self.routes.get(peer).ok_or_else(|| PeerError::Unreachable {",
+        "        self.routes.values().next().ok_or_else(|| PeerError::Unreachable {",
+    ),
+    "ADeclaredPeerGrantIgnoresItsFields": (
+        "src/runtime/ctx.rs",
+        "a_declared_peer_grants_protected_fields_govern_the_hop",
+        "the manifest grant's protected fields and ceiling never reach the peer "
+        "call, so a model-chosen value fills an authority-bearing field on a hop",
+        "                Some(safety) => call.governed_by(safety),",
+        "                Some(_) => call,",
+    ),
+    "ADeclaredPeerGrantGoesToTheRouter": (
+        "src/runtime/declarative.rs",
+        "a_declared_peer_grant_dispatches_to_the_peer_and_replay_calls_nobody",
+        "a grant naming a registered peer is dispatched as a tool call, which "
+        "extends no chain, counts against no delegation ceiling, and reaches "
+        "a router that knows no such server",
+        "                if let Some(peer) = cx.peer_named(&id.server) {\n"
+        "                    match cx.call_peer(&peer, &id.tool, &args).await {",
+        "                if let Some(peer) = cx.peer_named(&id.server).filter(|_| false) {\n"
+        "                    match cx.call_peer(&peer, &id.tool, &args).await {",
+    ),
+    "AGovernedSkillCallsAnyPeer": (
+        "src/runtime/ctx.rs",
+        "a_governed_skill_cannot_call_a_peer_its_manifest_never_granted",
+        "a governed skill may call a peer its manifest never granted — the "
+        "registry alone decides, and the reviewed document says nothing",
+        "                manifest.tool_grant(&reference).is_none().then(|| {",
+        "                manifest.tool_grant(&reference).is_none().then(|| None::<String>).flatten().map(|_| {",
+    ),
+    "APeerGrantOutsideScopeBuilds": (
+        "src/runtime/executor.rs",
+        "a_peer_grant_the_plane_cannot_honour_refuses_the_build",
+        "a manifest grant naming a capability the registry never gave the peer "
+        "builds, and is refused by the peer's admission on every run",
+        "                        if !peer_grant.scope.permits(&Capability::new(id.tool.as_str())) {",
+        "                        if false {",
+    ),
+    "APeerNamedLikeAToolServerBuilds": (
+        "src/runtime/executor.rs",
+        "a_peer_grant_the_plane_cannot_honour_refuses_the_build",
+        "one name is both a peer and a tool server, and a grant on it means "
+        "whichever the runtime checks first",
+        "            if servers.iter().any(|(server, _)| server == name)\n"
+        "                || tools\n"
+        "                    .as_ref()\n"
+        "                    .is_some_and(|t| t.servers().any(|s| s == name))\n"
+        "            {",
+        "            if false {",
+    ),
     "HopDoesNotAttenuate": (
         "src/peers/mod.rs",
         "a_grant_wider_than_the_caller_is_refused",
@@ -604,7 +761,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
             .delegate(Principal::new(peer.to_string(), grant.scope.clone()))
             .map_err(|source| PeerError::Delegation {
                 peer: peer.clone(),
-                source,
+                source: Box::new(source),
             })?;""",
         "        let acting_as = caller.clone();",
     ),
@@ -3627,8 +3784,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "fields, so a reviewer's field rules vanish on the way to the runtime — "
         "worse than the duplication it replaced, because the operator believes "
         "they declared something they did not",
-        "                protected_fields: grant.protected_fields.clone(),",
-        "                protected_fields: Vec::new(),",
+        "            protected_fields: grant.protected_fields.clone(),",
+        "            protected_fields: Vec::new(),",
     ),
     "CodeAndDeclarationMayDisagree": (
         "src/tools/typed.rs",
@@ -3657,9 +3814,9 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a plane hosting several agents enforces one declaration and ignores the "
         "rest — and the ignored ones are exactly where a second team's manifest "
         "drifts unnoticed",
-        "            tools\n                .check_against(manifest, &remote_servers)",
+        "            tools\n                .check_against(manifest, &reachable_elsewhere)",
         "            if declared > 1 {\n                continue;\n            }\n"
-        "            tools\n                .check_against(manifest, &remote_servers)",
+        "            tools\n                .check_against(manifest, &reachable_elsewhere)",
     ),
     "EmbeddingIsComputedNotObserved": (
         "src/runtime/ctx.rs",
@@ -4667,7 +4824,9 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a policy denial comes back as an internal error, so the caller reads a "
         "permanent refusal as a transient fault and retries a decision that "
         "will never change",
-        "        Err(crate::core::RuntimeError::PolicyDenied(_)) => {\n"
+        "        Err(\n"
+        "            crate::core::RuntimeError::PolicyDenied(_) | crate::core::RuntimeError::Delegation(_),\n"
+        "        ) => {\n"
         "            return Ok(json!({ \"message\": declined(&skill) }));\n"
         "        }",
         "",
@@ -4678,10 +4837,13 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the decline sent to a peer carries the runtime's own denial, naming "
         "the action and resource the gate keyed on — enough to map this "
         "plane's authorization vocabulary by probing it",
-        "        Err(crate::core::RuntimeError::PolicyDenied(_)) => {\n"
+        "        Err(\n"
+        "            crate::core::RuntimeError::PolicyDenied(_) | crate::core::RuntimeError::Delegation(_),\n"
+        "        ) => {\n"
         "            return Ok(json!({ \"message\": declined(&skill) }));\n"
         "        }",
-        "        Err(crate::core::RuntimeError::PolicyDenied(why)) => {\n"
+        "        Err(why @ crate::core::RuntimeError::PolicyDenied(_))\n"
+        "        | Err(why @ crate::core::RuntimeError::Delegation(_)) => {\n"
         "            return Ok(json!({ \"message\": declined(&why.to_string()) }));\n"
         "        }",
     ),
@@ -6268,9 +6430,9 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the admission key drops its producer, so one peer replaying "
         "another's messageId is treated as that peer's retry — it is handed "
         "the victim's task id and a seat inside the victim's case",
-        """    // a second run inside the right case.
+        """    let source = super::peer_source(&caller.actor);
     let keyed = format!("{source}\\u{1f}{}", message.message_id);""",
-        """    // a second run inside the right case.
+        """    let source = super::peer_source(&caller.actor);
     let _ = source;
     let keyed = message.message_id.clone();""",
     ),

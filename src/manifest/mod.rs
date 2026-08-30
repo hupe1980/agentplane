@@ -358,13 +358,13 @@ pub struct Identity {
     /// two are reviewed by different people and change on different schedules.
     ///
     /// There is deliberately no third field. A `workload_id` ("the SPIFFE ID
-    /// this agent runs as") was removed: nothing read it, so it was an
-    /// identity claim in a reviewed file that the runtime never checked — a
-    /// reviewer would take it as binding while the plane ran the agent as
-    /// whatever identity it actually held. Workload identity is configured on
-    /// the plane and recorded in the journal (`IdentityBound`), where it is
-    /// evidence rather than aspiration. Same cut as `capabilities.requires`
-    /// and `security.pattern`: a control the runtime does not check is what a
+    /// this agent runs as") would be an identity claim in a reviewed file that
+    /// the runtime never checks — a reviewer would take it as binding while
+    /// the plane ran the agent as whatever identity it actually held.
+    /// Workload identity is configured on the plane and recorded in the
+    /// journal (`IdentityBound`), where it is evidence rather than
+    /// aspiration. The same rule keeps out `capabilities.requires` and
+    /// `security.pattern`: a control the runtime does not check is what a
     /// reviewable file exists to eliminate.
     #[serde(default)]
     pub constraints: String,
@@ -900,13 +900,13 @@ pub struct Security {
 /// What this agent offers, as capability strings.
 ///
 /// `provides` is enforced: the plane refuses to build if a declared capability
-/// has no skill behind it, and an Agent Card advertises exactly these. A twin
-/// `requires` field was removed rather than left as review-only intent — it was
-/// parsed, digest-covered and never checked, which is the advisory-control shape
-/// I12 forbids, and its enforced meaning (does a requirement bind a plane-mate's
-/// capability, a `tool://agent` grant, or a peer?) was never pinned. A build
-/// check that every required capability is available on the plane is a
-/// well-formed future control; until it exists, the field does not.
+/// has no skill behind it, and an Agent Card advertises exactly these. There
+/// is no `requires` twin: parsed and digest-covered but never checked, it
+/// would be the advisory-control shape I12 forbids, and its enforced meaning
+/// (does a requirement bind a plane-mate's capability, a `tool://agent`
+/// grant, or a peer?) is not pinned. A build check that every required
+/// capability is available on the plane is a well-formed future control;
+/// until it exists, the field does not.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Capabilities {
@@ -978,9 +978,10 @@ pub struct Budgets {
 pub struct ToolGrant {
     /// Which tool, as `tool://server/name`.
     ///
-    /// Transport-neutral on purpose: the deployment's router decides whether
-    /// `server` is an MCP connection or tools compiled into the binary, so this
-    /// document states only what a reviewer can actually check.
+    /// Transport-neutral on purpose: the deployment's wiring decides whether
+    /// `server` is an MCP connection, tools compiled into the binary, `agent`
+    /// for another agent on this plane, or the id of a registered A2A peer —
+    /// so this document states only what a reviewer can actually check.
     #[serde(rename = "ref")]
     pub reference: String,
     /// Whether calling it changes the world.

@@ -158,6 +158,8 @@ pub(crate) struct Frame {
     /// meaningful against the index it was built for.
     pub semantic: Option<Arc<super::SemanticMemory>>,
     pub authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
+    /// The plane's peer registry and transport, for [`StepCtx::call_peer`].
+    pub peers: Option<Arc<super::executor::PeerWiring>>,
     /// The plane's checked catalogue and transport, for [`StepCtx::call_tool`].
     #[cfg(feature = "manifest")]
     pub tools: Option<(
@@ -230,6 +232,7 @@ pub struct StepCtx<'a> {
     memories: Option<Arc<dyn crate::memory::MemoryStore>>,
     semantic: Option<Arc<super::SemanticMemory>>,
     authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
+    peers: Option<Arc<super::executor::PeerWiring>>,
     #[cfg(feature = "manifest")]
     tools: Option<(
         Arc<crate::tools::ToolCatalog>,
@@ -300,6 +303,7 @@ impl<'a> StepCtx<'a> {
             memories,
             semantic,
             authorities,
+            peers,
             #[cfg(feature = "manifest")]
             tools,
             meter,
@@ -332,6 +336,7 @@ impl<'a> StepCtx<'a> {
             memories,
             semantic,
             authorities,
+            peers,
             #[cfg(feature = "manifest")]
             tools,
             meter,
@@ -471,6 +476,14 @@ impl<'a> StepCtx<'a> {
     /// * **The cost comes back**, and is billed to the commissioning run, so an
     ///   orchestrator's ceiling bounds the work it ordered rather than its own
     ///   idling.
+    /// * **The chain travels, one link longer.** The sub-run acts under this
+    ///   run's chain extended by a link naming the commissioned agent — the
+    ///   in-plane twin of what a peer call sends outward — so its journal
+    ///   answers "on whose behalf" with the same owner, and its expiry and
+    ///   audience are this run's. A sub-run admitted under the plane's chain
+    ///   instead would act as the operator for a caller who never held that,
+    ///   and a chain with no room for another hop refuses here rather than
+    ///   one journal down.
     ///
     /// The answer is untrusted whatever the org chart says: another agent's
     /// output is somebody else's data.
@@ -490,6 +503,24 @@ impl<'a> StepCtx<'a> {
             .identity
             .as_ref()
             .map_or(0, crate::core::Delegation::depth);
+        // The link carries this run's effective scope unchanged: what the
+        // commissioned agent may do is its own manifest's business, and the
+        // chain's job is to say for whom and how far from the owner.
+        let chain = self
+            .identity
+            .as_ref()
+            .map(|parent| {
+                parent.delegate(crate::core::Principal::new(
+                    format!("agent/{capability}"),
+                    parent.effective_scope().clone(),
+                ))
+            })
+            .transpose()
+            .map_err(|e| {
+                StepError::Effect(crate::core::EffectError::Other(format!(
+                    "commissioning '{capability}' refused: {e}"
+                )))
+            })?;
         let commissioned = self
             .effect(Commission {
                 capability: capability.to_owned(),
@@ -497,6 +528,7 @@ impl<'a> StepCtx<'a> {
                 label: input.label().clone(),
                 plane,
                 depth,
+                chain,
             })
             .await?;
         // Raised, never lowered — the same rule the effect layer applies to a
@@ -710,6 +742,153 @@ impl<'a> StepCtx<'a> {
         .await
     }
 
+    /// Call another plane's agent, under this run's chain.
+    ///
+    /// Reached through the plane's own wiring ([`RuntimeBuilder::peers`]),
+    /// never a registry or client the skill carries, which is what makes
+    /// three things hold:
+    ///
+    /// * the peer receives [`acting_as`](Self::acting_as) plus one link
+    ///   naming it — the caller's chain on a served plane — and a run
+    ///   admitted without a chain is refused rather than sent out as nobody;
+    /// * the manifest grant `tool://<peer>/<capability>` admits the call, and
+    ///   its protected fields and ceiling are checked at the sink as for a
+    ///   tool;
+    /// * it is an effect: journaled, policy-gated, counted against the
+    ///   delegation ceiling, metered, read back on replay.
+    ///
+    /// The answer is untrusted, labelled `tool://<peer>/<capability>` so a
+    /// source rule can name this peer.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError`] when no peers are wired, when this run acts under no
+    /// chain, when the peer is unknown or the capability outside its grant,
+    /// when the payload's label is refused at the sink, and whatever the peer
+    /// answers with — classified by [`PeerError::disposition`].
+    ///
+    /// [`RuntimeBuilder::peers`]: crate::runtime::RuntimeBuilder::peers
+    /// [`PeerError::disposition`]: crate::peers::PeerError::disposition
+    pub async fn call_peer(
+        &mut self,
+        peer: &crate::peers::PeerId,
+        capability: &str,
+        payload: &Tainted<Value>,
+    ) -> Result<Tainted<Value>, StepError> {
+        let wiring = self.peers.clone().ok_or_else(|| {
+            StepError::Effect(crate::core::EffectError::Other(
+                "this plane reaches no peers — `RuntimeBuilder::peers(registry, client)` \
+                 is what wires them"
+                    .into(),
+            ))
+        })?;
+        let chain = self.identity.clone().ok_or_else(|| {
+            StepError::Effect(crate::core::EffectError::Other(
+                "a peer call is made on somebody's behalf, and this run acts under no \
+                 chain — admit it with `RunTerms::acting_as`, or build the plane with \
+                 `RuntimeBuilder::acting_as`"
+                    .into(),
+            ))
+        })?;
+        // The grant that governs this call: the governing manifest's own,
+        // read directly — it is the reviewed document, and a plane whose
+        // only tools are agents and peers derives no catalogue to look it up
+        // in. A stated catalogue answers for a skill no manifest governs.
+        #[cfg(feature = "manifest")]
+        let safety = {
+            let id = crate::tools::ToolId::new(peer.to_string(), capability);
+            self.manifest
+                .as_ref()
+                .and_then(|m| m.tool_grant(&id.reference()))
+                .map(crate::tools::ToolSafety::from_grant)
+                .or_else(|| {
+                    self.tools
+                        .as_ref()
+                        .and_then(|(catalog, _)| catalog.safety(&id).cloned())
+                })
+        };
+        let peer = peer.clone();
+        let capability = capability.to_owned();
+        self.sink_with(payload, |value| {
+            let call = crate::peers::PeerCall::prepare(
+                &wiring.registry,
+                Arc::clone(&wiring.client),
+                &chain,
+                peer,
+                capability,
+                value,
+            )
+            .map_err(|e| StepError::Effect(crate::core::EffectError::Rejected(e.to_string())))?;
+            #[cfg(feature = "manifest")]
+            let call = match safety.as_ref() {
+                Some(safety) => call.governed_by(safety),
+                None => call,
+            };
+            Ok::<_, StepError>(call)
+        })
+        .await
+    }
+
+    /// Read a task a peer accepted earlier — the journaled, idempotent poll.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError`] when no peers are wired or the task's peer is unknown,
+    /// and whatever the read answers with.
+    pub async fn peer_task(
+        &mut self,
+        task: crate::peers::PeerTask,
+    ) -> Result<Tainted<crate::peers::PeerTaskSnapshot>, StepError> {
+        let wiring = self.peer_wiring()?;
+        let call =
+            crate::peers::PeerTaskCall::prepare(&wiring.registry, Arc::clone(&wiring.client), task)
+                .map_err(|e| {
+                    StepError::Effect(crate::core::EffectError::Rejected(e.to_string()))
+                })?;
+        self.effect(call).await
+    }
+
+    /// Ask a peer to stop a task it accepted earlier.
+    ///
+    /// Cooperative, and safe to retry: a repeat meets the peer's own
+    /// *not cancelable* refusal rather than a second act.
+    ///
+    /// # Errors
+    ///
+    /// As [`peer_task`](Self::peer_task).
+    pub async fn cancel_peer_task(
+        &mut self,
+        task: crate::peers::PeerTask,
+    ) -> Result<Tainted<crate::peers::PeerTaskSnapshot>, StepError> {
+        let wiring = self.peer_wiring()?;
+        let call = crate::peers::PeerTaskCancel::prepare(
+            &wiring.registry,
+            Arc::clone(&wiring.client),
+            task,
+        )
+        .map_err(|e| StepError::Effect(crate::core::EffectError::Rejected(e.to_string())))?;
+        self.effect(call).await
+    }
+
+    fn peer_wiring(&self) -> Result<Arc<super::executor::PeerWiring>, StepError> {
+        self.peers.clone().ok_or_else(|| {
+            StepError::Effect(crate::core::EffectError::Other(
+                "this plane reaches no peers — `RuntimeBuilder::peers(registry, client)` \
+                 is what wires them"
+                    .into(),
+            ))
+        })
+    }
+
+    /// The registered peer a grant's server component names, if any.
+    #[cfg(feature = "manifest")]
+    pub(crate) fn peer_named(&self, server: &str) -> Option<crate::peers::PeerId> {
+        let id = crate::peers::PeerId::new(server);
+        self.peers
+            .as_ref()
+            .and_then(|wiring| wiring.registry.grant(&id).is_some().then_some(id))
+    }
+
     /// What this run tells a callee about itself, sealed for one call.
     ///
     /// Unsigned when the plane has no workload identity, which is honest: a
@@ -747,6 +926,19 @@ impl<'a> StepCtx<'a> {
     /// Hand the step's history back once it has finished with it.
     pub(crate) fn into_cursor(self) -> StepCursor {
         self.cursor
+    }
+
+    /// The chain this run acts under, if it was admitted with one.
+    ///
+    /// The one to hand a `PeerCall` or anything else that extends a chain
+    /// outward: it is the caller's on a served plane and the plane's for a run
+    /// the embedder started, and on replay it is read back from the journal
+    /// rather than from whatever the plane is configured with now. A skill
+    /// that carries a chain of its own instead is spending one owner's
+    /// authority for every caller.
+    #[must_use]
+    pub fn acting_as(&self) -> Option<&crate::core::Delegation> {
+        self.identity.as_ref()
     }
 
     #[must_use]
@@ -1177,11 +1369,11 @@ impl<'a> StepCtx<'a> {
     /// The nested result is the point of the signature: the inner `Err` is a
     /// re-performance that **failed**, handed back to the ordinary attempt
     /// loop so the same disposition, reconciliation and stop machinery decides
-    /// what it means. An earlier version collapsed it to a step failure here,
-    /// which skipped the classifier — a resumed orphan whose re-performance
-    /// timed out `InDoubt` on a mutating effect read as a plain failure, and
-    /// the failure unwind then compensated completed steps around a call that
-    /// may have landed. The outer `Err` carries only the verdicts this
+    /// what it means. Collapsing it to a step failure here would skip the
+    /// classifier — a resumed orphan whose re-performance timed out `InDoubt`
+    /// on a mutating effect would read as a plain failure, and the failure
+    /// unwind would compensate completed steps around a call that may have
+    /// landed. The outer `Err` carries only the verdicts this
     /// function can reach alone: strict refuses to probe, an operator-recovery
     /// effect stays undecidable, and an inconclusive probe stays undecidable.
     async fn resolve_orphan<E: Effect>(
@@ -1195,11 +1387,9 @@ impl<'a> StepCtx<'a> {
 
         // Strict replay is a pure read, and resolving an orphan is not reading —
         // every branch below either performs an effect or probes a provider, and
-        // both write to the journal being verified.
-        //
-        // An earlier version fell straight through to the `Retry` arm here, so
-        // verifying a crashed run re-performed its interrupted effect for real
-        // and appended to the history it was meant to be checking.
+        // both write to the journal being verified. Falling through to the
+        // `Retry` arm would make verifying a crashed run re-perform its
+        // interrupted effect for real and append to the history under check.
         if self.mode == Mode::Strict {
             return Err(StepError::Undecidable {
                 key,
@@ -1581,6 +1771,21 @@ impl<'a> StepCtx<'a> {
                     }
                     Some(_) => None,
                 }
+            }
+            // A peer call is granted like a tool, under the peer's registry
+            // name: `tool://<peer>/<capability>`. Its ceilings and fields
+            // arrive on the effect from that same grant (`PeerCall::governed_by`),
+            // so presence is the whole question here.
+            "a2a.peer/call" => {
+                let peer = descriptor.args["peer"].as_str().unwrap_or_default();
+                let capability = descriptor.args["capability"].as_str().unwrap_or_default();
+                let reference = crate::tools::ToolId::new(peer, capability).reference();
+                manifest.tool_grant(&reference).is_none().then(|| {
+                    format!(
+                        "manifest '{}' does not grant '{reference}' — a peer the agent's declaration never listed is authority nobody granted",
+                        manifest.metadata.name
+                    )
+                })
             }
             // The grant's ceilings are compared against what the *effect*
             // declares, never against the descriptor: the descriptor is the
@@ -2292,14 +2497,13 @@ impl<'a> StepCtx<'a> {
     ///     .await?;
     /// ```
     ///
-    /// This replaces the two-pass spelling — `ModelCall::new(..,
-    /// prompt.peek().clone())` beside `cx.sink(call, &prompt)` — where the
-    /// same data was written twice and a runtime check caught the versions
-    /// drifting apart. Passing it once removes the drift at the API instead of
-    /// detecting it afterwards; the byte-for-byte binding check still runs
-    /// underneath, because a custom effect could bind something other than
-    /// what its constructor was handed, and that is a driver bug worth a loud
-    /// refusal.
+    /// The two-pass spelling — `ModelCall::new(.., prompt.peek().clone())`
+    /// beside `cx.sink(call, &prompt)` — writes the same data twice and
+    /// leaves a runtime check to catch the versions drifting apart. Passing it
+    /// once removes the drift at the API instead of detecting it afterwards;
+    /// the byte-for-byte binding check still runs underneath, because a custom
+    /// effect could bind something other than what its constructor was
+    /// handed, and that is a driver bug worth a loud refusal.
     ///
     /// Fallible construction composes: the closure may return
     /// `Result<E, impl Into<StepError>>` — see [`BuildsEffect`] — which is
@@ -4854,6 +5058,10 @@ struct Commission {
     plane: std::sync::Weak<super::Runtime>,
     /// How deep the commissioning run already is.
     depth: usize,
+    /// The chain the sub-run is admitted under: this run's, plus one link.
+    /// Not in the descriptor — the parent's `IdentityBound` already records
+    /// it, and the sub-run's records its own.
+    chain: Option<crate::core::Delegation>,
 }
 
 /// What a commission produced, and what it cost.
@@ -4952,19 +5160,37 @@ impl Effect for Commission {
             .upgrade()
             .ok_or_else(|| crate::core::EffectError::Other("the plane is gone".into()))?;
 
+        let mut terms = super::RunTerms::default();
+        if let Some(chain) = self.chain.as_ref() {
+            terms = terms.acting_as(chain.clone());
+        }
         // `Interrupted`, not `Rejected`: this caller cannot know whether the
         // commissioned agent performed effects before it failed, and asserting
         // that nothing was applied would be a claim it has no basis for.
-        let out = plane
-            .run(
+        let out = match plane
+            .run_under(
                 &self.capability,
                 Tainted::with_label(self.input.clone(), self.label.clone()),
+                terms,
             )
             .await
             .map_err(|e| crate::core::EffectError::Interrupted {
                 driver: self.capability.clone(),
                 detail: e.to_string(),
-            })?;
+            })? {
+            super::Admission::Fresh(out) | super::Admission::Replayed(out) => out,
+            // Unkeyed terms always admit fresh; an in-flight answer here
+            // would be the store contradicting itself.
+            super::Admission::InFlight(run) => {
+                return Err(crate::core::EffectError::Interrupted {
+                    driver: self.capability.clone(),
+                    detail: format!(
+                        "commission of '{}' reported run {run} as in flight",
+                        self.capability
+                    ),
+                });
+            }
+        };
 
         let answer = out
             .output

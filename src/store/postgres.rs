@@ -365,12 +365,12 @@ fn be(e: &tokio_postgres::Error) -> StoreError {
 /// acknowledgement — means the commit may be standing, and the caller must not
 /// treat it as taken back.
 ///
-/// One function rather than a closure per call site, because the
-/// classification used to exist only on the atomic path: a plain `append` or
-/// `seal` whose commit acknowledgement was lost read as a retryable backend
-/// error, and the retry double-appended every record that is not effect-keyed
-/// — exactly-once guards only `EffectStarted` rows, so a retried
-/// `StepPlanned` or `RunSealed` lands twice with nothing to refuse it.
+/// One function rather than a closure per call site, because a classification
+/// that lives only on the atomic path lets a plain `append` or `seal` whose
+/// commit acknowledgement was lost read as a retryable backend error — and the
+/// retry double-appends every record that is not effect-keyed: exactly-once
+/// guards only `EffectStarted` rows, so a retried `StepPlanned` or `RunSealed`
+/// lands twice with nothing to refuse it.
 fn commit_refused_or_in_doubt(e: &tokio_postgres::Error) -> StoreError {
     if e.as_db_error().is_some() {
         be(e)
@@ -433,8 +433,8 @@ fn now_secs() -> u64 {
 /// A lease expiry instant from a TTL, refusing what whole seconds cannot hold.
 ///
 /// Lease timing here has whole-second granularity, so a TTL below one second is
-/// **refused rather than clamped**. The clamp this replaces turned "expire
-/// immediately" into "hold for a second" without telling anyone — a contract
+/// **refused rather than clamped**. A clamp would turn "expire immediately"
+/// into "hold for a second" without telling anyone — a contract
 /// the runtime relies on (its epoch arithmetic assumes a TTL means what it
 /// says), enforced only upstream. Nothing legitimate reaches this refusal: the
 /// runtime builder already refuses any TTL below its own two-second minimum at
@@ -918,7 +918,7 @@ impl JournalStore for PostgresStore {
         let sealed = self.append_within(&tx, run, epoch, batch).await?;
         // In-doubt classification, not only on the atomic path: see
         // `commit_refused_or_in_doubt` for the double-append a retried
-        // "failure" here used to produce.
+        // "failure" here would produce.
         tx.commit()
             .await
             .map_err(|e| commit_refused_or_in_doubt(&e))?;
@@ -1349,8 +1349,8 @@ impl JournalStore for PostgresStore {
         // One transaction, fenced, mirroring the embedded store. This backend
         // exists for the topology where two instances race, and a seal is the
         // write that freezes a chain forever — so it must be arbitrated like
-        // every other write. It used to ignore its epoch and read the head on
-        // a separate connection, which let a fenced zombie seal a run its
+        // every other write. A seal that ignored its epoch and read the head
+        // on a separate connection would let a fenced zombie seal a run its
         // replacement was still extending, freezing the Merkle leaf at a head
         // the true history had already moved past.
         let mut client = self.pool.get().await.map_err(|e| pool_err(&e))?;

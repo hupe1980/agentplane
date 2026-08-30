@@ -1192,9 +1192,9 @@ impl EventStore for RedbStore {
             let mut out = Vec::new();
             // Registration order is the index's own order, so this is a bounded
             // walk rather than reading every wait and sorting them — and it is
-            // ranged to this tenant, like every sibling read. The whole-table
-            // walk this replaces leaned on the row lookup below being
-            // tenant-keyed, which held for *leaking* but not for *counting*:
+            // ranged to this tenant, like every sibling read. A whole-table
+            // walk would lean on the row lookup below being tenant-keyed,
+            // which holds for *leaking* but not for *counting*:
             // another tenant registering the same `(run, effect, key)` tuple —
             // all attacker-suppliable strings — made this tenant's row match
             // twice, and one wait listed as two is an operator paging over

@@ -1610,6 +1610,25 @@ so no code path can reach a credential without passing it.
 span attributes and error messages, and a secret with a `Debug` impl ends up in
 all three. The audience stays visible, because that is the part worth debugging.
 
+### The chain a peer receives is the run's
+
+`cx.call_peer` extends the run's chain — `cx.acting_as()`, which on a served
+plane is the *caller's* — by one link naming the peer, and dispatches through
+the plane's own registry and transport (`RuntimeBuilder::peers`). A skill never
+carries a registry or a client of its own: a chain a skill held in its own state
+would be an ambient credential, the same owner on every peer call whoever asked
+for the run. A run admitted without a chain has none to extend and is refused at
+the call.
+
+The peer is a server name in a grant. `tool://reviewer/audit.check` is offered
+to a tool-calling model like any tool and dispatches to the registered peer
+`reviewer`; the grant's protected fields and ceiling govern the hop at the sink,
+its `mutates` can only make the hop more cautious than the registry's wiring,
+and the answer is labelled with the same reference so a source rule can name
+it. Which of the four things a server name can be — a tool transport, typed
+tools, an agent on this plane, a peer — is settled once, at build, and a name
+that could be two of them refuses the build.
+
 ### Obtaining the credential
 
 `PeerCredential` models a token already bound to one audience. Getting one is

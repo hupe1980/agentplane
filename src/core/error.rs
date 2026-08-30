@@ -101,6 +101,16 @@ pub enum RuntimeError {
     #[error("policy denied: {0}")]
     PolicyDenied(#[from] PolicyError),
 
+    /// The delegation chain presented for this run cannot act here, now.
+    ///
+    /// Its own variant rather than a [`PolicyDenied`](Self::PolicyDenied):
+    /// no rule fired, and the two call for different responses — a denial is
+    /// an answer to retry nowhere, an expired chain is an answer to retry with
+    /// a fresh credential. Transparent, so the refusal keeps the chain's own
+    /// words: which link, until when, for which plane.
+    #[error(transparent)]
+    Delegation(#[from] crate::core::DelegationError),
+
     /// The worklist's own protocol refused a claim or a decision.
     ///
     /// Its own variant rather than a [`PolicyDenied`](Self::PolicyDenied),

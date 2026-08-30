@@ -1571,6 +1571,87 @@ both agents need `max_sensitivity_egress: internal` or the room refuses its
 own point. `requires_approval: true` works exactly as on any grant — a person
 sees the capability and the arguments before any specialist runs.
 
+## 🌐 Call another *plane's* agent, from a file or a skill
+
+A peer is a server name a grant can carry. Register it on the plane — where
+it is, what it is granted, which credential reaches it — and a manifest grants
+its capabilities like any tool's:
+
+```yaml
+# desk.yaml — consults a reviewer that runs somewhere else
+spec:
+  topology: { mode: collaborative, role: orchestrator, reason: distinct-authority }
+  security: { max_delegation_depth: 1, max_sensitivity_egress: internal }
+  capabilities: { provides: [desk.answer] }
+  models: { privileged: { provider: openai, model: gpt-4o-mini } }
+  tools:
+    - ref: tool://reviewer/audit.check      # `reviewer` is a registered peer
+      mutates: false
+      max_sensitivity: internal
+      description: Ask the reviewer to check an invoice.
+      arguments:
+        type: object
+        properties: { invoice: { type: string } }
+        required: [invoice]
+  execution: { kind: tool-calling, max_turns: 4 }
+  budgets: {}
+```
+
+```sh
+AGENTPLANE_PEER_TOKEN_REVIEWER=... \
+agentplane run desk.yaml --input '{"invoice": "INV-9"}' \
+  --peer reviewer=https://reviewer.example/a2a
+```
+
+`--peer` wires the A2A client for that name (needs `--features cli,a2a`, or
+the `:full` image); the registry scope is exactly the capabilities the
+manifests grant under `tool://reviewer/…`, and the bearer token comes from
+the environment, never the command line. In Rust the same wiring is one
+builder call, and a coded skill reaches the peer through the plane rather
+than through a client it carries:
+
+```rust
+let registry = PeerRegistry::new().allow(
+    PeerId::new("reviewer"),
+    PeerGrant::new(Scope::of(["audit.*"]))
+        .read_only()
+        .with_credential(&PeerId::new("reviewer"), credential),
+);
+let client = A2aClient::new(Endpoint::new("https://reviewer.example/a2a"))?;
+let rt = Runtime::builder(store)
+    .peers(registry, Arc::new(client))
+    .acting_as(chain)
+    .skill(Desk)
+    .build();
+
+// inside `Desk::invoke`
+let verdict = cx.call_peer(&PeerId::new("reviewer"), "audit.check", &input).await?;
+```
+
+What the hop carries is the point. The peer receives **the run's chain plus
+one link** naming it — the caller's chain on a served plane, `cx.acting_as()`
+— so the reviewer's journal answers *on whose behalf* with the same owner
+the desk's does, and a chain with no room for another hop refuses at the
+desk. The grant governs the hop as it governs a tool: its `protected_fields`
+and `max_sensitivity` are checked at the sink, `mutates: true` puts the
+whole-value taint gate in front of it, `requires_approval` puts a person in
+front of it. The answer comes back untrusted, labelled
+`tool://reviewer/audit.check`, so a source rule downstream can name this
+peer's word and nobody else's. And it is an effect — journaled, metered,
+counted against `max_delegation_depth`, read back on strict replay without
+a request leaving.
+
+Three things are refused at build rather than on every run: a peer name that
+is also a wired tool server (a grant would mean two things), a manifest grant
+naming a capability outside the peer's registry scope, and a peer grant on a
+`specialist` (a hop is delegation). A run admitted under **no** chain has
+nothing to extend and is refused at the call — admit it with
+`RunTerms::acting_as`, or build the plane with `RuntimeBuilder::acting_as`.
+
+The `peer_call` example runs both planes in one process: a served reviewer on
+a loopback port and a desk that consults it, then a strict replay of the desk's
+run that the reviewer never hears about.
+
 ## 🗺️ Plan once, then execute without the model
 
 When the task's shape is known up front and the data the tools return is
@@ -1841,8 +1922,10 @@ Three things bite:
 - **The runtime's gates see no caller roles.** `run:admit` and `effect:perform`
   are asked by the runtime, which has a plan and a delegation chain, not an HTTP
   request. `context.roles` exists on the `api:*` and `a2a:*` actions only; to key
-  the runtime's gates on who asked, give the run a delegation chain, whose
-  context is merged into those requests.
+  the runtime's gates on who asked, give the caller a delegation chain — a
+  `scope` on its token-file entry, or `Caller::acting_as` from your own
+  `Authenticator` — and its `owner`/`subject`/`scope` are merged into those
+  requests for every run that caller starts.
 
 ## 📡 Host an agent as an A2A peer
 
@@ -1874,6 +1957,23 @@ lead without handing displacement to every reviewer.
 promise it can be fetched again, which an in-memory journal breaks at the next
 restart. Needs `--features cli,a2a-server,cedar`, or the `:full` image. The full
 walkthrough is in [getting started](@/docs/getting-started.md).
+
+A token-file entry may carry the caller's own authority:
+
+```yaml
+- token: "a-long-random-string"
+  actor: peer-a
+  roles: [peer]
+  scope: [support.*]                # what runs peer-a may start
+  not_after: 2027-01-01T00:00:00Z   # refused at admission once passed
+```
+
+Every run peer-a starts is then admitted under a chain rooted at `peer-a`,
+bound to this plane's tenant, and the journal's `IdentityBound` names peer-a —
+not the plane. A message naming a skill outside the scope is declined; a
+message after the instant is refused with the expiry named. Leave both out and
+the caller has no chain: its runs act under whatever the plane was built with,
+which for `serve` is none.
 
 ## 📤 Emit an event per run, without an outbox table
 

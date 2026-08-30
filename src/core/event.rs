@@ -150,10 +150,9 @@ pub struct Subscription {
     ///
     /// Delivery journals the `EffectDone` under this position, and replay
     /// verifies effects per step — so a wait recorded against the wrong step is
-    /// a wait the resumed run never finds. An earlier version hardcoded step
-    /// zero here, which worked only because every wait happened to be in a
-    /// single-step plan; a wait in a later step, or in a compensation, suspended
-    /// forever.
+    /// a wait the resumed run never finds. A fixed step here would hold only
+    /// for single-step plans; a wait in a later step, or in a compensation,
+    /// would suspend forever.
     pub step: crate::core::StepId,
     pub phase: crate::core::Phase,
     pub kind: String,

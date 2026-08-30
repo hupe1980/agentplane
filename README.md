@@ -104,6 +104,11 @@ cargo run --example blog_room --features redb,testkit,manifest
 # a public card, authenticated methods, and a message that arrives untrusted.
 cargo run --example a2a_peer --features redb,a2a-server,manifest
 
+# Two planes in one process: a served reviewer and a desk that consults it
+# through `cx.call_peer` — the peer sees the run's chain plus one link, and a
+# strict replay of the desk's run never reaches the reviewer.
+cargo run --example peer_call --features redb,testkit,manifest,a2a,a2a-server
+
 # Live tokens for a human, one journaled completion for the machine — and a
 # replay that performs neither.
 cargo run --example streaming_run --features redb,testkit
@@ -206,7 +211,11 @@ sleeps, waits or loses its instance actually finishes.
 Both `--policy` and `--tokens` are required and have no defaults. That is the
 design rather than an inconvenience: a permissive engine and no engine are the
 same behaviour, and a server that authenticates nobody has no actor to record a
-decision against. Needs `--features cli,a2a-server,cedar`, or the `:full` image.
+decision against. A token may carry its caller's own `scope` and `not_after`;
+every run that caller starts is then admitted under a chain rooted at the
+caller — checked against the plan, refused once expired — and the journal
+names the caller, never the plane, as who the run acted for. Needs
+`--features cli,a2a-server,cedar`, or the `:full` image.
 
 New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/docs/getting-started/)**
 

@@ -460,7 +460,8 @@ Nearly every decision here has the same shape: **make the dangerous thing
 unrepresentable, rather than detectable.**
 
 - A widened delegation is not "validated" — `Delegation::delegate` refuses to
-  construct one, so there is no code path that must remember to check.
+  construct one, in scope, in validity and in audience, so there is no code
+  path that must remember to check.
 - A lost case update is not "warned about" — the write takes a version, so a
   blind overwrite cannot be spelled.
 - A quorum's split panel has no `majority()` accessor, so "pick whichever side

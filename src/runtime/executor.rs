@@ -36,38 +36,88 @@ pub(crate) enum CaseBinding {
     Existing(crate::core::CaseId),
 }
 
-/// What a caller asked admission for, beyond the plan and the input.
+/// What a caller asks admission for, beyond the capability and the input.
 ///
-/// One value rather than more positional arguments: admission threads through
-/// five functions, and most call sites pass nothing here.
+/// The named `run`/`spawn` methods each fix one combination of these; this is
+/// the general form, for a caller that needs a combination they do not name —
+/// above all a chain **per run**. A front door that authenticates many callers
+/// admits each one's run under the chain that caller presented, and there is
+/// no fixed method for "in this case, once, acting as her", nor should there
+/// be: the axes multiply, the methods would not.
+///
+/// ```ignore
+/// let terms = RunTerms::default()
+///     .correlated("order", &keys)
+///     .once(&message.dedup_key())
+///     .acting_as(caller_chain);
+/// let admission = runtime.run_under("order.settle", input, terms).await?;
+/// ```
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Terms {
+pub struct RunTerms {
     /// Which matter this run belongs to, if any.
     case: Option<CaseBinding>,
     /// The admission key to claim. Travels to the `RunAdmitted` record, because
     /// that is where the store claims it — see
     /// [`JournalStore::admitted_as`](crate::journal::JournalStore::admitted_as).
     idempotency_key: Option<String>,
+    /// The chain this run acts under, when it is not the plane's own.
+    ///
+    /// Set per request by a served surface from the authenticated caller. The
+    /// plane's chain ([`RuntimeBuilder::acting_as`]) is what an in-process
+    /// embedder's runs act under; binding it to every *peer's* run as well
+    /// would make it an ambient credential.
+    acting_as: Option<crate::core::Delegation>,
 }
 
-impl Terms {
+impl RunTerms {
     fn bound(case: CaseBinding) -> Self {
         Self {
             case: Some(case),
             idempotency_key: None,
+            acting_as: None,
         }
     }
 
-    fn correlated(kind: &str, keys: &[CorrelationKey]) -> Self {
-        Self::bound(CaseBinding::Correlate {
-            kind: kind.to_owned(),
-            keys: keys.to_vec(),
-        })
+    /// Run inside a case that already exists.
+    #[must_use]
+    pub fn in_case(mut self, case: crate::core::CaseId) -> Self {
+        self.case = Some(CaseBinding::Existing(case));
+        self
     }
 
-    fn keyed(mut self, key: &str) -> Self {
-        self.idempotency_key = Some(key.to_owned());
+    /// Join or open a case by business key before running.
+    #[must_use]
+    pub fn correlated(mut self, kind: &str, keys: &[CorrelationKey]) -> Self {
+        self.case = Some(CaseBinding::Correlate {
+            kind: kind.to_owned(),
+            keys: keys.to_vec(),
+        });
         self
+    }
+
+    /// Admit at most once under this key — see [`Runtime::run_once`].
+    #[must_use]
+    pub fn once(mut self, idempotency_key: &str) -> Self {
+        self.idempotency_key = Some(idempotency_key.to_owned());
+        self
+    }
+
+    /// Act under this chain rather than the plane's own.
+    ///
+    /// Checked at admission exactly as the plane's chain is: the plan must be
+    /// inside its scope, and [`Delegation::admissible`] must accept this
+    /// plane at this instant. Journaled as the run's `IdentityBound`, so
+    /// "on whose behalf" names the caller and not the plane.
+    ///
+    /// [`Delegation::admissible`]: crate::core::Delegation::admissible
+    #[must_use]
+    pub fn acting_as(mut self, chain: crate::core::Delegation) -> Self {
+        self.acting_as = Some(chain);
+        self
+    }
+
+    fn keyed(self, key: &str) -> Self {
+        self.once(key)
     }
 }
 
@@ -427,6 +477,22 @@ struct Admitted {
     plan: PlanIR,
     input: Tainted<Value>,
     case: Option<CaseContext>,
+    /// The chain admission bound — the caller's where one was presented,
+    /// the plane's otherwise — and what every step of this run acts under.
+    identity: Option<crate::core::Delegation>,
+}
+
+/// The peers a plane may call, and how it reaches them.
+///
+/// One value because the two are one decision: a registry says what each
+/// peer is granted and which credential reaches it, and the client is the
+/// transport those grants are spent over. Held by the plane and handed to
+/// every step, so a skill calling a peer reaches it through the same checked
+/// registry a declarative agent does — never one it carries itself.
+#[derive(Debug)]
+pub(crate) struct PeerWiring {
+    pub(crate) registry: crate::peers::PeerRegistry,
+    pub(crate) client: Arc<dyn crate::peers::PeerClient>,
 }
 
 /// Keeps a run's lease alive for as long as it is executing.
@@ -504,6 +570,8 @@ pub struct Runtime {
     memories: Option<Arc<dyn crate::memory::MemoryStore>>,
     semantic: Option<Arc<super::SemanticMemory>>,
     authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
+    /// The peers this plane may call, and the transport that reaches them.
+    peers: Option<Arc<PeerWiring>>,
     /// The catalogue and transport a **skill** reaches tools through.
     ///
     /// Held by the plane rather than handed to each skill, and that is the
@@ -601,6 +669,7 @@ impl Runtime {
             memories: None,
             semantic: None,
             authorities: None,
+            peers: None,
             metric_tenant: super::metrics::TenantLabel::default(),
             quotas: None,
             quota: crate::quota::TenantQuota::default(),
@@ -1274,7 +1343,7 @@ impl Runtime {
         target: &str,
         input: Tainted<Value>,
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit(target, input, Terms::default()).await
+        self.admit(target, input, RunTerms::default()).await
     }
 
     /// Admit a run and let it proceed in the background, returning its id.
@@ -1304,14 +1373,14 @@ impl Runtime {
         target: &str,
         input: Tainted<Value>,
     ) -> Result<RunId, RuntimeError> {
-        self.spawn_bound(target, input, Terms::default()).await
+        self.spawn_bound(target, input, RunTerms::default()).await
     }
 
     async fn spawn_bound(
         self: &Arc<Self>,
         target: &str,
         input: Tainted<Value>,
-        terms: Terms,
+        terms: RunTerms,
     ) -> Result<RunId, RuntimeError> {
         // Resolved before the id is minted: an unknown capability is the
         // caller's mistake and must be an error, not a run that exists and
@@ -1335,7 +1404,7 @@ impl Runtime {
         input: Tainted<Value>,
         case: crate::core::CaseId,
     ) -> Result<RunId, RuntimeError> {
-        self.spawn_bound(target, input, Terms::bound(CaseBinding::Existing(case)))
+        self.spawn_bound(target, input, RunTerms::bound(CaseBinding::Existing(case)))
             .await
     }
 
@@ -1358,7 +1427,7 @@ impl Runtime {
         self.spawn_bound_once(
             target,
             input,
-            Terms::bound(CaseBinding::Existing(case)).keyed(idempotency_key),
+            RunTerms::bound(CaseBinding::Existing(case)).keyed(idempotency_key),
         )
         .await
     }
@@ -1370,8 +1439,12 @@ impl Runtime {
         case_kind: &str,
         keys: &[CorrelationKey],
     ) -> Result<RunId, RuntimeError> {
-        self.spawn_bound(target, input, Terms::correlated(case_kind, keys))
-            .await
+        self.spawn_bound(
+            target,
+            input,
+            RunTerms::default().correlated(case_kind, keys),
+        )
+        .await
     }
 
     /// Start a new immutable run inside a case that already exists.
@@ -1381,7 +1454,7 @@ impl Runtime {
         input: Tainted<Value>,
         case: crate::core::CaseId,
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit(target, input, Terms::bound(CaseBinding::Existing(case)))
+        self.admit(target, input, RunTerms::bound(CaseBinding::Existing(case)))
             .await
     }
 
@@ -1400,7 +1473,7 @@ impl Runtime {
         self.admit_once(
             target,
             input,
-            Terms::bound(CaseBinding::Existing(case)).keyed(idempotency_key),
+            RunTerms::bound(CaseBinding::Existing(case)).keyed(idempotency_key),
         )
         .await
     }
@@ -1418,8 +1491,12 @@ impl Runtime {
         case_kind: &str,
         keys: &[CorrelationKey],
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit(target, input, Terms::correlated(case_kind, keys))
-            .await
+        self.admit(
+            target,
+            input,
+            RunTerms::default().correlated(case_kind, keys),
+        )
+        .await
     }
 
     /// Run under an admission key, at most once per tenant.
@@ -1458,7 +1535,7 @@ impl Runtime {
         input: Tainted<Value>,
         idempotency_key: &str,
     ) -> Result<Admission, RuntimeError> {
-        self.admit_once(target, input, Terms::default().keyed(idempotency_key))
+        self.admit_once(target, input, RunTerms::default().keyed(idempotency_key))
             .await
     }
 
@@ -1484,7 +1561,9 @@ impl Runtime {
         self.admit_once(
             target,
             input,
-            Terms::correlated(case_kind, keys).keyed(idempotency_key),
+            RunTerms::default()
+                .correlated(case_kind, keys)
+                .keyed(idempotency_key),
         )
         .await
     }
@@ -1508,7 +1587,7 @@ impl Runtime {
         input: Tainted<Value>,
         idempotency_key: &str,
     ) -> Result<Spawned, RuntimeError> {
-        self.spawn_bound_once(target, input, Terms::default().keyed(idempotency_key))
+        self.spawn_bound_once(target, input, RunTerms::default().keyed(idempotency_key))
             .await
     }
 
@@ -1532,7 +1611,9 @@ impl Runtime {
         self.spawn_bound_once(
             target,
             input,
-            Terms::correlated(case_kind, keys).keyed(idempotency_key),
+            RunTerms::default()
+                .correlated(case_kind, keys)
+                .keyed(idempotency_key),
         )
         .await
     }
@@ -1546,7 +1627,7 @@ impl Runtime {
         plan: PlanIR,
         input: Tainted<Value>,
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit_plan(plan, input, Terms::default()).await
+        self.admit_plan(plan, input, RunTerms::default()).await
     }
 
     /// Execute an explicit plan inside a long-lived case.
@@ -1557,8 +1638,68 @@ impl Runtime {
         case_kind: &str,
         keys: &[CorrelationKey],
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit_plan(plan, input, Terms::correlated(case_kind, keys))
+        self.admit_plan(plan, input, RunTerms::default().correlated(case_kind, keys))
             .await
+    }
+
+    /// Run under explicit [`RunTerms`] — the general form of every `run_*`.
+    ///
+    /// Keyed terms behave as [`run_once`](Self::run_once): a duplicate comes
+    /// back as [`Admission::Replayed`] or [`Admission::InFlight`]. Unkeyed
+    /// terms always admit, and the answer is [`Admission::Fresh`].
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run), plus [`RuntimeError::Delegation`] when the terms
+    /// carry a chain this plane may not act under now.
+    pub async fn run_under(
+        &self,
+        target: &str,
+        input: Tainted<Value>,
+        terms: RunTerms,
+    ) -> Result<Admission, RuntimeError> {
+        if terms.idempotency_key.is_some() {
+            self.admit_once(target, input, terms).await
+        } else {
+            self.admit(target, input, terms).await.map(Admission::Fresh)
+        }
+    }
+
+    /// Spawn under explicit [`RunTerms`] — the general form of every `spawn_*`.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, as [`spawn`](Self::spawn) does.
+    ///
+    /// # Errors
+    ///
+    /// As [`run_under`](Self::run_under).
+    pub async fn spawn_under(
+        self: &Arc<Self>,
+        target: &str,
+        input: Tainted<Value>,
+        terms: RunTerms,
+    ) -> Result<Spawned, RuntimeError> {
+        if terms.idempotency_key.is_some() {
+            self.spawn_bound_once(target, input, terms).await
+        } else {
+            let run = self.spawn_bound(target, input, terms).await?;
+            Ok(Spawned { run, fresh: true })
+        }
+    }
+
+    /// Execute an explicit plan under [`RunTerms`].
+    ///
+    /// # Errors
+    ///
+    /// As [`run_plan`](Self::run_plan) and [`run_under`](Self::run_under).
+    pub async fn run_plan_under(
+        &self,
+        plan: PlanIR,
+        input: Tainted<Value>,
+        terms: RunTerms,
+    ) -> Result<RunOutcome, RuntimeError> {
+        self.admit_plan(plan, input, terms).await
     }
 
     /// Admission under a key, for the blocking `_once` entry points.
@@ -1573,7 +1714,7 @@ impl Runtime {
         &self,
         target: &str,
         input: Tainted<Value>,
-        terms: Terms,
+        terms: RunTerms,
     ) -> Result<Admission, RuntimeError> {
         let key = terms
             .idempotency_key
@@ -1597,7 +1738,7 @@ impl Runtime {
         self: &Arc<Self>,
         target: &str,
         input: Tainted<Value>,
-        terms: Terms,
+        terms: RunTerms,
     ) -> Result<Spawned, RuntimeError> {
         let key = terms
             .idempotency_key
@@ -1722,7 +1863,7 @@ impl Runtime {
         &self,
         target: &str,
         input: Tainted<Value>,
-        terms: Terms,
+        terms: RunTerms,
     ) -> Result<RunOutcome, RuntimeError> {
         // A bare target is the degenerate plan: one node, terminal.
         let skill = self.resolve(target)?;
@@ -1735,7 +1876,7 @@ impl Runtime {
         &self,
         plan: PlanIR,
         input: Tainted<Value>,
-        terms: Terms,
+        terms: RunTerms,
     ) -> Result<RunOutcome, RuntimeError> {
         self.admit_plan_as(RunId::generate(), plan, input, terms)
             .await
@@ -1746,8 +1887,12 @@ impl Runtime {
     /// The two are read back together: a chain without its plan says nothing
     /// about what it was allowed to do, and a plan without its chain says
     /// nothing about who was allowed to run it.
-    fn bind_identity(&self, run: RunId, records: &mut Vec<Append>) {
-        if let Some(chain) = self.identity.as_ref() {
+    fn bind_identity(
+        run: RunId,
+        chain: Option<&crate::core::Delegation>,
+        records: &mut Vec<Append>,
+    ) {
+        if let Some(chain) = chain {
             records.push(Append::new(
                 run,
                 RecordKind::IdentityBound {
@@ -1764,10 +1909,20 @@ impl Runtime {
     /// start, rather than failing at whichever step happens to reach it first.
     /// Checking here also makes the refusal deterministic — it depends only on
     /// the frozen plan and the chain, both of which are recorded.
-    fn authorize_scope(&self, plan: &PlanIR) -> Result<(), RuntimeError> {
-        let Some(chain) = self.identity.as_ref() else {
+    ///
+    /// The chain's other two bounds are checked beside it, and only here: a
+    /// chain issued for another plane or past its validity is refused before
+    /// the run exists, and a run admitted under a live chain is never re-judged
+    /// — replay reads the recorded chain back.
+    fn authorize_scope(
+        &self,
+        plan: &PlanIR,
+        chain: Option<&crate::core::Delegation>,
+    ) -> Result<(), RuntimeError> {
+        let Some(chain) = chain else {
             return Ok(());
         };
+        chain.admissible(self.tenant.as_str(), now_for_admission())?;
         let scope = chain.effective_scope();
         for node in &plan.nodes {
             if !scope.permits(&node.capability) {
@@ -1792,6 +1947,7 @@ impl Runtime {
         &self,
         capability: &str,
         governed_by: Option<&crate::journal::AgentIdentity>,
+        chain: Option<&crate::core::Delegation>,
         input: &Value,
     ) -> Result<(), RuntimeError> {
         let Some(engine) = self.policy.as_ref() else {
@@ -1831,7 +1987,7 @@ impl Runtime {
             }
             context["agent"] = agent;
         }
-        super::ctx::merge_identity(&mut context, self.identity.as_ref());
+        super::ctx::merge_identity(&mut context, chain);
         // Who is acting, and what is being asked for. Passing one string as both
         // made every admission rule a tautology — `principal == resource` cannot
         // express "this agent may not run that capability", which is the whole
@@ -1932,7 +2088,7 @@ impl Runtime {
         run: RunId,
         plan: PlanIR,
         input: Tainted<Value>,
-        terms: Terms,
+        terms: RunTerms,
     ) -> Result<Admitted, RuntimeError> {
         crate::plan::validate(&plan, &self.contract())
             .map_err(|e| RuntimeError::PlanContract(e.to_string()))?;
@@ -1950,8 +2106,12 @@ impl Runtime {
         #[cfg(not(feature = "manifest"))]
         let governed_by: Option<crate::journal::AgentIdentity> = None;
 
-        self.authorize_scope(&plan)?;
-        self.authorize_admission(&agent, governed_by.as_ref(), input.peek())?;
+        // The caller's chain where one was presented, the plane's otherwise —
+        // one choice, made once, so the gate, the policy context and the
+        // record cannot disagree about whom this run acts for.
+        let chain = terms.acting_as.as_ref().or(self.identity.as_ref());
+        self.authorize_scope(&plan, chain)?;
+        self.authorize_admission(&agent, governed_by.as_ref(), chain, input.peek())?;
 
         // Before the lease and before any record: a run refused on quota must
         // leave nothing behind, or a throttled tenant accumulates half-open runs
@@ -1996,7 +2156,7 @@ impl Runtime {
         run: RunId,
         plan: PlanIR,
         input: Tainted<Value>,
-        terms: Terms,
+        terms: RunTerms,
         agent: String,
         governed_by: Option<crate::journal::AgentIdentity>,
     ) -> Result<Admitted, RuntimeError> {
@@ -2030,14 +2190,16 @@ impl Runtime {
         lease: &crate::journal::Lease,
         plan: PlanIR,
         input: Tainted<Value>,
-        terms: Terms,
+        terms: RunTerms,
         agent: &str,
         governed_by: Option<crate::journal::AgentIdentity>,
     ) -> Result<Admitted, RuntimeError> {
-        let Terms {
+        let RunTerms {
             case,
             idempotency_key,
+            acting_as,
         } = terms;
+        let chain = acting_as.as_ref().or(self.identity.as_ref());
         let mut records = vec![
             Append::new(
                 run,
@@ -2059,7 +2221,7 @@ impl Runtime {
             ),
         ];
 
-        self.bind_identity(run, &mut records);
+        Self::bind_identity(run, chain, &mut records);
 
         // Correlation is deterministic and runs before planning: which case a
         // message belongs to is a matter of fact, settled by a lookup.
@@ -2243,6 +2405,7 @@ impl Runtime {
             plan,
             input,
             case: case_ctx,
+            identity: chain.cloned(),
         })
     }
 
@@ -2262,6 +2425,7 @@ impl Runtime {
                 case: a.case,
                 budget: a.budget,
                 agent: a.agent,
+                identity: a.identity,
                 refusal: None,
                 successors: Vec::new(),
                 started: BTreeSet::new(),
@@ -2284,7 +2448,7 @@ impl Runtime {
         run: RunId,
         plan: PlanIR,
         input: Tainted<Value>,
-        terms: Terms,
+        terms: RunTerms,
     ) -> Result<RunOutcome, RuntimeError> {
         let admitted = self.admit_only(run, plan, input, terms).await?;
         self.execute_admitted(admitted).await
@@ -2521,6 +2685,7 @@ impl Runtime {
                     self.budget_for(&recorded)
                 },
                 agent: recorded_agent(&records),
+                identity: recorded_chain(&records)?,
                 // A step-level refusal has no effect key, so it cannot ride the
                 // replay cursor like an effect's does. It is lifted here from
                 // the records `replay` has already read.
@@ -2595,6 +2760,7 @@ impl Runtime {
             case,
             budget,
             agent,
+            identity,
             refusal: recorded_refusal,
             successors,
             started,
@@ -2683,6 +2849,7 @@ impl Runtime {
                     .stop(
                         Unwind {
                             agent: &agent,
+                            identity: identity.as_ref(),
                             run,
                             epoch,
                             ir: &current,
@@ -2731,6 +2898,7 @@ impl Runtime {
                     cursor,
                     Batch {
                         agent: &agent,
+                        identity: identity.as_ref(),
                         run,
                         epoch,
                         ir: &current,
@@ -2835,6 +3003,7 @@ impl Runtime {
                     .stop(
                         Unwind {
                             agent: &agent,
+                            identity: identity.as_ref(),
                             run,
                             epoch,
                             ir: &current,
@@ -2941,6 +3110,7 @@ impl Runtime {
                 .run_step(
                     StepRun {
                         agent: batch.agent,
+                        identity: batch.identity,
                         run: batch.run,
                         epoch: batch.epoch,
                         node,
@@ -3617,6 +3787,7 @@ impl Runtime {
                 memories: self.memories.clone(),
                 semantic: self.semantic.clone(),
                 authorities: self.authorities.clone(),
+                peers: self.peers.clone(),
                 #[cfg(feature = "manifest")]
                 tools: self.tools.clone(),
                 meter: self.meter.clone(),
@@ -3625,7 +3796,7 @@ impl Runtime {
                 tenant: self.tenant.clone(),
                 ledger: Arc::clone(cx.ledger),
                 policy: self.policy.clone(),
-                identity: self.identity.clone(),
+                identity: cx.identity.cloned(),
                 agent: cx.agent.to_owned(),
                 plane: self.self_ref.clone(),
                 #[cfg(feature = "manifest")]
@@ -3768,7 +3939,7 @@ impl Runtime {
     /// the same way. Otherwise an operator's stop compensates every step
     /// *around* the one nobody can account for — which is precisely the refund
     /// for money nobody took that `NoUnwindUnderDoubt` exists to forbid, arriving
-    /// through a control that was added to make things safer.
+    /// through a control meant to make things safer.
     async fn undecided_effect(&self, run: RunId) -> Result<Option<StepId>, RuntimeError> {
         let records = self
             .store
@@ -3899,6 +4070,7 @@ impl Runtime {
         RuntimeError,
     > {
         let StepRun {
+            identity,
             run,
             epoch,
             node,
@@ -3960,6 +4132,7 @@ impl Runtime {
                 memories: self.memories.clone(),
                 semantic: self.semantic.clone(),
                 authorities: self.authorities.clone(),
+                peers: self.peers.clone(),
                 #[cfg(feature = "manifest")]
                 tools: self.tools.clone(),
                 meter: self.meter.clone(),
@@ -3968,7 +4141,7 @@ impl Runtime {
                 tenant: self.tenant.clone(),
                 ledger: Arc::clone(ledger),
                 policy: self.policy.clone(),
-                identity: self.identity.clone(),
+                identity: identity.cloned(),
                 agent: agent.to_owned(),
                 plane: self.self_ref.clone(),
                 #[cfg(feature = "manifest")]
@@ -4344,6 +4517,7 @@ fn collect(
 /// What one ready set's dispatch needs.
 struct Batch<'a> {
     agent: &'a str,
+    identity: Option<&'a crate::core::Delegation>,
     run: RunId,
     epoch: u64,
     ir: &'a PlanIR,
@@ -4411,6 +4585,7 @@ struct Journalling<'a> {
 
 /// What unwinding a run needs.
 struct Unwind<'a> {
+    identity: Option<&'a crate::core::Delegation>,
     run: RunId,
     epoch: u64,
     ir: &'a PlanIR,
@@ -4424,6 +4599,7 @@ struct Unwind<'a> {
 
 /// What one step's execution needs.
 struct StepRun<'a> {
+    identity: Option<&'a crate::core::Delegation>,
     run: RunId,
     epoch: u64,
     node: &'a PlanNode,
@@ -4822,6 +4998,21 @@ fn recorded_canon(r: &Record) -> Option<u16> {
 /// principal a run was authorized as is a fact *about that run*, and deriving it
 /// again from a plan that may since have been edited would silently re-attribute
 /// history.
+/// The chain a recorded run acted under, re-checked structurally on the way
+/// back — never re-verified as a credential, for the reason `core::identity`
+/// gives. `None` for a run admitted without one.
+fn recorded_chain(records: &[Record]) -> Result<Option<crate::core::Delegation>, RuntimeError> {
+    records
+        .iter()
+        .find_map(|r| match r.kind() {
+            RecordKind::IdentityBound { chain } => Some(chain.clone()),
+            _ => None,
+        })
+        .map(crate::core::Delegation::rehydrate)
+        .transpose()
+        .map_err(RuntimeError::Delegation)
+}
+
 fn recorded_agent(records: &[Record]) -> String {
     records
         .iter()
@@ -5012,10 +5203,10 @@ fn classify(
         }
         Err(e) => {
             let msg = e.to_string();
-            // Matched structurally. An earlier version tested the *message* for
-            // the word "quarantined", which meant rewording an error silently
-            // downgraded a run to `Failed` — the run kept its history and lost
-            // the flag that said not to trust it.
+            // Matched structurally, never on the message: a match on the word
+            // "quarantined" would let a reworded error silently downgrade a run
+            // to `Failed` — history kept, the flag that said not to trust it
+            // lost.
             // Each of these is a failure P7 exists to make loud, and each gets
             // its own event so "did this happen" is a query rather than a grep.
             match &e {
@@ -5100,6 +5291,11 @@ struct Execution<'a> {
     /// a replay rather than recomputed, for the same reason the plan is: the
     /// principal a run was authorized as is a fact about that run.
     agent: String,
+    /// On whose behalf, for the policy context and for what this run
+    /// commissions. Read back from `IdentityBound` on a replay for the same
+    /// reason: a resumed run acting under the plane's chain instead of the one
+    /// recorded for it would reach different verdicts than the live run did.
+    identity: Option<crate::core::Delegation>,
 }
 
 /// The recorded status of a run that must not be resumed.
@@ -5385,6 +5581,7 @@ pub struct RuntimeBuilder {
     memories: Option<Arc<dyn crate::memory::MemoryStore>>,
     semantic: Option<Arc<super::SemanticMemory>>,
     authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
+    peers: Option<Arc<PeerWiring>>,
     metric_tenant: super::metrics::TenantLabel,
     quotas: Option<Arc<dyn crate::quota::QuotaStore>>,
     quota: crate::quota::TenantQuota,
@@ -5987,20 +6184,44 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Act under a verified delegation chain.
+    /// The chain this plane's own runs act under.
     ///
-    /// The chain is checked against the plan at admission — the plan is the
-    /// authorization graph, so a plan that exceeds the chain's authority never
-    /// starts — and journaled, so "on whose behalf" is answerable from history
-    /// rather than reconstructed from timestamps.
+    /// The identity of a run the embedder starts in-process — checked against
+    /// the plan at admission (the plan is the authorization graph, so one that
+    /// exceeds the chain's authority never starts), held to the chain's
+    /// audience and validity, and journaled, so "on whose behalf" is
+    /// answerable from history rather than reconstructed from timestamps.
     ///
-    /// Verification of the *credential* belongs to a
-    /// [`DelegationScheme`](crate::core::DelegationScheme); what arrives here is
-    /// already a chain, and its attenuation is guaranteed by its own
-    /// constructors however it was obtained.
+    /// It is **not** the identity of a run a served surface admits for a
+    /// caller: those act under the chain the caller presented
+    /// ([`RunTerms::acting_as`]), which takes precedence over this one. A plane
+    /// that bound its own chain to every peer's run would be an ambient
+    /// credential.
+    ///
+    /// Verification of the *credential* belongs to whatever authenticates the
+    /// caller; what arrives here is already a chain, and its attenuation is
+    /// guaranteed by its own constructors however it was obtained.
     #[must_use]
     pub fn acting_as(mut self, chain: crate::core::Delegation) -> Self {
         self.identity = Some(chain);
+        self
+    }
+
+    /// The peers this plane may call, and the transport that reaches them.
+    ///
+    /// The registry is wiring — what each peer is granted, which credential
+    /// reaches it, how a failed call recovers. What a run may *ask* a peer
+    /// for is a manifest grant, `tool://<peer>/<capability>`, dispatched
+    /// through [`StepCtx::call_peer`](crate::runtime::StepCtx::call_peer).
+    /// Refused at build: a peer named `agent` or like a wired tool server,
+    /// and a grant naming a capability outside the peer's registry scope.
+    #[must_use]
+    pub fn peers(
+        mut self,
+        registry: crate::peers::PeerRegistry,
+        client: Arc<dyn crate::peers::PeerClient>,
+    ) -> Self {
+        self.peers = Some(Arc::new(PeerWiring { registry, client }));
         self
     }
 
@@ -6029,12 +6250,38 @@ impl RuntimeBuilder {
     fn settle_toolbox(&mut self) -> Result<(), BuildError> {
         let servers = std::mem::take(&mut self.tool_servers);
         let tools = self.toolbox.take();
+        // A peer's name is a server name a grant can carry, so it must mean
+        // exactly one thing on this plane: not `agent`, and not a name some
+        // tool transport also answers for.
+        let peer_names: std::collections::BTreeSet<String> = self
+            .peers
+            .as_ref()
+            .map(|wiring| wiring.registry.peers().map(ToString::to_string).collect())
+            .unwrap_or_default();
+        if peer_names.contains(crate::tools::AGENT_SERVER) {
+            return Err(BuildError::ReservedToolServer);
+        }
+        for name in &peer_names {
+            if servers.iter().any(|(server, _)| server == name)
+                || tools
+                    .as_ref()
+                    .is_some_and(|t| t.servers().any(|s| s == name))
+            {
+                return Err(BuildError::PeerIsAlsoAToolServer {
+                    server: name.clone(),
+                });
+            }
+        }
         if tools.is_none() && servers.is_empty() {
             return Ok(());
         }
         let tools = tools.unwrap_or_default();
         let remote_servers: std::collections::BTreeSet<String> =
             servers.iter().map(|(name, _)| name.clone()).collect();
+        // What a grant may name without this box implementing it: a wired
+        // transport, or a registered peer.
+        let reachable_elsewhere: std::collections::BTreeSet<String> =
+            remote_servers.union(&peer_names).cloned().collect();
         // `agent` names agents on this plane, and only them. A transport or a
         // typed tool under that name would let a deployment decide whether a
         // reviewed grant means "an agent here" or "somebody's server".
@@ -6087,7 +6334,7 @@ impl RuntimeBuilder {
             };
             declared += 1;
             tools
-                .check_against(manifest, &remote_servers)
+                .check_against(manifest, &reachable_elsewhere)
                 .map_err(|problems| BuildError::ToolDrift {
                     agent: manifest.metadata.name.clone(),
                     problems,
@@ -6412,10 +6659,21 @@ impl RuntimeBuilder {
                 // arriving there is refused as unreachable rather than
                 // silently absorbed.
                 let tools = self.tools.clone().or_else(|| {
+                    // Agents on this plane and registered peers: both
+                    // dispatch through the runtime's own effects rather than
+                    // a tool transport, so a declaration made only of them
+                    // needs no box and no router.
                     let all_agent = !m.spec.tools.is_empty()
                         && m.spec.tools.iter().all(|g| {
-                            crate::tools::ToolId::parse(&g.reference)
-                                .is_some_and(|id| id.server == crate::tools::AGENT_SERVER)
+                            crate::tools::ToolId::parse(&g.reference).is_some_and(|id| {
+                                id.server == crate::tools::AGENT_SERVER
+                                    || self.peers.as_ref().is_some_and(|wiring| {
+                                        wiring
+                                            .registry
+                                            .grant(&crate::peers::PeerId::new(&id.server))
+                                            .is_some()
+                                    })
+                            })
                         });
                     all_agent.then(|| {
                         (
@@ -6558,6 +6816,36 @@ impl RuntimeBuilder {
                     let Some(id) = crate::tools::ToolId::parse(&grant.reference) else {
                         continue;
                     };
+                    // A grant naming a registered peer is a delegating hop,
+                    // and both things that would refuse it on every run are
+                    // knowable here: a capability the registry never gave the
+                    // peer, and a granting agent whose own ceiling is zero.
+                    if let Some(wiring) = self.peers.as_ref()
+                        && let Some(peer_grant) = wiring
+                            .registry
+                            .grant(&crate::peers::PeerId::new(&id.server))
+                    {
+                        if !peer_grant.scope.permits(&Capability::new(id.tool.as_str())) {
+                            return Err(BuildError::PeerGrantOutsideScope {
+                                agent: m.metadata.name.clone(),
+                                peer: id.server,
+                                capability: id.tool,
+                            });
+                        }
+                        let cannot_delegate = m
+                            .spec
+                            .topology
+                            .as_ref()
+                            .is_some_and(|t| t.role == crate::manifest::Role::Specialist)
+                            || m.spec.security.max_delegation_depth == Some(0);
+                        if cannot_delegate {
+                            return Err(BuildError::PeerGrantOnASpecialist {
+                                agent: m.metadata.name.clone(),
+                                peer: id.server,
+                            });
+                        }
+                        continue;
+                    }
                     if id.server != crate::tools::AGENT_SERVER {
                         continue;
                     }
@@ -6594,6 +6882,7 @@ impl RuntimeBuilder {
             memories: self.memories,
             semantic: self.semantic,
             authorities: self.authorities,
+            peers: self.peers,
             #[cfg(feature = "manifest")]
             tools: self.tools,
             quotas: self.quotas,

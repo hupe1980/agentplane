@@ -99,7 +99,7 @@ impl AuthorityStore for PostgresStore {
         // One transaction, not three autocommit statements. The terms row and
         // the balance row exist as a pair — `draw` reads them with a `JOIN`-
         // shaped pair of queries and treats a missing balance as the store
-        // being unavailable — so a crash between the two inserts used to leave
+        // being unavailable — so a crash between the two inserts would leave
         // an authority that could never be drawn on *and* never re-issued: the
         // terms row made every retry of `issue` read as an identical re-issue
         // that then skipped the balance insert it still needed. Under a

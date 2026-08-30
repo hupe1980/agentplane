@@ -84,7 +84,7 @@ jobs:
           - variant: slim
             features: cli
           - variant: full
-            features: cli,mcp,mcp-stdio,a2a-server,http,cedar,keyring,media,opendal,signing,witness-http,postgres,push
+            features: cli,mcp,mcp-stdio,a2a,a2a-server,http,cedar,keyring,media,opendal,signing,witness-http,postgres,push
           - platform: linux/amd64
             runner: ubuntu-latest
           - platform: linux/arm64

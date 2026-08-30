@@ -333,6 +333,15 @@ struct RunArgs {
     /// Needs the `mcp-stdio` feature.
     #[arg(long, value_name = "NAME=COMMAND")]
     mcp: Vec<String>,
+
+    /// Reach an A2A peer at URL as `tool://NAME/...`.
+    ///
+    /// Repeatable, one per peer. The manifest grants the capabilities; this
+    /// says where the peer is. Its bearer token, when it needs one, comes from
+    /// the environment as `AGENTPLANE_PEER_TOKEN_<NAME>` (upper-cased, `.`
+    /// and `-` as `_`), never from the command line. Needs the `a2a` feature.
+    #[arg(long, value_name = "NAME=URL")]
+    peer: Vec<String>,
 }
 
 /// Re-execute a recorded run.
@@ -371,6 +380,10 @@ struct ReplayArgs {
     /// continues past its recorded history dispatches live and may need one.
     #[arg(long, value_name = "NAME=COMMAND")]
     mcp: Vec<String>,
+
+    /// Reach an A2A peer, as `run` takes it.
+    #[arg(long, value_name = "NAME=URL")]
+    peer: Vec<String>,
 }
 
 /// Print the Agent Card a served manifest would advertise.
@@ -433,6 +446,10 @@ struct ServeArgs {
     /// Run an MCP server as a child process and reach it as `tool://NAME/...`.
     #[arg(long, value_name = "NAME=COMMAND")]
     mcp: Vec<String>,
+
+    /// Reach an A2A peer at URL as `tool://NAME/...`, as `run` takes it.
+    #[arg(long, value_name = "NAME=URL")]
+    peer: Vec<String>,
 }
 
 /// The two verbs that read a journal instead of a manifest.
@@ -991,6 +1008,10 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
         {
             builder = builder.tool_server(name, client);
         }
+        if let Some((registry, client)) = connect_peers(&opts.peer, std::slice::from_ref(manifest))?
+        {
+            builder = builder.peers(registry, client);
+        }
         builder = builder
             .policy(Arc::new(policy) as Arc<dyn agentplane::core::PolicyEngine>)
             .agent(agentplane::runtime::Agent::new(manifest));
@@ -1113,6 +1134,97 @@ async fn spawn_operator_surface(
         }
     });
     Ok(())
+}
+
+/// A peer registry and the transport that reaches every peer in it.
+type WiredPeers = (
+    agentplane::peers::PeerRegistry,
+    Arc<dyn agentplane::peers::PeerClient>,
+);
+
+/// Wire the A2A peers `--peer` names, granted what the manifests grant them.
+///
+/// The registry scope for a peer is exactly the set of capabilities some
+/// manifest grants under `tool://<name>/…`: the reviewed documents are what
+/// say what this plane may ask a peer for, and a peer nothing grants is a
+/// flag naming nobody. The token rides in the environment, because a command
+/// line is visible to every process on the host.
+#[cfg(feature = "a2a")]
+fn connect_peers(specs: &[String], manifests: &[Manifest]) -> Result<Option<WiredPeers>, String> {
+    use agentplane::core::Scope;
+    use agentplane::peers::a2a::{A2aClient, Endpoint};
+    use agentplane::peers::{PeerCredential, PeerGrant, PeerId, PeerRegistry, PeerRouter};
+
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let mut registry = PeerRegistry::new();
+    let mut router = PeerRouter::new();
+    for spec in specs {
+        let (name, url) = spec.split_once('=').ok_or_else(|| {
+            format!(
+                "--peer wants `<name>=<url>`, got `{spec}`. The name is the one your \
+                 manifest's grants use: a grant `tool://reviewer/audit.check` needs \
+                 `--peer reviewer=https://...`"
+            )
+        })?;
+        if name.trim().is_empty() || url.trim().is_empty() {
+            return Err(format!("--peer `{spec}` names no peer or no URL"));
+        }
+        let granted: Vec<String> = manifests
+            .iter()
+            .flat_map(|m| &m.spec.tools)
+            .filter_map(|g| agentplane::tools::ToolId::parse(&g.reference))
+            .filter(|id| id.server == name)
+            .map(|id| id.tool)
+            .collect();
+        if granted.is_empty() {
+            return Err(format!(
+                "--peer `{name}` is wired but no manifest grants a `tool://{name}/…` \
+                 capability, so nothing could ever call it"
+            ));
+        }
+        let peer = PeerId::new(name);
+        let mut grant = PeerGrant::new(Scope::of(granted.iter().cloned()));
+        let token_var = format!(
+            "AGENTPLANE_PEER_TOKEN_{}",
+            name.to_ascii_uppercase().replace(['.', '-'], "_")
+        );
+        if let Ok(token) = std::env::var(&token_var)
+            && !token.is_empty()
+        {
+            grant = grant.with_credential(&peer, PeerCredential::for_audience(peer.clone(), token));
+        }
+        registry = registry.allow(peer.clone(), grant);
+        let client = A2aClient::new(Endpoint::new(url))
+            .map_err(|e| format!("could not build a client for peer `{name}`: {e}"))?
+            // The CLI build carries `testkit`, so a peer served on this
+            // machine is reachable; the exception applies to loopback
+            // literals only, never to a name that merely resolved to one.
+            .allow_loopback();
+        router = router.peer(
+            peer,
+            Arc::new(client) as Arc<dyn agentplane::peers::PeerClient>,
+        );
+        eprintln!("  peer: {name} <- {url} ({})", granted.join(", "));
+    }
+    Ok(Some((
+        registry,
+        Arc::new(router) as Arc<dyn agentplane::peers::PeerClient>,
+    )))
+}
+
+/// Naming the feature rather than ignoring the flag, as `--mcp` does.
+#[cfg(not(feature = "a2a"))]
+fn connect_peers(specs: &[String], _manifests: &[Manifest]) -> Result<Option<WiredPeers>, String> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    Err(
+        "this build cannot call an A2A peer: `--peer` needs the `a2a` feature. Reinstall \
+         with `--features cli,a2a`, or use the `:full` container image"
+            .to_owned(),
+    )
 }
 
 /// Connect the MCP servers named on the command line.
@@ -1401,6 +1513,9 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
         for (name, client) in connect_mcp_servers(&opts.mcp, manifests).await? {
             builder = builder.tool_server(name, client);
         }
+        if let Some((registry, client)) = connect_peers(&opts.peer, manifests)? {
+            builder = builder.peers(registry, client);
+        }
         for manifest in manifests {
             builder = builder.agent(agentplane::runtime::Agent::new(manifest));
         }
@@ -1448,6 +1563,9 @@ fn replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, String>
             with_providers(Runtime::builder_on(Arc::clone(&store)), manifests).await?;
         for (name, client) in connect_mcp_servers(&opts.mcp, manifests).await? {
             builder = builder.tool_server(name, client);
+        }
+        if let Some((registry, client)) = connect_peers(&opts.peer, manifests)? {
+            builder = builder.peers(registry, client);
         }
         for manifest in manifests {
             builder = builder.agent(agentplane::runtime::Agent::new(manifest));

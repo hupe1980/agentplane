@@ -25,7 +25,8 @@ use agentplane::core::{
     AwaitSpec, CorrelationKey, DeadlineSpec, Digest, Outcome, PolicyBundleIdentity, PolicyDecision,
     PolicyEngine, PolicyRequest, RunId, Skill, SkillDescriptor, SkillError, Tainted, TenantId,
 };
-use agentplane::journal::JournalStore;
+use agentplane::core::{Delegation, Principal, Scope};
+use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::manifest::Manifest;
 use agentplane::peers::CardSecurity;
 use agentplane::push::{Delivered, PushConfig, PushError, PushStore, PushTransport};
@@ -140,7 +141,16 @@ impl Authenticator for HeaderAuth {
                 Some((t, a)) => (TenantId::new(t).map_err(|_| AuthError::Rejected)?, a),
                 None => (TenantId::default(), actor),
             };
-            return Ok(Caller::new(actor, vec!["peer".to_owned()]).in_tenant(tenant));
+            let mut caller = Caller::new(actor, vec!["peer".to_owned()]).in_tenant(tenant);
+            // `x-scope: a.*,b.c` stands in for a credential that carries a
+            // chain: the caller then acts under one rooted at itself.
+            if let Some(scope) = headers.get("x-scope").and_then(|v| v.to_str().ok()) {
+                caller = caller.acting_as(Delegation::root(Principal::new(
+                    actor,
+                    Scope::of(scope.split(',')),
+                )));
+            }
+            return Ok(caller);
         }
         let bearer = headers
             .get("authorization")
@@ -1211,6 +1221,89 @@ async fn a_peers_message_is_untrusted_and_carries_its_sender() {
     assert_eq!(
         input["text"], "please settle INV-9",
         "the message text did not reach the skill: {input:#}"
+    );
+}
+
+/// A run a peer starts acts as **that peer**, under the chain its credential
+/// carried — never as the plane.
+///
+/// The plane below holds a chain of its own, rooted at its operator. A server
+/// that admitted every peer's run under it would answer "on whose behalf" with
+/// the operator's name for every caller — an ambient credential — and would
+/// act for a peer whose own authority is narrower. So the journal must name
+/// the peer, and the peer's scope must be what gates the plan: a caller
+/// holding `billing.*` is declined for `settlement.check` even though the
+/// plane's chain would have permitted it.
+#[tokio::test]
+async fn a_served_run_acts_as_its_caller_not_as_the_plane() {
+    let f = fixture();
+    let plane = Delegation::root(Principal::new("user:operator", Scope::root()));
+    let rt = Runtime::builder(Arc::clone(&f.store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&f.store) as Arc<dyn CaseStore>)
+        .policy(f.policy.clone() as Arc<dyn PolicyEngine>)
+        .acting_as(plane)
+        .skill(Echoes {
+            capability: "settlement.check",
+            seen: f.seen.clone(),
+        })
+        .build();
+    let router = A2aServer::new(
+        rt,
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &f.manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("policy wired")
+    .router();
+
+    // Two distinct message ids: a second message under the first one's id
+    // would be a *retry*, answered with the run the key already admitted.
+    let scoped = |scope: &str, message_id: &str| {
+        let mut message = text("please settle INV-9");
+        message["messageId"] = json!(message_id);
+        let mut req = rpc(
+            "SendMessage",
+            &json!({"message": message}),
+            Some("acme-peer"),
+        );
+        req.headers_mut().insert("x-scope", scope.parse().unwrap());
+        req
+    };
+
+    // Inside the caller's own scope: admitted, and recorded as the caller.
+    let (_, body) = send(&router, scoped("settlement.*", "m-inside")).await;
+    let task = RunId::parse(
+        body["result"]["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a peer within its own scope is admitted: {body:#}")),
+    )
+    .unwrap();
+    let records = f.store.read(task, 1).await.expect("journal");
+    let bound = records
+        .iter()
+        .find_map(|r| match r.kind() {
+            RecordKind::IdentityBound { chain } => Some(chain.clone()),
+            _ => None,
+        })
+        .expect("a served run records the chain it acted under");
+    assert_eq!(
+        bound.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        vec!["acme-peer"],
+        "the run acted as the plane's operator, not as the peer that asked: {bound:?}"
+    );
+
+    // Outside it: declined, though the plane's own chain permits everything.
+    f.seen.lock().unwrap().clear();
+    let (_, body) = send(&router, scoped("billing.*", "m-outside")).await;
+    assert_eq!(
+        body["result"]["message"]["parts"][0]["text"], "this agent declined the request",
+        "a caller whose chain excludes the skill was admitted under the plane's \
+         wider chain: {body:#}"
+    );
+    assert!(
+        f.seen.lock().unwrap().is_empty(),
+        "nothing ran for a declined call"
     );
 }
 

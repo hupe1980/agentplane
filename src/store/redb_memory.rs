@@ -65,9 +65,9 @@ const CURRENT: TableDefinition<(&str, &str), (&str, &str, i64, u64)> =
 /// Per-version rather than per-id, because supersession does not un-absorb
 /// anything: a summary re-derived from other sources still *contains* what its
 /// superseded version read, and that version stays readable through
-/// `version()`. Id-level edges were replaced on every revision, so a cascade
-/// from the original source no longer found the superseded summary that had
-/// absorbed it. Keeping every version's edges makes the traversal see the
+/// `version()`. Id-level edges, replaced on every revision, would lose the
+/// superseded summary that absorbed the original source, and a cascade from
+/// that source would miss it. Keeping every version's edges makes the traversal see the
 /// union of what was ever derived, and lets it erase exactly the superseded
 /// versions that named a doomed source while sparing a current version that
 /// did not.
@@ -966,8 +966,8 @@ impl MemoryStore for RedbStore {
                 // The sliding-retention row goes with the memory it describes.
                 // Left behind, it is residue about an erased id — and worse, a
                 // future write under a recycled id would inherit a window it
-                // never asked for. Every erasure path removes it; this one
-                // used to leave it to `forget_cascading` alone.
+                // never asked for. Every erasure path removes it, this one
+                // included rather than leaving it to `forget_cascading`.
                 w.open_table(ACCESS_EXPIRY)
                     .map_err(|e| be(&e))?
                     .remove((tenant.as_str(), id.as_str()))

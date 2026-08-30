@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.24.0"
+version      = "0.25.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -373,6 +373,10 @@ required-features = ["redb", "testkit", "manifest"]
 [[example]]
 name              = "a2a_peer"
 required-features = ["redb", "a2a-server", "manifest"]
+
+[[example]]
+name              = "peer_call"
+required-features = ["redb", "testkit", "manifest", "a2a", "a2a-server"]
 
 # Serves the A2A surface for the official conformance kit — `just test-a2a-tck`
 # boots it and runs the kit's MUST battery against the live socket.
