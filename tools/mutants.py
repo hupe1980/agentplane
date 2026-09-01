@@ -4778,7 +4778,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     "ASettlementFailureReleasesItsRetryLease": (
         "src/runtime/executor.rs",
-        "a_failed_quota_settlement_is_recovered_exactly_once",
+        "a_failed_recovery_keeps_the_run_in_the_retry_queue",
         "a failed settlement releases the run lease, removing the only queue "
         "that can discover and retry the missing receipt",
         """        let settlement_pending =

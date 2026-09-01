@@ -843,6 +843,98 @@ async fn a_failed_quota_settlement_is_recovered_exactly_once() {
     );
 }
 
+/// A recovery whose settlement fails again leaves the run in the retry queue.
+///
+/// The outage that survives one tick is the interesting one: the live run
+/// already failed to settle, and the sweep that takes it over meets the same
+/// unavailable ledger. What must not happen then is the recovery handing the
+/// lease back — an expired *unreleased* lease is the only thing that names
+/// this run to `abandoned_runs`, and it is carrying the one pass whose receipt
+/// is still missing. Release it and the run leaves every driving query while
+/// its spend is unbilled and its journal unsealed, with nothing left to notice.
+#[tokio::test]
+async fn a_failed_recovery_keeps_the_run_in_the_retry_queue() {
+    use agentplane::runtime::MIN_LEASE_TTL;
+
+    let quota = TenantQuota {
+        max_concurrent_runs: Some(1),
+        max_tokens_per_period: Some(1_000_000),
+        ..TenantQuota::default()
+    };
+    let store = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant("acme")),
+    );
+    let quotas = Arc::new(FailsFirstSettlement {
+        inner: Arc::clone(&store),
+        fail: AtomicBool::new(true),
+    });
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .owner("settlement-recovery")
+        .lease_ttl(MIN_LEASE_TTL)
+        .quota(quotas.clone() as Arc<dyn QuotaStore>, quota)
+        .skill(SpendsOnce)
+        .build();
+
+    let error = rt
+        .run("spends-once", Tainted::trusted(json!({})))
+        .await
+        .expect_err("the injected settlement outage must reach the caller");
+    let run = match error {
+        agentplane::core::RuntimeError::QuotaSettlementPending { run, .. } => {
+            agentplane::RunId::parse(&run).expect("runtime wrote a run id")
+        }
+        other => panic!("wrong settlement failure: {other}"),
+    };
+    let period = this_period(&quota);
+
+    // The outage is still there when the sweep takes the run over.
+    quotas.fail.store(true, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let report = rt
+        .sweep(harness_now(), std::time::Duration::ZERO)
+        .await
+        .expect("recovery sweep");
+    assert_eq!(report.runs_recovered, 0, "{report:?}");
+    assert_eq!(report.recovery_failures, 1, "{report:?}");
+    assert_eq!(
+        quotas.spent(&period).await.expect("spent").tokens,
+        0,
+        "the settlement failed, so nothing may have been billed"
+    );
+    assert!(
+        store.inclusion_proof(run).await.expect("proof").is_none(),
+        "the run sealed over a settlement that never happened"
+    );
+
+    // The failed takeover kept its lease, so the lapse recurs and the run is
+    // still discoverable — the queue is what makes a later retry possible.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(
+        JournalStore::abandoned_runs(store.as_ref(), 16)
+            .await
+            .expect("abandoned")
+            .contains(&run),
+        "a failed settlement released the run's lease, so the only queue that \
+         could retry the missing receipt no longer names it"
+    );
+
+    let report = rt
+        .sweep(harness_now(), std::time::Duration::ZERO)
+        .await
+        .expect("second recovery sweep");
+    assert_eq!(report.runs_recovered, 1, "{report:?}");
+    assert_eq!(
+        quotas.spent(&period).await.expect("spent").tokens,
+        100,
+        "the receipt the first recovery could not write is still owed"
+    );
+    assert_eq!(quotas.running().await.expect("running"), 0);
+    assert!(store.inclusion_proof(run).await.expect("proof").is_some());
+}
+
 /// Repairing accounting is not permission to retry a failed business run.
 #[tokio::test]
 async fn settlement_recovery_preserves_an_open_failure() {
