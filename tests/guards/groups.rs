@@ -2370,7 +2370,7 @@ async fn a_resume_does_not_settle_a_settled_group_again() {
          opened/settled pairing queries now count phantom groups"
     );
     assert_eq!(
-        group_kind_count(&store, out.run_id, "RunSealed").await,
+        group_kind_count(&store, out.run_id, "RunConcluded").await,
         1,
         "a no-op resume re-appended the conclusion the record already holds"
     );
@@ -2394,7 +2394,7 @@ async fn a_resume_does_not_settle_a_settled_group_again() {
         "success must not re-settle either"
     );
     assert_eq!(
-        group_kind_count(&store, out.run_id, "RunSealed").await,
+        group_kind_count(&store, out.run_id, "RunConcluded").await,
         2,
         "the new conclusion is a different fact and must land"
     );

@@ -7,7 +7,7 @@
 # `COPY . .`, then been pushed to a public registry:
 #
 #   * `.env`        — real credentials.
-#   * `CONCEPT.md`  — the internal design document, which `just package`
+#   * `concepts/`   — the internal design documents, which `just package`
 #                     already refuses to put in the crates.io tarball.
 #
 # Both were invisible to every existing guard, because those guard the *tarball*

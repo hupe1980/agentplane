@@ -725,10 +725,12 @@ async fn a_run_that_changed_hands_restores_with_its_epochs() {
             2,
             vec![Append::new(
                 run,
-                RecordKind::RunSealed {
+                RecordKind::RunConcluded {
                     outcome: "succeeded".to_owned(),
                     chain_head: head.hash,
                     reason: None,
+                    exhaustion: None,
+                    live_spend: agentplane::core::Spend::default(),
                 },
             )],
         )
@@ -1697,7 +1699,7 @@ async fn a_foreign_canon_rule_is_narrowed_coverage_not_a_finding() {
 
 /// **A sealing record claiming a foreign head is caught offline.**
 ///
-/// The live audit holds `RunSealed.chain_head` to the chain it sits in; an
+/// The live audit holds `RunConcluded.chain_head` to the chain it sits in; an
 /// auditor working from the file alone deserves the same check, because the
 /// forgery it catches — a conclusion composed against a different history
 /// and appended to this one — leaves every hash, leaf and root verifying:
@@ -1731,11 +1733,13 @@ async fn a_sealing_record_claiming_a_foreign_head_is_caught_offline() {
                 ),
                 Append::new(
                     run,
-                    RecordKind::RunSealed {
+                    RecordKind::RunConcluded {
                         outcome: "succeeded".into(),
                         // Not the head this conclusion sits on.
                         chain_head: Digest::of(b"some other history"),
                         reason: None,
+                        exhaustion: None,
+                        live_spend: agentplane::core::Spend::default(),
                     },
                 ),
             ],

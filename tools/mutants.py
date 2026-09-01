@@ -3251,9 +3251,9 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "carries — and the resume releases the lease, so no later tick can "
         "re-select the run and write it",
         """                .await?;
-            match self.replay(run, Mode::Resume).await {""",
+            match self.recover_abandoned_run(run).await {""",
         """                .await.ok();
-            match self.replay(run, Mode::Resume).await {""",
+            match self.recover_abandoned_run(run).await {""",
     ),
     # ── Transactional effect groups ─────────────────────────────────────────
     "AGroupCommitsByBeingForgotten": (
@@ -3901,7 +3901,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "tenant with no quotas configured cannot be halted at all — which is "
         "the tenant an operator is most likely to need to stop",
         "        match quotas.halted().await {",
-        "        if self.quota.is_unlimited() {\n            return Ok(());\n        }\n        match quotas.halted().await {",
+        "        if self.quota.is_unlimited() {\n            return Ok(pass);\n        }\n        match quotas.halted().await {",
     ),
     "AHighImpactCallSkipsItsApproval": (
         "src/runtime/declarative.rs",
@@ -4399,12 +4399,18 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the run view drops the seal's reason, so an operator asking what "
         "happened is answered 'failed' and sent into the journal for the one "
         "sentence the record already carries",
-        """        RecordKind::RunSealed {
-            outcome, reason, ..
-        } => (outcome.clone(), None, reason.clone(), true),""",
-        """        RecordKind::RunSealed {
-            outcome, reason: _, ..
-        } => (outcome.clone(), None, None, true),""",
+        """        RecordKind::RunConcluded {
+            outcome,
+            reason,
+            exhaustion,
+            ..
+        } => (outcome.clone(), None, reason.clone(), exhaustion.clone()),""",
+        """        RecordKind::RunConcluded {
+            outcome,
+            reason: _,
+            exhaustion,
+            ..
+        } => (outcome.clone(), None, None, exhaustion.clone()),""",
     ),
     "APushDeliveryAnnouncesOneMediaType": (
         "src/push/mod.rs",
@@ -4711,15 +4717,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_refused_run_writes_nothing",
         "admission never consults the tenant's ceiling, so a caller that can "
         "start runs can start a thousand of them, each within its own budget",
-        "        self.check_quota(run).await?;",
-        "",
+        "        let quota = match self.check_quota(run, now_for_admission()).await {",
+        "        let quota = match Ok(QuotaPass::disabled()) {",
     ),
     "AFinishedRunKeepsItsSlot": (
         "src/runtime/executor.rs",
         "a_finished_run_frees_its_slot",
         "a run never gives its concurrency slot back, so a ceiling of N permits "
         "N runs per process lifetime rather than N at a time",
-        "            self.settle_quota(run, live_spend).await;",
+        "            self.settle_quota(run, epoch, live_spend, quota).await?;",
         "",
     ),
     "ReplayReChecksTheQuota": (
@@ -4730,9 +4736,103 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the second reading",
         "        // Strict verification never writes, so it holds no lease to renew.\n"
         "        let _heartbeat = lease.map(|l| self.heartbeat(run, l.epoch));",
-        "        self.check_quota(run).await?;\n"
+        "        let _ = self.check_quota(run, now_for_admission()).await?;\n"
         "        // Strict verification never writes, so it holds no lease to renew.\n"
         "        let _heartbeat = lease.map(|l| self.heartbeat(run, l.epoch));",
+    ),
+    "AnUnlimitedQuotaHidesItsRunningWork": (
+        "src/runtime/executor.rs",
+        "an_unlimited_wired_quota_tracks_active_runs",
+        "the runtime skips reservation when every ceiling is unlimited, so "
+        "the operator's running count is false and a newly-added ceiling starts "
+        "from an empty ledger while work is already active",
+        "        if let Some(period) = pass.period() {\n            let spent = quotas.spent(period).await.map_err(|e| {",
+        "        if self.quota.is_unlimited() {\n            return Ok(pass);\n        }\n\n        if let Some(period) = pass.period() {\n            let spent = quotas.spent(period).await.map_err(|e| {",
+    ),
+    "AQuotaPassMovesToTheCompletionPeriod": (
+        "src/runtime/executor.rs",
+        "a_quota_pass_keeps_the_period_it_started_in",
+        "the accounting period is read from the clock instead of the pass's "
+        "start instant, so work crossing midnight is authorized against one "
+        "ledger and charged to another",
+        "            period: quota.bounds_spend().then(|| quota.period.key_for(at)),",
+        "            period: quota\n                .bounds_spend()\n                .then(|| quota.period.key_for(now_for_admission())),",
+    ),
+    "AQuotaPassStartsAfterItsEffects": (
+        "src/runtime/executor.rs",
+        "a_failed_quota_settlement_is_recovered_exactly_once",
+        "the pass marker is omitted from admission, so a crash leaves durable "
+        "effect spend with no period or receipt identity recovery can derive",
+        """        if let Some(started) = quota.started() {
+            records.push(Append::new(run, started));
+        }""",
+        "",
+    ),
+    "AQuotaSettlementRetryBillsTwice": (
+        "src/store/redb_quota.rs",
+        "redb_satisfies_the_quota_store_contract",
+        "an existing receipt falls through to accrual again, so a lost "
+        "acknowledgement charges one pass twice",
+        "            if !fresh {",
+        "            if false && !fresh {",
+    ),
+    "ASettlementFailureReleasesItsRetryLease": (
+        "src/runtime/executor.rs",
+        "a_failed_quota_settlement_is_recovered_exactly_once",
+        "a failed settlement releases the run lease, removing the only queue "
+        "that can discover and retry the missing receipt",
+        """        let settlement_pending =
+            matches!(outcome, Err(RuntimeError::QuotaSettlementPending { .. }));""",
+        "        let settlement_pending = false;",
+    ),
+    "RecoverySkipsRecordedQuotaPasses": (
+        "src/runtime/executor.rs",
+        "a_failed_quota_settlement_is_recovered_exactly_once",
+        "resume never replays the journal's quota intents, so the run seals "
+        "while the failed charge and admission slot remain missing",
+        "        self.settle_recorded_quota_passes(run, records).await?;",
+        "",
+    ),
+    "AccountingRecoveryRetriesBusinessFailure": (
+        "src/runtime/executor.rs",
+        "settlement_recovery_preserves_an_open_failure",
+        "the abandonment sweep repairs accounting and then treats that repair "
+        "as permission to start a second execution pass over failed work",
+        "        if !recovering {\n            return Ok(None);\n        }",
+        "        if true {\n            return Ok(None);\n        }",
+    ),
+    "AQuotaStoreCanServeAnotherTenant": (
+        "src/runtime/executor.rs",
+        "a_plane_refuses_another_tenants_quota_store",
+        "the builder omits the quota store from tenant checks, so one tenant's "
+        "runs reserve and bill another tenant's ledger while their journals "
+        "remain correctly isolated",
+        "                (\"quota\", self.quotas.as_ref().map(|s| s.tenant())),",
+        "                (\"quota\", None),",
+    ),
+    "ATimerStoreCanServeAnotherTenant": (
+        "src/runtime/executor.rs",
+        "a_plane_refuses_mismatched_timer_batch_and_authority_stores",
+        "the timer store is omitted from tenant checks, so a sweep can claim "
+        "another tenant's timer and try to execute its run under this plane",
+        "                (\"timer\", self.timers.as_ref().map(|s| s.tenant())),",
+        "                (\"timer\", None),",
+    ),
+    "ABatchStoreCanServeAnotherTenant": (
+        "src/runtime/executor.rs",
+        "a_plane_refuses_mismatched_timer_batch_and_authority_stores",
+        "the batch store is omitted from tenant checks, so item reservations "
+        "and outcomes are written into another tenant's batch",
+        "                (\"batch\", self.batches.as_ref().map(|s| s.tenant())),",
+        "                (\"batch\", None),",
+    ),
+    "AnAuthorityStoreCanServeAnotherTenant": (
+        "src/runtime/executor.rs",
+        "a_plane_refuses_mismatched_timer_batch_and_authority_stores",
+        "the authority store is omitted from tenant checks, so one tenant's "
+        "run draws against another tenant's standing authorization",
+        "                (\"authority\", self.authorities.as_ref().map(|s| s.tenant())),",
+        "                (\"authority\", None),",
     ),
     "APeerCanNameAnyTenant": (
         "src/api/a2a.rs",
@@ -6062,7 +6162,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "with no way to discover the disagreement",
         "    let (state, detail) = super::a2a::state_from_history(&records)?;",
         """    let (state, detail) = match records.last()?.kind() {
-        RecordKind::RunSealed { outcome, .. } => (sealed_state(outcome), outcome.clone()),
+        RecordKind::RunConcluded { outcome, .. } => (sealed_state(outcome), outcome.clone()),
         _ => (TaskState::Working, "running".to_owned()),
     };""",
     ),

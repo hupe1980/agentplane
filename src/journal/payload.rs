@@ -6,7 +6,7 @@
 //! and it is wrong here, for a reason that compiles and passes tests: both
 //! store backends match on the concrete variant. redb keys the **exactly-once**
 //! index off `EffectStarted`, and both backends key the outcome index off
-//! `RunSealed`. A record whose variant became a sealed wrapper would still
+//! `RunConcluded`. A record whose variant became a sealed wrapper would still
 //! build, still pass every test that writes unsealed records, and silently stop
 //! enforcing exactly-once — the guarantee whose failure is a payment taken
 //! twice.
@@ -127,7 +127,7 @@ pub(crate) enum SealedField<'a> {
 /// The dividing rule: *what a store is asked questions about stays readable;
 /// what it merely holds is sealed.* Neither backend matches or
 /// indexes on any field below — routing lives in `seq`, `run`, `case`,
-/// `effect_key`, the variant, and `RunSealed.outcome`, all of which stay
+/// `effect_key`, the variant, and `RunConcluded.outcome`, all of which stay
 /// clear.
 pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
     use super::RecordKind as K;
@@ -177,9 +177,11 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         // A conclusion's reason is the same free text `EffectFailed.error` is —
         // a provider or tool's refusal, quoting the request it refused — lifted
         // to the run. `outcome` and `chain_head` route and stay clear.
-        K::RunSealed {
+        K::RunConcluded {
             reason,
             outcome: _,
+            exhaustion: _,
+            live_spend: _,
             chain_head: _,
         } => reason.as_mut().map(SealedField::Text).into_iter().collect(),
 
@@ -198,7 +200,11 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         // One arm, because the answer is one answer. The fields are still all
         // named: that is what makes a field added later a build error rather
         // than a silent no.
-        K::StepStarted { skill: _ }
+        K::QuotaPassStarted {
+            period: _,
+            release_slot: _,
+        }
+        | K::StepStarted { skill: _ }
         | K::StepFinished { outcome: _ }
         | K::CaseBound {
             case_kind: _,

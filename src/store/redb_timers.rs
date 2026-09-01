@@ -105,6 +105,10 @@ fn build(
 
 #[async_trait]
 impl TimerStore for RedbStore {
+    fn tenant(&self) -> &str {
+        crate::journal::JournalStore::tenant(self)
+    }
+
     async fn arm(&self, timer: &Timer) -> Result<(), StoreError> {
         let tenant = self.tenant_name();
         let (run, effect) = (timer.run.to_string(), timer.effect.to_hex());

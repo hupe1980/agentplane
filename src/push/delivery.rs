@@ -64,10 +64,10 @@ pub trait Projection: Send + Sync + Debug {
     /// cursor sitting forever at the end of a sealed run's journal is a row that
     /// is scanned on every tick and can never move.
     ///
-    /// The default is [`RecordKind::RunSealed`], which is the honest answer for
+    /// The default is [`RecordKind::RunConcluded`], which is the honest answer for
     /// anything keyed on a run: nothing is appended after a seal.
     fn terminal(&self, record: &Record) -> bool {
-        matches!(record.kind(), RecordKind::RunSealed { .. })
+        matches!(record.kind(), RecordKind::RunConcluded { .. })
     }
 
     /// Which id namespace this worker serves.

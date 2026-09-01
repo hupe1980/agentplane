@@ -194,6 +194,22 @@ pub enum RuntimeError {
     #[error("quota: {0}")]
     QuotaExceeded(#[from] crate::quota::QuotaError),
 
+    /// A live pass finished, but its durable quota receipt did not commit.
+    ///
+    /// The run deliberately keeps its lease. Once it expires, the abandonment
+    /// sweep derives the same settlement from the journal and retries it under
+    /// the idempotent `(run, epoch)` key; releasing here would remove that retry
+    /// handle and turn a store outage into permanent under-accounting.
+    #[error(
+        "quota settlement for run {run} at epoch {epoch} is pending: {detail} — \
+         the run remains leased so recovery can retry without charging twice"
+    )]
+    QuotaSettlementPending {
+        run: String,
+        epoch: u64,
+        detail: String,
+    },
+
     /// The journal's hash chain does not verify. Either a record was altered
     /// after the fact, or a writer produced bytes it did not hash.
     #[error("journal integrity broken at seq {seq}: {detail}")]

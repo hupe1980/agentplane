@@ -74,7 +74,8 @@ pub enum BuildError {
          destroys a key that does not reach these rows"
     )]
     StateStoreTenant {
-        /// Which store disagreed: `case`, `event`, `task`, `memory` or `push`.
+        /// Which store disagreed: `case`, `event`, `task`, `memory`, `quota`,
+        /// `timer`, `batch`, `authority` or `push`.
         store: &'static str,
         plane: String,
         tenant: String,

@@ -1166,7 +1166,7 @@ fn read_record(
     // appended to, which no honest writer produces. What this does NOT cover:
     // a run with no sealing record at all — an open run has made no claim,
     // and its absence of one is a state, not a defect.
-    if let crate::journal::RecordKind::RunSealed { chain_head, .. } = &body.kind
+    if let crate::journal::RecordKind::RunConcluded { chain_head, .. } = &body.kind
         && *chain_head != pass.prev
     {
         report.findings.push(format!(
@@ -1636,7 +1636,7 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
                         ))
                     })?;
                 if let Some(current) = parsed.runs.last_mut() {
-                    if let crate::journal::RecordKind::RunSealed { outcome, .. } = &body.kind {
+                    if let crate::journal::RecordKind::RunConcluded { outcome, .. } = &body.kind {
                         current.outcome = Some(outcome.clone());
                     }
                     current.bodies.push(body);

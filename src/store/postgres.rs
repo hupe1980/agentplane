@@ -732,7 +732,7 @@ impl PostgresStore {
             seq += 1;
             let body = append.into_body(seq, epoch);
             match &body.kind {
-                crate::journal::RecordKind::RunSealed { outcome, .. } => {
+                crate::journal::RecordKind::RunConcluded { outcome, .. } => {
                     conclusion = Some(outcome.clone());
                 }
                 crate::journal::RecordKind::RunAdmitted {

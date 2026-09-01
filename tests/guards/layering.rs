@@ -549,7 +549,7 @@ fn spans_are_instrumented_onto_futures_not_entered() {
 /// capability the system had, and each was a promise to the caller that nothing
 /// kept — `Recovery::Reconcile` escalated instead of probing,
 /// `RuntimeError::CompensationFailed` was never constructed, `RecordKind::
-/// RunSealed` was never written. An API that reads as though a capability exists
+/// RunConcluded` was never written. An API that reads as though a capability exists
 /// is worse than one that admits it does not, because callers plan around it.
 ///
 /// So the sweep runs on every build instead of when somebody remembers.

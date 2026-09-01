@@ -20,9 +20,9 @@ use std::sync::{Arc, Mutex};
 use agentplane::api::{Api, ApiSetupError, AuthError, Authenticator, Caller, action};
 use agentplane::case::{CaseStore, EventStore, TaskStore};
 use agentplane::core::{
-    CorrelationKey, DeadlineSpec, Digest, Justification, Outcome, PolicyBundleIdentity,
-    PolicyDecision, PolicyEngine, PolicyRequest, Priority, Skill, SkillDescriptor, SkillError,
-    Tainted, TaskSpec,
+    BudgetExceeded, CorrelationKey, DeadlineSpec, Digest, Justification, Outcome,
+    PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest, Priority, Skill,
+    SkillDescriptor, SkillError, StepError, Tainted, TaskSpec,
 };
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{Runtime, StepCtx};
@@ -1020,6 +1020,54 @@ async fn a_failed_runs_view_carries_the_reason_the_seal_records() {
         body["reason"], "the counterparty ledger refused the transfer",
         "the view must say what the seal says: {body}"
     );
+    assert_eq!(
+        body["sealed"], false,
+        "a resumable failed conclusion was reported as a closed journal: {body}"
+    );
+}
+
+/// Exhaustion stays machine-readable through the operator surface.
+#[tokio::test]
+async fn an_exhausted_runs_view_carries_the_typed_ceiling() {
+    #[derive(Debug)]
+    struct Exhausts;
+
+    #[async_trait::async_trait]
+    impl Skill for Exhausts {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("exhausts").provides("demo.exhausts")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            Err(StepError::Budget(BudgetExceeded::Effects {
+                allowed: 3,
+                used: 3,
+            })
+            .into())
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .skill(Exhausts)
+        .build();
+    let out = rt
+        .run("demo.exhausts", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    let router = Api::new(rt, Arc::new(HeaderAuth)).unwrap().router();
+
+    let (status, body) = send(&router, get(&format!("/runs/{}", out.run_id), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "exhausted", "{body}");
+    assert_eq!(body["exhaustion"]["limit"], "effects", "{body}");
+    assert_eq!(body["exhaustion"]["allowed"], 3, "{body}");
+    assert_eq!(body["exhaustion"]["used"], 3, "{body}");
+    assert_eq!(body["sealed"], false, "{body}");
 }
 
 /// An unknown run is a 404, and a malformed one a 400 — after the gate.

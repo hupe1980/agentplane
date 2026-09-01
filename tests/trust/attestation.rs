@@ -682,7 +682,7 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
 
 /// **The sealing record's own claim is held to the chain it sits in.**
 ///
-/// `RunSealed.chain_head` is the head the conclusion was drawn over — by
+/// `RunConcluded.chain_head` is the head the conclusion was drawn over — by
 /// construction its own record's `prev_hash`. A writer that seals a
 /// conclusion composed against some other history produces a mismatch no
 /// honest path can, and an audit that never read the field left it
@@ -716,11 +716,13 @@ async fn a_sealing_record_claiming_a_foreign_head_is_a_finding() {
             ),
             Append::new(
                 run,
-                RecordKind::RunSealed {
+                RecordKind::RunConcluded {
                     outcome: "succeeded".into(),
                     // Not the head this conclusion sits on.
                     chain_head: Digest::of(b"some other history"),
                     reason: None,
+                    exhaustion: None,
+                    live_spend: agentplane::core::Spend::default(),
                 },
             ),
         ],
@@ -779,10 +781,12 @@ async fn run_holding(
             lease.epoch,
             vec![Append::new(
                 run,
-                RecordKind::RunSealed {
+                RecordKind::RunConcluded {
                     outcome: "succeeded".into(),
                     chain_head: head.hash,
                     reason: None,
+                    exhaustion: None,
+                    live_spend: agentplane::core::Spend::default(),
                 },
             )],
         )

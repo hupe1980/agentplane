@@ -22,7 +22,7 @@
 //! * periods are **independent**, since the window is a billing period.
 
 use crate::core::{RunId, Spend, Timestamp};
-use crate::quota::{QuotaError, QuotaStore};
+use crate::quota::{QuotaError, QuotaSettlement, QuotaStore};
 
 use super::conformance::Report;
 
@@ -99,8 +99,17 @@ async fn ceiling_refuses_and_frees(store: &dyn QuotaStore, at: Timestamp, report
     }
 
     report.checked += 1;
-    if let Err(e) = store.release(first).await {
-        report.record("releasing a slot", format!("{e}"));
+    if let Err(e) = store
+        .settle(&QuotaSettlement {
+            run: first,
+            epoch: 1,
+            period: None,
+            spend: Spend::default(),
+            release_slot: true,
+        })
+        .await
+    {
+        report.record("settling and releasing a slot", format!("{e}"));
         return;
     }
     report.checked += 1;
@@ -162,11 +171,26 @@ async fn reserving_twice_takes_one_slot(
 /// Spend sums within a period and does not cross between them.
 async fn spend_accrues_per_period(store: &dyn QuotaStore, report: &mut Report) {
     let (this, next) = ("2999-01", "2999-02");
+    let run = RunId::generate();
+    let first = QuotaSettlement {
+        run,
+        epoch: 1,
+        period: Some(this.to_owned()),
+        spend: Spend::tokens(400),
+        release_slot: false,
+    };
+    let second = QuotaSettlement {
+        run,
+        epoch: 2,
+        period: Some(this.to_owned()),
+        spend: Spend::tokens(600),
+        release_slot: false,
+    };
 
     report.checked += 1;
-    for n in [400u64, 600] {
-        if let Err(e) = store.accrue(this, Spend::tokens(n)).await {
-            report.record("accruing spend", format!("{e}"));
+    for settlement in [&first, &second] {
+        if let Err(e) = store.settle(settlement).await {
+            report.record("settling spend", format!("{e}"));
             return;
         }
     }
@@ -185,6 +209,36 @@ async fn spend_accrues_per_period(store: &dyn QuotaStore, report: &mut Report) {
             ),
         ),
         Err(e) => report.record("reading spend", format!("{e}")),
+    }
+
+    // A lost acknowledgement retries the exact same receipt. It must not bill
+    // the pass twice, and the positive total above means this cannot pass by
+    // ignoring every settlement.
+    report.checked += 1;
+    if let Err(e) = store.settle(&first).await {
+        report.record("retrying an identical settlement", format!("{e}"));
+    }
+    match store.spent(this).await {
+        Ok(s) if s.tokens == 1_000 => {}
+        Ok(s) => report.record(
+            "an identical settlement accrues once",
+            format!("retrying one pass changed the total to {} tokens", s.tokens),
+        ),
+        Err(e) => report.record("reading spend after a settlement retry", format!("{e}")),
+    }
+
+    // A key may not be reused to rewrite accounting. The store must compare
+    // the receipt, not treat every conflict as idempotent success.
+    report.checked += 1;
+    let changed = QuotaSettlement {
+        spend: Spend::tokens(401),
+        ..first.clone()
+    };
+    if store.settle(&changed).await.is_ok() {
+        report.record(
+            "one pass key names one exact settlement",
+            "the same run/epoch accepted a different spend, so a retry can rewrite the bill",
+        );
     }
 
     report.checked += 1;

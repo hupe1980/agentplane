@@ -86,6 +86,10 @@ fn unavailable(e: &impl std::fmt::Display) -> AuthorityError {
 
 #[async_trait]
 impl AuthorityStore for PostgresStore {
+    fn tenant(&self) -> &str {
+        crate::journal::JournalStore::tenant(self)
+    }
+
     async fn issue(&self, authority: &StandingAuthority) -> Result<(), AuthorityError> {
         authority.validate()?;
         let mut client = self.pool_ref().get().await.map_err(|e| unavailable(&e))?;

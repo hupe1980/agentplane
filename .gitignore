@@ -30,7 +30,8 @@ spec/*.out
 
 # Custom
 .env
-CONCEPT.md
+# The internal architecture constitution — never published, never packaged.
+concepts/
 # Backups written by tools/mutants.py while a mutation is applied. Present only
 # between apply and revert; an interrupted sweep leaves one behind, and it must
 # not be mistaken for source.
@@ -38,7 +39,7 @@ CONCEPT.md
 
 # Local agent tooling. The audit skill encodes this project's own review
 # standards and is useful, but it is workflow rather than product — and it
-# references CONCEPT.md, which is itself internal.
+# references `concepts/`, which is itself internal.
 .claude/
 
 # Python bytecode from tools/mutants.py.

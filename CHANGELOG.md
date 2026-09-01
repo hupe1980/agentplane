@@ -30,6 +30,53 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.26.0] — 2026-09-01
+
+### Changed — **breaking**: conclusions are typed and no longer called seals
+
+`RecordKind::RunSealed` is now `RunConcluded`. The old name was false for
+`failed` and `exhausted`: both append a conclusion but deliberately leave the
+journal open for resume. That ambiguity caused the HTTP run view to report an
+open failed run as `sealed: true`; it now derives the field from actual Merkle
+inclusion.
+
+An exhausted conclusion also carries its structured `BudgetExceeded` verdict.
+Previously idempotent redelivery reconstructed every exhausted run as
+`RunStatus::Failed(reason)`, losing the resumable state and forcing callers to
+parse prose. Existing pre-freeze journals use the old variant and must be
+recreated; there is intentionally no compatibility alias or migration.
+
+### Fixed — quota accounting keeps one identity across a live pass
+
+Admission checked spend in the current billing period and settlement computed
+the period again. A run crossing midnight or month-end could therefore be
+authorized against the old ledger and charged to the new one. The period is now
+captured once per live pass and carried to settlement; a later resume starts a
+new pass in its resume period, while strict replay remains unbilled.
+
+A wired quota store also records active runs when every ceiling is `None`.
+Previously the runtime returned after the halt check and skipped reservation,
+so `running()` reported zero during real work and adding a limit started from a
+falsely empty ledger.
+
+Settlement itself is no longer two best-effort writes. `QuotaPassStarted` is
+journaled before effects; `QuotaStore::settle(QuotaSettlement)` stores an exact
+`(run, epoch)` receipt, accrues spend, and releases the admission slot in one
+backend transaction. Identical retries are no-ops and changed retries are
+corruption. Physical sealing and lease release happen only after acknowledgement;
+on failure the expired owned lease drives the existing recovery sweep, which
+derives the pass from journal evidence and retries without double charging.
+This is a breaking store and journal format change: `QuotaStore::accrue` is
+removed, PostgreSQL/redb gain settlement receipts, `RunConcluded` gains
+`live_spend`, and pre-freeze stores must be recreated.
+
+`QuotaStore`, `TimerStore`, `BatchStore`, and `AuthorityStore` also gain a
+required `tenant()` accessor, and `try_build` refuses any handle scoped
+differently from the plane. Previously these tenant-keyed operational stores
+were omitted from the startup check, so an `acme` plane could run correctly
+while reserving and charging `globex`'s ledger, claiming its timers, settling
+its batch items, or drawing its standing authority.
+
 ## [0.25.0] — 2026-08-30
 
 An audit round over the identity tier, asking of I6 — *audience-bound,

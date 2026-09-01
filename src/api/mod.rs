@@ -315,6 +315,12 @@ pub struct RunView {
     /// the journal for the one sentence the seal already records.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Structured ceiling detail when `status == "exhausted"`.
+    ///
+    /// Kept beside the sentence because automation must not parse prose to
+    /// decide which limit to raise or by how much.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exhaustion: Option<crate::core::BudgetExceeded>,
     pub sealed: bool,
     /// Who asked for this run to stop, if anyone has.
     ///
@@ -858,18 +864,31 @@ async fn run_view(
     // appears anywhere. A run that waited for an event, got it, and carried on
     // has a `RunSuspended` in its history and is not suspended now; scanning for
     // one would report every resumed run as stuck forever.
-    let (status, waiting_for, reason, sealed) = match last.kind() {
-        RecordKind::RunSuspended { reason } => (
-            "suspended".to_owned(),
-            Some(reason.to_string()),
-            None,
-            false,
-        ),
-        RecordKind::RunSealed {
-            outcome, reason, ..
-        } => (outcome.clone(), None, reason.clone(), true),
-        _ => ("running".to_owned(), None, None, false),
+    let (status, waiting_for, reason, exhaustion) = match last.kind() {
+        RecordKind::RunSuspended { reason } => {
+            ("suspended".to_owned(), Some(reason.to_string()), None, None)
+        }
+        RecordKind::RunConcluded {
+            outcome,
+            reason,
+            exhaustion,
+            ..
+        } => (outcome.clone(), None, reason.clone(), exhaustion.clone()),
+        _ => ("running".to_owned(), None, None, None),
     };
+
+    // A conclusion is not necessarily a closure. Failed and exhausted runs
+    // carry `RunConcluded` records but deliberately remain open so an
+    // operator can resume them. Merkle inclusion is the store's actual answer
+    // to whether this run was sealed; the record variant's historical name is
+    // not.
+    let sealed = s
+        .plane
+        .journal()
+        .inclusion_proof(id)
+        .await
+        .map_err(|_| store_failed())?
+        .is_some();
 
     let case = records
         .iter()
@@ -887,6 +906,7 @@ async fn run_view(
         status,
         waiting_for,
         reason,
+        exhaustion,
         sealed,
         cancellation_requested_by,
         records: records.len() as u64,

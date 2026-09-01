@@ -165,7 +165,7 @@ async fn a_sweep_wakes_a_run_whose_instant_arrived() {
     let records = f.store.read(out.run_id, 1).await.unwrap();
     assert!(
         records.iter().any(
-            |r| matches!(r.kind(), RecordKind::RunSealed { outcome, .. } if outcome == "succeeded")
+            |r| matches!(r.kind(), RecordKind::RunConcluded { outcome, .. } if outcome == "succeeded")
         ),
         "the woken run reaches a conclusion"
     );
@@ -592,7 +592,7 @@ async fn two_concurrent_siblings_can_both_sleep() {
         .unwrap()
         .iter()
         .filter_map(|r| match r.kind() {
-            RecordKind::RunSealed { outcome, .. } => Some(outcome.clone()),
+            RecordKind::RunConcluded { outcome, .. } => Some(outcome.clone()),
             _ => None,
         })
         .collect();

@@ -1950,14 +1950,14 @@ async fn continue_task(
     }
     if !matches!(
         last.kind(),
-        RecordKind::RunSuspended { .. } | RecordKind::RunSealed { .. }
+        RecordKind::RunSuspended { .. } | RecordKind::RunConcluded { .. }
     ) {
         return Err(RpcError::new(
             code::UNSUPPORTED_OPERATION,
             "this task is not waiting for input",
         ));
     }
-    if matches!(last.kind(), RecordKind::RunSealed { .. }) {
+    if matches!(last.kind(), RecordKind::RunConcluded { .. }) {
         return continue_sealed_task(run, &records, message);
     }
     // Search history rather than only the last record so a transport retry of
@@ -2857,7 +2857,7 @@ pub(super) fn state_from_history(
     let last = records.last()?;
     Some(match last.kind() {
         RecordKind::RunSuspended { reason } => (TaskState::InputRequired, reason.to_string()),
-        RecordKind::RunSealed { outcome, .. } => (sealed_state(outcome), outcome.clone()),
+        RecordKind::RunConcluded { outcome, .. } => (sealed_state(outcome), outcome.clone()),
         _ => (TaskState::Working, "running".to_owned()),
     })
 }
@@ -2887,7 +2887,7 @@ async fn cancel_task(
     // A sealed run is finished, and A2A has a code for exactly this. Accepting
     // the request and reporting success would tell the caller a completed run
     // is about to stop.
-    if let RecordKind::RunSealed { outcome, .. } = last.kind() {
+    if let RecordKind::RunConcluded { outcome, .. } = last.kind() {
         return Err(RpcError::new(
             code::TASK_NOT_CANCELABLE,
             format!("this task already finished as '{outcome}'"),
@@ -3138,7 +3138,7 @@ async fn push_create(
         .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
     let next_seq = if tail
         .last()
-        .is_some_and(|record| matches!(record.kind(), RecordKind::RunSealed { .. }))
+        .is_some_and(|record| matches!(record.kind(), RecordKind::RunConcluded { .. }))
     {
         head.seq
     } else {

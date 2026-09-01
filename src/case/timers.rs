@@ -27,6 +27,9 @@ use crate::core::{EffectKey, RunId, StoreError, Timer, Timestamp};
 /// Durable wake-ups.
 #[async_trait]
 pub trait TimerStore: Send + Sync + Debug {
+    /// Which tenant this handle's wake-up rows belong to.
+    fn tenant(&self) -> &str;
+
     /// Register a run's wake-up.
     ///
     /// Idempotent on `(run, effect)`: a resumed run that re-registers the same

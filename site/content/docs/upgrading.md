@@ -15,6 +15,47 @@ property that makes a hard cut acceptable at this stage.
 
 ---
 
+## `QuotaStore::accrue` is now idempotent pass settlement
+
+**Affected:** custom `QuotaStore` implementations and persisted quota schemas.
+
+Delete `accrue(period, spend)` and implement
+`settle(&QuotaSettlement)`. The key is `(run, epoch)` and the full payload is a
+receipt: an identical retry succeeds without adding spend again; a changed
+period, amount, or `release_slot` under the same key is corruption. Receipt
+insert, period accumulation, and the optional running-slot deletion must commit
+in one backend transaction. Keep `release(run)` for an admission whose journal
+batch never landed; normal run completion uses `settle`.
+
+Also implement the new required `tenant()` accessor on `QuotaStore`,
+`TimerStore`, `BatchStore`, and `AuthorityStore`. `RuntimeBuilder` now refuses
+any of those handles when scoped differently from the plane, matching its
+existing checks for journal, case, task, event, memory and push stores. There is
+no default: answering `default` by omission would let a named-tenant plane bill
+the wrong ledger, wake another tenant's timer, settle its batch, or draw its
+standing authority while every run journal itself remained correctly isolated.
+
+Add a settlement-receipt table keyed by tenant, run, and epoch. Existing
+pre-freeze stores have no receipts and must be recreated; no migration is
+provided. The journal format also adds `QuotaPassStarted`, and `RunConcluded`
+adds `live_spend`, so old journals are intentionally unreadable by this release.
+
+## `RunSealed` is now `RunConcluded`
+
+**Affected:** code matching `RecordKind::RunSealed`; persisted journals written
+by earlier pre-freeze builds; consumers treating `/runs/{id}.sealed` as “has a
+conclusion”.
+
+Rename the record variant to `RunConcluded` and recreate existing stores. A
+conclusion is not necessarily a closure: `failed` and `exhausted` remain open
+for resume, while succeeded, quarantined and cancelled runs are sealed into the
+Merkle log. The HTTP `sealed` field now reports that actual store state.
+
+Exhausted records gained `exhaustion: Option<BudgetExceeded>`. Runtime-written
+`outcome: "exhausted"` records always carry it; a hand-built exhausted record
+without it quarantines because the runtime cannot reconstruct typed control
+state from a human sentence. Non-exhausted fixtures set `exhaustion: None`.
+
 ## A served run acts as its caller; `DelegationScheme` is gone
 
 **Affected:** deployments serving A2A with `RuntimeBuilder::acting_as` set;

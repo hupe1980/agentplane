@@ -13,10 +13,11 @@
 //! throttles everybody, which is a shared ceiling wearing a per-tenant name.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Spend, Tainted, TenantId};
-use agentplane::journal::JournalStore;
-use agentplane::quota::{Period, QuotaError, QuotaStore, TenantQuota};
+use agentplane::journal::{JournalStore, RecordKind};
+use agentplane::quota::{Period, QuotaError, QuotaSettlement, QuotaStore, TenantQuota};
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
@@ -39,6 +40,84 @@ impl Skill for Work {
     }
 }
 
+/// Holds a run at a deterministic point while the test inspects accounting.
+#[derive(Debug)]
+struct BlockingWork {
+    entered: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
+}
+
+/// A separate quota backend whose first settlement is unavailable.
+#[derive(Debug)]
+struct FailsFirstSettlement {
+    inner: Arc<RedbStore>,
+    fail: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl QuotaStore for FailsFirstSettlement {
+    fn tenant(&self) -> &str {
+        QuotaStore::tenant(self.inner.as_ref())
+    }
+
+    async fn reserve(
+        &self,
+        run: agentplane::RunId,
+        limit: Option<u32>,
+        at: agentplane::core::Timestamp,
+    ) -> Result<(), QuotaError> {
+        self.inner.reserve(run, limit, at).await
+    }
+
+    async fn release(&self, run: agentplane::RunId) -> Result<(), agentplane::core::StoreError> {
+        self.inner.release(run).await
+    }
+
+    async fn set_halt(&self, reason: Option<&str>) -> Result<(), agentplane::core::StoreError> {
+        self.inner.set_halt(reason).await
+    }
+
+    async fn halted(&self) -> Result<Option<String>, agentplane::core::StoreError> {
+        self.inner.halted().await
+    }
+
+    async fn settle(
+        &self,
+        settlement: &QuotaSettlement,
+    ) -> Result<(), agentplane::core::StoreError> {
+        if self.fail.swap(false, Ordering::SeqCst) {
+            return Err(agentplane::core::StoreError::Backend(
+                "injected settlement outage".to_owned(),
+            ));
+        }
+        self.inner.settle(settlement).await
+    }
+
+    async fn spent(&self, period: &str) -> Result<Spend, agentplane::core::StoreError> {
+        self.inner.spent(period).await
+    }
+
+    async fn running(&self) -> Result<u32, agentplane::core::StoreError> {
+        self.inner.running().await
+    }
+}
+
+#[async_trait::async_trait]
+impl Skill for BlockingWork {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("blocking-work").provides("blocking-work")
+    }
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        self.entered.wait().await;
+        self.release.wait().await;
+        Ok(Outcome::done(input))
+    }
+}
+
 fn tenant(name: &str) -> TenantId {
     TenantId::new(name).expect("valid")
 }
@@ -50,6 +129,28 @@ fn plane(store: &RedbStore, name: &str, quota: TenantQuota) -> Arc<Runtime> {
         .quota(scoped as Arc<dyn QuotaStore>, quota)
         .skill(Work)
         .build()
+}
+
+/// A plane cannot reserve and bill another tenant's quota ledger.
+#[test]
+fn a_plane_refuses_another_tenants_quota_store() {
+    let base = RedbStore::open_in_memory().expect("store");
+    let journal = Arc::new(base.clone().for_tenant(tenant("acme")));
+    let quotas = Arc::new(base.for_tenant(tenant("globex")));
+
+    let result = Runtime::builder(journal as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .quota(quotas as Arc<dyn QuotaStore>, TenantQuota::default())
+        .skill(Work)
+        .try_build();
+    assert!(matches!(
+        result,
+        Err(agentplane::runtime::BuildError::StateStoreTenant {
+            store: "quota",
+            plane,
+            tenant,
+        }) if plane == "acme" && tenant == "globex"
+    ));
 }
 
 // ── Concurrency ─────────────────────────────────────────────────────────────
@@ -161,14 +262,19 @@ async fn a_tenant_that_has_spent_its_period_is_refused() {
         ..TenantQuota::default()
     };
 
-    quotas
-        .accrue("2026-08", Spend::tokens(400))
-        .await
-        .expect("accrue");
-    quotas
-        .accrue("2026-08", Spend::tokens(600))
-        .await
-        .expect("accrue again");
+    let run = agentplane::core::RunId::generate();
+    for (epoch, tokens) in [(1, 400), (2, 600)] {
+        quotas
+            .settle(&QuotaSettlement {
+                run,
+                epoch,
+                period: Some("2026-08".to_owned()),
+                spend: Spend::tokens(tokens),
+                release_slot: false,
+            })
+            .await
+            .expect("settle");
+    }
 
     let spent = quotas.spent("2026-08").await.expect("read");
     assert_eq!(
@@ -273,6 +379,49 @@ async fn a_finished_run_frees_its_slot() {
         "finished runs still hold their slots, so a ceiling of one permits one \
          run per process lifetime"
     );
+}
+
+/// Unlimited ceilings still keep the running set truthful when it is wired.
+///
+/// A deployment may wire the store only for the emergency stop today and add
+/// a concurrency limit tomorrow. `running()` must already describe the work in
+/// flight; otherwise adding the ceiling starts from a falsely empty ledger.
+#[tokio::test]
+async fn an_unlimited_wired_quota_tracks_active_runs() {
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.for_tenant(tenant("acme")));
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let rt = Runtime::builder(scoped.clone() as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .quota(
+            scoped.clone() as Arc<dyn QuotaStore>,
+            TenantQuota::default(),
+        )
+        .skill(BlockingWork {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        })
+        .build();
+
+    rt.spawn("blocking-work", Tainted::trusted(json!({})))
+        .await
+        .expect("admit");
+    entered.wait().await;
+    assert_eq!(
+        QuotaStore::running(scoped.as_ref()).await.expect("count"),
+        1,
+        "the runtime bypassed reservation because every ceiling was unlimited"
+    );
+
+    release.wait().await;
+    for _ in 0..100 {
+        if QuotaStore::running(scoped.as_ref()).await.expect("count") == 0 {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the completed run did not release its visibility slot");
 }
 
 /// redb, held to the quota contract.
@@ -497,6 +646,11 @@ fn this_period(quota: &TenantQuota) -> String {
     quota.period.key_for(agentplane::core::Timestamp::now_utc())
 }
 
+#[allow(clippy::disallowed_methods)]
+fn harness_now() -> agentplane::core::Timestamp {
+    agentplane::core::Timestamp::now_utc()
+}
+
 /// A suspend/resume cycle accrues each token once, not once per pass.
 ///
 /// The run's own budget deliberately re-bills replayed history so a resume
@@ -601,6 +755,174 @@ async fn a_strict_pass_accrues_no_spend() {
     );
 }
 
+/// A settlement outage leaves a retryable lease, never a missing or double bill.
+#[tokio::test]
+async fn a_failed_quota_settlement_is_recovered_exactly_once() {
+    use agentplane::runtime::{MIN_LEASE_TTL, Mode};
+
+    let quota = TenantQuota {
+        max_concurrent_runs: Some(1),
+        max_tokens_per_period: Some(1_000_000),
+        ..TenantQuota::default()
+    };
+    let store = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant("acme")),
+    );
+    let quotas = Arc::new(FailsFirstSettlement {
+        inner: Arc::clone(&store),
+        fail: AtomicBool::new(true),
+    });
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .owner("settlement-recovery")
+        .lease_ttl(MIN_LEASE_TTL)
+        .quota(quotas.clone() as Arc<dyn QuotaStore>, quota)
+        .skill(SpendsOnce)
+        .build();
+
+    let error = rt
+        .run("spends-once", Tainted::trusted(json!({})))
+        .await
+        .expect_err("the injected settlement outage must reach the caller");
+    let run = match error {
+        agentplane::core::RuntimeError::QuotaSettlementPending { run, .. } => {
+            agentplane::RunId::parse(&run).expect("runtime wrote a run id")
+        }
+        other => panic!("wrong settlement failure: {other}"),
+    };
+    assert_eq!(quotas.running().await.expect("running"), 1);
+
+    let records = store.read(run, 1).await.expect("records");
+    let period = records
+        .iter()
+        .find_map(|record| match record.kind() {
+            RecordKind::QuotaPassStarted { period, .. } => period.clone(),
+            _ => None,
+        })
+        .expect("the pass period is durable before effects");
+    let pass_seq = records
+        .iter()
+        .find(|record| matches!(record.kind(), RecordKind::QuotaPassStarted { .. }))
+        .expect("quota pass")
+        .body
+        .seq;
+    let effect_seq = records
+        .iter()
+        .find(|record| matches!(record.kind(), RecordKind::EffectStarted { .. }))
+        .expect("paid effect")
+        .body
+        .seq;
+    assert!(
+        pass_seq < effect_seq,
+        "the paid effect became durable before the period its spend belongs to"
+    );
+    assert!(
+        store.inclusion_proof(run).await.expect("proof").is_none(),
+        "the run sealed before its quota settlement was acknowledged"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let report = rt
+        .sweep(harness_now(), std::time::Duration::ZERO)
+        .await
+        .expect("recovery sweep");
+    assert_eq!(report.runs_recovered, 1, "{report:?}");
+    assert_eq!(quotas.running().await.expect("running"), 0);
+    assert_eq!(quotas.spent(&period).await.expect("spent").tokens, 100);
+    assert!(store.inclusion_proof(run).await.expect("proof").is_some());
+
+    rt.replay(run, Mode::Resume)
+        .await
+        .expect("idempotent resume");
+    assert_eq!(
+        quotas.spent(&period).await.expect("spent").tokens,
+        100,
+        "retrying a settled pass charged it twice"
+    );
+}
+
+/// Repairing accounting is not permission to retry a failed business run.
+#[tokio::test]
+async fn settlement_recovery_preserves_an_open_failure() {
+    use agentplane::runtime::MIN_LEASE_TTL;
+
+    let quota = TenantQuota {
+        max_concurrent_runs: Some(1),
+        max_tokens_per_period: Some(1_000_000),
+        ..TenantQuota::default()
+    };
+    let store = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant("acme")),
+    );
+    let quotas = Arc::new(FailsFirstSettlement {
+        inner: Arc::clone(&store),
+        fail: AtomicBool::new(true),
+    });
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .owner("failed-settlement-recovery")
+        .lease_ttl(MIN_LEASE_TTL)
+        .quota(quotas.clone() as Arc<dyn QuotaStore>, quota)
+        .skill(SpendsThenFails)
+        .build();
+
+    let error = rt
+        .run("spends-then-fails", Tainted::trusted(json!({})))
+        .await
+        .expect_err("the injected settlement outage must reach the caller");
+    let run = match error {
+        agentplane::core::RuntimeError::QuotaSettlementPending { run, .. } => {
+            agentplane::RunId::parse(&run).expect("runtime wrote a run id")
+        }
+        other => panic!("wrong settlement failure: {other}"),
+    };
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let report = rt
+        .sweep(harness_now(), std::time::Duration::ZERO)
+        .await
+        .expect("recovery sweep");
+    assert_eq!(report.runs_recovered, 1, "{report:?}");
+
+    let records = store.read(run, 1).await.expect("records");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.kind(), RecordKind::QuotaPassStarted { .. }))
+            .count(),
+        1,
+        "settlement recovery started a second execution pass"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.kind(), RecordKind::RunConcluded { .. }))
+            .count(),
+        1,
+        "settlement recovery concluded the failed business work again"
+    );
+    assert!(matches!(
+        rt.recorded_outcome(run).await.expect("outcome").map(|out| out.status),
+        Some(RunStatus::Failed(reason)) if reason == "the work itself failed"
+    ));
+    let period = records
+        .iter()
+        .find_map(|record| match record.kind() {
+            RecordKind::QuotaPassStarted { period, .. } => period.as_deref(),
+            _ => None,
+        })
+        .expect("period");
+    assert_eq!(quotas.spent(period).await.expect("spent").tokens, 100);
+    assert!(
+        store.inclusion_proof(run).await.expect("proof").is_none(),
+        "a resumable failure was physically sealed during accounting recovery"
+    );
+}
+
 /// Spends 100 tokens and finishes — the strict test's fixture.
 #[derive(Debug)]
 struct SpendsOnce;
@@ -617,5 +939,24 @@ impl Skill for SpendsOnce {
     ) -> Result<Outcome, SkillError> {
         cx.effect(Costs(100)).await?;
         Ok(Outcome::done(Tainted::trusted(json!({"ok": true}))))
+    }
+}
+
+/// Spends once and reaches an ordinary resumable failure.
+#[derive(Debug)]
+struct SpendsThenFails;
+
+#[async_trait::async_trait]
+impl Skill for SpendsThenFails {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("spends-then-fails").provides("spends-then-fails")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.effect(Costs(100)).await?;
+        Ok(Outcome::fail("the work itself failed"))
     }
 }

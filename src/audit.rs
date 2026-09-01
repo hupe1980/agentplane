@@ -387,7 +387,7 @@ fn has_sealing_conclusion(records: &[Record]) -> bool {
         .iter()
         .rev()
         .find_map(|r| match r.kind() {
-            crate::journal::RecordKind::RunSealed { outcome, .. } => Some(outcome.as_str()),
+            crate::journal::RecordKind::RunConcluded { outcome, .. } => Some(outcome.as_str()),
             _ => None,
         })
         .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o))
@@ -518,7 +518,7 @@ fn seal_claim_holds(records: &[Record]) -> bool {
         .iter()
         .rev()
         .find_map(|r| match r.kind() {
-            crate::journal::RecordKind::RunSealed { chain_head, .. } => {
+            crate::journal::RecordKind::RunConcluded { chain_head, .. } => {
                 Some(*chain_head == r.prev_hash)
             }
             _ => None,

@@ -18,8 +18,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentplane::case::{CaseStore, EventStore};
 use agentplane::core::{
-    AwaitSpec, CorrelationKey, DeadlineSpec, Digest, InboundEvent, Outcome, PolicyBundleIdentity,
-    PolicyDecision, PolicyEngine, PolicyRequest, Skill, SkillDescriptor, SkillError, Tainted,
+    AwaitSpec, BudgetExceeded, CorrelationKey, DeadlineSpec, Digest, InboundEvent, Outcome,
+    PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest, Skill, SkillDescriptor,
+    SkillError, StepError, Tainted,
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{Admission, RunStatus, Runtime, StepCtx};
@@ -101,6 +102,28 @@ impl Skill for AlwaysFails {
     }
 }
 
+/// Stops on a budget so duplicate admission has to preserve a typed pause.
+#[derive(Debug)]
+struct Exhausts;
+
+#[async_trait::async_trait]
+impl Skill for Exhausts {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("exhausts").provides("demo.exhausts")
+    }
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        Err(StepError::Budget(BudgetExceeded::Effects {
+            allowed: 3,
+            used: 3,
+        })
+        .into())
+    }
+}
+
 /// Denies admission while `deny` is set, so the same call can be refused and
 /// then permitted without rebuilding the plane.
 #[derive(Debug, Default)]
@@ -139,6 +162,7 @@ fn fixture() -> Fixture {
         .skill(Counts(Arc::clone(&runs)))
         .skill(WaitsForApproval(Arc::clone(&runs)))
         .skill(AlwaysFails)
+        .skill(Exhausts)
         .build();
     Fixture { rt, store, runs }
 }
@@ -327,6 +351,45 @@ async fn a_failed_run_still_holds_its_key() {
         outcome.reason()
     );
     assert_eq!(again.run_id(), first.run_id());
+}
+
+/// A duplicate sees exhaustion as the resumable pause it is, not as a fault.
+#[tokio::test]
+async fn an_exhausted_run_keeps_its_typed_status_on_redelivery() {
+    let f = fixture();
+    let key = dedup_key("urn:test:bus", "EV-exhausted");
+
+    let first =
+        f.rt.run_once("demo.exhausts", Tainted::trusted(json!({})), &key)
+            .await
+            .unwrap();
+    assert!(matches!(
+        first,
+        Admission::Fresh(ref outcome)
+            if matches!(outcome.status, RunStatus::Exhausted(BudgetExceeded::Effects {
+                allowed: 3,
+                used: 3,
+            }))
+    ));
+
+    let again =
+        f.rt.run_once("demo.exhausts", Tainted::trusted(json!({})), &key)
+            .await
+            .unwrap();
+    let Admission::Replayed(outcome) = again else {
+        panic!("an exhausted run is a resting point and must answer its redelivery");
+    };
+    assert!(
+        matches!(
+            outcome.status,
+            RunStatus::Exhausted(BudgetExceeded::Effects {
+                allowed: 3,
+                used: 3,
+            })
+        ),
+        "string-only conclusion reconstruction collapsed exhaustion into a failure: {:?}",
+        outcome.status
+    );
 }
 
 /// Two different messages are two runs.

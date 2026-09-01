@@ -71,6 +71,10 @@ fn is_open(has_outcome: u8, outcome: &str) -> bool {
 
 #[async_trait]
 impl BatchStore for RedbStore {
+    fn tenant(&self) -> &str {
+        crate::journal::JournalStore::tenant(self)
+    }
+
     async fn open(&self, id: BatchId, plan_digest: &str) -> Result<(), StoreError> {
         let tenant = self.tenant_name();
         let (key, digest) = (id.to_string(), plan_digest.to_owned());

@@ -712,7 +712,7 @@ async fn a_wait_in_a_later_step_resumes_and_completes() {
 
     let records = store.read(out.run_id, 1).await.unwrap();
     let sealed = records.iter().any(
-        |r| matches!(r.kind(), RecordKind::RunSealed { outcome, .. } if outcome == "succeeded"),
+        |r| matches!(r.kind(), RecordKind::RunConcluded { outcome, .. } if outcome == "succeeded"),
     );
     assert!(
         sealed,

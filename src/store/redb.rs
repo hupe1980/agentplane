@@ -757,7 +757,7 @@ impl JournalStore for RedbStore {
                     let is_start =
                         matches!(body.kind, crate::journal::RecordKind::EffectStarted { .. });
                     let (conclusion, claimed) = match &body.kind {
-                        crate::journal::RecordKind::RunSealed { outcome, .. } => {
+                        crate::journal::RecordKind::RunConcluded { outcome, .. } => {
                             (Some(outcome.clone()), None)
                         }
                         crate::journal::RecordKind::RunAdmitted {

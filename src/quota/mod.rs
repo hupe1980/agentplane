@@ -43,6 +43,13 @@
 //! deployment sets. A tighter cap would mean consulting the store on every
 //! effect, which buys exactness at the cost of a round trip per step.
 //!
+//! One live execution pass belongs to the period in which it starts. Admission
+//! checks that period and settlement accrues the pass's spend to the same key,
+//! even if midnight or month-end passes while work is running. A later resume
+//! is a new pass in the period in which it resumes. Without that identity a run
+//! can be authorized against the old period and charged to the new one, leaving
+//! both ledgers wrong in opposite directions.
+//!
 //! # The window is a billing period, not an arbitrary bucket
 //!
 //! Fixed windows are usually criticised for boundary amplification: spend the
@@ -58,6 +65,26 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 
 use crate::core::{RunId, Spend, StoreError, Timestamp};
+
+/// One live execution pass to settle exactly once.
+///
+/// `epoch` is the pass identity: every takeover receives a new fencing epoch,
+/// so suspension/resume and crash recovery cannot collide with an earlier
+/// charge from the same run. A store keeps the full payload as a receipt;
+/// repeating the same settlement is a no-op, while changing any field under an
+/// existing key is corruption rather than a second charge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaSettlement {
+    pub run: RunId,
+    pub epoch: u64,
+    pub period: Option<String>,
+    pub spend: Spend,
+    /// Whether this pass took the run's admission slot.
+    ///
+    /// Fresh admission does; resume does not. Settlement removes the slot in
+    /// the same transaction that records the receipt and accrues spend.
+    pub release_slot: bool,
+}
 
 /// What one tenant may consume.
 ///
@@ -175,6 +202,13 @@ impl From<StoreError> for QuotaError {
 /// deployment gets it from the backend it already wired.
 #[async_trait]
 pub trait QuotaStore: Send + Sync + Debug {
+    /// Which tenant this handle accounts for.
+    ///
+    /// Required with no default: a plane and quota store scoped differently
+    /// work perfectly while reserving and billing the wrong tenant, so the
+    /// mismatch must be refused at build rather than inferred from behavior.
+    fn tenant(&self) -> &str;
+
     /// Take a concurrency slot for `run`, or refuse.
     ///
     /// **Must count and insert in one transaction.** A read followed by a write
@@ -196,7 +230,11 @@ pub trait QuotaStore: Send + Sync + Debug {
         at: Timestamp,
     ) -> Result<(), QuotaError>;
 
-    /// Give the slot back. Idempotent.
+    /// Give back a reservation whose admission journal never landed. Idempotent.
+    ///
+    /// Normal pass completion MUST use [`settle`](Self::settle), which couples
+    /// release to the receipt and spend transaction. This separate verb exists
+    /// only for the pre-journal admission cleanup path.
     ///
     /// # Errors
     ///
@@ -226,12 +264,23 @@ pub trait QuotaStore: Send + Sync + Debug {
     /// If the store cannot be reached.
     async fn halted(&self) -> Result<Option<String>, StoreError>;
 
-    /// Add to what this tenant has spent in `period`.
+    /// Settle one live pass exactly once.
+    ///
+    /// The receipt, spend accrual, and admission-slot release MUST commit in one
+    /// transaction. Repeating an identical settlement MUST succeed without
+    /// accruing again. Reusing `(run, epoch)` with a different period, spend, or
+    /// slot flag MUST fail as corruption: accepting it makes retries a way to
+    /// rewrite the bill.
+    ///
+    /// `period: None` records the receipt and releases the slot without adding a
+    /// billing total, which is the correct shape when only concurrency or halt
+    /// is configured.
     ///
     /// # Errors
     ///
-    /// If the store cannot be reached.
-    async fn accrue(&self, period: &str, spend: Spend) -> Result<(), StoreError>;
+    /// If the store cannot be reached or the pass key already names a different
+    /// settlement.
+    async fn settle(&self, settlement: &QuotaSettlement) -> Result<(), StoreError>;
 
     /// What this tenant has spent in `period`.
     ///
@@ -244,6 +293,9 @@ pub trait QuotaStore: Send + Sync + Debug {
     ///
     /// For an operator answering "why is my tenant being throttled?", which a
     /// refusal alone does not answer.
+    /// A runtime with this store wired records active runs even when every
+    /// configured ceiling is `None`, so the answer stays truthful before a
+    /// limit is introduced and while the store is used only for emergency halt.
     ///
     /// # Errors
     ///

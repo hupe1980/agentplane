@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::core::{RunId, Spend, StoreError, Timestamp};
-use crate::quota::{QuotaError, QuotaStore};
+use crate::quota::{QuotaError, QuotaSettlement, QuotaStore};
 
 use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
@@ -25,6 +25,16 @@ const RUNNING: TableDefinition<(&str, &str), i64> = TableDefinition::new("quota_
 /// `(tenant, period) -> (tokens, minor_units)`.
 const SPENT: TableDefinition<(&str, &str), (u64, u64)> = TableDefinition::new("quota_spent");
 
+/// `(tenant, run, epoch) -> (period, tokens, minor_units, release_slot)`.
+///
+/// The receipt makes a lost acknowledgement retryable without charging twice.
+/// Empty `period` means this pass had no spend ceiling; period keys themselves
+/// are never empty.
+type SettlementKey<'a> = (&'a str, &'a str, u64);
+type SettlementReceipt<'a> = (&'a str, u64, u64, u8);
+const SETTLED: TableDefinition<SettlementKey<'static>, SettlementReceipt<'static>> =
+    TableDefinition::new("quota_settled");
+
 /// `tenant -> reason`. The emergency stop.
 ///
 /// One row per halted tenant and nothing for the rest, so the check is a point
@@ -36,6 +46,10 @@ const HALTED: TableDefinition<&str, &str> = TableDefinition::new("quota_halted")
 
 #[async_trait]
 impl QuotaStore for RedbStore {
+    fn tenant(&self) -> &str {
+        crate::journal::JournalStore::tenant(self)
+    }
+
     async fn reserve(
         &self,
         run: RunId,
@@ -171,28 +185,73 @@ impl QuotaStore for RedbStore {
         .await
     }
 
-    async fn accrue(&self, period: &str, spend: Spend) -> Result<(), StoreError> {
+    async fn settle(&self, settlement: &QuotaSettlement) -> Result<(), StoreError> {
         let tenant = self.tenant_name();
-        let period = period.to_owned();
+        let settlement = settlement.clone();
         self.with_db(move |db| {
             let w = begin_write(db)?;
-            {
+            let run = settlement.run.to_string();
+            let period = settlement.period.as_deref().unwrap_or("");
+            let receipt = (
+                period,
+                settlement.spend.tokens,
+                settlement.spend.minor_units,
+                u8::from(settlement.release_slot),
+            );
+            let fresh = {
+                let mut settled = w.open_table(SETTLED).map_err(|e| be(&e))?;
+                let stored = settled
+                    .get((tenant.as_str(), run.as_str(), settlement.epoch))
+                    .map_err(|e| be(&e))?
+                    .map(|value| {
+                        let (period, tokens, minor_units, release_slot) = value.value();
+                        (period.to_owned(), tokens, minor_units, release_slot)
+                    });
+                match stored {
+                    Some(stored)
+                        if stored != (period.to_owned(), receipt.1, receipt.2, receipt.3) =>
+                    {
+                        return Err(StoreError::Corrupt {
+                            seq: 0,
+                            detail: format!(
+                                "quota pass {run}/{} was settled twice with different payloads",
+                                settlement.epoch
+                            ),
+                        });
+                    }
+                    Some(_) => false,
+                    None => {
+                        settled
+                            .insert((tenant.as_str(), run.as_str(), settlement.epoch), receipt)
+                            .map_err(|e| be(&e))?;
+                        true
+                    }
+                }
+            };
+            if !fresh {
+                w.commit().map_err(|e| be(&e))?;
+                return Ok(());
+            }
+            if let Some(period) = settlement.period.as_deref() {
                 let mut totals = w.open_table(SPENT).map_err(|e| be(&e))?;
                 let (tokens, minor) = totals
-                    .get((tenant.as_str(), period.as_str()))
+                    .get((tenant.as_str(), period))
                     .map_err(|e| be(&e))?
                     .map_or((0, 0), |v| v.value());
                 totals
                     .insert(
-                        (tenant.as_str(), period.as_str()),
-                        // Saturating: a spend total that wraps would report a
-                        // tenant at zero after enough usage, which is a ceiling
-                        // that disappears once it matters most.
+                        (tenant.as_str(), period),
                         (
-                            tokens.saturating_add(spend.tokens),
-                            minor.saturating_add(spend.minor_units),
+                            tokens.saturating_add(settlement.spend.tokens),
+                            minor.saturating_add(settlement.spend.minor_units),
                         ),
                     )
+                    .map_err(|e| be(&e))?;
+            }
+            if settlement.release_slot {
+                w.open_table(RUNNING)
+                    .map_err(|e| be(&e))?
+                    .remove((tenant.as_str(), run.as_str()))
                     .map_err(|e| be(&e))?;
             }
             w.commit().map_err(|e| be(&e))?;

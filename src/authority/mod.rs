@@ -340,6 +340,9 @@ impl From<StoreError> for AuthorityError {
 /// is exactly when a shared ceiling was needed.
 #[async_trait]
 pub trait AuthorityStore: Send + Sync + Debug {
+    /// Which tenant this handle's standing authorities belong to.
+    fn tenant(&self) -> &str;
+
     /// Record a new authority.
     ///
     /// Idempotent for an identical re-issue and refused for a differing one —

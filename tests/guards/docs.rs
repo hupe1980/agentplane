@@ -377,16 +377,40 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
 /// it means.
 const NAMED_EXTERNAL: &[&str] = &["RFC", "C2SP", "A2A", "MCP", "CloudEvents"];
 
-/// Whether a line names the internal design document itself.
+/// The internal design documents, by file name.
+///
+/// The name alone is the needle, so both a bare sibling reference and a
+/// `concepts/`-prefixed path are caught. The folder name is deliberately *not*
+/// on this list: the published site serves `/docs/concepts/`, and a needle that
+/// coarse fails on the README link to it. `README.md` and `CHANGELOG.md` are
+/// absent for the same reason in reverse — those ship.
+const INTERNAL_DOCUMENTS: &[&str] = &[
+    "OVERVIEW.md",
+    "INVARIANTS.md",
+    "EXECUTION.md",
+    "STATE.md",
+    "AUTHORITY.md",
+    "INTEGRITY.md",
+    "INTEROP.md",
+    "OPERATIONS.md",
+    "ASSURANCE.md",
+    "LANDSCAPE.md",
+    "DECISIONS.md",
+    "REFERENCES.md",
+    "ROADMAP.md",
+];
+
+/// Whether a line names one of the internal design documents.
 ///
 /// The sibling detector below catches a bare `§11.1`. This catches the other
-/// half of the same leak: naming or linking `CONCEPT.md`, which is not in the
-/// release tarball and is not on the site, so every such reference is a dead
-/// link for the only people who read these pages. It is easy to write while
-/// editing, because the file is open in the author's editor and resolves fine
-/// there — which is precisely why a guard rather than a habit.
+/// half of the same leak: naming or linking a document under `concepts/`, which
+/// is not in the release tarball and is not on the site, so every such
+/// reference is a dead link for the only people who read these pages. It is
+/// easy to write while editing, because the file is open in the author's editor
+/// and resolves fine there — which is precisely why a guard rather than a
+/// habit.
 fn names_internal_document(line: &str) -> bool {
-    line.contains("CONCEPT.md")
+    INTERNAL_DOCUMENTS.iter().any(|doc| line.contains(doc))
 }
 
 /// Whether a line cites a section of a document the reader does not have.
@@ -464,16 +488,20 @@ fn nothing_a_reader_sees_cites_an_internal_section_number() {
         "the detector fires on a line containing no section reference"
     );
     assert!(
-        names_internal_document("see https://github.com/x/y/blob/main/CONCEPT.md"),
-        "the detector does not recognise a link to the internal document"
+        names_internal_document("see https://github.com/x/y/blob/main/concepts/AUTHORITY.md"),
+        "the detector does not recognise a link to an internal document"
     );
     assert!(
-        names_internal_document("/// the reasoning is in CONCEPT.md"),
-        "the detector does not recognise the internal document by name"
+        names_internal_document("/// the reasoning is in AUTHORITY.md"),
+        "the detector does not recognise an internal document by its bare name"
     );
     assert!(
         !names_internal_document("/// the reasoning is stated at the mechanism"),
         "the detector fires on a line naming no document"
+    );
+    assert!(
+        !names_internal_document("/// the release notes are in CHANGELOG.md"),
+        "the detector flags a document that ships"
     );
 
     // `src` is what reaches docs.rs, but the repository is public and an

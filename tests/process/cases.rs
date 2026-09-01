@@ -1156,7 +1156,7 @@ async fn a_sweep_records_what_it_did_in_a_sealed_run() {
     assert!(
         records
             .iter()
-            .any(|r| matches!(r.kind(), RecordKind::RunSealed { .. })),
+            .any(|r| matches!(r.kind(), RecordKind::RunConcluded { .. })),
         "the sweep's record was left open, so it never enters the Merkle log"
     );
 
@@ -1212,11 +1212,11 @@ async fn a_sweep_whose_evidence_fails_to_write_is_flagged_not_silent() {
         .unwrap();
 
     // The notes land and the breach is applied — but the sweep's own record
-    // cannot be *closed*: the `RunSealed` append fails, so the decisions sit
+    // cannot be *closed*: the `RunConcluded` append fails, so the decisions sit
     // in an open run no checkpoint will ever commit to.
     let journal: Arc<dyn JournalStore> = Arc::new(Faulty::new(
         Arc::clone(&inner) as Arc<dyn JournalStore>,
-        Schedule::healthy().on_kind("RunSealed", Fault::FailedClean),
+        Schedule::healthy().on_kind("RunConcluded", Fault::FailedClean),
     ));
     let rt = Runtime::builder(journal).cases(Arc::clone(&cases)).build();
 
@@ -1333,6 +1333,10 @@ async fn sweep_evidence_survives_a_later_phase_failure() {
 
     #[async_trait::async_trait]
     impl agentplane::case::TimerStore for ClaimFails {
+        fn tenant(&self) -> &str {
+            agentplane::core::TenantId::DEFAULT
+        }
+
         async fn arm(&self, _: &Timer) -> Result<(), StoreError> {
             Ok(())
         }

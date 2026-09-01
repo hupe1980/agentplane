@@ -233,10 +233,12 @@ async fn an_unrecognised_recorded_outcome_refuses_resume() {
             lease.epoch,
             vec![Append::new(
                 run,
-                RecordKind::RunSealed {
+                RecordKind::RunConcluded {
                     outcome: "swept".to_owned(),
                     chain_head: agentplane::core::Digest::ZERO,
                     reason: None,
+                    exhaustion: None,
+                    live_spend: agentplane::core::Spend::default(),
                 },
             )],
         )

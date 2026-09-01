@@ -472,6 +472,7 @@ pub const SEALED_OUTCOMES: &[&str] = &[
 struct Admitted {
     run: RunId,
     epoch: crate::core::Epoch,
+    quota: QuotaPass,
     budget: Budget,
     agent: String,
     plan: PlanIR,
@@ -480,6 +481,66 @@ struct Admitted {
     /// The chain admission bound — the caller's where one was presented,
     /// the plane's otherwise — and what every step of this run acts under.
     identity: Option<crate::core::Delegation>,
+}
+
+/// The quota identity of one live execution pass.
+///
+/// Captured once at admission or resume and carried to settlement. Computing
+/// the period again after the work finishes can cross a day or month boundary,
+/// authorizing against one ledger and charging another.
+#[derive(Debug, Clone, Default)]
+struct QuotaPass {
+    period: Option<String>,
+    enabled: bool,
+    release_slot: bool,
+}
+
+impl QuotaPass {
+    fn at(
+        quota: &crate::quota::TenantQuota,
+        at: crate::core::Timestamp,
+        release_slot: bool,
+    ) -> Self {
+        Self {
+            period: quota.bounds_spend().then(|| quota.period.key_for(at)),
+            enabled: true,
+            release_slot,
+        }
+    }
+
+    const fn disabled() -> Self {
+        Self {
+            period: None,
+            enabled: false,
+            release_slot: false,
+        }
+    }
+
+    fn period(&self) -> Option<&str> {
+        self.period.as_deref()
+    }
+
+    fn started(&self) -> Option<RecordKind> {
+        self.enabled.then(|| RecordKind::QuotaPassStarted {
+            period: self.period.clone(),
+            release_slot: self.release_slot,
+        })
+    }
+
+    fn settlement(
+        &self,
+        run: RunId,
+        epoch: crate::core::Epoch,
+        spend: Spend,
+    ) -> Option<crate::quota::QuotaSettlement> {
+        self.enabled.then(|| crate::quota::QuotaSettlement {
+            run,
+            epoch,
+            period: self.period.clone(),
+            spend,
+            release_slot: self.release_slot,
+        })
+    }
 }
 
 /// The peers a plane may call, and how it reaches them.
@@ -1028,9 +1089,11 @@ impl Runtime {
                 epoch,
                 vec![Append::new(
                     run,
-                    RecordKind::RunSealed {
+                    RecordKind::RunConcluded {
                         outcome: BREAK_GLASS_OUTCOME.to_owned(),
                         reason: Some(reason.to_owned()),
+                        exhaustion: None,
+                        live_spend: Spend::default(),
                         chain_head: head.hash,
                     },
                 )],
@@ -1171,10 +1234,15 @@ impl Runtime {
     /// deliberate — re-checking a quota during replay would let a run that
     /// happened produce a different history when it is re-read, and a ceiling
     /// crossed since admission would rewrite the past into a refusal.
-    async fn check_quota(&self, run: RunId) -> Result<(), RuntimeError> {
+    async fn check_quota(
+        &self,
+        run: RunId,
+        at: crate::core::Timestamp,
+    ) -> Result<QuotaPass, RuntimeError> {
         let Some(quotas) = self.quotas.as_ref() else {
-            return Ok(());
+            return Ok(QuotaPass::disabled());
         };
+        let pass = QuotaPass::at(&self.quota, at, true);
 
         // The halt is checked **before** the unlimited shortcut, because an
         // emergency stop is not a ceiling and a tenant with no ceilings is
@@ -1199,49 +1267,240 @@ impl Runtime {
             }
         }
 
-        if self.quota.is_unlimited() {
-            return Ok(());
-        }
-
-        if self.quota.bounds_spend() {
-            let period = self.quota.period.key_for(now_for_admission());
-            let spent = quotas.spent(&period).await.map_err(|e| {
+        if let Some(period) = pass.period() {
+            let spent = quotas.spent(period).await.map_err(|e| {
                 RuntimeError::QuotaExceeded(crate::quota::QuotaError::Unavailable(e.to_string()))
             })?;
-            crate::quota::check_spend(self.tenant.as_str(), &period, &self.quota, spent)
+            crate::quota::check_spend(self.tenant.as_str(), period, &self.quota, spent)
                 .map_err(RuntimeError::QuotaExceeded)?;
         }
 
         quotas
-            .reserve(run, self.quota.max_concurrent_runs, now_for_admission())
+            .reserve(run, self.quota.max_concurrent_runs, at)
             .await
-            .map_err(RuntimeError::QuotaExceeded)
+            .map_err(RuntimeError::QuotaExceeded)?;
+        Ok(pass)
     }
 
-    /// Give back the slot and record what the run spent.
+    /// Atomically settle this pass's spend and admission slot.
     ///
-    /// Best-effort, and deliberately so: the work is done and journaled by the
-    /// time this runs, and turning a bookkeeping failure into a run failure
-    /// would convert a tidiness problem into a correctness one. A slot that is
-    /// not released is attributable — the table names the run — so an operator
-    /// can see a stranded one rather than a counter that has silently drifted.
-    async fn settle_quota(&self, run: RunId, spend: Spend) {
+    /// Required before physical sealing and lease release. A failure keeps the
+    /// lease owned so the abandonment sweep retries from journal evidence; a
+    /// best-effort write here would turn a transient store outage into permanent
+    /// under-accounting. The period is the one captured when this pass started,
+    /// never recomputed here.
+    async fn settle_quota(
+        &self,
+        run: RunId,
+        epoch: crate::core::Epoch,
+        spend: Spend,
+        pass: &QuotaPass,
+    ) -> Result<(), RuntimeError> {
+        if !pass.enabled {
+            return Ok(());
+        }
         let Some(quotas) = self.quotas.as_ref() else {
-            return;
+            return Ok(());
         };
-        if let Err(e) = quotas.release(run).await {
-            tracing::debug!(%run, error = %e, "could not release the quota slot");
+        let settlement = pass
+            .settlement(run, epoch, spend)
+            .expect("an enabled quota pass has a settlement");
+        quotas
+            .settle(&settlement)
+            .await
+            .map_err(|error| RuntimeError::QuotaSettlementPending {
+                run: run.to_string(),
+                epoch,
+                detail: error.to_string(),
+            })
+    }
+
+    /// Release a reservation for an admission whose journal never existed.
+    pub(crate) async fn release_empty_quota_reservation(
+        &self,
+        run: RunId,
+    ) -> Result<(), crate::core::StoreError> {
+        match self.quotas.as_ref() {
+            Some(quotas) => quotas.release(run).await,
+            None => Ok(()),
         }
-        if self.quota.bounds_spend() {
-            let period = self.quota.period.key_for(now_for_admission());
-            if let Err(e) = quotas.accrue(&period, spend).await {
-                tracing::warn!(
-                    %run, error = %e,
-                    "could not record this run's spend against the tenant ceiling — \
-                     the period will under-count"
-                );
+    }
+
+    /// Settle every quota pass present in history, idempotently.
+    ///
+    /// Reached before a resume can dispatch. A normally settled pass is a cheap
+    /// receipt lookup; a pass whose process died is accrued here. Conclusions
+    /// carry the exact in-memory live total, including a known outcome whose
+    /// terminal effect record failed before a later append recovered. An
+    /// unconcluded crash has only durable terminal effect records to sum.
+    async fn settle_recorded_quota_passes(
+        &self,
+        run: RunId,
+        records: &[Record],
+    ) -> Result<(), RuntimeError> {
+        let Some(quotas) = self.quotas.as_ref() else {
+            if records
+                .iter()
+                .any(|record| matches!(record.kind(), RecordKind::QuotaPassStarted { .. }))
+            {
+                return Err(RuntimeError::PlanContract(
+                    "this run has unsettled quota passes but the resuming plane has no quota store"
+                        .to_owned(),
+                ));
             }
+            return Ok(());
+        };
+
+        for record in records {
+            let RecordKind::QuotaPassStarted {
+                period,
+                release_slot,
+            } = record.kind()
+            else {
+                continue;
+            };
+            let epoch = record.body.epoch;
+            let spend = records
+                .iter()
+                .rev()
+                .find_map(|candidate| (candidate.body.epoch == epoch).then_some(candidate.kind()))
+                .and_then(|kind| match kind {
+                    RecordKind::RunConcluded { live_spend, .. } => Some(*live_spend),
+                    _ => None,
+                })
+                .unwrap_or_else(|| spend_recorded_in_epoch(records, epoch));
+            quotas
+                .settle(&crate::quota::QuotaSettlement {
+                    run,
+                    epoch,
+                    period: period.clone(),
+                    spend,
+                    release_slot: *release_slot,
+                })
+                .await
+                .map_err(|error| RuntimeError::QuotaSettlementPending {
+                    run: run.to_string(),
+                    epoch,
+                    detail: error.to_string(),
+                })?;
         }
+        Ok(())
+    }
+
+    /// Repair quota receipts before abandonment recovery continues.
+    ///
+    /// Returns a recorded conclusion only when the abandoned pass itself
+    /// carried quota intent. That is settlement recovery, not permission to
+    /// retry failed business work; an ordinary crashed run with no such marker
+    /// continues through replay as before.
+    async fn recover_quota_before_resume(
+        &self,
+        run: RunId,
+        records: &[Record],
+        lease: &crate::journal::Lease,
+        recovering: bool,
+    ) -> Result<Option<RunOutcome>, RuntimeError> {
+        self.settle_recorded_quota_passes(run, records).await?;
+        if !recovering {
+            return Ok(None);
+        }
+        let Some(last) = records.last() else {
+            return Ok(None);
+        };
+        let same_quota_pass = records.iter().any(|record| {
+            record.body.epoch == last.body.epoch
+                && matches!(record.kind(), RecordKind::QuotaPassStarted { .. })
+        });
+        let RecordKind::RunConcluded {
+            outcome,
+            reason,
+            exhaustion,
+            ..
+        } = last.kind()
+        else {
+            return Ok(None);
+        };
+        if !same_quota_pass {
+            return Ok(None);
+        }
+
+        let status = recorded_status(outcome, reason.as_deref(), exhaustion.as_ref(), records);
+        let chain_head = if SEALED_OUTCOMES.contains(&outcome.as_str()) {
+            self.store
+                .seal(run, lease.epoch, outcome)
+                .await
+                .map_err(RuntimeError::from_store)?
+        } else {
+            self.store
+                .head(run)
+                .await
+                .map_err(RuntimeError::from_store)?
+                .hash
+        };
+        Ok(Some(RunOutcome {
+            run_id: run,
+            status,
+            chain_head,
+            spend: Spend::default(),
+            output: None,
+        }))
+    }
+
+    /// Return a closed run without continuing it, repairing a missing physical
+    /// seal when a crash landed after the conclusion append.
+    async fn closed_resume_outcome(
+        &self,
+        run: RunId,
+        records: &[Record],
+        lease: &crate::journal::Lease,
+    ) -> Result<Option<RunOutcome>, RuntimeError> {
+        let Some(status) = resume_is_closed(records) else {
+            return Ok(None);
+        };
+        let outcome = recorded_conclusion(records).unwrap_or_else(|| status.as_str().to_owned());
+        let chain_head = if SEALED_OUTCOMES.contains(&outcome.as_str()) {
+            self.store
+                .seal(run, lease.epoch, &outcome)
+                .await
+                .map_err(RuntimeError::from_store)?
+        } else {
+            self.store
+                .head(run)
+                .await
+                .map_err(RuntimeError::from_store)?
+                .hash
+        };
+        Ok(Some(RunOutcome {
+            run_id: run,
+            status,
+            chain_head,
+            output: None,
+            spend: Spend::default(),
+        }))
+    }
+
+    /// Open the quota identity of the live tail a resume is about to execute.
+    async fn start_replay_quota_pass(
+        &self,
+        run: RunId,
+        mode: Mode,
+        lease: Option<&crate::journal::Lease>,
+    ) -> Result<QuotaPass, RuntimeError> {
+        if mode != Mode::Resume || self.quotas.is_none() {
+            return Ok(QuotaPass::disabled());
+        }
+        let pass = QuotaPass::at(&self.quota, now_for_admission(), false);
+        self.store
+            .append(
+                lease.expect("resume holds a lease").epoch,
+                vec![Append::new(
+                    run,
+                    pass.started().expect("an enabled pass has a marker"),
+                )],
+            )
+            .await
+            .map_err(RuntimeError::from_store)?;
+        Ok(pass)
     }
 
     /// The ceilings a run gets: its agent's, or the plane's if it has no agent.
@@ -1804,9 +2063,12 @@ impl Runtime {
         };
         let status = match last.kind() {
             RecordKind::RunSuspended { reason } => RunStatus::Suspended(reason.clone()),
-            RecordKind::RunSealed {
-                outcome, reason, ..
-            } => recorded_status(outcome, reason.as_deref(), &records),
+            RecordKind::RunConcluded {
+                outcome,
+                reason,
+                exhaustion,
+                ..
+            } => recorded_status(outcome, reason.as_deref(), exhaustion.as_ref(), &records),
             _ => return Ok(None),
         };
         Ok(Some(RunOutcome {
@@ -2113,30 +2375,8 @@ impl Runtime {
         self.authorize_scope(&plan, chain)?;
         self.authorize_admission(&agent, governed_by.as_ref(), chain, input.peek())?;
 
-        // Before the lease and before any record: a run refused on quota must
-        // leave nothing behind, or a throttled tenant accumulates half-open runs
-        // that its next request has to step over.
-        self.check_quota(run).await?;
-
-        // From here a concurrency slot is reserved, and every error path below
-        // must give it back. `check_quota`'s own refusals reserve nothing; an
-        // error *after* the reservation — a lease that cannot be taken, a case
-        // store that refuses, an append that fails — that kept the slot would
-        // leak it permanently, throttling a tenant whose admissions fail
-        // transiently down to zero by its own error handling, one failure at a
-        // time. Best-effort, like `settle_quota`: the slot row names the run,
-        // so one that survives an unreachable store is attributable rather
-        // than a counter that silently drifted.
-        let out = self
-            .admit_reserved(run, plan, input, terms, agent, governed_by)
-            .await;
-        if out.is_err()
-            && let Some(quotas) = self.quotas.as_ref()
-            && let Err(e) = quotas.release(run).await
-        {
-            tracing::debug!(%run, error = %e, "could not release the quota slot of a failed admission");
-        }
-        out
+        self.admit_reserved(run, plan, input, terms, agent, governed_by)
+            .await
     }
 
     /// Admission past the quota reservation: the lease, the records, the case
@@ -2160,25 +2400,41 @@ impl Runtime {
         agent: String,
         governed_by: Option<crate::journal::AgentIdentity>,
     ) -> Result<Admitted, RuntimeError> {
-        // Admission: take ownership, then record what we are about to do —
-        // before doing any of it.
+        // Ownership precedes reservation. A process can die between any two
+        // store calls; with this order, a slot reserved before the admission
+        // batch always has an owned lease beside it, and the abandonment sweep
+        // can release both. Reserving first could strand a slot over no run and
+        // no lease — invisible to every recovery query.
         let lease = self
             .store
             .acquire(run, &self.owner, self.lease_ttl)
             .await
             .map_err(RuntimeError::from_store)?;
 
+        let quota = match self.check_quota(run, now_for_admission()).await {
+            Ok(pass) => pass,
+            Err(error) => {
+                let _ = self.store.release_lease(run, lease.epoch).await;
+                return Err(error);
+            }
+        };
+
         let out = self
-            .admit_under_lease(run, &lease, plan, input, terms, &agent, governed_by)
+            .admit_under_lease(run, &lease, plan, input, terms, &agent, governed_by, quota)
             .await;
-        if out.is_err()
-            && let Err(e) = self.store.release_lease(run, lease.epoch).await
-        {
-            tracing::debug!(
-                %run,
-                error = %e,
-                "could not release the lease of a failed admission; it will expire on its own"
-            );
+        if out.is_err() {
+            if let Some(quotas) = self.quotas.as_ref()
+                && let Err(error) = quotas.release(run).await
+            {
+                tracing::debug!(%run, %error, "could not release the quota slot of a failed admission");
+            }
+            if let Err(error) = self.store.release_lease(run, lease.epoch).await {
+                tracing::debug!(
+                    %run,
+                    %error,
+                    "could not release the lease of a failed admission; it will expire on its own"
+                );
+            }
         }
         out
     }
@@ -2193,6 +2449,7 @@ impl Runtime {
         terms: RunTerms,
         agent: &str,
         governed_by: Option<crate::journal::AgentIdentity>,
+        quota: QuotaPass,
     ) -> Result<Admitted, RuntimeError> {
         let RunTerms {
             case,
@@ -2222,6 +2479,9 @@ impl Runtime {
         ];
 
         Self::bind_identity(run, chain, &mut records);
+        if let Some(started) = quota.started() {
+            records.push(Append::new(run, started));
+        }
 
         // Correlation is deterministic and runs before planning: which case a
         // message belongs to is a matter of fact, settled by a lookup.
@@ -2381,12 +2641,14 @@ impl Runtime {
                         ),
                         Append::new(
                             run,
-                            RecordKind::RunSealed {
+                            RecordKind::RunConcluded {
                                 outcome: RunStatus::Failed(String::new()).as_str().to_owned(),
                                 reason: Some(format!(
                                     "the outbox registration was refused ({open_failed}), so \
                                      this run was concluded without ever executing"
                                 )),
+                                exhaustion: None,
+                                live_spend: Spend::default(),
                                 chain_head: head.hash,
                             },
                         ),
@@ -2400,6 +2662,7 @@ impl Runtime {
         Ok(Admitted {
             run,
             epoch: lease.epoch,
+            quota,
             budget: self.budget_for(agent),
             agent: agent.to_owned(),
             plan,
@@ -2419,6 +2682,7 @@ impl Runtime {
             Execution {
                 run: a.run,
                 epoch: a.epoch,
+                quota: a.quota,
                 plan: &a.plan,
                 input: a.input,
                 mode: Mode::Live,
@@ -2511,7 +2775,7 @@ impl Runtime {
             None
         };
 
-        self.replay_releasing(run, mode, lease).await
+        self.replay_releasing(run, mode, lease, false).await
     }
 
     /// Resume a run under a lease the caller already holds.
@@ -2530,7 +2794,23 @@ impl Runtime {
         run: RunId,
         lease: crate::journal::Lease,
     ) -> Result<RunOutcome, RuntimeError> {
-        self.replay_releasing(run, Mode::Resume, Some(lease)).await
+        self.replay_releasing(run, Mode::Resume, Some(lease), false)
+            .await
+    }
+
+    /// Recover an owner-abandoned run without turning settlement repair into
+    /// an operator-requested retry of a recorded conclusion.
+    pub(crate) async fn recover_abandoned_run(
+        &self,
+        run: RunId,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let lease = self
+            .store
+            .acquire(run, &self.owner, self.lease_ttl)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        self.replay_releasing(run, Mode::Resume, Some(lease), true)
+            .await
     }
 
     async fn replay_releasing(
@@ -2538,8 +2818,11 @@ impl Runtime {
         run: RunId,
         mode: Mode,
         lease: Option<crate::journal::Lease>,
+        recovering: bool,
     ) -> Result<RunOutcome, RuntimeError> {
-        let outcome = self.replay_under(run, mode, lease.as_ref()).await;
+        let outcome = self
+            .replay_under(run, mode, lease.as_ref(), recovering)
+            .await;
 
         // Idempotent: a resume that reached execution already handed its lease
         // back in `conclude`, and re-releasing the same epoch changes nothing.
@@ -2547,7 +2830,10 @@ impl Runtime {
         // closed run's no-op, a refused resume, an unverifiable chain — which
         // would otherwise strand the freshly claimed lease until it expired
         // and the recovery sweep "recovered" a run nobody was running.
-        if let Some(lease) = &lease
+        let settlement_pending =
+            matches!(outcome, Err(RuntimeError::QuotaSettlementPending { .. }));
+        if !settlement_pending
+            && let Some(lease) = &lease
             && let Err(e) = self.store.release_lease(run, lease.epoch).await
         {
             tracing::debug!(
@@ -2564,6 +2850,7 @@ impl Runtime {
         run: RunId,
         mode: Mode,
         lease: Option<&crate::journal::Lease>,
+        recovering: bool,
     ) -> Result<RunOutcome, RuntimeError> {
         let records = self
             .store
@@ -2587,6 +2874,19 @@ impl Runtime {
 
         ensure_replayable_canon(&records)?;
 
+        if mode == Mode::Resume
+            && let Some(outcome) = self
+                .recover_quota_before_resume(
+                    run,
+                    &records,
+                    lease.expect("resume holds a lease"),
+                    recovering,
+                )
+                .await?
+        {
+            return Ok(outcome);
+        }
+
         let input = records.iter().find_map(recorded_input).ok_or_else(|| {
             RuntimeError::PlanContract("journal has no RunAdmitted record".into())
         })?;
@@ -2604,27 +2904,12 @@ impl Runtime {
             .ok_or_else(|| RuntimeError::PlanContract("journal has no PlanFrozen record".into()))
             .and_then(|v| serde_json::from_value(v).map_err(RuntimeError::Encoding))?;
 
-        // A succeeded or quarantined run must not be resumed — see
-        // `resume_is_closed`. Strict mode still re-executes, because
-        // verification is the point there and it writes nothing.
         if mode == Mode::Resume
-            && let Some(recorded) = resume_is_closed(&records)
+            && let Some(outcome) = self
+                .closed_resume_outcome(run, &records, lease.expect("resume holds a lease"))
+                .await?
         {
-            let head = self
-                .store
-                .head(run)
-                .await
-                .map_err(RuntimeError::from_store)?;
-            return Ok(RunOutcome {
-                run_id: run,
-                status: recorded,
-                chain_head: head.hash,
-                output: None,
-                // Re-reading a closed run performs nothing, so it consumes
-                // nothing. The spend belongs to the pass that did the work and
-                // is on that run's records, not re-attributed on every read.
-                spend: Spend::default(),
-            });
+            return Ok(outcome);
         }
 
         // A run whose journal holds compensation-phase records is not
@@ -2658,6 +2943,8 @@ impl Runtime {
             self.ensure_resume_policy_bundle(&records)?;
         }
 
+        let quota = self.start_replay_quota_pass(run, mode, lease).await?;
+
         let case_ctx = self.recorded_case(&records);
 
         let mut cursor = ReplayCursor::from_records(&records);
@@ -2674,6 +2961,7 @@ impl Runtime {
             Execution {
                 run,
                 epoch,
+                quota,
                 plan: &plan,
                 input,
                 mode,
@@ -2754,6 +3042,7 @@ impl Runtime {
         let Execution {
             run,
             epoch,
+            quota,
             plan: ir,
             input,
             mode,
@@ -2864,6 +3153,7 @@ impl Runtime {
                         &outputs,
                         cursor,
                         case_id,
+                        &quota,
                     )
                     .await;
             }
@@ -2958,6 +3248,7 @@ impl Runtime {
                                 case_id,
                                 Spend::default(),
                                 Spend::default(),
+                                &quota,
                             )
                             .await;
                     }
@@ -3018,6 +3309,7 @@ impl Runtime {
                         &outputs,
                         cursor,
                         case_id,
+                        &quota,
                     )
                     .await;
             }
@@ -3052,6 +3344,7 @@ impl Runtime {
                     case_id,
                     Spend::default(),
                     Spend::default(),
+                    &quota,
                 )
                 .await;
         }
@@ -3075,6 +3368,7 @@ impl Runtime {
             case_id,
             spend,
             live_spend,
+            &quota,
         )
         .await
     }
@@ -3431,6 +3725,7 @@ impl Runtime {
         outputs: &BTreeMap<StepId, Tainted<Value>>,
         cursor: &mut ReplayCursor,
         case_id: Option<crate::core::CaseId>,
+        quota: &QuotaPass,
     ) -> Result<RunOutcome, RuntimeError> {
         let (run, epoch, writing, ir) = (cx.run, cx.epoch, cx.writing, cx.ir);
         let output = run_output(ir, outputs);
@@ -3481,6 +3776,7 @@ impl Runtime {
                     case_id,
                     Spend::default(),
                     Spend::default(),
+                    quota,
                 )
                 .await;
         }
@@ -3491,7 +3787,7 @@ impl Runtime {
             (l.consumed().spend, l.live_spend())
         };
         self.conclude(
-            run, epoch, unwound, output, writing, case_id, spend, live_spend,
+            run, epoch, unwound, output, writing, case_id, spend, live_spend, quota,
         )
         .await
     }
@@ -4205,6 +4501,7 @@ impl Runtime {
         case: Option<crate::core::CaseId>,
         spend: Spend,
         live_spend: Spend,
+        quota: &QuotaPass,
     ) -> Result<RunOutcome, RuntimeError> {
         // Loud toward the operator, ordinary toward the caller. A failed run is
         // a conclusion a resume can honestly answer, so it is not an incident —
@@ -4253,7 +4550,7 @@ impl Runtime {
                     .is_some_and(|r| {
                         matches!(
                             r.kind(),
-                            RecordKind::RunSealed { outcome, .. }
+                            RecordKind::RunConcluded { outcome, .. }
                                 if outcome == status.as_str()
                         )
                     });
@@ -4262,9 +4559,14 @@ impl Runtime {
             } else {
                 let mut sealed = Append::new(
                     run,
-                    RecordKind::RunSealed {
+                    RecordKind::RunConcluded {
                         outcome: status.as_str().to_owned(),
                         reason: status.reason().map(std::borrow::Cow::into_owned),
+                        exhaustion: match &status {
+                            RunStatus::Exhausted(limit) => Some(limit.clone()),
+                            _ => None,
+                        },
+                        live_spend,
                         chain_head: before.hash,
                     },
                 );
@@ -4277,20 +4579,7 @@ impl Runtime {
                     .await
                     .map_err(RuntimeError::from_store)?;
 
-                // Only a conclusion nothing may resume freezes the journal and
-                // enters the Merkle log. A failed or exhausted run stays open:
-                // its conclusion is in the chain — indexed, findable,
-                // tamper-covered — but a leaf published for it would be a
-                // checkpoint attesting a history its own resume is permitted
-                // to grow past.
-                if status.seals() {
-                    self.store
-                        .seal(run, epoch, status.as_str())
-                        .await
-                        .map_err(RuntimeError::from_store)?
-                } else {
-                    concluded.last().map_or(before.hash, |r| r.hash)
-                }
+                concluded.last().map_or(before.hash, |r| r.hash)
             }
         } else {
             self.store
@@ -4322,6 +4611,21 @@ impl Runtime {
         // tenant did today, and accruing a historical run's spend into the
         // current period on every audit would bill the past once per look.
         if writing {
+            // Settlement precedes both physical sealing and lease release. If
+            // it fails, the conclusion remains open under an owned lease; once
+            // that lease expires, recovery derives this pass from the journal
+            // and retries the idempotent receipt.
+            self.settle_quota(run, epoch, live_spend, quota).await?;
+
+            let chain_head = if status.seals() {
+                self.store
+                    .seal(run, epoch, status.as_str())
+                    .await
+                    .map_err(RuntimeError::from_store)?
+            } else {
+                chain_head
+            };
+
             if let Err(e) = self.store.release_lease(run, epoch).await {
                 tracing::debug!(
                     %run,
@@ -4340,9 +4644,15 @@ impl Runtime {
             // cumulative spend: `spend` includes the replayed prefix so the
             // caller sees what the run has cost in total, but accruing it
             // would bill the prefix once per suspend/resume cycle.
-            self.settle_quota(run, live_spend).await;
-
             announce(&self.meter, run, &status);
+
+            return Ok(RunOutcome {
+                run_id: run,
+                status,
+                chain_head,
+                spend,
+                output,
+            });
         }
 
         Ok(RunOutcome {
@@ -4373,6 +4683,22 @@ fn run_output(ir: &PlanIR, outputs: &BTreeMap<StepId, Tainted<Value>>) -> Option
         // A run that stopped before any terminal step still has something to
         // report: the furthest output it did produce.
         .or_else(|| outputs.iter().next_back().map(|(_, v)| v.clone()))
+}
+
+/// Spend durably recorded by effects written under one live pass epoch.
+fn spend_recorded_in_epoch(records: &[Record], epoch: crate::core::Epoch) -> Spend {
+    records
+        .iter()
+        .filter(|record| record.body.epoch == epoch)
+        .fold(Spend::default(), |total, record| {
+            let spend = match record.kind() {
+                RecordKind::EffectDone { spend, .. }
+                | RecordKind::EffectFailed { spend, .. }
+                | RecordKind::EffectReconciled { spend, .. } => *spend,
+                _ => Spend::default(),
+            };
+            total.plus(spend)
+        })
 }
 
 /// Whether the plan actually finished.
@@ -4660,7 +4986,7 @@ fn recorded_step_refusal(records: &[Record]) -> Option<(StepId, String, String)>
 /// conclusion, and `conclude` writes no `RunSealed` for it.
 fn recorded_conclusion(records: &[Record]) -> Option<String> {
     records.iter().rev().find_map(|r| match r.kind() {
-        RecordKind::RunSealed { outcome, .. } => Some(outcome.clone()),
+        RecordKind::RunConcluded { outcome, .. } => Some(outcome.clone()),
         _ => None,
     })
 }
@@ -5282,6 +5608,7 @@ struct Execution<'a> {
     recorded_groups: BTreeMap<(StepId, Phase, String), super::ctx::RecordedGroup>,
     run: RunId,
     epoch: u64,
+    quota: QuotaPass,
     plan: &'a PlanIR,
     input: Tainted<Value>,
     mode: Mode,
@@ -5330,7 +5657,7 @@ struct Execution<'a> {
 /// it is the fact it reads.
 fn resume_is_closed(records: &[Record]) -> Option<RunStatus> {
     let outcome = records.iter().rev().find_map(|r| match r.kind() {
-        RecordKind::RunSealed { outcome, .. } => Some(outcome.as_str()),
+        RecordKind::RunConcluded { outcome, .. } => Some(outcome.as_str()),
         _ => None,
     })?;
 
@@ -5429,7 +5756,12 @@ fn parse_holder(run: &str) -> Result<RunId, RuntimeError> {
 /// resumed* and returns `None` for the conclusions that stay resumable. Every
 /// conclusion has an answer here: a failed run reported as "still working"
 /// would send a redelivery into a second admission.
-fn recorded_status(outcome: &str, reason: Option<&str>, records: &[Record]) -> RunStatus {
+fn recorded_status(
+    outcome: &str,
+    reason: Option<&str>,
+    exhaustion: Option<&crate::core::BudgetExceeded>,
+    records: &[Record],
+) -> RunStatus {
     // A conclusion that carries no reason gets a statement of that fact rather
     // than an empty string: the empty summary is what `RunStatus::reason`
     // exists to prevent, and this is the surface a retried delivery reads.
@@ -5441,7 +5773,15 @@ fn recorded_status(outcome: &str, reason: Option<&str>, records: &[Record]) -> R
     };
     match outcome {
         "succeeded" => RunStatus::Succeeded,
-        "failed" | "exhausted" => RunStatus::Failed(said()),
+        "failed" => RunStatus::Failed(said()),
+        "exhausted" => exhaustion.cloned().map_or_else(
+            || {
+                RunStatus::Quarantined(
+                    "recorded as exhausted without the typed ceiling verdict".to_owned(),
+                )
+            },
+            RunStatus::Exhausted,
+        ),
         "quarantined" => RunStatus::Quarantined(said()),
         "cancelled" => RunStatus::Cancelled {
             actor: recorded_canceller(records).unwrap_or_else(|| "unknown".into()),
@@ -6569,6 +6909,10 @@ impl RuntimeBuilder {
                 ("event", self.events.as_ref().map(|s| s.tenant())),
                 ("task", self.tasks.as_ref().map(|s| s.tenant())),
                 ("memory", self.memories.as_ref().map(|s| s.tenant())),
+                ("quota", self.quotas.as_ref().map(|s| s.tenant())),
+                ("timer", self.timers.as_ref().map(|s| s.tenant())),
+                ("batch", self.batches.as_ref().map(|s| s.tenant())),
+                ("authority", self.authorities.as_ref().map(|s| s.tenant())),
                 ("push", push),
             ],
             &self.tenant,
@@ -7421,7 +7765,7 @@ pub(crate) fn every_status() -> Vec<RunStatus> {
 
 #[cfg(test)]
 mod resume_agreement_tests {
-    use super::{RunStatus, resume_is_closed};
+    use super::{QuotaPass, RunStatus, resume_is_closed};
     use crate::journal::RecordKind;
 
     // Through the crate re-export rather than `super::`, so the one path both
@@ -7538,12 +7882,39 @@ mod resume_agreement_tests {
             epoch: Epoch::default(),
             v: 1,
             effect_key: None,
-            kind: RecordKind::RunSealed {
+            kind: RecordKind::RunConcluded {
                 outcome: outcome.to_owned(),
                 chain_head: Digest::of(b""),
                 reason: None,
+                exhaustion: None,
+                live_spend: crate::core::Spend::default(),
             },
         };
         vec![Record::seal(body, Digest::of(b"")).expect("a sealed record")]
+    }
+
+    /// One execution pass is authorized and accrued against one period even
+    /// when it finishes after a billing boundary.
+    #[test]
+    fn a_quota_pass_keeps_the_period_it_started_in() {
+        let quota = crate::quota::TenantQuota {
+            max_tokens_per_period: Some(1_000),
+            period: crate::quota::Period::Daily,
+            ..crate::quota::TenantQuota::default()
+        };
+        let before_midnight = crate::core::Timestamp::from_unix_timestamp(86_399).unwrap();
+        let after_midnight = crate::core::Timestamp::from_unix_timestamp(86_400).unwrap();
+
+        let pass = QuotaPass::at(&quota, before_midnight, true);
+        assert_eq!(
+            pass.period(),
+            Some(quota.period.key_for(before_midnight).as_str())
+        );
+        assert_ne!(
+            pass.period(),
+            Some(quota.period.key_for(after_midnight).as_str()),
+            "settlement recomputed the period at completion, so this pass was \
+             authorized against one ledger and charged to another"
+        );
     }
 }

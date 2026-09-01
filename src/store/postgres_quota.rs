@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 
 use crate::core::{RunId, Spend, StoreError, Timestamp};
-use crate::quota::{QuotaError, QuotaStore};
+use crate::quota::{QuotaError, QuotaSettlement, QuotaStore};
 
 use super::postgres::{PostgresStore, amount_of, sql_amount};
 
@@ -22,6 +22,10 @@ fn pool_err(e: &impl std::fmt::Display) -> StoreError {
 
 #[async_trait]
 impl QuotaStore for PostgresStore {
+    fn tenant(&self) -> &str {
+        crate::journal::JournalStore::tenant(self)
+    }
+
     async fn reserve(
         &self,
         run: RunId,
@@ -189,29 +193,87 @@ impl QuotaStore for PostgresStore {
         Ok(())
     }
 
-    async fn accrue(&self, period: &str, spend: Spend) -> Result<(), StoreError> {
-        let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
-        // The addition happens in the database, not here. Reading a total,
-        // adding to it and writing it back would lose one of two concurrent
-        // accruals — and the one it loses is spend a tenant has already
-        // incurred, so the ceiling drifts upward under exactly the load that
-        // makes it matter.
-        client
+    async fn settle(&self, settlement: &QuotaSettlement) -> Result<(), StoreError> {
+        let mut client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        let tenant = self.tenant_name();
+        let run = settlement.run.to_string();
+        let epoch = settlement.epoch.cast_signed();
+        let tokens = sql_amount(settlement.spend.tokens);
+        let minor_units = sql_amount(settlement.spend.minor_units);
+
+        let inserted = tx
             .execute(
-                "INSERT INTO quota_spent (tenant, period, tokens, minor_units)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (tenant, period) DO UPDATE SET
-                   tokens = quota_spent.tokens + EXCLUDED.tokens,
-                   minor_units = quota_spent.minor_units + EXCLUDED.minor_units",
+                "INSERT INTO quota_settled
+                   (tenant, run_id, epoch, period, tokens, minor_units, release_slot)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (tenant, run_id, epoch) DO NOTHING",
                 &[
-                    &self.tenant_name(),
-                    &period.to_owned(),
-                    &sql_amount(spend.tokens),
-                    &sql_amount(spend.minor_units),
+                    &tenant,
+                    &run,
+                    &epoch,
+                    &settlement.period,
+                    &tokens,
+                    &minor_units,
+                    &settlement.release_slot,
                 ],
             )
             .await
             .map_err(|e| be(&e))?;
+
+        if inserted == 0 {
+            let stored = tx
+                .query_one(
+                    "SELECT period, tokens, minor_units, release_slot
+                       FROM quota_settled
+                      WHERE tenant = $1 AND run_id = $2 AND epoch = $3",
+                    &[&tenant, &run, &epoch],
+                )
+                .await
+                .map_err(|e| be(&e))?;
+            let same = stored.get::<_, Option<String>>(0) == settlement.period
+                && stored.get::<_, i64>(1) == tokens
+                && stored.get::<_, i64>(2) == minor_units
+                && stored.get::<_, bool>(3) == settlement.release_slot;
+            if !same {
+                return Err(StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!(
+                        "quota pass {run}/{} was settled twice with different payloads",
+                        settlement.epoch
+                    ),
+                });
+            }
+            tx.commit().await.map_err(|e| be(&e))?;
+            return Ok(());
+        }
+
+        if let Some(period) = settlement.period.as_deref() {
+            // Cast before addition: BIGINT addition can overflow before LEAST
+            // sees it. The numeric intermediate is exact and the stored total
+            // saturates at the largest representable non-negative amount.
+            tx.execute(
+                "INSERT INTO quota_spent (tenant, period, tokens, minor_units)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (tenant, period) DO UPDATE SET
+                   tokens = LEAST(9223372036854775807::numeric,
+                                  quota_spent.tokens::numeric + EXCLUDED.tokens::numeric)::bigint,
+                   minor_units = LEAST(9223372036854775807::numeric,
+                                       quota_spent.minor_units::numeric + EXCLUDED.minor_units::numeric)::bigint",
+                &[&tenant, &period, &tokens, &minor_units],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+        if settlement.release_slot {
+            tx.execute(
+                "DELETE FROM quota_running WHERE tenant = $1 AND run_id = $2",
+                &[&tenant, &run],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+        tx.commit().await.map_err(|e| be(&e))?;
         Ok(())
     }
 

@@ -131,6 +131,18 @@ pub enum RecordKind {
         idempotency_key: Option<String>,
     },
 
+    /// A live execution pass began under this record body's fencing epoch.
+    ///
+    /// Written before any effect the pass may dispatch. `period` is captured
+    /// once so recovery never moves spend across a billing boundary; `release_slot`
+    /// distinguishes fresh admission from a resume, which is deliberately not
+    /// gated by the concurrency ceiling.
+    QuotaPassStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        period: Option<String>,
+        release_slot: bool,
+    },
+
     /// The plan was compiled from trusted input and frozen.
     ///
     /// From here the plan is an authorization graph: the journal that follows
@@ -498,7 +510,7 @@ pub enum RecordKind {
     /// resumed run reads its completed effects back from history, appends past
     /// this record, and concludes again. That is why one chain may carry more
     /// than one of these, and why the *last* one is the run's answer.
-    RunSealed {
+    RunConcluded {
         outcome: String,
         /// Why the run ended this way, when the ending has a why.
         ///
@@ -509,6 +521,23 @@ pub enum RecordKind {
         /// answered with, gets the word "failed" and nothing else.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// The typed ceiling verdict when `outcome == "exhausted"`.
+        ///
+        /// A rendered reason is for people, not reconstruction. Without this
+        /// value a duplicate admission can only turn an exhausted pause into a
+        /// generic failure or parse prose back into control flow. Both are
+        /// wrong: exhaustion is resumable and its variant carries the numbers
+        /// an operator needs to raise the right ceiling.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exhaustion: Option<crate::core::BudgetExceeded>,
+        /// What this execution pass dispatched, excluding its replayed prefix.
+        ///
+        /// The quota receipt is derived from durable records on recovery. A
+        /// conclusion carries the authoritative total because it can include a
+        /// provider result this process observed but could not record at the
+        /// effect's terminal record before a later append recovered.
+        #[serde(default, skip_serializing_if = "Spend::is_free_ref")]
+        live_spend: Spend,
         chain_head: Digest,
     },
 
@@ -562,6 +591,7 @@ impl RecordKind {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::RunAdmitted { .. } => "RunAdmitted",
+            Self::QuotaPassStarted { .. } => "QuotaPassStarted",
             Self::PlanFrozen { .. } => "PlanFrozen",
             Self::StepStarted { .. } => "StepStarted",
             Self::StepFinished { .. } => "StepFinished",
@@ -583,7 +613,7 @@ impl RecordKind {
             Self::PolicyDenied { .. } => "PolicyDenied",
             Self::Released { .. } => "Released",
             Self::RunCancelled { .. } => "RunCancelled",
-            Self::RunSealed { .. } => "RunSealed",
+            Self::RunConcluded { .. } => "RunConcluded",
             Self::BreakGlass { .. } => "BreakGlass",
             Self::Swept { .. } => "Swept",
         }

@@ -434,11 +434,13 @@ impl RunCompleted {
 impl Projection for RunCompleted {
     async fn messages(&self, record: &Record) -> Result<Vec<PushMessage>, StoreError> {
         // Every field named, no `..` — the payload-sealing list's rule, held
-        // here for the same reason: a field added to `RunSealed` must ask
+        // here for the same reason: a field added to `RunConcluded` must ask
         // this projection deliver-or-not at the build, not default to silence.
-        let RecordKind::RunSealed {
+        let RecordKind::RunConcluded {
             outcome,
             reason,
+            exhaustion,
+            live_spend,
             chain_head,
         } = record.kind()
         else {
@@ -470,6 +472,12 @@ impl Projection for RunCompleted {
         // deliberately does not carry it.
         if let Some(reason) = reason {
             data["reason"] = json!(reason);
+        }
+        if let Some(exhaustion) = exhaustion {
+            data["exhaustion"] = json!(exhaustion);
+        }
+        if !live_spend.is_free() {
+            data["live_spend"] = json!(live_spend);
         }
         let event = event
             // What the event is *about* within this producer. `source` names

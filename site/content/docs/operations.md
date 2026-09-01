@@ -404,12 +404,18 @@ a bounded query: it is a page that stops changing, so a plane whose backlog
 exceeds one page returns the same rows forever and the thing that just happened
 is the one that never appears.
 
-`/runs` reads an index **derived** from the `RunSealed` record inside `append`,
+`/runs` reads an index **derived** from the `RunConcluded` record inside `append`,
 in the same transaction, so it rebuilds from the chain and is never an
 authority. **The last conclusion wins** — a failed run moves to `succeeded` when
 a resume concludes it, so the failed backlog drains. Failure does not seal: a
 failed or exhausted run stays open and resumable, and only succeeded,
 quarantined and cancelled freeze the journal.
+
+The single-run view's `sealed` field is backed by Merkle inclusion, not by the
+presence of `RunConcluded`. That distinction is observable: a failed run has a
+conclusion and reports `sealed: false`, while a succeeded run reports `true`.
+Exhaustion remains structured in the journal and in operator push events, so
+automation can inspect the exact ceiling without parsing `reason`.
 
 `/cases` defaults to `escalated`. An unrecognised status is a `400` rather than
 a quiet fallback — answering *what is escalated* with a list of healthy cases
@@ -1037,9 +1043,35 @@ resume is not gated: that work was admitted already, and refusing it would
 strand a run waiting on something that has now happened.
 
 **Spend** bounds a period and is checked at admission, against what has been
-*accrued* — and a run accrues when it finishes. A run already executing when the
-ceiling is crossed therefore runs to completion, so the overshoot is at most the
-concurrency ceiling times the per-run budget.
+*accrued*. One live execution pass is assigned to the period in which it starts:
+admission checks that key and settlement charges the pass to the same key even
+when midnight or month-end passes before it finishes. A later resume is a new
+pass in its resume period. Recomputing at completion would authorize against one
+ledger and debit another. A run already executing when the ceiling is crossed
+therefore runs to completion, so the overshoot is at most the concurrency
+ceiling times the per-run budget.
+
+Wiring a quota store records every active run even when all ceilings are
+`None`. That keeps `running()` truthful for operators and means adding a limit
+starts from the work actually in flight, not from an empty ledger manufactured
+by the previous unlimited configuration.
+
+Settlement is crash-safe rather than best-effort. Before a pass can dispatch an
+effect, `QuotaPassStarted` records its period and whether it owns the admission
+slot. At the end, `QuotaStore::settle` writes an exact `(run, epoch)` receipt,
+accrues that pass's spend, and releases its slot in one store transaction. A
+lost acknowledgement repeats the same receipt and charges nothing twice; a
+changed retry is corruption. The run is physically sealed and its lease is
+released only after settlement succeeds. If settlement is unavailable, the
+lease expires still owned and the ordinary abandonment sweep derives the spend
+from the journal and retries it.
+
+The journal and quota store may be separate systems, so this is deliberately
+not described as one distributed transaction. The journal is durable intent;
+the quota receipt is idempotent application. The protocol tolerates failure on
+either side of the call and converges after a transient outage. It cannot make
+progress through a permanent partition or survive independent destructive loss
+of one backend while claiming the other is complete.
 
 Both of those are yours to set, and the second one has a default worth knowing:
 `RuntimeBuilder` starts at `Budget::unlimited()`. A deployment that sets a tenant

@@ -310,6 +310,20 @@ CREATE TABLE IF NOT EXISTS quota_spent (
     minor_units BIGINT NOT NULL DEFAULT 0 CHECK (minor_units >= 0),
     PRIMARY KEY (tenant, period)
 );
+
+-- One exact receipt per live execution pass. The payload is retained so a
+-- retry with changed accounting is damage, not a second interpretation of the
+-- same key.
+CREATE TABLE IF NOT EXISTS quota_settled (
+    tenant       TEXT    NOT NULL,
+    run_id       TEXT    NOT NULL,
+    epoch        BIGINT  NOT NULL CHECK (epoch >= 0),
+    period       TEXT,
+    tokens       BIGINT  NOT NULL CHECK (tokens >= 0),
+    minor_units  BIGINT  NOT NULL CHECK (minor_units >= 0),
+    release_slot BOOLEAN NOT NULL,
+    PRIMARY KEY (tenant, run_id, epoch)
+);
 ";
 
 fn be(e: &tokio_postgres::Error) -> StoreError {
@@ -1741,6 +1755,10 @@ const CLAIM_LEASE: i64 = 60;
 
 #[async_trait]
 impl TimerStore for PostgresStore {
+    fn tenant(&self) -> &str {
+        crate::journal::JournalStore::tenant(self)
+    }
+
     async fn arm(&self, timer: &Timer) -> Result<(), StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client
@@ -2309,6 +2327,10 @@ fn task_from(row: &tokio_postgres::Row) -> Result<Task, StoreError> {
 
 #[async_trait]
 impl BatchStore for PostgresStore {
+    fn tenant(&self) -> &str {
+        crate::journal::JournalStore::tenant(self)
+    }
+
     async fn open(&self, id: BatchId, plan_digest: &str) -> Result<(), StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         client

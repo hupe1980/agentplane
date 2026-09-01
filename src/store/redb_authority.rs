@@ -61,6 +61,10 @@ const RECEIPTS: TableDefinition<(&str, &str, &str), ReceiptRow> =
 
 #[async_trait]
 impl AuthorityStore for RedbStore {
+    fn tenant(&self) -> &str {
+        crate::journal::JournalStore::tenant(self)
+    }
+
     async fn issue(&self, authority: &StandingAuthority) -> Result<(), AuthorityError> {
         authority.validate()?;
         let tenant = self.tenant_name();

@@ -857,6 +857,61 @@ fn a_plane_will_not_start_over_another_tenants_store() {
         .build();
 }
 
+/// Every independently wired operational store must serve the plane's tenant.
+#[cfg(feature = "redb")]
+#[test]
+fn a_plane_refuses_mismatched_timer_batch_and_authority_stores() {
+    use agentplane::authority::AuthorityStore;
+    use agentplane::batch::BatchStore;
+    use agentplane::case::TimerStore;
+    use agentplane::core::TenantId;
+    use agentplane::journal::JournalStore;
+    use agentplane::runtime::{BuildError, Runtime};
+    use agentplane::store::RedbStore;
+
+    let base = RedbStore::open_in_memory().expect("store");
+    let acme = || TenantId::new("acme").expect("tenant");
+    let journal = || Arc::new(base.clone().for_tenant(acme()));
+    let globex = || {
+        Arc::new(
+            base.clone()
+                .for_tenant(TenantId::new("globex").expect("tenant")),
+        )
+    };
+    let assert_store = |result: Result<Arc<Runtime>, BuildError>, expected| {
+        assert!(matches!(
+            result,
+            Err(BuildError::StateStoreTenant {
+                store,
+                plane,
+                tenant,
+            }) if store == expected && plane == "acme" && tenant == "globex"
+        ));
+    };
+
+    assert_store(
+        Runtime::builder(journal() as Arc<dyn JournalStore>)
+            .tenant(acme())
+            .timers(globex() as Arc<dyn TimerStore>)
+            .try_build(),
+        "timer",
+    );
+    assert_store(
+        Runtime::builder(journal() as Arc<dyn JournalStore>)
+            .tenant(acme())
+            .batches(globex() as Arc<dyn BatchStore>)
+            .try_build(),
+        "batch",
+    );
+    assert_store(
+        Runtime::builder(journal() as Arc<dyn JournalStore>)
+            .tenant(acme())
+            .authorities(globex() as Arc<dyn AuthorityStore>)
+            .try_build(),
+        "authority",
+    );
+}
+
 /// A plane will not start over another tenant's blob store.
 ///
 /// The same mismatch as the journal one and a separate wire: a plane can be

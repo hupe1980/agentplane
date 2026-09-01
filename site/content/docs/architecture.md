@@ -640,10 +640,15 @@ seq | kind              | effect_key | prev_hash | hash
 
 `hash = H(prev_hash ‖ record_bytes)`.
 
-A run that reaches a conclusion appends a `RunSealed` record, so how a run
+A run that reaches a conclusion appends a `RunConcluded` record, so how a run
 ended is covered by tamper detection and a resumed run reads its own outcome
 from the history it just verified. A side table alone could not answer *is this
 run finished?* without inferring it from the last step that happened to finish.
+
+The record keeps machine state machine-readable. An exhausted conclusion carries
+the typed `BudgetExceeded` verdict as well as its human reason, so idempotent
+redelivery returns `RunStatus::Exhausted` with the exact ceiling and counters;
+no projection parses prose back into control flow.
 
 A conclusion is not always a closure. Only conclusions nothing may resume —
 `succeeded`, `quarantined`, `cancelled` — **seal**: the journal freezes (the
@@ -652,7 +657,7 @@ enters the Merkle log below. `failed` and `exhausted` leave the run open,
 because both are conclusions a resume can honestly answer — completed effects
 are read back from history rather than performed again — and a leaf published
 for a run its own resume may grow would be a checkpoint attesting a prefix of
-a moving history. One chain can therefore carry more than one `RunSealed`
+a moving history. One chain can therefore carry more than one `RunConcluded`
 record, and the *last* one is the run's answer; the outcome index the
 operator queries derives from it in the same transaction, so a failed run
 that is resumed and succeeds moves between listings rather than being listed
@@ -1470,8 +1475,8 @@ src/
              webhook cursors with SSRF-guarded delivery for caller-supplied URLs,
              and an operator-configured outbox for the deployment's own events
              (feature `push`)
-  quota/     per-tenant ceilings on concurrent work and spend, accounted in
-             the store so they survive a second instance
+  quota/     per-tenant ceilings on concurrent work and spend; journaled pass
+             identity plus idempotent store receipts survive settlement crashes
   authority/ standing authority: a ceiling bound to an authorization rather
              than to a run or a billing period — revocable, drawn on as a
              journaled effect, idempotent across retries

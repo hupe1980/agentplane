@@ -329,9 +329,9 @@ specs:
 package:
     cargo package --list --allow-dirty
     @echo
-    @cargo package --list --allow-dirty | grep -qx 'CONCEPT.md' \
-        && (echo "REFUSED: CONCEPT.md is in the tarball" && exit 1) \
-        || echo "ok: the internal design document is not in the tarball"
+    @cargo package --list --allow-dirty | grep -q '^concepts/' \
+        && (echo "REFUSED: concepts/ is in the tarball" && exit 1) \
+        || echo "ok: the internal design documents are not in the tarball"
 
 # a full verification build from the tarball, uploading nothing
 publish-dry:

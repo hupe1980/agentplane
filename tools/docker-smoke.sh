@@ -65,13 +65,13 @@ echo "==> no secret and no internal document in any layer"
 # anyone who pulls the earlier one, and a build arg can leak a path into the
 # recorded command line.
 layers=$(docker save "$IMAGE" | tar -tf - 2>/dev/null || true)
-for forbidden in CONCEPT.md .env; do
+for forbidden in concepts/ .env; do
   if docker run --rm --entrypoint /usr/local/bin/agentplane "$IMAGE" --help >/dev/null 2>&1 \
      && grep -q "$forbidden" <<<"$layers"; then
     echo "REFUSED: '$forbidden' is present in an image layer"; exit 1
   fi
 done
-if docker history --no-trunc "$IMAGE" | grep -qE 'CONCEPT\.md|\.env'; then
+if docker history --no-trunc "$IMAGE" | grep -qE 'concepts/|\.env'; then
   echo "REFUSED: build history names a file that must not ship"; exit 1
 fi
 

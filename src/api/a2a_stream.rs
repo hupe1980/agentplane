@@ -113,7 +113,7 @@ pub(super) fn progress_of(kind: &RecordKind) -> Option<(TaskState, String)> {
         RecordKind::RunSuspended { reason } => {
             Some((TaskState::InputRequired, format!("waiting: {reason}")))
         }
-        RecordKind::RunSealed { outcome, .. } => Some((sealed_state(outcome), outcome.clone())),
+        RecordKind::RunConcluded { outcome, .. } => Some((sealed_state(outcome), outcome.clone())),
         _ => None,
     }
 }
@@ -125,7 +125,7 @@ pub(super) async fn payloads_for_record(
     case: Option<&str>,
 ) -> Result<Vec<Value>, crate::core::RuntimeError> {
     let run = record.body.run;
-    if let RecordKind::RunSealed { outcome, .. } = record.kind() {
+    if let RecordKind::RunConcluded { outcome, .. } = record.kind() {
         let state = sealed_state(outcome);
         let mut payloads = Vec::new();
         if state == TaskState::Completed
@@ -217,7 +217,7 @@ fn frames(
             let mut done = false;
             for record in &records {
                 next = record.body.seq + 1;
-                if let RecordKind::RunSealed { outcome, .. } = record.kind() {
+                if let RecordKind::RunConcluded { outcome, .. } = record.kind() {
                     let state = sealed_state(outcome);
                     if state == TaskState::Completed {
                         match task_artifacts(&runtime, run, state).await {

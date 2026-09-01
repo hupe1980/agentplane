@@ -1083,9 +1083,11 @@ fn admitted(run: RunId) -> Append {
 fn concluded(run: RunId, outcome: &str) -> Append {
     Append::new(
         run,
-        RecordKind::RunSealed {
+        RecordKind::RunConcluded {
             outcome: outcome.to_owned(),
             reason: None,
+            exhaustion: None,
+            live_spend: crate::core::Spend::default(),
             chain_head: Digest::ZERO,
         },
     )

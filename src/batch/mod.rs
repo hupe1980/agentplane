@@ -238,6 +238,9 @@ pub struct BatchReport {
 /// it needs is a cursor, a reservation, and a census — three queries, not a log.
 #[async_trait]
 pub trait BatchStore: Send + Sync + Debug {
+    /// Which tenant this handle's batches and item reservations belong to.
+    fn tenant(&self) -> &str;
+
     /// Register a batch. Idempotent on `id`, so a retried submission does not
     /// fork one act into two.
     ///

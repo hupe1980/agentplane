@@ -31,7 +31,6 @@ use crate::core::{
 };
 use crate::journal::{Append, JournalStore, RecordKind};
 
-use super::ctx::Mode;
 use super::executor::{LEASE_TTL, Runtime};
 use super::metrics::{self, Census};
 
@@ -169,9 +168,11 @@ impl SweepLedger {
         };
         let sealed = crate::journal::Append::new(
             run,
-            RecordKind::RunSealed {
+            RecordKind::RunConcluded {
                 outcome: SWEEP_OUTCOME.to_owned(),
                 reason: None,
+                exhaustion: None,
+                live_spend: crate::core::Spend::default(),
                 chain_head: head.hash,
             },
         );
@@ -554,7 +555,7 @@ impl Runtime {
                     ),
                 )
                 .await?;
-            match self.replay(run, Mode::Resume).await {
+            match self.recover_abandoned_run(run).await {
                 Ok(outcome) => {
                     // A resume that concluded released its lease on the way
                     // out. The one path that does not is the closed-run
@@ -607,6 +608,9 @@ impl Runtime {
                         )
                         .await?;
                     if let Ok(lease) = self.store().acquire(run, self.owner_id(), LEASE_TTL).await {
+                        if let Err(error) = self.release_empty_quota_reservation(run).await {
+                            tracing::warn!(%run, %error, "could not release the quota slot of an empty abandoned admission");
+                        }
                         let _ = self.store().release_lease(run, lease.epoch).await;
                     }
                     report.runs_recovered += 1;

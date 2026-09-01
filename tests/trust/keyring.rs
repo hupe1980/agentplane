@@ -687,7 +687,7 @@ async fn a_sealed_journal_hides_payloads_and_still_verifies_without_keys() {
 
 /// A conclusion's reason is a payload, and reaches the store sealed.
 ///
-/// `RunSealed` routes on `outcome`, so the whole record used to be
+/// `RunConcluded` routes on `outcome`, so the whole record used to be
 /// control-plane and carried nothing to seal. A reason is the same free text
 /// `EffectFailed.error` is — a provider's refusal quoting the request — and a
 /// field added to an existing variant is exactly what an exhaustive match over
@@ -717,9 +717,11 @@ async fn a_conclusions_reason_is_sealed_and_its_outcome_stays_readable() {
             lease.epoch,
             vec![Append::new(
                 run,
-                RecordKind::RunSealed {
+                RecordKind::RunConcluded {
                     outcome: "failed".into(),
                     reason: Some("the registry refused patient Ada Lovelace".into()),
+                    exhaustion: None,
+                    live_spend: agentplane::core::Spend::default(),
                     chain_head: agentplane::core::Digest::ZERO,
                 },
             )],
@@ -728,7 +730,7 @@ async fn a_conclusions_reason_is_sealed_and_its_outcome_stays_readable() {
         .expect("append");
 
     let raw = plain.read(run, 1).await.expect("raw read");
-    let RecordKind::RunSealed {
+    let RecordKind::RunConcluded {
         outcome, reason, ..
     } = raw[0].kind()
     else {
@@ -751,7 +753,7 @@ async fn a_conclusions_reason_is_sealed_and_its_outcome_stays_readable() {
     // Through the wrapper it opens, so an operator asking why still gets an
     // answer.
     let opened = sealed.read(run, 1).await.expect("read");
-    let RecordKind::RunSealed { reason, .. } = opened[0].kind() else {
+    let RecordKind::RunConcluded { reason, .. } = opened[0].kind() else {
         panic!("unexpected record")
     };
     assert_eq!(

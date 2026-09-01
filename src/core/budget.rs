@@ -341,8 +341,9 @@ pub struct Consumed {
 ///
 /// Carries the numbers rather than a message: an operator raising a limit needs
 /// to know what it actually reached, and "budget exhausted" does not say.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[non_exhaustive]
+#[serde(tag = "limit", rename_all = "snake_case")]
 pub enum BudgetExceeded {
     #[error("step budget exhausted: {allowed} step(s) permitted")]
     Steps { allowed: usize },
@@ -365,7 +366,11 @@ pub enum BudgetExceeded {
     /// Carries the recorded limit rather than the one in force now, because a
     /// run replayed under a larger budget still stopped where it stopped.
     #[error("{limit} (recorded: {used})")]
-    Recorded { limit: String, used: String },
+    Recorded {
+        #[serde(rename = "recorded_limit")]
+        limit: String,
+        used: String,
+    },
 
     #[error("token budget exhausted: {allowed} permitted, {used} consumed")]
     Tokens { allowed: u64, used: u64 },
@@ -785,6 +790,70 @@ mod tests {
         );
         // 0, 40, 80 all admit; at 120 consumption has reached the 100 limit.
         assert_eq!(replay(&spends), Some(3));
+    }
+
+    /// Literal vectors because this enum is now part of the durable conclusion
+    /// format. A serialize-then-deserialize test proves only that two copies of
+    /// the same mistake agree.
+    #[test]
+    fn exhaustion_has_a_stable_tagged_format() {
+        let vectors = [
+            (
+                BudgetExceeded::Steps { allowed: 2 },
+                r#"{"limit":"steps","allowed":2}"#,
+            ),
+            (
+                BudgetExceeded::Effects {
+                    allowed: 3,
+                    used: 4,
+                },
+                r#"{"limit":"effects","allowed":3,"used":4}"#,
+            ),
+            (
+                BudgetExceeded::Replans { allowed: 5 },
+                r#"{"limit":"replans","allowed":5}"#,
+            ),
+            (
+                BudgetExceeded::Denials { allowed: 6 },
+                r#"{"limit":"denials","allowed":6}"#,
+            ),
+            (
+                BudgetExceeded::Recorded {
+                    limit: "effect budget exhausted".to_owned(),
+                    used: "3 performed".to_owned(),
+                },
+                r#"{"limit":"recorded","recorded_limit":"effect budget exhausted","used":"3 performed"}"#,
+            ),
+            (
+                BudgetExceeded::Tokens {
+                    allowed: 7,
+                    used: 8,
+                },
+                r#"{"limit":"tokens","allowed":7,"used":8}"#,
+            ),
+            (
+                BudgetExceeded::Money {
+                    allowed: 9,
+                    used: 10,
+                },
+                r#"{"limit":"money","allowed":9,"used":10}"#,
+            ),
+            (
+                BudgetExceeded::Wallclock {
+                    allowed: 11,
+                    used: 12,
+                },
+                r#"{"limit":"wallclock","allowed":11,"used":12}"#,
+            ),
+        ];
+
+        for (value, literal) in vectors {
+            assert_eq!(serde_json::to_string(&value).unwrap(), literal);
+            assert_eq!(
+                serde_json::from_str::<BudgetExceeded>(literal).unwrap(),
+                value
+            );
+        }
     }
 
     /// A metered budget is overshot by at most one operation, because an

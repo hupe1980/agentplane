@@ -1371,7 +1371,7 @@ async fn a_failure_with_doubt_but_nothing_to_unwind_stays_failed_and_resumable()
     );
 }
 
-// ── One RunSealed per distinct conclusion ───────────────────────────────────
+// ── One RunConcluded per distinct conclusion ────────────────────────────────
 
 /// Fails until told otherwise; performs no effects, so a resume replays
 /// nothing and reaches the same conclusion doing nothing new.
@@ -1404,7 +1404,7 @@ impl Skill for FailsUntilFixed {
 ///
 /// A failed run is retried by resuming, and each unsuccessful resume ends at
 /// the same open conclusion the journal already holds. Re-appending it grows
-/// the chain by one identical `RunSealed{failed}` per attempt — a journal
+/// the chain by one identical `RunConcluded{failed}` per attempt — a journal
 /// whose length measures operator patience rather than history. The dedup
 /// must not overreach either: when the resume finally succeeds, the new
 /// conclusion is a different fact and must land, or the run would stay
@@ -1420,7 +1420,7 @@ async fn a_repeated_conclusion_is_not_re_sealed_but_a_new_one_is() {
             .filter(|r| {
                 matches!(
                     r.kind(),
-                    RecordKind::RunSealed { outcome: o, .. } if o == outcome
+                    RecordKind::RunConcluded { outcome: o, .. } if o == outcome
                 )
             })
             .count()
