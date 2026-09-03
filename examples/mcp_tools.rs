@@ -38,8 +38,8 @@ use rmcp::model::{
     Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
     ServerInfo, Tool as McpTool, ToolAnnotations,
 };
+use rmcp::serve_server;
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::{ServiceExt, serve_server};
 use serde_json::{Value, json};
 
 /// The agent. Two servers, two grants, and no mention of a transport.
@@ -122,7 +122,11 @@ impl ServerHandler for TicketServer {
         me.name = "tickets".into();
         me.version = "0.0.0".into();
         let mut info = ServerInfo::default();
-        info.protocol_version = ProtocolVersion::default();
+        // The version the spec text names, never the SDK's `default()`: that
+        // is whatever rmcp's `LATEST` happens to be in the linked release, and a fixture
+        // that inherits it makes the negotiation test check the dependency's
+        // constant against itself.
+        info.protocol_version = ProtocolVersion::V_2026_07_28;
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = me;
         info
@@ -182,11 +186,15 @@ async fn connect() -> McpClient {
             let _ = running.waiting().await;
         }
     });
-    let service = McpClient::host_info()
-        .serve((cr, cw))
-        .await
-        .expect("client initialises");
-    McpClient::new("tickets", Arc::new(service)).expect("a known negotiated version")
+    McpClient::connect(
+        "tickets",
+        (cr, cw),
+        // An in-process duplex pipe: no socket, so no host for an egress
+        // allowlist to judge.
+        agentplane::tools::Destination::Local,
+    )
+    .await
+    .expect("client initialises on a known version")
 }
 
 #[tokio::main]

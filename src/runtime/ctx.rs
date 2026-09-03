@@ -166,6 +166,16 @@ pub(crate) struct Frame {
         Arc<crate::tools::ToolCatalog>,
         Arc<dyn crate::tools::ToolClient>,
     )>,
+    /// Where the plane's tool transports may connect, for the same gate a
+    /// model driver applies to its base URL.
+    ///
+    /// Behind `manifest` because the tool path is: a plane with no catalogue
+    /// dispatches no tool call for an allowlist to judge.
+    #[cfg(feature = "manifest")]
+    pub egress: Option<Arc<crate::core::Egress>>,
+    /// The highest sensitivity this plane will write into a record, when it
+    /// says. The plane-level twin of `spec.security.max_sensitivity_journaled`.
+    pub journal_ceiling: Option<crate::core::Sensitivity>,
     pub meter: crate::runtime::metrics::Meter,
     #[cfg(feature = "keyring")]
     pub keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
@@ -238,6 +248,11 @@ pub struct StepCtx<'a> {
         Arc<crate::tools::ToolCatalog>,
         Arc<dyn crate::tools::ToolClient>,
     )>,
+    /// Where the plane's tool transports may connect, when it says so.
+    #[cfg(feature = "manifest")]
+    egress: Option<Arc<crate::core::Egress>>,
+    /// The highest sensitivity this plane will write into a record.
+    journal_ceiling: Option<crate::core::Sensitivity>,
     meter: crate::runtime::metrics::Meter,
     #[cfg(feature = "keyring")]
     keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
@@ -306,6 +321,9 @@ impl<'a> StepCtx<'a> {
             peers,
             #[cfg(feature = "manifest")]
             tools,
+            #[cfg(feature = "manifest")]
+            egress,
+            journal_ceiling,
             meter,
             #[cfg(feature = "keyring")]
             keyring,
@@ -339,6 +357,9 @@ impl<'a> StepCtx<'a> {
             peers,
             #[cfg(feature = "manifest")]
             tools,
+            #[cfg(feature = "manifest")]
+            egress,
+            journal_ceiling,
             meter,
             #[cfg(feature = "keyring")]
             keyring,
@@ -735,11 +756,36 @@ impl<'a> StepCtx<'a> {
                     .into(),
             ))
         })?;
+        let egress = self.tool_egress();
         self.sink_with(&arguments, |value| {
-            crate::tools::ToolCall::prepare(&catalog, client, tool, value)
+            crate::tools::ToolCall::prepare(&catalog, client, tool, value, egress.as_deref())
                 .map_err(|e| StepError::Effect(crate::core::EffectError::Rejected(e.to_string())))
         })
         .await
+    }
+
+    /// Where this plane's tool transports may connect, when it says so.
+    ///
+    /// [`call_tool`](Self::call_tool) applies it already. This is for a skill
+    /// assembling its own catalogue and calling
+    /// [`ToolCall::prepare`](crate::tools::ToolCall::prepare) directly: that
+    /// path bypasses the plane's checked catalogue, and it would silently
+    /// bypass the plane's destination allowlist too unless the skill can reach
+    /// it. Hand it straight through:
+    ///
+    /// ```ignore
+    /// let egress = cx.tool_egress();   // before the closure: it cannot borrow cx
+    /// cx.sink_with(&args, |value| {
+    ///     ToolCall::prepare(&catalog, client, tool, value, egress.as_deref())
+    /// }).await?
+    /// ```
+    ///
+    /// Captured before a `sink_with` closure rather than read inside one: the
+    /// closure cannot borrow the context it is being handed to.
+    #[cfg(feature = "manifest")]
+    #[must_use]
+    pub fn tool_egress(&self) -> Option<Arc<crate::core::Egress>> {
+        self.egress.clone()
     }
 
     /// Call another plane's agent, under this run's chain.
@@ -2566,8 +2612,24 @@ impl<'a> StepCtx<'a> {
         let Some(bound) = effect.sink_arguments() else {
             return Err(PolicyError::UnboundSinkArguments { sink: sink_name }.into());
         };
-        if canon::value_bytes(bound) != canon::value_bytes(args.peek()) {
-            return Err(PolicyError::SinkArgumentsMismatch { sink: sink_name }.into());
+        let bound_bytes = canon::value_bytes(bound);
+        let sent_bytes = canon::value_bytes(args.peek());
+        if bound_bytes != sent_bytes {
+            // Where, not only that. The rule is exact equality and the verdict
+            // needs nothing more, but the reader does: without a path this is
+            // two documents and a diff by eye, and the commonest case — a
+            // bound payload still at its `null` default beside a labelled
+            // object — is the one a bare "they differ" hides worst. Neither
+            // value is printed: the labelled one is precisely the data these
+            // gates exist to keep out of a log, so the digests identify it to
+            // whoever already holds it and disclose nothing to anyone else.
+            return Err(PolicyError::SinkArgumentsMismatch {
+                sink: sink_name,
+                at: canon::first_difference(bound, args.peek()).unwrap_or_default(),
+                bound: crate::core::Digest::of(&bound_bytes),
+                sent: crate::core::Digest::of(&sent_bytes),
+            }
+            .into());
         }
 
         // The label these gates judge is the **effective label at this sink**:
@@ -2665,14 +2727,24 @@ impl<'a> StepCtx<'a> {
         // destination, not for storage. A sensitivity release toward this sink
         // does not make the bytes en route to the append-only chain any more
         // erasable.
-        #[cfg(feature = "manifest")]
+        //
+        // Two sources, and **the stricter wins** — exactly as a reviewed tool
+        // grant may only tighten the operator's catalogue. The plane's ceiling
+        // is how a hand-written skill, running under no manifest, states it.
         let stored = args.label().sensitivity;
         #[cfg(feature = "manifest")]
-        if let Some(journal_ceiling) = self
+        let declared = self
             .manifest
             .as_ref()
             .filter(|_| manifest_gates)
-            .and_then(|m| m.spec.security.max_sensitivity_journaled)
+            .and_then(|m| m.spec.security.max_sensitivity_journaled);
+        #[cfg(not(feature = "manifest"))]
+        let declared: Option<crate::core::Sensitivity> = None;
+        let journal_ceiling = match (self.journal_ceiling, declared) {
+            (Some(plane), Some(manifest)) => Some(plane.min(manifest)),
+            (only, None) | (None, only) => only,
+        };
+        if let Some(journal_ceiling) = journal_ceiling
             && stored > journal_ceiling
         {
             let denial = PolicyError::JournalCeiling {

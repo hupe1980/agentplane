@@ -2438,6 +2438,75 @@ async fn a_policy_denial_is_a_decline_not_a_server_fault() {
     );
 }
 
+/// A halted agent answers *stop*, never *retry later*.
+///
+/// The two refusals ask opposite things of a caller. A ceiling under
+/// `QUOTA_EXHAUSTED` tells a compliant peer to back off and come back; a halt
+/// under the same code would teach every peer to hammer the one door that
+/// means somebody is dealing with an incident. So a halt has its own code and
+/// its own `ErrorInfo` reason, and the message carries none of the operator's
+/// words: the counterparty gets the outcome, not the plane's internals.
+#[tokio::test]
+async fn a_halted_agent_is_not_back_pressure() {
+    use agentplane::quota::{HaltScope, QuotaStore, TenantQuota};
+
+    let manifest = Manifest::parse(ONE_SKILL).expect("parse");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let policy = Arc::new(Recording::default());
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let scoped = Arc::new(store.as_ref().clone().for_tenant(TenantId::default()));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .policy(policy.clone() as Arc<dyn PolicyEngine>)
+        .quota(scoped as Arc<dyn QuotaStore>, TenantQuota::default())
+        .skill(Echoes {
+            capability: "settlement.check",
+            seen: seen.clone(),
+        })
+        .build();
+    rt.set_halt(
+        &HaltScope::Tenant,
+        Some("incident 42: ledger reconciliation is wrong"),
+    )
+    .await
+    .expect("halt");
+    let f = Fixture {
+        rt,
+        store,
+        policy,
+        seen,
+        manifest,
+    };
+
+    let (status, body) = send(
+        &f.router(),
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(
+        err_code(&body),
+        -32030,
+        "a halt must not wear the back-pressure code: {body:#}"
+    );
+    let info = &body["error"]["data"][0];
+    assert_eq!(info["domain"], "agentplane.hupe1980.github.io", "{body:#}");
+    assert_eq!(info["reason"], "HALTED", "{body:#}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("incident") && !message.contains("ledger"),
+        "the operator's reason is for the operator, not the counterparty: {message}"
+    );
+    assert!(
+        message.contains("do not retry"),
+        "a halt must tell the caller the opposite of a ceiling: {message}"
+    );
+}
+
 /// A full quota answers with the server-defined back-pressure code, and the
 /// quota arithmetic stays inside.
 ///

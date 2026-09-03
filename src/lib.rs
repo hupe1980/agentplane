@@ -109,6 +109,7 @@ pub mod policy;
 #[cfg(feature = "push")]
 pub mod push;
 pub mod quota;
+pub mod retention;
 pub mod runtime;
 pub mod tools;
 

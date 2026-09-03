@@ -40,6 +40,28 @@ impl Skill for Work {
     }
 }
 
+/// The same, under a name and capability a caller chooses.
+///
+/// Two of these under two manifests is the plane a scoped halt exists for.
+#[cfg(feature = "manifest")]
+#[derive(Debug)]
+struct Named(&'static str, &'static str);
+
+#[cfg(feature = "manifest")]
+#[async_trait::async_trait]
+impl Skill for Named {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new(self.0).provides(self.1)
+    }
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        Ok(Outcome::done(Tainted::trusted(json!({"ok": true}))))
+    }
+}
+
 /// Holds a run at a deterministic point while the test inspects accounting.
 #[derive(Debug)]
 struct BlockingWork {
@@ -73,12 +95,16 @@ impl QuotaStore for FailsFirstSettlement {
         self.inner.release(run).await
     }
 
-    async fn set_halt(&self, reason: Option<&str>) -> Result<(), agentplane::core::StoreError> {
-        self.inner.set_halt(reason).await
+    async fn set_halt(
+        &self,
+        scope: &agentplane::quota::HaltScope,
+        reason: Option<&str>,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.set_halt(scope, reason).await
     }
 
-    async fn halted(&self) -> Result<Option<String>, agentplane::core::StoreError> {
-        self.inner.halted().await
+    async fn halts(&self) -> Result<Vec<agentplane::quota::Halt>, agentplane::core::StoreError> {
+        self.inner.halts().await
     }
 
     async fn settle(
@@ -519,6 +545,192 @@ async fn a_quota_refusal_is_not_a_policy_denial() {
     }
 }
 
+/// A halt names what it stops, so an incident does not have to stop everything.
+///
+/// The tenant switch is the right answer when the plane is the incident and the
+/// wrong one at three in the morning when agent 12 of 28 is: the options were
+/// stop all 28 or ship a policy change, and neither is an emergency stop. Four
+/// properties, and the last is the one a single overwritable flag fails.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn a_halt_can_name_one_agent_and_leave_the_rest_running() {
+    use agentplane::core::RuntimeError;
+    use agentplane::manifest::Manifest;
+    use agentplane::quota::{HaltScope, QuotaError};
+    use agentplane::runtime::Agent;
+
+    fn declared(name: &str, capability: &str, version: &str) -> Manifest {
+        Manifest::parse(&format!(
+            "
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: {name}, version: '{version}' }}
+spec:
+  capabilities: {{ provides: [{capability}] }}
+  budgets: {{}}
+"
+        ))
+        .expect("a well-formed declaration")
+    }
+
+    let store = RedbStore::open_in_memory().expect("store");
+    let clerk = declared("payments-clerk", "pay.do", "1.0.0");
+    let desk = declared("support-desk", "support.do", "1.0.0");
+
+    let scoped = Arc::new(store.clone().for_tenant(tenant("acme")));
+    let plane = || {
+        Runtime::builder(scoped.clone() as Arc<dyn JournalStore>)
+            .tenant(tenant("acme"))
+            .quota(
+                scoped.clone() as Arc<dyn QuotaStore>,
+                TenantQuota::default(),
+            )
+            .agent(Agent::new(&clerk).skill(Named("clerk", "pay.do")))
+            .agent(Agent::new(&desk).skill(Named("desk", "support.do")))
+            // Ungoverned: no manifest, so only a tenant halt can reach it.
+            .skill(Work)
+            .build()
+    };
+    let rt = plane();
+
+    rt.set_halt(
+        &HaltScope::agent("payments-clerk"),
+        Some("incident 42: agent 12 is looping"),
+    )
+    .await
+    .expect("halt one agent");
+
+    match rt.run("pay.do", Tainted::trusted(json!({}))).await {
+        Err(RuntimeError::QuotaExceeded(QuotaError::Halted { scope, reason, .. })) => {
+            assert_eq!(scope, HaltScope::agent("payments-clerk"));
+            assert!(
+                reason.contains("incident 42"),
+                "the refusal must carry the operator's reason: {reason}"
+            );
+        }
+        other => panic!("the halted agent was admitted: {other:?}"),
+    }
+
+    // The whole point: everything else on the plane keeps running.
+    for capability in ["support.do", "work"] {
+        assert_eq!(
+            rt.run(capability, Tainted::trusted(json!({})))
+                .await
+                .expect("run")
+                .status,
+            RunStatus::Succeeded,
+            "halting one agent stopped '{capability}', which nobody asked to stop"
+        );
+    }
+
+    // A second instance on the same store sees it: the flag is durable, not a
+    // switch thrown in one process.
+    let two = plane();
+    assert!(
+        two.run("pay.do", Tainted::trusted(json!({})))
+            .await
+            .is_err(),
+        "a halt on one instance must reach the others"
+    );
+
+    // Scopes are independent rows. A tenant halt beside the agent halt, and
+    // lifting the agent's, must leave the tenant's standing — an incident that
+    // widens and then partly resolves is the ordinary shape, and one
+    // overwritable flag gets it wrong in the direction that lets work through.
+    rt.set_halt(&HaltScope::Tenant, Some("incident 42 widened"))
+        .await
+        .expect("widen");
+    rt.set_halt(&HaltScope::agent("payments-clerk"), None)
+        .await
+        .expect("narrow the stop");
+    match rt.run("support.do", Tainted::trusted(json!({}))).await {
+        Err(RuntimeError::QuotaExceeded(QuotaError::Halted { scope, .. })) => {
+            assert_eq!(scope, HaltScope::Tenant);
+        }
+        other => panic!("lifting a narrow halt lifted the broad one under it: {other:?}"),
+    }
+
+    rt.set_halt(&HaltScope::Tenant, None).await.expect("lift");
+    assert_eq!(
+        rt.run("pay.do", Tainted::trusted(json!({})))
+            .await
+            .expect("run")
+            .status,
+        RunStatus::Succeeded
+    );
+}
+
+/// A revision halt stops the bad deploy and not its fix.
+///
+/// The property a name-keyed halt cannot give: a manifest republished at a new
+/// version is a different digest, so it runs while the revision an operator
+/// stopped stays stopped. No policy change, no window where everything is down.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn a_revision_halt_stops_one_deploy_and_not_the_version_that_fixes_it() {
+    use agentplane::manifest::Manifest;
+    use agentplane::quota::HaltScope;
+    use agentplane::runtime::Agent;
+
+    fn declared(version: &str) -> Manifest {
+        Manifest::parse(&format!(
+            "
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: payments-clerk, version: '{version}' }}
+spec:
+  capabilities: {{ provides: [pay.do] }}
+  budgets: {{}}
+"
+        ))
+        .expect("a well-formed declaration")
+    }
+
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.clone().for_tenant(tenant("acme")));
+    let broken = declared("1.0.0");
+    let fixed = declared("1.0.1");
+
+    let plane = |m: &Manifest| {
+        Runtime::builder(scoped.clone() as Arc<dyn JournalStore>)
+            .tenant(tenant("acme"))
+            .quota(
+                scoped.clone() as Arc<dyn QuotaStore>,
+                TenantQuota::default(),
+            )
+            .agent(Agent::new(m).skill(Named("clerk", "pay.do")))
+            .build()
+    };
+
+    let running_broken = plane(&broken);
+    running_broken
+        .set_halt(
+            &HaltScope::revision(broken.digest().expect("digest")),
+            Some("incident 42: this revision double-posts"),
+        )
+        .await
+        .expect("halt one revision");
+
+    assert!(
+        running_broken
+            .run("pay.do", Tainted::trusted(json!({})))
+            .await
+            .is_err(),
+        "the stopped revision must not be admitted"
+    );
+
+    // The fix, published as a new version, is a different digest — and runs.
+    assert_eq!(
+        plane(&fixed)
+            .run("pay.do", Tainted::trusted(json!({})))
+            .await
+            .expect("run")
+            .status,
+        RunStatus::Succeeded,
+        "a revision halt must not stop the version that fixes it"
+    );
+}
+
 /// The emergency stop refuses new work, across instances, and says why.
 ///
 /// Three properties in one test because they are one control:
@@ -548,16 +760,24 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
         RunStatus::Succeeded
     );
 
-    one.set_halt(Some("incident 42: ledger reconciliation is wrong"))
-        .await
-        .expect("halt");
+    one.set_halt(
+        &agentplane::quota::HaltScope::Tenant,
+        Some("incident 42: ledger reconciliation is wrong"),
+    )
+    .await
+    .expect("halt");
 
     for (which, rt) in [("the halting instance", &one), ("a second instance", &two)] {
         match rt.run("work", Tainted::trusted(json!({}))).await {
             Err(agentplane::core::RuntimeError::QuotaExceeded(
-                agentplane::quota::QuotaError::Halted { tenant, reason },
+                agentplane::quota::QuotaError::Halted {
+                    tenant,
+                    scope,
+                    reason,
+                },
             )) => {
                 assert_eq!(tenant, "acme");
+                assert_eq!(scope, agentplane::quota::HaltScope::Tenant);
                 assert!(
                     reason.contains("incident 42"),
                     "{which}: the refusal must carry the operator's reason, got '{reason}'"
@@ -580,7 +800,9 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
         "halting one tenant stopped another"
     );
 
-    one.set_halt(None).await.expect("lift");
+    one.set_halt(&agentplane::quota::HaltScope::Tenant, None)
+        .await
+        .expect("lift");
     assert_eq!(
         two.run("work", Tainted::trusted(json!({})))
             .await

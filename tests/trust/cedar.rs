@@ -75,6 +75,114 @@ fn an_empty_policy_set_denies_and_says_nothing_permits() {
     );
 }
 
+// ── What a denial names ─────────────────────────────────────────────────────
+
+/// The reason names the **rule**, and does not repeat the request.
+///
+/// `StepError::Denied` already formats the action and the resource, so an
+/// adapter that formats them again produces `policy denied 'effect:perform' on
+/// 'tool.call': 'effect:perform' on 'tool.call' refused by policy1` — half the
+/// line an auditor reads spent saying the same thing twice.
+#[test]
+fn a_denial_names_the_rule_and_not_the_request() {
+    let engine = CedarEngine::new(
+        r#"permit(principal, action, resource);
+           @id("betragsgrenze-5000-eur")
+           forbid(principal, action, resource) when { context.args.amount_eur > 5000 };"#,
+    )
+    .unwrap();
+    let ctx = json!({ "args": { "amount_eur": 6000 } });
+    let d = ask(&engine, "agent:a", ACTION_PERFORM, TOOL_CALL, &ctx);
+
+    let PolicyDecision::Deny { reason } = d else {
+        panic!("the forbid must fire")
+    };
+    assert_eq!(
+        reason, "refused by betragsgrenze-5000-eur",
+        "the reason's job is the half the wrapper cannot know: which rule"
+    );
+}
+
+/// `@id` beats Cedar's generated `policy0`/`policy1`.
+///
+/// Cedar treats `@id` as an ordinary annotation and does not adopt it as the
+/// `PolicyId`, so the adapter has to read it. Without this, forty rules produce
+/// `policy0`…`policy39` and the required reason answers nothing.
+#[test]
+fn a_named_rule_is_named_in_the_denial_rather_than_numbered() {
+    let engine = CedarEngine::new(
+        r"permit(principal, action, resource);
+          forbid(principal, action, resource) when { context.args.risk > 3 };",
+    )
+    .unwrap();
+    let ctx = json!({ "args": { "risk": 9 } });
+    let PolicyDecision::Deny { reason } = ask(&engine, "agent:a", ACTION_PERFORM, TOOL_CALL, &ctx)
+    else {
+        panic!("the forbid must fire")
+    };
+    assert_eq!(
+        reason, "refused by policy1",
+        "an unannotated rule falls back to Cedar's own id"
+    );
+
+    let named = CedarEngine::new(
+        r#"permit(principal, action, resource);
+           @id("risk-tier-ceiling")
+           forbid(principal, action, resource) when { context.args.risk > 3 };"#,
+    )
+    .unwrap();
+    let PolicyDecision::Deny { reason } = ask(&named, "agent:a", ACTION_PERFORM, TOOL_CALL, &ctx)
+    else {
+        panic!("the forbid must fire")
+    };
+    assert_eq!(reason, "refused by risk-tier-ceiling");
+}
+
+/// An `@id` with no value names nothing, so the generated id stands.
+#[test]
+fn a_valueless_id_annotation_falls_back_rather_than_naming_nothing() {
+    let engine = CedarEngine::new(
+        r"permit(principal, action, resource);
+          @id
+          forbid(principal, action, resource) when { context.args.risk > 3 };",
+    )
+    .unwrap();
+    let ctx = json!({ "args": { "risk": 9 } });
+    let PolicyDecision::Deny { reason } = ask(&engine, "agent:a", ACTION_PERFORM, TOOL_CALL, &ctx)
+    else {
+        panic!("the forbid must fire")
+    };
+    assert_eq!(reason, "refused by policy1");
+}
+
+/// Two rules answering to one name are refused at construction.
+///
+/// A name that reads like an answer and points at the wrong rule is worse than
+/// a number that points at the right one.
+#[test]
+fn two_rules_sharing_a_name_are_refused_at_startup() {
+    let err = CedarEngine::new(
+        r#"@id("limit") forbid(principal, action, resource) when { context.args.a > 1 };
+           @id("limit") forbid(principal, action, resource) when { context.args.b > 1 };"#,
+    )
+    .expect_err("an ambiguous rule name must not compile");
+    assert!(matches!(err, CedarError::AmbiguousRuleName { .. }), "{err}");
+    assert!(err.to_string().contains("limit"), "{err}");
+}
+
+/// An `@id` that collides with another rule's *generated* id is refused too.
+///
+/// The case an annotation-only uniqueness check misses.
+#[test]
+fn an_id_colliding_with_a_generated_id_is_refused() {
+    let err = CedarEngine::new(
+        r#"permit(principal, action, resource);
+           @id("policy0") forbid(principal, action, resource) when { context.args.a > 1 };"#,
+    )
+    .expect_err("a name colliding with a generated id must not compile");
+    assert!(matches!(err, CedarError::AmbiguousRuleName { .. }), "{err}");
+}
+
 /// A malformed policy set fails at construction, not at the first request.
 #[test]
 fn a_policy_set_that_does_not_parse_is_refused_at_startup() {

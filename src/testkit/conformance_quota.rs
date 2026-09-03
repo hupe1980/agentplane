@@ -258,24 +258,42 @@ async fn spend_accrues_per_period(store: &dyn QuotaStore, report: &mut Report) {
 
 /// The emergency stop, held to the same contract on every backend.
 ///
-/// Three properties, and the third is the one an in-process flag fails.
+/// Four properties, and the last two are the ones an in-process flag and a
+/// single overwritable row respectively fail.
+#[allow(clippy::too_many_lines)]
 async fn halt(store: &dyn QuotaStore, report: &mut Report) {
+    use crate::quota::HaltScope;
+
+    let tenant = HaltScope::Tenant;
+    let agent = HaltScope::agent("payments-clerk");
+    let revision = HaltScope::revision(crate::core::Digest::of(b"a manifest revision"));
+
+    let standing = |halts: &[crate::quota::Halt], scope: &HaltScope| -> Option<String> {
+        halts
+            .iter()
+            .find(|h| &h.scope == scope)
+            .map(|h| h.reason.clone())
+    };
+
     report.checked += 1;
-    match store.halted().await {
-        Ok(None) => {}
-        Ok(Some(reason)) => report.record(
+    match store.halts().await {
+        Ok(halts) if halts.is_empty() => {}
+        Ok(halts) => report.record(
             "a fresh tenant is not halted",
-            format!("an untouched tenant reports itself halted for '{reason}', so a plane would refuse every run it was never told to refuse"),
+            format!(
+                "an untouched tenant reports {halts:?}, so a plane would refuse \
+                 every run it was never told to refuse"
+            ),
         ),
-        Err(e) => report.record("reading the halt", format!("{e}")),
+        Err(e) => report.record("reading the halts", format!("{e}")),
     }
 
     report.checked += 1;
-    if let Err(e) = store.set_halt(Some("incident 42")).await {
+    if let Err(e) = store.set_halt(&tenant, Some("incident 42")).await {
         report.record("setting the halt", format!("{e}"));
     }
-    match store.halted().await {
-        Ok(Some(reason)) if reason == "incident 42" => {}
+    match store.halts().await {
+        Ok(halts) if standing(&halts, &tenant).as_deref() == Some("incident 42") => {}
         Ok(other) => report.record(
             "the halt survives being written",
             format!(
@@ -289,11 +307,11 @@ async fn halt(store: &dyn QuotaStore, report: &mut Report) {
     // The reason is replaced rather than appended to, so the current one is
     // always the current one.
     report.checked += 1;
-    if let Err(e) = store.set_halt(Some("incident 43")).await {
+    if let Err(e) = store.set_halt(&tenant, Some("incident 43")).await {
         report.record("re-halting", format!("{e}"));
     }
-    match store.halted().await {
-        Ok(Some(reason)) if reason == "incident 43" => {}
+    match store.halts().await {
+        Ok(halts) if standing(&halts, &tenant).as_deref() == Some("incident 43") => {}
         Ok(other) => report.record(
             "re-halting replaces the reason",
             format!("expected the newer reason, got {other:?}"),
@@ -301,16 +319,62 @@ async fn halt(store: &dyn QuotaStore, report: &mut Report) {
         Err(e) => report.record("re-reading the halt", format!("{e}")),
     }
 
+    // **Scopes are independent rows.** A narrow halt beside a broad one, and
+    // lifting the narrow one, must leave the broad one standing: an incident
+    // that widens and then partly resolves is the ordinary shape, and a single
+    // overwritable flag gets it wrong in the direction that lets work through.
     report.checked += 1;
-    if let Err(e) = store.set_halt(None).await {
-        report.record("lifting the halt", format!("{e}"));
+    if let Err(e) = store.set_halt(&agent, Some("agent 12 is looping")).await {
+        report.record("halting one agent", format!("{e}"));
     }
-    match store.halted().await {
-        Ok(None) => {}
-        Ok(Some(reason)) => report.record(
+    if let Err(e) = store.set_halt(&revision, Some("bad deploy")).await {
+        report.record("halting one revision", format!("{e}"));
+    }
+    match store.halts().await {
+        Ok(halts)
+            if standing(&halts, &tenant).as_deref() == Some("incident 43")
+                && standing(&halts, &agent).as_deref() == Some("agent 12 is looping")
+                && standing(&halts, &revision).as_deref() == Some("bad deploy") => {}
+        Ok(other) => report.record(
+            "scopes are independent",
+            format!(
+                "a narrow halt overwrote a broader one, or was not kept: {other:?} — \
+                 an incident that widens must not un-stop what was already stopped"
+            ),
+        ),
+        Err(e) => report.record("reading several standing halts", format!("{e}")),
+    }
+
+    report.checked += 1;
+    if let Err(e) = store.set_halt(&agent, None).await {
+        report.record("lifting one scope", format!("{e}"));
+    }
+    match store.halts().await {
+        Ok(halts)
+            if standing(&halts, &agent).is_none()
+                && standing(&halts, &tenant).as_deref() == Some("incident 43") => {}
+        Ok(other) => report.record(
+            "lifting one scope leaves the others",
+            format!(
+                "after lifting the agent halt the store reports {other:?} — lifting \
+                 a narrow stop must not lift the broad one it sits under"
+            ),
+        ),
+        Err(e) => report.record("reading a partly lifted halt", format!("{e}")),
+    }
+
+    report.checked += 1;
+    for scope in [&tenant, &revision] {
+        if let Err(e) = store.set_halt(scope, None).await {
+            report.record("lifting the halt", format!("{e}"));
+        }
+    }
+    match store.halts().await {
+        Ok(halts) if halts.is_empty() => {}
+        Ok(other) => report.record(
             "a lifted halt stays lifted",
             format!(
-                "the tenant is still halted for '{reason}' after the stop was \
+                "the tenant is still halted by {other:?} after the stop was \
                  lifted, so an incident that is over never ends"
             ),
         ),
@@ -320,7 +384,7 @@ async fn halt(store: &dyn QuotaStore, report: &mut Report) {
     // Lifting a halt nobody set is a no-op, not an error: an operator clearing
     // a switch they are not sure about must not be punished for it.
     report.checked += 1;
-    if let Err(e) = store.set_halt(None).await {
+    if let Err(e) = store.set_halt(&tenant, None).await {
         report.record("lifting an unset halt", format!("{e}"));
     }
 }

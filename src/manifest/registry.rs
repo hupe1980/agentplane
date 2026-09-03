@@ -161,7 +161,7 @@ pub trait Registry: Send + Sync + Debug {
     /// about.
     ///
     /// Signed over [`crate::core::signing_hash`] with
-    /// [`DOMAIN_MANIFEST`](crate::core::DOMAIN_MANIFEST), not over the bare
+    /// [`DOMAIN_MANIFEST`], not over the bare
     /// digest — so a manifest signature can never be presented as a record
     /// attestation, and a record attestation can never be presented as an
     /// approval of a manifest.
@@ -245,6 +245,189 @@ pub trait Registry: Send + Sync + Debug {
     ///
     /// If the backing store cannot be read.
     async fn versions(&self, name: &str) -> Result<Vec<String>, RegistryError>;
+
+    /// Every name this registry holds, sorted.
+    ///
+    /// *Which agents does this organisation run?* is the question a governance
+    /// function asks first, and `versions` cannot answer it — it needs the name
+    /// you were already going to ask about. An inventory nobody can enumerate
+    /// is one that gets maintained somewhere else, and then the two drift.
+    ///
+    /// Sorted, unlike `versions`, and the difference is not an inconsistency: a
+    /// name is an ordinary string with an obvious ordering, where a version is
+    /// free-form and this crate has no opinion about whether `1.10` follows
+    /// `1.9`.
+    ///
+    /// # Errors
+    ///
+    /// If the backing store cannot be read.
+    async fn names(&self) -> Result<Vec<String>, RegistryError>;
+}
+
+/// What a publish must do to whatever is already stored.
+///
+/// # Why this is a value rather than three implementations
+///
+/// The rule — *the same content is the same publish, a different content is a
+/// refusal, and an unsigned artifact may adopt its first attestation but never
+/// change publisher* — is the whole security argument for having a registry.
+/// Every backend has to apply it inside its own read-modify-write, and three
+/// hand-written copies would be three chances to get "may this replace what is
+/// there" subtly different. The one that is wrong is whichever nobody tested,
+/// and the signed path is exactly where a weaker rule would matter most.
+///
+/// So the decision is computed once, here, and each backend only *performs* it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishVerdict {
+    /// Nothing is stored under this name and version. Write the row.
+    Insert,
+    /// The same content is stored, and this publish carries the first
+    /// attestation for it. Record the attestation, leave the content.
+    AdoptAttestation,
+    /// The same content, and nothing to change. A retried deploy.
+    Unchanged,
+}
+
+/// Apply the immutability and publisher rules to one publish.
+///
+/// `stored` is what the backend found under `(name, version)`, if anything.
+///
+/// # Errors
+///
+/// [`RegistryError::Immutable`] when the version holds different content, and
+/// [`RegistryError::PublisherChanged`] when identical content is already
+/// attributed to a different signer.
+pub fn decide_publish(
+    name: &str,
+    version: &str,
+    offered: Digest,
+    offered_attestation: Option<&Attestation>,
+    stored: Option<(Digest, Option<&Attestation>)>,
+) -> Result<PublishVerdict, RegistryError> {
+    let Some((existing, recorded)) = stored else {
+        return Ok(PublishVerdict::Insert);
+    };
+    if existing != offered {
+        // The refusal that makes a version number mean something. Publishing
+        // identical content again succeeds, because a retried deploy is not an
+        // attack and making it look like one trains people to force.
+        return Err(RegistryError::Immutable {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            existing: existing.to_hex(),
+            offered: offered.to_hex(),
+        });
+    }
+    match (recorded, offered_attestation) {
+        (None, Some(_)) => Ok(PublishVerdict::AdoptAttestation),
+        (Some(recorded), Some(offered)) if recorded.key_id != offered.key_id => {
+            Err(RegistryError::PublisherChanged {
+                name: name.to_owned(),
+                version: version.to_owned(),
+                existing: recorded.key_id.clone(),
+                offered: offered.key_id.clone(),
+            })
+        }
+        _ => Ok(PublishVerdict::Unchanged),
+    }
+}
+
+/// The signature a publisher makes over a manifest.
+///
+/// Domain-separated with [`DOMAIN_MANIFEST`], so this signature cannot be
+/// replayed as a record attestation and a record attestation cannot be replayed
+/// as approval of a manifest. Shared by every backend for the same reason
+/// [`decide_publish`] is: one spelling of what is signed, or two backends
+/// produce attestations that do not verify against each other.
+///
+/// # Errors
+///
+/// If the manifest cannot be digested.
+pub fn attest_manifest(
+    manifest: &Manifest,
+    signer: &dyn Signer,
+) -> Result<(Digest, Attestation), RegistryError> {
+    let digest = manifest.digest().map_err(|e| RegistryError::Corrupt {
+        name: manifest.metadata.name.clone(),
+        version: manifest.metadata.version.clone(),
+        source: e,
+    })?;
+    Ok((
+        digest,
+        signer.attest(&signing_hash(DOMAIN_MANIFEST, &digest)),
+    ))
+}
+
+/// Check a resolved manifest against the attestation a registry stored for it.
+///
+/// The digest is **recomputed from the manifest that was just re-parsed**,
+/// never read back from the row. Verifying a stored digest against a stored
+/// signature would confirm only that the registry is consistent with itself,
+/// which is precisely the assurance a caller worried about the registry does
+/// not want.
+///
+/// # Errors
+///
+/// [`RegistryError::Unsigned`] when nothing signed it, and
+/// [`RegistryError::BadSignature`] when the signature is not one that key made.
+pub fn check_attestation(
+    name: &str,
+    version: &str,
+    manifest: &Manifest,
+    attestation: Option<&Attestation>,
+    verifier: &dyn Verifier,
+) -> Result<KeyId, RegistryError> {
+    let Some(a) = attestation else {
+        return Err(RegistryError::Unsigned {
+            name: name.to_owned(),
+            version: version.to_owned(),
+        });
+    };
+    let digest = manifest.digest().map_err(|e| RegistryError::Corrupt {
+        name: name.to_owned(),
+        version: version.to_owned(),
+        source: e,
+    })?;
+    if verifier.verify(
+        &a.key_id,
+        &signing_hash(DOMAIN_MANIFEST, &digest),
+        &a.signature,
+    ) {
+        Ok(a.key_id.clone())
+    } else {
+        Err(RegistryError::BadSignature {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            key_id: a.key_id.clone(),
+        })
+    }
+}
+
+/// Re-parse stored YAML, so a registry cannot serve what this crate refuses.
+///
+/// A registry that only validates on write enforces the rules of whatever
+/// version happened to publish, which is the version nobody is running any
+/// more.
+///
+/// # Errors
+///
+/// [`RegistryError::Corrupt`] when the stored bytes are not a manifest this
+/// crate accepts.
+pub fn reparse(name: &str, version: &str, yaml: &str) -> Result<Manifest, RegistryError> {
+    Manifest::parse(yaml).map_err(|source| RegistryError::Corrupt {
+        name: name.to_owned(),
+        version: version.to_owned(),
+        source,
+    })
+}
+
+/// The canonical stored form of a manifest.
+///
+/// # Errors
+///
+/// If the manifest cannot be serialized.
+pub fn to_yaml(manifest: &Manifest) -> Result<String, RegistryError> {
+    serde_yaml_ng::to_string(manifest).map_err(|e| RegistryError::Backend(e.to_string()))
 }
 
 /// A registry that lives in this process.
@@ -273,11 +456,10 @@ impl MemoryRegistry {
         Self::default()
     }
 
-    /// The immutability rule, shared by the signed and unsigned paths.
+    /// Apply one publish under the map lock.
     ///
-    /// One implementation on purpose: two would be two chances to get "may this
-    /// replace what is there" subtly different, and the signed path is exactly
-    /// where a weaker rule would matter most.
+    /// The *decision* is [`decide_publish`]'s, shared with every durable
+    /// backend; what is here is only the performing of it.
     fn insert(
         &self,
         manifest: &Manifest,
@@ -292,51 +474,35 @@ impl MemoryRegistry {
             version: version.clone(),
             source: e,
         })?;
-        let yaml = serde_yaml_ng::to_string(manifest)
-            .map_err(|e| RegistryError::Backend(e.to_string()))?;
+        let yaml = to_yaml(manifest)?;
 
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| RegistryError::Backend("registry mutex poisoned".into()))?;
-        match entries.get_mut(&(name.clone(), version.clone())) {
-            // Same content is the same publish — a retried deploy must not look
-            // like an attack. Signing may be adopted later without deleting an
-            // immutable artifact, but an existing publisher may not be silently
-            // replaced by another identity.
-            Some(existing) if existing.digest == digest => {
-                match (&existing.attestation, attestation) {
-                    (None, Some(signed)) => existing.attestation = Some(signed),
-                    (Some(recorded), Some(offered)) if recorded.key_id != offered.key_id => {
-                        return Err(RegistryError::PublisherChanged {
-                            name,
-                            version,
-                            existing: recorded.key_id.clone(),
-                            offered: offered.key_id,
-                        });
-                    }
-                    _ => {}
-                }
-                Ok(digest)
-            }
-            Some(existing) => Err(RegistryError::Immutable {
-                name,
-                version,
-                existing: existing.digest.to_hex(),
-                offered: digest.to_hex(),
-            }),
-            None => {
+        let key = (name.clone(), version.clone());
+        let stored = entries
+            .get(&key)
+            .map(|e| (e.digest, e.attestation.as_ref()));
+        match decide_publish(&name, &version, digest, attestation.as_ref(), stored)? {
+            PublishVerdict::Insert => {
                 entries.insert(
-                    (name, version),
+                    key,
                     Entry {
                         digest,
                         yaml,
                         attestation,
                     },
                 );
-                Ok(digest)
             }
+            PublishVerdict::AdoptAttestation => {
+                if let Some(entry) = entries.get_mut(&key) {
+                    entry.attestation = attestation;
+                }
+            }
+            PublishVerdict::Unchanged => {}
         }
+        Ok(digest)
     }
 }
 
@@ -351,15 +517,7 @@ impl Registry for MemoryRegistry {
         manifest: &Manifest,
         signer: &dyn Signer,
     ) -> Result<Digest, RegistryError> {
-        let digest = manifest.digest().map_err(|e| RegistryError::Corrupt {
-            name: manifest.metadata.name.clone(),
-            version: manifest.metadata.version.clone(),
-            source: e,
-        })?;
-        // Domain-separated, so this signature cannot be replayed as a record
-        // attestation and a record attestation cannot be replayed as approval
-        // of a manifest.
-        let attestation = signer.attest(&signing_hash(DOMAIN_MANIFEST, &digest));
+        let (_, attestation) = attest_manifest(manifest, signer)?;
         self.insert(manifest, Some(attestation))
     }
 
@@ -379,34 +537,8 @@ impl Registry for MemoryRegistry {
                 .get(&(name.to_owned(), version.to_owned()))
                 .and_then(|e| e.attestation.clone())
         };
-        let Some(a) = attestation else {
-            return Err(RegistryError::Unsigned {
-                name: name.to_owned(),
-                version: version.to_owned(),
-            });
-        };
-
-        // Recomputed from the manifest that was just re-parsed, never read back
-        // from the row. Verifying a stored digest against a stored signature
-        // would confirm only that the registry is consistent with itself.
-        let digest = manifest.digest().map_err(|e| RegistryError::Corrupt {
-            name: name.to_owned(),
-            version: version.to_owned(),
-            source: e,
-        })?;
-        if verifier.verify(
-            &a.key_id,
-            &signing_hash(DOMAIN_MANIFEST, &digest),
-            &a.signature,
-        ) {
-            Ok((manifest, a.key_id))
-        } else {
-            Err(RegistryError::BadSignature {
-                name: name.to_owned(),
-                version: version.to_owned(),
-                key_id: a.key_id.clone(),
-            })
-        }
+        let key = check_attestation(name, version, &manifest, attestation.as_ref(), verifier)?;
+        Ok((manifest, key))
     }
 
     async fn resolve(&self, name: &str, version: &str) -> Result<Manifest, RegistryError> {
@@ -423,15 +555,7 @@ impl Registry for MemoryRegistry {
                     version: version.to_owned(),
                 })?
         };
-        // Re-parsed rather than handed back from a cache, so a stored manifest
-        // that this version of the crate would refuse is refused on the way out
-        // too. A registry that only validates on write enforces the rules of
-        // whatever version happened to publish.
-        Manifest::parse(&yaml).map_err(|e| RegistryError::Corrupt {
-            name: name.to_owned(),
-            version: version.to_owned(),
-            source: e,
-        })
+        reparse(name, version, &yaml)
     }
 
     async fn versions(&self, name: &str) -> Result<Vec<String>, RegistryError> {
@@ -444,5 +568,15 @@ impl Registry for MemoryRegistry {
             .take_while(|((n, _), _)| n == name)
             .map(|((_, v), _)| v.clone())
             .collect())
+    }
+
+    async fn names(&self) -> Result<Vec<String>, RegistryError> {
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|_| RegistryError::Backend("registry mutex poisoned".into()))?;
+        let mut names: Vec<String> = entries.keys().map(|(n, _)| n.clone()).collect();
+        names.dedup();
+        Ok(names)
     }
 }

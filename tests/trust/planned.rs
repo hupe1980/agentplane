@@ -51,6 +51,12 @@ impl ToolClient for Recorder {
             _ => json!({ "sent": true }),
         })
     }
+
+    /// In-process: this double opens no connection, so there is no host for
+    /// the plane's egress allowlist to judge.
+    fn destination(&self, _tool: &ToolId) -> agentplane::tools::Destination {
+        agentplane::tools::Destination::Local
+    }
 }
 
 fn plan(value: Value) -> agentplane::model::Completion {
@@ -112,6 +118,29 @@ fn wired(
         .tools(catalog, Arc::clone(client) as Arc<dyn ToolClient>)
         .agent(Agent::new(manifest))
         .build()
+}
+
+/// The same wiring, with a plane-level journal ceiling to compose against the
+/// manifest's.
+fn wired_with(
+    manifest: &Manifest,
+    provider: &Arc<agentplane::testkit::FakeProvider>,
+    catalog: Arc<ToolCatalog>,
+    client: &Arc<Recorder>,
+    store: Arc<agentplane::store::RedbStore>,
+    journal_ceiling: Option<agentplane::core::Sensitivity>,
+) -> Arc<Runtime> {
+    let mut b = Runtime::builder(store as Arc<dyn JournalStore>)
+        .provider(
+            "fake",
+            Arc::clone(provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .tools(catalog, Arc::clone(client) as Arc<dyn ToolClient>)
+        .agent(Agent::new(manifest));
+    if let Some(ceiling) = journal_ceiling {
+        b = b.max_sensitivity_journaled(ceiling);
+    }
+    b.build()
 }
 
 fn read_only_catalog() -> Arc<ToolCatalog> {
@@ -1016,10 +1045,211 @@ async fn data_above_the_journal_ceiling_is_refused_before_it_is_recorded() {
     );
 }
 
+/// A plane of hand-written skills can state the ceiling too.
+///
+/// The declaration existed only as `spec.security.max_sensitivity_journaled`
+/// and was read only from a manifest, so a plane that is code — which is every
+/// plane before the declarative tier and many after it — had no way to make the
+/// decision at all. The default is the unsafe one: a journal keeps everything,
+/// indefinitely, and nothing says so until somebody files an erasure request.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_plane_without_a_manifest_can_bound_what_it_writes_down() {
+    use agentplane::core::{
+        Effect, EffectDescriptor, EffectError, Label, Outcome, Recovery, Sensitivity, Skill,
+        SkillDescriptor, SkillError, SourceId, Tainted,
+    };
+    use agentplane::runtime::StepCtx;
+
+    /// A sink that would happily receive anything.
+    #[derive(Debug)]
+    struct Archive(Value);
+
+    #[async_trait::async_trait]
+    impl Effect for Archive {
+        type Output = Value;
+        fn descriptor(&self) -> EffectDescriptor {
+            EffectDescriptor::new("archive.write", self.0.clone())
+        }
+        fn mutates(&self) -> bool {
+            false
+        }
+        fn max_sensitivity(&self) -> Sensitivity {
+            Sensitivity::Secret
+        }
+        fn sink_arguments(&self) -> Option<&Value> {
+            Some(&self.0)
+        }
+        fn source(&self) -> SourceId {
+            SourceId::new("tool://archive/write")
+        }
+        fn recovery(&self) -> Recovery {
+            Recovery::Retry
+        }
+        async fn perform(&self) -> Result<Value, EffectError> {
+            Ok(json!({ "written": true }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Records;
+
+    #[async_trait::async_trait]
+    impl Skill for Records {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("intake").provides("intake.record")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let out = cx.sink(Archive(input.peek().clone()), &input).await?;
+            Ok(Outcome::done(out))
+        }
+    }
+
+    let plane = |ceiling: Option<Sensitivity>| {
+        let store: Arc<dyn JournalStore> =
+            Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+        let mut b = Runtime::builder(store);
+        if let Some(ceiling) = ceiling {
+            b = b.max_sensitivity_journaled(ceiling);
+        }
+        b.skill(Records).build()
+    };
+
+    let confidential = |value: Value| {
+        Tainted::with_label(
+            value,
+            Label::trusted().with_sensitivity(Sensitivity::Confidential),
+        )
+    };
+
+    // Without a ceiling the plane keeps its old behaviour: silence must not
+    // start refusing traffic that used to flow.
+    assert!(
+        matches!(
+            plane(None)
+                .run("intake.record", confidential(json!({ "iban": "GB-4471" })))
+                .await
+                .expect("run")
+                .status,
+            RunStatus::Succeeded
+        ),
+        "a plane that stated no ceiling must behave as it did before the field existed"
+    );
+
+    // With one, the same value is refused before it reaches the chain.
+    let out = plane(Some(Sensitivity::Internal))
+        .run("intake.record", confidential(json!({ "iban": "GB-4471" })))
+        .await
+        .expect("run");
+    match out.status {
+        RunStatus::Failed(reason) => {
+            assert!(
+                reason.contains("journal ceiling"),
+                "refused for the wrong reason: {reason}"
+            );
+            assert!(
+                reason.contains("blob"),
+                "the refusal does not say what to do instead: {reason}"
+            );
+        }
+        other => panic!("confidential data was written into the chain: {other:?}"),
+    }
+
+    // And the ceiling is a boundary, not a ban.
+    assert!(
+        matches!(
+            plane(Some(Sensitivity::Internal))
+                .run(
+                    "intake.record",
+                    Tainted::with_label(
+                        json!({ "ticket": "T-1" }),
+                        Label::trusted().with_sensitivity(Sensitivity::Internal)
+                    )
+                )
+                .await
+                .expect("run")
+                .status,
+            RunStatus::Succeeded
+        ),
+        "internal data was refused by a ceiling set at internal"
+    );
+}
+
+/// Where both ceilings exist, the stricter wins.
+///
+/// The same rule a reviewed tool grant follows: a declaration may only tighten
+/// what the deployment allows, never widen it. Either direction of "one of them
+/// is looser" has to end at the tighter number, or an operator's ceiling is
+/// advisory the moment an agent declares its own.
+#[tokio::test]
+async fn the_plane_and_the_manifest_journal_ceilings_take_the_stricter() {
+    use agentplane::core::{Label, Sensitivity, Tainted};
+
+    let manifest = Manifest::parse(JOURNALLED).expect("parse");
+    let confidential = Tainted::with_label(
+        json!({ "customer": "AC-1" }),
+        Label::trusted().with_sensitivity(Sensitivity::Confidential),
+    );
+
+    // The manifest says `internal`; the plane says `secret`. `internal` binds.
+    let provider = agentplane::testkit::FakeProvider::new();
+    let client = Arc::new(Recorder::default());
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let rt = wired_with(
+        &manifest,
+        &provider,
+        read_only_catalog(),
+        &client,
+        Arc::clone(&store),
+        Some(Sensitivity::Secret),
+    );
+    match rt
+        .run("intake.record", confidential.clone())
+        .await
+        .expect("run")
+        .status
+    {
+        RunStatus::Failed(reason) => assert!(
+            reason.contains("journal ceiling"),
+            "a looser plane ceiling must not widen a manifest's: {reason}"
+        ),
+        other => panic!("a looser plane ceiling widened the manifest's: {other:?}"),
+    }
+
+    // And the other direction: the plane says `public`, the manifest
+    // `internal`. `public` binds, so even internal data is refused.
+    let provider = agentplane::testkit::FakeProvider::new();
+    let client = Arc::new(Recorder::default());
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let rt = wired_with(
+        &manifest,
+        &provider,
+        read_only_catalog(),
+        &client,
+        store,
+        Some(Sensitivity::Public),
+    );
+    let internal = Tainted::with_label(
+        json!({ "customer": "AC-1" }),
+        Label::trusted().with_sensitivity(Sensitivity::Internal),
+    );
+    match rt.run("intake.record", internal).await.expect("run").status {
+        RunStatus::Failed(reason) => assert!(
+            reason.contains("journal ceiling"),
+            "a stricter plane ceiling must bind: {reason}"
+        ),
+        other => panic!("a stricter plane ceiling was ignored: {other:?}"),
+    }
+}
+
 /// Data at or below the ceiling still runs.
 ///
 /// The positive half: without it a change that refused everything would pass
-/// the test above, and the ceiling would be a ban rather than a boundary.
+/// the test above, and the ceiling would be a ban rather than a boundary."""
 #[tokio::test]
 async fn data_within_the_journal_ceiling_still_runs() {
     let manifest = Manifest::parse(JOURNALLED).expect("parse");

@@ -799,8 +799,13 @@ let args = Tainted::object([
 ]);
 let safety = ToolSafety::default()
     .protect(ProtectedField::trusted("/recipient"));
+// The plane's destination allowlist. `cx.call_tool` applies it for you; a
+// skill building its own catalogue hands it through.
+let egress = cx.tool_egress();
 let result = cx
-    .sink_with(&args, |value| ToolCall::prepare(&catalog, client, tool, value))
+    .sink_with(&args, |value| {
+        ToolCall::prepare(&catalog, client, tool, value, egress.as_deref())
+    })
     .await?;
 ```
 
@@ -971,7 +976,7 @@ a digest. So erase by case:
 ```rust
 use agentplane::blob::erase_case;
 
-let n = erase_case(blobs.as_ref(), cases.as_ref(), case, now, "art-17 request").await?;
+let n = erase_case(Some(blobs.as_ref()), cases.as_ref(), case, now, "art-17 request").await?;
 ```
 
 Every blob that case produced is tombstoned; other cases are untouched, even
@@ -1044,6 +1049,70 @@ Prefer it anywhere the answer decides what an agent may do.
 for a durable or remote implementation; no such implementation ships today.
 
 ---
+
+## 🗂️ Keep the inventory where the agents are
+
+`MemoryRegistry` proves the rules and dies with the process. *Which agents
+does this organisation run* — the first question a governance function asks —
+needs an inventory that outlives one, and a second registry kept beside the
+files drifts from them.
+
+Both shipped stores are registries:
+
+```rust
+let store = Arc::new(RedbStore::open("./journal.redb")?);
+store.publish_signed(&manifest, &signer).await?;
+
+for name in store.names().await? {
+    for version in store.versions(&name).await? {
+        println!("{name} {version}");
+    }
+}
+```
+
+Everything the in-memory one refuses, these refuse identically — the rules live
+in one place (`manifest::registry::decide_publish`) and each backend only
+*performs* the decision, because three hand-written copies of "may this replace
+what is there" are three chances to get it subtly different.
+
+**The trap:** read-then-write. Immutability is a claim about a race as much as
+about a rule — two publishes of different content both seeing "nothing there"
+is exactly the outcome it exists to prevent — so the read, the decision and the
+write are one transaction on both backends.
+
+Registries are **tenant-scoped**, like every other table: `metadata.name` is
+whatever an author typed, so two tenants choosing one name is ordinary rather
+than exotic.
+
+## 🏷️ Put the registry entry in the manifest
+
+A governance catalogue wants business owner, technical owner, risk class and a
+ticket. A document closed by `deny_unknown_fields` cannot hold them as fields,
+and a second registry kept beside it drifts.
+
+```yaml
+metadata:
+  name: pattern-compliance-auditor
+  version: "2.0.0"
+  annotations:
+    example.com/business-owner: "Compliance, F. Meier"
+    example.com/risk-class: "C"
+    example.com/ticket: "GRC-2291"
+```
+
+**The runtime never reads it.** No key here reaches a gate, a grant, a prompt or
+a decision, and there is no accessor that turns one into behaviour — so nothing
+here can become a security decision, which is what an advisory control would be.
+
+**The digest covers it**, so changing an owner is a version bump with a reviewer
+on it. That is exactly what a governance process wants from an ownership record
+and what a wiki page cannot give it.
+
+**The trap:** an unqualified key. `owner` is precisely the name a future
+first-class field wants, so keys must be `prefix/name` with a dotted prefix you
+control; `agentplane.hupe1980.github.io/` is reserved for the same reason. A
+blank value is refused too — a key that answers nothing reads, to a reviewer,
+like a question that was answered.
 
 ## 🧯 Build a plane from a manifest you did not write
 
@@ -1323,6 +1392,52 @@ spoof what they cannot express.
 a *second* opt-in (`allow_unattended()`). One enum variant among four is too easy
 to pick off a list, and "the human didn't answer so we did it anyway" should be
 greppable.
+
+## 🔍 Show a reviewer the consequences, not the instruction
+
+`requires_approval: true` shows the exact call — which for
+`transfer(to: "GB-4471", amount: 12000)` is the whole change. It stops being so
+when one call changes many things at once: `archive(older_than: "2024-01-01")`
+shows an instruction, and the four thousand records it will touch are nowhere on
+the reviewer's screen.
+
+The runtime cannot compute that preview; it needs the tool's own dry run. What a
+manifest can do is name one:
+
+```yaml
+tools:
+  - ref: "tool://archive/purge"
+    mutates: true
+    description: "Delete every record older than a date."
+    requires_approval: true
+    preview: "tool://archive/purge_preview"
+    protected_fields:
+      - path: /older_than
+        allowed_sources: [model:anthropic/claude-sonnet-5]
+        max_sensitivity: internal
+  # The preview receives the same arguments, so it needs its own ceiling: every
+  # sink gate runs on it exactly as on the call it previews.
+  - ref: "tool://archive/purge_preview"
+    mutates: false
+    max_sensitivity: internal
+    description: "Count what a purge would delete."
+```
+
+The preview is dispatched before the task opens and its answer lands in
+`Justification.evidence` — an ordinary effect, so it is journaled, gated,
+metered, and replayed rather than repeated. What the reviewer saw is on the
+record beside what they decided; a long answer is cut at 64 KiB with the total
+and a digest of the whole stated on the row, never silently.
+
+**The trap:** a preview that is not read-only. A dry run that changes the world
+is the opposite of a dry run, so a `preview` naming a grant this manifest
+declares `mutates: true` is refused at parse — along with a `preview` without
+`requires_approval` (nothing would call it) and one naming a tool the manifest
+does not grant (a call with no declared safety, ceiling or field rules).
+
+**If the preview fails**, the task opens anyway and says so in the evidence.
+Refusing the call because its preview was unavailable would turn a read-only
+convenience into a second thing that can stop a payment.
 
 ## 🔔 Tell a desk without stopping the run
 
@@ -1752,28 +1867,41 @@ client: point it at a running server and its tools become callable under the
 ordinary governed path — declaration, protected fields, egress ceiling, budget,
 disposition and all.
 
-Wiring is two lines. `McpClient::new` takes an already-initialised `rmcp` client,
-so the transport — stdio, a child process, streamable HTTP — stays your choice:
+Wiring is two lines. `McpClient::connect` takes the transport — stdio, a child
+process, streamable HTTP — and runs the lifecycle; where the transport goes is
+yours to state, because this crate never dereferences an MCP URL:
 
 ```rust
-use agentplane::tools::{McpClient, ToolBox};
+use agentplane::tools::{Destination, McpClient, ToolBox};
 
 // One name per server. It is *your* name for it, not one the server chose:
 // the catalogue keys on it, and a server able to rename itself could step
 // into another server's entry.
-let tickets = Arc::new(McpClient::new("tickets", Arc::new(service)));
+let tickets = Arc::new(
+    McpClient::connect("tickets", transport, Destination::remote("mcp.tickets.example")).await?,
+);
 
 let rt = Runtime::builder(store)
     .agent(Agent::new(&manifest))
     .toolbox(ToolBox::new().with::<ReadBalance>())   // tools in this binary
     .tool_server("tickets", tickets)                 // tools on that server
+    .egress(Egress::new().allow("mcp.tickets.example"))
     .build();
 ```
 
-Initialize `service` with `McpClient::host_info()` rather than rmcp's empty
-default client handler. That profile negotiates the Tasks extension and nothing
-else: elicitation, sampling, roots and subscriptions stay absent until a
-governed runtime callback exists.
+**The trap:** starting the client yourself with rmcp's `.serve(transport)`.
+That is the `initialize` handshake, which `2026-07-28` replaced with
+`server/discover`, so a plain `initialize` negotiates down to a legacy dialect
+every time — `tools/call` keeps working, the tasks extension and structured
+results simply never appear, and nothing says why. `connect` discovers first
+and falls back to `initialize` only when the server is legacy; the version it
+landed on is readable as `negotiated_version()`, and `agentplane serve` prints
+it. `McpClient::new` still wraps a service you already started, for an embedder
+whose transport is running.
+
+The client profile `connect` offers (`McpClient::host_info()`) negotiates the
+Tasks extension and nothing else: elicitation, sampling, roots and
+subscriptions stay absent until a governed runtime callback exists.
 
 MCP context is available without turning it into a tool. Exact grants may live
 in the manifest:
@@ -2171,6 +2299,42 @@ fiction. Constrain a Bedrock plane where the SDK does: a VPC endpoint, an egress
 proxy, or an IAM policy. What the driver does give you is the region on the
 record — read from the client, and part of effect identity, so a change of
 region is replay divergence rather than a quiet move.
+
+### The tool path asks too, and it asks the plane
+
+A grant is `tool://server/name`, which names a catalogue entry and not a
+destination — so there is no URL for the plane to parse. The split is the one
+the rest of the crate makes: **the client owns the connection, the plane owns
+the destination.**
+
+```rust
+let plane = Runtime::builder(store)
+    .tool_server("tickets", mcp_over_https)
+    .egress(Egress::new().allow("mcp.tickets.example"))
+    .build();
+```
+
+A `ToolClient` says where it goes:
+
+```rust
+fn destination(&self, _tool: &ToolId) -> Destination {
+    Destination::remote("mcp.tickets.example")   // or Destination::Local
+}
+```
+
+`Local` is for tools compiled into the binary and for an MCP server run as a
+child process over stdio — no host of this plane's choosing is contacted, so
+there is nothing for an allowlist to decide. It does *not* claim the far side
+reaches nothing.
+
+**The trap this avoids:** the method has **no default**. A default of `Local`
+would let a remote transport answer *reaches nobody* by saying nothing, which is
+a control that fails open when an implementer forgets — the same reason
+`JournalStore::is_shared` has no default either.
+
+`ToolRouter` answers per tool, delegating to whichever transport would actually
+carry the call: one answer for a whole router would have to be the union of its
+routes, and a union is the wildcard this allowlist refuses to have.
 
 ## ⚖️ Judge a high-stakes step more than once
 
@@ -2907,7 +3071,7 @@ Erasing a case destroys its wrapping key, so every copy becomes unreadable at
 once — including the ones nobody can reach:
 
 ```rust
-blob::erase_case(&blobs, cases.as_ref(), Some(keys.as_ref()), &tenant, case, at, reason).await?;
+blob::erase_case(Some(&blobs), cases.as_ref(), Some(keys.as_ref()), &tenant, case, at, reason).await?;
 ```
 
 The chain still verifies afterwards, because it commits to the sealed bytes

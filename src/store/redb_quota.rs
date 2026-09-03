@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::core::{RunId, Spend, StoreError, Timestamp};
-use crate::quota::{QuotaError, QuotaSettlement, QuotaStore};
+use crate::quota::{Halt, HaltScope, QuotaError, QuotaSettlement, QuotaStore};
 
 use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
@@ -35,14 +35,19 @@ type SettlementReceipt<'a> = (&'a str, u64, u64, u8);
 const SETTLED: TableDefinition<SettlementKey<'static>, SettlementReceipt<'static>> =
     TableDefinition::new("quota_settled");
 
-/// `tenant -> reason`. The emergency stop.
+/// `(tenant, scope) -> reason`. The emergency stop.
 ///
-/// One row per halted tenant and nothing for the rest, so the check is a point
-/// lookup and an unhalted plane pays one miss. In the store rather than in the
-/// process, because a switch that stops only the instance it was thrown on is
-/// not a switch — it is the in-process-counter failure arriving during an
-/// incident.
-const HALTED: TableDefinition<&str, &str> = TableDefinition::new("quota_halted");
+/// One row per standing halt and nothing for the rest, so an unhalted plane
+/// pays one empty range scan. In the store rather than in the process, because
+/// a switch that stops only the instance it was thrown on is not a switch — it
+/// is the in-process-counter failure arriving during an incident.
+///
+/// Keyed on the scope as well as the tenant, so a halt on one agent and a halt
+/// on the whole tenant are two rows rather than one flag the last writer wins.
+/// An incident that widens and then partly resolves is the ordinary shape, and
+/// a single overwritable flag gets it wrong in the direction that lets work
+/// through.
+const HALTED: TableDefinition<(&str, &str), &str> = TableDefinition::new("quota_halted");
 
 #[async_trait]
 impl QuotaStore for RedbStore {
@@ -128,8 +133,9 @@ impl QuotaStore for RedbStore {
         })
     }
 
-    async fn set_halt(&self, reason: Option<&str>) -> Result<(), StoreError> {
+    async fn set_halt(&self, scope: &HaltScope, reason: Option<&str>) -> Result<(), StoreError> {
         let tenant = self.tenant_name();
+        let scope = scope.key();
         let reason = reason.map(ToOwned::to_owned);
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -138,11 +144,13 @@ impl QuotaStore for RedbStore {
                 match &reason {
                     Some(reason) => {
                         halted
-                            .insert(tenant.as_str(), reason.as_str())
+                            .insert((tenant.as_str(), scope.as_str()), reason.as_str())
                             .map_err(|e| be(&e))?;
                     }
                     None => {
-                        halted.remove(tenant.as_str()).map_err(|e| be(&e))?;
+                        halted
+                            .remove((tenant.as_str(), scope.as_str()))
+                            .map_err(|e| be(&e))?;
                     }
                 }
             }
@@ -151,19 +159,38 @@ impl QuotaStore for RedbStore {
         .await
     }
 
-    async fn halted(&self) -> Result<Option<String>, StoreError> {
+    async fn halts(&self) -> Result<Vec<Halt>, StoreError> {
         let tenant = self.tenant_name();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             // An absent table is an unhalted plane, not an error: nothing has
             // ever been halted, so there is nothing to read.
             let Ok(halted) = r.open_table(HALTED) else {
-                return Ok(None);
+                return Ok(Vec::new());
             };
-            Ok(halted
-                .get(tenant.as_str())
+            let mut out = Vec::new();
+            for entry in halted
+                .range((tenant.as_str(), "")..=(tenant.as_str(), MAX_STR))
                 .map_err(|e| be(&e))?
-                .map(|v| v.value().to_owned()))
+            {
+                let (key, reason) = entry.map_err(|e| be(&e))?;
+                let stored = key.value().1.to_owned();
+                // Corruption, not a row to skip. A halt this build cannot read
+                // is one it would otherwise run straight through, and from the
+                // outside that is indistinguishable from a halt that was lifted.
+                let scope = HaltScope::parse(&stored).ok_or_else(|| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!(
+                        "quota_halted holds the scope '{stored}', which this build cannot \
+                         read — refusing rather than admitting work an operator stopped"
+                    ),
+                })?;
+                out.push(Halt {
+                    scope,
+                    reason: reason.value().to_owned(),
+                });
+            }
+            Ok(out)
         })
         .await
     }

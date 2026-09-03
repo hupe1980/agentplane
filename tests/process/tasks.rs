@@ -1246,6 +1246,306 @@ spec:
     );
 }
 
+/// A reviewer sees consequences, not only the instruction.
+///
+/// `archive(older_than: "2024-01-01")` shows the instruction and not the four
+/// thousand records it will touch, and a reviewer looking at an instruction is
+/// approving a sentence. The runtime cannot compute that preview — it needs the
+/// tool's own dry run — but a manifest can name one, and then the claim becomes
+/// a property the file asserts and the runtime enforces.
+///
+/// Three properties: the preview runs, its answer reaches the reviewer, and the
+/// mutation still has not happened while they read it.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_declared_preview_shows_the_reviewer_what_the_call_will_touch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use agentplane::runtime::Agent;
+    use agentplane::tools::{Tool, ToolBox, ToolFailure};
+
+    static PURGED: AtomicUsize = AtomicUsize::new(0);
+    static PREVIEWED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Delete every record older than a date.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct Purge {
+        /// Records older than this go.
+        older_than: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Purge {
+        const SERVER: &'static str = "archive";
+        const NAME: &'static str = "purge";
+        async fn call(self) -> Result<Value, ToolFailure> {
+            PURGED.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "deleted": 4000, "older_than": self.older_than }))
+        }
+    }
+
+    /// Count what a purge would delete, without deleting it.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct PurgePreview {
+        /// Records older than this would go.
+        #[allow(dead_code)]
+        older_than: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for PurgePreview {
+        const SERVER: &'static str = "archive";
+        const NAME: &'static str = "purge_preview";
+        fn mutates() -> bool {
+            false
+        }
+        async fn call(self) -> Result<Value, ToolFailure> {
+            PREVIEWED.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "would_delete": 4000, "oldest": "2019-03-02" }))
+        }
+    }
+
+    let manifest = agentplane::manifest::Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: archivist, version: "1.0.0" }
+spec:
+  capabilities: { provides: [desk.archive] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: tool-calling, max_turns: 4 }
+  oversight:
+    approval: tools-only
+    deadline: { name: purge-review, kind: hours, params: { n: 4 } }
+  tools:
+    - ref: tool://archive/purge
+      mutates: true
+      description: Delete every record older than a date.
+      requires_approval: true
+      preview: tool://archive/purge_preview
+      protected_fields:
+        - path: /older_than
+          allowed_sources: [model:fake/m-1]
+          max_sensitivity: internal
+    # The preview receives the same arguments, so it needs its own ceiling:
+    # every sink gate runs on it exactly as on the call it previews.
+    - ref: tool://archive/purge_preview
+      mutates: false
+      max_sensitivity: internal
+      description: Count what a purge would delete.
+  budgets: {}
+"#,
+    )
+    .expect("manifest");
+
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_call_tool(
+        "call_1",
+        "archive__purge",
+        json!({ "older_than": "2024-01-01" }),
+    );
+    provider.will_say("done");
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .events(Arc::clone(&store) as Arc<dyn EventStore>)
+        .tasks(Arc::clone(&store) as Arc<dyn TaskStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .toolbox(ToolBox::new().with::<Purge>().with::<PurgePreview>())
+        .build();
+
+    rt.run_correlated(
+        "desk.archive",
+        Tainted::trusted(json!({ "q": "clear out 2023" })),
+        "archive",
+        &[key("ARC-1")],
+    )
+    .await
+    .expect("the run suspends on the approval");
+
+    assert_eq!(
+        PREVIEWED.load(Ordering::SeqCst),
+        1,
+        "the declared preview was never computed"
+    );
+    assert_eq!(
+        PURGED.load(Ordering::SeqCst),
+        0,
+        "the purge happened before anyone approved it"
+    );
+
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    let evidence = task.justification.evidence.join("\n");
+    assert!(
+        evidence.contains("4000"),
+        "the reviewer was shown the instruction and not its consequences: {evidence}"
+    );
+    assert!(
+        evidence.contains("tool://archive/purge_preview"),
+        "the evidence must say where it came from: {evidence}"
+    );
+    // The instruction is still there. A preview is shown *beside* the call, not
+    // instead of it.
+    assert_eq!(
+        task.justification.proposed_action["arguments"]["older_than"],
+        "2024-01-01"
+    );
+
+    rt.decide_task(
+        task.id,
+        &Decision::reject("carol", "that reaches further back than the retention rule"),
+        &officer(),
+    )
+    .await
+    .expect("the rejection is recorded");
+    assert_eq!(
+        PURGED.load(Ordering::SeqCst),
+        0,
+        "a refused call was dispatched anyway"
+    );
+}
+
+/// A preview that answers with a book is shown as a head, and says so.
+///
+/// A dry run listing the four thousand records it would touch has done its job
+/// by the first screenful; the rest is a worklist row nobody can open. The
+/// bound is **stated** on the row — total size and a digest of the whole
+/// answer — because a silent truncation is a bounded result shaped exactly
+/// like a complete one, and the journaled effect output still holds every
+/// byte.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_preview_larger_than_the_bound_is_truncated_and_says_so() {
+    use agentplane::runtime::Agent;
+    use agentplane::tools::{Tool, ToolBox, ToolFailure};
+
+    /// Delete every record older than a date.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct Purge {
+        /// Records older than this go.
+        #[allow(dead_code)]
+        older_than: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Purge {
+        const SERVER: &'static str = "archive";
+        const NAME: &'static str = "purge";
+        async fn call(self) -> Result<Value, ToolFailure> {
+            Ok(json!({ "deleted": 0 }))
+        }
+    }
+
+    /// Lists every record a purge would delete — all of them.
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct PurgePreview {
+        /// Records older than this would go.
+        #[allow(dead_code)]
+        older_than: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for PurgePreview {
+        const SERVER: &'static str = "archive";
+        const NAME: &'static str = "purge_preview";
+        fn mutates() -> bool {
+            false
+        }
+        async fn call(self) -> Result<Value, ToolFailure> {
+            let rows: Vec<Value> = (0..20_000)
+                .map(|i| json!({ "id": i, "opened": "2019-03-02" }))
+                .collect();
+            Ok(json!({ "would_delete": rows }))
+        }
+    }
+
+    let manifest = agentplane::manifest::Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: archivist, version: "1.0.0" }
+spec:
+  capabilities: { provides: [desk.archive] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: tool-calling, max_turns: 4 }
+  oversight:
+    approval: tools-only
+    deadline: { name: purge-review, kind: hours, params: { n: 4 } }
+  tools:
+    - ref: tool://archive/purge
+      mutates: true
+      description: Delete every record older than a date.
+      requires_approval: true
+      preview: tool://archive/purge_preview
+      protected_fields:
+        - path: /older_than
+          allowed_sources: [model:fake/m-1]
+          max_sensitivity: internal
+    - ref: tool://archive/purge_preview
+      mutates: false
+      max_sensitivity: internal
+      description: List what a purge would delete.
+  budgets: {}
+"#,
+    )
+    .expect("manifest");
+
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_call_tool(
+        "call_1",
+        "archive__purge",
+        json!({ "older_than": "2024-01-01" }),
+    );
+    provider.will_say("done");
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .events(Arc::clone(&store) as Arc<dyn EventStore>)
+        .tasks(Arc::clone(&store) as Arc<dyn TaskStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .toolbox(ToolBox::new().with::<Purge>().with::<PurgePreview>())
+        .build();
+
+    rt.run_correlated(
+        "desk.archive",
+        Tainted::trusted(json!({ "q": "clear out 2023" })),
+        "archive",
+        &[key("ARC-2")],
+    )
+    .await
+    .expect("the run suspends on the approval rather than failing on the preview's size");
+
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    let evidence = task.justification.evidence.join("\n");
+    assert!(
+        evidence.len() < agentplane::runtime::PREVIEW_EVIDENCE_BYTES + 512,
+        "the evidence was not bounded: {} bytes",
+        evidence.len()
+    );
+    assert!(
+        evidence.contains("truncated: showing"),
+        "a bounded result must say it is one: {}",
+        &evidence[evidence.len().saturating_sub(300)..]
+    );
+    assert!(
+        evidence.contains("sha256"),
+        "the whole answer must stay matchable against the journal: {}",
+        &evidence[evidence.len().saturating_sub(300)..]
+    );
+}
+
 /// One approval plane, parameterized by the protected-field rule under test.
 ///
 /// The scripted model always proposes the same transfer; what varies across

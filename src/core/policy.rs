@@ -200,6 +200,16 @@ pub enum PolicyDecision {
     /// The reason is required. "Denied by policy" sends someone to read a policy
     /// set looking for which of forty rules fired, which is how an authorization
     /// layer becomes something people route around.
+    ///
+    /// **It says which rule, not which request.** Every caller of this trait
+    /// already holds the action and the resource and puts them in the message
+    /// it raises and the record it journals — see
+    /// [`StepError::Denied`](crate::core::StepError::Denied). An engine that
+    /// repeats them produces `policy denied 'effect:perform' on 'tool.call':
+    /// 'effect:perform' on 'tool.call' refused by …`, which spends the half of
+    /// the line an auditor reads on saying the same thing twice. The half the
+    /// wrapper cannot know is *which rule fired*, and that is this string's
+    /// job.
     Deny {
         reason: String,
     },
@@ -321,10 +331,8 @@ pub struct DenyAll;
 
 impl PolicyEngine for DenyAll {
     fn authorize(&self, request: &PolicyRequest<'_>) -> PolicyDecision {
-        PolicyDecision::deny(format!(
-            "no policy set is configured; '{}' on '{}' is refused by default",
-            request.action, request.resource
-        ))
+        let _ = request;
+        PolicyDecision::deny("no policy set is configured, so nothing is permitted")
     }
 
     fn bundle(&self) -> PolicyBundleIdentity {

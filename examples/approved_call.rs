@@ -180,6 +180,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(shown["arguments"]["amount"], 250_000);
 
     // ── 2. Approval admits exactly that call ───────────────────────────────
+    // The header before the decision: the tool prints its own line the moment
+    // the approved call dispatches, and it belongs under this section.
+    println!("\n2. dana approves the call as proposed");
     rt.decide_task(
         task.id,
         &Decision::approve("dana", "matches the approved invoice INV-7"),
@@ -192,7 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .recorded_outcome(run.run_id)
         .await?
         .expect("the run concluded");
-    println!("\n2. dana approved → {:?}", done.status);
+    println!("   run          → {:?}", done.status);
     println!("   transfers    → {}", POSTED.load(Ordering::SeqCst));
     assert_eq!(done.status, RunStatus::Succeeded);
     assert_eq!(POSTED.load(Ordering::SeqCst), 1, "approved means once");
@@ -249,6 +252,10 @@ async fn an_amendment_is_the_call() -> Result<(), Box<dyn std::error::Error>> {
         .pop()
         .expect("the call is on the worklist");
     let before = POSTED.load(Ordering::SeqCst);
+    // The header goes out before the decision, because the tool prints its
+    // own line the moment the amended call dispatches — after the header, or
+    // the line files under the previous section.
+    println!("\n4. dana amends the call to AC-2, capped at 120000");
     // The amendment is the call: dana answers with the settlement account and
     // a capped amount, and exactly those dispatch — as her value, not the
     // model's. It passes `/recipient`'s source rule because the manifest
@@ -265,7 +272,7 @@ async fn an_amendment_is_the_call() -> Result<(), Box<dyn std::error::Error>> {
         .recorded_outcome(run.run_id)
         .await?
         .expect("the run concluded");
-    println!("\n4. dana amended  → {:?}", done.status);
+    println!("   run          → {:?}", done.status);
     println!(
         "   transfers    → {} — the reviewer's arguments ran, the model's never did",
         POSTED.load(Ordering::SeqCst)

@@ -559,6 +559,14 @@ fn classify_rpc(peer: &PeerId, e: &RpcError) -> PeerError {
                 detail: format!("{detail} — the peer is at a ceiling; come back"),
             }
         }
+        // The peer's operator stopped it. Nothing was performed, so the
+        // disposition is the same as a ceiling's — but the advice is the
+        // opposite, and the detail says so: an incident is being dealt with,
+        // and a retry loop is what the switch exists to end.
+        -32030 if e.names_reason(super::ERROR_DOMAIN, super::HALTED_REASON) => PeerError::Refused {
+            peer: peer.clone(),
+            detail: format!("{detail} — the peer is halted by its operator; do not retry"),
+        },
         // `-32603 Internal error` and anything unrecognised. The request
         // arrived; whether the peer acted is exactly what it is not saying.
         // Calling this a refusal is how a half-finished transfer is sent again

@@ -24,6 +24,14 @@
 //!    runs resuming. Those are existing work, and stranding them mid-saga
 //!    would turn an incident into a second one — to stop work in flight,
 //!    cancel it, which is what the first half is for.
+//!
+//!    It also **names what it stops**. `HaltScope::Tenant` is the power
+//!    switch; `HaltScope::Agent` stops every revision of one declared name,
+//!    and `HaltScope::Revision` stops one exact reviewed digest so a fix
+//!    published as a new version runs while the broken one stays stopped. On a
+//!    plane hosting twenty-eight agents, the tenant switch is the wrong answer
+//!    to *agent 12 is misbehaving*, and shipping a policy change at 3am is the
+//!    other wrong answer.
 
 use std::sync::{Arc, Mutex};
 
@@ -32,7 +40,7 @@ use agentplane::core::{
     Recovery, Skill, SkillDescriptor, SkillError, Tainted, TaskSpec,
 };
 use agentplane::journal::{JournalStore, RecordKind};
-use agentplane::quota::TenantQuota;
+use agentplane::quota::{HaltScope, TenantQuota};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
@@ -240,9 +248,12 @@ async fn halt_the_front_door() -> Result<(), Box<dyn std::error::Error>> {
     let one = plane();
     let two = plane();
 
-    one.set_halt(Some("incident 42: ledger reconciliation is wrong"))
-        .await?;
-    println!("2. instance one throws the emergency stop");
+    one.set_halt(
+        &HaltScope::Tenant,
+        Some("incident 42: ledger reconciliation is wrong"),
+    )
+    .await?;
+    println!("2. instance one throws the emergency stop (whole tenant)");
 
     // Both instances refuse new work at admission — the flag is in the store,
     // and the refusal is its own error, not a ceiling inviting a retry.
@@ -253,7 +264,7 @@ async fn halt_the_front_door() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    one.set_halt(None).await?;
+    one.set_halt(&HaltScope::Tenant, None).await?;
     let lifted = two.run("desk.ack", Tainted::trusted(json!({}))).await?;
     println!(
         "   lifted     → instance two admits again ({})",

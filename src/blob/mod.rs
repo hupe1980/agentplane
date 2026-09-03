@@ -218,11 +218,20 @@ pub trait BlobStore: Send + Sync + Debug {
 /// design, so personal data written into one cannot be removed — keep it out of
 /// records rather than expecting erasure to reach it.
 ///
+/// `blobs` is optional because the erasure unit is the **key scope**, and a
+/// plane that seals its journal with a key ring and stores no blobs at all is
+/// an ordinary shape. Refusing to erase such a case for want of a store to
+/// tombstone would leave the one act that reaches every copy undone because a
+/// second, lesser act had nowhere to land. With no store the linked digests
+/// are counted and left; on a sealed plane their bytes become unreadable by
+/// the key destruction below, and a later drill reads them as *erased by
+/// design* through the key rather than through a tombstone.
+///
 /// # Errors
 ///
 /// If the case's blob list cannot be read, or a blob cannot be expired.
 pub async fn erase_case(
-    blobs: &dyn BlobStore,
+    blobs: Option<&dyn BlobStore>,
     cases: &dyn crate::case::CaseStore,
     #[cfg(feature = "keyring")] keyring: Option<&dyn crate::keyring::KeyRing>,
     tenant: &crate::core::TenantId,
@@ -236,11 +245,13 @@ pub async fn erase_case(
         .map_err(|e| BlobError::Backend(e.to_string()))?;
     let scope = crate::core::erasure_scope(tenant, &case.to_string());
     let mut n = 0;
-    for digest in digests {
-        blobs
-            .expire(unit_address(&scope, digest), at, reason)
-            .await?;
-        n += 1;
+    if let Some(blobs) = blobs {
+        for digest in digests {
+            blobs
+                .expire(unit_address(&scope, digest), at, reason)
+                .await?;
+            n += 1;
+        }
     }
 
     // The key last, and only once every tombstone is written.

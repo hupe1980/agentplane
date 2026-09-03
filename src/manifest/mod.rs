@@ -41,6 +41,8 @@
 //! skill code cannot be proven to follow one, and a security document must not
 //! appear to enforce a control it cannot bind.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::core::{Budget, Digest, Sensitivity, canon};
@@ -51,7 +53,13 @@ pub use binding::MemorySubject;
 mod error;
 pub use error::ManifestError;
 
-mod registry;
+/// The registry seam, and the rules every backend must apply identically.
+///
+/// Public because a durable or remote registry is somebody else's to write, and
+/// the immutability and publisher rules are the whole security argument for
+/// having a registry at all — an implementation that re-derived them would be
+/// an implementation that could get them subtly wrong.
+pub mod registry;
 pub use registry::{MemoryRegistry, Registry, RegistryError};
 
 mod triage;
@@ -85,6 +93,103 @@ pub struct Metadata {
     /// semver: it has no version-ordering decision to make, and pretending to
     /// understand a scheme it never checks would invite one.
     pub version: String,
+    /// Facts about this agent that the runtime never reads.
+    ///
+    /// # Why an opaque map is not a hole in `deny_unknown_fields`
+    ///
+    /// Everywhere else a field is enforced or refused, which is what makes the
+    /// manifest a review artifact. *Business owner*, *risk class* and *ticket*
+    /// are facts no `spec` field should enforce, and a document that cannot
+    /// hold them gets a second registry kept beside it that drifts. One map
+    /// holds them without weakening the rule, because the map is **intent by
+    /// construction**:
+    ///
+    /// * **The runtime never reads it.** No key here reaches a gate, a grant,
+    ///   a prompt or a decision. There is no accessor that resolves a key to
+    ///   behaviour, and adding one would be the change this doc-comment exists
+    ///   to argue against. So no value here can become a security decision,
+    ///   which is what an advisory *control* would be.
+    /// * **The digest covers it.** Changing an owner changes
+    ///   [`Manifest::digest`], so it is a version bump with a reviewer on it —
+    ///   which is exactly what a governance process wants from an ownership
+    ///   record, and what a wiki page cannot give it.
+    /// * **Keys are namespaced, in Kubernetes' grammar.** Every key is
+    ///   `prefix/name` — a DNS-subdomain prefix and a name of at most 63
+    ///   characters, with 256 KiB of keys and values in all — so an entry
+    ///   carries into a Kubernetes object unchanged. The prefix is required
+    ///   here where Kubernetes makes it optional: an unqualified key is
+    ///   exactly the name a future first-class field would want. The prefix
+    ///   under [`API_VERSION`]'s own group is reserved, as `kubernetes.io/` is
+    ///   there, so a first-class field is never shadowed by an annotation
+    ///   somebody wrote first.
+    ///
+    /// Who may read them is the line Kubernetes draws between its API server
+    /// and its controllers. Controllers read annotations as configuration all
+    /// the time — an ingress controller's rewrite rules, cert-manager's
+    /// issuer — while the API server never acts on one. The runtime is the
+    /// API server here; the embedder's wiring is the controller, and this map
+    /// is public so that a deploy pipeline or a cluster controller can read
+    /// it and act. What the runtime refuses is only to be that controller:
+    /// `kubernetes.io/ingress.class` was read as configuration with no schema
+    /// and no version until it had to be promoted to a real field, and
+    /// anything an agent's behaviour depends on goes in `spec` for the same
+    /// reason.
+    ///
+    /// ```yaml
+    /// metadata:
+    ///   name: pattern-compliance-auditor
+    ///   version: "2.0.0"
+    ///   annotations:
+    ///     example.com/business-owner: "Compliance, F. Meier"
+    ///     example.com/risk-class: "C"
+    /// ```
+    ///
+    /// A `BTreeMap`, so the serialization a digest is taken over does not
+    /// depend on the order somebody typed the keys in.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, String>,
+}
+
+/// The annotation prefix this format keeps for itself.
+///
+/// Everything under the API group is reserved, so a deployment cannot write
+/// `agentplane.hupe1980.github.io/budgets` today and have it mean something
+/// else tomorrow. Reserving it is the price of promising that annotations
+/// never collide with a field.
+pub const RESERVED_ANNOTATION_PREFIX: &str = "agentplane.hupe1980.github.io/";
+
+/// The most one manifest may carry in annotation keys and values, combined.
+///
+/// Kubernetes' limit, taken as is. Annotations enter the digest, the registry
+/// row and every copy of the reviewed file; they are facts about the agent,
+/// not a place to keep its documents.
+pub const MAX_ANNOTATIONS_BYTES: usize = 256 * 1024;
+
+/// A DNS subdomain as Kubernetes validates one: lowercase labels of letters,
+/// digits and `-`, each beginning and ending alphanumeric, joined by dots, at
+/// most 253 characters in all.
+fn is_dns_subdomain(prefix: &str) -> bool {
+    prefix.len() <= 253
+        && prefix.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
+/// An annotation name segment as Kubernetes validates one.
+fn is_annotation_name(name: &str) -> bool {
+    let alnum = |b: u8| b.is_ascii_alphanumeric();
+    name.len() <= 63
+        && name.as_bytes().first().is_some_and(|&b| alnum(b))
+        && name.as_bytes().last().is_some_and(|&b| alnum(b))
+        && name
+            .bytes()
+            .all(|b| alnum(b) || b == b'-' || b == b'_' || b == b'.')
 }
 
 /// The declaration proper.
@@ -970,6 +1075,20 @@ pub struct Budgets {
     /// zero — so `0` refuses the first step and is refused at parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wallclock_secs: Option<u64>,
+    /// How many times the policy may refuse this run before it is stopped.
+    ///
+    /// The declarative half of the control the security model names: refusals
+    /// carry a uniform message so a model cannot tell one from another, but the
+    /// refused/allowed bit still leaks once per attempt, and what bounds that
+    /// channel is bounding the attempts. A run that keeps hitting the policy is
+    /// probing it — and, read operationally, has stopped making progress.
+    ///
+    /// `0` is meaningful and accepted, like [`max_replans`](Self::max_replans)
+    /// and unlike every ceiling above: it is counted *after* the refusal, so it
+    /// says the first refusal ends the run. A run nothing refuses never notices
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_denials: Option<u32>,
 }
 
 /// One tool this agent may call, and on what terms.
@@ -1028,6 +1147,38 @@ pub struct ToolGrant {
     /// does.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requires_approval: bool,
+    /// A read-only tool that computes what this call *will do*, shown to the
+    /// reviewer beside the call itself.
+    ///
+    /// [`requires_approval`](Self::requires_approval) shows the exact call, and
+    /// for `transfer(to: "GB-4471", amount: 12000)` that **is** the change.
+    /// `archive(older_than: "2024-01-01")` shows an instruction and not the
+    /// four thousand records it touches; a reviewer of an instruction approves
+    /// a sentence. The runtime cannot compute the consequences — that needs
+    /// the tool's own dry run — but a manifest can name one, and then *the
+    /// reviewer sees consequences* is a claim the declaration asserts and the
+    /// runtime enforces.
+    ///
+    /// ```yaml
+    /// - ref: "tool://archive/purge"
+    ///   mutates: true
+    ///   requires_approval: true
+    ///   preview: "tool://archive/purge_preview"   # read-only, same arguments
+    /// ```
+    ///
+    /// Before the task opens the preview is called **with the same
+    /// arguments** and its answer lands in
+    /// [`Justification::evidence`](crate::core::Justification::evidence) — an
+    /// ordinary effect, journaled and replayed rather than repeated. If it
+    /// fails the task opens anyway and says so: refusing a payment over an
+    /// unavailable convenience would be the wrong trade.
+    ///
+    /// Refused at parse: a `preview` without `requires_approval` (nothing would
+    /// call it), one naming a grant declared `mutates: true` (a dry run that
+    /// changes the world), one naming an ungranted tool (a call with no
+    /// declared safety), and one naming the grant itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
     /// A JSON Schema for the arguments, carried opaquely.
     ///
     /// Sent to providers that enforce it during generation, so a well-shaped
@@ -1141,6 +1292,7 @@ impl Manifest {
             metadata: Metadata {
                 name: name.into(),
                 version: version.into(),
+                annotations: BTreeMap::new(),
             },
             spec: Spec::default(),
         }
@@ -1320,6 +1472,7 @@ impl Manifest {
         if self.metadata.version.trim().is_empty() {
             return Err(ManifestError::Empty("metadata.version"));
         }
+        self.validate_annotations()?;
         if let Some(identity) = &self.spec.identity {
             // A declared-but-blank role is the worst of both worlds: the digest
             // covers a prompt that says nothing, and a reviewer sees a field
@@ -1347,6 +1500,7 @@ impl Manifest {
         self.validate_prompt_tool_references()?;
         self.validate_oversight()?;
         self.validate_tool_approval()?;
+        self.validate_tool_previews()?;
         self.validate_tool_grants()?;
         self.validate_mutating_grants_can_fire()?;
         self.validate_agent_grants()?;
@@ -1412,9 +1566,9 @@ impl Manifest {
     /// this whole document exists to remove. The two ways to say it are already
     /// there, and the message names them.
     ///
-    /// `max_replans` is deliberately absent: zero replans is a coherent
-    /// instruction, because a replan is an event that may never occur, so
-    /// forbidding it forbids nothing the run needs.
+    /// `max_replans` and `max_denials` are deliberately absent: zero is a
+    /// coherent instruction for both, because each counts an event that may
+    /// never occur, so forbidding it forbids nothing the run needs.
     fn validate_budgets(&self) -> Result<(), ManifestError> {
         // Which ceilings are bricked is `Budget`'s rule, not this layer's: the
         // same budget reaches the runtime through `RuntimeBuilder::budget`
@@ -1435,6 +1589,77 @@ impl Manifest {
              a halt says somebody is dealing with an incident, where a ceiling only \
              says not right now"
         )))
+    }
+
+    /// Annotation keys are `prefix/name`, and the prefix is somebody else's.
+    ///
+    /// The grammar is Kubernetes' own — a DNS-subdomain prefix of at most 253
+    /// characters, a name of at most 63 beginning and ending alphanumeric with
+    /// `-`, `_` and `.` inside, and at most 256 KiB of keys and values on one
+    /// object — so an entry carries into a Kubernetes object unchanged, which
+    /// is the shape a deployment tooling a manifest into a cluster needs. One
+    /// rule is stricter: the prefix is **required** where Kubernetes makes it
+    /// optional. An unqualified `owner` is exactly the name a future
+    /// first-class field would want, and a format that accepted it could
+    /// never add one. The prefix must also contain a dot, because a
+    /// single-label "domain" names nothing anybody owns.
+    ///
+    /// The value is otherwise unconstrained. It is never parsed, so there is
+    /// nothing to constrain it *for*; a blank one is refused because a key
+    /// that answers nothing reads, to a reviewer, like a question that was
+    /// answered.
+    fn validate_annotations(&self) -> Result<(), ManifestError> {
+        let mut total = 0usize;
+        for (key, value) in &self.metadata.annotations {
+            let Some((prefix, name)) = key.split_once('/') else {
+                return Err(ManifestError::Syntax(format!(
+                    "metadata.annotations: '{key}' is not namespaced — a key must be \
+                     'prefix/name' with a dotted prefix you control (e.g. \
+                     'example.com/business-owner'), so it cannot collide with a field \
+                     this format may grow"
+                )));
+            };
+            if name.contains('/') {
+                return Err(ManifestError::Syntax(format!(
+                    "metadata.annotations: '{key}' must be exactly one 'prefix/name' pair"
+                )));
+            }
+            if !prefix.contains('.') || !is_dns_subdomain(prefix) {
+                return Err(ManifestError::Syntax(format!(
+                    "metadata.annotations: '{key}' has no valid prefix — it must be a DNS \
+                     subdomain you control, like 'example.com/{name}': lowercase labels of \
+                     letters, digits and '-', joined by dots, at most 253 characters"
+                )));
+            }
+            if !is_annotation_name(name) {
+                return Err(ManifestError::Syntax(format!(
+                    "metadata.annotations: '{key}' has an invalid name — at most 63 characters, \
+                     beginning and ending with a letter or digit, with '-', '_' and '.' between"
+                )));
+            }
+            if key.starts_with(RESERVED_ANNOTATION_PREFIX) {
+                return Err(ManifestError::Syntax(format!(
+                    "metadata.annotations: '{key}' is under '{RESERVED_ANNOTATION_PREFIX}', which \
+                     this format reserves so an annotation can never shadow a field it grows. \
+                     Use a prefix you control"
+                )));
+            }
+            if value.trim().is_empty() {
+                return Err(ManifestError::Syntax(format!(
+                    "metadata.annotations: '{key}' has no value — a key that answers nothing \
+                     reads to a reviewer like a question that was answered"
+                )));
+            }
+            total += key.len() + value.len();
+        }
+        if total > MAX_ANNOTATIONS_BYTES {
+            return Err(ManifestError::Syntax(format!(
+                "metadata.annotations: {total} bytes of keys and values, and the limit is \
+                 {MAX_ANNOTATIONS_BYTES} — annotations are facts about the agent, not a \
+                 place to keep its documents; store the document and annotate its address"
+            )));
+        }
+        Ok(())
     }
 
     fn validate_context_grants(&self) -> Result<(), ManifestError> {
@@ -1909,6 +2134,52 @@ impl Manifest {
                          `planned` executor; a hand-written skill chooses its own moment \
                          to ask, and a `completion` agent calls no tools at all",
             });
+        }
+        Ok(())
+    }
+
+    /// A declared preview has to be a dry run, and a reachable one.
+    ///
+    /// Each refusal here is the same shape as `oversight` without `execution`:
+    /// a control that reads as present in the reviewed file and would do
+    /// nothing, or the opposite of what it says, at run time.
+    fn validate_tool_previews(&self) -> Result<(), ManifestError> {
+        for grant in &self.spec.tools {
+            let Some(preview) = grant.preview.as_deref() else {
+                continue;
+            };
+            let named = grant.reference.as_str();
+            if !grant.requires_approval {
+                return Err(ManifestError::Unenforceable {
+                    field: "spec.tools[].preview",
+                    detail: "a preview is computed to show a reviewer what a call will do, \
+                             and nothing would ever call it without `requires_approval: \
+                             true` — a field in the reviewed file that the runtime never \
+                             reaches",
+                });
+            }
+            if preview == named {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.tools: '{named}' names itself as its own preview, so the dry run \
+                     would be the mutation"
+                )));
+            }
+            let Some(target) = self.spec.tools.iter().find(|g| g.reference == preview) else {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.tools: '{named}' names the preview '{preview}', which this \
+                     manifest does not grant — a call with no declared safety, no \
+                     sensitivity ceiling and no protected fields"
+                )));
+            };
+            if target.mutates {
+                return Err(ManifestError::Unenforceable {
+                    field: "spec.tools[].preview",
+                    detail: "a preview that this manifest declares `mutates: true` is a dry \
+                             run that changes the world, which is the opposite of what the \
+                             field claims. Declare the preview grant `mutates: false`, or \
+                             name a different tool",
+                });
+            }
         }
         Ok(())
     }
@@ -2467,7 +2738,7 @@ impl Manifest {
             max_minor_units: b.max_minor_units,
             max_replans: b.max_replans,
             max_wallclock_secs: b.max_wallclock_secs,
-            ..Budget::default()
+            max_denials: b.max_denials,
         }
     }
 }
@@ -2480,6 +2751,18 @@ pub struct ManifestBuilder {
 }
 
 impl ManifestBuilder {
+    /// Record a fact about this agent that the runtime will never read.
+    ///
+    /// Namespaced — `example.com/business-owner` — and covered by the digest,
+    /// so changing it is a version bump. See
+    /// [`Metadata::annotations`] for why an opaque map is not a hole in
+    /// `deny_unknown_fields`.
+    #[must_use]
+    pub fn annotate(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.annotations.insert(key.into(), value.into());
+        self
+    }
+
     /// Configure the declaration body as one typed unit.
     #[must_use]
     pub fn spec(mut self, spec: Spec) -> Self {

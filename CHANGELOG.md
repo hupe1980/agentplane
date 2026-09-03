@@ -30,6 +30,356 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.27.0] — 2026-09-03
+
+### Fixed — a concurrent publish could overwrite a published version on Postgres
+
+The registry's immutability rule was enforced by a `SELECT … FOR UPDATE`
+followed by an upsert. A row lock cannot serialise the race that matters — two
+publishes of *different* content both finding **no** row — so both decided to
+insert, and the `ON CONFLICT DO UPDATE` let whichever landed second silently
+replace the first: the exact outcome the primary key exists to refuse, on the
+backend the rule is actually about. Now a transaction-scoped advisory lock on
+the key is taken before the read, the insert is a plain insert (an upsert would
+turn any future hole in that reasoning into a silent overwrite), and adopting an
+attestation is a column update. Pinned by a twenty-round concurrent publish
+against a real server: exactly one lands, the other is `Immutable`, and what
+resolves is the winner byte for byte.
+
+### Changed — dependencies updated; the MCP fixtures state their version
+
+`cargo update` (rmcp 3.1.4 → 3.2.0, a2a-server-lf 0.4.3, hyper 1.11.1, and
+the usual small bumps). rmcp 3.2 moved its `ProtocolVersion::LATEST` back to
+2025-11-25 to keep `initialize` working on legacy dialects, and the wire
+fixtures here advertised `ProtocolVersion::default()` — so the test that pins
+the negotiated dialect to 2026-07-28 was checking the dependency's constant
+against itself, and a dependency bump downgraded every handshake in the suite
+until `InputRequired` results became illegal. The fixture servers now state
+`V_2026_07_28`, the version the spec text names.
+
+The larger finding was in `src/`: rmcp 3.2 made `initialize` legacy-only, as
+the spec's `2026-07-28` revision requires — that revision replaced the
+handshake with `server/discover` and per-request metadata — so every
+`host_info().serve(transport)` in the tree negotiated **down** to 2025-11-25,
+silently: `tools/call` kept working, the tasks extension and structured results
+this crate is written against simply never appeared, and nothing said why.
+Three call sites each choosing a lifecycle were three chances to make that
+mistake. **New:** `McpClient::connect(server, transport, destination)` owns
+it — `server/discover` preferring 2026-07-28, `initialize` at 2025-11-25 when
+the server is legacy — and the binary, the example and the tests go through
+it. `McpClient::new` remains for an embedder whose transport is already
+running.
+
+### Fixed — a halt mid-batch failed every remaining item, permanently
+
+`run_item` classified every admission error — a halt, a tenant ceiling, a store
+outage — as a terminal `Failed` item and recorded it in the batch store. So the
+emergency stop, thrown mid-batch, wrote *failed* over every item behind it; when
+the stop lifted, the next pass read those outcomes as terminal and skipped them
+forever. A stop turned into loss by bookkeeping. An admission that never
+happened is no outcome of the item: the pass now returns the refusal as its
+error, the reservation stays outcome-less, and the next pass admits the item as
+*reserved, never finished*. A **run** that fails still does not stop the batch.
+
+### Fixed — a halt reached peers as back-pressure
+
+The A2A server answered every quota refusal with `QUOTA_EXHAUSTED` and *retry
+later* — a halt included, so every compliant peer backed off and retried the
+one refusal that means somebody is dealing with an incident. A halt now has its
+own code (`-32030`) and `ErrorInfo` reason (`HALTED`), identified by the pair
+and never the numeral like its sibling, with a fixed message that carries none
+of the operator's words. The client classifies the marked pair as a refusal
+whose detail says *do not retry*; a bare `-32030` from a foreign server stays an
+unknown fault. One function maps all three admission sites, because a halt that
+reached one as a ceiling would be a peer told *retry* by `message/send` and
+*stop* by `message/stream`.
+
+### Fixed — retention skipped every case on a sealed plane with no blob store
+
+`retain` returned before erasing anything when no blob store was wired. A plane
+that seals its journal with a key ring and stores no blobs is an ordinary
+shape, and for it the erasure that reaches every copy is the **key
+destruction** — so the pass left the one act that matters undone for want of a
+lesser act with nowhere to land, while reporting a clean count. `erase_case`
+now takes `Option<&dyn BlobStore>`: with no store the linked digests are left
+and the key scope is destroyed; on a sealed plane the drill then reads the
+bytes as *erased by design* through the key. The pass names the missing
+tombstones in `not_erasable` and carries on. **Breaking:** `erase_case`'s first
+argument is an `Option`.
+
+### Fixed — a preview's whole answer went into the worklist row
+
+A dry run listing the four thousand records it would touch has done its job by
+the first screenful; the rest was a task nobody could open. The evidence is
+bounded at `PREVIEW_EVIDENCE_BYTES` (64 KiB) and the bound is **stated** on
+the row — total size and a digest of the whole answer — because a silent
+truncation is a bounded result shaped exactly like a complete one. The
+journaled effect output still holds every byte, which is what the digest
+matches against.
+
+### Fixed — a halt was displayed as a quota
+
+`RuntimeError::QuotaExceeded` prefixed its message with `quota:`, so an
+operator refused by the emergency stop read `quota: the whole tenant is
+halted …` — a stop reported as back-pressure, which is the confusion
+`QuotaError::Halted` exists to prevent. The variant is transparent now; the
+inner error already says which of the two it is. `examples/approved_call`
+also printed its section headers after the runs they describe, filing a tool's
+own output line under the previous section.
+
+### Changed — `agentplane retain` lists; it does not pretend to erase
+
+The shipped binary wires no blob store and no key ring — a redb file is a
+journal and a case layer — so a verb that walked the cases, erased nothing and
+printed `erased: 0` beside a clean exit code was a control that read as having
+run. The verb now answers the half it can, through the same selection rule
+`Runtime::retain` uses (`retention::plan`, so a listing and an erasure cannot
+disagree about which cases), and refuses the other half by name. **Breaking:**
+`--dry-run` is required.
+
+An external evaluation against a governance control catalogue — reproduced with
+seven runnable demos — produced fourteen findings. All fourteen are addressed
+below. Where a finding's premise turned out to be wrong, the entry says so
+rather than shipping a control that answers the wrong question.
+
+### Fixed — a policy denial names the rule, not the request
+
+`StepError::Denied` already formats the action and the resource, and the Cedar
+adapter formatted them again, so an auditor read
+`policy denied 'effect:perform' on 'tool.call': 'effect:perform' on 'tool.call'
+refused by policy1` — half the line spent saying the same thing twice. The
+adapter's reason is now the half the wrapper cannot know: `refused by
+betragsgrenze-5000-eur`. `DenyAll` and the default-deny message follow the same
+rule.
+
+`PolicyDecision::Deny`'s documentation now states the contract, because it is
+one a third-party engine has to follow too.
+
+### Fixed — Cedar denials name the rule, not `policy1`
+
+`PolicySet::from_str` assigns positional ids, so a forty-rule set produced forty
+denials that each named a number — the outcome the required reason exists to
+prevent. Cedar treats `@id` as an ordinary annotation and does **not** adopt it
+as the `PolicyId`, so the adapter now reads it explicitly and prefers it:
+
+```cedar
+@id("betragsgrenze-5000-eur")
+forbid (principal, action == Action::"effect:perform", resource)
+when { context.args.amount_eur > 5000 };
+```
+
+Two rules answering to one name are refused at construction
+(`CedarError::AmbiguousRuleName`), including the case where one rule's `@id`
+collides with another's generated id — a name that reads like an answer and
+points at the wrong rule is worse than a number that points at the right one.
+
+**Breaking:** `EVALUATOR_SEMANTICS` is now `agentplane-adapter/3`, so every
+policy bundle digest moves. An open run resumed across the change presents a
+different bundle and is refused, which is the drift check working. Pre-alpha:
+re-admit rather than migrate.
+
+### Fixed — `max_denials` is declarable in a manifest
+
+`Budget::max_denials` is named in the security model as the control that bounds
+the one bit a uniform refusal cannot hide — and `manifest::Budgets` did not
+expose it, so the declarative tier, the one aimed at reviewers rather than Rust
+authors, could not bound the policy-probing side channel at all. It is now
+`spec.budgets.max_denials`. `0` is accepted, like `max_replans`: it is counted
+after the refusal, so it means *the first refusal ends the run*.
+
+### Fixed — a sink argument mismatch says where the two values differ
+
+The refusal said only that the bound value and the labelled one were not the
+same, leaving the reader with two JSON documents and a diff to do by eye — and
+the commonest case is the least visible: a payload still at its `null` default
+beside a labelled object. It now names the first differing RFC 6901 pointer and
+both canonical digests. Neither value is printed: the labelled one is precisely
+the data these gates exist to keep out of a log.
+
+**Breaking:** `PolicyError::SinkArgumentsMismatch` gains `at`, `bound` and
+`sent`. New: `core::canon::first_difference`.
+
+### Added — `metadata.annotations`
+
+A governance catalogue asks a registry entry for business owner, technical
+owner, risk class and a ticket. `deny_unknown_fields` refused all four, and the
+consequence was not that deployments did without — it was a second registry keyed
+on `name + version + digest`, drifting from the file. Two sources of truth about
+one agent is the defect this format exists to remove, arriving by the door
+marked *strictness*.
+
+One opaque map closes it without weakening the rule, because the map is intent
+by construction: the runtime never reads it, the digest covers it, and keys are
+namespaced in Kubernetes' own grammar — a DNS-subdomain prefix, a name of at
+most 63 characters, 256 KiB in all — so an entry carries into a cluster object
+unchanged. The prefix is required where Kubernetes makes it optional, because an
+unqualified key is exactly the name a future first-class field would want; the
+reserved `agentplane.hupe1980.github.io/` prefix and a blank value are refused
+too. Who reads them is Kubernetes' own line between API server and
+controllers: the runtime never acts on one, as the API server never does, while
+the embedder's wiring — a deploy pipeline, a cluster controller — may, and the
+map is public for exactly that.
+
+### Added — an emergency stop that names what it stops
+
+**Breaking:** `Runtime::set_halt` and `QuotaStore::set_halt` take a `HaltScope`;
+`Runtime::halted`/`QuotaStore::halted` are replaced by `halts()`, which returns
+every standing halt.
+
+A tenant-wide switch is the right answer when the plane is the incident and the
+wrong one at three in the morning when agent 12 of 28 is misbehaving — and
+hosting several agents is what a multi-document manifest and `A2aServer::hosting`
+are for. The options were stop all 28 or ship a policy change; neither is an
+emergency stop. `HaltScope::Agent` stops every revision of one declared name,
+and `HaltScope::Revision` stops one exact reviewed digest, so a fix published as
+a new version runs while the broken one stays stopped.
+
+Scopes are **independent rows**, not one flag the last writer wins: an incident
+that widens and then partly resolves is the ordinary shape, and lifting a narrow
+stop must not lift the broad one under it. Where several halts cover a run the
+narrowest is the reason reported.
+
+New CLI verbs: `agentplane halt --scope ... --reason ...` / `--lift`, and
+`agentplane halts`. `QuotaStore::halts` must report a scope it cannot parse as
+`StoreError::Corrupt` rather than skipping it — a halt an instance silently
+ignores is indistinguishable, from outside, from one that was lifted.
+
+**Breaking (schema):** `quota_halted` is keyed `(tenant, scope)` on both
+backends. Recreate rather than migrate.
+
+### Added — a durable manifest registry, and an enumerable inventory
+
+`MemoryRegistry` proves the rules and dies with the process, so *which agents
+does this organisation run* — the first question a governance function asks —
+had no answer. Both shipped stores now implement `Registry`, tenant-scoped like
+every other table, and `Registry::names()` is the inventory.
+
+The rules are shared rather than reimplemented: `manifest::registry` exposes
+`decide_publish`, `attest_manifest`, `check_attestation` and `reparse`, and each
+backend only *performs* the decision. Three hand-written copies of "may this
+replace what is there" are three chances to get it subtly different, and the one
+that is wrong is whichever nobody tested. `testkit::conformance_registry` holds
+all three to one contract.
+
+Immutability is a claim about a race as much as about a rule, so the read, the
+decision and the write are one transaction on both backends — `FOR UPDATE` on
+Postgres, redb's single writer otherwise.
+
+**Breaking:** `Registry` gains `names()`.
+
+### Added — a retention pass, and an honest account of what it cannot reach
+
+`erase_case` and `erase_run` erase one unit; nothing walked them on a window, so
+retention was something each deployment implemented once in Rust and the
+declarative tier could not implement at all. `Runtime::retain(older_than, at,
+reason)` and `agentplane retain --older-than-days N --reason ... [--dry-run]`
+erase every **closed** case opened before the window.
+
+Every pass returns `not_erasable` beside its count, and that list is the half
+that matters: without a key ring, blob tombstones cover the live store only and
+journal payloads stay verbatim. A number with no coverage statement beside it is
+how a deployment comes to believe an erasure obligation is discharged.
+
+### Added — a plane can bound what it writes down
+
+`spec.security.max_sensitivity_journaled` was read only from a manifest, so a
+plane of hand-written skills — every plane before the declarative tier and many
+after it — had no way to state the decision at all, and the default is the
+unerasable one. `RuntimeBuilder::max_sensitivity_journaled` is the twin,
+enforced at the same gate; where both are present the stricter binds.
+
+An enforcement point rather than a build-time warning, because a lint that let
+the run proceed would be the advisory control this project refuses everywhere
+else.
+
+### Added — a reviewer can be shown consequences, not only the instruction
+
+`archive(older_than: "2024-01-01")` shows an instruction and not the four
+thousand records it will touch. The runtime cannot compute that preview — it
+needs the tool's own dry run — but a grant can now name one:
+
+```yaml
+- ref: "tool://archive/purge"
+  requires_approval: true
+  preview: "tool://archive/purge_preview"
+```
+
+The preview is dispatched with the same arguments before the task opens and its
+answer lands in `Justification.evidence`: an ordinary effect, journaled, gated,
+metered and replayed rather than repeated. A `preview` without
+`requires_approval`, one naming a grant declared `mutates: true`, one naming an
+ungranted tool, and one naming the grant itself are each refused at parse. If the
+preview fails the task opens anyway and says so — refusing the call because its
+preview was unavailable would turn a read-only convenience into a second thing
+that can stop a payment.
+
+### Added — the egress allowlist reaches the tool path
+
+`core::Egress` covered the model drivers, peers, push and media — every outbound
+path except the most-used one. A deployment wiring `.tools(catalog, my_client)`
+got no egress control and no warning, while the security model read as though the
+rule covered everything.
+
+The split is the one the rest of the crate makes: **the client owns the
+connection, the plane owns the destination.** `RuntimeBuilder::egress` is
+consulted before the effect exists, so nothing leaves, nothing is journaled and
+nothing is metered.
+
+**Breaking:** `ToolClient` gains `destination(&ToolId) -> Destination`, with no
+default — a default of `Local` would let a remote transport answer *reaches
+nobody* by saying nothing, which is the fail-open `JournalStore::is_shared`
+avoids the same way. `McpClient::new` takes a `Destination`, because this crate
+never dereferences an MCP URL and an initialised `RunningService` does not
+disclose the host it dialled. `ToolCall::prepare` takes `Option<&Egress>`.
+
+### Added — `--drill-every`, and the observability last mile
+
+`Runtime::drill` could only be reached by writing Rust, so the tier that is a
+YAML file could not rehearse its own recovery — and a control that exists and is
+never exercised is one an audit cannot count. `agentplane serve --drill-every
+86400` runs it on a timer beside `--sweep-every`, logging a finding at `error`
+with the report attached.
+
+`examples/observability.rs` closes the gap between *instrumented* and
+*monitored*: a real subscriber that keeps replays out of latency, shows that
+gauges exist only once something queries the stores, and keys an alert on
+`SweepReport::needs_attention()`. No exporter is linked — the OTLP wiring is in
+the example's own docs, verbatim.
+
+### Fixed — the replay marking, as documented
+
+`runtime::telemetry`'s module docs said *every effect span carries
+`EFFECT_REPLAYED`*, which understated what actually happens and misled a bridge
+author in the unsafe direction: a replayed effect opens **no span at all**, and
+emits a `debug` event on the same target instead. A span-derived histogram is
+therefore clean by construction; what is not safe is keying on the *target* and
+treating everything on it as a span.
+
+### Fixed — the security model implied an egress coverage it did not have
+
+The page's framing — *one rule, shared by …* — read as exhaustive, and an
+evaluator concluded from it that a remote MCP server was a crate-owned URL
+dereference outside `netguard`. It is not: this crate never dereferences an MCP
+URL. `McpClient::new` takes an already-initialised `rmcp` service, the
+transport is dialled by the embedder, and the `mcp-http` feature enables an
+`rmcp` transport rather than adding a URL this crate holds — so there is
+nothing for `netguard` to guard, which is exactly why `Destination` is supplied
+by the wiring rather than inferred. That reasoning existed nowhere a reader
+could find it. The security model now carries a table of every outbound path,
+who checks it, and how the host is known, with Bedrock's *nobody* stated in the
+same table rather than in a footnote.
+
+### Added — the status page states the freeze conditions
+
+*When does the journal format freeze* was the one question an adopter of a
+regulated deployment could not answer from the docs, and the page that should
+have carried it said only *will change*. It now carries the freeze as eight
+checkable conditions, one met, and the interim position stated plainly: treat
+the export as the long-term artifact and the store as disposable — `export`,
+`verify` and `restore` already work, and an export taken today is verifiable
+today by a party who has never run this crate. No date, because inventing one
+would be the claim the page exists to avoid.
+
 ## [0.26.0] — 2026-09-01
 
 ### Changed — **breaking**: conclusions are typed and no longer called seals

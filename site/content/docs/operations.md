@@ -883,6 +883,45 @@ Every failure P7 exists to surface has its own event target:
 on what the source contains — an instrumentation test that greps is checking the
 author's intent, not the runtime's behaviour.
 
+### The last mile: instrumented is not monitored
+
+Shipping no exporter is the right call for the same reason as shipping no policy
+engine, and it leaves a gap that a deployment has to close by hand. Three things
+sit in it, none of them obvious from the API docs, and
+`cargo run --example observability` is a runnable bridge that does all three and
+asserts on the result:
+
+1. **Latency must exclude replay** — and the runtime already makes this easy in
+   a way worth stating, because it is not what a reader assumes. A replayed
+   effect opens **no span at all**; it emits a `debug` *event* on the
+   `agentplane.effect` target with `replayed = true`, plus the
+   `agentplane.effects.replayed` counter. So a histogram built from *spans* is
+   clean by construction. What is not safe is keying on the **target** and
+   treating everything on it as a span: that view sees both, and it is the one
+   in which replays quietly improve your p99 in proportion to how much recovery
+   you are doing.
+2. **Scheduling the sweep is scheduling your gauges.** Gauges come from a census
+   queried against the stores, never from increments — see below for why — so a
+   plane with no sweep loop has counters and no gauges, and nothing says so. A
+   dashboard with no data looks exactly like a plane holding nothing.
+3. **`SweepReport::needs_attention()` is the alert predicate.** It already folds
+   in breaches, expiries, dead letters, saturation, failed recoveries, lost
+   evidence and an unreadable census. Re-deriving it from individual counters is
+   how the next failure mode ends up alerting on nothing.
+
+The example's module docs carry the OTLP wiring verbatim — pinned crate
+versions, the `tracing-opentelemetry` layer, and where each of the three rules
+goes — so the difference between it and a production subscriber is the exporter
+and nothing else.
+
+Then schedule the two loops, or let the binary do it:
+
+```sh
+agentplane serve --manifest agent.yaml \
+  --sweep-every 30      `# gauges, deadlines, task expiry, dead letters` \
+  --drill-every 86400   `# the recovery rehearsal`
+```
+
 ## The operator surface
 
 Feature `http`, off by default. A library embedded in someone else's process
@@ -1094,7 +1133,7 @@ operator can name and release, rather than a number nobody can audit.
 ### The emergency stop
 
 Beside the ceilings sits a switch that is deliberately not one:
-`Runtime::set_halt(Some(reason))` stops a tenant from **starting new work**,
+`Runtime::set_halt(&scope, Some(reason))` stops **new work** from starting,
 across every instance, because the flag lives in the quota store rather than
 in the process — a stop that only stops the instance it was thrown on is the
 in-process-counter failure arriving during an incident. The refusal is its own
@@ -1102,13 +1141,58 @@ error carrying the operator's reason, never a ceiling: a ceiling says *not
 right now* and invites the retry somebody pulling this switch is trying to
 stop.
 
-What it does **not** stop, deliberately: runs already executing, and suspended
-runs resuming. Those are existing work, and refusing to let them continue
-would strand them mid-saga with reversals unrun — turning one incident into
-two. Work in flight is stopped by *cancelling* it (`request_cancel`), which
-unwinds what it did and records who asked. `cargo run --example operator_stop`
-runs both brakes side by side, which is the clearest statement of the
-difference.
+#### It names what it stops
+
+A tenant-wide switch is the right answer when the plane is the incident and the
+wrong one at three in the morning when agent 12 of 28 is misbehaving — and
+hosting several agents is exactly what a multi-document manifest and
+`A2aServer::hosting` are for. Against a tenant-only switch the options were stop
+all 28 or ship a policy change; neither is an emergency stop.
+
+| Scope | Stops | Reach for it when |
+|---|---|---|
+| `HaltScope::Tenant` | everything this tenant would start | the plane is the incident |
+| `HaltScope::agent("payments-clerk")` | every revision of one declared name | *this agent is misbehaving and I do not yet know since when* |
+| `HaltScope::revision(digest)` | one exact reviewed revision | a bad deploy — a fix published as a new version runs while the broken one stays stopped |
+
+```sh
+agentplane halt  --store ./journal.redb --scope 'agent:payments-clerk' --reason "incident 42: looping"
+agentplane halts --store ./journal.redb          # what is stopped right now
+agentplane halt  --store ./journal.redb --scope 'agent:payments-clerk' --lift
+```
+
+**Scopes are independent rows, not one flag the last writer wins.** Halting the
+whole tenant while an agent is halted, and then lifting the agent's, leaves the
+tenant's standing — an incident that widens and then partly resolves is the
+ordinary shape, and a single overwritable flag gets it wrong in the direction
+that lets work through. Where several halts cover one run the **narrowest**
+match is the reason reported, because "the tenant is halted" told to the caller
+of agent 12 sends them to the wrong incident.
+
+An **ungoverned** run — a skill registered directly on the plane, with no
+manifest — is stopped only by a tenant halt. There is nothing narrower to key it
+on, and inventing a match would stop work for a reason nobody could look up.
+
+Where a halt is answered, it is answered as itself. A peer over A2A receives
+`-32030` with the `ErrorInfo` reason `HALTED` and a fixed message that carries
+none of the operator's words — not the ceiling's `QUOTA_EXHAUSTED`, whose
+advice is *come back*, because a peer that backs off and retries is doing
+exactly what the switch exists to end. A batch pass returns the halt as its
+error and leaves the items it stopped pending: an admission that never
+happened is not an outcome of the item, and the next pass admits them again.
+
+`--reason` is required to halt and refused to lift: the next person to look will
+be somebody else, possibly at three in the morning, and *why* is the whole
+question, while a lift needs no justification because it restores the default.
+
+#### What it does not stop
+
+Runs already executing, and suspended runs resuming — deliberately. Those are
+existing work, and refusing to let them continue would strand them mid-saga with
+reversals unrun, turning one incident into two. Work in flight is stopped by
+*cancelling* it (`request_cancel`), which unwinds what it did and records who
+asked. `cargo run --example operator_stop` runs both brakes side by side, which
+is the clearest statement of the difference.
 
 ### One surface, many tenants
 
@@ -1320,8 +1404,11 @@ bare `dyn Fn` field in `src/runtime/`.
 
 ## 🗄️ Retention and erasure
 
-A full-fidelity journal is simultaneously an asset and a GDPR liability, and
-**this is currently your problem to solve, not the runtime's.**
+A full-fidelity journal is simultaneously an asset and a GDPR liability. The
+**window** is yours to choose — a retention period is a legal decision and a
+crate that picked one would be choosing somebody else's — but running it is not:
+`Runtime::retain` walks it, `agentplane retain --dry-run` lists what a walk
+would erase, and [erasure](@/docs/erasure.md) is the full account.
 
 What exists today:
 
@@ -1362,7 +1449,7 @@ find its case), and answer a request with one call:
 
 ```rust
 let n = agentplane::blob::erase_case(
-    blobs.as_ref(), cases.as_ref(), Some(keys.as_ref()), &tenant,
+    Some(blobs.as_ref()), cases.as_ref(), Some(keys.as_ref()), &tenant,
     case, now, "art-17 request",
 ).await?;
 ```
@@ -1378,14 +1465,34 @@ are untouched — including ones that stored *identical bytes*, which land on th
 same digest by construction, so the link is what scopes the erasure rather than
 the content.
 
+**On a window, rather than one case at a time.** The same act on a clock is
+`Runtime::retain(older_than, at, reason)`, or:
+
+```sh
+agentplane retain --store ./journal.redb \
+  --older-than-days 2555 --reason "retention: 7 years from opening" --dry-run
+```
+
+The CLI form lists and refuses to erase — the binary wires no store that can
+— so the pass itself is the library call. It erases **closed** cases only, and
+measures the window from `opened_at`: a
+case still open is a matter still running, and erasing underneath a live run
+turns a retention pass into an outage. Every pass returns `not_erasable` beside
+its count, and that list is the half that matters — a number with no coverage
+statement beside it is how a deployment comes to believe an obligation is
+discharged.
+
 **What still cannot be erased** is anything written into a journal *record*. The
-chain is append-only by design; keep personal data out of records rather than
-expecting erasure to reach it. The 1 MiB refusal pushes bulk content out by
-construction, but a short string still fits. Personal data that
-reached a journal *record* rather than a blob also cannot be removed: the chain
-is append-only, which is the point. Keep it out of records — the 1 MiB refusal
-pushes bulk content out by construction, but a short string still fits.
-[Regulation](@/docs/regulation.md) says the same in the obligations' own terms.
+chain is append-only by design, which is the point — keep personal data out of
+records rather than expecting erasure to reach it. Two ways to do that, and both
+are enforcement points rather than advice: write bytes through `cx.store_blob`
+so the chain commits to a digest, and declare a ceiling on what may be written
+down at all — `spec.security.max_sensitivity_journaled` in a manifest, or
+`RuntimeBuilder::max_sensitivity_journaled` on a plane of hand-written skills.
+The 1 MiB record refusal pushes *bulk* content out by construction, but a name,
+an address and an IBAN are a few hundred bytes and fit comfortably.
+[Erasure](@/docs/erasure.md) has the full table of what lands where;
+[regulation](@/docs/regulation.md) says the same in the obligations' own terms.
 
 ## 🚑 Runbook
 

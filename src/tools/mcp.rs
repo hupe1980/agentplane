@@ -53,7 +53,10 @@ use rmcp::model::{
     InputResponses, JsonObject, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
     TASKS_EXTENSION_ID, UpdateTaskParams,
 };
-use rmcp::service::{RoleClient, RunningService, ServiceError};
+use rmcp::service::{
+    ClientLifecycleMode, ClientServiceExt as _, RoleClient, RunningService, ServiceError,
+};
+use rmcp::transport::IntoTransport;
 use serde_json::Value;
 
 use super::{Advertised, ToolClient, ToolError, ToolId};
@@ -186,6 +189,16 @@ pub struct McpClient {
     /// transport timeout: `InDoubt`, because a deadline is not evidence about
     /// what the server did.
     timeout: Duration,
+    /// Where this client's transport goes, for the plane's egress allowlist.
+    ///
+    /// It has to be **declared** rather than derived. The transport is the
+    /// caller's — [`new`](Self::new) takes an already-initialised rmcp service
+    /// precisely so stdio, a child process and streamable HTTP stay a
+    /// deployment's choice — and an initialised `RunningService` does not
+    /// disclose the URL it dialled. So this client cannot discover its own
+    /// destination, and a control that guessed at one would be worse than the
+    /// absent one it replaced.
+    destination: crate::tools::Destination,
 }
 
 impl McpClient {
@@ -229,7 +242,7 @@ impl McpClient {
     /// any string into a version, so without this check a server answering
     /// `2099-01-01` would proceed on a dialect nobody implements — and the
     /// spec's own instruction for an unsupported answer is to disconnect.
-    const KNOWN_VERSIONS: [ProtocolVersion; 5] = [
+    pub const KNOWN_VERSIONS: [ProtocolVersion; 5] = [
         ProtocolVersion::V_2024_11_05,
         ProtocolVersion::V_2025_03_26,
         ProtocolVersion::V_2025_06_18,
@@ -237,10 +250,87 @@ impl McpClient {
         ProtocolVersion::V_2026_07_28,
     ];
 
+    /// Open a transport and run the MCP lifecycle this host is written for.
+    ///
+    /// # Why the lifecycle lives here and not at the caller
+    ///
+    /// `2026-07-28` replaced the `initialize` handshake with `server/discover`
+    /// and per-request metadata, and rmcp answers a plain `initialize` naming
+    /// that revision with its newest *legacy* dialect instead. So a caller
+    /// that starts the client with `.serve(transport)` negotiates down every
+    /// time, silently: `tools/call` keeps working, the tasks extension and
+    /// structured results this module is written against simply never appear,
+    /// and nothing anywhere names the cause. Three call sites each choosing a
+    /// lifecycle are three chances to make that mistake; this method makes it
+    /// once.
+    ///
+    /// The lifecycle is *discover first, legacy fallback*: `server/discover`
+    /// preferring `2026-07-28`, and the `initialize` handshake at
+    /// `2025-11-25` when the server answers discover with a legacy refusal
+    /// or not at all. A downgrade is still the protocol working and stays
+    /// readable through [`negotiated_version`](Self::negotiated_version); a
+    /// version outside [`KNOWN_VERSIONS`](Self::KNOWN_VERSIONS) is refused
+    /// exactly as [`new`](Self::new) refuses it.
+    ///
+    /// Takes the transport rather than a URL for the reason `new` takes a
+    /// running service: dialling is the caller's, and `destination` says what
+    /// was dialled. A server that never answers `server/discover` costs the
+    /// SDK's ten-second probe before the fallback — the price of a legacy
+    /// server that cannot say so.
+    ///
+    /// # Errors
+    ///
+    /// [`ToolError::Unreachable`] when neither lifecycle completes, or when
+    /// the handshake settled on a version this host does not speak.
+    pub async fn connect<T, E, A>(
+        server: impl Into<String>,
+        transport: T,
+        destination: crate::tools::Destination,
+    ) -> Result<Self, ToolError>
+    where
+        T: IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let server = server.into();
+        let service = Self::host_info()
+            .serve_with_lifecycle(
+                transport,
+                ClientLifecycleMode::Auto {
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                    legacy_version: Some(ProtocolVersion::V_2025_11_25),
+                },
+            )
+            .await
+            .map_err(|e| ToolError::Unreachable {
+                tool: ToolId::new(&server, "initialize"),
+                detail: format!("the MCP server did not initialise: {e}"),
+            })?;
+        Self::new(server, Arc::new(service), destination)
+    }
+
     /// Wrap an already-initialised rmcp client.
     ///
     /// Taking the running service rather than a connection string keeps every
     /// transport — stdio, a child process, streamable HTTP — a caller's choice.
+    /// Prefer [`connect`](Self::connect), which also chooses the lifecycle;
+    /// this is for an embedder whose transport is already running.
+    ///
+    /// # Why the destination is a parameter and not an inference
+    ///
+    /// That choice is also why `destination` is asked for. This crate never
+    /// dereferences an MCP URL: the transport is dialled by the caller, and an
+    /// initialised `RunningService` does not disclose the host it reached. So
+    /// there is nothing here to parse, and the plane's egress allowlist —
+    /// which does set membership on a host — has nothing to judge unless the
+    /// wiring says what it dialled.
+    ///
+    /// A child process or a stdio pipe is
+    /// [`Destination::Local`](crate::tools::Destination::Local). A streamable
+    /// HTTP connection is
+    /// [`Destination::remote(host)`](crate::tools::Destination::remote), and
+    /// naming a host other than the one dialled makes the allowlist judge the
+    /// wrong string — which is why this is a required argument rather than a
+    /// builder method somebody can forget.
     ///
     /// # Errors
     ///
@@ -250,6 +340,7 @@ impl McpClient {
     pub fn new(
         server: impl Into<String>,
         service: Arc<RunningService<RoleClient, ClientInfo>>,
+        destination: crate::tools::Destination,
     ) -> Result<Self, ToolError> {
         let server = server.into();
         if let Some(info) = service.peer_info() {
@@ -271,6 +362,7 @@ impl McpClient {
             service,
             access: McpAccess::default(),
             timeout: Self::DEFAULT_TIMEOUT,
+            destination,
         })
     }
 
@@ -1101,6 +1193,11 @@ impl ToolClient for McpClient {
             tool: tool.clone(),
             detail: format!("MCP tool result content could not be represented: {error}"),
         })
+    }
+
+    /// What the wiring declared, unchanged.
+    fn destination(&self, _tool: &ToolId) -> crate::tools::Destination {
+        self.destination.clone()
     }
 }
 

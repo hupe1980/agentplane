@@ -1498,6 +1498,8 @@ src/
              it away as well as check it in place
   drill      the live half of that check: blob bytes re-hashed and sealed
              state proven to open, with erasure told from loss
+  retention  the time-windowed erasure pass: closed cases past a window, with
+             an honest account of what it cannot make unreadable
   manifest/  the declaration an agent is built from, and the registry it is
              pinned in (feature `manifest`, off by default)
   api/       the HTTP surface for operators (feature `http`, off by default)
@@ -1998,6 +2000,14 @@ standards-compliant. The client backs off only on the marked pair; a bare
 `-32029` from a foreign server is an unknown fault and stays in doubt. The
 message beside the code is one fixed sentence with no numbers in it — the
 quota's counters are the operator's to read, not a prober's.
+
+A halt is the other admission refusal, and it is deliberately **not** the same
+answer: `-32030` with the reason `HALTED`, under the same domain and the same
+pair-is-the-identity rule. A ceiling says *come back*; a halt says somebody is
+dealing with an incident, and a peer that backs off and retries is doing
+exactly what the switch exists to end. The message is fixed and carries none of
+the operator's reason — the counterparty gets the outcome, not the plane's
+internals.
 
 Outbound, both legs refuse plaintext: the peer call carries the run's payload
 and a bearer credential, and the card fetch decides where that call will go,

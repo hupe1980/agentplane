@@ -140,6 +140,56 @@ its own opinion.
 An unconfigured seam is no control, spelled as absence: there is no
 `Egress::allow_all()`, for the same reason there is no `AllowAll` policy engine.
 
+#### Which outbound paths it covers
+
+Stated as a table rather than left to a reader to infer, because a rule that
+reads as exhaustive and is not is how a deployment sizes its risk wrongly.
+
+| Path | Who checks | How the host is known |
+|---|---|---|
+| HTTP model drivers — Anthropic, OpenAI, Gemini, Chat Completions | the driver, from `.egress(..)` | it parses its own base URL |
+| A2A peers | the peer client | the card URL, before it is fetched |
+| Push webhooks, governed media | [`netguard`](https://docs.rs/agentplane/latest/agentplane/netguard/), a stricter rule again | the URL being dereferenced |
+| **Tool calls — MCP, typed tools, anything else** | the **plane**, from `RuntimeBuilder::egress(..)` | the transport declares it: `ToolClient::destination` |
+| Bedrock | **nobody**, and it says so | the SDK will not disclose its endpoint |
+
+The tool path works differently from the rest. A grant is `tool://server/name`,
+which names a catalogue entry and not a destination, so there is no URL for the
+plane to parse. The split is the one the rest of the crate makes: **the client
+owns the connection, the plane owns the destination.** A
+`ToolClient` answers `destination()` — `Local` for tools compiled into the
+binary or an MCP server run as a child process over stdio, `Remote(host)` for a
+transport that dials one — and the plane's allowlist judges the answer before
+the effect exists. The method has **no default**, for the reason
+`JournalStore::is_shared` has none: a default of `Local` would let a remote
+transport answer *reaches nobody* by saying nothing.
+
+`Local` claims that no host of *this plane's* choosing is contacted. It does not
+claim the far side reaches nothing — a child process can open its own socket,
+which is the same residual a compromised allowlisted endpoint carries.
+
+#### Is MCP-over-HTTP outside `netguard`? Yes, and here is why
+
+`netguard` covers push webhooks and governed media: paths where **this crate
+dereferences a URL it was handed**, and where the URL can be attacker-influenced
+— an A2A card URL, an image link in a document. Those need DNS pinning, redirect
+revalidation and a public-address check, because the string arrived from
+somewhere.
+
+An MCP server URL is not that string. This crate **never dereferences it**:
+`McpClient::connect` takes a transport and `McpClient::new` an already-initialised `rmcp` service, so the transport is
+dialled by the embedder's own code and an initialised `RunningService` does not
+disclose the host it reached. The `mcp-http` feature enables an `rmcp` transport;
+it does not add a URL this crate holds. So there is nothing here for `netguard`
+to guard — and correspondingly nothing for the crate to parse, which is exactly
+why `Destination` is a value the wiring supplies rather than something the client
+infers.
+
+What that leaves is the operator's own decision, which is the one the table
+above now covers: name the host in `.egress(..)` and in the client's
+`destination()`, and a remote MCP server is held to the same allowlist as a
+model provider.
+
 ### Provenance that a callee can check
 
 A tool call carries a little context — which run, which case, which effect, which
@@ -1390,15 +1440,48 @@ refused rather than dropped silently. Neither orders the *external* effects. If
 two of your runs can touch one resource at once, the callee needs to be
 idempotent — which is what `ToolSafety` and the reconciliation path assume.
 
-**An approval shows arguments, not a diff.** `requires_approval: true` opens a
-task carrying the exact call about to be dispatched. For an ordinary tool call
-that *is* the change — `transfer(to: "GB-4471", amount: 12000)` tells an approver
-everything that will happen. It stops being so when one call changes many things
-at once: `archive(older_than: "2024-01-01")` shows the instruction and not the
-four thousand records it will touch. Producing that preview needs the tool itself
-to support a dry run, and nothing here requires or checks for one. Where an
-approver must see consequences rather than instructions, the tool has to compute
-them.
+**An approval shows arguments, not a diff — unless a preview is declared.**
+`requires_approval: true` opens a task carrying the exact call about to be
+dispatched. For an ordinary tool call that *is* the change:
+`transfer(to: "GB-4471", amount: 12000)` tells an approver everything that will
+happen. It stops being so when one call changes many things at once —
+`archive(older_than: "2024-01-01")` shows the instruction and not the four
+thousand records it will touch.
+
+Producing that preview needs the tool's own dry run, and the runtime cannot
+invent one. What it can do is call the one the manifest names:
+
+```yaml
+- ref: "tool://archive/purge"
+  mutates: true
+  requires_approval: true
+  preview: "tool://archive/purge_preview"   # read-only, same arguments
+```
+
+The preview is dispatched with the same arguments before the task opens, and
+its result lands in `Justification.evidence` — an ordinary effect, so it is
+journaled, gated, metered and replayed rather than repeated, and what the
+reviewer saw is on the record beside what they decided. The row carries at most
+64 KiB of it (`PREVIEW_EVIDENCE_BYTES`), and a longer answer is cut with the
+total size and a digest of the whole stated on the row: a silent truncation is
+a bounded result shaped exactly like a complete one, and the journaled effect
+output still holds every byte the digest matches. Every sink gate runs on
+it, so the preview grant needs its own `max_sensitivity`: it receives the same
+data the call does.
+
+Three things are refused at parse, each the same shape as `oversight` without
+`execution`: a `preview` without `requires_approval` (nothing would call it), a
+preview naming a grant declared `mutates: true` (a dry run that changes the
+world is the opposite of a dry run), and a preview naming a tool this manifest
+does not grant (a call with no declared safety, no ceiling and no field rules).
+
+**What remains uncovered** is a tool that has no dry run to name. Nothing here
+can compute one, and a `preview` pointing at a tool that quietly returns
+something other than what the call would do is a control that lies — which is
+why the field names a *granted, reviewed* tool rather than taking a description.
+If a preview fails at run time the task opens anyway and says so in the
+evidence: refusing the call because its preview was unavailable would turn a
+read-only convenience into a second thing that can stop a payment.
 
 **A decision's amendment is the call, not advice.** A reviewer who approves
 with an `amendment` has answered with the arguments that may run, and the

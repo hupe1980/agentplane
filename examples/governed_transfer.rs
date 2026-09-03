@@ -77,6 +77,12 @@ impl ToolClient for Ledger {
         self.calls.lock().unwrap().push(arguments.clone());
         Ok(json!({ "posted": true }))
     }
+
+    /// In-process: this double opens no connection, so there is no host for
+    /// the plane's egress allowlist to judge.
+    fn destination(&self, _tool: &ToolId) -> agentplane::tools::Destination {
+        agentplane::tools::Destination::Local
+    }
 }
 
 /// No catalogue, no client, no `Arc<dyn ToolClient>`.

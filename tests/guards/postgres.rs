@@ -588,6 +588,104 @@ fn mem_item(id: &str, subject: &str) -> agentplane::memory::MemoryItem {
     }
 }
 
+/// The manifest registry, on the backend the immutability rule is about.
+///
+/// On one node almost anything holds a "may this replace what is there" rule
+/// up. The moment two instances publish concurrently only the database can
+/// arbitrate, and a backend that got the read-decide-write wrong would pass
+/// every single-threaded test written for it.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn postgres_satisfies_the_registry_contract() {
+    use agentplane::testkit::StubSigner;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let store = PostgresStore::connect(&url).await.expect("connect");
+
+    let signer = StubSigner::new("release-bot");
+    let other = StubSigner::new("compromised-bot");
+    let mut report = agentplane::testkit::conformance::Report::default();
+    agentplane::testkit::conformance_registry::check(&store, &signer, &other, &signer, &mut report)
+        .await;
+    report.assert_conforms("PostgresStore (registry)");
+}
+
+/// Two publishes of different content under one version: exactly one lands.
+///
+/// The race the single-threaded battery cannot see. Both writers find no row,
+/// both decide to insert; without a lock taken *before* the read, the second
+/// either fails on the primary key wearing a backend fault's type, or — under
+/// an upsert — silently wins. The advisory lock serialises on the key whether
+/// or not a row exists yet, so the loser reads the winner's row and is refused
+/// as the immutability rule intends.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn postgres_refuses_the_loser_of_a_concurrent_publish() {
+    use agentplane::manifest::{Manifest, Registry, RegistryError};
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let one = PostgresStore::connect(&url).await.expect("connect");
+    let two = PostgresStore::connect(&url).await.expect("connect");
+
+    let manifest = |tokens: u64| {
+        Manifest::parse(&format!(
+            "
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: raced, version: '1.0.0' }}
+spec:
+  capabilities: {{ provides: [work.do] }}
+  budgets: {{ max_tokens: {tokens} }}
+"
+        ))
+        .expect("manifest")
+    };
+    let (a, b) = (manifest(1000), manifest(2000));
+
+    // Many rounds, because a race that is lost one time in fifty is still a
+    // race; each round uses its own version so the rows do not accumulate
+    // into a state where nothing races any more.
+    for round in 0..20u32 {
+        let mut a = a.clone();
+        let mut b = b.clone();
+        a.metadata.version = format!("1.0.{round}");
+        b.metadata.version = format!("1.0.{round}");
+        let (ra, rb) = tokio::join!(one.publish(&a), two.publish(&b));
+        let outcomes = [ra, rb];
+        let landed = outcomes.iter().filter(|r| r.is_ok()).count();
+        let refused = outcomes
+            .iter()
+            .filter(|r| matches!(r, Err(RegistryError::Immutable { .. })))
+            .count();
+        assert_eq!(
+            (landed, refused),
+            (1, 1),
+            "round {round}: exactly one publish must land and the other must be refused as \
+             Immutable, got {outcomes:?}"
+        );
+        // And what resolves is the winner, byte for byte.
+        let stored = one
+            .resolve("raced", &a.metadata.version)
+            .await
+            .expect("resolve");
+        let winner = if outcomes[0].is_ok() { &a } else { &b };
+        assert_eq!(
+            &stored, winner,
+            "round {round}: the loser's content replaced the winner's"
+        );
+    }
+}
+
 /// The case layer, against the same battery `SQLite` is held to.
 #[tokio::test]
 async fn postgres_satisfies_the_case_layer_contracts() {

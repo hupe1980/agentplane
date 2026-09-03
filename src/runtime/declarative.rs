@@ -323,9 +323,15 @@ impl Declarative {
                     };
                     cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)
                         .await?;
-                    let decision = cx
-                        .task(&spec.approve_call(&reference, &asked.arguments))
-                        .await?;
+                    let mut task = spec.approve_call(&reference, &asked.arguments);
+                    // Consequences beside the instruction, when the grant names
+                    // a dry run that can produce them.
+                    if let Some(preview) = grant.preview.as_deref() {
+                        let evidence =
+                            preview_evidence(cx, &catalog, &client, preview, &args).await;
+                        task.justification.evidence.push(evidence);
+                    }
+                    let decision = cx.task(&task).await?;
                     if !decision.approved {
                         // Reported to the model the way every other refused call
                         // is, and without the reviewer's words. A human's free
@@ -405,14 +411,21 @@ impl Declarative {
                     continue;
                 }
 
+                let egress = cx.tool_egress();
                 let dispatched = cx
                     .sink_with(&args, |value| {
-                        crate::tools::ToolCall::prepare(&catalog, Arc::clone(&client), id, value)
-                            .map_err(|e| {
-                                crate::core::StepError::Effect(crate::core::EffectError::Rejected(
-                                    e.to_string(),
-                                ))
-                            })
+                        crate::tools::ToolCall::prepare(
+                            &catalog,
+                            Arc::clone(&client),
+                            id,
+                            value,
+                            egress.as_deref(),
+                        )
+                        .map_err(|e| {
+                            crate::core::StepError::Effect(crate::core::EffectError::Rejected(
+                                e.to_string(),
+                            ))
+                        })
                     })
                     .await;
                 match dispatched {
@@ -865,9 +878,13 @@ impl Declarative {
                         };
                         cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)
                             .await?;
-                        let decision = cx
-                            .task(&spec.approve_call(&reference, assembled.peek()))
-                            .await?;
+                        let mut task = spec.approve_call(&reference, assembled.peek());
+                        if let Some(preview) = grant.preview.as_deref() {
+                            let evidence =
+                                preview_evidence(cx, catalog, client, preview, &assembled).await;
+                            task.justification.evidence.push(evidence);
+                        }
+                        let decision = cx.task(&task).await?;
                         if !decision.approved {
                             return Ok(Outcome::fail(format!(
                                 "{} refused the call to {reference}: {}",
@@ -897,13 +914,20 @@ impl Declarative {
                     } else if let Some(peer) = cx.peer_named(&id.server) {
                         cx.call_peer(&peer, &id.tool, &assembled).await?
                     } else {
+                        let egress = cx.tool_egress();
                         cx.sink_with(&assembled, |value| {
-                            crate::tools::ToolCall::prepare(catalog, Arc::clone(client), id, value)
-                                .map_err(|e| {
-                                    crate::core::StepError::Effect(
-                                        crate::core::EffectError::Rejected(e.to_string()),
-                                    )
-                                })
+                            crate::tools::ToolCall::prepare(
+                                catalog,
+                                Arc::clone(client),
+                                id,
+                                value,
+                                egress.as_deref(),
+                            )
+                            .map_err(|e| {
+                                crate::core::StepError::Effect(crate::core::EffectError::Rejected(
+                                    e.to_string(),
+                                ))
+                            })
                         })
                         .await?
                     };
@@ -1270,6 +1294,100 @@ impl Proposal {
 /// them must name exactly that source. Two spellings of the kind would let
 /// the task queue and the provenance drift apart.
 pub(crate) const APPROVE_CALL_KIND: &str = "agent.approve_call";
+
+/// Compute what a call **will do**, for the reviewer who has to approve it.
+///
+/// # Why this exists at all
+///
+/// A task carrying the exact tool and the exact arguments is the whole review
+/// for an ordinary call: `transfer(to: "GB-4471", amount: 12000)` says
+/// everything that will happen. It stops saying it the moment one call changes
+/// many things — `archive(older_than: "2024-01-01")` shows the instruction and
+/// not the four thousand records — and the reviewer is then approving a
+/// sentence rather than its consequences.
+///
+/// The runtime cannot produce that preview: computing it needs the tool's own
+/// dry run. What it can do is *call the one the manifest names*, with the same
+/// arguments, and put the answer where the reviewer reads it.
+///
+/// # Why a failure does not stop the call
+///
+/// It returns evidence either way. Refusing the call because its preview was
+/// unavailable would turn a read-only convenience into a second thing that can
+/// stop a payment — and a reviewer told *the preview could not be produced*
+/// still knows strictly more than one who is shown nothing. What is never done
+/// is opening the task silently without it.
+///
+/// The preview dispatches through the same three paths a granted tool does, so
+/// a preview that is another agent or a peer is a preview rather than a
+/// reference nothing can reach.
+async fn preview_evidence(
+    cx: &mut StepCtx<'_>,
+    catalog: &Arc<crate::tools::ToolCatalog>,
+    client: &Arc<dyn crate::tools::ToolClient>,
+    preview: &str,
+    args: &Tainted<Value>,
+) -> String {
+    let Some(id) = crate::tools::ToolId::parse(preview) else {
+        return format!("preview '{preview}' is not a tool reference, so none was computed");
+    };
+    let dispatched = if id.server == crate::tools::AGENT_SERVER {
+        cx.commission(&id.tool, args.clone()).await
+    } else if let Some(peer) = cx.peer_named(&id.server) {
+        cx.call_peer(&peer, &id.tool, args).await
+    } else {
+        let egress = cx.tool_egress();
+        cx.sink_with(args, |value| {
+            crate::tools::ToolCall::prepare(
+                catalog,
+                Arc::clone(client),
+                id.clone(),
+                value,
+                egress.as_deref(),
+            )
+            .map_err(|e| {
+                crate::core::StepError::Effect(crate::core::EffectError::Rejected(e.to_string()))
+            })
+        })
+        .await
+    };
+    match dispatched {
+        // The value, not a summary of it. A preview the runtime paraphrased
+        // would be one more thing between the reviewer and the consequences.
+        Ok(answer) => bounded_evidence(preview, &answer.peek().to_string()),
+        Err(why) => format!(
+            "preview from {preview} could not be produced ({why}) — this task is being \
+             decided without it"
+        ),
+    }
+}
+
+/// The most of a preview a task carries verbatim.
+///
+/// A dry run that answers with the four thousand records it would touch has
+/// done its job by the first screenful; the rest is a worklist row nobody can
+/// open. The bound is stated on the row rather than applied silently — the
+/// total size and a digest of the whole answer — so a reviewer knows they are
+/// reading a head and an auditor can match it against the journaled effect
+/// output, which keeps every byte.
+pub const PREVIEW_EVIDENCE_BYTES: usize = 64 * 1024;
+
+fn bounded_evidence(preview: &str, rendered: &str) -> String {
+    if rendered.len() <= PREVIEW_EVIDENCE_BYTES {
+        return format!("preview from {preview}: {rendered}");
+    }
+    let mut cut = PREVIEW_EVIDENCE_BYTES;
+    while !rendered.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "preview from {preview}: {} … [truncated: showing {cut} of {} bytes; the journaled \
+         effect output holds the whole answer, sha256 {}]",
+        &rendered[..cut],
+        rendered.len(),
+        crate::core::Digest::of(rendered.as_bytes())
+    )
+}
 
 /// The arguments an approval actually authorized.
 ///

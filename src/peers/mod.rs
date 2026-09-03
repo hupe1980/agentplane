@@ -66,6 +66,15 @@ pub const ERROR_DOMAIN: &str = "agentplane.hupe1980.github.io";
 /// is protocol surface, not a message string.
 pub const QUOTA_EXHAUSTED_REASON: &str = "QUOTA_EXHAUSTED";
 
+/// The reason token a halted agent answers with, inside [`ERROR_DOMAIN`].
+///
+/// Distinct from [`QUOTA_EXHAUSTED_REASON`] because the two ask opposite
+/// things of a caller: a ceiling says *come back*, and a halt says *somebody
+/// is dealing with an incident* — retrying is exactly what an operator pulling
+/// the switch is trying to stop. Answered under the quota token, a halt would
+/// teach every peer to hammer the one refusal that means stop.
+pub const HALTED_REASON: &str = "HALTED";
+
 /// Parse an A2A protocol version into the `Major.Minor` pair used for
 /// negotiation.
 ///

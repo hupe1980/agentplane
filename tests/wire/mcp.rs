@@ -34,8 +34,8 @@ use rmcp::model::{
     ServerCapabilities, ServerInfo, Task, TaskPayload, TaskStatus, Tool, ToolAnnotations,
     UpdateTaskParams,
 };
+use rmcp::serve_server;
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::{ServiceExt, serve_server};
 use serde_json::json;
 
 /// A server that lies about itself.
@@ -61,7 +61,11 @@ impl ServerHandler for LyingServer {
         me.version = "0.0.0".into();
 
         let mut info = ServerInfo::default();
-        info.protocol_version = ProtocolVersion::default();
+        // The version the spec text names, never the SDK's `default()`: that
+        // is whatever rmcp's `LATEST` happens to be in the linked release, and a fixture
+        // that inherits it makes the negotiation test check the dependency's
+        // constant against itself.
+        info.protocol_version = ProtocolVersion::V_2026_07_28;
         info.capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()
@@ -243,12 +247,9 @@ async fn connect() -> McpClient {
         }
     });
 
-    let service = McpClient::host_info()
-        .serve((cr, cw))
+    McpClient::connect("ledger", (cr, cw), agentplane::tools::Destination::Local)
         .await
-        .expect("client initialises");
-    McpClient::new("ledger", Arc::new(service))
-        .expect("a known negotiated version")
+        .expect("client initialises; a known negotiated version")
         .with_access(
             McpAccess::new()
                 .prompt("summarize", McpDataSafety::public())
@@ -277,13 +278,10 @@ async fn answering_an_elicitation_needs_its_own_grant() {
             let _ = running.waiting().await;
         }
     });
-    let service = McpClient::host_info()
-        .serve((cr, cw))
-        .await
-        .expect("client initialises");
     // Every other capability granted, and task input deliberately not.
-    let ungranted = McpClient::new("ledger", Arc::new(service))
-        .expect("a known negotiated version")
+    let ungranted = McpClient::connect("ledger", (cr, cw), agentplane::tools::Destination::Local)
+        .await
+        .expect("client initialises on a known version")
         .with_access(McpAccess::new().prompt("summarize", McpDataSafety::public()));
 
     let task = agentplane::tools::McpTask::from_result(
@@ -324,14 +322,12 @@ async fn the_negotiated_protocol_version_is_pinned_to_2026_07_28() {
             let _ = running.waiting().await;
         }
     });
-    let service = McpClient::host_info()
-        .serve((cr, cw))
+    let client = McpClient::connect("ledger", (cr, cw), agentplane::tools::Destination::Local)
         .await
         .expect("client initialises");
-    let negotiated = service.peer_info().expect("handshake completed");
     assert_eq!(
-        negotiated.protocol_version.as_str(),
-        "2026-07-28",
+        client.negotiated_version().as_deref(),
+        Some("2026-07-28"),
         "the negotiated MCP protocol version drifted from the pinned baseline"
     );
 }
@@ -371,6 +367,18 @@ async fn the_client_reports_the_version_the_handshake_settled_on() {
             let Ok(request): Result<serde_json::Value, _> = serde_json::from_str(&line) else {
                 continue;
             };
+            // A legacy server: `server/discover` is a method it never heard
+            // of, and saying so is what lets the client fall back at once.
+            if request["method"] == "server/discover" {
+                let refusal = json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": { "code": -32601, "message": "Method not found" }
+                });
+                let _ = w.write_all(format!("{refusal}\n").as_bytes()).await;
+                let _ = w.flush().await;
+                continue;
+            }
             if request["method"] != "initialize" {
                 continue;
             }
@@ -389,11 +397,9 @@ async fn the_client_reports_the_version_the_handshake_settled_on() {
     });
 
     let (cr, cw) = tokio::io::split(client_side);
-    let service = McpClient::host_info()
-        .serve((cr, cw))
+    let client = McpClient::connect("legacy", (cr, cw), agentplane::tools::Destination::Local)
         .await
-        .expect("an older server is a legal answer, not a failure");
-    let client = McpClient::new("legacy", Arc::new(service)).expect("a known negotiated version");
+        .expect("an older server is a legal answer, not a failure; a known negotiated version");
 
     assert_eq!(
         client.negotiated_version().as_deref(),
@@ -436,6 +442,7 @@ async fn a_servers_annotations_are_read_but_do_not_decide_anything() {
         Arc::clone(&client) as Arc<dyn ToolClient>,
         id,
         json!({}),
+        None,
     )
     .expect("permitted");
 
@@ -733,7 +740,11 @@ struct Watching(Arc<std::sync::Mutex<Option<serde_json::Map<String, serde_json::
 impl ServerHandler for Watching {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
-        info.protocol_version = ProtocolVersion::default();
+        // The version the spec text names, never the SDK's `default()`: that
+        // is whatever rmcp's `LATEST` happens to be in the linked release, and a fixture
+        // that inherits it makes the negotiation test check the dependency's
+        // constant against itself.
+        info.protocol_version = ProtocolVersion::V_2026_07_28;
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
     }
@@ -761,12 +772,10 @@ async fn watching() -> (McpClient, Watching) {
             let _ = running.waiting().await;
         }
     });
-    let service = McpClient::host_info()
-        .serve((cr, cw))
-        .await
-        .expect("client handshake");
     (
-        McpClient::new("ledger", Arc::new(service)).expect("a known negotiated version"),
+        McpClient::connect("ledger", (cr, cw), agentplane::tools::Destination::Local)
+            .await
+            .expect("client handshake on a known version"),
         seen,
     )
 }
@@ -996,6 +1005,18 @@ async fn an_unknown_negotiated_version_is_refused_at_construction() {
             let Ok(request): Result<serde_json::Value, _> = serde_json::from_str(&line) else {
                 continue;
             };
+            // A legacy server: `server/discover` is a method it never heard
+            // of, and saying so is what lets the client fall back at once.
+            if request["method"] == "server/discover" {
+                let refusal = json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": { "code": -32601, "message": "Method not found" }
+                });
+                let _ = w.write_all(format!("{refusal}\n").as_bytes()).await;
+                let _ = w.flush().await;
+                continue;
+            }
             if request["method"] != "initialize" {
                 continue;
             }
@@ -1014,11 +1035,8 @@ async fn an_unknown_negotiated_version_is_refused_at_construction() {
     });
 
     let (cr, cw) = tokio::io::split(client_side);
-    let service = McpClient::host_info()
-        .serve((cr, cw))
+    let error = McpClient::connect("future", (cr, cw), agentplane::tools::Destination::Local)
         .await
-        .expect("the transport accepts what the host must then judge");
-    let error = McpClient::new("future", Arc::new(service))
         .expect_err("an unknown dialect must be refused, not proceeded on");
     assert!(
         error.to_string().contains("2099-01-01"),
@@ -1043,13 +1061,25 @@ async fn a_wedged_server_is_a_timeout_not_a_hang() {
             let Ok(request): Result<serde_json::Value, _> = serde_json::from_str(&line) else {
                 continue;
             };
+            // A legacy server: refuse discover so the client falls back at
+            // once rather than after its probe timeout.
+            if request["method"] == "server/discover" {
+                let refusal = json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": { "code": -32601, "message": "Method not found" }
+                });
+                let _ = w.write_all(format!("{refusal}\n").as_bytes()).await;
+                let _ = w.flush().await;
+                continue;
+            }
             // Answer the handshake, then go quiet: child alive, never answering.
             if request["method"] == "initialize" {
                 let reply = json!({
                     "jsonrpc": "2.0",
                     "id": request["id"],
                     "result": {
-                        "protocolVersion": "2026-07-28",
+                        "protocolVersion": "2025-11-25",
                         "capabilities": { "tools": {} },
                         "serverInfo": { "name": "wedged", "version": "0.0.0" },
                     }
@@ -1061,12 +1091,9 @@ async fn a_wedged_server_is_a_timeout_not_a_hang() {
     });
 
     let (cr, cw) = tokio::io::split(client_side);
-    let service = McpClient::host_info()
-        .serve((cr, cw))
+    let client = McpClient::connect("wedged", (cr, cw), agentplane::tools::Destination::Local)
         .await
-        .expect("handshake completes");
-    let client = McpClient::new("wedged", Arc::new(service))
-        .expect("a known version")
+        .expect("handshake completes; a known version")
         .with_timeout(std::time::Duration::from_millis(100));
 
     let started = std::time::Instant::now();

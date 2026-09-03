@@ -120,6 +120,77 @@ pub fn value_bytes(value: &Value) -> Vec<u8> {
     out
 }
 
+/// Where two JSON values first differ, as an RFC 6901 pointer.
+///
+/// `None` when they are equal. The empty string — RFC 6901's pointer to the
+/// whole document — when they differ at the root, which is the common case and
+/// the one a bare "they differ" message hides worst: an object was expected and
+/// `null` arrived.
+///
+/// # Why a comparison has a diagnostic in it
+///
+/// A refusal that says *these two values are not the same* leaves the reader
+/// holding two documents and a diff to do by eye. The gate this serves is the
+/// sink argument binding, where the two documents are the value policy checked
+/// and the value the effect will send, and the difference between them is the
+/// whole finding. Naming the path costs one walk of a value already in hand.
+///
+/// Deterministic: object members are visited in the same UTF-16 key order
+/// [`value_bytes`] writes them, so the pointer this reports does not depend on
+/// how a caller built the map. A member present on one side and absent on the
+/// other is reported at that member's own path rather than at its parent's,
+/// because "the object differs" is the answer the reader already had.
+#[must_use]
+pub fn first_difference(left: &Value, right: &Value) -> Option<String> {
+    fn escape(token: &str) -> String {
+        // RFC 6901: `~` is `~0` and `/` is `~1`, in that order.
+        token.replace('~', "~0").replace('/', "~1")
+    }
+
+    fn walk(left: &Value, right: &Value, at: &str) -> Option<String> {
+        match (left, right) {
+            (Value::Object(l), Value::Object(r)) => {
+                let mut keys: Vec<&String> = l.keys().chain(r.keys()).collect();
+                keys.sort_by(|a, b| utf16_order(a, b));
+                keys.dedup();
+                for key in keys {
+                    let path = format!("{at}/{}", escape(key));
+                    match (l.get(key), r.get(key)) {
+                        (Some(lv), Some(rv)) => {
+                            if let Some(found) = walk(lv, rv, &path) {
+                                return Some(found);
+                            }
+                        }
+                        // Present on one side only: the member's own path is
+                        // the finding, not its parent's.
+                        _ => return Some(path),
+                    }
+                }
+                None
+            }
+            (Value::Array(l), Value::Array(r)) => {
+                for (index, (lv, rv)) in l.iter().zip(r.iter()).enumerate() {
+                    if let Some(found) = walk(lv, rv, &format!("{at}/{index}")) {
+                        return Some(found);
+                    }
+                }
+                // Equal prefixes, different lengths: the first index only one
+                // side has.
+                (l.len() != r.len()).then(|| format!("{at}/{}", l.len().min(r.len())))
+            }
+            // Scalars, and any two values of different shape. Comparing the
+            // canonical bytes rather than `==` keeps this agreeing with the
+            // gate that called it: `1.0` and `1` are one value to a hash taken
+            // over canonical form, and a pointer that disagreed with the
+            // comparison would send a reader hunting a difference that is not
+            // there.
+            _ => (value_bytes(left) != value_bytes(right)).then(|| at.to_owned()),
+        }
+    }
+
+    walk(left, right, "")
+}
+
 /// RFC 8785 key ordering: lexicographic by UTF-16 code unit.
 ///
 /// Not `str`'s own ordering, which compares UTF-8 bytes. The two agree for
@@ -409,6 +480,80 @@ mod tests {
         assert_eq!(
             String::from_utf8(value_bytes(&a)).unwrap(),
             "9007199254740993"
+        );
+    }
+
+    #[test]
+    fn equal_values_have_no_first_difference() {
+        let a = serde_json::json!({ "b": 1, "a": [1, 2, { "x": true }] });
+        let b = serde_json::json!({ "a": [1, 2, { "x": true }], "b": 1 });
+        assert_eq!(first_difference(&a, &b), None);
+    }
+
+    #[test]
+    fn a_differing_leaf_is_named_by_its_path() {
+        let a = serde_json::json!({ "to": "GB", "amount": 12000 });
+        let b = serde_json::json!({ "to": "GB", "amount": 999 });
+        assert_eq!(first_difference(&a, &b).as_deref(), Some("/amount"));
+    }
+
+    #[test]
+    fn a_root_level_difference_is_the_empty_pointer() {
+        let a = serde_json::json!(null);
+        let b = serde_json::json!({ "to": "GB" });
+        assert_eq!(first_difference(&a, &b).as_deref(), Some(""));
+    }
+
+    /// A member only one side has is reported at its own path.
+    ///
+    /// "The object differs" is the answer the reader already had.
+    #[test]
+    fn a_missing_member_is_named_rather_than_its_parent() {
+        let a = serde_json::json!({ "outer": { "kept": 1 } });
+        let b = serde_json::json!({ "outer": { "kept": 1, "added": 2 } });
+        assert_eq!(first_difference(&a, &b).as_deref(), Some("/outer/added"));
+    }
+
+    #[test]
+    fn a_shorter_array_is_named_at_the_first_index_it_lacks() {
+        let a = serde_json::json!({ "xs": [1, 2] });
+        let b = serde_json::json!({ "xs": [1, 2, 3] });
+        assert_eq!(first_difference(&a, &b).as_deref(), Some("/xs/2"));
+    }
+
+    /// RFC 6901 escaping, so a key containing `/` cannot forge a path.
+    #[test]
+    fn pointer_tokens_are_escaped() {
+        let a = serde_json::json!({ "a/b": 1, "c~d": 1 });
+        let b = serde_json::json!({ "a/b": 2, "c~d": 1 });
+        assert_eq!(first_difference(&a, &b).as_deref(), Some("/a~1b"));
+
+        let c = serde_json::json!({ "a/b": 1, "c~d": 2 });
+        assert_eq!(first_difference(&a, &c).as_deref(), Some("/c~0d"));
+    }
+
+    /// The pointer agrees with the comparison that asked for it.
+    ///
+    /// The gate compares canonical bytes, where `1.0` and `1` are one value; a
+    /// pointer reported from `==` would send a reader hunting a difference the
+    /// gate did not find.
+    #[test]
+    fn the_pointer_agrees_with_canonical_equality() {
+        let a: Value = serde_json::from_str("{\"n\": 1.0}").unwrap();
+        let b: Value = serde_json::from_str("{\"n\": 1}").unwrap();
+        assert_eq!(value_bytes(&a), value_bytes(&b));
+        assert_eq!(first_difference(&a, &b), None);
+    }
+
+    /// The reported difference does not depend on how a caller built the map.
+    #[test]
+    fn the_first_difference_is_reported_in_canonical_key_order() {
+        let a = serde_json::json!({ "z": 1, "a": 1 });
+        let b = serde_json::json!({ "z": 2, "a": 2 });
+        assert_eq!(
+            first_difference(&a, &b).as_deref(),
+            Some("/a"),
+            "keys are visited in the order canonical bytes write them"
         );
     }
 }

@@ -84,6 +84,21 @@ about you. See [status](@/docs/status.md).
 | Refusing to guess | A run that cannot account for an outcome is `Quarantined` rather than unwound — reversing everything except the one thing nobody can account for is how a system refunds money nobody took |
 | Declared, not remembered | `spec.oversight` puts approval in the reviewable file (`manifest`), so a declarative agent's answer waits for a person by declaration rather than because a developer coded the call. Declaring it where nothing would apply it is refused, so the file cannot claim a human is in the loop when none is |
 
+### Art. 13 — a machine-readable description of the agent
+
+| Requirement | Mechanism |
+|---|---|
+| What the agent is, in one reviewable artifact | A manifest declares the prompt, grants, ceilings, models, result shape and oversight, and the runtime **refuses** effects the declaration never named. The A2A Agent Card is derived from the same file, so what a peer is told and what the runtime enforces cannot drift |
+| The version that runs is the version that was reviewed | The registry addresses a manifest by digest, refuses to replace a published version with different content, and lets a caller pin the digest they reviewed — the form that survives the registry itself being compromised |
+| Who published it | A domain-separated publisher attestation, verified on resolve, with publisher reassignment refused. An unsigned publish may adopt its first signature; an existing publisher may not be replaced |
+| Facts a registry entry needs and a manifest could not hold | `metadata.annotations` — business owner, technical owner, risk class, ticket — namespaced, never interpreted by the runtime, and covered by the digest, so changing an owner is a version bump with a reviewer on it rather than an edit in a second system |
+| *Which agents does this organisation run* | `Registry::names()`, against a **durable** registry: both shipped stores implement the registry, so the inventory survives the process that published it |
+
+**The limit, stated plainly:** trust in publisher keys is a deployment decision.
+This crate never mints a key and never decides to trust one — `resolve_verified`
+returns the `KeyId` that signed, and what that identity is allowed to publish is
+somebody else's policy.
+
 ### Art. 15 — accuracy, robustness, cybersecurity
 
 Not a feature but an evidence question, and the evidence is the assurance ladder:
@@ -92,6 +107,18 @@ prefix of a real journal, store conformance batteries run against every backend,
 and a mutation sweep that breaks each guarantee on purpose to prove its test
 notices. [Operations](@/docs/operations.md) describes what each layer does and does not
 cover.
+
+### Recovery rehearsal, and retention, on a schedule
+
+A control that exists and is never exercised is one an audit cannot count, and
+a retention policy nothing enforces is a document.
+
+| Requirement | Mechanism |
+|---|---|
+| Rehearse recovery | `Runtime::drill` holds every case's blob digests and sealed-state keys against the live stores — re-hashing bytes, proving sealed state opens, and telling *intact* from *erased by design* from *lost*. `agentplane serve --drill-every 86400` runs it on a timer and logs a finding at `error` with the report attached; `agentplane drill` runs one pass and fails only on loss, never on honest erasure |
+| Prove a copy without this crate | `agentplane verify history.jsonl --checkpoint cp.note` recomputes an export from its own bytes; `restore` rebuilds a store and proves it by its own checkpoint |
+| Enforce a retention window | `Runtime::retain(older_than, at, reason)` erases every **closed** case opened before the window: blob tombstones, and the case's key scope destroyed, which reaches every replica and backup at once. `agentplane retain --older-than-days N --reason ... --dry-run` lists what that pass would erase, through the same selection rule, from a binary that wires no store able to erase |
+| Know what retention did *not* reach | Every pass returns `not_erasable`, and it is the half that matters: without a key ring, journal payloads stay verbatim. A count with no coverage statement beside it is how a deployment comes to believe an obligation is discharged |
 
 ### Art. 26 — deployers keep logs
 
@@ -189,9 +216,7 @@ case and its adapter is single-node by contract — so wrap it explicitly.
 | Obligation | Why not |
 |---|---|
 | **Art. 9** risk management | There is a policy seam and a Cedar adapter, but no risk-tier model. Cedar's `symcc` could *prove* properties of a policy set rather than test them; nothing invokes it |
-| **Art. 13** machine-readable description | A manifest declares an agent's prompt, grants, ceilings, models, result shape and oversight; the registry pins it by digest, can verify a domain-separated publisher attestation, and refuses publisher reassignment; the runtime **refuses** effects the declaration never named; and the A2A Agent Card is derived from that same manifest and served by the optional A2A server. What is still absent: the shipped registry is process-local rather than durable or remote, and trust in publisher keys remains a deployment decision |
 | **Art. 50** transparency to users | An interface obligation, not a runtime one (above) |
-| **A scheduled recovery rehearsal** | The pieces exist: `verify` proves an export from its own bytes, `restore` rebuilds a store and proves it by its own checkpoint, and `Runtime::drill` holds every case's blob digests and sealed-state keys against the live stores — re-hashing the bytes, proving sealed state opens, and telling intact from erased-by-design from lost. The drill also has a CLI verb — `agentplane drill` opens a store and fails only on loss, never on honest erasure — but nothing invokes any of the three on a schedule: the rehearsal itself is still yours to arrange |
 | Anything about your **model** | Bias, accuracy, training data, and evaluation are properties of the model and its use. This is a runtime |
 | A **conformity assessment** | A person does that, about a system, in a context |
 

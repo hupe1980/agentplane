@@ -73,10 +73,140 @@ impl ToolClient for Fake {
             .pop()
             .unwrap_or_else(|| Ok(json!({ "result": "fine" })))
     }
+
+    /// In-process: this double opens no connection, so there is no host for
+    /// the plane's egress allowlist to judge.
+    fn destination(&self, _tool: &ToolId) -> agentplane::tools::Destination {
+        agentplane::tools::Destination::Local
+    }
 }
 
 fn transfer() -> ToolId {
     ToolId::new("ledger", "transfer")
+}
+
+/// A transport that names a host, so the plane's allowlist has something to
+/// judge.
+#[derive(Debug)]
+struct Reaches(&'static str);
+
+#[async_trait::async_trait]
+impl ToolClient for Reaches {
+    async fn call(
+        &self,
+        _tool: &ToolId,
+        _args: &Value,
+        _provenance: Option<&agentplane::core::Provenance>,
+    ) -> Result<Value, ToolError> {
+        panic!("a call refused by the egress allowlist must never be dispatched")
+    }
+
+    fn destination(&self, _tool: &ToolId) -> agentplane::tools::Destination {
+        agentplane::tools::Destination::remote(self.0)
+    }
+}
+
+// ── Egress on the tool path ─────────────────────────────────────────────────
+
+/// The most-used outbound path is covered by the allowlist too.
+///
+/// `Egress` reached the model drivers, the peer client, push and media — every
+/// outbound path except the one a plane uses most. A deployment wiring
+/// `.tools(catalog, my_http_client)` got no egress control and no warning,
+/// while the security model read as though the rule covered everything.
+///
+/// Refused **before the effect exists**: the client's `call` panics, so a
+/// passing test is proof nothing was dispatched.
+#[test]
+fn a_tool_transport_reaching_an_ungranted_host_is_refused() {
+    let catalog = ToolCatalog::new().allow(transfer(), ToolSafety::default());
+    let egress = agentplane::core::Egress::new().allow("ledger.example");
+
+    let err = ToolCall::prepare(
+        &catalog,
+        Arc::new(Reaches("evil.example")) as Arc<dyn ToolClient>,
+        transfer(),
+        json!({}),
+        Some(&egress),
+    )
+    .expect_err("an ungranted host must be refused");
+    assert!(
+        err.to_string().contains("evil.example"),
+        "the refusal must name the host that was attempted: {err}"
+    );
+    assert_eq!(
+        err.disposition(),
+        Disposition::DidNotHappen,
+        "nothing was sent, so nothing is in doubt"
+    );
+}
+
+/// The same call, to a granted host, is prepared.
+///
+/// Without this the test above passes for a gate that refuses everything.
+#[test]
+fn a_tool_transport_reaching_a_granted_host_is_prepared() {
+    let catalog = ToolCatalog::new().allow(transfer(), ToolSafety::default());
+    let egress = agentplane::core::Egress::new().allow("ledger.example");
+
+    ToolCall::prepare(
+        &catalog,
+        Arc::new(Reaches("ledger.example")) as Arc<dyn ToolClient>,
+        transfer(),
+        json!({}),
+        Some(&egress),
+    )
+    .expect("a granted host is permitted");
+}
+
+/// A local transport has no host, so an allowlist has nothing to decide.
+///
+/// Tools compiled into the binary contact no host of this plane's choosing.
+/// Refusing them under an allowlist that lists only remote servers would make
+/// the control unusable on the ordinary shape — a typed toolbox beside one MCP
+/// server.
+#[test]
+fn a_local_transport_is_not_judged_by_the_host_allowlist() {
+    let catalog = ToolCatalog::new().allow(transfer(), ToolSafety::default());
+    let egress = agentplane::core::Egress::new().allow("ledger.example");
+
+    ToolCall::prepare(&catalog, Fake::ok(), transfer(), json!({}), Some(&egress))
+        .expect("an in-process tool reaches no host and is not judged by a host allowlist");
+}
+
+/// The router answers for the transport that would actually carry the call.
+///
+/// A single answer for a router would have to be the union of its routes, and a
+/// union is the wildcard `Egress` refuses to have — so one ungranted server
+/// would either refuse every server or none.
+#[test]
+fn the_router_reports_the_destination_of_the_route_that_would_carry_the_call() {
+    use agentplane::tools::{Destination, ToolRouter};
+
+    let router = ToolRouter::new()
+        .server(
+            "ledger",
+            Arc::new(Reaches("ledger.example")) as Arc<dyn ToolClient>,
+        )
+        .server(
+            "mail",
+            Arc::new(Reaches("evil.example")) as Arc<dyn ToolClient>,
+        );
+
+    assert_eq!(
+        router.destination(&transfer()),
+        Destination::remote("ledger.example")
+    );
+    assert_eq!(
+        router.destination(&ToolId::new("mail", "send")),
+        Destination::remote("evil.example")
+    );
+    assert_eq!(
+        router.destination(&ToolId::new("nowhere", "x")),
+        Destination::Local,
+        "an unrouted server has no destination to grant; the call fails as \
+         Unreachable with the honest reason instead"
+    );
 }
 
 // ── The security property ───────────────────────────────────────────────────
@@ -99,7 +229,8 @@ fn a_servers_read_only_hint_does_not_make_a_tool_safe_to_repeat() {
             },
         );
 
-    let call = ToolCall::prepare(&catalog, Fake::ok(), transfer(), json!({})).expect("permitted");
+    let call =
+        ToolCall::prepare(&catalog, Fake::ok(), transfer(), json!({}), None).expect("permitted");
 
     assert!(
         call.mutates(),
@@ -148,7 +279,7 @@ fn a_server_claiming_more_safety_than_granted_is_reported() {
 #[test]
 fn an_undeclared_tool_cannot_be_prepared() {
     let catalog = ToolCatalog::new();
-    let err = ToolCall::prepare(&catalog, Fake::ok(), transfer(), json!({}))
+    let err = ToolCall::prepare(&catalog, Fake::ok(), transfer(), json!({}), None)
         .expect_err("an undeclared tool must be refused");
     assert!(
         err.to_string().contains("ledger/transfer"),
@@ -220,7 +351,7 @@ async fn a_timed_out_tool_call_is_in_doubt_when_it_reaches_the_runtime() {
         tool: transfer(),
         detail: "no answer in 30s".into(),
     })]);
-    let call = ToolCall::prepare(&catalog, client, transfer(), json!({})).expect("permitted");
+    let call = ToolCall::prepare(&catalog, client, transfer(), json!({}), None).expect("permitted");
 
     let err = call.perform().await.expect_err("the call times out");
     assert_eq!(
@@ -239,7 +370,7 @@ async fn a_tool_that_ran_and_failed_is_treated_as_having_landed() {
         tool: transfer(),
         detail: "insufficient funds".into(),
     })]);
-    let call = ToolCall::prepare(&catalog, client, transfer(), json!({})).expect("permitted");
+    let call = ToolCall::prepare(&catalog, client, transfer(), json!({}), None).expect("permitted");
 
     let err = call.perform().await.expect_err("the tool fails");
     assert_eq!(
@@ -263,6 +394,7 @@ fn a_tool_result_is_untrusted_whatever_the_catalogue_says() {
         Fake::ok(),
         ToolId::new("ledger", "read"),
         json!({}),
+        None,
     )
     .expect("permitted");
 
@@ -286,6 +418,7 @@ fn the_server_is_part_of_the_effect_identity() {
         Fake::ok(),
         ToolId::new("a", "transfer"),
         json!({}),
+        None,
     )
     .expect("permitted");
     let two = ToolCall::prepare(
@@ -293,6 +426,7 @@ fn the_server_is_part_of_the_effect_identity() {
         Fake::ok(),
         ToolId::new("b", "transfer"),
         json!({}),
+        None,
     )
     .expect("permitted");
 
@@ -327,6 +461,7 @@ impl Skill for Calls {
             Arc::clone(&self.client) as Arc<dyn ToolClient>,
             ToolId::new("ledger", "read"),
             json!({ "account": "1" }),
+            None,
         )
         .map_err(|e| SkillError::Other(e.to_string()))?;
         let arguments = Tainted::trusted(json!({ "account": "1" }));
@@ -395,6 +530,7 @@ async fn tool_output_cannot_steer_a_mutating_call() {
                 Arc::clone(&self.client) as Arc<dyn ToolClient>,
                 ToolId::new("ledger", "read"),
                 json!({}),
+                None,
             )
             .map_err(|e| SkillError::Other(e.to_string()))?;
             let query = Tainted::trusted(json!({}));
@@ -406,6 +542,7 @@ async fn tool_output_cannot_steer_a_mutating_call() {
                 Arc::clone(&self.client) as Arc<dyn ToolClient>,
                 transfer(),
                 answer.peek().clone(),
+                None,
             )
             .map_err(|e| SkillError::Other(e.to_string()))?;
             let out = cx.sink(write, &answer).await?;
@@ -469,6 +606,7 @@ async fn a_sink_cannot_check_one_argument_value_and_send_another() {
                 Arc::clone(&self.client) as Arc<dyn ToolClient>,
                 transfer(),
                 json!({ "recipient": "attacker", "amount": 1_000_000 }),
+                None,
             )
             .map_err(|error| SkillError::Other(error.to_string()))?;
 
@@ -530,6 +668,7 @@ impl Skill for BypassesSink {
             Arc::clone(&self.client) as Arc<dyn ToolClient>,
             transfer(),
             json!({ "recipient": "attacker", "amount": 50_000 }),
+            None,
         )
         .map_err(|error| SkillError::Other(error.to_string()))?;
         let out = cx.effect(call).await?;
@@ -599,6 +738,7 @@ impl Skill for SendsStructured {
             Arc::clone(&self.client) as Arc<dyn ToolClient>,
             transfer(),
             arguments.peek().clone(),
+            None,
         )
         .map_err(|error| SkillError::Other(error.to_string()))?;
         let out = cx.sink(call, &arguments).await?;
@@ -928,6 +1068,7 @@ impl Skill for LooksUpThenPays {
             Arc::clone(&self.client) as Arc<dyn ToolClient>,
             self.lookup.clone(),
             query.peek().clone(),
+            None,
         )
         .map_err(|error| SkillError::Other(error.to_string()))?;
         let looked_up = cx.sink(read, &query).await?;
@@ -945,6 +1086,7 @@ impl Skill for LooksUpThenPays {
             Arc::clone(&self.client) as Arc<dyn ToolClient>,
             transfer(),
             arguments.peek().clone(),
+            None,
         )
         .map_err(|error| SkillError::Other(error.to_string()))?;
         Ok(Outcome::done(cx.sink(call, &arguments).await?))
@@ -1770,6 +1912,7 @@ async fn the_taint_gate_takes_the_stricter_of_catalogue_and_grant() {
                 Arc::clone(&self.client) as Arc<dyn ToolClient>,
                 ToolId::new("ledger", "post"),
                 args.clone(),
+                None,
             )
             .map_err(|e| SkillError::Other(e.to_string()))?;
             let untrusted = Tainted::with_label(
@@ -2271,6 +2414,12 @@ async fn an_in_doubt_tool_call_does_not_become_a_chat_message() {
                 detail: "no answer in 30s".into(),
             })
         }
+
+        /// In-process: this double opens no connection, so there is no host for
+        /// the plane's egress allowlist to judge.
+        fn destination(&self, _tool: &ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
+        }
     }
 
     let provider = FakeProvider::new();
@@ -2481,6 +2630,12 @@ fn a_plane_may_wire_typed_tools_and_a_remote_server_at_once() {
         ) -> Result<Value, ToolError> {
             Ok(json!({ "remote": true }))
         }
+
+        /// In-process: this double opens no connection, so there is no host for
+        /// the plane's egress allowlist to judge.
+        fn destination(&self, _tool: &ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
+        }
     }
 
     let agent = |tools: &str| {
@@ -2566,6 +2721,7 @@ impl Skill for SendsVia {
                     Arc::clone(&self.client) as Arc<dyn ToolClient>,
                     self.tool.clone(),
                     value,
+                    None,
                 )
             })
             .await?;

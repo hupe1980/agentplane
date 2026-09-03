@@ -505,6 +505,137 @@ async fn an_undeclared_effect_keeps_the_sensitivity_its_provenance_implies() {
 
 // ── The gate ────────────────────────────────────────────────────────────────
 
+/// The binding refusal says **where** the two values differ.
+///
+/// The rule is exact equality, so *that* they differ is the whole verdict — and
+/// it is not the whole message. Told only that the bound value and the labelled
+/// one are not the same, a reader is holding two JSON documents and a diff to
+/// do by eye, and the commonest case is the least visible: a sink whose bound
+/// payload is still its default while the labelled value is an object.
+///
+/// Neither value may be printed. The labelled one is exactly the data these
+/// gates exist to keep out of a log, so the message carries a path and two
+/// digests: enough to identify a value to whoever already holds it, and nothing
+/// to anyone who does not.
+#[tokio::test]
+async fn a_sink_binding_mismatch_says_where_the_two_values_differ() {
+    #[derive(Debug)]
+    struct Mismatched {
+        world: World,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Mismatched {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("mismatched").provides("mismatched")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            // What policy is shown, and what the sink would actually send,
+            // agree everywhere except one leaf.
+            let checked = Tainted::trusted(json!({ "to": "GB-4471", "amount": 12000 }));
+            let out = cx
+                .sink(
+                    Transfer {
+                        world: Arc::clone(&self.world),
+                        arguments: json!({ "to": "GB-4471", "amount": 999_999 }),
+                    },
+                    &checked,
+                )
+                .await?;
+            Ok(Outcome::done(out))
+        }
+    }
+
+    let world: World = Arc::default();
+    let store = db();
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Mismatched {
+            world: Arc::clone(&world),
+        })
+        .build()
+        .run("mismatched", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+
+    let RunStatus::Failed(why) = &out.status else {
+        panic!("a sink that would send something else must be refused: {out:?}")
+    };
+    assert!(
+        why.contains("/amount"),
+        "the refusal must name the first differing pointer: {why}"
+    );
+    assert!(
+        !why.contains("999999") && !why.contains("GB-4471"),
+        "and must not print the values it is refusing to send: {why}"
+    );
+    assert!(
+        world.lock().unwrap().is_empty(),
+        "the transfer must not have happened"
+    );
+}
+
+/// The case the message exists for: a bound payload nobody set.
+///
+/// `EffectDescriptor::new(kind, json!(null))` beside a labelled object is the
+/// misconfiguration this gate invites, and "they differ" is the least useful
+/// thing to say about it. The pointer is the root — RFC 6901's empty string —
+/// so the message has to name that rather than a path.
+#[tokio::test]
+async fn a_default_payload_beside_a_labeled_object_reports_the_root() {
+    #[derive(Debug)]
+    struct Unset {
+        world: World,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Unset {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("unset").provides("unset")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let checked = Tainted::trusted(json!({ "to": "GB-4471" }));
+            let out = cx
+                .sink(
+                    Transfer {
+                        world: Arc::clone(&self.world),
+                        arguments: Value::Null,
+                    },
+                    &checked,
+                )
+                .await?;
+            Ok(Outcome::done(out))
+        }
+    }
+
+    let world: World = Arc::default();
+    let store = db();
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Unset {
+            world: Arc::clone(&world),
+        })
+        .build()
+        .run("unset", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+
+    let RunStatus::Failed(why) = &out.status else {
+        panic!("an unbound payload must be refused: {out:?}")
+    };
+    assert!(
+        why.contains("differ at ''"),
+        "a root-level difference is RFC 6901's empty pointer: {why}"
+    );
+    assert!(world.lock().unwrap().is_empty());
+}
+
 /// A tool result cannot reach a mutating sink.
 #[tokio::test]
 async fn tool_output_cannot_reach_a_mutating_sink() {

@@ -126,6 +126,94 @@ enum Verb {
     Drill(DrillArgs),
     /// Retire admission keys older than a window you choose.
     ForgetAdmissions(ForgetArgs),
+    /// List the closed cases a retention pass would erase.
+    Retain(RetainArgs),
+    /// Throw or lift the emergency stop, and say what it covers.
+    Halt(HaltArgs),
+    /// List every emergency stop standing on a tenant.
+    Halts(HaltsArgs),
+}
+
+/// Retention, as a verb, for the tier that is a manifest and this binary.
+///
+/// `--older-than-days` is **required and has no default**, for the reason
+/// [`ForgetArgs`]'s window is: a retention period is a legal and business
+/// decision, and a crate that picked one would be choosing somebody else's.
+///
+/// `--reason` is required too. It lands on every tombstone and on each key
+/// destruction, so a later read says *expired, on this date, for this reason*
+/// rather than *missing* — which is the distinction the recovery drill's
+/// three-way verdict is built on.
+#[derive(clap::Args, Debug)]
+struct RetainArgs {
+    /// The store holding the case layer.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: String,
+
+    /// Which tenant's cases. Blob addresses and key scopes derive from it, so a
+    /// pass under the wrong one erases nothing and says it erased nothing.
+    #[arg(long, env = "AGENTPLANE_TENANT")]
+    tenant: Option<String>,
+
+    /// Erase closed cases opened longer ago than this, in days. Required.
+    #[arg(long)]
+    older_than_days: u32,
+
+    /// Why, recorded on every tombstone. Required.
+    #[arg(long)]
+    reason: String,
+
+    /// List what a pass would erase. Required: this binary wires no blob
+    /// store and no key ring, so listing is the only half it can perform.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+/// The emergency stop, as a verb: an incident is the worst time to discover
+/// that the brake needs a compiler.
+///
+/// `--reason` is required to halt and refused to lift. The next person to look
+/// will be somebody else, possibly at three in the morning, and *why* is the
+/// whole question — while a lift needs no justification because it restores the
+/// default.
+#[derive(clap::Args, Debug)]
+struct HaltArgs {
+    /// The store holding the halt.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: String,
+
+    /// Which tenant to stop. Defaults to the single-tenant plane's tenant.
+    #[arg(long, env = "AGENTPLANE_TENANT")]
+    tenant: Option<String>,
+
+    /// What to stop: `tenant`, `agent:<metadata.name>`, or
+    /// `revision:<manifest digest>`.
+    ///
+    /// `revision:` is the one to reach for when a bad deploy is the incident:
+    /// it names the exact reviewed bytes, so a fix published as a new version
+    /// runs while the broken revision stays stopped.
+    #[arg(long, default_value = "tenant")]
+    scope: String,
+
+    /// Why. Required unless `--lift`.
+    #[arg(long)]
+    reason: Option<String>,
+
+    /// Lift this halt instead of setting it.
+    #[arg(long, conflicts_with = "reason")]
+    lift: bool,
+}
+
+/// What is stopped right now — the question a per-scope lookup cannot answer.
+#[derive(clap::Args, Debug)]
+struct HaltsArgs {
+    /// The store holding the halts.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: String,
+
+    /// Which tenant to read. Defaults to the single-tenant plane's tenant.
+    #[arg(long, env = "AGENTPLANE_TENANT")]
+    tenant: Option<String>,
 }
 
 /// Retention for the admission index, as a verb.
@@ -436,6 +524,23 @@ struct ServeArgs {
     #[arg(long, value_name = "SECS", env = "AGENTPLANE_SWEEP_EVERY")]
     sweep_every: Option<u32>,
 
+    /// How often the recovery drill runs, in seconds. Off unless you say.
+    ///
+    /// `Runtime::drill` walks every case and holds its blob and sealed-state
+    /// references against the live stores, telling *intact* from *erased by
+    /// design* from *lost*. Nothing invoked it on a schedule, and a control
+    /// that exists and is never exercised is one an audit cannot count — the
+    /// rehearsal was left as something an operator would arrange, and the
+    /// deployments that most need it are the ones that write no Rust.
+    ///
+    /// **Off by default, deliberately.** A drill is a full walk of the case
+    /// layer, so its cost grows with the case layer and this crate does not
+    /// know how large yours is or when your quiet hour is. Daily (`86400`) is
+    /// the shape most deployments want; a finding is logged at `error` with
+    /// the report attached, which is what an alert rule keys on.
+    #[arg(long, value_name = "SECS", env = "AGENTPLANE_DRILL_EVERY")]
+    drill_every: Option<u32>,
+
     /// Permit A2A push notifications to this exact host. Repeatable.
     ///
     /// Without one, push is not wired and the Agent Card advertises it as
@@ -666,6 +771,148 @@ fn forget_admissions_verb(opts: &ForgetArgs) -> Result<ExitCode, String> {
     })
 }
 
+/// Plan a retention pass, and refuse to pretend to run one.
+///
+/// This binary wires **no blob store and no key ring** — a redb file is a
+/// journal and a case layer, not a bucket and not a KMS — so nothing here can
+/// make a byte unreadable. A verb that walked the cases, erased nothing, and
+/// printed `erased: 0` beside a clean exit code would be the shape this project
+/// refuses hardest: a control that reads as having run. So the verb answers the
+/// half it can — *what a pass would erase* — through the same selection rule
+/// `Runtime::retain` uses, and refuses the other half by name.
+fn retain_verb(opts: &RetainArgs) -> Result<ExitCode, String> {
+    if !opts.dry_run {
+        return Err(concat!(
+            "this binary wires no blob store and no key ring, so it cannot erase anything; ",
+            "it can only say what a pass would erase. Run again with --dry-run, or call ",
+            "`Runtime::retain` from a plane built with `.blobs(..)` and `.keyring(..)`"
+        )
+        .to_owned());
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    rt.block_on(async {
+        let redb = RedbStore::open(&opts.store).map_err(|e| e.to_string())?;
+        let redb = match opts.tenant.as_deref() {
+            Some(name) => redb.for_tenant(
+                agentplane::core::TenantId::new(name).map_err(|e| format!("--tenant: {e}"))?,
+            ),
+            None => redb,
+        };
+        let cases: Arc<dyn agentplane::case::CaseStore> = Arc::new(redb);
+
+        // Wall clock by design, like the sweeper's: a retention window is a
+        // question about how long ago a matter opened, not a journaled
+        // observation of a run.
+        #[allow(clippy::disallowed_methods)]
+        let now = time::OffsetDateTime::now_utc();
+        let cutoff = now - std::time::Duration::from_secs(u64::from(opts.older_than_days) * 86_400);
+        let plan = agentplane::retention::plan(cases.as_ref(), cutoff)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": true,
+                "reason": opts.reason,
+                "cutoff": cutoff.unix_timestamp(),
+                "scanned": plan.scanned,
+                "would_erase": plan.due,
+            }))
+            .map_err(|e| e.to_string())?
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// Throw or lift one emergency stop.
+///
+/// Prints what it did, because an operator who cannot see the switch move has
+/// not been told whether they threw it.
+fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, String> {
+    let scope = agentplane::quota::HaltScope::parse(&opts.scope).ok_or_else(|| {
+        format!(
+            "'{}' is not a scope: use 'tenant', 'agent:<metadata.name>', {}",
+            opts.scope, "or 'revision:<manifest digest>'"
+        )
+    })?;
+    if !opts.lift && opts.reason.is_none() {
+        return Err(concat!(
+            "--reason is required to halt: the next person to look will be somebody else, ",
+            "possibly at three in the morning, and why is the whole question. ",
+            "Use --lift to clear a halt"
+        )
+        .to_owned());
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    rt.block_on(async {
+        let quotas = quota_store_at(&opts.store, opts.tenant.as_deref())?;
+        quotas
+            .set_halt(&scope, opts.reason.as_deref())
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "scope": scope.key(),
+                "halted": !opts.lift,
+                "reason": opts.reason,
+            })
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// Every standing halt, so an operator can see what an incident left behind.
+fn halts_verb(opts: &HaltsArgs) -> Result<ExitCode, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    rt.block_on(async {
+        let quotas = quota_store_at(&opts.store, opts.tenant.as_deref())?;
+        let halts = quotas.halts().await.map_err(|e| e.to_string())?;
+        let rows: Vec<serde_json::Value> = halts
+            .iter()
+            .map(|h| serde_json::json!({ "scope": h.scope.key(), "reason": h.reason }))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "halts": rows }))
+                .map_err(|e| e.to_string())?
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// The quota store behind a file, scoped to the tenant an operator named.
+///
+/// Scoping is not optional decoration: a halt written against the default
+/// tenant while the plane runs as `acme` is a switch that reads back correctly
+/// and stops nothing.
+fn quota_store_at(
+    path: &str,
+    tenant: Option<&str>,
+) -> Result<Arc<dyn agentplane::quota::QuotaStore>, String> {
+    let store = RedbStore::open(path).map_err(|e| e.to_string())?;
+    let store = match tenant {
+        Some(name) => store.for_tenant(
+            agentplane::core::TenantId::new(name).map_err(|e| format!("--tenant: {e}"))?,
+        ),
+        None => store,
+    };
+    Ok(Arc::new(store))
+}
+
 /// Read and validate the manifests, for every verb.
 ///
 /// A manifest that does not validate is not a thing to run, digest, or reason
@@ -720,6 +967,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Verb::Export(a) => journal_verb(&a, None),
         Verb::Drill(a) => drill_verb(&a),
         Verb::ForgetAdmissions(a) => forget_admissions_verb(&a),
+        Verb::Retain(a) => retain_verb(&a),
+        Verb::Halt(a) => halt_verb(&a),
+        Verb::Halts(a) => halts_verb(&a),
         Verb::Restore(a) => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1027,6 +1277,7 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
         }
 
         spawn_sweeper(&runtime, opts.sweep_every.unwrap_or(DEFAULT_SWEEP_SECONDS));
+        spawn_drill(&runtime, opts.drill_every.unwrap_or(0));
 
         if let Some(operator_addr) = opts.operator_addr.as_deref() {
             spawn_operator_surface(&runtime, operator_auth, operator_addr).await?;
@@ -1046,6 +1297,52 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
             .map_err(|e| format!("the server stopped: {e}"))?;
         Ok(ExitCode::SUCCESS)
     })
+}
+
+/// Rehearse recovery on a timer, because a control nobody exercises is one an
+/// audit cannot count.
+///
+/// The three-way verdict — *intact*, *erased by design*, *lost* — is the whole
+/// value: an erasure that worked and a byte that went missing look identical
+/// to a store, and telling them apart is what a rehearsal establishes.
+///
+/// A finding is an `error` with the report attached, not a panic: a drill
+/// reports on the past and stopping a serving plane because yesterday's bytes
+/// are gone helps nobody. `not_checked` is logged whenever it is non-empty,
+/// because the difference between *sound* and *nothing I looked at was wrong*
+/// is exactly that list — the same reason the report carries it at all.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+fn spawn_drill(runtime: &Arc<Runtime>, every: u32) {
+    if every == 0 {
+        return;
+    }
+    if runtime.cases().is_none() {
+        eprintln!(
+            "  drill: --drill-every was given but this plane has no case store, \
+             so there are no cases to walk"
+        );
+        return;
+    }
+    let plane = Arc::clone(runtime);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(u64::from(every)));
+        loop {
+            tick.tick().await;
+            match plane.drill().await {
+                Ok(report) if !report.is_sound() => {
+                    tracing::error!(?report, "the recovery drill found unrecoverable references");
+                }
+                Ok(report) if !report.not_checked.is_empty() => {
+                    tracing::warn!(
+                        ?report,
+                        "the recovery drill passed, but could not check everything"
+                    );
+                }
+                Ok(report) => tracing::info!(cases = report.cases, "the recovery drill passed"),
+                Err(error) => tracing::error!(%error, "the recovery drill could not run"),
+            }
+        }
+    });
 }
 
 /// Sweep on a clock, because nothing else will.
@@ -1255,8 +1552,6 @@ async fn connect_mcp_servers(
     specs: &[String],
     manifests: &[Manifest],
 ) -> Result<Vec<(String, Arc<dyn agentplane::tools::ToolClient>)>, String> {
-    use rmcp::ServiceExt as _;
-
     let mut wired = Vec::with_capacity(specs.len());
     for spec in specs {
         let (name, command) = spec.split_once('=').ok_or_else(|| {
@@ -1277,15 +1572,18 @@ async fn connect_mcp_servers(
         process.args(parts);
         let transport = rmcp::transport::TokioChildProcess::new(process)
             .map_err(|e| format!("could not start the MCP server `{name}` (`{command}`): {e}"))?;
-        // `host_info` is the crate's own client declaration — it negotiates
-        // Tasks and deliberately omits elicitation, sampling, roots and
-        // subscriptions, none of which has a governed runtime callback path.
-        let service = agentplane::tools::McpClient::host_info()
-            .serve(transport)
-            .await
-            .map_err(|e| format!("the MCP server `{name}` did not initialise: {e}"))?;
-        let client = agentplane::tools::McpClient::new(name, Arc::new(service))
-            .map_err(|e| format!("the MCP server `{name}` cannot be used: {e}"))?;
+        // A child process over stdio: this plane opens no socket for it, so
+        // there is no host for an egress allowlist to judge. That is not a
+        // claim about what the server itself reaches — the same residual a
+        // compromised allowlisted endpoint carries — and it is the honest
+        // answer to the only question an allowlist can decide.
+        let client = agentplane::tools::McpClient::connect(
+            name,
+            transport,
+            agentplane::tools::Destination::Local,
+        )
+        .await
+        .map_err(|e| format!("the MCP server `{name}` cannot be used: {e}"))?;
         // The negotiated version, not the offered one. MCP negotiation is a
         // designed downgrade, and a server that answered with an older version
         // still serves `tools/call` — it simply never returns a task, so a

@@ -135,6 +135,18 @@ pub mod code {
     /// would hand an unauthenticated prober the tenant's ceilings. The message
     /// beside this code is a fixed sentence with no numbers in it.
     pub const QUOTA_EXHAUSTED: i32 = -32029;
+
+    /// This agent is halted by its operator.
+    ///
+    /// Its own code, beside [`QUOTA_EXHAUSTED`] and
+    /// under the same identification rule — the `(domain, reason)` pair, never
+    /// the numeral — because the two ask opposite things of a caller. A ceiling
+    /// says *come back*; a halt says *somebody is dealing with an incident*,
+    /// and a peer told to back off and retry keeps knocking on the one door
+    /// that means stop. The message is fixed and carries none of the
+    /// operator's reason: the counterparty gets the outcome, not the plane's
+    /// internals.
+    pub const HALTED: i32 = -32030;
 }
 
 /// Actions this surface asks the policy engine about.
@@ -171,6 +183,23 @@ const VERSION_HEADER: &str = "a2a-version";
 /// digit-free; the test on this path asserts exactly that.
 const QUOTA_EXHAUSTED_MESSAGE: &str =
     "this agent cannot take the request on right now; retry later";
+
+/// The one sentence a halt answers with, beside [`code::HALTED`]. No reason,
+/// no scope: an incident's description is for the operator's own worklist.
+const HALTED_MESSAGE: &str =
+    "this agent is halted by its operator; do not retry until it is lifted";
+
+/// Which of the two admission refusals a quota error is, on the wire.
+///
+/// One function for the three admission sites, because a halt that reached one
+/// of them as a ceiling would be the sibling-divergence shape: a peer told
+/// *retry* by `message/send` and *stop* by `message/stream`.
+fn quota_refusal(e: &crate::quota::QuotaError) -> RpcError {
+    match e {
+        crate::quota::QuotaError::Halted { .. } => RpcError::new(code::HALTED, HALTED_MESSAGE),
+        _ => RpcError::new(code::QUOTA_EXHAUSTED, QUOTA_EXHAUSTED_MESSAGE),
+    }
+}
 
 /// A task's lifecycle state, as A2A names them.
 ///
@@ -837,6 +866,7 @@ impl RpcError {
         const A2A: &str = "a2a-protocol.org";
         const SELF_DOMAIN: &str = crate::peers::ERROR_DOMAIN;
         const QUOTA_EXHAUSTED_REASON: &str = crate::peers::QUOTA_EXHAUSTED_REASON;
+        const HALTED_REASON: &str = crate::peers::HALTED_REASON;
         match self.code {
             code::TASK_NOT_FOUND => Some((A2A, "TASK_NOT_FOUND")),
             code::TASK_NOT_CANCELABLE => Some((A2A, "TASK_NOT_CANCELABLE")),
@@ -846,6 +876,7 @@ impl RpcError {
             code::EXTENDED_CARD_NOT_CONFIGURED => Some((A2A, "EXTENDED_AGENT_CARD_NOT_CONFIGURED")),
             code::VERSION_NOT_SUPPORTED => Some((A2A, "VERSION_NOT_SUPPORTED")),
             code::QUOTA_EXHAUSTED => Some((SELF_DOMAIN, QUOTA_EXHAUSTED_REASON)),
+            code::HALTED => Some((SELF_DOMAIN, HALTED_REASON)),
             _ => None,
         }
     }
@@ -1721,11 +1752,8 @@ async fn stream_method(
                         "this agent declined the request",
                     ));
                 }
-                Err(crate::core::RuntimeError::QuotaExceeded(_)) => {
-                    return Err(RpcError::new(
-                        code::QUOTA_EXHAUSTED,
-                        QUOTA_EXHAUSTED_MESSAGE,
-                    ));
+                Err(crate::core::RuntimeError::QuotaExceeded(e)) => {
+                    return Err(quota_refusal(&e));
                 }
                 Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
             }
@@ -2098,10 +2126,7 @@ async fn send_message(
                 crate::core::RuntimeError::PolicyDenied(_)
                 | crate::core::RuntimeError::Delegation(_),
             ) => Ok(json!({ "message": declined(&skill) })),
-            Err(crate::core::RuntimeError::QuotaExceeded(_)) => Err(RpcError::new(
-                code::QUOTA_EXHAUSTED,
-                QUOTA_EXHAUSTED_MESSAGE,
-            )),
+            Err(crate::core::RuntimeError::QuotaExceeded(e)) => Err(quota_refusal(&e)),
             Err(crate::core::RuntimeError::PlanContract(why)) if message.context_id.is_some() => {
                 Err(RpcError::new(code::TASK_NOT_FOUND, why))
             }
@@ -2130,11 +2155,8 @@ async fn send_message(
         // ceiling means and what a caller should back off from. The code and
         // message are fixed — see `code::QUOTA_EXHAUSTED` for why neither is
         // the spec's `-32004` and why the quota arithmetic stays out of it.
-        Err(crate::core::RuntimeError::QuotaExceeded(_)) => {
-            return Err(RpcError::new(
-                code::QUOTA_EXHAUSTED,
-                QUOTA_EXHAUSTED_MESSAGE,
-            ));
+        Err(crate::core::RuntimeError::QuotaExceeded(e)) => {
+            return Err(quota_refusal(&e));
         }
         Err(crate::core::RuntimeError::PlanContract(why)) if message.context_id.is_some() => {
             return Err(RpcError::new(code::TASK_NOT_FOUND, why));

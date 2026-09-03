@@ -329,8 +329,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/ctx.rs",
         "a_sink_cannot_check_one_argument_value_and_send_another",
         "a sink validates one labelled value and dispatches different arguments",
-        "        if canon::value_bytes(bound) != canon::value_bytes(args.peek()) {",
-        "        if false && canon::value_bytes(bound) != canon::value_bytes(args.peek()) {",
+        "        if bound_bytes != sent_bytes {",
+        "        if false && bound_bytes != sent_bytes {",
     ),
     "ModelPromptIsNotASinkArgument": (
         "src/model/mod.rs",
@@ -1047,10 +1047,10 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "case's own unit address, so the tombstones land where nothing was "
         "written — the erasure reports success and this case's copies stay "
         "readable",
-        """        blobs
-            .expire(unit_address(&scope, digest), at, reason)
-            .await?;""",
-        """        blobs.expire(digest, at, reason).await?;""",
+        """            blobs
+                .expire(unit_address(&scope, digest), at, reason)
+                .await?;""",
+        """            blobs.expire(digest, at, reason).await?;""",
     ),
     "TheDrillReadsBesideTheDeployment": (
         "src/drill.rs",
@@ -1702,39 +1702,42 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a manifest is signed over its bare digest, so a signature made in any "
         "other context over the same digest — a record attestation — is accepted "
         "as approval of the manifest",
-        "        let attestation = signer.attest(&signing_hash(DOMAIN_MANIFEST, &digest));",
-        "        let attestation = signer.attest(&digest);",
+        """    Ok((
+        digest,
+        signer.attest(&signing_hash(DOMAIN_MANIFEST, &digest)),
+    ))""",
+        """    Ok((digest, signer.attest(&digest)))""",
     ),
     "AnUnsignedManifestPassesAVerifyingResolve": (
         "src/manifest/registry.rs",
         "a_signed_manifest_names_who_published_it",
         "a resolve that required a signature accepts a manifest nobody signed, "
         "so 'who published this' has no answer and nothing says so",
-        """        let Some(a) = attestation else {
-            return Err(RegistryError::Unsigned {
-                name: name.to_owned(),
-                version: version.to_owned(),
-            });
-        };""",
-        """        let Some(a) = attestation else {
-            return Ok((manifest, String::from("unverified")));
-        };""",
+        """    let Some(a) = attestation else {
+        return Err(RegistryError::Unsigned {
+            name: name.to_owned(),
+            version: version.to_owned(),
+        });
+    };""",
+        """    let Some(a) = attestation else {
+        return Ok(String::from("unverified"));
+    };""",
     ),
     "SigningAnExistingManifestRecordsNothing": (
         "src/manifest/registry.rs",
         "signing_an_existing_unsigned_manifest_records_the_publisher",
         "publish_signed reports success for an existing unsigned artifact but "
         "does not record the publisher, so every verifying resolve still says unsigned",
-        "                    (None, Some(signed)) => existing.attestation = Some(signed),",
-        "                    (None, Some(_)) => {},",
+        "        (None, Some(_)) => Ok(PublishVerdict::AdoptAttestation),",
+        "        (None, Some(_)) => Ok(PublishVerdict::Unchanged),",
     ),
     "AManifestPublisherCanBeReassigned": (
         "src/manifest/registry.rs",
         "republishing_with_another_signer_cannot_reassign_the_publisher",
         "identical artifact bytes can be republished by another identity without a refusal, "
         "so publication reports success while changing who approved the version",
-        "                    (Some(recorded), Some(offered)) if recorded.key_id != offered.key_id => {",
-        "                    (Some(recorded), Some(offered)) if false && recorded.key_id != offered.key_id => {",
+        "        (Some(recorded), Some(offered)) if recorded.key_id != offered.key_id => {",
+        "        (Some(recorded), Some(offered)) if false && recorded.key_id != offered.key_id => {",
     ),
     "OversightMayBeDeclaredWhereNothingAppliesIt": (
         "src/manifest/mod.rs",
@@ -2163,14 +2166,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a published manifest version is overwritten rather than refused, so a "
         "widened tool grant reaches every consumer that pinned the version they "
         "reviewed",
-        """            Some(existing) => Err(RegistryError::Immutable {
-                name,
-                version,
-                existing: existing.digest.to_hex(),
-                offered: digest.to_hex(),
-            }),
-            None => {""",
-        """            _ => {""",
+        "    if existing != offered {",
+        "    if false {",
     ),
     "APinnedResolveAcceptsAnything": (
         "src/manifest/registry.rs",
@@ -3900,8 +3897,17 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the emergency stop is checked after the no-ceilings shortcut, so a "
         "tenant with no quotas configured cannot be halted at all — which is "
         "the tenant an operator is most likely to need to stop",
-        "        match quotas.halted().await {",
-        "        if self.quota.is_unlimited() {\n            return Ok(pass);\n        }\n        match quotas.halted().await {",
+        "        match quotas.halts().await {",
+        "        if self.quota.is_unlimited() {\n            return Ok(pass);\n        }\n        match quotas.halts().await {",
+    ),
+    "APreviewIsNeverComputed": (
+        "src/runtime/declarative.rs",
+        "a_declared_preview_shows_the_reviewer_what_the_call_will_touch",
+        "a grant naming a dry run opens its approval task without one, so a "
+        "reviewer approves the instruction while the file says they were shown "
+        "its consequences",
+        "                    let mut task = spec.approve_call(&reference, &asked.arguments);",
+        "                    #[allow(unused_mut)]\n                    let mut task = spec.approve_call(&reference, &asked.arguments);\n                    let grant = &crate::manifest::ToolGrant { preview: None, ..grant.clone() };",
     ),
     "AHighImpactCallSkipsItsApproval": (
         "src/runtime/declarative.rs",
@@ -4015,14 +4021,141 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if tool.server != self.server {",
         "        if false && tool.server != self.server {",
     ),
+    "APlaneCeilingDoesNotBoundWhatIsWrittenDown": (
+        "src/runtime/ctx.rs",
+        "a_plane_without_a_manifest_can_bound_what_it_writes_down",
+        "a plane's own journal ceiling is ignored, so a plane of hand-written "
+        "skills cannot bound what enters an append-only chain and the default "
+        "stays the unerasable one",
+        "        let journal_ceiling = match (self.journal_ceiling, declared) {",
+        "        let journal_ceiling = match (None, declared) {",
+    ),
+    "AnAnnotationNameIsUnchecked": (
+        "src/manifest/mod.rs",
+        "annotation_keys_follow_the_kubernetes_grammar",
+        "an annotation name of any length or charset is accepted, so an entry "
+        "the manifest reviewed cannot be carried into a Kubernetes object and "
+        "the grammar the docs promise is prose",
+        "            if !is_annotation_name(name) {",
+        "            if false {",
+    ),
+    "AnnotationsAreUnbounded": (
+        "src/manifest/mod.rs",
+        "annotations_are_capped_in_total_size",
+        "a manifest may carry a document as an annotation, so the digest, the "
+        "registry row and every copy of the reviewed file carry it too",
+        "        if total > MAX_ANNOTATIONS_BYTES {",
+        "        if false {",
+    ),
+    "AnMcpClientStartsWithTheLegacyHandshake": (
+        "src/tools/mcp.rs",
+        "the_negotiated_protocol_version_is_pinned_to_2026_07_28",
+        "the client opens every MCP server with the initialize handshake, which "
+        "2026-07-28 replaced with server/discover, so every connection negotiates "
+        "down to a legacy dialect and the tasks extension silently never appears",
+        """                ClientLifecycleMode::Auto {
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                    legacy_version: Some(ProtocolVersion::V_2025_11_25),
+                },""",
+        """                ClientLifecycleMode::Initialize,""",
+    ),
+    "ARefusedBatchAdmissionIsRecordedAsFailed": (
+        "src/runtime/batch.rs",
+        "a_halt_mid_batch_stops_the_pass_without_failing_the_items",
+        "an admission the plane refused — a halt, a ceiling, a store outage — "
+        "is written over the item as a terminal Failed, so when the halt lifts "
+        "every item behind it stays failed forever",
+        "        let out = outcome?;",
+        "        let out = match outcome {\n            Ok(out) => out,\n            Err(e) => {\n                let result = ItemOutcome::Failed(e.to_string());\n                store.record(id, &item.key, &result, Spend::default()).await.map_err(RuntimeError::from_store)?;\n                return Ok(result);\n            }\n        };",
+    ),
+    "AHaltWearsTheBackPressureCode": (
+        "src/api/a2a.rs",
+        "a_halted_agent_is_not_back_pressure",
+        "a halted agent answers a peer with QUOTA_EXHAUSTED, so every compliant "
+        "peer backs off and retries the one refusal that means stop",
+        "        crate::quota::QuotaError::Halted { .. } => RpcError::new(code::HALTED, HALTED_MESSAGE),",
+        "        crate::quota::QuotaError::Halted { .. } => RpcError::new(code::QUOTA_EXHAUSTED, QUOTA_EXHAUSTED_MESSAGE),",
+    ),
+    "APeersHaltIsAnUnknownFault": (
+        "src/peers/a2a.rs",
+        "a_peers_halt_is_a_refusal_that_says_do_not_retry",
+        "the client does not recognise a peer's marked halt, so it falls to the "
+        "unknown-fault arm as InDoubt — a clean pre-admission refusal reported "
+        "as a peer that may have acted",
+        "        -32030 if e.names_reason(super::ERROR_DOMAIN, super::HALTED_REASON) => PeerError::Refused {",
+        "        -32030 if false && e.names_reason(super::ERROR_DOMAIN, super::HALTED_REASON) => PeerError::Refused {",
+    ),
+    "RetentionSkipsASealedCaseWithNoBlobStore": (
+        "src/retention.rs",
+        "retention_without_a_blob_store_still_destroys_the_case_key",
+        "a retention pass returns before erasing anything when no blob store is "
+        "wired, so a plane that seals its journal and stores no blobs never has "
+        "a key destroyed — the one act that reaches every copy, skipped for want "
+        "of a lesser one",
+        "    if stores.blobs.is_none() {",
+        "    if stores.blobs.is_none() {\n        return Ok(finish(report));\n    }\n    if false {",
+    ),
+    "APreviewIsUnbounded": (
+        "src/runtime/declarative.rs",
+        "a_preview_larger_than_the_bound_is_truncated_and_says_so",
+        "a preview's whole answer is copied into the reviewer's evidence, so a "
+        "dry run listing four thousand records produces a worklist row nobody "
+        "can open",
+        "    if rendered.len() <= PREVIEW_EVIDENCE_BYTES {",
+        "    if true {",
+    ),
+    "RetentionErasesALiveCase": (
+        "src/retention.rs",
+        "retention_erases_closed_cases_past_the_window_and_nothing_else",
+        "a retention pass erases matters that are still open or still inside "
+        "their window, so retention becomes an outage and data goes early",
+        "            if case.status == CaseStatus::Closed && case.opened_at < older_than {",
+        "            if true {",
+    ),
+    "APostgresPublishRacesWithoutALock": (
+        "src/store/postgres_registry.rs",
+        "postgres_refuses_the_loser_of_a_concurrent_publish",
+        "the registry reads and decides without serialising on the key, so two "
+        "publishes of different content both find no row and the primary key "
+        "conflict — not the immutability rule — decides who wins, wearing a "
+        "backend fault's type",
+        """        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext($1 || E'\\\\x1f' || $2 || E'\\\\x1f' || $3))",
+            &[&tenant, &name, &version],
+        )
+        .await
+        .map_err(|e| be(&e))?;""",
+        """        let _ = (&tenant, &name, &version);""",
+    ),
+    "ACedarDenialNamesANumberNotTheRule": (
+        "src/policy/cedar.rs",
+        "a_named_rule_is_named_in_the_denial_rather_than_numbered",
+        "a Cedar denial reports the generated policy id instead of the rule's "
+        "@id, so forty rules produce forty reasons that each name a number and "
+        "the required reason answers nothing",
+        """        self.policies
+            .annotation(id, RULE_NAME_ANNOTATION)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| id.to_string(), ToOwned::to_owned)""",
+        """        id.to_string()""",
+    ),
+    "AToolTransportReachesAnUngrantedHost": (
+        "src/tools/mod.rs",
+        "a_tool_transport_reaching_an_ungranted_host_is_refused",
+        "the plane's egress allowlist is not applied to the tool path, so the "
+        "most-used outbound path is the one destination control does not reach",
+        "        if let Some(egress) = egress",
+        "        if let Some(egress) = None::<&crate::core::Egress>",
+    ),
     "TheRouterIgnoresTheServer": (
         "src/tools/mod.rs",
         "a_router_sends_each_server_to_its_own_transport",
         "the router hands every tool id to whichever transport it holds first, "
         "so the server component that exists to tell two servers' identically "
         "named tools apart decides nothing",
-        "        let Some(client) = self.routes.get(&tool.server) else {",
-        "        let Some(client) = self.routes.values().next() else {",
+        "    fn route(&self, tool: &ToolId) -> Option<&Arc<dyn ToolClient>> {\n        self.routes.get(&tool.server)\n    }",
+        "    fn route(&self, tool: &ToolId) -> Option<&Arc<dyn ToolClient>> {\n        let _ = tool;\n        self.routes.values().next()\n    }",
     ),
     "TwoCataloguesSilentlyMerge": (
         "src/runtime/executor.rs",
@@ -4717,8 +4850,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_refused_run_writes_nothing",
         "admission never consults the tenant's ceiling, so a caller that can "
         "start runs can start a thousand of them, each within its own budget",
-        "        let quota = match self.check_quota(run, now_for_admission()).await {",
-        "        let quota = match Ok(QuotaPass::disabled()) {",
+        "        let quota = match self\n            .check_quota(run, governed_by.as_ref(), now_for_admission())\n            .await\n        {",
+        "        let quota = match Ok::<_, RuntimeError>(QuotaPass::disabled()) {",
     ),
     "AFinishedRunKeepsItsSlot": (
         "src/runtime/executor.rs",

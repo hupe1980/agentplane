@@ -384,6 +384,78 @@ async fn back_pressure_is_identified_by_its_error_info_not_its_numeral() {
     );
 }
 
+/// A peer's halt is a refusal that says *do not retry* — and only its pair
+/// says so.
+///
+/// Same disposition as a ceiling (nothing was performed) with the opposite
+/// advice, which is the whole reason it is a second code: a caller that backs
+/// off and comes back is doing exactly what the operator pulling the switch is
+/// trying to stop. A bare `-32030` from a foreign server proves nothing and
+/// stays an unknown fault.
+#[tokio::test]
+async fn a_peers_halt_is_a_refusal_that_says_do_not_retry() {
+    let marked = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+            "code": -32030,
+            "message": "this agent is halted by its operator; do not retry until it is lifted",
+            "data": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "domain": "agentplane.hupe1980.github.io",
+                "reason": "HALTED",
+            }],
+        }
+    });
+    let (c, _) = canned(200, marked);
+    let url = serve(c).await;
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
+    let err = client
+        .send(
+            &PeerId::new("peer"),
+            "audit.check",
+            &json!({}),
+            &chain(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.disposition(), Disposition::DidNotHappen, "{err}");
+    match &err {
+        PeerError::Refused { detail, .. } => assert!(
+            detail.contains("halted") && detail.contains("do not retry"),
+            "the advice must be the opposite of back-pressure: {detail}"
+        ),
+        other => panic!("a marked halt is a refusal: {other}"),
+    }
+
+    let bare = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": { "code": -32030, "message": "server error" }
+    });
+    let (c, _) = canned(200, bare);
+    let url = serve(c).await;
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
+    let err = client
+        .send(
+            &PeerId::new("peer"),
+            "audit.check",
+            &json!({}),
+            &chain(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.disposition(),
+        Disposition::InDoubt,
+        "a foreign server's bare -32030 is an unknown fault: {err}"
+    );
+}
+
 /// An internal error is **not** a refusal.
 ///
 /// The expensive row in the table. `-32603` can be raised after the peer has

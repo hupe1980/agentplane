@@ -20,6 +20,8 @@ mod postgres_memory;
 mod postgres_push;
 #[cfg(feature = "postgres")]
 mod postgres_quota;
+#[cfg(all(feature = "postgres", feature = "manifest"))]
+mod postgres_registry;
 #[cfg(feature = "redb")]
 mod redb;
 #[cfg(feature = "redb")]
@@ -36,6 +38,8 @@ mod redb_memory;
 mod redb_push;
 #[cfg(feature = "redb")]
 mod redb_quota;
+#[cfg(all(feature = "redb", feature = "manifest"))]
+mod redb_registry;
 #[cfg(feature = "redb")]
 mod redb_tasks;
 #[cfg(feature = "redb")]

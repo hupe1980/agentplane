@@ -418,6 +418,53 @@ impl ToolError {
     }
 }
 
+/// Where a [`ToolClient`] sends a call.
+///
+/// # Why a transport has to say this
+///
+/// [`Egress`](crate::core::Egress) does set membership on a **host**, and
+/// every other outbound path hands it one — a model driver parses its base
+/// URL, a peer client its card URL. A tool grant is `tool://server/name`,
+/// which names a catalogue entry and not a destination, so a client cannot be
+/// asked to parse a URL it may not have: it declares the answer, and the
+/// declaration is what the allowlist judges.
+///
+/// # What each answer means, and what it does not claim
+///
+/// [`Local`](Self::Local) says *this client opens no network connection from
+/// this plane*: tools compiled into the binary, an MCP server run as a child
+/// process over stdio, a test double. It is **not** a claim that the far side
+/// reaches nothing — a child process can open its own socket, and that is the
+/// same residual as a compromised allowlisted endpoint. What it claims is that
+/// no host of this plane's choosing is being contacted, which is the question
+/// an allowlist can answer.
+///
+/// [`Remote`](Self::Remote) names the host. Deny-by-default applies to it once
+/// an [`Egress`](crate::core::Egress) is wired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destination {
+    /// Opens no network connection from this plane.
+    Local,
+    /// Connects to this host.
+    Remote(String),
+}
+
+impl Destination {
+    /// Name the host this client connects to.
+    pub fn remote(host: impl Into<String>) -> Self {
+        Self::Remote(host.into())
+    }
+
+    /// The host an allowlist judges, or `None` for a local transport.
+    #[must_use]
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Remote(host) => Some(host),
+        }
+    }
+}
+
 /// Transports a tool call. Implemented by the MCP adapter, or by anything else.
 #[async_trait]
 pub trait ToolClient: Send + Sync + Debug {
@@ -439,6 +486,25 @@ pub trait ToolClient: Send + Sync + Debug {
         arguments: &Value,
         provenance: Option<&crate::core::Provenance>,
     ) -> Result<Value, ToolError>;
+
+    /// Where this client sends *this* call, for the plane's egress allowlist.
+    ///
+    /// Per tool rather than per client, because [`ToolRouter`] is itself a
+    /// `ToolClient` fanning out to one transport per server: a single answer
+    /// for the whole router would have to be the union of its routes, and a
+    /// union is exactly the wildcard `Egress` refuses to have.
+    ///
+    /// **No default, deliberately**, for the reason
+    /// [`JournalStore::is_shared`](crate::journal::JournalStore::is_shared)
+    /// has none: a default of [`Destination::Local`] would let a remote
+    /// transport answer *reaches nobody* by saying nothing, and the runtime
+    /// uses this answer to refuse a destination the deployment never granted —
+    /// and a control that fails open when an implementer forgets is not a
+    /// control.
+    ///
+    /// Answered cheaply — it is read before every dispatch, so a client that
+    /// resolved DNS here would put a lookup in the hot path.
+    fn destination(&self, tool: &ToolId) -> Destination;
 }
 
 /// The tools this plane may call, and what the operator says about each.
@@ -739,6 +805,13 @@ impl ToolRouter {
     }
 }
 
+impl ToolRouter {
+    /// The transport that would carry this call, if one is routed.
+    fn route(&self, tool: &ToolId) -> Option<&Arc<dyn ToolClient>> {
+        self.routes.get(&tool.server)
+    }
+}
+
 #[async_trait]
 impl ToolClient for ToolRouter {
     async fn call(
@@ -747,7 +820,7 @@ impl ToolClient for ToolRouter {
         arguments: &Value,
         provenance: Option<&crate::core::Provenance>,
     ) -> Result<Value, ToolError> {
-        let Some(client) = self.routes.get(&tool.server) else {
+        let Some(client) = self.route(tool) else {
             return Err(ToolError::Unreachable {
                 tool: tool.clone(),
                 detail: format!(
@@ -758,6 +831,18 @@ impl ToolClient for ToolRouter {
             });
         };
         client.call(tool, arguments, provenance).await
+    }
+
+    /// Whatever the routed transport says.
+    ///
+    /// An unrouted server answers [`Destination::Local`] rather than refusing:
+    /// there is no transport, so there is no destination to grant, and the call
+    /// is about to fail as [`ToolError::Unreachable`] with the honest reason.
+    /// Reporting an egress refusal for a server nobody wired would name the
+    /// wrong problem.
+    fn destination(&self, tool: &ToolId) -> Destination {
+        self.route(tool)
+            .map_or(Destination::Local, |client| client.destination(tool))
     }
 }
 
@@ -814,6 +899,7 @@ impl ToolCall {
         client: std::sync::Arc<dyn ToolClient>,
         id: ToolId,
         arguments: Value,
+        egress: Option<&crate::core::Egress>,
     ) -> Result<Self, ToolError> {
         let Some(safety) = catalog.safety(&id) else {
             return Err(ToolError::Unreachable {
@@ -823,6 +909,21 @@ impl ToolCall {
                 tool: id,
             });
         };
+        // Refused **before the effect exists**, so nothing leaves, nothing is
+        // journaled and nothing is metered — the same point in the sequence at
+        // which a model driver refuses an ungranted base URL. A `Local`
+        // transport has no host to grant and is not judged: the allowlist
+        // decides where traffic may go, and this traffic goes nowhere of the
+        // plane's choosing.
+        if let Some(egress) = egress
+            && let Some(host) = client.destination(&id).host().map(ToOwned::to_owned)
+            && let Err(refused) = egress.permits(Some(&host))
+        {
+            return Err(ToolError::Unreachable {
+                detail: format!("the transport for server '{}' reaches {refused}", id.server),
+                tool: id,
+            });
+        }
         Ok(Self {
             safety: safety.clone(),
             id,

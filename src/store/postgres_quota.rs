@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 
 use crate::core::{RunId, Spend, StoreError, Timestamp};
-use crate::quota::{QuotaError, QuotaSettlement, QuotaStore};
+use crate::quota::{Halt, HaltScope, QuotaError, QuotaSettlement, QuotaStore};
 
 use super::postgres::{PostgresStore, amount_of, sql_amount};
 
@@ -143,15 +143,16 @@ impl QuotaStore for PostgresStore {
         })
     }
 
-    async fn set_halt(&self, reason: Option<&str>) -> Result<(), StoreError> {
+    async fn set_halt(&self, scope: &HaltScope, reason: Option<&str>) -> Result<(), StoreError> {
         let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
+        let scope = scope.key();
         match reason {
             Some(reason) => {
                 client
                     .execute(
-                        "INSERT INTO quota_halted (tenant, reason) VALUES ($1, $2)
-                         ON CONFLICT (tenant) DO UPDATE SET reason = EXCLUDED.reason",
-                        &[&self.tenant_name(), &reason],
+                        "INSERT INTO quota_halted (tenant, scope, reason) VALUES ($1, $2, $3)
+                         ON CONFLICT (tenant, scope) DO UPDATE SET reason = EXCLUDED.reason",
+                        &[&self.tenant_name(), &scope, &reason],
                     )
                     .await
                     .map_err(|e| be(&e))?;
@@ -159,8 +160,8 @@ impl QuotaStore for PostgresStore {
             None => {
                 client
                     .execute(
-                        "DELETE FROM quota_halted WHERE tenant = $1",
-                        &[&self.tenant_name()],
+                        "DELETE FROM quota_halted WHERE tenant = $1 AND scope = $2",
+                        &[&self.tenant_name(), &scope],
                     )
                     .await
                     .map_err(|e| be(&e))?;
@@ -169,16 +170,34 @@ impl QuotaStore for PostgresStore {
         Ok(())
     }
 
-    async fn halted(&self) -> Result<Option<String>, StoreError> {
+    async fn halts(&self) -> Result<Vec<Halt>, StoreError> {
         let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
-        let row = client
-            .query_opt(
-                "SELECT reason FROM quota_halted WHERE tenant = $1",
+        let rows = client
+            .query(
+                "SELECT scope, reason FROM quota_halted WHERE tenant = $1 ORDER BY scope",
                 &[&self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
-        Ok(row.map(|row| row.get::<_, String>(0)))
+        rows.into_iter()
+            .map(|row| {
+                let stored: String = row.get(0);
+                // Corruption, not a row to skip: a halt this build cannot read
+                // is one it would run straight through, and from the outside
+                // that is indistinguishable from a halt that was lifted.
+                let scope = HaltScope::parse(&stored).ok_or_else(|| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!(
+                        "quota_halted holds the scope '{stored}', which this build cannot \
+                         read — refusing rather than admitting work an operator stopped"
+                    ),
+                })?;
+                Ok(Halt {
+                    scope,
+                    reason: row.get(1),
+                })
+            })
+            .collect()
     }
 
     async fn release(&self, run: RunId) -> Result<(), StoreError> {

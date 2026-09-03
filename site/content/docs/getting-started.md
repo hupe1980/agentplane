@@ -486,9 +486,14 @@ let args = Tainted::object([
   ("account", Tainted::trusted(json!("receivables"))),
   ("memo", model_written_memo), // may remain untrusted
 ]);
+// The plane's destination allowlist, captured before the closure — which
+// cannot borrow `cx`. `cx.call_tool` does this for you.
+let egress = cx.tool_egress();
 let result = cx
   .sink_with(&args, |value| {
-    ToolCall::prepare(&catalog, client, ToolId::new("ledger", "post_entry"), value)
+    ToolCall::prepare(
+      &catalog, client, ToolId::new("ledger", "post_entry"), value, egress.as_deref(),
+    )
   })
   .await?; // exact bytes, protected account
 ```

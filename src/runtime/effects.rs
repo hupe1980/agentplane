@@ -84,6 +84,15 @@ pub struct Recorded {
 }
 
 impl Recorded {
+    /// The payload starts as `null`, and it is also what
+    /// [`sink_arguments`](Effect::sink_arguments) binds.
+    ///
+    /// So a `Recorded` dispatched through `StepCtx::sink` with anything but
+    /// `Tainted::…(json!(null))` is refused by the argument binding, which is
+    /// working as intended — the gate's rule is that what policy checked and
+    /// what the sink sends are the same value — but it is a refusal about the
+    /// fixture rather than about the run. Set both sides with
+    /// [`payload`](Self::payload), or dispatch through `cx.effect`.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),

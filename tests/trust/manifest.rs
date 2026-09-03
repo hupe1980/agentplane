@@ -424,6 +424,428 @@ spec:
     );
 }
 
+// ── spec.tools[].preview ────────────────────────────────────────────────────
+
+/// A declared preview must be a dry run, and a reachable one.
+///
+/// Each refusal is the same shape as `oversight` without `execution`: a control
+/// that reads as present in the reviewed file and would do nothing — or the
+/// opposite of what it says — at run time.
+///
+/// `planned` rather than `tool-calling`, so the grants need no protected
+/// fields: what is under test is the preview rule, and a second refusal in the
+/// fixture would make every case ambiguous.
+#[test]
+fn a_preview_that_cannot_do_its_job_is_refused_at_parse() {
+    fn agent(tools: &str) -> Result<Manifest, agentplane::manifest::ManifestError> {
+        let head = r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: archivist, version: '1.0.0' }
+spec:
+  capabilities: { provides: [desk.archive] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: planned, max_turns: 4 }
+  oversight:
+    approval: tools-only
+    deadline: { name: purge-review, kind: hours, params: { n: 4 } }
+  budgets: {}
+  tools:
+";
+        Manifest::parse(&format!("{head}{tools}"))
+    }
+
+    const PREVIEW_GRANT: &str = r"    - ref: tool://archive/purge_preview
+      mutates: false
+      description: Count what a purge would delete.
+";
+
+    // The shape that works, first — so every refusal below is attributable to
+    // the one thing it changes.
+    agent(&format!(
+        r"    - ref: tool://archive/purge
+      mutates: true
+      description: Delete records.
+      requires_approval: true
+      preview: tool://archive/purge_preview
+{PREVIEW_GRANT}"
+    ))
+    .expect("a read-only preview beside an approved mutating call is the whole point");
+
+    // A preview nothing would call.
+    let err = agent(&format!(
+        r"    - ref: tool://archive/purge
+      mutates: false
+      description: Delete records.
+      preview: tool://archive/purge_preview
+{PREVIEW_GRANT}"
+    ))
+    .expect_err("a preview without requires_approval must be refused");
+    assert!(err.to_string().contains("requires_approval"), "{err}");
+
+    // A dry run that changes the world is the opposite of a dry run.
+    let err = agent(
+        r"    - ref: tool://archive/purge
+      mutates: true
+      description: Delete records.
+      requires_approval: true
+      preview: tool://archive/purge_twice
+    - ref: tool://archive/purge_twice
+      mutates: true
+      requires_approval: true
+      description: Also deletes records.
+",
+    )
+    .expect_err("a mutating preview must be refused");
+    assert!(err.to_string().contains("dry run"), "{err}");
+
+    // A preview with no grant behind it is a call with no declared safety.
+    let err = agent(
+        r"    - ref: tool://archive/purge
+      mutates: true
+      description: Delete records.
+      requires_approval: true
+      preview: tool://archive/nowhere
+",
+    )
+    .expect_err("an ungranted preview must be refused");
+    assert!(err.to_string().contains("does not grant"), "{err}");
+
+    // Naming itself makes the dry run the mutation.
+    let err = agent(
+        r"    - ref: tool://archive/purge
+      mutates: true
+      description: Delete records.
+      requires_approval: true
+      preview: tool://archive/purge
+",
+    )
+    .expect_err("a self-referential preview must be refused");
+    assert!(err.to_string().contains("itself"), "{err}");
+}
+
+/// The preview is part of the reviewed artifact.
+///
+/// Changing which tool computes a reviewer's evidence changes what a reviewer
+/// sees, so it is a version bump rather than a deploy-time edit.
+#[test]
+fn a_preview_is_covered_by_the_digest() {
+    fn agent(preview: &str) -> Manifest {
+        Manifest::parse(&format!(
+            "\
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: archivist, version: '1.0.0' }}
+spec:
+  capabilities: {{ provides: [desk.archive] }}
+  models: {{ privileged: {{ provider: fake, model: m-1 }} }}
+  execution: {{ kind: planned, max_turns: 4 }}
+  oversight:
+    approval: tools-only
+    deadline: {{ name: purge-review, kind: hours, params: {{ n: 4 }} }}
+  tools:
+    - ref: tool://archive/purge
+      mutates: true
+      description: Delete records.
+      requires_approval: true
+      preview: {preview}
+    - ref: tool://archive/count
+      mutates: false
+      description: Count records.
+    - ref: tool://archive/estimate
+      mutates: false
+      description: Estimate records.
+  budgets: {{}}
+"
+        ))
+        .expect("manifest")
+    }
+
+    assert_ne!(
+        agent("tool://archive/count").digest().unwrap(),
+        agent("tool://archive/estimate").digest().unwrap(),
+        "which tool computes a reviewer's evidence is part of what was reviewed"
+    );
+}
+
+// ── metadata.annotations ────────────────────────────────────────────────────
+
+/// A registry entry's facts live in the manifest, and the digest covers them.
+///
+/// The alternative is a second registry keyed on `name + version + digest`,
+/// which drifts from the file — two sources of truth about one agent, which is
+/// the defect this format exists to remove.
+#[test]
+fn annotations_are_carried_and_change_the_digest() {
+    let with = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata:
+  name: pattern-compliance-auditor
+  version: '2.0.0'
+  annotations:
+    example.com/business-owner: "Compliance, F. Meier"
+    example.com/risk-class: "C"
+spec:
+  capabilities: { provides: [audit.do] }
+  budgets: {}
+"#,
+    )
+    .expect("namespaced annotations are accepted");
+    assert_eq!(
+        with.metadata.annotations.get("example.com/risk-class"),
+        Some(&"C".to_owned())
+    );
+
+    let mut moved = with.clone();
+    moved.metadata.annotations.insert(
+        "example.com/business-owner".into(),
+        "Compliance, A. Other".into(),
+    );
+    assert_ne!(
+        with.digest().unwrap(),
+        moved.digest().unwrap(),
+        "a changed owner must be a version bump with a reviewer on it"
+    );
+
+    let mut without = with.clone();
+    without.metadata.annotations.clear();
+    assert_ne!(
+        with.digest().unwrap(),
+        without.digest().unwrap(),
+        "annotations are inside the reviewed artifact, not beside it"
+    );
+}
+
+/// Key order does not reach the digest.
+///
+/// A `BTreeMap`, so two files that differ only in the order somebody typed the
+/// keys are one artifact.
+#[test]
+fn annotation_order_does_not_move_the_digest() {
+    let one = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata:
+  name: a
+  version: '1'
+  annotations: { example.com/b: "2", example.com/a: "1" }
+spec: { capabilities: { provides: [x.y] }, budgets: {} }
+"#,
+    )
+    .unwrap();
+    let two = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata:
+  name: a
+  version: '1'
+  annotations: { example.com/a: "1", example.com/b: "2" }
+spec: { capabilities: { provides: [x.y] }, budgets: {} }
+"#,
+    )
+    .unwrap();
+    assert_eq!(one.digest().unwrap(), two.digest().unwrap());
+}
+
+/// An unqualified key is refused, because it would mortgage the schema.
+///
+/// `owner` is exactly the name a first-class field would want, and a format
+/// that accepted it could never add one.
+#[test]
+fn an_unqualified_annotation_key_is_refused() {
+    let err = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata:
+  name: a
+  version: '1'
+  annotations: { owner: "someone" }
+spec: { capabilities: { provides: [x.y] }, budgets: {} }
+"#,
+    )
+    .expect_err("an unqualified key must be refused");
+    assert!(err.to_string().contains("namespaced"), "{err}");
+}
+
+/// The key grammar is Kubernetes' own, so an entry carries into a cluster
+/// object unchanged.
+#[test]
+fn annotation_keys_follow_the_kubernetes_grammar() {
+    fn with(key: &str, value: &str) -> Result<Manifest, agentplane::manifest::ManifestError> {
+        Manifest::parse(&format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata:
+  name: a
+  version: '1'
+  annotations: {{ "{key}": "{value}" }}
+spec: {{ capabilities: {{ provides: [x.y] }}, budgets: {{}} }}
+"#
+        ))
+    }
+    with("example.com/business-owner", "x").expect("a k8s-shaped key is accepted");
+    with("sub.example.com/risk_class.v2", "x").expect("'_' and '.' are legal inside a name");
+
+    let long_name = "a".repeat(64);
+    assert!(
+        with(&format!("example.com/{long_name}"), "x")
+            .unwrap_err()
+            .to_string()
+            .contains("63"),
+        "a name over 63 characters is refused, as Kubernetes refuses it"
+    );
+    assert!(
+        with("example.com/-leading", "x").is_err(),
+        "a name must begin alphanumeric"
+    );
+    assert!(
+        with("example.com/has space", "x").is_err(),
+        "a name may not contain a space"
+    );
+    assert!(
+        with("Example.com/owner", "x").is_err(),
+        "a prefix is a DNS subdomain: lowercase"
+    );
+    assert!(
+        with("bad_label.com/owner", "x").is_err(),
+        "a DNS label may not contain '_'"
+    );
+}
+
+/// 256 KiB in all, as Kubernetes caps it: facts about the agent, not its
+/// documents.
+#[test]
+fn annotations_are_capped_in_total_size() {
+    let big = "x".repeat(agentplane::manifest::MAX_ANNOTATIONS_BYTES);
+    let err = Manifest::parse(&format!(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata:
+  name: a
+  version: '1'
+  annotations: {{ "example.com/document": "{big}" }}
+spec: {{ capabilities: {{ provides: [x.y] }}, budgets: {{}} }}
+"#
+    ))
+    .expect_err("a manifest carrying a document as an annotation must be refused");
+    assert!(err.to_string().contains("annotate its address"), "{err}");
+}
+
+/// A prefix with no dot names no namespace.
+#[test]
+fn an_annotation_prefix_without_a_dot_is_refused() {
+    let err = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata:
+  name: a
+  version: '1'
+  annotations: { internal/owner: "someone" }
+spec: { capabilities: { provides: [x.y] }, budgets: {} }
+"#,
+    )
+    .expect_err("a prefix that owns nothing must be refused");
+    assert!(err.to_string().contains("valid prefix"), "{err}");
+}
+
+/// The format's own API group is reserved.
+///
+/// Otherwise an annotation somebody wrote first could shadow a field this
+/// document grows later — which is the collision the namespacing rule exists to
+/// make impossible.
+#[test]
+fn the_formats_own_prefix_is_reserved() {
+    let err = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata:
+  name: a
+  version: '1'
+  annotations: { agentplane.hupe1980.github.io/budgets: "unbounded" }
+spec: { capabilities: { provides: [x.y] }, budgets: {} }
+"#,
+    )
+    .expect_err("the reserved prefix must be refused");
+    assert!(err.to_string().contains("reserves"), "{err}");
+}
+
+/// A key that answers nothing reads like a question that was answered.
+#[test]
+fn a_blank_annotation_value_is_refused() {
+    let err = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata:
+  name: a
+  version: '1'
+  annotations: { example.com/owner: "  " }
+spec: { capabilities: { provides: [x.y] }, budgets: {} }
+"#,
+    )
+    .expect_err("a blank value must be refused");
+    assert!(err.to_string().contains("answers nothing"), "{err}");
+}
+
+/// Everything else in `metadata` is still closed.
+///
+/// The opaque map is one deliberate door, not a general loosening.
+#[test]
+fn metadata_still_refuses_an_unknown_field() {
+    let err = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: a, version: '1', businessOwner: "someone" }
+spec: { capabilities: { provides: [x.y] }, budgets: {} }
+"#,
+    )
+    .expect_err("deny_unknown_fields still governs metadata");
+    assert!(err.to_string().contains("businessOwner"), "{err}");
+}
+
+/// The refusal side channel is bounded from the manifest, not only from Rust.
+///
+/// `Budget::max_denials` is named in the security model as what bounds the one
+/// bit a uniform refusal cannot hide. A declarative agent is the tier aimed at
+/// reviewers rather than Rust authors, so a control it could not declare would
+/// be a control that tier does not have.
+#[test]
+fn a_declared_agent_can_bound_how_often_it_is_refused() {
+    let m = Manifest::parse(
+        r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: probed, version: '1.0.0' }
+spec:
+  capabilities: { provides: [work.do] }
+  budgets: { max_denials: 3, max_tokens: 1000 }
+",
+    )
+    .expect("a denial ceiling is declarable");
+    assert_eq!(m.budget().max_denials, Some(3));
+
+    let mut ledger = agentplane::core::Ledger::new(m.budget());
+    for _ in 0..3 {
+        ledger
+            .record_denial()
+            .expect("refusals below the ceiling do not stop the run");
+    }
+    assert!(
+        ledger.record_denial().is_err(),
+        "the fourth refusal has to stop a run allowed three"
+    );
+}
+
 /// The zeros that mean something are not swept up with the ones that do not.
 ///
 /// A blanket "no ceiling may be zero" would be easier to write and wrong. Two
@@ -436,10 +858,9 @@ spec:
 ///   zero says the first policy refusal ends the run. A run nothing refuses
 ///   runs to completion under it.
 ///
-/// The second has no manifest surface today — `spec.budgets` does not expose
-/// `max_denials` — so it is asserted against the [`Ledger`] where it lives.
-/// Both halves are here because the distinction is the whole reason the parse
-/// refusal is a list of five fields rather than "every ceiling".
+/// Both are declarable, and both reach the runtime as written. The distinction
+/// is the whole reason the parse refusal is a list of fields rather than "every
+/// ceiling".
 #[test]
 fn a_zero_that_means_something_still_parses() {
     let no_replanning = r"
@@ -448,7 +869,7 @@ kind: Agent
 metadata: { name: fixed-plan, version: '1.0.0' }
 spec:
   capabilities: { provides: [work.do] }
-  budgets: { max_replans: 0, max_tokens: 1000 }
+  budgets: { max_replans: 0, max_denials: 0, max_tokens: 1000 }
 ";
     let m = Manifest::parse(no_replanning)
         .expect("`max_replans: 0` is a coherent instruction and must parse");
@@ -456,6 +877,11 @@ spec:
         m.budget().max_replans,
         Some(0),
         "the run may not replan, and the ceiling has to reach the runtime saying so"
+    );
+    assert_eq!(
+        m.budget().max_denials,
+        Some(0),
+        "the first refusal ends the run, and the ceiling has to reach the runtime saying so"
     );
 
     // And a zero denial ceiling still means what it says: the first refusal
@@ -1788,6 +2214,12 @@ async fn protected_tool_fields_must_match_the_live_catalogue() {
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(json!({ "sent": true }))
         }
+
+        /// In-process: this double opens no connection, so there is no host for
+        /// the plane's egress allowlist to judge.
+        fn destination(&self, _tool: &agentplane::tools::ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
+        }
     }
 
     #[derive(Debug)]
@@ -1814,6 +2246,7 @@ async fn protected_tool_fields_must_match_the_live_catalogue() {
                 Arc::clone(&self.client) as Arc<dyn ToolClient>,
                 ToolId::new("ledger", "transfer"),
                 arguments.peek().clone(),
+                None,
             )
             .map_err(|error| SkillError::Other(error.to_string()))?;
             Ok(Outcome::done(cx.sink(call, &arguments).await?))
@@ -2120,9 +2553,155 @@ fn an_unstated_expiry_denies() {
 
 /// A signature says who published, which no digest can.
 ///
+/// Every registry, held to one contract.
+///
+/// The rules **are** the registry: a backend that stores and serves correctly
+/// and gets one of immutability, pinning or publisher-stability wrong has
+/// removed the only reason to have a registry at all. A shared battery is the
+/// only thing that catches the shape where one backend is right and another is
+/// not.
+#[tokio::test]
+async fn the_memory_registry_satisfies_the_registry_contract() {
+    use agentplane::manifest::MemoryRegistry;
+    use agentplane::testkit::StubSigner;
+
+    let signer = StubSigner::new("release-bot");
+    let other = StubSigner::new("compromised-bot");
+    let reg = MemoryRegistry::new();
+
+    let mut report = agentplane::testkit::conformance::Report::default();
+    agentplane::testkit::conformance_registry::check(&reg, &signer, &other, &signer, &mut report)
+        .await;
+    report.assert_conforms("MemoryRegistry");
+}
+
+/// The same contract, against a registry that survives a restart.
+///
+/// A process-local registry cannot answer *which agents does this organisation
+/// run*, which is the first question a governance function asks — so a
+/// deployment keeps a second inventory keyed on `name + version + digest`, and
+/// the two drift.
+#[tokio::test]
+async fn the_redb_registry_satisfies_the_registry_contract() {
+    use agentplane::store::RedbStore;
+    use agentplane::testkit::StubSigner;
+
+    let signer = StubSigner::new("release-bot");
+    let other = StubSigner::new("compromised-bot");
+    let store = RedbStore::open_in_memory().expect("store");
+
+    let mut report = agentplane::testkit::conformance::Report::default();
+    agentplane::testkit::conformance_registry::check(&store, &signer, &other, &signer, &mut report)
+        .await;
+    report.assert_conforms("RedbStore (registry)");
+}
+
+/// A durable registry is durable: the inventory survives reopening the file.
+///
+/// The whole point of the durable backend, and the one property a battery
+/// running against a live handle cannot establish — every check in it would
+/// pass against a map that lives in the handle.
+#[tokio::test]
+async fn a_published_manifest_survives_reopening_the_store() {
+    use agentplane::manifest::Registry;
+    use agentplane::store::RedbStore;
+
+    #[allow(clippy::disallowed_methods)]
+    let dir = std::env::temp_dir().join(format!(
+        "agentplane-registry-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("registry.redb");
+    let m = Manifest::parse(GOOD).expect("parse");
+    let digest = m.digest().expect("digest");
+
+    {
+        let store = RedbStore::open(&path).expect("store");
+        store.publish(&m).await.expect("publish");
+    }
+
+    let reopened = RedbStore::open(&path).expect("store");
+    let back = reopened
+        .resolve_pinned("pattern-compliance-auditor", "2.0.0", digest)
+        .await
+        .expect("a published manifest survives the process that published it");
+    assert_eq!(back, m);
+    assert_eq!(
+        reopened.names().await.expect("names"),
+        vec!["pattern-compliance-auditor".to_owned()],
+        "the inventory is the question a governance function asks first"
+    );
+
+    // And the refusal survives too: immutability is a property of the artifact,
+    // not of the process that happened to be running when it was published.
+    let mut different = Manifest::parse(GOOD).expect("parse");
+    different.spec.budgets = Some(agentplane::manifest::Budgets {
+        max_tokens: Some(1),
+        ..agentplane::manifest::Budgets::default()
+    });
+    assert!(
+        matches!(
+            reopened.publish(&different).await,
+            Err(agentplane::manifest::RegistryError::Immutable { .. })
+        ),
+        "a version published before the restart must still be immutable after it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One tenant's registry is not another's.
+///
+/// `metadata.name` is whatever an author typed, so two tenants choosing one
+/// name is ordinary rather than exotic — and a registry that did not scope
+/// would let one tenant's publish be refused by, or resolve to, another's.
+#[tokio::test]
+async fn one_tenants_registry_does_not_collide_with_another() {
+    use agentplane::core::TenantId;
+    use agentplane::manifest::Registry;
+    use agentplane::store::RedbStore;
+
+    let base = RedbStore::open_in_memory().expect("store");
+    let acme = base
+        .clone()
+        .for_tenant(TenantId::new("acme").expect("tenant"));
+    let globex = base.for_tenant(TenantId::new("globex").expect("tenant"));
+
+    let theirs = Manifest::parse(GOOD).expect("parse");
+    let mut mine = theirs.clone();
+    mine.spec.budgets = Some(agentplane::manifest::Budgets {
+        max_tokens: Some(7),
+        ..agentplane::manifest::Budgets::default()
+    });
+
+    acme.publish(&theirs).await.expect("publish");
+    globex
+        .publish(&mine)
+        .await
+        .expect("a different tenant publishing the same name is not a collision");
+
+    assert_eq!(
+        acme.resolve("pattern-compliance-auditor", "2.0.0")
+            .await
+            .expect("resolve"),
+        theirs
+    );
+    assert_eq!(
+        globex
+            .resolve("pattern-compliance-auditor", "2.0.0")
+            .await
+            .expect("resolve"),
+        mine
+    );
+}
+
 /// Immutability and pinning both answer *what* was published. Neither answers
 /// *who*, and "the registry accepted it" is not an answer when the registry is
-/// the thing you are worried about.
+/// the thing you are worried about."""
 #[tokio::test]
 async fn a_signed_manifest_names_who_published_it() {
     use agentplane::manifest::{MemoryRegistry, Registry, RegistryError};
@@ -2378,6 +2957,12 @@ async fn a_tool_calling_agent_loops_until_it_answers() {
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(json!({ "balance": 42 }))
         }
+
+        /// In-process: this double opens no connection, so there is no host for
+        /// the plane's egress allowlist to judge.
+        fn destination(&self, _tool: &agentplane::tools::ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
+        }
     }
 
     const YAML: &str = r#"
@@ -2500,6 +3085,12 @@ async fn a_tool_result_above_the_model_ceiling_never_reenters_the_provider() {
         ) -> Result<Value, ToolError> {
             Ok(json!({"secret": "must not reach the model"}))
         }
+
+        /// In-process: this double opens no connection, so there is no host for
+        /// the plane's egress allowlist to judge.
+        fn destination(&self, _tool: &agentplane::tools::ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
+        }
     }
 
     let manifest = Manifest::parse(
@@ -2576,6 +3167,12 @@ async fn a_tool_calling_agent_stops_when_it_will_not_converge() {
             _p: Option<&agentplane::core::Provenance>,
         ) -> Result<Value, ToolError> {
             Ok(json!({ "again": true }))
+        }
+
+        /// In-process: this double opens no connection, so there is no host for
+        /// the plane's egress allowlist to judge.
+        fn destination(&self, _tool: &agentplane::tools::ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
         }
     }
 
@@ -3993,6 +4590,12 @@ async fn a_declared_instruction_survives_an_untrusted_input_in_the_tool_loop() {
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(json!({ "balance": 42 }))
         }
+
+        /// In-process: this double opens no connection, so there is no host for
+        /// the plane's egress allowlist to judge.
+        fn destination(&self, _tool: &agentplane::tools::ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
+        }
     }
 
     const YAML: &str = r#"
@@ -5002,6 +5605,12 @@ async fn the_agent_tool_server_name_is_reserved() {
         ) -> Result<serde_json::Value, agentplane::tools::ToolError> {
             unreachable!("a reserved server must never be dialled")
         }
+
+        /// In-process: this double opens no connection, so there is no host for
+        /// the plane's egress allowlist to judge.
+        fn destination(&self, _tool: &agentplane::tools::ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
+        }
     }
 
     let store: std::sync::Arc<dyn agentplane::journal::JournalStore> =
@@ -5951,6 +6560,12 @@ spec:
         ) -> Result<serde_json::Value, ToolError> {
             self.called.lock().unwrap().push(tool.clone());
             Ok(serde_json::json!({ "ok": true }))
+        }
+
+        /// In-process: this double opens no connection, so there is no host for
+        /// the plane's egress allowlist to judge.
+        fn destination(&self, _tool: &agentplane::tools::ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
         }
     }
 

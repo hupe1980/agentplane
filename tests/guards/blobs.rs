@@ -270,7 +270,7 @@ async fn erasing_a_case_leaves_other_cases_alone() {
         .expect("link");
 
     let n = erase_case(
-        blobs.as_ref(),
+        Some(blobs.as_ref()),
         cases.as_ref(),
         #[cfg(feature = "keyring")]
         None,

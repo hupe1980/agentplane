@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.26.0"
+version      = "0.27.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -327,6 +327,15 @@ required-features = ["redb"]
 # the store-backed emergency stop that halts new admissions on every instance.
 [[example]]
 name              = "operator_stop"
+required-features = ["redb"]
+
+# The last mile between instrumented and monitored: a real subscriber that
+# excludes replays from latency, shows that gauges only exist once something
+# queries the stores, and keys an alert on `needs_attention()`. No exporter is
+# linked — the OTLP wiring is in the example's own docs, verbatim — because
+# picking a collector is the embedder's decision, not this crate's.
+[[example]]
+name              = "observability"
 required-features = ["redb"]
 
 # An instance dies mid-run; the survivor's sweep finds the lapsed lease, takes

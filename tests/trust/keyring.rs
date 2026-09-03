@@ -496,7 +496,7 @@ async fn erasing_a_case_destroys_its_key_and_the_backup_with_it() {
 
     // Erase the case. Tombstones *and* the key.
     let n = agentplane::blob::erase_case(
-        disk.as_ref(),
+        Some(disk.as_ref()),
         store.as_ref(),
         Some(ring.as_ref() as &dyn KeyRing),
         &agentplane::core::TenantId::default(),
@@ -1045,7 +1045,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
 
     // ── One erasure ─────────────────────────────────────────────────────────
     agentplane::blob::erase_case(
-        &blobs,
+        Some(&blobs),
         cases_plain.as_ref(),
         Some(ring.as_ref()),
         &tenant,

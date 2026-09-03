@@ -63,7 +63,11 @@ cargo run --example memory_run         # private/team memory, provenance, recall
 cargo run --example budget_pause       # a ceiling pauses the run; a raise
                                         # resumes it, on the record, nothing repeated
 cargo run --example operator_stop      # cancel a run and it unwinds; halt a
-                                        # tenant and nothing new starts
+                                        # tenant, an agent or one revision, and
+                                        # nothing new starts
+cargo run --example observability      # the last mile: latency without replays,
+                                        # gauges from the census, one alert
+                                        # predicate — and the OTLP wiring
 cargo run --example recovered_run      # an instance dies mid-run; the survivor's
                                         # sweep finds it and finishes it
 cargo run --example bedrock_live --features bedrock
@@ -230,16 +234,18 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | 🏷️ | **Field-level information flow** — exact outbound arguments are bound to hierarchical provenance; recipient, amount, path, URL and other authority-bearing fields can require trusted or named sources while ordinary content remains untrusted |
 | 💸 | **Budgets and tenant quotas that bind** — a failed model call is billed for what it burned, because the provider bills for it too. Tenant spend is settled exactly once per live pass: a durable journal marker supplies recovery intent, and an idempotent store receipt makes a lost acknowledgement retryable without charging twice |
 | 🧬 | **Effects that take together, or not at all** — a group declares the resources it touches and refuses any member outside them. Each reversible member records the concrete call that undoes it, built from what that call *actually returned* rather than reconstructed later from state that has moved — the gap a per-step saga leaves, since `compensate` is handed the output of a step that failed and therefore has none. `commit` is the frontier: invariants are checked there because it is the last instant at which failing them is free, and only then are **deferred** members released. That is what makes an irreversible send safe — an aborted group never sends it, which beats sending and apologising. Doubt reverses nothing |
-| 👤 | **Human oversight on the *call*, not a summary of it** — `requires_approval: true` on a tool grant opens a task carrying the exact tool and arguments about to be dispatched, and nothing happens until somebody approves. A reviewer may also answer *with* the arguments — an approval's amendment dispatches in the model's place, as the reviewer's own trusted value. Gating the agent's answer instead is a review that arrives after the money moved. Durable worklists, four-eyes, declared expiry behaviour, and an operator who can *stop* a run and have it unwind |
+| 👤 | **Human oversight on the *call*, not a summary of it** — `requires_approval: true` on a tool grant opens a task carrying the exact tool and arguments about to be dispatched, and nothing happens until somebody approves. A reviewer may also answer *with* the arguments — an approval's amendment dispatches in the model's place, as the reviewer's own trusted value. Where one call changes many things at once, a grant may name a read-only `preview`: the runtime dispatches it with the same arguments and puts the answer in the reviewer's evidence, so *four thousand records* reaches the screen instead of `older_than: "2024-01-01"`. Gating the agent's answer instead is a review that arrives after the money moved. Durable worklists, four-eyes, declared expiry behaviour, and an operator who can *stop* a run and have it unwind — or stop one agent, or one reviewed revision, without stopping the plane |
 | 🔑 | **Erasure that reaches the backups** — deleting clears the live store; the backup taken an hour earlier still has everything, and backups are offsite and often immutable *by design*. So payload bytes are sealed under a per-case data key wrapped by a key the crate never holds: erasing a case **destroys the key**, and every copy becomes unreadable at once — including the ones nobody can reach. Sealed bytes are rotation-immutable, because the chain commits to them, so the erasure scope *is* the rotation unit. **And the journal too**: `SealedJournal::wrap(store, keys, tenant)` seals run input, prompts and tool-call arguments, effect outputs, failure messages, notes and frozen plans under the same per-case scope. Only the *payload* is sealed, so exactly-once and every index keep working with no key; and the chain commits to the **ciphertext**, so an auditor holding no keys still verifies the history of a run whose data is gone → [erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) |
 | 📄 | **An agent that is only a file** — `agentplane run agent.yaml`. No Rust, no `main`, no skill. The digest covers the agent *in its entirety* rather than only its boundary, **and** the run is journaled and deterministically replayable. Declarative formats give you the first; durable platforms give you the second; the pairing is what makes the evidence about something you can actually read |
 
 Ten rows, not the inventory. The full surface — the export/audit/restore
-toolchain, typed release, standing authorities, effect groups that commit with
-the journal, the emergency stop, the audited sweeper, model drivers and
-streaming, MCP and A2A on both sides, signed Agent Cards, governed media and
-memory, multi-tenancy, quotas, witnessing, break-glass, and why there is no
-`AllowAll` anywhere — is documented mechanism by mechanism on the site:
+toolchain, a durable manifest registry with an enumerable inventory, typed
+release, standing authorities, effect groups that commit with the journal, the
+scoped emergency stop, the audited sweeper, a scheduled recovery drill and a
+retention pass that says what it could not reach, model drivers and streaming,
+MCP and A2A on both sides, signed Agent Cards, governed media and memory,
+multi-tenancy, quotas, witnessing, break-glass, and why there is no `AllowAll`
+anywhere — is documented mechanism by mechanism on the site:
 **[what you get, in full](https://hupe1980.github.io/agentplane/docs/)**.
 
 What is deliberately **not** built, and what will move →

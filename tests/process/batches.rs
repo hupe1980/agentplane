@@ -197,6 +197,72 @@ fn db() -> Arc<RedbStore> {
 
 // ── The claims ──────────────────────────────────────────────────────────────
 
+/// A halt mid-batch stops the pass and leaves the rest pending.
+///
+/// The failure this pins is a durable one: an admission that never happened
+/// written over the item as a terminal `Failed`. The halt lifts, and every item
+/// behind it stays failed forever — a stop turned into loss by bookkeeping. A
+/// halt holds for every item behind the one it hit, so the pass returns it as
+/// the error, the item keeps its reservation with no outcome, and the next
+/// pass admits it as *reserved, never finished*.
+#[tokio::test]
+async fn a_halt_mid_batch_stops_the_pass_without_failing_the_items() {
+    use agentplane::core::{RuntimeError, TenantId};
+    use agentplane::quota::{HaltScope, QuotaError, QuotaStore, TenantQuota};
+
+    let store = db();
+    let world: World = Arc::default();
+    let scoped = Arc::new(store.as_ref().clone().for_tenant(TenantId::default()));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .owner("batch")
+        .batches(Arc::clone(&store) as Arc<dyn BatchStore>)
+        .quota(scoped as Arc<dyn QuotaStore>, TenantQuota::default())
+        .skill(Settler {
+            world: Arc::clone(&world),
+            fails: vec![],
+        })
+        .build();
+    let id = BatchId::generate();
+    let spec = BatchSpec::new(plan(), Arc::new(Keys::upto(3)));
+
+    rt.set_halt(&HaltScope::Tenant, Some("incident 42"))
+        .await
+        .expect("halt");
+    let stopped = rt.run_batch(id, &spec).await;
+    assert!(
+        matches!(
+            stopped,
+            Err(RuntimeError::QuotaExceeded(QuotaError::Halted { .. }))
+        ),
+        "a halt must stop the pass as itself, not as an item outcome: {stopped:?}"
+    );
+    let report = rt.batch_report(id).await.expect("report");
+    assert_eq!(
+        report.status,
+        BatchStatus::Running,
+        "nothing ran, so nothing may be terminal: {report:?}"
+    );
+    assert!(
+        world.lock().unwrap().is_empty(),
+        "a halted plane performed work"
+    );
+
+    rt.set_halt(&HaltScope::Tenant, None).await.expect("lift");
+    let report = rt
+        .run_batch(id, &spec)
+        .await
+        .expect("the lifted batch runs");
+    assert_eq!(
+        report.status,
+        BatchStatus::Completed {
+            succeeded: 3,
+            failed: 0,
+            quarantined: 0,
+        },
+        "every item the halt stopped must run once the halt lifts: {report:?}"
+    );
+}
+
 #[tokio::test]
 async fn every_item_gets_its_own_run_and_its_own_journal() {
     let store = db();

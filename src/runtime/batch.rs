@@ -69,6 +69,11 @@ impl Runtime {
     /// failing item does not stop the batch** — that is the failure isolation a
     /// batch exists for, and a caller who wants the opposite should be running
     /// one run, not many.
+    ///
+    /// What does stop it is an admission that never happened: a halt, a
+    /// tenant ceiling, a store outage. Those hold for every item behind the
+    /// one they hit, and they are returned as the error rather than written
+    /// over the item, so the item is still pending when the next pass runs.
     pub async fn run_batch(
         &self,
         id: BatchId,
@@ -171,7 +176,16 @@ impl Runtime {
             .await
         };
 
-        let (result, spend) = classify_item(outcome);
+        // Only a run that reached an outcome is an item outcome. An error
+        // here is the plane refusing to *admit* — a halt, a ceiling, a store
+        // that could not be reached — and it holds for the next item as much
+        // as this one, so the pass stops with it. Recording it would write a
+        // terminal `Failed` over an item nothing ever ran: the halt lifts, the
+        // ceiling frees, and the item stays failed forever. The reservation
+        // is left without an outcome, which is exactly the state the next
+        // pass reads as *reserved, never finished* and admits again.
+        let out = outcome?;
+        let (result, spend) = classify_item(out);
         store
             .record(id, &item.key, &result, spend)
             .await
@@ -249,11 +263,7 @@ fn status_of(c: &BatchCensus, source_exhausted: bool) -> BatchStatus {
 /// A store or contract error is *the item's* failure, not the batch's: one
 /// malformed item must not take down a settlement run for the other 99,999. The
 /// detail goes on the item record, and the item's own journal holds the rest.
-fn classify_item(outcome: Result<RunOutcome, RuntimeError>) -> (ItemOutcome, Spend) {
-    let Ok(out) = outcome else {
-        let e = outcome.expect_err("checked");
-        return (ItemOutcome::Failed(e.to_string()), Spend::default());
-    };
+fn classify_item(out: RunOutcome) -> (ItemOutcome, Spend) {
     let spend = out.spend;
     let item = match out.status {
         RunStatus::Succeeded => ItemOutcome::Succeeded,

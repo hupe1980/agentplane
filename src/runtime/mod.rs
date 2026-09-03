@@ -5,6 +5,8 @@ mod build_error;
 mod ctx;
 #[cfg(feature = "manifest")]
 mod declarative;
+#[cfg(feature = "manifest")]
+pub use declarative::PREVIEW_EVIDENCE_BYTES;
 pub mod effects;
 mod executor;
 pub mod group;

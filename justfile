@@ -218,6 +218,7 @@ examples:
     cargo run --example peer_call --features redb,testkit,manifest,a2a,a2a-server
     cargo run --example standing_authority --features redb,testkit
     cargo run --example streaming_run --features redb,testkit
+    cargo run --example observability
 
 FULL_FEATURES := "cli,mcp,mcp-stdio,a2a-server,http,cedar,keyring,media,opendal,signing,witness-http,postgres,push"
 

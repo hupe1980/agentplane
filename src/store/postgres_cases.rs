@@ -292,15 +292,46 @@ CREATE TABLE IF NOT EXISTS quota_running (
     PRIMARY KEY (tenant, run_id)
 );
 
--- The emergency stop: one row per halted tenant, none for the rest.
+-- The emergency stop: one row per standing halt, none for the rest.
 --
 -- In the database rather than in a process, because a switch that stops only
 -- the instance it was thrown on is not a switch — it is the in-process-counter
 -- failure arriving during an incident.
+--
+-- `scope` is part of the key, not a column beside it: a halt on one agent and a
+-- halt on the whole tenant are two rows rather than one flag the last writer
+-- wins. An incident that widens and then partly resolves is the ordinary shape,
+-- and a single overwritable flag gets it wrong in the direction that lets work
+-- through. Values are 'tenant', 'agent:<metadata.name>' or
+-- 'revision:<manifest digest>'.
 CREATE TABLE IF NOT EXISTS quota_halted (
     tenant      TEXT   NOT NULL,
+    scope       TEXT   NOT NULL,
     reason      TEXT   NOT NULL,
-    PRIMARY KEY (tenant)
+    PRIMARY KEY (tenant, scope)
+);
+
+-- The manifest registry: one row per published name and version.
+--
+-- The primary key is the immutability rule as a database constraint rather
+-- than as application logic, for the reason exactly-once is a unique index
+-- here: application logic can be bypassed by the next caller and a constraint
+-- cannot. What the transaction around it adds is the *decision* — a version
+-- holding different content is a refusal, not an overwrite.
+--
+-- `key_id` and `signature` are empty for a publish that happened before
+-- anybody signed. That is an operational fact rather than a defect, and it is
+-- not a sentinel overlapping a real value: a signature cannot exist without a
+-- key id.
+CREATE TABLE IF NOT EXISTS registry_manifests (
+    tenant      TEXT   NOT NULL,
+    name        TEXT   NOT NULL,
+    version     TEXT   NOT NULL,
+    digest      TEXT   NOT NULL,
+    yaml        TEXT   NOT NULL,
+    key_id      TEXT   NOT NULL DEFAULT '',
+    signature   TEXT   NOT NULL DEFAULT '',
+    PRIMARY KEY (tenant, name, version)
 );
 
 CREATE TABLE IF NOT EXISTS quota_spent (

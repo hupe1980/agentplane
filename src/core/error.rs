@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core::Spend;
-use crate::core::{EffectKey, Sensitivity, Seq};
+use crate::core::{Digest, EffectKey, Sensitivity, Seq};
 
 /// Render an error's `Debug` as its `Display`, for the types user code holds.
 ///
@@ -191,7 +191,11 @@ pub enum RuntimeError {
     /// says *not right now*, and the caller should come back — a concurrency
     /// ceiling clears when a run finishes. Collapsing them would teach callers
     /// to retry denials or to give up on back-pressure.
-    #[error("quota: {0}")]
+    /// Transparent, because the variant carries a halt as well as a ceiling
+    /// and the two must not share a prefix: an operator reading `quota: … is
+    /// halted` has been told a stop is back-pressure, which is the confusion
+    /// `QuotaError::Halted` exists to prevent.
+    #[error(transparent)]
     QuotaExceeded(#[from] crate::quota::QuotaError),
 
     /// A live pass finished, but its durable quota receipt did not commit.
@@ -760,10 +764,28 @@ pub enum PolicyError {
 
     /// The labeled value presented to the gate differs from the value the sink
     /// will send.
+    ///
+    /// The rule is exact equality, so *that* they differ is the whole verdict;
+    /// the reader also needs *where*, or is left with two documents and a diff
+    /// by eye — and the commonest case, a bound payload still at its `null`
+    /// default beside a labelled object, is the least visible. So the refusal
+    /// names the first differing RFC 6901 pointer (`""` at the root) and both
+    /// canonical digests. Neither value is printed: the labelled one is the
+    /// data these gates exist to keep out of a log, and a digest identifies it
+    /// to whoever already holds it while disclosing nothing to anyone else.
     #[error(
-        "sink '{sink}' attempted to send arguments other than the labeled value policy checked"
+        "sink '{sink}' attempted to send arguments other than the labeled value policy \
+         checked — they first differ at '{at}' (bound {bound}, sent {sent})"
     )]
-    SinkArgumentsMismatch { sink: String },
+    SinkArgumentsMismatch {
+        sink: String,
+        /// RFC 6901 pointer to the first difference; `""` is the whole value.
+        at: String,
+        /// Digest of the canonical bytes the effect will actually send.
+        bound: Digest,
+        /// Digest of the canonical bytes presented to the gate.
+        sent: Digest,
+    },
 
     /// A field the sink declares security-sensitive is absent from the value.
     #[error("sink '{sink}' requires protected field '{path}', but the argument is absent")]

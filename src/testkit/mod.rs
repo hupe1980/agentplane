@@ -19,6 +19,8 @@ pub mod conformance_case;
 #[cfg(feature = "keyring")]
 pub mod conformance_keyring;
 pub mod conformance_quota;
+#[cfg(feature = "manifest")]
+pub mod conformance_registry;
 mod fake_model;
 pub mod faults;
 #[cfg(feature = "keyring")]

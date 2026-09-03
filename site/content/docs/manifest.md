@@ -56,6 +56,8 @@ kind: Agent                                          # the only value
 metadata:
   name: support-triage
   version: "2.0.0"
+  annotations:                                       # opaque, never read
+    example.com/business-owner: "Support Ops, F. Meier"
 
 spec:
   execution:      { kind: tool-calling, max_turns: 6 }
@@ -89,6 +91,70 @@ spec:
 |---|---|---|
 | `name` | yes | Non-empty. Identifies the agent to an operator; **never** a grant — a rule keyed on a name grants authority to anyone who types it. |
 | `version` | yes | Free-form and compared only for equality. The crate does not parse semver, because it has no version-ordering decision to make and pretending to understand a scheme it never checks would invite one. |
+| `annotations` | no | Facts about this agent that the runtime never reads. Namespaced keys, covered by the digest. See below. |
+
+### `metadata.annotations`
+
+A governance catalogue asks a registry entry for name, id, business owner,
+technical owner, business goal, platform, data sources, tool access, autonomy
+level and risk classification. The manifest answers most of those better than a
+registry would; the ownership ones are facts no `spec` field should enforce,
+and a document that cannot hold them at all gets a second registry kept beside
+it, keyed on `name + version + digest` and drifting from the file. Two sources
+of truth about one agent is the defect this format exists to remove.
+
+```yaml
+metadata:
+  name: pattern-compliance-auditor
+  version: "2.0.0"
+  annotations:
+    example.com/business-owner: "Compliance, F. Meier"
+    example.com/technical-owner: "Platform, T. Nguyen"
+    example.com/risk-class: "C"
+    example.com/ticket: "GRC-2291"
+```
+
+This does **not** weaken the rule that a field either has an enforcement point
+or is refused. Three properties make the whole map *intent by construction*:
+
+- **The runtime never reads it.** No key here reaches a gate, a grant, a prompt
+  or a decision, and there is no accessor that turns one into behaviour. So no
+  value here can become a security decision — which is what an advisory control
+  would be, and what [I12](@/docs/architecture.md) forbids.
+- **The digest covers it.** Changing an owner changes the manifest digest, so it
+  is a version bump with a reviewer on it. That is exactly what a governance
+  process wants from an ownership record and what a wiki page cannot give it.
+- **Keys are namespaced, in Kubernetes' grammar.** `prefix/name`: a
+  DNS-subdomain prefix (lowercase labels joined by dots, at most 253
+  characters) and a name of at most 63 beginning and ending alphanumeric with
+  `-`, `_` and `.` between, with 256 KiB of keys and values in all — so an
+  entry carries into a Kubernetes object unchanged. The prefix is **required**
+  here where Kubernetes makes it optional: an unqualified `owner` is exactly
+  the name a future first-class field wants. `agentplane.hupe1980.github.io/`
+  is reserved as `kubernetes.io/` is there, so an annotation can never shadow
+  a field the format grows.
+
+**Who may read them is the same line Kubernetes draws.** In a cluster,
+annotations are configuration for *controllers* all the time — an ingress
+controller reads its rewrite rules from them, cert-manager its issuer, a cloud
+provider its load-balancer type — while the API server itself never acts on
+one. Here the runtime is the API server: it enforces `spec` and never reads an
+annotation, because a field that changes behaviour belongs where it is
+validated, versioned and refused when wrong. Your wiring is the controller:
+the map is public on `Manifest`, a registry resolve returns it, and a deploy
+pipeline, a dashboard or a controller that turns a manifest into a cluster
+object may read `example.com/replicas` and act on it — that is what the
+namespace is for. What the runtime refuses is only to *be* that controller,
+and Kubernetes' own history says why: `kubernetes.io/ingress.class` was read
+by controllers as configuration with no schema and no version until it had to
+be promoted to a real field (`ingressClassName`) to get them. Anything an
+agent's behaviour should depend on goes in `spec`, and the format grows a
+field for it.
+
+A blank value is refused: a key that answers nothing reads, to a reviewer, like
+a question that was answered. Everything else in `metadata` is still closed —
+`businessOwner` at the top level is still a parse failure, and this is one
+deliberate door rather than a general loosening.
 
 ## `spec.execution`
 
@@ -331,9 +397,25 @@ decision that has to be visible — declare `budgets: {}` to mean it.
 | `max_minor_units` | money in **minor units** — cents, not euros. A float would make a budget that fails to bind by a rounding error, and it is **unsigned**, so a negative ceiling is a parse failure rather than a ceiling that un-spends itself |
 | `max_replans` | replans |
 | `max_wallclock_secs` | seconds, named for its unit so a manifest cannot mean minutes |
+| `max_denials` | policy refusals, before the run is stopped |
 
 Budgets bind the whole run including delegation: `commission` is an effect, so a
 sub-run's reported spend is billed to the run that ordered it.
+
+Every ceiling above except the last two is checked *before* the work and against
+**every** effect — a clock read and a tool call each cost one — so `0` is refused
+at parse: it does not mean "no spend", it means the run is refused its first
+operation of any kind, forever.
+
+`max_replans` and `max_denials` are the exceptions, and `0` is accepted for
+both, because each counts an event that may never happen. `max_denials` is the
+declarative half of the [refusal side channel](@/docs/security.md): a refusal
+carries a uniform message so a model cannot tell one denial from another, but
+the refused/allowed bit itself still leaks once per attempt, and what bounds
+that channel is bounding the attempts. It is counted *after* the refusal, so
+`max_denials: 0` means the first refusal ends the run. Read operationally it is
+the same control: a run stuck in a denial loop has stopped making progress,
+exactly like one that replans without bound.
 
 ## `spec.tools`
 

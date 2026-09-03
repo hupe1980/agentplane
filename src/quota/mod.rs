@@ -144,6 +144,122 @@ impl Period {
     }
 }
 
+/// What an emergency stop covers.
+///
+/// A plane hosts many agents, and *agent 12 of 28 is misbehaving at three in
+/// the morning* is the ordinary incident — a switch that can only stop all 28
+/// is not an emergency stop for it. So a halt names its scope. Every standing
+/// halt is checked together and a run is refused if **any** matches, so a
+/// broad stop and a narrow one coexist and lifting the narrow one leaves the
+/// broad one standing.
+///
+/// [`Revision`](Self::Revision) names exact reviewed bytes, so a fix published
+/// as a new version runs while the broken revision stays stopped — prefer it
+/// when a deploy is the incident. [`Agent`](Self::Agent) covers every revision
+/// of a declared name. [`Tenant`](Self::Tenant) is the power switch.
+///
+/// A name is a string the manifest's author typed, and a halt is still keyed
+/// on one because it is a **refusal**: a name-keyed refusal at worst stops
+/// work somebody did not mean to stop, which an operator sees at once and
+/// lifts — the opposite of a name-keyed *grant*, which `context.agent.name` is
+/// therefore never used for.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HaltScope {
+    /// Everything this tenant would start. The power switch.
+    Tenant,
+    /// Every revision of one declared agent, by `metadata.name`.
+    Agent { name: String },
+    /// One exact reviewed revision, by manifest digest.
+    ///
+    /// The form that is precise about *which* revision is stopped, so a fix
+    /// published as a new version is not stopped with it.
+    Revision { digest: crate::core::Digest },
+}
+
+impl HaltScope {
+    /// Every revision of one declared agent.
+    pub fn agent(name: impl Into<String>) -> Self {
+        Self::Agent { name: name.into() }
+    }
+
+    /// One exact reviewed revision.
+    #[must_use]
+    pub const fn revision(digest: crate::core::Digest) -> Self {
+        Self::Revision { digest }
+    }
+
+    /// The durable key, and the form an operator types on the command line.
+    ///
+    /// Round-trips through [`parse`](Self::parse). One column rather than a
+    /// discriminant beside a value, because a scope stored in two columns is a
+    /// scope two backends can disagree about the emptiness rules of.
+    #[must_use]
+    pub fn key(&self) -> String {
+        match self {
+            Self::Tenant => "tenant".to_owned(),
+            Self::Agent { name } => format!("agent:{name}"),
+            Self::Revision { digest } => format!("revision:{digest}"),
+        }
+    }
+
+    /// Read back a stored key.
+    ///
+    /// `None` for anything this build does not understand — a scope written by
+    /// a newer version, say. A caller reading standing halts must treat that as
+    /// corruption rather than skipping the row: a halt this instance cannot
+    /// read is one it must not run through.
+    #[must_use]
+    pub fn parse(key: &str) -> Option<Self> {
+        if key == "tenant" {
+            return Some(Self::Tenant);
+        }
+        if let Some(name) = key.strip_prefix("agent:")
+            && !name.is_empty()
+        {
+            return Some(Self::agent(name));
+        }
+        if let Some(hex) = key.strip_prefix("revision:") {
+            return crate::core::Digest::from_hex(hex).ok().map(Self::revision);
+        }
+        None
+    }
+
+    /// Whether this halt stops a run governed by `agent`.
+    ///
+    /// An ungoverned run — a skill registered directly on the plane, with no
+    /// manifest — is stopped only by [`Tenant`](Self::Tenant). There is nothing
+    /// narrower to key it on, and inventing a match would stop work for a
+    /// reason nobody could look up.
+    #[must_use]
+    pub fn covers(&self, agent: Option<&crate::journal::AgentIdentity>) -> bool {
+        match self {
+            Self::Tenant => true,
+            Self::Agent { name } => agent.is_some_and(|a| &a.name == name),
+            Self::Revision { digest } => agent.is_some_and(|a| &a.digest == digest),
+        }
+    }
+}
+
+impl std::fmt::Display for HaltScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tenant => f.write_str("the whole tenant"),
+            Self::Agent { name } => write!(f, "agent '{name}'"),
+            Self::Revision { digest } => write!(f, "manifest revision {digest}"),
+        }
+    }
+}
+
+/// One standing emergency stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Halt {
+    pub scope: HaltScope,
+    /// Why. Required when halting, because the next person to look will be
+    /// somebody else, possibly at three in the morning, and *why* is the whole
+    /// question.
+    pub reason: String,
+}
+
 /// Why a run was not admitted.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QuotaError {
@@ -170,15 +286,24 @@ pub enum QuotaError {
         limit: u64,
     },
 
-    /// An operator stopped this tenant from starting new work.
+    /// An operator stopped this work from starting.
     ///
     /// Deliberately its own variant rather than a zero ceiling. A ceiling says
     /// *not right now*, and a caller is right to retry it; a halt says *somebody
     /// is dealing with an incident*, and retrying is exactly what an operator
     /// pulling the switch is trying to stop. Collapsing the two would teach
     /// callers to hammer through the one refusal that means stop.
-    #[error("tenant '{tenant}' is halted by an operator: {reason}")]
-    Halted { tenant: String, reason: String },
+    ///
+    /// `scope` says **what** was stopped, because "halted" alone is a different
+    /// message on a plane hosting one agent and on a plane hosting twenty-eight:
+    /// whoever is refused needs to know whether the plane is down or their agent
+    /// is.
+    #[error("{scope} is halted by an operator (tenant '{tenant}'): {reason}")]
+    Halted {
+        tenant: String,
+        scope: HaltScope,
+        reason: String,
+    },
 
     /// The accounting itself could not be reached.
     ///
@@ -241,7 +366,7 @@ pub trait QuotaStore: Send + Sync + Debug {
     /// If the store cannot be reached.
     async fn release(&self, run: RunId) -> Result<(), StoreError>;
 
-    /// Stop this tenant from starting new work, or let it start again.
+    /// Stop work at `scope` from starting, or let it start again.
     ///
     /// `Some(reason)` halts; `None` lifts. The reason is required when halting
     /// because the next person to look will be someone else, possibly at 3am,
@@ -252,17 +377,34 @@ pub trait QuotaStore: Send + Sync + Debug {
     /// in-process quota counter has, arriving at the worst possible moment. One
     /// tenant's halt does not touch another's.
     ///
+    /// Scopes are **independent rows**, not one flag that the last writer wins.
+    /// Halting an agent while the tenant is halted, and lifting the agent's,
+    /// must leave the tenant's standing — an incident that widens and then
+    /// partly resolves is the ordinary shape, and a single overwritable flag
+    /// gets it wrong in the direction that lets work through.
+    ///
     /// # Errors
     ///
     /// If the store cannot be reached.
-    async fn set_halt(&self, reason: Option<&str>) -> Result<(), StoreError>;
+    async fn set_halt(&self, scope: &HaltScope, reason: Option<&str>) -> Result<(), StoreError>;
 
-    /// Why this tenant is halted, if it is.
+    /// Every standing halt for this tenant.
+    ///
+    /// One read rather than a lookup per scope: admission has to consider all
+    /// of them, and three round trips per admitted run is a gate people turn
+    /// off. It is also the operator's question — *what is stopped right now?* —
+    /// which a per-scope lookup cannot answer without already knowing what to
+    /// ask about.
+    ///
+    /// A stored scope this build cannot parse MUST be reported as
+    /// [`StoreError::Corrupt`] rather than skipped. A halt an instance silently
+    /// ignores is a halt that reads, from the outside, exactly like one that was
+    /// lifted.
     ///
     /// # Errors
     ///
-    /// If the store cannot be reached.
-    async fn halted(&self) -> Result<Option<String>, StoreError>;
+    /// If the store cannot be reached, or holds a scope it cannot read.
+    async fn halts(&self) -> Result<Vec<Halt>, StoreError>;
 
     /// Settle one live pass exactly once.
     ///

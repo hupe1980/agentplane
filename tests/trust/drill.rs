@@ -108,7 +108,7 @@ async fn the_drill_tells_erasure_from_loss() {
     // Erased: the full ceremony — tombstones, then the case scope key.
     let erased = matter(&f, "ERASED-1", b"personal data").await;
     agentplane::blob::erase_case(
-        f.blobs.as_ref(),
+        Some(f.blobs.as_ref()),
         f.cases.as_ref(),
         Some(f.keys.as_ref()),
         &f.tenant,
@@ -425,5 +425,196 @@ async fn a_retired_key_version_is_not_reported_as_loss_or_as_erasure() {
         "lowering the floor did not make the case readable again, so the \
          refusal was never really a version floor: {:#?}",
         readmitted.findings
+    );
+}
+
+// ── Retention: the window, and what it honestly cannot reach ────────────────
+
+/// A retention pass erases closed cases past the window, and only those.
+///
+/// The three cases here are the three answers the pass has to keep apart: a
+/// closed matter past its window (erase), a closed matter inside it (keep), and
+/// a matter still open (keep — erasing under a live run turns a retention pass
+/// into an outage).
+///
+/// Checked through the **drill**, which is the point: after retention runs, the
+/// erased case must read as *erased by design* rather than as loss, or a real
+/// loss six months later is indistinguishable from a discharged obligation.
+#[tokio::test]
+async fn retention_erases_closed_cases_past_the_window_and_nothing_else() {
+    use agentplane::core::CaseStatus;
+    use agentplane::retention::{Stores as RetentionStores, retain};
+
+    let f = fixture();
+
+    let old_closed = matter(&f, "OLD-CLOSED", b"personal data, long past").await;
+    let recent_closed = matter(&f, "NEW-CLOSED", b"personal data, still in window").await;
+    let still_open = matter(&f, "OPEN", b"a live matter").await;
+
+    // Two closed, one open. `matter` opens every case at t=1000, so the window
+    // is moved rather than the cases: only `old_closed` is aged deliberately.
+    for case in [old_closed, recent_closed] {
+        f.cases
+            .set_status(case, CaseStatus::Closed)
+            .await
+            .expect("close");
+    }
+
+    // The cutoff sits between the two closed cases' `opened_at`.
+    let report = retain(
+        &RetentionStores {
+            cases: &f.cases,
+            blobs: Some(&f.blobs),
+            keys: Some(&f.keys),
+            tenant: &f.tenant,
+        },
+        ts(1_001),
+        ts(5_000),
+        "retention: 1 day",
+    )
+    .await
+    .expect("retention");
+
+    assert_eq!(report.scanned, 3, "every case must be considered");
+    assert_eq!(
+        report.erased, 2,
+        "both closed cases opened before the cutoff must be erased: {report:#?}"
+    );
+    assert!(report.is_complete(), "{:#?}", report.failures);
+    assert!(
+        report
+            .not_erasable
+            .iter()
+            .any(|line| line.contains("append-only")),
+        "a count with no coverage statement beside it is how a deployment comes \
+         to believe an obligation is discharged: {:#?}",
+        report.not_erasable
+    );
+
+    // The open matter is untouched, and the drill still reads it as intact.
+    let after = drill(&Stores {
+        cases: &f.cases,
+        blobs: Some(&f.blobs),
+        keys: Some(&f.keys),
+        tenant: &f.tenant,
+    })
+    .await
+    .expect("drill");
+    assert_eq!(
+        after.sealed_erased, 2,
+        "the erased cases must read as erased by design: {after:#?}"
+    );
+    assert_eq!(
+        after.blobs_erased, 2,
+        "their blobs must carry tombstones, not be missing"
+    );
+    assert_eq!(
+        after.sealed_open, 1,
+        "the live matter was erased underneath a running case"
+    );
+    assert!(
+        after.is_sound(),
+        "retention produced a finding, so an erasure it performed reads as a \
+         loss: {:#?}",
+        after.findings
+    );
+    let _ = still_open;
+}
+
+/// Without a key ring the pass says so, rather than reporting a clean number.
+///
+/// The residual the erasure page names: blob tombstones cover the live store
+/// only, and journal payloads stay verbatim. A report that omitted this would
+/// be the shape that lets a deployment believe an erasure obligation is
+/// discharged while the chain still holds the payload.
+#[tokio::test]
+async fn retention_without_a_key_ring_reports_what_it_cannot_reach() {
+    use agentplane::retention::{Stores as RetentionStores, retain};
+
+    let f = fixture();
+    let report = retain(
+        &RetentionStores {
+            cases: &f.cases,
+            blobs: Some(&f.blobs),
+            keys: None,
+            tenant: &f.tenant,
+        },
+        ts(1_001),
+        ts(5_000),
+        "retention: 1 day",
+    )
+    .await
+    .expect("retention");
+
+    assert!(
+        report
+            .not_erasable
+            .iter()
+            .any(|line| line.contains("no key ring")),
+        "the pass must name the residual rather than reporting a clean zero: {:#?}",
+        report.not_erasable
+    );
+}
+
+/// A sealed plane with no blob store is still erased: the unit is the key.
+///
+/// Sealing the journal with a ring and storing no blobs is an ordinary shape,
+/// and the erasure that reaches every copy is the key destruction, not the
+/// tombstone. A pass that skipped such a case for want of a store to tombstone
+/// would leave the one act that matters undone because a lesser act had
+/// nowhere to land.
+#[tokio::test]
+async fn retention_without_a_blob_store_still_destroys_the_case_key() {
+    use agentplane::core::CaseStatus;
+    use agentplane::retention::{Stores as RetentionStores, retain};
+
+    let f = fixture();
+    let case = matter(&f, "SEALED-ONLY", b"personal data").await;
+    f.cases
+        .set_status(case, CaseStatus::Closed)
+        .await
+        .expect("close");
+
+    let report = retain(
+        &RetentionStores {
+            cases: &f.cases,
+            blobs: None,
+            keys: Some(&f.keys),
+            tenant: &f.tenant,
+        },
+        ts(1_001),
+        ts(5_000),
+        "retention: 1 day",
+    )
+    .await
+    .expect("retention");
+    assert_eq!(
+        report.erased, 1,
+        "the case must be erased through its key: {report:#?}"
+    );
+    assert_eq!(
+        report.blobs_expired, 0,
+        "nothing could be tombstoned, and the count says so"
+    );
+    assert!(
+        report
+            .not_erasable
+            .iter()
+            .any(|line| line.contains("no blob store")),
+        "the missing tombstones must be named: {:#?}",
+        report.not_erasable
+    );
+
+    let after = drill(&Stores {
+        cases: &f.cases,
+        blobs: Some(&f.blobs),
+        keys: Some(&f.keys),
+        tenant: &f.tenant,
+    })
+    .await
+    .expect("drill");
+    assert_eq!(
+        after.sealed_erased, 1,
+        "the sealed state must read as erased by design through the key: {after:#?}"
     );
 }

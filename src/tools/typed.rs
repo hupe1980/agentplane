@@ -453,6 +453,12 @@ impl ToolClient for ToolBox {
         };
         (registered.invoke)(arguments.clone()).await
     }
+
+    /// In-process, always. A typed tool is a Rust closure compiled into this
+    /// binary; there is no host for an allowlist to judge.
+    fn destination(&self, _tool: &ToolId) -> crate::tools::Destination {
+        crate::tools::Destination::Local
+    }
 }
 
 #[cfg(test)]

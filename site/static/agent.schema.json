@@ -1,8 +1,1133 @@
 {
+  "$id": "https://hupe1980.github.io/agentplane/agent.schema.json",
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "agentplane Agent manifest",
+  "additionalProperties": false,
+  "definitions": {
+    "Approval": {
+      "description": "What a human decides on **before the run continues**.",
+      "oneOf": [
+        {
+          "const": "required",
+          "description": "Every answer waits for a person.",
+          "type": "string"
+        },
+        {
+          "const": "tools-only",
+          "description": "Only the tool calls that ask for it wait; the answer returns unattended.",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "Nothing waits. The run completes and `Oversight::triage` decides what a person is shown afterwards.",
+          "type": "string"
+        }
+      ]
+    },
+    "Budgets": {
+      "additionalProperties": false,
+      "description": "Ceilings, in the manifest's own vocabulary.",
+      "properties": {
+        "max_denials": {
+          "description": "How many times the policy may refuse this run before it is stopped.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_effects": {
+          "description": "Externally visible operations of **every** kind — a tool call, a clock read and a model completion each cost one, so this is not a model ceiling.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_minor_units": {
+          "description": "Money in minor units — cents, not euros. A float here would make a budget that fails to bind by a rounding error, and money is the one number nobody accepts \"approximately\" for.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_replans": {
+          "description": "How many times the run may change its plan.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_steps": {
+          "description": "Plan nodes this run may execute, checked before each one starts.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_tokens": {
+          "description": "Metered units consumed, compared against the run's total before **every** effect — including effects that consume no tokens at all.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_wallclock_secs": {
+          "description": "Seconds. Named for its unit so a manifest cannot mean minutes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Capabilities": {
+      "additionalProperties": false,
+      "description": "What this agent offers, as capability strings.",
+      "properties": {
+        "provides": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Condition": {
+      "description": "One field of the answer, and one thing that must be true of it.",
+      "oneOf": [
+        {
+          "description": "Deep JSON equality against a constant.",
+          "properties": {
+            "equals": true
+          },
+          "required": [
+            "equals"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Deep JSON equality against any of several constants.",
+          "properties": {
+            "in": {
+              "items": true,
+              "type": "array"
+            }
+          },
+          "required": [
+            "in"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A number at or above this. Non-numbers do not match.",
+          "properties": {
+            "at_least": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "at_least"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A number at or below this. Non-numbers do not match.",
+          "properties": {
+            "at_most": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "at_most"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The pointer selects something — anything, including `null`.",
+          "properties": {
+            "exists": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "exists"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "path": {
+          "description": "RFC 6901 pointer into the answer, e.g. `/deadline_status`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "ContextGrants": {
+      "additionalProperties": false,
+      "properties": {
+        "prompts": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextPrompt"
+          },
+          "type": "array"
+        },
+        "resources": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextResource"
+          },
+          "type": "array"
+        },
+        "task_input": {
+          "default": [],
+          "description": "Servers this agent may answer `tasks/update` input requests on.",
+          "items": {
+            "$ref": "#/definitions/ContextTaskInput"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "ContextPrompt": {
+      "additionalProperties": false,
+      "properties": {
+        "max_input_sensitivity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Sensitivity"
+            }
+          ],
+          "default": "public"
+        },
+        "name": {
+          "type": "string"
+        },
+        "output_sensitivity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Sensitivity"
+            }
+          ],
+          "default": "public"
+        },
+        "server": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server",
+        "name"
+      ],
+      "type": "object"
+    },
+    "ContextResource": {
+      "additionalProperties": false,
+      "properties": {
+        "output_sensitivity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Sensitivity"
+            }
+          ],
+          "default": "public"
+        },
+        "server": {
+          "type": "string"
+        },
+        "uri": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server",
+        "uri"
+      ],
+      "type": "object"
+    },
+    "ContextTaskInput": {
+      "additionalProperties": false,
+      "description": "One server this agent may send task input responses to.",
+      "properties": {
+        "max_input_sensitivity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Sensitivity"
+            }
+          ],
+          "default": "public"
+        },
+        "server": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server"
+      ],
+      "type": "object"
+    },
+    "Execution": {
+      "additionalProperties": false,
+      "description": "How a declarative agent runs.",
+      "properties": {
+        "kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExecutionKind"
+            }
+          ],
+          "description": "Which built-in behaviour runs this agent."
+        },
+        "max_turns": {
+          "default": 8,
+          "description": "How many model turns a tool-calling agent may take.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "ExecutionKind": {
+      "description": "The built-in behaviours a manifest may ask for.",
+      "oneOf": [
+        {
+          "const": "completion",
+          "description": "One model call, answered in the declared `Output` shape.",
+          "type": "string"
+        },
+        {
+          "const": "tool-calling",
+          "description": "Call tools until the model stops asking, then answer.",
+          "type": "string"
+        },
+        {
+          "const": "planned",
+          "description": "Plan first over trusted input, then execute without the model.",
+          "type": "string"
+        }
+      ]
+    },
+    "Expiry": {
+      "description": "What happens when the approval window closes.",
+      "oneOf": [
+        {
+          "const": "deny",
+          "description": "Refuse the answer. The safe default, and the default here.",
+          "type": "string"
+        },
+        {
+          "const": "escalate",
+          "description": "Widen the audience and keep waiting.",
+          "type": "string"
+        },
+        {
+          "const": "proceed",
+          "description": "Return the answer with nobody having looked.",
+          "type": "string"
+        }
+      ]
+    },
+    "Identity": {
+      "additionalProperties": false,
+      "description": "The words an agent is given about itself.",
+      "properties": {
+        "constraints": {
+          "default": "",
+          "description": "How it must behave. Kept separate from `role`(Self::role) because the two are reviewed by different people and change on different schedules.",
+          "type": "string"
+        },
+        "role": {
+          "description": "What the agent is for, in one line.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role"
+      ],
+      "type": "object"
+    },
+    "Justification": {
+      "description": "Why collaboration is worth its cost.",
+      "oneOf": [
+        {
+          "const": "parallel-disjoint",
+          "description": "Sub-tasks operate on provably disjoint inputs.",
+          "type": "string"
+        },
+        {
+          "const": "distinct-authority",
+          "description": "Sub-tasks require strictly different capabilities.",
+          "type": "string"
+        }
+      ]
+    },
+    "Memory": {
+      "additionalProperties": false,
+      "description": "A declarative agent's two halves of durable memory: what it reads, and what it writes.",
+      "properties": {
+        "formation": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MemoryFormation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Form bounded durable facts from each answer."
+        },
+        "recall": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MemoryRecall"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Read memories into the prompt, before the model is called."
+        }
+      },
+      "type": "object"
+    },
+    "MemoryFormation": {
+      "additionalProperties": false,
+      "properties": {
+        "access_retention_seconds": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "instruction": {
+          "type": "string"
+        },
+        "max_items": {
+          "default": 3,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_sensitivity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Sensitivity"
+            }
+          ],
+          "default": "public"
+        },
+        "purpose": {
+          "type": "string"
+        },
+        "retention_seconds": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "subject": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/MemorySubject"
+            }
+          ],
+          "description": "Where the formed memories are filed."
+        }
+      },
+      "required": [
+        "subject",
+        "purpose",
+        "instruction"
+      ],
+      "type": "object"
+    },
+    "MemoryRecall": {
+      "additionalProperties": false,
+      "description": "What a declarative agent is given to remember, before it answers.",
+      "properties": {
+        "limit": {
+          "default": 5,
+          "description": "How many, at most.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "purpose": {
+          "description": "Restrict to memories kept for one purpose.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "refresh_access": {
+          "default": false,
+          "description": "Slide each selected memory's access-retention window forward.",
+          "type": "boolean"
+        },
+        "subject": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/MemorySubject"
+            }
+          ],
+          "description": "Which pile to read, with the same three bindings formation writes under. See `MemorySubject`."
+        }
+      },
+      "required": [
+        "subject"
+      ],
+      "type": "object"
+    },
+    "MemorySubject": {
+      "description": "A memory scope: a literal name, or a run binding — `$correlation/<namespace>`, `$case`, or `$input/<RFC 6901 pointer>`. Write `$$` for a literal that really begins with a dollar sign; any other `$` spelling is refused rather than read as a constant.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "Metadata": {
+      "additionalProperties": false,
+      "description": "Who this agent is, for the record.",
+      "properties": {
+        "annotations": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Facts about this agent that the runtime never reads.",
+          "type": "object"
+        },
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "description": "Free-form, and compared only for equality. The crate does not parse semver: it has no version-ordering decision to make, and pretending to understand a scheme it never checks would invite one.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "type": "object"
+    },
+    "ModelRef": {
+      "additionalProperties": false,
+      "description": "One model, named the way a provider names it.",
+      "properties": {
+        "max_tokens": {
+          "description": "A per-call output ceiling, if this role needs one.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "The provider's own model identifier, pinned exactly.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "The driver: `anthropic`, `openai`, or whatever an embedder registered.",
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit reasoning depth. Omitted uses the selected model's default."
+        }
+      },
+      "required": [
+        "provider",
+        "model"
+      ],
+      "type": "object"
+    },
+    "Models": {
+      "additionalProperties": false,
+      "description": "The models an agent runs on, by role.",
+      "properties": {
+        "privileged": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The model trusted with tool calls and decisions."
+        },
+        "quarantined": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The model that reads untrusted material and holds no authority."
+        }
+      },
+      "type": "object"
+    },
+    "Output": {
+      "additionalProperties": false,
+      "description": "The shape an agent promises its callers.",
+      "properties": {
+        "schema": {
+          "description": "A JSON Schema, carried opaquely."
+        }
+      },
+      "required": [
+        "schema"
+      ],
+      "type": "object"
+    },
+    "Oversight": {
+      "additionalProperties": false,
+      "description": "Human oversight, declared rather than remembered.",
+      "properties": {
+        "allow_unattended": {
+          "default": false,
+          "description": "Explicit consent to act with no human when the window closes.",
+          "type": "boolean"
+        },
+        "approval": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Approval"
+            }
+          ],
+          "description": "What a human decides **before** the run continues."
+        },
+        "approvers": {
+          "default": [],
+          "description": "Who may decide. Empty means anyone — a choice worth making on purpose rather than by omission.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "deadline": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OversightDeadline"
+            }
+          ],
+          "description": "The obligation that bounds the wait."
+        },
+        "escalate_to": {
+          "description": "Who is added to the audience when an unanswered task escalates.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "on_expiry": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Expiry"
+            }
+          ],
+          "default": "deny",
+          "description": "What happens when the window closes."
+        },
+        "triage": {
+          "description": "Tasks opened **beside** a completed answer, not in front of it.",
+          "items": {
+            "$ref": "#/definitions/TriageRule"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "approval",
+        "deadline"
+      ],
+      "type": "object"
+    },
+    "OversightDeadline": {
+      "additionalProperties": false,
+      "description": "The obligation that bounds an oversight wait.",
+      "properties": {
+        "kind": {
+          "description": "The resolution rule, e.g. `hours`, `days`, `working-days`.",
+          "type": "string"
+        },
+        "name": {
+          "description": "What the obligation is called on the case.",
+          "type": "string"
+        },
+        "params": {
+          "default": null,
+          "description": "Parameters for that rule, e.g. `{ n: 2 }`."
+        }
+      },
+      "required": [
+        "name",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "ProtectedField": {
+      "additionalProperties": false,
+      "description": "A stricter information-flow rule for one JSON field sent to a sink.",
+      "properties": {
+        "allowed_sources": {
+          "items": {
+            "$ref": "#/definitions/SourceId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "max_sensitivity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Sensitivity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "one_of": {
+          "description": "The closed set of values this field may carry, when one is declared.",
+          "items": true,
+          "type": "array"
+        },
+        "path": {
+          "type": "string"
+        },
+        "require_trusted": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "ReasoningEffort": {
+      "description": "Provider-neutral reasoning depth.",
+      "enum": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "x-high",
+        "max"
+      ],
+      "type": "string"
+    },
+    "Role": {
+      "description": "What an agent is within an arrangement.",
+      "oneOf": [
+        {
+          "const": "specialist",
+          "description": "Does one thing and hands off to nobody.",
+          "type": "string"
+        },
+        {
+          "const": "orchestrator",
+          "description": "Decomposes a task, delegates to specialists, assembles the result.",
+          "type": "string"
+        }
+      ]
+    },
+    "Security": {
+      "additionalProperties": false,
+      "description": "The constraints a runtime enforces.",
+      "properties": {
+        "max_delegation_depth": {
+          "description": "How far authority may be re-delegated. Checked both against the runtime's configured identity and against every delegating sink before dispatch.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_sensitivity_egress": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Sensitivity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The highest sensitivity any value may reach an outward sink at. Combined with the sink's own ceiling at dispatch; the stricter limit wins."
+        },
+        "max_sensitivity_journaled": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Sensitivity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The highest sensitivity a value may reach an effect **whose arguments the journal records**."
+        }
+      },
+      "type": "object"
+    },
+    "Sensitivity": {
+      "description": "How much damage disclosure would do.",
+      "enum": [
+        "public",
+        "internal",
+        "confidential",
+        "secret"
+      ],
+      "type": "string"
+    },
+    "SourceId": {
+      "description": "Where a value came from. Free-form so the engine stays domain-agnostic; the runtime stamps tool refs, peer ids, and collection names.",
+      "type": "string"
+    },
+    "Spec": {
+      "additionalProperties": false,
+      "description": "The declaration proper.",
+      "properties": {
+        "budgets": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Budgets"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Absent means *unbounded*, and that is a decision the manifest has to state out loud — see `Manifest::validate`."
+        },
+        "capabilities": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Capabilities"
+            }
+          ],
+          "default": {
+            "provides": []
+          }
+        },
+        "context": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ContextGrants"
+            }
+          ],
+          "description": "External context this agent may retrieve."
+        },
+        "execution": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Execution"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How this agent runs — and whether it needs any code at all."
+        },
+        "identity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Identity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Who the agent is told it is."
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Memory"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What this agent reads from and writes to durable memory."
+        },
+        "models": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Models"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which models this agent runs on."
+        },
+        "output": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Output"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The shape of what this agent returns."
+        },
+        "oversight": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Oversight"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether a human decides before this agent's answer is returned."
+        },
+        "security": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Security"
+            }
+          ],
+          "default": {}
+        },
+        "tools": {
+          "default": [],
+          "description": "Tools this agent may call. An empty list grants nothing.",
+          "items": {
+            "$ref": "#/definitions/ToolGrant"
+          },
+          "type": "array"
+        },
+        "topology": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Topology"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What this agent is in a multi-agent arrangement."
+        }
+      },
+      "type": "object"
+    },
+    "ToolGrant": {
+      "additionalProperties": false,
+      "description": "One tool this agent may call, and on what terms.",
+      "properties": {
+        "arguments": {
+          "description": "A JSON Schema for the arguments, carried opaquely."
+        },
+        "description": {
+          "description": "What this tool does, in the words the **model** is given.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_sensitivity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Sensitivity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The highest sensitivity this tool may be shown."
+        },
+        "mutates": {
+          "default": true,
+          "description": "Whether calling it changes the world.",
+          "type": "boolean"
+        },
+        "preview": {
+          "description": "A read-only tool that computes what this call *will do*, shown to the reviewer beside the call itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "protected_fields": {
+          "description": "Authority-bearing JSON arguments and the lineage each is allowed to derive from. These rules are part of the canonical manifest digest.",
+          "items": {
+            "$ref": "#/definitions/ProtectedField"
+          },
+          "type": "array"
+        },
+        "ref": {
+          "description": "Which tool, as `tool://server/name`.",
+          "type": "string"
+        },
+        "requires_approval": {
+          "description": "Whether a person approves each call, before it happens.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "Topology": {
+      "additionalProperties": false,
+      "description": "Where this agent sits in a multi-agent arrangement.",
+      "properties": {
+        "mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TopologyMode"
+            }
+          ],
+          "default": "single",
+          "description": "How many agents, and therefore how much coordination risk."
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Justification"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why collaboration is warranted."
+        },
+        "role": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Role"
+            }
+          ],
+          "default": "specialist",
+          "description": "What this agent is within that shape."
+        }
+      },
+      "type": "object"
+    },
+    "TopologyMode": {
+      "description": "How many agents contribute to one task.",
+      "oneOf": [
+        {
+          "const": "single",
+          "description": "One agent, one context, many tools. Inter-agent failure is structurally absent, which is why it is the default.",
+          "type": "string"
+        },
+        {
+          "const": "collaborative",
+          "description": "Several agents contribute to one task. The full failure surface.",
+          "type": "string"
+        }
+      ]
+    },
+    "TriagePriority": {
+      "description": "How a triage task is ranked in a worklist.",
+      "enum": [
+        "low",
+        "normal",
+        "high",
+        "urgent"
+      ],
+      "type": "string"
+    },
+    "TriageRule": {
+      "additionalProperties": false,
+      "description": "One reason to put an answer in front of a person, and who.",
+      "properties": {
+        "audience": {
+          "default": [],
+          "description": "Roles that may act on the task. Empty means anyone, which is a choice worth making on purpose rather than by omission.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "deadline": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OversightDeadline"
+            }
+          ],
+          "description": "The obligation that bounds the task."
+        },
+        "name": {
+          "description": "What the task is called, so a worklist can be filtered on it.",
+          "type": "string"
+        },
+        "priority": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TriagePriority"
+            }
+          ],
+          "default": "normal",
+          "description": "How urgent the row is."
+        },
+        "summary": {
+          "description": "What the worklist row says, in the words a reviewer reads.",
+          "type": "string"
+        },
+        "when": {
+          "description": "Every condition that must hold. Conjunctive, and an empty list is refused — a rule matching everything is a task per run written as a filter.",
+          "items": {
+            "$ref": "#/definitions/Condition"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "when",
+        "summary",
+        "deadline"
+      ],
+      "type": "object"
+    }
+  },
   "description": "The shape of an agentplane Agent manifest. The crate's parser stays authoritative: this schema refuses unknown fields, missing fields, and wrong types exactly as the parser does, but the parser's semantic refusals (an unstated budget, a declared control nothing performs) run only there — `agentplane validate` is the full check.",
-  "type": "object",
   "properties": {
     "apiVersion": {
       "description": "Which schema this document claims to be.",
@@ -19,1114 +1144,12 @@
       "$ref": "#/definitions/Spec"
     }
   },
-  "additionalProperties": false,
   "required": [
     "apiVersion",
     "kind",
     "metadata",
     "spec"
   ],
-  "definitions": {
-    "Metadata": {
-      "description": "Who this agent is, for the record.",
-      "type": "object",
-      "properties": {
-        "name": {
-          "type": "string"
-        },
-        "version": {
-          "description": "Free-form, and compared only for equality. The crate does not parse semver: it has no version-ordering decision to make, and pretending to understand a scheme it never checks would invite one.",
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "name",
-        "version"
-      ]
-    },
-    "Spec": {
-      "description": "The declaration proper.",
-      "type": "object",
-      "properties": {
-        "identity": {
-          "description": "Who the agent is told it is.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Identity"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "security": {
-          "default": {},
-          "allOf": [
-            {
-              "$ref": "#/definitions/Security"
-            }
-          ]
-        },
-        "capabilities": {
-          "default": {
-            "provides": []
-          },
-          "allOf": [
-            {
-              "$ref": "#/definitions/Capabilities"
-            }
-          ]
-        },
-        "budgets": {
-          "description": "Absent means *unbounded*, and that is a decision the manifest has to state out loud — see `Manifest::validate`.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Budgets"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "tools": {
-          "description": "Tools this agent may call. An empty list grants nothing.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/ToolGrant"
-          },
-          "default": []
-        },
-        "context": {
-          "description": "External context this agent may retrieve.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/ContextGrants"
-            }
-          ]
-        },
-        "oversight": {
-          "description": "Whether a human decides before this agent's answer is returned.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Oversight"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "execution": {
-          "description": "How this agent runs — and whether it needs any code at all.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Execution"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "topology": {
-          "description": "What this agent is in a multi-agent arrangement.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Topology"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "models": {
-          "description": "Which models this agent runs on.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Models"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "output": {
-          "description": "The shape of what this agent returns.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Output"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "memory": {
-          "description": "What this agent reads from and writes to durable memory.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Memory"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "Identity": {
-      "description": "The words an agent is given about itself.",
-      "type": "object",
-      "properties": {
-        "role": {
-          "description": "What the agent is for, in one line.",
-          "type": "string"
-        },
-        "constraints": {
-          "description": "How it must behave. Kept separate from `role`(Self::role) because the two are reviewed by different people and change on different schedules.",
-          "type": "string",
-          "default": ""
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "role"
-      ]
-    },
-    "Security": {
-      "description": "The constraints a runtime enforces.",
-      "type": "object",
-      "properties": {
-        "max_sensitivity_egress": {
-          "description": "The highest sensitivity any value may reach an outward sink at. Combined with the sink's own ceiling at dispatch; the stricter limit wins.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Sensitivity"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "max_sensitivity_journaled": {
-          "description": "The highest sensitivity a value may reach an effect **whose arguments the journal records**.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Sensitivity"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "max_delegation_depth": {
-          "description": "How far authority may be re-delegated. Checked both against the runtime's configured identity and against every delegating sink before dispatch.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint8",
-          "minimum": 0,
-          "maximum": 255
-        }
-      },
-      "additionalProperties": false
-    },
-    "Sensitivity": {
-      "description": "How much damage disclosure would do.",
-      "type": "string",
-      "enum": [
-        "public",
-        "internal",
-        "confidential",
-        "secret"
-      ]
-    },
-    "Capabilities": {
-      "description": "What this agent offers, as capability strings.",
-      "type": "object",
-      "properties": {
-        "provides": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": []
-        }
-      },
-      "additionalProperties": false
-    },
-    "Budgets": {
-      "description": "Ceilings, in the manifest's own vocabulary.",
-      "type": "object",
-      "properties": {
-        "max_steps": {
-          "description": "Plan nodes this run may execute, checked before each one starts.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint",
-          "minimum": 0
-        },
-        "max_effects": {
-          "description": "Externally visible operations of **every** kind — a tool call, a clock read and a model completion each cost one, so this is not a model ceiling.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint",
-          "minimum": 0
-        },
-        "max_tokens": {
-          "description": "Metered units consumed, compared against the run's total before **every** effect — including effects that consume no tokens at all.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
-        "max_minor_units": {
-          "description": "Money in minor units — cents, not euros. A float here would make a budget that fails to bind by a rounding error, and money is the one number nobody accepts \"approximately\" for.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
-        "max_replans": {
-          "description": "How many times the run may change its plan.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "max_wallclock_secs": {
-          "description": "Seconds. Named for its unit so a manifest cannot mean minutes.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        }
-      },
-      "additionalProperties": false
-    },
-    "ToolGrant": {
-      "description": "One tool this agent may call, and on what terms.",
-      "type": "object",
-      "properties": {
-        "ref": {
-          "description": "Which tool, as `tool://server/name`.",
-          "type": "string"
-        },
-        "mutates": {
-          "description": "Whether calling it changes the world.",
-          "type": "boolean",
-          "default": true
-        },
-        "max_sensitivity": {
-          "description": "The highest sensitivity this tool may be shown.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Sensitivity"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "protected_fields": {
-          "description": "Authority-bearing JSON arguments and the lineage each is allowed to derive from. These rules are part of the canonical manifest digest.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/ProtectedField"
-          }
-        },
-        "description": {
-          "description": "What this tool does, in the words the **model** is given.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "requires_approval": {
-          "description": "Whether a person approves each call, before it happens.",
-          "type": "boolean"
-        },
-        "arguments": {
-          "description": "A JSON Schema for the arguments, carried opaquely."
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "ref"
-      ]
-    },
-    "ProtectedField": {
-      "description": "A stricter information-flow rule for one JSON field sent to a sink.",
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        },
-        "require_trusted": {
-          "type": "boolean",
-          "default": false
-        },
-        "allowed_sources": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/definitions/SourceId"
-          }
-        },
-        "max_sensitivity": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Sensitivity"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "one_of": {
-          "description": "The closed set of values this field may carry, when one is declared.",
-          "type": "array",
-          "items": true
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "path"
-      ]
-    },
-    "SourceId": {
-      "description": "Where a value came from. Free-form so the engine stays domain-agnostic; the runtime stamps tool refs, peer ids, and collection names.",
-      "type": "string"
-    },
-    "ContextGrants": {
-      "type": "object",
-      "properties": {
-        "prompts": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/ContextPrompt"
-          },
-          "default": []
-        },
-        "resources": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/ContextResource"
-          },
-          "default": []
-        },
-        "task_input": {
-          "description": "Servers this agent may answer `tasks/update` input requests on.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/ContextTaskInput"
-          },
-          "default": []
-        }
-      },
-      "additionalProperties": false
-    },
-    "ContextPrompt": {
-      "type": "object",
-      "properties": {
-        "server": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        },
-        "max_input_sensitivity": {
-          "default": "public",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Sensitivity"
-            }
-          ]
-        },
-        "output_sensitivity": {
-          "default": "public",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Sensitivity"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "server",
-        "name"
-      ]
-    },
-    "ContextResource": {
-      "type": "object",
-      "properties": {
-        "server": {
-          "type": "string"
-        },
-        "uri": {
-          "type": "string"
-        },
-        "output_sensitivity": {
-          "default": "public",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Sensitivity"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "server",
-        "uri"
-      ]
-    },
-    "ContextTaskInput": {
-      "description": "One server this agent may send task input responses to.",
-      "type": "object",
-      "properties": {
-        "server": {
-          "type": "string"
-        },
-        "max_input_sensitivity": {
-          "default": "public",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Sensitivity"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "server"
-      ]
-    },
-    "Oversight": {
-      "description": "Human oversight, declared rather than remembered.",
-      "type": "object",
-      "properties": {
-        "approval": {
-          "description": "What a human decides **before** the run continues.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Approval"
-            }
-          ]
-        },
-        "approvers": {
-          "description": "Who may decide. Empty means anyone — a choice worth making on purpose rather than by omission.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": []
-        },
-        "deadline": {
-          "description": "The obligation that bounds the wait.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/OversightDeadline"
-            }
-          ]
-        },
-        "on_expiry": {
-          "description": "What happens when the window closes.",
-          "default": "deny",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Expiry"
-            }
-          ]
-        },
-        "escalate_to": {
-          "description": "Who is added to the audience when an unanswered task escalates.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "allow_unattended": {
-          "description": "Explicit consent to act with no human when the window closes.",
-          "type": "boolean",
-          "default": false
-        },
-        "triage": {
-          "description": "Tasks opened **beside** a completed answer, not in front of it.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/TriageRule"
-          }
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "approval",
-        "deadline"
-      ]
-    },
-    "Approval": {
-      "description": "What a human decides on **before the run continues**.",
-      "oneOf": [
-        {
-          "description": "Every answer waits for a person.",
-          "type": "string",
-          "const": "required"
-        },
-        {
-          "description": "Only the tool calls that ask for it wait; the answer returns unattended.",
-          "type": "string",
-          "const": "tools-only"
-        },
-        {
-          "description": "Nothing waits. The run completes and `Oversight::triage` decides what a person is shown afterwards.",
-          "type": "string",
-          "const": "none"
-        }
-      ]
-    },
-    "OversightDeadline": {
-      "description": "The obligation that bounds an oversight wait.",
-      "type": "object",
-      "properties": {
-        "name": {
-          "description": "What the obligation is called on the case.",
-          "type": "string"
-        },
-        "kind": {
-          "description": "The resolution rule, e.g. `hours`, `days`, `working-days`.",
-          "type": "string"
-        },
-        "params": {
-          "description": "Parameters for that rule, e.g. `{ n: 2 }`.",
-          "default": null
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "name",
-        "kind"
-      ]
-    },
-    "Expiry": {
-      "description": "What happens when the approval window closes.",
-      "oneOf": [
-        {
-          "description": "Refuse the answer. The safe default, and the default here.",
-          "type": "string",
-          "const": "deny"
-        },
-        {
-          "description": "Widen the audience and keep waiting.",
-          "type": "string",
-          "const": "escalate"
-        },
-        {
-          "description": "Return the answer with nobody having looked.",
-          "type": "string",
-          "const": "proceed"
-        }
-      ]
-    },
-    "TriageRule": {
-      "description": "One reason to put an answer in front of a person, and who.",
-      "type": "object",
-      "properties": {
-        "name": {
-          "description": "What the task is called, so a worklist can be filtered on it.",
-          "type": "string"
-        },
-        "when": {
-          "description": "Every condition that must hold. Conjunctive, and an empty list is refused — a rule matching everything is a task per run written as a filter.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Condition"
-          }
-        },
-        "audience": {
-          "description": "Roles that may act on the task. Empty means anyone, which is a choice worth making on purpose rather than by omission.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": []
-        },
-        "summary": {
-          "description": "What the worklist row says, in the words a reviewer reads.",
-          "type": "string"
-        },
-        "deadline": {
-          "description": "The obligation that bounds the task.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/OversightDeadline"
-            }
-          ]
-        },
-        "priority": {
-          "description": "How urgent the row is.",
-          "default": "normal",
-          "allOf": [
-            {
-              "$ref": "#/definitions/TriagePriority"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "name",
-        "when",
-        "summary",
-        "deadline"
-      ]
-    },
-    "Condition": {
-      "description": "One field of the answer, and one thing that must be true of it.",
-      "type": "object",
-      "properties": {
-        "path": {
-          "description": "RFC 6901 pointer into the answer, e.g. `/deadline_status`.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "path"
-      ],
-      "oneOf": [
-        {
-          "description": "Deep JSON equality against a constant.",
-          "type": "object",
-          "properties": {
-            "equals": true
-          },
-          "required": [
-            "equals"
-          ]
-        },
-        {
-          "description": "Deep JSON equality against any of several constants.",
-          "type": "object",
-          "properties": {
-            "in": {
-              "type": "array",
-              "items": true
-            }
-          },
-          "required": [
-            "in"
-          ]
-        },
-        {
-          "description": "A number at or above this. Non-numbers do not match.",
-          "type": "object",
-          "properties": {
-            "at_least": {
-              "type": "number",
-              "format": "double"
-            }
-          },
-          "required": [
-            "at_least"
-          ]
-        },
-        {
-          "description": "A number at or below this. Non-numbers do not match.",
-          "type": "object",
-          "properties": {
-            "at_most": {
-              "type": "number",
-              "format": "double"
-            }
-          },
-          "required": [
-            "at_most"
-          ]
-        },
-        {
-          "description": "The pointer selects something — anything, including `null`.",
-          "type": "object",
-          "properties": {
-            "exists": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "exists"
-          ]
-        }
-      ]
-    },
-    "TriagePriority": {
-      "description": "How a triage task is ranked in a worklist.",
-      "type": "string",
-      "enum": [
-        "low",
-        "normal",
-        "high",
-        "urgent"
-      ]
-    },
-    "Execution": {
-      "description": "How a declarative agent runs.",
-      "type": "object",
-      "properties": {
-        "kind": {
-          "description": "Which built-in behaviour runs this agent.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/ExecutionKind"
-            }
-          ]
-        },
-        "max_turns": {
-          "description": "How many model turns a tool-calling agent may take.",
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0,
-          "default": 8
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "kind"
-      ]
-    },
-    "ExecutionKind": {
-      "description": "The built-in behaviours a manifest may ask for.",
-      "oneOf": [
-        {
-          "description": "One model call, answered in the declared `Output` shape.",
-          "type": "string",
-          "const": "completion"
-        },
-        {
-          "description": "Call tools until the model stops asking, then answer.",
-          "type": "string",
-          "const": "tool-calling"
-        },
-        {
-          "description": "Plan first over trusted input, then execute without the model.",
-          "type": "string",
-          "const": "planned"
-        }
-      ]
-    },
-    "Topology": {
-      "description": "Where this agent sits in a multi-agent arrangement.",
-      "type": "object",
-      "properties": {
-        "mode": {
-          "description": "How many agents, and therefore how much coordination risk.",
-          "default": "single",
-          "allOf": [
-            {
-              "$ref": "#/definitions/TopologyMode"
-            }
-          ]
-        },
-        "role": {
-          "description": "What this agent is within that shape.",
-          "default": "specialist",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Role"
-            }
-          ]
-        },
-        "reason": {
-          "description": "Why collaboration is warranted.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Justification"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "TopologyMode": {
-      "description": "How many agents contribute to one task.",
-      "oneOf": [
-        {
-          "description": "One agent, one context, many tools. Inter-agent failure is structurally absent, which is why it is the default.",
-          "type": "string",
-          "const": "single"
-        },
-        {
-          "description": "Several agents contribute to one task. The full failure surface.",
-          "type": "string",
-          "const": "collaborative"
-        }
-      ]
-    },
-    "Role": {
-      "description": "What an agent is within an arrangement.",
-      "oneOf": [
-        {
-          "description": "Does one thing and hands off to nobody.",
-          "type": "string",
-          "const": "specialist"
-        },
-        {
-          "description": "Decomposes a task, delegates to specialists, assembles the result.",
-          "type": "string",
-          "const": "orchestrator"
-        }
-      ]
-    },
-    "Justification": {
-      "description": "Why collaboration is worth its cost.",
-      "oneOf": [
-        {
-          "description": "Sub-tasks operate on provably disjoint inputs.",
-          "type": "string",
-          "const": "parallel-disjoint"
-        },
-        {
-          "description": "Sub-tasks require strictly different capabilities.",
-          "type": "string",
-          "const": "distinct-authority"
-        }
-      ]
-    },
-    "Models": {
-      "description": "The models an agent runs on, by role.",
-      "type": "object",
-      "properties": {
-        "privileged": {
-          "description": "The model trusted with tool calls and decisions.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ModelRef"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "quarantined": {
-          "description": "The model that reads untrusted material and holds no authority.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ModelRef"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "ModelRef": {
-      "description": "One model, named the way a provider names it.",
-      "type": "object",
-      "properties": {
-        "provider": {
-          "description": "The driver: `anthropic`, `openai`, or whatever an embedder registered.",
-          "type": "string"
-        },
-        "model": {
-          "description": "The provider's own model identifier, pinned exactly.",
-          "type": "string"
-        },
-        "max_tokens": {
-          "description": "A per-call output ceiling, if this role needs one.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "reasoning_effort": {
-          "description": "Explicit reasoning depth. Omitted uses the selected model's default.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ReasoningEffort"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "provider",
-        "model"
-      ]
-    },
-    "ReasoningEffort": {
-      "description": "Provider-neutral reasoning depth.",
-      "type": "string",
-      "enum": [
-        "none",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "x-high",
-        "max"
-      ]
-    },
-    "Output": {
-      "description": "The shape an agent promises its callers.",
-      "type": "object",
-      "properties": {
-        "schema": {
-          "description": "A JSON Schema, carried opaquely."
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "schema"
-      ]
-    },
-    "Memory": {
-      "description": "A declarative agent's two halves of durable memory: what it reads, and what it writes.",
-      "type": "object",
-      "properties": {
-        "recall": {
-          "description": "Read memories into the prompt, before the model is called.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/MemoryRecall"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "formation": {
-          "description": "Form bounded durable facts from each answer.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/MemoryFormation"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "MemoryRecall": {
-      "description": "What a declarative agent is given to remember, before it answers.",
-      "type": "object",
-      "properties": {
-        "subject": {
-          "description": "Which pile to read, with the same three bindings formation writes under. See `MemorySubject`.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/MemorySubject"
-            }
-          ]
-        },
-        "purpose": {
-          "description": "Restrict to memories kept for one purpose.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "limit": {
-          "description": "How many, at most.",
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0,
-          "default": 5
-        },
-        "refresh_access": {
-          "description": "Slide each selected memory's access-retention window forward.",
-          "type": "boolean",
-          "default": false
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "subject"
-      ]
-    },
-    "MemorySubject": {
-      "description": "A memory scope: a literal name, or a run binding — `$correlation/<namespace>`, `$case`, or `$input/<RFC 6901 pointer>`. Write `$$` for a literal that really begins with a dollar sign; any other `$` spelling is refused rather than read as a constant.",
-      "type": "string",
-      "minLength": 1
-    },
-    "MemoryFormation": {
-      "type": "object",
-      "properties": {
-        "subject": {
-          "description": "Where the formed memories are filed.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/MemorySubject"
-            }
-          ]
-        },
-        "purpose": {
-          "type": "string"
-        },
-        "instruction": {
-          "type": "string"
-        },
-        "max_items": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0,
-          "default": 3
-        },
-        "retention_seconds": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
-        "access_retention_seconds": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
-        "max_sensitivity": {
-          "default": "public",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Sensitivity"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "subject",
-        "purpose",
-        "instruction"
-      ]
-    }
-  },
-  "$id": "https://hupe1980.github.io/agentplane/agent.schema.json"
+  "title": "agentplane Agent manifest",
+  "type": "object"
 }

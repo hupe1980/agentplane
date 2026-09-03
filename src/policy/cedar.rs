@@ -31,6 +31,33 @@
 //! distinctly — in the reason string, and as a dedicated `tracing` event — while
 //! still denying. Failing closed and saying why are not in tension.
 //!
+//! # Naming a rule, so a denial can name it back
+//!
+//! Cedar's diagnostics report positional ids — `policy0`, `policy1`, … — so a
+//! forty-rule set produces forty denials that each name a number, which is
+//! what [`PolicyDecision::Deny`](crate::core::PolicyDecision::Deny)'s required
+//! reason exists to prevent. Cedar treats `@id` as an ordinary annotation and
+//! does **not** adopt it as the `PolicyId`; this adapter reads it and prefers
+//! it:
+//!
+//! ```cedar
+//! @id("betragsgrenze-5000-eur")
+//! forbid (principal, action == Action::"effect:perform", resource)
+//! when { context.args.amount_eur > 5000 };
+//! ```
+//!
+//! ```text
+//! policy denied 'effect:perform' on 'tool.call': refused by betragsgrenze-5000-eur
+//! ```
+//!
+//! The reason names the **rule and nothing else**: every caller already holds
+//! the action and the resource on
+//! [`StepError::Denied`](crate::core::StepError::Denied) and the journaled
+//! `PolicyDenied` record. Two rules answering to one name are refused at
+//! construction ([`CedarError::AmbiguousRuleName`]), including an `@id` that
+//! collides with another rule's generated id — a name pointing at the wrong
+//! rule is worse than a number pointing at the right one.
+//!
 //! # Entity shape
 //!
 //! The runtime's vocabulary maps onto Cedar's directly, which is why the trait
@@ -90,10 +117,29 @@ use crate::runtime::telemetry;
 /// adapter revision covers entity mapping, schema-aware context parsing, and
 /// the set of Cedar extensions made available by 4.12.
 pub const EVALUATOR_SEMANTICS: &str =
-    "cedar-policy/4.12.0;agentplane-adapter/2;extensions=all-available";
+    "cedar-policy/4.12.0;agentplane-adapter/3;extensions=all-available";
 
 const ADAPTER_CONFIGURATION: &[u8] =
-    b"principal=Agent;action=Action;resource=Resource;context=action-schema";
+    b"principal=Agent;action=Action;resource=Resource;context=action-schema;rule-name=@id";
+
+/// The annotation this adapter reads as a rule's name.
+///
+/// Cedar generates `policy0`, `policy1`, … when a policy set is parsed from
+/// text, and those ids are what its diagnostics report. A denial naming
+/// `policy17` sends an operator to count `forbid` blocks in a file, which is
+/// the outcome [`PolicyDecision::Deny`]'s required reason exists to prevent.
+///
+/// Cedar treats `@id` as an ordinary annotation — it does **not** adopt it as
+/// the `PolicyId` — so the adapter reads it explicitly and prefers it over the
+/// generated id. Two rules sharing one name are refused at construction: see
+/// [`CedarError::AmbiguousRuleName`].
+///
+/// ```cedar
+/// @id("betragsgrenze-5000-eur")
+/// forbid (principal, action == Action::"effect:perform", resource)
+/// when { context.args.amount_eur > 5000 };
+/// ```
+pub const RULE_NAME_ANNOTATION: &str = "id";
 
 /// Target of the `tracing` event emitted when null stripping changed the
 /// context a rule evaluated — see `without_nulls` (crate-private) for why
@@ -131,6 +177,20 @@ pub enum CedarError {
     Validation(String),
     #[error("static Cedar entities do not parse against the bundle schema: {0}")]
     Entities(String),
+    /// Two rules answer to one name, so a denial could not say which fired.
+    ///
+    /// The whole point of the `@id` annotation is that a reason names one
+    /// rule. A name shared by two rules is worse than no name: it reads like
+    /// an answer and sends the operator to the wrong `forbid`.
+    #[error(
+        "two rules answer to the name '{name}' ({first} and {second}) — a denial \
+         naming it could not say which fired; give each rule its own @id"
+    )]
+    AmbiguousRuleName {
+        name: String,
+        first: String,
+        second: String,
+    },
 }
 
 impl CedarEngine {
@@ -162,6 +222,7 @@ impl CedarEngine {
         entities_json: Option<&str>,
     ) -> Result<Self, CedarError> {
         let policies = PolicySet::from_str(source).map_err(|e| CedarError::Parse(e.to_string()))?;
+        check_rule_names(&policies)?;
 
         let (schema, schema_digest) = match schema_json {
             Some(json) => {
@@ -245,6 +306,55 @@ impl CedarEngine {
         Request::new(principal, action, resource, context, self.schema.as_ref())
             .map_err(|e| format!("request is not well formed: {e}"))
     }
+
+    /// What to call a rule in a denial: its `@id`, or Cedar's generated id.
+    ///
+    /// Cedar's own ids are positional — `policy0`, `policy1` — so a forty-rule
+    /// set produces forty reasons that each name a number, and the operator
+    /// still has to find which of forty rules that is. The annotation is the
+    /// half a wrapper cannot supply, and it is why the reason is required at
+    /// all.
+    ///
+    /// An `@id` with no value parses as `Some("")`, which would name nothing;
+    /// that falls back to the generated id rather than producing an empty
+    /// reason.
+    fn rule_name(&self, id: &cedar_policy::PolicyId) -> String {
+        self.policies
+            .annotation(id, RULE_NAME_ANNOTATION)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| id.to_string(), ToOwned::to_owned)
+    }
+}
+
+/// Refuse a policy set in which two rules answer to one name.
+///
+/// Checked over the *effective* name — the `@id` when there is one, Cedar's
+/// generated id otherwise — so it also catches the case an annotation-only
+/// check would miss: `@id("policy1")` on the first rule while the second is
+/// generated as `policy1`.
+///
+/// At construction, because that is where every other policy defect in this
+/// adapter is caught. A denial that names a rule ambiguously is discovered at
+/// 3am by whoever is reading it.
+fn check_rule_names(policies: &PolicySet) -> Result<(), CedarError> {
+    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for policy in policies.policies() {
+        let generated = policy.id().to_string();
+        let name = policy
+            .annotation(RULE_NAME_ANNOTATION)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| generated.clone(), ToOwned::to_owned);
+        if let Some(first) = seen.insert(name.clone(), generated.clone()) {
+            return Err(CedarError::AmbiguousRuleName {
+                name,
+                first,
+                second: generated,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Cedar has no `null`, so an absent value must be spelled *absent*.
@@ -422,23 +532,15 @@ impl PolicyEngine for CedarEngine {
                 let determining: Vec<String> = answer
                     .diagnostics()
                     .reason()
-                    .map(ToString::to_string)
+                    .map(|id| self.rule_name(id))
                     .collect();
                 if determining.is_empty() {
                     // Cedar denies by default when nothing permits. Saying so
                     // beats "denied by policy", which sends someone hunting for
                     // a `forbid` that does not exist.
-                    PolicyDecision::deny(format!(
-                        "no policy permits '{}' on '{}'",
-                        request.action, request.resource
-                    ))
+                    PolicyDecision::deny("no policy permits it")
                 } else {
-                    PolicyDecision::deny(format!(
-                        "'{}' on '{}' refused by {}",
-                        request.action,
-                        request.resource,
-                        determining.join(", ")
-                    ))
+                    PolicyDecision::deny(format!("refused by {}", determining.join(", ")))
                 }
             }
         }

@@ -126,7 +126,12 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
-agentplane = { path = "$ROOT", features = ["redb", "testkit"] }
+# The manifest feature is on because the pages this harness compiles document
+# the plane's tool wiring -- a catalogue, a grant, and the plane's destination
+# allowlist -- and all three live behind it. Compiling them without it checked a
+# different program than the one a reader copies. (No backticks in this
+# heredoc: it is unquoted, so they would run as commands.)
+agentplane = { path = "$ROOT", features = ["redb", "testkit", "manifest"] }
 serde_json = "1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

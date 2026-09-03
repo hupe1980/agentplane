@@ -85,6 +85,21 @@ spec:
 Absent means unbounded, which is what every deployment had before the field
 existed.
 
+**A plane of hand-written skills declares the same ceiling in code**, since it
+runs under no manifest:
+
+```rust
+Runtime::builder(store)
+    .max_sensitivity_journaled(Sensitivity::Internal)
+    .skill(Triage)
+    .build()
+```
+
+Where both are present the **stricter** binds, the same rule a reviewed tool
+grant follows: a declaration may only tighten what the deployment allows. It is
+an enforcement point rather than a warning — a build-time lint that let the run
+proceed would be the advisory control this format refuses everywhere else.
+
 **Or seal the journal itself.** `SealedJournal::wrap(store, keys, tenant)` seals the
 payload fields — run input, effect arguments (prompts, tool calls), effect and
 reconciliation outputs, failure messages, notes and frozen plans; the caller's
@@ -230,6 +245,92 @@ key and takes the journal copies with it — or keeps the data out, which is wha
 `max_sensitivity_journaled` refuses at the boundary.
 
 ---
+
+## Retention on a window, and what it cannot reach
+
+`erase_case` and `erase_run` erase one unit. Retention is the same act on a
+clock: a window, applied to every closed case, by the plane.
+
+```rust
+let report = plane.retain(cutoff, now, "retention: 7 years from opening").await?;
+```
+
+```sh
+agentplane retain --store ./journal.redb \
+  --older-than-days 2555 --reason "retention: 7 years from opening" --dry-run
+```
+
+The verb **lists**; it does not erase. The shipped binary wires no blob store
+and no key ring — a redb file is a journal and a case layer — so nothing in it
+can make a byte unreadable, and a verb that walked the cases and printed
+`erased: 0` beside a clean exit code would be a control that reads as having
+run. It answers the half it can, through the same selection rule the pass uses
+(`retention::plan`, so a listing and an erasure cannot disagree about which
+cases), and refuses to run without `--dry-run`. The pass itself is
+`Runtime::retain`, from a plane built with the stores that can act.
+
+**A pass erases closed cases only, and the window is measured from `opened_at`.** A
+case still open is a matter still running, and erasing the data underneath a
+live run turns a retention pass into an outage. `opened_at` is the anchor
+because retention rules are written as *N years from the start of the business
+matter* — and it is the only instant a case records, which is a fact this verb
+states rather than works around.
+
+`--older-than-days` has **no default**, for the reason `forget-admissions` has
+none: a retention period is a legal and business decision, and a crate that
+picked one would be choosing somebody else's. `--reason` is required and lands
+on every tombstone and key destruction, so a later read says *expired, on this
+date, for this reason* rather than *missing* — which is the distinction the
+recovery drill's three-way verdict is built on.
+
+### `not_erasable` is the half that matters
+
+Every pass returns a coverage list beside its count, for the same reason
+`DrillReport` carries `not_checked`:
+
+```json
+{
+  "scanned": 1204, "erased": 318, "blobs_expired": 892, "failures": [],
+  "not_erasable": [
+    "no key ring is wired: blob tombstones cover the live store only, and journal payloads — run input, prompts, tool arguments, effect outputs — stay verbatim and permanent…",
+    "journal records are append-only: the chain, the routing fields and the fact each run happened remain — by design…",
+    "a run that belongs to no case is not reached by a case walk; erase one with `blob::erase_run`"
+  ]
+}
+```
+
+A number with no coverage statement beside it is exactly how a deployment comes
+to believe an erasure obligation is discharged while the chain still holds the
+payload verbatim. **Without a key ring, retention tombstones blobs in the live
+store and nothing else.** Without a blob store the pass still runs — the unit
+is the key, and a plane that seals its journal and stores no blobs is an
+ordinary shape — and the tombstones it could not write are named. With one, the case's key scope is destroyed and the
+erasure reaches every replica and every backup at once — because what was
+destroyed was never in them.
+
+### Admission keys are their own window
+
+`agentplane forget-admissions --older-than-days N` retires the idempotency index,
+and it is a different decision from the one above: **retiring a key reopens the
+door it closed.** The window must exceed how long your emitter keeps retrying a
+delivery it has not seen a 2xx for, or a redelivery arriving after retirement
+admits a second run — the failure the key exists to prevent, delivered on a
+timer.
+
+There is no default, deliberately. Other durable runtimes bound this for you —
+Restate expires an idempotency key a day after the invocation completes,
+Temporal's dedup window is its namespace retention — and both are choosing a
+retry horizon on your behalf. Pick yours from the emitter, not from the index's
+size:
+
+```sh
+# A webhook source that retries for 72 hours; a week is comfortably clear of it.
+agentplane forget-admissions --store ./journal.redb --older-than-days 7
+```
+
+Absent a call, keys are kept forever. That is the safe default — the one that
+cannot silently admit a duplicate — and the size of the index is a fact your
+database monitoring already reports.
 
 ## Erasure that reaches the backups
 

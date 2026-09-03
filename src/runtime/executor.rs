@@ -647,6 +647,20 @@ pub struct Runtime {
         Arc<crate::tools::ToolCatalog>,
         Arc<dyn crate::tools::ToolClient>,
     )>,
+    /// The highest sensitivity this plane will write into an append-only
+    /// record, when it says.
+    journal_ceiling: Option<crate::core::Sensitivity>,
+    /// Where this plane's tool transports may connect.
+    ///
+    /// Behind `manifest` because the tool path is.
+    ///
+    /// Here rather than on each `ToolClient` because it is a **plane**
+    /// decision: the client owns the connection, the plane owns the
+    /// destination, exactly as it does for a model driver's base URL. Absent
+    /// means no egress control on the tool path, spelled the same way an
+    /// absent policy engine is.
+    #[cfg(feature = "manifest")]
+    egress: Option<Arc<crate::core::Egress>>,
     /// How this plane attributes its metrics.
     meter: super::metrics::Meter,
     /// Durable per-tenant ceilings, when a deployment wires them.
@@ -744,6 +758,9 @@ impl Runtime {
             keyring: None,
             #[cfg(feature = "manifest")]
             tools: None,
+            journal_ceiling: None,
+            #[cfg(feature = "manifest")]
+            egress: None,
             tenant: crate::core::TenantId::default(),
             batches: None,
             policy: None,
@@ -838,6 +855,56 @@ impl Runtime {
             tenant: &self.tenant,
         };
         crate::drill::drill(&stores)
+            .await
+            .map_err(RuntimeError::from_store)
+    }
+
+    /// Erase every closed case opened before `older_than`. The retention verb.
+    ///
+    /// The wiring is the point, exactly as it is for [`drill`](Self::drill):
+    /// erasure derives blob addresses and key scopes from the tenant and the
+    /// case, so a caller assembling the stores by hand could tombstone
+    /// addresses no run ever wrote and report a clean pass over nothing.
+    ///
+    /// `reason` lands on every tombstone and on each key destruction, so a
+    /// later read says *expired, on this date, for this reason* rather than
+    /// *missing* — the distinction the drill's three-way verdict turns on.
+    ///
+    /// `at` is a parameter rather than a clock read, for the reason the
+    /// sweeper's is: a pass that read the clock could not be tested against a
+    /// year of ageing cases.
+    ///
+    /// Read [`RetentionReport::not_erasable`](crate::retention::RetentionReport::not_erasable)
+    /// before concluding anything. Without a key ring this expires blob
+    /// tombstones in the live store and **journal payloads stay verbatim**,
+    /// which is the residual the erasure page names and the one an erasure
+    /// request actually turns on.
+    ///
+    /// # Errors
+    ///
+    /// If this runtime has no case store, or the case layer cannot be walked.
+    /// A store that fails on one case is a report entry, not an error.
+    pub async fn retain(
+        &self,
+        older_than: crate::core::Timestamp,
+        at: crate::core::Timestamp,
+        reason: &str,
+    ) -> Result<crate::retention::RetentionReport, RuntimeError> {
+        let cases = self.cases().ok_or_else(|| {
+            RuntimeError::PlanContract(
+                "this runtime has no case store — retention walks cases, so there is \
+                 nothing to retain; build it with `.cases(store)`"
+                    .into(),
+            )
+        })?;
+        let stores = crate::retention::Stores {
+            cases,
+            blobs: self.blobs(),
+            #[cfg(feature = "keyring")]
+            keys: self.keyring.as_ref(),
+            tenant: &self.tenant,
+        };
+        crate::retention::retain(&stores, older_than, at, reason)
             .await
             .map_err(RuntimeError::from_store)
     }
@@ -955,13 +1022,23 @@ impl Runtime {
     /// power cut, and saying so is the difference between a control an operator
     /// can reason about and one they discover the shape of during an outage.
     ///
+    /// **How wide it reaches** is the [`HaltScope`](crate::quota::HaltScope):
+    /// the tenant, every revision of one declared agent, or one exact reviewed
+    /// digest. Scopes are independent rows — lifting a narrow halt leaves a
+    /// broad one standing. An ungoverned run, with no manifest, is stopped
+    /// only by a tenant halt; there is nothing narrower to key it on.
+    ///
     /// Requires a quota store; without one there is nowhere durable to keep the
     /// flag, and an emergency stop that a restart forgets is not one.
     ///
     /// # Errors
     ///
     /// If no quota store is wired, or the store is unreachable.
-    pub async fn set_halt(&self, reason: Option<&str>) -> Result<(), RuntimeError> {
+    pub async fn set_halt(
+        &self,
+        scope: &crate::quota::HaltScope,
+        reason: Option<&str>,
+    ) -> Result<(), RuntimeError> {
         let quotas = self.quotas.as_ref().ok_or_else(|| {
             RuntimeError::Store(crate::core::StoreError::Backend(
                 "an emergency stop needs a quota store to keep the flag in — an \
@@ -970,21 +1047,28 @@ impl Runtime {
                     .to_owned(),
             ))
         })?;
-        quotas.set_halt(reason).await.map_err(RuntimeError::Store)
+        quotas
+            .set_halt(scope, reason)
+            .await
+            .map_err(RuntimeError::Store)
     }
 
-    /// Why this tenant is halted, if it is.
+    /// Every standing emergency stop on this tenant, and why.
+    ///
+    /// The operator's question — *what is stopped right now?* — which a
+    /// per-scope lookup cannot answer without already knowing what to ask
+    /// about.
     ///
     /// # Errors
     ///
     /// If no quota store is wired, or the store is unreachable.
-    pub async fn halted(&self) -> Result<Option<String>, RuntimeError> {
+    pub async fn halts(&self) -> Result<Vec<crate::quota::Halt>, RuntimeError> {
         let quotas = self.quotas.as_ref().ok_or_else(|| {
             RuntimeError::Store(crate::core::StoreError::Backend(
                 "no quota store is wired, so no emergency stop can be set or read".to_owned(),
             ))
         })?;
-        quotas.halted().await.map_err(RuntimeError::Store)
+        quotas.halts().await.map_err(RuntimeError::Store)
     }
 
     /// # Errors
@@ -1237,6 +1321,7 @@ impl Runtime {
     async fn check_quota(
         &self,
         run: RunId,
+        governed_by: Option<&crate::journal::AgentIdentity>,
         at: crate::core::Timestamp,
     ) -> Result<QuotaPass, RuntimeError> {
         let Some(quotas) = self.quotas.as_ref() else {
@@ -1250,16 +1335,30 @@ impl Runtime {
         // fails closed for the same reason the ceilings do: a switch that yields
         // when its store is unreachable is a switch an attacker throws by taking
         // the store down.
-        match quotas.halted().await {
-            Ok(Some(reason)) => {
-                return Err(RuntimeError::QuotaExceeded(
-                    crate::quota::QuotaError::Halted {
-                        tenant: self.tenant.as_str().to_owned(),
-                        reason,
-                    },
-                ));
+        //
+        // Every standing halt in one read, and the **narrowest match wins the
+        // message**: an operator who stopped one agent and whoever is refused
+        // are looking for different sentences, and "the tenant is halted" told
+        // to the caller of agent 12 sends them to the wrong incident. Ordering
+        // the scopes puts `Revision` before `Agent` before `Tenant`, so the
+        // reason reported is the most specific one that actually covers this
+        // run.
+        match quotas.halts().await {
+            Ok(halts) => {
+                if let Some(halt) = halts
+                    .into_iter()
+                    .filter(|halt| halt.scope.covers(governed_by))
+                    .max_by(|a, b| a.scope.cmp(&b.scope))
+                {
+                    return Err(RuntimeError::QuotaExceeded(
+                        crate::quota::QuotaError::Halted {
+                            tenant: self.tenant.as_str().to_owned(),
+                            scope: halt.scope,
+                            reason: halt.reason,
+                        },
+                    ));
+                }
             }
-            Ok(None) => {}
             Err(e) => {
                 return Err(RuntimeError::QuotaExceeded(
                     crate::quota::QuotaError::Unavailable(e.to_string()),
@@ -2411,7 +2510,10 @@ impl Runtime {
             .await
             .map_err(RuntimeError::from_store)?;
 
-        let quota = match self.check_quota(run, now_for_admission()).await {
+        let quota = match self
+            .check_quota(run, governed_by.as_ref(), now_for_admission())
+            .await
+        {
             Ok(pass) => pass,
             Err(error) => {
                 let _ = self.store.release_lease(run, lease.epoch).await;
@@ -4045,6 +4147,61 @@ impl Runtime {
         })
     }
 
+    /// The half of a step's frame that belongs to the **plane** rather than to
+    /// the step.
+    ///
+    /// One place, for both a forward step and a compensation: a plane
+    /// capability wired into one of the two and not the other is a control
+    /// that applies going forward and not while unwinding.
+    fn plane_frame(&self, step: StepFrame) -> super::ctx::Frame {
+        let StepFrame {
+            run,
+            epoch,
+            step,
+            phase,
+            mode,
+            case,
+            ledger,
+            identity,
+            agent,
+            #[cfg(feature = "manifest")]
+            manifest,
+            recorded_groups,
+        } = step;
+        super::ctx::Frame {
+            run,
+            epoch,
+            step,
+            phase,
+            mode,
+            case,
+            timers: self.timers.clone(),
+            blobs: self.blobs.clone(),
+            memories: self.memories.clone(),
+            semantic: self.semantic.clone(),
+            authorities: self.authorities.clone(),
+            peers: self.peers.clone(),
+            #[cfg(feature = "manifest")]
+            tools: self.tools.clone(),
+            journal_ceiling: self.journal_ceiling,
+            #[cfg(feature = "manifest")]
+            egress: self.egress.clone(),
+            meter: self.meter.clone(),
+            #[cfg(feature = "keyring")]
+            keyring: self.keyring.clone(),
+            tenant: self.tenant.clone(),
+            ledger,
+            policy: self.policy.clone(),
+            identity,
+            agent,
+            plane: self.self_ref.clone(),
+            #[cfg(feature = "manifest")]
+            manifest,
+            signer: self.signer.clone(),
+            recorded_groups,
+        }
+    }
+
     /// Run one step's `compensate`, in its own phase and cursor slice.
     ///
     /// Split out so the unwind reads as the policy it is. The step gets a full
@@ -4071,35 +4228,20 @@ impl Runtime {
         let mut ctx = StepCtx::new(
             &self.store,
             cursor.take(step, Phase::Compensating),
-            super::ctx::Frame {
+            self.plane_frame(StepFrame {
                 run: cx.run,
                 epoch: cx.epoch,
                 step,
                 phase: Phase::Compensating,
                 mode: cx.mode,
                 case: cx.case.clone(),
-                timers: self.timers.clone(),
-                blobs: self.blobs.clone(),
-                memories: self.memories.clone(),
-                semantic: self.semantic.clone(),
-                authorities: self.authorities.clone(),
-                peers: self.peers.clone(),
-                #[cfg(feature = "manifest")]
-                tools: self.tools.clone(),
-                meter: self.meter.clone(),
-                #[cfg(feature = "keyring")]
-                keyring: self.keyring.clone(),
-                tenant: self.tenant.clone(),
                 ledger: Arc::clone(cx.ledger),
-                policy: self.policy.clone(),
                 identity: cx.identity.cloned(),
                 agent: cx.agent.to_owned(),
-                plane: self.self_ref.clone(),
                 #[cfg(feature = "manifest")]
                 manifest: self.governing(skill),
-                signer: self.signer.clone(),
                 recorded_groups,
-            },
+            }),
         );
 
         let result = skill.compensate(&mut ctx, &output).await;
@@ -4416,35 +4558,20 @@ impl Runtime {
         let mut cx = StepCtx::new(
             &self.store,
             cursor,
-            super::ctx::Frame {
+            self.plane_frame(StepFrame {
                 run,
                 epoch,
                 step,
                 phase,
                 mode,
                 case,
-                timers: self.timers.clone(),
-                blobs: self.blobs.clone(),
-                memories: self.memories.clone(),
-                semantic: self.semantic.clone(),
-                authorities: self.authorities.clone(),
-                peers: self.peers.clone(),
-                #[cfg(feature = "manifest")]
-                tools: self.tools.clone(),
-                meter: self.meter.clone(),
-                #[cfg(feature = "keyring")]
-                keyring: self.keyring.clone(),
-                tenant: self.tenant.clone(),
                 ledger: Arc::clone(ledger),
-                policy: self.policy.clone(),
                 identity: identity.cloned(),
                 agent: agent.to_owned(),
-                plane: self.self_ref.clone(),
                 #[cfg(feature = "manifest")]
                 manifest: self.governing(skill.as_ref()),
-                signer: self.signer.clone(),
                 recorded_groups,
-            },
+            }),
         );
         let result = skill.invoke(&mut cx, step_input).await;
         let result = settle_abandoned_group(&mut cx, result).await;
@@ -4942,6 +5069,26 @@ struct StepRun<'a> {
     /// `false` live.
     already_finished: bool,
     /// Group records this step and phase already wrote. Always empty live.
+    recorded_groups: BTreeMap<String, super::ctx::RecordedGroup>,
+}
+
+/// The half of a `StepCtx`'s frame that belongs to the **step**.
+///
+/// A struct rather than a dozen positional arguments, for the reason
+/// [`StepRun`] is one: the other half comes from the plane, and a caller who
+/// transposed `phase` and `mode` positionally would compile.
+struct StepFrame {
+    run: RunId,
+    epoch: crate::core::Epoch,
+    step: StepId,
+    phase: Phase,
+    mode: Mode,
+    case: Option<CaseContext>,
+    ledger: Arc<std::sync::Mutex<Ledger>>,
+    identity: Option<crate::core::Delegation>,
+    agent: String,
+    #[cfg(feature = "manifest")]
+    manifest: Option<Arc<crate::manifest::Manifest>>,
     recorded_groups: BTreeMap<String, super::ctx::RecordedGroup>,
 }
 
@@ -5915,6 +6062,9 @@ pub struct RuntimeBuilder {
         Arc<crate::tools::ToolCatalog>,
         Arc<dyn crate::tools::ToolClient>,
     )>,
+    #[cfg(feature = "manifest")]
+    egress: Option<Arc<crate::core::Egress>>,
+    journal_ceiling: Option<crate::core::Sensitivity>,
     tenant: crate::core::TenantId,
     owner: Option<String>,
     lease_ttl: Duration,
@@ -6348,6 +6498,74 @@ impl RuntimeBuilder {
         client: Arc<dyn crate::tools::ToolClient>,
     ) -> Self {
         self.tool_servers.push((name.into(), client));
+        self
+    }
+
+    /// Where this plane's **tool transports** may connect.
+    ///
+    /// A `ToolClient` is the embedder's code, and the split is the one every
+    /// other outbound path here makes: **the client owns the connection, the
+    /// plane owns the destination.** A transport says where it goes with
+    /// [`ToolClient::destination`](crate::tools::ToolClient::destination), and
+    /// this decides whether that is somewhere it may go — before the effect
+    /// exists, so nothing leaves, nothing is journaled and nothing is metered.
+    ///
+    /// A [`Destination::Local`](crate::tools::Destination::Local) transport is
+    /// not judged: tools compiled into the binary and a stdio child process
+    /// contact no host of this plane's choosing, so there is nothing for an
+    /// allowlist to decide. What that does not claim is that the far side
+    /// reaches nothing — the same residual a compromised allowlisted endpoint
+    /// carries.
+    ///
+    /// Unset means no egress control on the tool path, spelled the way an
+    /// absent policy engine is: by configuring nothing, rather than by
+    /// configuring something that looks like a control and is not.
+    ///
+    /// ```ignore
+    /// let plane = Runtime::builder(store)
+    ///     .tool_server("tickets", mcp_over_https)
+    ///     .egress(Egress::new().allow("mcp.tickets.example"))
+    ///     .build();
+    /// ```
+    #[cfg(feature = "manifest")]
+    #[must_use]
+    pub fn egress(mut self, egress: crate::core::Egress) -> Self {
+        self.egress = Some(Arc::new(egress));
+        self
+    }
+
+    /// The highest sensitivity this plane will write into an append-only record.
+    ///
+    /// # What this is, and what the key ring is
+    ///
+    /// Two different answers to *this data must be erasable*, and they compose.
+    /// [`keyring`](Self::keyring) is the **seal it** half: payloads become
+    /// ciphertext whose key an erasure destroys, which reaches every replica
+    /// and every backup at once. This is the **refuse it** half: an argument
+    /// more sensitive than the deployment is willing to make permanent is
+    /// refused at dispatch, before it reaches the chain.
+    ///
+    /// The plane-level twin of `spec.security.max_sensitivity_journaled`, for
+    /// a plane of hand-written skills that runs under no manifest. The default
+    /// is the unsafe one — a journal keeps everything, indefinitely — so a
+    /// plane must be able to state the ceiling whether or not it is
+    /// declarative. It is an enforcement point at the same gate the manifest's
+    /// field reaches, not a warning; where both are present **the stricter
+    /// wins**, as a reviewed tool grant may only tighten what the operator's
+    /// catalogue allows.
+    ///
+    /// Absent means no ceiling, spelled the way an absent policy engine is.
+    ///
+    /// ```ignore
+    /// let plane = Runtime::builder(store)
+    ///     // Personal data goes in a blob and the chain gets the digest.
+    ///     .max_sensitivity_journaled(Sensitivity::Internal)
+    ///     .skill(Triage)
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub const fn max_sensitivity_journaled(mut self, ceiling: crate::core::Sensitivity) -> Self {
+        self.journal_ceiling = Some(ceiling);
         self
     }
 
@@ -7229,6 +7447,9 @@ impl RuntimeBuilder {
             peers: self.peers,
             #[cfg(feature = "manifest")]
             tools: self.tools,
+            journal_ceiling: self.journal_ceiling,
+            #[cfg(feature = "manifest")]
+            egress: self.egress,
             quotas: self.quotas,
             quota: self.quota,
             budget: self.budget,

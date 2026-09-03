@@ -28,8 +28,24 @@
 //!
 //! A replayed run re-executes its skills, so it emits spans again. Without a
 //! mode attribute an operator sees each run twice and metrics like "effect
-//! latency by driver" silently average real calls with journal reads. Every span
-//! carries [`MODE`], and every effect span carries [`EFFECT_REPLAYED`].
+//! latency by driver" silently average real calls with journal reads. Every
+//! span carries [`MODE`].
+//!
+//! For effects the marking is sharper than an attribute, and a bridge author
+//! should know exactly what it is: **a replayed effect opens no span at all.**
+//! It never reaches the world, so there is no duration to record; what it emits
+//! instead is a `debug` **event** on the [`EFFECT_SPAN`] target carrying
+//! `replayed = true`, plus the `agentplane.effects_replayed` counter. The
+//! [`EFFECT_REPLAYED`] field on a live effect span is therefore always `false`,
+//! and it is there so a collector filtering on one attribute name gets a
+//! uniform answer rather than an absent field.
+//!
+//! The consequence is the one that matters: a span-derived latency histogram is
+//! clean **by construction**, because replays contribute no spans to it. What a
+//! bridge must not do is key on the *target* and treat every record on it as a
+//! span — that view sees both, and it is the view in which replays contaminate
+//! latency. `examples/observability.rs` does it the correct way and asserts on
+//! the difference.
 //!
 //! # Semantic conventions
 //!
