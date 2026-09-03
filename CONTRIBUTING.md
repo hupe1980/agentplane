@@ -39,6 +39,14 @@ finding that prompted the check was in code we merely linked: the AWS SDK's
 default TLS feature pinned a `rustls-webpki` with three advisories against
 certificate validation.
 
+`just site-check` needs [zola](https://www.getzola.org) (`brew install zola`),
+pinned in CI to the version the docs site deploys with — a heading's generated
+id is that version's slugification rule, so two versions would be two rules. It
+refuses a broken internal link or anchor and deliberately skips external ones:
+an anchor is a property of this repository, an external link is a property of
+somebody else's server, and a gate that checks the second makes a green build
+depend on the internet.
+
 `just mutants` is deliberately **not** an inner-loop check — it rebuilds the
 library once per mutation. `just anchors` is the one that belongs in your muscle
 memory, and it catches the silent half: a refactor that moves the code a mutation

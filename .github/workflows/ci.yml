@@ -29,6 +29,13 @@ jobs:
       # prebuilt binary rather than `cargo install`, which would rebuild it on
       # every cache miss for a check that takes seconds to run.
       - uses: taiki-e/install-action@cargo-audit
+      # `just ci` refuses a broken internal doc anchor, so the site generator
+      # has to be here. Pinned to the version the pages job builds with: a
+      # heading's generated id is that version's slugification rule, and two
+      # versions would be two rules.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: zola@0.22.1
       - run: just ci
 
   # Each seam with *only* its own features on — the configuration an embedder

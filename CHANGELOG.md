@@ -46,6 +46,22 @@ attestation is a column update. Pinned by a twenty-round concurrent publish
 against a real server: exactly one lands, the other is `Immutable`, and what
 resolves is the winner byte for byte.
 
+### Fixed — the local gate did not check the docs site
+
+`just ci` carries the claim that it is the same set of commands CI runs, so a
+check cannot drift between a contributor's machine and the pipeline. The site's
+link check was not in it — it lived only in the pages workflow — so a
+documentation change could pass the gate, land, and fail CI on a broken
+internal anchor, which is what happened to a link into a new heading whose
+generated id includes the slugified name of its emoji. `just ci` now runs
+`site-check`, and the CI job installs the pinned generator to match. The check
+skips external links deliberately: an anchor is a property of this repository,
+an external link is a property of somebody else's server.
+
+Headings that link targets point at carry an explicit `{#id}`, which is what
+the rest of the docs already do — an emoji in a heading otherwise puts its
+Unicode name in the anchor.
+
 ### Changed — dependencies updated; the MCP fixtures state their version
 
 `cargo update` (rmcp 3.1.4 → 3.2.0, a2a-server-lf 0.4.3, hyper 1.11.1, and

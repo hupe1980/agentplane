@@ -298,9 +298,19 @@ og:
 doc-examples:
     tools/check-doc-examples.sh
 
-# build the docs site into site/public, refusing broken internal links/anchors
-site:
-    cd site && zola check && zola build
+# refuse a broken internal link or anchor in the docs site
+#
+# In `ci`, and deliberately `--skip-external-links`: an internal anchor is a
+# property of this repository — deterministic, and broken by the commit that
+# breaks it — while an external link is a property of somebody else's server,
+# so checking one in the gate makes a green build depend on the internet. The
+# deploy job checks both.
+site-check:
+    cd site && zola check --skip-external-links
+
+# build the docs site into site/public
+site: site-check
+    cd site && zola build
 
 # serve the docs site locally with live reload
 site-serve:
@@ -358,7 +368,7 @@ audit:
 # run them before a release, not on every save.
 
 # everything CI runs, minus the two slow layers
-ci: lint features anchors audit test test-default test-minimal examples cli-smoke doc-examples docs package
+ci: lint features anchors audit test test-default test-minimal examples cli-smoke doc-examples docs site-check package
 
 # everything, including the slow layers — what a release must pass
 ci-full: ci specs mutants
