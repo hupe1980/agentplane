@@ -76,14 +76,23 @@ jobs:
   # matches the code it names — text, not types — which is the cheap half only.
   # A guarantee that stopped being checked looks exactly like one that is.
   #
-  # It therefore runs on every push, **sharded**. Ungated and serial it took
-  # 2h12m on a CI runner — a gate nobody waits for is a gate that gets ignored,
-  # which would put the sweep back where the `pull_request` condition had it.
+  # It therefore runs on every push, **sharded**. Serial it takes hours — a gate
+  # nobody waits for is a gate that gets ignored, which would put the sweep back
+  # where the `pull_request` condition had it.
   #
-  # `MUTANTS_SHARD=k/n` takes a round-robin slice of the table. Round-robin, not
-  # contiguous: the table groups mutations by subject, so neighbouring entries
-  # share a test target and therefore a build cost, and a contiguous split hands
-  # one shard every expensive target. The job is as slow as its slowest shard.
+  # `MUTANTS_SHARD=k/n` takes a contiguous slice of the list, which the harness
+  # emits grouped by the **feature set** each mutation is checked under. That
+  # set is what decides the build: cargo keeps one set of artifacts per feature
+  # combination, so a shard that walks all thirteen of this table's combinations
+  # builds thirteen dependency graphs, while a shard that walks two builds two.
+  # It pays for them twice — in time, and in the disk they all stay on, which a
+  # runner has about as much of as this crate's combinations want. Grouping is
+  # therefore worth more than balancing mutation counts, and the slices are
+  # equal in length anyway.
+  #
+  # Ten rather than six: with the dependency builds amortised, a shard's cost is
+  # mostly its mutation count, and ten keeps this matrix plus the other jobs
+  # inside a twenty-job concurrency budget.
   #
   # Each shard is its own checkout, which is what makes this safe — the sweep
   # rewrites source in place and refuses to run twice against one tree.
@@ -92,8 +101,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
-    name: mutants (${{ matrix.shard }}/6)
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    name: mutants (${{ matrix.shard }}/10)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -101,7 +110,7 @@ jobs:
       - uses: extractions/setup-just@v2
       - run: just mutants
         env:
-          MUTANTS_SHARD: ${{ matrix.shard }}/6
+          MUTANTS_SHARD: ${{ matrix.shard }}/10
 
   # Two passes: the first checks the design, the second checks the check. A
   # spec whose invariants cannot be violated proves nothing, so each is re-run

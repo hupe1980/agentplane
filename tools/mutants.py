@@ -7008,6 +7008,25 @@ def _locate(test: str) -> tuple[str | None, set[str] | None] | None:
     return None
 
 
+def _build_key(test: str) -> tuple[str, str]:
+    """The `(features, target)` pair a mutation's check is built under.
+
+    Read from [`_locate`] rather than derived a second way, so the order a
+    sweep runs in cannot disagree with the command `verify` then issues — two
+    models of one build would put a mutation in the group whose dependencies
+    it does not use, and the grouping would quietly buy nothing.
+    """
+    found = _locate(test)
+    if not found:
+        # A test nothing can find has no build. Sorted last, under its own key,
+        # so it neither joins a group nor splits one.
+        return ("~~missing", test)
+    target, feats = found
+    if feats is None:
+        return ("all", "")
+    return (",".join(sorted(set(feats) | {"redb", "testkit"})), target or "")
+
+
 def verify(name: str) -> int:
     """Apply one mutation, run the test it names, and classify what happened.
 
@@ -7138,12 +7157,23 @@ def main() -> int:
     if len(sys.argv) == 2 and sys.argv[1] == "--check":
         return check()
     if sys.argv[1:2] == ["--list"]:
-        # `--shard k/n` selects one slice, so the sweep can be split across n
-        # machines. Round-robin rather than contiguous: mutations are grouped by
-        # subject in this table, so consecutive entries tend to share a test
-        # target and therefore a build cost — a contiguous split would hand one
-        # shard every expensive target and another every cheap one, and the job
-        # takes as long as its slowest shard.
+        # Emitted **grouped by the feature set each mutation is checked under**,
+        # because that set is what decides the build. Cargo keeps one set of
+        # compiled artifacts per feature combination, so moving from one to
+        # another rebuilds the library and every dependency for the combination
+        # being moved to; staying inside one rebuilds only the library, whose
+        # single line changed.
+        #
+        # The table is authored by subject, and the thirteen feature sets are
+        # scattered through it — so in authoring order a sweep switches
+        # combination about two thirds of the time and pays a dependency build
+        # for almost every mutation. Grouping makes each combination's
+        # dependencies build once.
+        #
+        # `--shard k/n` then takes a **contiguous** slice of that grouped order,
+        # so a shard sees one or two combinations rather than all thirteen. The
+        # slices are equal in length, which is the balance that matters once
+        # build locality is what a shard's cost is made of.
         #
         # Sharding is for separate checkouts. Two shards on one tree would
         # rewrite the same files under each other, which is what the sweep's
@@ -7161,9 +7191,19 @@ def main() -> int:
         elif len(sys.argv) != 2:
             print(__doc__, file=sys.stderr)
             return 2
-        for i, (name, (path, test, desc, _, _)) in enumerate(MUTANTS.items()):
-            if i % total == shard - 1:
-                print(f"{name}\t{path}\t{test}\t{desc}")
+        rows = sorted(
+            MUTANTS.items(),
+            # `_locate` answers with the target and features `verify` will use,
+            # so this orders by the real build rather than by a guess from the
+            # table. A mutation whose test cannot be found sorts last under a
+            # key of its own; `verify` reports it, and it must not silently
+            # join another group's build.
+            key=lambda kv: _build_key(kv[1][1]),
+        )
+        lo = round((shard - 1) * len(rows) / total)
+        hi = round(shard * len(rows) / total)
+        for name, (path, test, desc, _, _) in rows[lo:hi]:
+            print(f"{name}\t{path}\t{test}\t{desc}")
         return 0
     if len(sys.argv) != 3 or sys.argv[1] not in MUTANTS:
         print(__doc__, file=sys.stderr)

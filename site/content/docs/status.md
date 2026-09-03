@@ -116,7 +116,7 @@ just test-postgres  # the shared-store backend against a real server
 just test-vault     # the key-ring contract against a real Vault
 
 python3 tools/mutants.py <name> --verify   # one guarantee, end to end
-MUTANTS_SHARD=2/6 just mutants           # one slice, for a machine that is not alone
+MUTANTS_SHARD=2/10 just mutants          # one slice, for a machine that is not alone
 ```
 
 The mutation sweep is the one that matters most: it breaks each guarantee on
