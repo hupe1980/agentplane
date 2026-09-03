@@ -1652,7 +1652,7 @@ impl Manifest {
             }
             total += key.len() + value.len();
         }
-        if false {
+        if total > MAX_ANNOTATIONS_BYTES {
             return Err(ManifestError::Syntax(format!(
                 "metadata.annotations: {total} bytes of keys and values, and the limit is \
                  {MAX_ANNOTATIONS_BYTES} — annotations are facts about the agent, not a \

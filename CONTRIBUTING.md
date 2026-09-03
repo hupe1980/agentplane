@@ -28,7 +28,7 @@ the pipeline is right and you find out late; the justfile exists so they cannot.
 | `just test` | seconds | while working |
 | `just audit` | seconds | before pushing; part of `just ci` |
 | `just ci` | ~5 minutes | before pushing |
-| `just mutants` | ~25 minutes | before a release, or after touching a guarantee |
+| `just mutants` | ~1.5 hours, or a tenth of that per shard | before a release, or after touching a guarantee |
 | `just specs` | ~2 minutes | after changing the effect protocol, sagas, fencing, or authorization |
 
 `just audit` needs `cargo-audit` (`cargo install cargo-audit`, or
@@ -48,7 +48,10 @@ somebody else's server, and a gate that checks the second makes a green build
 depend on the internet.
 
 `just mutants` is deliberately **not** an inner-loop check — it rebuilds the
-library once per mutation. `just anchors` is the one that belongs in your muscle
+library once per mutation. `MUTANTS_SHARD=k/10` runs one slice, which is how CI
+splits it; the slices are ordered so each stays inside one or two feature sets,
+because cargo keeps a separate build per feature combination and this table has
+thirteen of them. `just anchors` is the one that belongs in your muscle
 memory, and it catches the silent half: a refactor that moves the code a mutation
 is anchored to leaves that guarantee unverified while still looking verified.
 

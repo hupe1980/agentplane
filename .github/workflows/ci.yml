@@ -85,14 +85,17 @@ jobs:
   # set is what decides the build: cargo keeps one set of artifacts per feature
   # combination, so a shard that walks all thirteen of this table's combinations
   # builds thirteen dependency graphs, while a shard that walks two builds two.
-  # It pays for them twice — in time, and in the disk they all stay on, which a
-  # runner has about as much of as this crate's combinations want. Grouping is
-  # therefore worth more than balancing mutation counts, and the slices are
-  # equal in length anyway.
+  # It keeps them all on disk too, and thirteen combinations of this crate's
+  # graph is about as much space as a runner has. Where the artifacts are
+  # already cached the grouping buys no per-mutation time — that cost is the
+  # library rebuild and the test-binary relink — so what it buys is the disk
+  # and a coherent sweep against a cold target. The slices stay equal in length
+  # either way.
   #
-  # Ten rather than six: with the dependency builds amortised, a shard's cost is
-  # mostly its mutation count, and ten keeps this matrix plus the other jobs
-  # inside a twenty-job concurrency budget.
+  # Ten rather than six is where the wall-clock comes from: a shard's cost is
+  # mostly its mutation count, sixty-four of them run in about fourteen minutes
+  # where a hundred and six took twenty-two, and ten keeps this matrix plus the
+  # other jobs inside a twenty-job concurrency budget.
   #
   # Each shard is its own checkout, which is what makes this safe — the sweep
   # rewrites source in place and refuses to run twice against one tree.

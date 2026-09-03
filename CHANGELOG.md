@@ -46,6 +46,40 @@ attestation is a column update. Pinned by a twenty-round concurrent publish
 against a real server: exactly one lands, the other is `Immutable`, and what
 resolves is the winner byte for byte.
 
+### Changed — the mutation sweep is ordered by what it builds
+
+A mutation's cost is dominated by the feature set its check runs under: cargo
+keeps one set of compiled artifacts per feature combination, so moving between
+two rebuilds the library *and every dependency* for the one being moved to.
+This table holds thirteen combinations, scattered through it because it is
+authored by subject — so a sweep in authoring order switched combination about
+two thirds of the time, and a shard that walked all thirteen paid for thirteen
+dependency graphs in time and in the disk they all stay on.
+
+`--list` now emits the table grouped by that feature set, and `--shard k/n`
+takes a contiguous slice of the grouped order rather than a round-robin one, so
+a shard walks one to six combinations instead of all thirteen while the slices
+stay equal in length.
+
+What that buys is stated narrowly, because the obvious claim does not survive
+measurement: on a pipeline whose dependency artifacts are already cached the
+per-mutation cost is the library rebuild and the test-binary relink, which
+grouping does not change. What it does change is how many dependency graphs a
+shard builds and keeps on disk — thirteen combinations of this crate's graph is
+about as much space as a runner has — and it makes a sweep against a cold
+target coherent rather than thrashing.
+
+The wall-clock improvement comes from the matrix, six shards to ten: fewer
+mutations each, measured at fourteen minutes for a shard of sixty-four against
+the twenty-two minutes a shard of a hundred and six took.
+
+The order comes from the same `_locate` that `verify` uses to build its cargo
+command, so a mutation cannot be grouped under a build it does not use, and
+`--check` now asserts that the slices partition the table for every split CI
+might pick. An off-by-one there would leave a mutation in no shard at all —
+and every shard would still pass, reporting that every guarantee is
+falsifiable.
+
 ### Fixed — the local gate did not check the docs site
 
 `just ci` carries the claim that it is the same set of commands CI runs, so a

@@ -4869,7 +4869,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the second reading",
         "        // Strict verification never writes, so it holds no lease to renew.\n"
         "        let _heartbeat = lease.map(|l| self.heartbeat(run, l.epoch));",
-        "        let _ = self.check_quota(run, now_for_admission()).await?;\n"
+        "        let _ = self.check_quota(run, None, now_for_admission()).await?;\n"
         "        // Strict verification never writes, so it holds no lease to renew.\n"
         "        let _heartbeat = lease.map(|l| self.heartbeat(run, l.epoch));",
     ),
@@ -6928,6 +6928,26 @@ def check() -> int:
         return 2
 
     bad = 0
+
+    # Every mutation lands in exactly one shard, for every split CI might use.
+    #
+    # The slice is a rounded division, and a slip there is silent in the worst
+    # way: a mutation in no shard is a guarantee the sweep never checks, while
+    # every shard still passes and the summary still says every guarantee is
+    # falsifiable. Checked here because this answers in milliseconds and the
+    # sweep that would notice runs for hours.
+    names = list(MUTANTS)
+    for total in (1, 2, 6, 10, 16, len(names)):
+        seen = [n for k in range(1, total + 1) for n in _shard(names, k, total)]
+        if sorted(seen) != sorted(names):
+            missing = [n for n in names if n not in set(seen)]
+            twice = sorted({n for n in seen if seen.count(n) > 1})
+            print(
+                f"--shard k/{total} does not partition the table: "
+                f"{len(missing)} mutation(s) in no slice, {len(twice)} in more than one"
+            )
+            bad += 1
+
     for name, (path, test, _desc, find, _replace) in MUTANTS.items():
         target = ROOT / path
         if not target.exists():
@@ -7006,6 +7026,23 @@ def _locate(test: str) -> tuple[str | None, set[str] | None] | None:
         if f"fn {test}(" in path.read_text():
             return None, None
     return None
+
+
+def _shard(rows: list, shard: int, total: int) -> list:
+    """One slice of `rows`, as `--shard k/n` selects it.
+
+    Contiguous, because `rows` arrives grouped by the feature set each mutation
+    builds under and the point of a slice is to stay inside as few of those
+    groups as possible. Equal in length to within one, which is the balance
+    left to want once build locality is what a shard's cost is made of.
+
+    Shared with [`check`] rather than written twice: a slice that dropped a
+    mutation would leave it in no shard at all, and a sweep that skipped a
+    guarantee prints the same summary as one that checked it.
+    """
+    lo = round((shard - 1) * len(rows) / total)
+    hi = round(shard * len(rows) / total)
+    return rows[lo:hi]
 
 
 def _build_key(test: str) -> tuple[str, str]:
@@ -7200,9 +7237,7 @@ def main() -> int:
             # join another group's build.
             key=lambda kv: _build_key(kv[1][1]),
         )
-        lo = round((shard - 1) * len(rows) / total)
-        hi = round(shard * len(rows) / total)
-        for name, (path, test, desc, _, _) in rows[lo:hi]:
+        for name, (path, test, desc, _, _) in _shard(rows, shard, total):
             print(f"{name}\t{path}\t{test}\t{desc}")
         return 0
     if len(sys.argv) != 3 or sys.argv[1] not in MUTANTS:

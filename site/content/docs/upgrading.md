@@ -15,6 +15,135 @@ property that makes a hard cut acceptable at this stage.
 
 ---
 
+## An MCP client is opened with `McpClient::connect`
+
+**Affected:** any wiring that built an `rmcp` service by hand and passed it to
+`McpClient::new`.
+
+```rust
+// Before
+let service = McpClient::host_info().serve(transport).await?;
+let client = McpClient::new("tickets", Arc::new(service))?;
+
+// After
+let client = McpClient::connect(
+    "tickets", transport, Destination::remote("mcp.tickets.example"),
+).await?;
+```
+
+`2026-07-28` replaced the `initialize` handshake with `server/discover` and
+per-request metadata, and an `initialize` naming that revision is answered with
+the server's newest *legacy* dialect. So `.serve(transport)` negotiates down on
+every connection with nothing refusing: `tools/call` keeps working, the tasks
+extension and structured results never appear, and no error names the cause.
+`connect` owns the sequence — discover preferring 2026-07-28, `initialize` at
+2025-11-25 only for a server that answers discover as a legacy one.
+
+`McpClient::new` remains for a service you already started, and both now take a
+`Destination`. Read what the handshake settled on with `negotiated_version()`.
+
+## `ToolClient` must say where it sends calls
+
+**Affected:** every `ToolClient` implementation.
+
+Implement `destination(&self, tool: &ToolId) -> Destination`: `Destination::Local`
+for tools compiled into this binary or a server run as a child process over
+stdio, `Destination::remote(host)` for a transport that dials one. There is no
+default, because a default of `Local` would let a remote transport answer
+*reaches nobody* by saying nothing — the same reason `JournalStore::is_shared`
+has none.
+
+`RuntimeBuilder::egress(..)` then judges that answer before the effect exists,
+which is how the tool path joined the destination allowlist the model drivers
+and peer client already used. `ToolCall::prepare` takes the allowlist as a
+fifth argument; inside a skill, `cx.tool_egress()` hands you the plane's.
+
+## The emergency stop names what it stops
+
+**Affected:** callers of `Runtime::set_halt` / `Runtime::halted`, custom
+`QuotaStore` implementations, and persisted quota schemas.
+
+```rust
+// Before
+rt.set_halt(Some("incident 42")).await?;
+let why: Option<String> = rt.halted().await?;
+
+// After
+rt.set_halt(&HaltScope::Tenant, Some("incident 42")).await?;
+rt.set_halt(&HaltScope::agent("payments-clerk"), Some("incident 42")).await?;
+let standing: Vec<Halt> = rt.halts().await?;
+```
+
+`halted()` is replaced by `halts()`, which returns every standing stop —
+`HaltScope::Tenant`, `Agent` by `metadata.name`, or `Revision` by manifest
+digest. Scopes are **independent rows**: `quota_halted` is keyed
+`(tenant, scope)` on both backends, so lifting a narrow stop leaves a broader
+one standing. Recreate the table; no migration is provided. A store that reads
+back a scope it cannot parse must report `StoreError::Corrupt` rather than skip
+the row — a halt an instance ignores looks, from outside, exactly like one that
+was lifted.
+
+A halt also has its own wire identity: A2A answers `-32030` with the
+`ErrorInfo` reason `HALTED`, not the ceiling's `QUOTA_EXHAUSTED`. A client
+keying on the pair gets *do not retry* instead of *come back*; a bare `-32030`
+from a foreign server stays an unknown fault.
+
+## `erase_case` takes an optional blob store
+
+**Affected:** direct callers of `blob::erase_case`.
+
+Wrap the first argument in `Some(..)`. The erasure unit is the **key scope**,
+and a plane that seals its journal with a key ring and stores no blobs is an
+ordinary shape — passing `None` there erases the case through its key and
+reports the tombstones it could not write, rather than declining to erase at
+all. `Runtime::retain` does the same over a window.
+
+## A Cedar denial names the rule, and the bundle identity moved
+
+**Affected:** deployments with a Cedar policy set, and open runs resumed across
+the upgrade.
+
+Annotate rules you want named in a refusal:
+
+```cedar
+@id("betragsgrenze-5000-eur")
+forbid (principal, action == Action::"effect:perform", resource)
+when { context.args.amount_eur > 5000 };
+```
+
+Cedar treats `@id` as an ordinary annotation and does not adopt it as the
+`PolicyId`, so without one a denial names `policy17` and the required reason
+answers nothing. Two rules answering to one name are refused at construction,
+including an `@id` that collides with another rule's generated id.
+
+The reason no longer repeats the action and resource — `StepError::Denied` and
+the journaled `PolicyDenied` record already carry both. `EVALUATOR_SEMANTICS`
+is now `agentplane-adapter/3`, so every policy bundle digest moves: an open run
+resumed across the change presents a different bundle and is refused, which is
+the drift check working. Re-admit rather than migrate.
+
+## A sink argument mismatch says where the values differ
+
+**Affected:** code matching `PolicyError::SinkArgumentsMismatch`.
+
+The variant gains `at` (the first differing RFC 6901 pointer, `""` for the whole
+document), `bound` and `sent` (canonical digests). Neither value is printed —
+the labelled one is exactly the data these gates keep out of a log.
+`RuntimeError::QuotaExceeded` is also `#[error(transparent)]` now, so a halt no
+longer renders under a `quota:` prefix.
+
+## `Registry` gains `names()`, and both stores implement it
+
+**Affected:** custom `Registry` implementations.
+
+Implement `names()`, the enumerable inventory — *which agents does this
+organisation run* is the first question a governance function asks, and
+`versions(name)` needs the name you were going to ask about. Both shipped
+stores are now registries (`registry_manifests`, keyed
+`(tenant, name, version)`); the immutability and publisher rules live once, in
+`manifest::registry::decide_publish`, so a backend performs the decision rather
+than re-deriving it.
+
 ## `QuotaStore::accrue` is now idempotent pass settlement
 
 **Affected:** custom `QuotaStore` implementations and persisted quota schemas.
